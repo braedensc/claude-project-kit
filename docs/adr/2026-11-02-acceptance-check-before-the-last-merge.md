@@ -74,6 +74,38 @@ trigger, and telemetry records the real cost.
 **8. Off unless a project opts in.** A `delivery.json` without an `acceptance` section behaves
 exactly as before. The section also tells planning to write checks a machine can run.
 
+**9. Each check gets its own look config, and its session's tool finds it by where it was
+started (KIT-571, the owner's choice of 11 Nov).** The dispatcher's MCP config is fixed per
+entry, so one file cannot name every session's worktree and plan. Before it hands the
+acceptance ticket to the agent, the live pass writes `<look_config_dir>/<ticket>.json`: the
+session's worktree (`<workspace_dir>/<ticket>`, the dispatcher's own naming), the plan, and the
+check's own record folder. The entry's MCP config starts the look tool once, with
+`--config-dir <look_config_dir>`. The tool takes the one config naming the folder it was started
+in. The dispatcher chose that folder, and the session cannot change it; the config folder sits
+outside every worktree, so the session cannot write one either. No match, or two, is a refusal.
+The tool looks for its file again at every run: when the pass stops a check past its time limit,
+it removes the file, and the tool refuses every run after that.
+
+Live-test item: that the dispatcher starts a session's MCP servers in its worktree. The selftest
+cannot prove it. If it does not, every run is refused, in words, and the check reads
+could-not-check: never a pass.
+
+**10. The follow-ups go to the finding path, marked (KIT-571).** The finding poller files only
+what the dispatcher's agent writes, and the live pass writes with the owner's key. So the pass
+posts each request on the plan's epic, under a first-line mark of its own (contract §25), and
+the finding poller is taught, separately, to file that mark from its own key. No second filer
+of tickets exists. The finding poller reads the mark from 11 Nov (KIT-607): the mark names the
+check's own run, the cap is three per run, and one problem is filed once per plan and head.
+
+**11. After the merge, the default branch is checked (KIT-571).** A plan whose pieces all
+merged before any check ran would wait for ever for a verdict the bridge needs before it closes
+the plan. So the live pass checks the repository's default branch at its head then. When the
+owner asks for a plan to be checked again, the bridge posts a request on the epic (contract §26)
+after his yes, and the pass runs one more check, even at a head it checked before: a
+could-not-check on an unchanged head would otherwise hold the plan for good. A re-run takes the
+place of the earlier check's ledger row once that check is over, so the ledger still holds one
+row per plan and head, the newest.
+
 ## Consequences
 
 - A project that opts in owes a fake backend and its scenarios. That module belongs in its

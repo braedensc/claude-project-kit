@@ -81,6 +81,9 @@ Source for all three: `docs/STAGE-A-OPERATOR.md`.
 | --- | --- | --- | --- |
 | A ticket handed over never starts | See row 11 | `docs/CATCH-UP.md` | Agent to read |
 | Work vanished after a ticket was tidied | Moving a ticket to **Done** or **Canceled** runs `git worktree remove --force` and a recursive remove. It destroys uncommitted work (KIT-44, the destructive trap) | Do not tidy a ticket after a crash. Rescue the worktree diff first | Human |
+| Work vanished right after a merge, and nobody touched the ticket | The tracker's GitHub integration moves a ticket to **Done** seconds after its PR merges (measured: 2 to 3 seconds). Done runs the same forced remove as the row above. A merge while that ticket's session still runs, such as a bounce re-prompt mid-fix, removes the worktree under it (KIT-51) | Before you merge, check that the ticket's session has ended. GitHub shows nothing about a session | Human |
+| A ticket moved, and no person or job moved it | The integration moves every ticket whose id is in a PR's title, branch or body: to the team's review state when the PR opens, and to **Done** when it merges. The tracker sets these moves per team. Who owns which move is decided in `docs/PIPELINE-CONTRACT.md` §1, the `stateIds` rows (KIT-51) | Read the ticket's history: the move lands within seconds of the PR event. Then name only the ticket the PR completes, in all three places. Put a note about another ticket on that ticket instead | Agent |
+| A team's tickets never move when their PRs open or merge | That team's Git automation is off, or points at other states. The tracker sets it per team, so a team added later needs it set too | The team's settings, *Workflow*, Git automation: PR opened → the review state, PR merged → Done | Human |
 | A session asked a question nobody answered | Nobody is there. A session must comment on the ticket and end; it never waits for a person (`docs/SESSION-BRIEF.md`) | Read the ticket's comments | Agent |
 | A guard blocked a command | Either the guard is right, or it is spurious | Read the block message. A correct block names the rule; **never respell the command** (`CLAUDE.md`). If the block is wrong, say so and stop | Agent reports. Human decides |
 
@@ -104,7 +107,7 @@ Awaiting first operation. The telemetry collector and the schema gate are tested
 | Symptom | Cause | Check | Who |
 | --- | --- | --- | --- |
 | The DM went quiet | The bridge stopped, or the tech lead's session is busy. The clerks watch each other, so a stopped bridge pages | `python3 scripts/pipeline_bridge_setup.py verify --conf <bridge.conf>` | Agent to read. Human to restart |
-| *The tech lead hasn't answered yet* every time | The chat bot is not in the back room | Invite it to that channel | Human |
+| *The tech lead hasn't answered yet* every time | The tech lead's turn fails: a refused token, a usage limit, or an old copy of the kit | `verify`'s `turn` row, and the bridge's log line that says why | Agent to read. Human to renew the token |
 | A `yes` acted on nothing | The question expired after 24 hours, was edited or deleted, or its terms changed | The bridge's reply says which | Agent |
 | No stand-up arrived | The status file is missing or over an hour old, or the rundown is more than three hours late | `python3 scripts/pipeline_standup.py preview --kind morning` | Agent |
 
@@ -114,7 +117,7 @@ Source: `docs/BRIDGE-OPERATOR.md`, `docs/STANDUP.md`, `docs/HEARTBEAT-MONITOR.md
 
 ## 4. Recovery rituals
 
-**The destructive trap.** Moving a ticket to Done or Canceled deletes its worktree, uncommitted work included (KIT-44). After a crash, leave the ticket where it is until the work is rescued.
+**The destructive trap.** Moving a ticket to Done or Canceled deletes its worktree, uncommitted work included (KIT-44). After a crash, leave the ticket where it is until the work is rescued. A merge moves the ticket to Done on its own, so do not merge that ticket's PR either until the work is rescued (KIT-51).
 
 **The safe order after a dispatcher crash** (KIT-44; the dispatcher's setup runbook, *Recovery*):
 
@@ -146,3 +149,4 @@ Source: `docs/BRIDGE-OPERATOR.md`, `docs/STANDUP.md`, `docs/HEARTBEAT-MONITOR.md
 - **The telemetry and schema-gate section.** No failure observed. KIT-46.
 - **The three dispatcher unknowns** from the resilience ticket: whether the tracker retries a failed hand-over and for how long, whether an idle session stays "working", and whether a non-interrupt kill orphans the child. KIT-44.
 - **That each *Check* column command still works** as the guides change. Run it before relying on it. KIT-46.
+- **Every event the tracker's GitHub integration acts on.** Two moves were measured from ticket history, in each team that has a repository: a PR opening and a PR merging. A draft PR, a review request and a PR closed without merging were not seen. Each team's Git automation settings page says, and it needs a person's sign-in. KIT-51.

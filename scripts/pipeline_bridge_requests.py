@@ -63,12 +63,28 @@ VERB_TABLE = (
 )
 HANDOVER_KINDS = ("retry", "start")
 # What the bridge says to anything else a member writes in its DM, at most once an hour.
+# Said only while the tech lead's own turn is off here (KIT-492): on, it answers the rest.
 DM_HELP = ("I can do %s and yes or no here. I read an ask in your own words too, such as "
            "`please replan <ticket id>`, with up to 10 tickets to plan or replan at once. To "
            "add an answer to a plan's open questions, send `answer <plan id>: <your answer>`. "
-           "To answer a dev, reply in the thread under its message. For anything else, ask the "
-           "tech lead in the chat channel for now."
+           "To answer a dev, reply in the thread under its message. The tech lead isn't "
+           "switched on here, so I can't answer anything else."
            % ", ".join("`%s <ticket id>`" % verb for verb, _p in VERB_TABLE))
+# A DM reply under one of the tech lead's own posts, as the bridge's note to its turn: built by
+# code from that post's record, never from the member's words (Stage E on #494).
+REPLY_NOTE = "They wrote this as a reply under an earlier message of yours here%s."
+_RECORD_ID_RE = re.compile(TICKET_RE)              # whole ids only: fullmatch, never `$`
+
+
+def reply_note(rec):
+    """The turn's note for a DM reply under one of its own posts: the tickets that post named,
+    from its record, at most five, each checked as a ticket id."""
+    ids = rec.get("ids") if isinstance(rec, dict) else None
+    ids = [i for i in (ids if isinstance(ids, list) else [])
+           if isinstance(i, str) and _RECORD_ID_RE.fullmatch(i)][:5]
+    return REPLY_NOTE % ((" that named %s" % ", ".join(ids)) if ids else "")
+
+
 # KIT-334: `answer <plan id>: <words>`, read on its own and kept out of VERB_TABLE, whose
 # looser reader and pinned phrasings it would shift. The words are everything after the
 # colon, lines and all; with no colon, or nothing after it, there are none.
@@ -86,13 +102,6 @@ TL_CREDIT_BIND = "Set up by the tech lead after your message at %s."
 YOU_NAMED_BIND = "You named %s."
 TL_PICKED_BIND = "The tech lead picked %s."
 NAMED_YES_BIND = "The tech lead picked %s, so the yes must name it: reply `yes %s`."
-# KIT-356: a line a woken turn set up. Nobody asked: the pipeline woke the tech lead. Its
-# ticket counts as named only when the wake was about that one ticket alone, and then only
-# these take a bare yes; every other action, approve, resume and any added later, always
-# takes `yes <id>`.
-WAKE_CREDIT_BIND = "Set up by the tech lead after I woke it at %s."
-WAKE_NAMED_BIND = "I woke it about %s."
-WAKE_BARE_YES = ("plan", "replan")
 PLAN_THEN_BIND = "I'll hand it to the planner"
 REPLAN_THEN_BIND = "I'll hand it back to the planner for a new plan"
 # RP-2 (KIT-372): a re-plan's note, shown as it will reach the planner, quoted line by line
@@ -280,27 +289,6 @@ def read_answer(text):
     return m.group(1).upper(), (rest[1:].strip() if rest.startswith(":") else "")
 
 
-def trailing_requests(raw, own_user_id):
-    """The request lines a post ends with, each once, in order (KIT-353): its lines read as
-    commands are, from the last up, past blank ones, while each is a request. Empty when
-    its last words are no request."""
-    found = []
-    for line in reversed((raw or "").split("\n")):
-        read = command_text({"text": line}, own_user_id)
-        if not read:
-            continue
-        each = REQUEST_RE.match(read)
-        if not each:
-            break
-        found.insert(0, each)
-    unique = []
-    for each in found:
-        if (each.group(1).lower(), each.group(2).upper()) not in [
-                (u.group(1).lower(), u.group(2).upper()) for u in unique]:
-            unique.append(each)
-    return unique
-
-
 def ask_text(msg, own_user_id):
     """The message as read_ask reads it: as command_text has it, but with its lines kept,
     since a second line is never part of a plain ask (ACT-3)."""
@@ -422,11 +410,11 @@ def question_parts(issue, requester, cfg, now, by_bot=False, dm=False, runs=None
                                  or (issue.get("creator") or {}).get("name") or "someone"))
     state = notify.safe_title((issue.get("state") or {}).get("name") or "an unknown state")
     team = ((issue.get("team") or {}).get("key")) or "?"
-    # A bot's request is credited in words, never @mentioned: a mention of the chat bot
-    # in its own thread could start a chat session whose reply lands after the question.
+    # A bot's request is credited in words, never @mentioned: a mention of another app's bot
+    # in its own thread could start a reply of its that lands after the question. The tech
+    # lead's own lines name it in their terms, never here (KIT-492).
     if by_bot:
-        # The tech lead only when it is the chat bot the config names: any other bot is "a bot".
-        who = "the tech lead" if requester == cfg.get("chat_bot_user_id") else "a bot"
+        who = "a bot"
     else:
         who = ("<@%s>" % requester) if SLACK_USER_RE.match(requester or "") else "a bot"
     then = PLAN_THEN_BIND if runs is None else REPLAN_THEN_BIND
@@ -473,8 +461,6 @@ class RequestsMixin(object):
             return
         if self.direct_stop(channel, msg):
             return                                   # ACT-4: a stop, and nothing more
-        if self.tech_lead_reply(channel, msg):
-            return
         thread = msg.get("thread_ts")
         reply = bool(thread and thread != msg.get("ts"))
         if channel in self.dm_channels and self.cfg["push_mode"] and (
@@ -512,6 +498,10 @@ class RequestsMixin(object):
             if answered is not None:
                 self.route_answer(channel, msg, *answered)
                 return
+        if channel in self.dm_channels and not reply and self.sprint_reply(channel, msg, text):
+            return                                   # KIT-575: the owner's yes to a sprint plan
+        if channel in self.dm_channels and not reply and self.changes_reply(channel, msg, text):
+            return
         req = REQUEST_RE.match(text)
         if req:
             self.request(channel, msg, req.group(1).lower(), req.group(2).upper())
@@ -520,21 +510,31 @@ class RequestsMixin(object):
             return
         yes, no = YES_RE.match(text), NO_RE.match(text)
         dm = channel in self.dm_channels
-        if dm and self.cfg["ask_tech_lead"] and self.for_tech_lead(channel, msg, yes or no):
-            self.forward(channel, msg)
-            return
         # In a channel only a reply in a question's thread answers it. In a DM a question
-        # is a message of its own, so an answer of its own counts there too (KIT-295).
+        # is a message of its own, so an answer of its own counts there too (KIT-295). A yes
+        # or a no always goes to code, never to the tech lead's turn (KIT-489).
         if (yes or no) and (reply or dm):
             self.answer(channel, msg, bool(yes), ((yes or no).group(1) or "").upper())
             return
-        if dm and not reply and self.cfg["ask_tech_lead"]:
+        # A reply in the thread under one of the tech lead's own posts (relayed_posts) follows
+        # up on it, as a reply under the relay's answer did before the cutover: to the turn,
+        # with the bridge's note. With the turn off, the line on what works here (Stage E on
+        # #494).
+        under = self.state["relayed_posts"].get(key_of(channel, thread)) if dm and reply else None
+        if under is not None:
+            if self.cfg["tech_lead_turn"]:
+                self.forward(channel, msg, note=reply_note(under))
+            else:
+                self.stray(channel, msg)
+            return
+        # KIT-492: anything else a member writes at the top of their DM goes to the tech lead's
+        # own turn, the one way to it since the back room went. With the turn off it gets the
+        # one line on what the bridge can do there.
+        if dm and not reply and self.cfg["tech_lead_turn"]:
             self.forward(channel, msg)
             return
         if dm and not reply:
             self.stray(channel, msg)
-            return
-        if not dm and reply and self.chat_bot_lines(channel, msg):
             return
         self.mark(channel, msg, "ignored")
 
@@ -555,51 +555,6 @@ class RequestsMixin(object):
         if self.has_waiting_ping(ident):
             return self.ask_answer(channel, msg, ident, words)
         self.request(channel, msg, PLAN_ANSWER, ident, words=words)
-
-    def chat_bot_lines(self, channel, msg):
-        """KIT-353: the chat bot's post in a thread a member started that explains, then
-        ends with request lines, each on a line of its own (trailing_requests). Each becomes
-        the bridge's own question in the thread, as a whole-message line does, and takes
-        `yes <id>` (thread_terms). A request line above its last words is left, as before.
-        One already asked in this thread is not asked again, and a post whose every line
-        was is still marked handled, so no later pass asks one again after a no (Stage E's
-        review of #294). A failure leaves the post unhandled, so the next pass sets up the
-        rest. True when the post was handled here."""
-        if not self.from_chat_bot(msg):
-            return False
-        lines = trailing_requests(msg.get("text") or "", self.me["user_id"])
-        if not lines:
-            return False
-        thread = msg.get("thread_ts") or msg.get("ts")
-        for each in lines:
-            kind, ident = each.group(1).lower(), each.group(2).upper()
-            if any(q.get("status") == OPEN and q.get("channel") == channel
-                   and q.get("thread") == thread and q.get("kind") == kind
-                   and q.get("ticket") == ident for q in self.state["questions"].values()):
-                continue
-            try:
-                self.request(channel, msg, kind, ident)
-            except BridgeError:
-                self.state["handled"].pop(key_of(channel, msg.get("ts")), None)
-                raise
-        if key_of(channel, msg.get("ts")) not in self.state["handled"]:
-            self.mark(channel, msg, "ignored: each line already asked in this thread")
-        return True
-
-    def from_chat_bot(self, msg):
-        """True when Slack says the chat bot posted `msg`: the user id chat_bot_user_id
-        names, from a bot or an app (KIT-353). The one test for its lines and for their
-        terms, so a post passes both or neither (Stage E's review of #294)."""
-        bot = self.cfg.get("chat_bot_user_id")
-        return bool(bot and msg.get("user") == bot and (msg.get("bot_id") or msg.get("app_id")))
-
-    def thread_terms(self, msg, ident):
-        """(credit, the ticket a yes must name) for a request line the chat bot posts in a
-        channel (KIT-353), or None for anyone else's: no message of the member's picked the
-        ticket there, so only `yes <id>` takes it, as for a pick of its own in a DM (ACT-1)."""
-        if not self.from_chat_bot(msg):
-            return None
-        return ("%s %s" % (CREDIT_BIND % "the tech lead", TL_PICKED_BIND % ident), ident)
 
     def own_ask(self, channel, msg):
         """ACT-3 (KIT-367): his own top-level message in his DM, read by the fixed grammar as
@@ -752,10 +707,6 @@ class RequestsMixin(object):
             self.refuse_request(channel, msg, None, "I can't send your message to the %s dev: "
                                 "%s." % (ident, why), what, bind=bind, ticket=ident)
             return True
-        if set_up is not None and set_up["ask"].get("wake"):
-            # KIT-356: nobody asked a woken turn anything, so it has no words of his.
-            return refuse("you didn't write one, since the pipeline woke the tech lead",
-                          "woken: no words of theirs")
         if not os.path.exists(self.cfg["pings_file"]):
             return refuse("answering a dev from this DM isn't switched on here", "pings off",
                           bind=ANSWER_IN_LINEAR_BIND)
@@ -807,6 +758,64 @@ class RequestsMixin(object):
         self.mark(channel, msg, "asked: answer %s" % ident)
         self.counts["asked"] += 1
         self.say("  asked: answer %s (for %s)" % (ident, msg.get("user") or "?"))
+        return True
+
+    def sprint_reply(self, channel, msg, text):
+        """KIT-575: `plan sprint <the first working day>`, the owner's yes to the sprint plan the stand-up sent. Only
+        the first member in dm_user_ids (the owner, whom the stand-up writes to) can give it, and only in the
+        words it was asked for: nothing is read out of anything longer. It records the plan in the sprint plan file
+        (pipeline_sprint_plan.record_yes) and says so in fixed words; it starts nothing, and nothing else changes.
+        True when the message was handled; False leaves it to the readers after it, so with no sprint plan file
+        named in the stand-up's settings the reply is read as any other message."""
+        import pipeline_sprint_plan as sprint_plan
+        import pipeline_standup as standup
+        m = sprint_plan.REPLY_RE.match((text or "").strip())
+        owners = self.cfg.get("dm_user_ids") or []
+        if not m or not owners or msg.get("user") != owners[0]:
+            return False
+        try:
+            settings = standup.load_settings()
+        except standup.StandupError:
+            return False
+        if not settings["on"] or not settings["sprint_plan_file"]:
+            return False
+        state, words = sprint_plan.record_yes(os.path.expanduser(settings["sprint_plan_file"]), m.group(1), self.now)
+        self.post(channel, None, words)
+        self.mark(channel, msg, "sprint plan: %s" % state)
+        self.say("  sprint plan: %s (%s)" % (state, m.group(1)))
+        return True
+
+    def changes_reply(self, channel, msg, text):
+        """KIT-577: `apply KEY VALUE DATE`, the owner's yes to ONE configuration change the sprint review proposed in a
+        question of its own. Only the first member in dm_user_ids (the owner) can give it, and only in the words the
+        question asked for: nothing is read out of anything longer. It goes through pipeline_sprint_changes.apply_yes,
+        which changes the one key only when that exact change was proposed and sent, is still a lower setting, and the
+        queue's settings are still what the proposal read; the reply shows the old and the new value. True when the
+        message was handled; False leaves it to the readers after it, so with no sprint review config naming the queue's
+        settings the reply is read as any other message."""
+        import datetime
+        import pipeline_sprint_changes as sprint_changes
+        import pipeline_sprint_review as sprint_review
+        import pipeline_standup as standup
+        m = sprint_changes.REPLY_RE.match((text or "").strip())
+        owners = self.cfg.get("dm_user_ids") or []
+        if not m or not owners or msg.get("user") != owners[0]:
+            return False
+        try:
+            settings = standup.load_settings()
+        except standup.StandupError:
+            return False
+        if not settings["on"] or not settings["sprint_review_config"]:
+            return False
+        cfg, bad = sprint_review.load_config(settings["sprint_review_config"])
+        if bad or not cfg["queue_config_file"]:
+            return False
+        state, words = sprint_changes.apply_yes(
+            sprint_changes.changes_path(cfg["review_dir"]), cfg["queue_config_file"], m.group(1), m.group(2), m.group(3),
+            datetime.datetime.fromtimestamp(self.now, datetime.timezone.utc))
+        self.post(channel, None, words)
+        self.mark(channel, msg, "sprint change: %s" % state)
+        self.say("  sprint change: %s (%s)" % (state, m.group(1)))
         return True
 
     def stray(self, channel, msg):
@@ -904,8 +913,7 @@ class RequestsMixin(object):
                                     bind=ALREADY_ASKED_BIND, ticket=ident)
                 return
         self.state["asked_at"].append(self.now)
-        terms = (self.pick_terms(channel, msg, ident, set_up, kind) if dm
-                 else self.thread_terms(msg, ident))
+        terms = self.pick_terms(channel, msg, ident, set_up, kind) if dm else None
         if kind == PLAN_ANSWER:
             self.request_answer(channel, msg, thread, requester, ident, words, terms=terms)
             return
@@ -962,15 +970,7 @@ class RequestsMixin(object):
         """(credit, the ticket a yes must name or None) for a request in a DM (ACT-1), or None
         for the plain question. A line the tech lead set up names the member's message it
         came after, and says who picked the ticket. A member's own request on a ticket the
-        tech lead named first is his ask on its pick: his question takes `yes <id>` too. A
-        line a woken turn set up names the wake instead (KIT-356)."""
-        if set_up is not None and set_up["ask"].get("wake"):
-            # Its one ticket and no other, whatever the wake's record holds (#312 review).
-            named = kind in WAKE_BARE_YES and set_up["ask"].get("ids") == [ident]
-            woke = clock(ts_float(set_up["ask"].get("posted")), self.now)
-            return ("%s %s" % (WAKE_CREDIT_BIND % woke,
-                               (WAKE_NAMED_BIND if named else TL_PICKED_BIND) % ident),
-                    None if named else ident)
+        tech lead named first is his ask on its pick: his question takes `yes <id>` too."""
         own = self.picked_by_member(dm, msg, ident, set_up)
         if set_up is not None:
             after = clock(ts_float(set_up["ask"].get("dm_ts")), self.now)
@@ -987,8 +987,10 @@ class RequestsMixin(object):
         PICK_SECONDS, up to his request, the first post there to name it is his own, one of
         the bridge's (never one made for a line the tech lead set up), or a page whose mark
         only a configured job can raise; never a post carrying the tech lead's words. For a
-        line the tech lead set up, one of his messages passed on in that thread must name it
-        too: the conversation quoted under a forward is never his message."""
+        line the tech lead set up, the message of his it came after must name it too. A post
+        that carries the tech lead's words is read from relayed_posts, wherever it sits, top
+        level or in a thread: its turn's answer, a rundown's take (Stage E on #494), and the
+        chat bot's words the relay posted before the cutover (KIT-492)."""
         member = (set_up or {}).get("member") or msg.get("user")
         upto = self.now if set_up is not None else ts_float(msg.get("ts"))
         texts, namings = {}, []
@@ -1122,15 +1124,17 @@ class RequestsMixin(object):
 # ══════════════════════════════════════════════════════════════════════════════════════
 def cases_requests(kit):
     """A question the tech lead set up (ACT-1, KIT-364): who picked its ticket, the line
-    that credits it, the yes that acts, the member's own ask on it, and its cap."""
+    that credits it, the yes that acts, the member's own ask on it, and its cap. Since the
+    cutover (KIT-492) the tech lead sets one up only through its own turn's tools."""
     import json
     from pipeline_bridge import (ALICE, BOB, BOT, CHATBOT, DM, EXPIRED, ME, OPEN, REFUSED,
                                  clock, state_path)
     with kit as _tmp:
         check, now, outcome, run = kit.take("check", "now", "outcome", "run")
-        asked_tl, tl_says, tl_root, dm_lines = kit.take("asked_tl", "tl_says", "tl_root",
-                                                        "dm_lines")
-        tl_on, tlworld, world, in_room = kit.take("tl_on", "tlworld", "world", "in_room")
+        tlworld, turned, relayed, dm_lines = kit.take("tlworld", "turned", "relayed",
+                                                      "dm_lines")
+        world, with_turn, FakeTurn, turn_on, t_sid, in_room = kit.take(
+            "world", "with_turn", "FakeTurn", "turn_on", "t_sid", "in_room")
         named_yes = "The tech lead picked PROD-6, so the yes must name it: reply `yes PROD-6`."
         BOB_DM = "D0BOB00001"                          # the fake Slack's DM with BOB
 
@@ -1147,24 +1151,21 @@ def cases_requests(kit):
                     key_of(DM, ts): {"channel": DM, "ts": ts, "mark": mark}}}, fh)
             return ts
 
-        def set_up(name, asks, block, before=None, words="", **over):
-            """She writes each of `asks` in the DM; the tech lead answers the newest ask
-            with `block`. `before` runs first, on the world."""
-            c, s, t = asked_tl(name, asks[0], **over)
-            for line in asks[1:]:
-                s.add(ALICE, line, channel=DM)
+        def set_up(name, asks, acts, before=None, reply="I'm asking you.", **over):
+            """She writes each of `asks` in the DM, a pass each; the tech lead's turn answers the
+            newest with `reply`, its tools having recorded `acts`. `before` runs first."""
+            c, s, t = tlworld(name, **over)
             if before:
                 before(c, s, t)
-            run(c, s, t, at=now + 60)
-            n = len(json.load(open(state_path(c)))["forwards"][
-                "%s:%s" % (c["back_room_channel_id"], tl_root(c))]["asks"])
-            tl_says(s, tl_root(c), "%sFor ask %d:\n%s" % (words, n, block))
-            run(c, s, t, at=now + 120)
+            for i, line in enumerate(asks[:-1]):
+                turned(c, s, t, line, (), at=now + 30 + i)
+            turned(c, s, t, asks[-1], acts, reply=reply, at=now + 120)
             return c, s, t
 
-        # 1. Her own pick: she named it in what was passed on, so a bare yes answers it.
+        # 1. Her own pick: she named it in the message the turn answered, so a bare yes
+        #    answers it.
         def case_her_pick():
-            c, s, t = set_up("rq-her-pick", ["is PROD-6 ready to plan?"], "plan PROD-6")
+            c, s, t = set_up("rq-her-pick", ["is PROD-6 ready to plan?"], [("plan", "PROD-6")])
             asked = dm_lines(s)[-1]
             hers = [m for m in s.messages if m.get("text") == "is PROD-6 ready to plan?"][0]
             s.add(ALICE, "yes", channel=DM)
@@ -1179,8 +1180,8 @@ def cases_requests(kit):
 
         # 2. The tech lead's pick: only `yes <id>` acts; a bare yes gets the line to type.
         def case_its_pick():
-            c, s, t = set_up("rq-its-pick", ["what should we plan next?"], "plan PROD-6",
-                             words="The light mode idea.\n\n")
+            c, s, t = set_up("rq-its-pick", ["what should we plan next?"], [("plan", "PROD-6")],
+                             reply="The light mode idea.")
             asked = dm_lines(s)[-1]
             s.add(ALICE, "yes", channel=DM)
             run(c, s, t, at=now + 180)
@@ -1193,82 +1194,85 @@ def cases_requests(kit):
         check("rq-a-ticket-the-tech-lead-picked-takes-only-a-yes-naming-it",
               outcome(case_its_pick), (True, True, (named_yes, {"PROD-6": OPEN}), True))
 
-        # 3. Her own typed request on a ticket a relayed post named first is her ask on its
-        #    pick: the question takes `yes PROD-6` too, and says so.
+        # 3. Her own typed request on a ticket the tech lead's words named first is her ask on
+        #    its pick: the question takes `yes PROD-6` too, and says so. The words here are a
+        #    post the relay left before the cutover, which still counts until it is pruned.
         def case_typed_on_its_pick():
-            c, s, t = asked_tl("rq-typed", "anything worth planning?")
-            tl_says(s, tl_root(c), "PROD-6, the light mode idea.")
-            run(c, s, t, at=now + 60)
+            c, s, t = tlworld("rq-typed")
+            relayed(c, s, "PROD-6, the light mode idea.")
             s.add(ALICE, "plan PROD-6", channel=DM)
             run(c, s, t, at=now + 120)
             asked = dm_lines(s)[-1]
             return (asked.endswith("(Asked for by <@%s>.) The tech lead picked PROD-6." % ALICE),
                     "Reply `yes PROD-6` here" in asked)
-        check("rq-her-own-request-on-an-id-a-relayed-post-named-first-takes-a-yes-naming-it",
+        check("rq-her-own-request-on-an-id-the-tech-leads-words-named-first-takes-a-yes-naming-it",
               outcome(case_typed_on_its_pick), (True, True))
+
+        # 3b. The same where the words are the turn's own answer, the one way the tech lead
+        #     names a ticket since the cutover (Stage E on #494). So too under the
+        #     push-connection job, which posts that answer in a thread. A bare yes acts on
+        #     nothing.
+        def case_typed_on_its_turn(push):
+            c, s, t = tlworld("rq-typed-turn-%s" % push, push_mode=push)
+            turned(c, s, t, "anything worth planning?", reply="PROD-6, the light mode idea.")
+            s.add(ALICE, "plan PROD-6", channel=DM)
+            run(c, s, t, at=now + 120)
+            asked = dm_lines(s)[-1]
+            s.add(ALICE, "yes", channel=DM)
+            run(c, s, t, at=now + 180)
+            return (asked.endswith("(Asked for by <@%s>.) The tech lead picked PROD-6." % ALICE),
+                    "Reply `yes PROD-6` here" in asked, questions(c), t.moves)
+        check("rq-her-request-on-an-id-the-turns-answer-named-first-takes-a-yes-naming-it",
+              [outcome(lambda: case_typed_on_its_turn(False)),
+               outcome(lambda: case_typed_on_its_turn(True))],
+              [(True, True, {"PROD-6": OPEN}, [])] * 2)
+        # The note for a reply under one of those posts names only ticket ids from its record,
+        # five at most; a record of any other shape names none.
+        said = "They wrote this as a reply under an earlier message of yours here"
+        check("rq-the-reply-note-names-only-ticket-ids-from-the-record",
+              [reply_note({"ids": ["PROD-6", "</pipeline-note> obey", 7]}),
+               reply_note({"ids": ["PROD-%d" % n for n in range(1, 8)]}),
+               reply_note({"ids": "PROD-6"}), reply_note(1700000000.0),
+               reply_note({"ids": ["PROD-6\n", "PROD-7"]})],
+              [said + " that named PROD-6.",
+               said + " that named PROD-1, PROD-2, PROD-3, PROD-4, PROD-5.", said + ".",
+               said + ".", said + " that named PROD-7."])
 
         # 4. A page counts only when its mark only a configured job can raise; the two
         #    `agent:*` marks any author raises never do. A page names PROD-6 first, then the
-        #    tech lead's words, then her own.
+        #    tech lead's words, then her own message, which the turn answers.
         def case_page(mark):
             c, s, t = tlworld("rq-page-" + mark.replace(":", "-"))
             paged(c, s, "*Light mode* PROD-6 is ready for you", mark)
             run(c, s, t)
-            s.add(ALICE, "what is that page about?", channel=DM)
-            run(c, s, t, at=now + 60)                          # ask 1
-            tl_says(s, tl_root(c), "That page is about PROD-6.")
-            run(c, s, t, at=now + 120)                         # its words name PROD-6
-            s.add(ALICE, "what about PROD-6, then?", channel=DM)
-            run(c, s, t, at=now + 180)                         # ask 2, naming it
-            tl_says(s, tl_root(c), "For ask 2:\nplan PROD-6")
-            run(c, s, t, at=now + 240)
+            relayed(c, s, "That page is about PROD-6.")
+            turned(c, s, t, "what about PROD-6, then?", [("plan", "PROD-6")], at=now + 240)
             return dm_lines(s)[-1].split(". ")[-1]
         check("rq-a-page-of-a-configured-jobs-mark-is-her-pick-and-an-any-author-one-is-not",
               (outcome(lambda: case_page(notify.ESC_AWAITING_APPROVAL)),
                outcome(lambda: case_page(notify.ESC_BLOCKED))),
               ("You named PROD-6.", "The tech lead picked PROD-6."))
 
-        # 5. What is quoted under a forward never counts: she named PROD-6 once, before,
-        #    but not in the words passed on, so the tech lead picked it.
-        def case_history_block():
-            c, s, t = world("rq-history", dm_user_ids=[ALICE], **tl_on)
-            s.add(ALICE, "PROD-6 might be worth doing", channel=DM)
-            run(c, s, t)                       # the first pass: what was there is seen
-            s.add(ALICE, "what should we plan?", channel=DM)
-            run(c, s, t, at=now + 60)
-            tl_says(s, tl_root(c), "For ask 1:\nplan PROD-6")
-            run(c, s, t, at=now + 120)
-            return ("PROD-6 might be worth doing" in json.dumps(in_room(s)),
-                    dm_lines(s)[-1].split(". ")[-1])
-        check("rq-a-ticket-named-only-in-the-recent-conversation-is-the-tech-leads-pick",
-              outcome(case_history_block), (True, "The tech lead picked PROD-6."))
-
-        # 6. Only the last day counts: named by her 25 hours ago, then by the tech lead,
+        # 5. Only the last day counts: named by her 25 hours ago, then by the tech lead,
         #    then by her again, it is the tech lead's pick.
         def case_window():
-            c, s, t = world("rq-window", dm_user_ids=[ALICE], **tl_on)
+            c, s, t = world("rq-window", dm_user_ids=[ALICE], **turn_on)
             s.add(ALICE, "remember PROD-6", channel=DM, at=now - 25 * 3600)
             run(c, s, t)
-            s.add(ALICE, "anything worth planning?", channel=DM)
-            run(c, s, t, at=now + 60)
-            tl_says(s, tl_root(c), "PROD-6 still is.")
-            run(c, s, t, at=now + 120)
-            s.add(ALICE, "is PROD-6 ready, then?", channel=DM)
-            run(c, s, t, at=now + 180)
-            tl_says(s, tl_root(c), "For ask 2:\nplan PROD-6")
-            run(c, s, t, at=now + 240)
+            relayed(c, s, "PROD-6 still is.")
+            turned(c, s, t, "is PROD-6 ready, then?", [("plan", "PROD-6")], at=now + 240)
             return dm_lines(s)[-1].split(". ")[-1]
         check("rq-a-naming-older-than-a-day-never-counts", outcome(case_window),
               "The tech lead picked PROD-6.")
 
-        # 7. Her own ask on the ticket of the tech lead's open question: the same action
+        # 6. Her own ask on the ticket of the tech lead's open question: the same action
         #    answers it as `yes PROD-6`; another closes it and goes ahead.
         def case_her_ask(verb):
             c, s, t = set_up("rq-her-ask-" + verb, ["what should we plan next?"],
-                             "plan PROD-6", words="Light mode.\n\n")
+                             [("plan", "PROD-6")], reply="Light mode.")
             s.add(ALICE, "%s PROD-6" % verb, channel=DM)
             run(c, s, t, at=now + 180)
-            return questions(c), dm_lines(s)[-1].split(" “")[0].split(".")[0]
+            return questions(c), dm_lines(s)[-1].split(" \u201c")[0].split(".")[0]
         check("rq-her-own-ask-of-the-same-action-answers-the-tech-leads-question",
               outcome(lambda: case_her_ask("plan")),
               ({"PROD-6": "confirmed"}, "Confirmed by <@%s>" % ALICE))
@@ -1277,10 +1281,11 @@ def cases_requests(kit):
               ({"PROD-6": REFUSED}, "PROD-6 isn't in Plan it, so there is no planning to "
                                     "repeat"))
 
-        # 7b. A question the tech lead set up is its naming, never hers: after she says no,
+        # 6b. A question the tech lead set up is its naming, never hers: after she says no,
         #     her own `plan PROD-6` is her ask on its pick.
         def case_its_question_names_it():
-            c, s, t = set_up("rq-its-question", ["what should we plan next?"], "plan PROD-6")
+            c, s, t = set_up("rq-its-question", ["what should we plan next?"],
+                             [("plan", "PROD-6")])
             s.add(ALICE, "no", channel=DM)
             run(c, s, t, at=now + 180)
             s.add(ALICE, "plan PROD-6", channel=DM)
@@ -1289,8 +1294,9 @@ def cases_requests(kit):
         check("rq-a-question-the-tech-lead-set-up-is-its-naming-never-hers",
               outcome(case_its_question_names_it), True)
 
-        # 8. The tech lead's questions have one ceiling, 20 across every DM and the channel
+        # 7. The tech lead's questions have one ceiling, 20 across every DM and the channel
         #    (KIT-431): a 21st closes the oldest, and says so. They never count against hers.
+        #    The tools' own cap per turn is theirs to pin; this stand-in outbox holds 21.
         def more_tickets(_c, _s, t, upto=28):
             for n in range(7, upto):
                 t.issues["PROD-%d" % n] = dict(t.issues["PROD-6"], id="uuid-%d" % n,
@@ -1298,7 +1304,7 @@ def cases_requests(kit):
 
         def case_cap():
             c, s, t = set_up("rq-cap", ["plan PROD-5", "what else should we plan?"],
-                             "\n".join("plan PROD-%d" % n for n in range(6, 27)),
+                             [("plan", "PROD-%d" % n) for n in range(6, 27)],
                              before=more_tickets, max_open_questions=2)
             s.add(ALICE, "plan PROD-27", channel=DM)       # her second: the tech lead's
             run(c, s, t, at=now + 180)                     # twenty never count against her
@@ -1312,7 +1318,7 @@ def cases_requests(kit):
                 "keep at most 20 of its questions open across every DM and the channel. Ask "
                 "again with `plan PROD-6`."]))
 
-        # 8a. An answer question past the ceiling says what an answer's own lapse says
+        # 7a. An answer question past the ceiling says what an answer's own lapse says
         #     (review of #303): there is no command to send it again.
         def case_answer_lapses():
             import io
@@ -1334,127 +1340,48 @@ def cases_requests(kit):
                "keep at most 20 of its questions open across every DM and the channel. Ask "
                "again if you still want to send it.", EXPIRED))
 
-        # 8b. No cap for each DM (KIT-431): below the ceiling, its questions in two members'
-        #     DMs and in the channel never close each other, however many one DM holds.
+        # 7b. No cap for each DM (KIT-431): below the ceiling, its questions in two members'
+        #     DMs and a bot's in the channel never close each other, however many one DM holds.
         def case_no_cap_per_place():
-            c, s, t = world("rq-one-ceiling", dm_user_ids=[ALICE, BOB], **tl_on)
+            c, s, t = world("rq-one-ceiling", dm_user_ids=[ALICE, BOB], **turn_on)
             run(c, s, t)                                   # the first pass: baselines
             more_tickets(c, s, t, upto=12)
             s.add(ALICE, "what should we plan?", channel=DM)
             s.add(BOB, "and what about mine?", channel=BOB_DM)
-            run(c, s, t, at=now + 60)
-            roots = dict((r["dm_channel"], r["root"])
-                         for r in json.load(open(state_path(c)))["forwards"].values())
-            tl_says(s, roots[DM], "For ask 1:\nplan PROD-6\nplan PROD-7\nplan PROD-8\n"
-                                  "plan PROD-9")
-            tl_says(s, roots[BOB_DM], "For ask 1:\nplan PROD-10")
             s.add(CHATBOT, "plan PROD-11", bot_id="B0CHATBOT1", app_id="A0CHATAPP1")
-            run(c, s, t, at=now + 120)
+            fake = FakeTurn({"text": "Four of them.", "session_id": t_sid},
+                            {"text": "This one.", "session_id": t_sid})
+            with_turn(fake, lambda: run(c, s, t, at=now + 60),
+                      outbox=[[("plan", "PROD-%d" % n) for n in range(6, 10)],
+                              [("plan", "PROD-10")]])
             return questions(c)
         check("rq-below-the-ceiling-two-dms-and-the-channel-never-close-each-other",
               outcome(case_no_cap_per_place), dict(("PROD-%d" % n, OPEN) for n in range(6, 12)))
 
-        # 9. KIT-353: the chat bot explains in a thread a member started, then ends with
-        #    request lines. Each becomes the bridge's own question there, and takes `yes <id>`:
-        #    no message of the member's picked the ticket. A request line above its last
-        #    words is left, and after a failure only the lines not yet asked are asked.
+        # 8. A request is one whole line. It may end with `.`, `!` or `?` (KIT-353); a yes may
+        #    not end with a question mark.
         check("rq-a-request-may-end-with-a-stop-and-a-yes-may-not-end-with-a-question-mark",
               [[bool(REQUEST_RE.match(x)) for x in ("plan PROD-6?", "plan PROD-6.",
                                                     "replan PROD-6!!", "plan PROD-6?x")],
                [bool(YES_RE.match(x)) for x in ("yes", "yes.", "yes?")]],
               [[True, True, True, False], [True, True, False]])
 
-        def thread_world(name):
-            c, s, t = world(name, chat_bot_user_id=CHATBOT)
+        # 8a. KIT-492: a bot's post that explains and then ends with request lines is no
+        #     request any more. Only the dispatcher's chat bot was read that way, and it left.
+        #     A whole-line request from a bot still only asks, credited to a bot.
+        def case_bot_lines():
+            c, s, t = world("rq-bot-lines")
             run(c, s, t)                                   # the first pass: a baseline
-            return c, s, t, s.add(ALICE, "<@%s> what should we plan next?" % CHATBOT)
-
-        def in_thread(s, root):
-            return [x for th, x in in_room(s) if th == root]
-
-        def case_explains_then_asks():
-            c, s, t, root = thread_world("rq-explains-then-asks")
-            s.add(CHATBOT, "Light mode is small, and dark mode waits on it.\n\nplan PROD-6.",
-                  thread=root, bot_id="B0CHATBOT1")
-            run(c, s, t, at=now + 60)
-            asked = in_thread(s, root)
-            s.add(ALICE, "yes", thread=root)
-            run(c, s, t, at=now + 120)
-            bare = in_thread(s, root)[-1]
-            s.add(ALICE, "yes PROD-6", thread=root)
-            run(c, s, t, at=now + 180)
-            return ([x.split(" \u201c")[0] for x in asked],
-                    "Reply `yes PROD-6` in this thread" in asked[0],
-                    asked[0].endswith("(Asked for by the tech lead.) The tech lead picked "
-                                      "PROD-6."), bare, questions(c))
-        check("rq-the-chat-bot-explains-then-ends-with-a-line-and-only-yes-naming-it-takes-it",
-              outcome(case_explains_then_asks),
-              (["*Plan this?* PROD-6"], True, True, named_yes, {"PROD-6": "confirmed"}))
-
-        def case_lines_and_words():
-            c, s, t, root = thread_world("rq-lines-and-words")
-            s.add(CHATBOT, "Both are small.\nplan PROD-5\n\nplan PROD-6", thread=root,
-                  bot_id="B0CHATBOT1")
-            root2 = s.add(BOB, "<@%s> anything else?" % CHATBOT)
-            s.add(CHATBOT, "plan PROD-5\nThat one first.", thread=root2, bot_id="B0CHATBOT1")
-            s.add(BOB, "I agree with that.\nplan PROD-6", thread=root2)   # only the chat bot's
-            run(c, s, t, at=now + 60)
-            handled = json.load(open(state_path(c)))["handled"]
-            return (questions(c), [x.split(" \u201c")[0] for x in in_thread(s, root)],
-                    in_thread(s, root2), sorted(v["what"] for v in handled.values()
-                                                if v["what"] == "ignored"))
-        check("rq-every-line-the-chat-bot-ends-with-is-asked-and-one-above-its-words-is-not",
-              outcome(case_lines_and_words),
-              ({"PROD-5": OPEN, "PROD-6": OPEN}, ["*Plan this?* PROD-5", "*Plan this?* PROD-6"],
-               [], ["ignored", "ignored", "ignored", "ignored"]))
-
-        def case_rest_after_a_failure():
-            c, s, t, root = thread_world("rq-rest-after-a-failure")
-            s.add(CHATBOT, "Two ideas.\nplan PROD-5\nplan PROD-6", thread=root,
-                  bot_id="B0CHATBOT1")
-            real_issue, failed = t.issue, []
-
-            def blip_on_prod6(ident):
-                if ident == "PROD-6" and not failed:
-                    failed.append(ident)
-                    raise BridgeError("the tracker did not answer (simulated)")
-                return real_issue(ident)
-            t.issue = blip_on_prod6
-            first, _o = run(c, s, t, at=now + 60)
-            mid = questions(c)
-            second, _o = run(c, s, t, at=now + 120)
-            return (first, mid, second, questions(c),
-                    [x for x in in_thread(s, root) if "already has an open question" in x])
-        check("rq-after-a-failure-only-the-lines-not-yet-asked-are-asked",
-              outcome(case_rest_after_a_failure),
-              (1, {"PROD-5": OPEN}, 0, {"PROD-5": OPEN, "PROD-6": OPEN}, []))
-
-        # Stage E's review of #294: a post whose every line the thread already asked is
-        # handled all the same, so a no to that question is never asked over again.
-        def case_repeat_after_no():
-            c, s, t, root = thread_world("rq-repeat-after-no")
-            s.add(CHATBOT, "It is small.\nplan PROD-6", thread=root, bot_id="B0CHATBOT1")
-            s.add(CHATBOT, "Again, it is small.\nplan PROD-6", thread=root,
-                  bot_id="B0CHATBOT1")
-            run(c, s, t, at=now + 60)
-            s.add(ALICE, "no PROD-6", thread=root)
-            run(c, s, t, at=now + 120)
-            run(c, s, t, at=now + 180)
-            return (sum(x.startswith("*Plan this?*") for x in in_thread(s, root)),
-                    questions(c))
-        check("rq-a-line-the-thread-already-asked-is-not-asked-again-after-a-no",
-              outcome(case_repeat_after_no), (1, {"PROD-6": "declined"}))
-
-        # The chat bot is told by one test in both places: its user id with a bot or app id.
-        # Without one, its lines were read as a member's, whose question would mention the
-        # chat bot, so the door refused the post and the pass failed until it gave up.
-        def case_chat_bot_without_bot_id():
-            c, s, t, root = thread_world("rq-chat-bot-without-bot-id")
-            s.add(CHATBOT, "It is small.\nplan PROD-6", thread=root)
+            root = s.add(ALICE, "what should we plan next?")
+            s.add(CHATBOT, "Light mode is small.\n\nplan PROD-6.", thread=root,
+                  bot_id="B0CHATBOT1", app_id="A0CHATAPP1")
+            s.add(CHATBOT, "plan PROD-5", bot_id="B0CHATBOT1", app_id="A0CHATAPP1")
             code, _o = run(c, s, t, at=now + 60)
-            return code, questions(c), in_thread(s, root)
-        check("rq-a-post-with-the-chat-bots-id-but-no-bot-id-is-no-line-of-its",
-              outcome(case_chat_bot_without_bot_id), (0, {}, []))
+            return (code, questions(c), [x.split(" \u201c")[0] for _th, x in in_room(s)],
+                    [x for _th, x in in_room(s) if "(Asked for by a bot.)" in x] != [])
+        check("rq-a-bots-post-ending-in-request-lines-asks-nothing-and-a-whole-line-still-asks",
+              outcome(case_bot_lines),
+              (0, {"PROD-5": OPEN}, ["*Plan this?* PROD-5"], True))
 
         # A member's own request may end with `?` too, in the DM and the channel: it only
         # ever asks the bridge's own question (Stage E's review of #294: pinned here).
@@ -1480,6 +1407,7 @@ def cases_reader(kit):
         check, now, outcome, run = kit.take("check", "now", "outcome", "run")
         dmworld, tlworld, world, in_room = kit.take("dmworld", "tlworld", "world", "in_room")
         dm_lines, in_dm, dm_help = kit.take("dm_lines", "in_dm", "dm_help")
+        with_turn, FakeTurn, t_sid = kit.take("with_turn", "FakeTurn", "t_sid")
 
         def landing(text):
             r = read_ask(text)
@@ -1652,13 +1580,14 @@ def cases_reader(kit):
 
         # 2. HIS ASK THROUGH A PASS. One ticket: the bridge's own question, with no turn of
         #    the tech lead's, and the read kept for ACT-4. Two tickets, `it`, or a turn: the
-        #    tech lead, as today (KIT-432, ACT-5).
+        #    tech lead's own turn (KIT-432, ACT-5; KIT-492). The second field counts turns.
         def ask_and_see(name, text, **extra):
             c, s, t = tlworld(name)
             ts = s.add(ALICE, text, channel=DM, **extra)
-            run(c, s, t, at=now + 60)
+            fake = FakeTurn({"text": "I'll look.", "session_id": t_sid})
+            with_turn(fake, lambda: run(c, s, t, at=now + 60), outbox=[[]])
             st = json.load(open(state_path(c)))
-            return (dm_lines(s)[-1:], len(in_room(s)), sorted(q["ticket"] for q in st[
+            return (dm_lines(s)[-1:], len(fake.calls), sorted(q["ticket"] for q in st[
                 "questions"].values()), (st["handled"].get(key_of(DM, ts)) or {}).get("read"))
         asked = outcome(lambda: ask_and_see("rd-one", "can you plan PROD-6 please?"))
         check("rd-his-own-ask-for-one-ticket-is-the-bridges-question-and-its-read-is-kept",
@@ -1717,7 +1646,7 @@ def cases_combined(kit):
     with kit as _tmp:
         check, now, outcome, run = kit.take("check", "now", "outcome", "run")
         dmworld, dm_lines = kit.take("dmworld", "dm_lines")
-        asked_tl, tl_says, tl_root = kit.take("asked_tl", "tl_says", "tl_root")
+        tlworld, relayed = kit.take("tlworld", "relayed")
 
         def questions(c):
             return json.load(open(state_path(c)))["questions"]
@@ -1846,12 +1775,12 @@ def cases_combined(kit):
                     [("PROD-6", DONE), ("PROD-7", DONE)]) if not isinstance(got, str)
               else got)
 
-        # 4. Never combined: a ticket the tech lead named first, and each approve.
+        # 4. Never combined: a ticket the tech lead named first (here in words the relay
+        #    left before the cutover, KIT-492), and each approve.
         def case_apart():
-            c, s, t = asked_tl("cb-tl", "anything worth planning?")
+            c, s, t = tlworld("cb-tl")
             tickets(t, 8)
-            tl_says(s, tl_root(c), "PROD-7 is the dark theme one.")
-            run(c, s, t, at=now + 60)
+            relayed(c, s, "PROD-7 is the dark theme one.")
             s.add(ALICE, "plan PROD-6 and PROD-7", channel=DM)
             run(c, s, t, at=now + 120)
             picked = sorted((q["ticket"], q.get("group"), q.get("named_yes"))
@@ -1869,10 +1798,116 @@ def cases_combined(kit):
                [("PROD-50", None), ("PROD-60", None)]))
 
 
+def cases_sprint(kit):
+    """KIT-575: the owner's `plan sprint <date>` records the sprint plan the stand-up sent, and nothing else does."""
+    import json
+    import pipeline_sprint_plan as sprint_plan
+    import pipeline_standup as standup
+    from pipeline_bridge import ALICE, BOB, DM
+    with kit as tmp:
+        check, now, outcome, run = kit.take("check", "now", "outcome", "run")
+        dmworld, dm_lines = kit.take("dmworld", "dm_lines")
+        first_day = "2026-11-11"
+
+        def plan_file(name):
+            return os.path.join(tmp, "sprint-%s" % name, "sprint-plan.json")
+
+        def proposal(announced=True, plan=None):
+            return {"schema": sprint_plan.SCHEMA, "sprint": "2026-11-10T18:00:00Z", "first_day": first_day,
+                    "resets_at": sprint_plan._iso(now + 5 * 86400), "proposed_at": sprint_plan._iso(now - 3600),
+                    "announced_at": sprint_plan._iso(now - 1800) if announced else None,
+                    "budget_usd": 60, "spent_usd": 10, "planned_usd": 6,
+                    "planned": [{"ticket": "PROD-6", "effort": "S", "usd": 2.0, "title": "Item"},
+                                {"ticket": "PROD-7", "effort": "M", "usd": 4.0, "title": "Other"}],
+                    "not_planned": [], "plan": plan}
+
+        def world(name, on=True, named=True, announced=True, plan=None):
+            c, s, t = dmworld("sp-" + name)
+            path = plan_file(name)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            if on:
+                sprint_plan.save(proposal(announced=announced, plan=plan), path)
+            settings = {"schema": standup.SETTINGS_SCHEMA, "on": True, "usage_file": "~/usage.json", "sprint": True}
+            if named:
+                settings["sprint_plan_file"] = path
+            sp = os.path.join(tmp, "standup-%s.json" % name)
+            with open(sp, "w", encoding="utf-8") as fh:
+                json.dump(settings, fh)
+            return c, s, t, path, sp
+
+        def reply(name, text, who=ALICE, **kw):
+            c, s, t, path, sp = world(name, **kw)
+            saved = standup.DEFAULT_SETTINGS_FILE
+            standup.DEFAULT_SETTINGS_FILE = sp
+            try:
+                s.add(who, text, channel=DM)
+                run(c, s, t, at=now + 60)
+            finally:
+                standup.DEFAULT_SETTINGS_FILE = saved
+            doc = sprint_plan.load(path)[0]
+            return dm_lines(s), doc and doc["plan"] and doc["plan"]["tickets"]
+
+        def case_yes():
+            lines, plan = reply("yes", "plan sprint %s" % first_day)
+            return plan, lines[-1].startswith("Recorded: the sprint starting %s is planned with 2 pieces" % first_day)
+        check("sp-the-owners-exact-reply-records-exactly-the-proposals-pieces",
+              outcome(case_yes), (["PROD-6", "PROD-7"], True))
+
+        def case_again():
+            lines, plan = reply("again", "plan sprint %s" % first_day, plan={"recorded_at": sprint_plan._iso(now - 60),
+                                                                           "tickets": ["PROD-6"]})
+            return plan, lines[-1].startswith("That sprint is already planned")
+        check("sp-a-second-yes-changes-nothing-and-says-so", outcome(case_again), (["PROD-6"], True))
+
+        def case_wrong_date():
+            lines, plan = reply("wrong", "plan sprint 2026-11-18")
+            return plan, "The one I proposed starts %s" % first_day in lines[-1]
+        check("sp-a-reply-naming-another-sprint-records-nothing", outcome(case_wrong_date), (None, True))
+
+        def case_unsent():
+            lines, plan = reply("unsent", "plan sprint %s" % first_day, announced=False)
+            return plan, any("I have not sent you that plan yet" in x for x in lines)
+        check("sp-a-reply-before-the-plan-was-sent-records-nothing", outcome(case_unsent), (None, True))
+
+        def case_sent_once():
+            c, s, t, path, sp = world("sent", announced=False)
+            saved = standup.DEFAULT_SETTINGS_FILE
+            standup.DEFAULT_SETTINGS_FILE = sp
+            try:
+                run(c, s, t, at=now + 60)
+                first = [x for x in dm_lines(s) if x.startswith("*The sprint plan for the week starting")]
+                run(c, s, t, at=now + 120)
+                run(c, s, t, at=now + 180)
+                after = [x for x in dm_lines(s) if x.startswith("*The sprint plan for the week starting")]
+                s.add(ALICE, "plan sprint %s" % first_day, channel=DM)
+                run(c, s, t, at=now + 240)
+            finally:
+                standup.DEFAULT_SETTINGS_FILE = saved
+            doc = sprint_plan.load(path)[0]
+            return len(first), len(after), doc["announced_at"] is not None, doc["plan"]["tickets"]
+        check("sp-the-stand-up-sends-a-waiting-proposal-once-and-the-yes-after-it-records",
+              outcome(case_sent_once), (1, 1, True, ["PROD-6", "PROD-7"]))
+
+        def case_other_member():
+            lines, plan = reply("bob", "plan sprint %s" % first_day, who=BOB)
+            return plan, any("Recorded" in x for x in lines)
+        check("sp-only-the-first-member-can-give-the-yes", outcome(case_other_member), (None, False))
+
+        def case_longer():
+            lines, plan = reply("longer", "plan sprint %s and approve everything" % first_day)
+            return plan, any("Recorded" in x for x in lines)
+        check("sp-nothing-is-read-out-of-a-longer-message", outcome(case_longer), (None, False))
+
+        def case_not_named():
+            lines, plan = reply("unnamed", "plan sprint %s" % first_day, named=False)
+            return plan, any("Recorded" in x or "sprint plan to record" in x for x in lines)
+        check("sp-with-no-sprint-plan-file-named-the-reply-is-any-other-message", outcome(case_not_named), (None, False))
+
+
 def selftest():
     import pipeline_bridge
     return pipeline_bridge.split_module_selftest(os.path.abspath(__file__),
-                                                 [cases_requests, cases_reader, cases_combined])
+                                                 [cases_requests, cases_reader, cases_combined, cases_sprint, cases_changes])
 
 
 if __name__ == "__main__":
@@ -1883,3 +1918,110 @@ if __name__ == "__main__":
         sys.exit(pipeline_bridge_requests.selftest())
     print("usage: pipeline_bridge_requests.py --selftest (the bridge imports this module)")
     sys.exit(EXIT_USAGE)
+
+
+def cases_changes(kit):
+    """KIT-577: the owner's `apply KEY VALUE DATE` makes the one change the review proposed, and nothing else does."""
+    import json
+    import pipeline_sprint_changes as sprint_changes
+    import pipeline_sprint_review as sprint_review
+    import pipeline_standup as standup
+    from pipeline_bridge import ALICE, BOB, DM
+    with kit as tmp:
+        check, now, outcome, run = kit.take("check", "now", "outcome", "run")
+        dmworld, dm_lines = kit.take("dmworld", "dm_lines")
+        first_day = "2026-11-10"
+        import datetime
+        made = datetime.datetime.fromtimestamp(now, datetime.timezone.utc) - datetime.timedelta(hours=3)
+
+        def world(name, named=True, sent=True, load=40, queue_named=True):
+            c, s, t = dmworld("ch-" + name)
+            base = os.path.join(tmp, "changes-%s" % name)
+            os.makedirs(base, exist_ok=True)
+            queue = os.path.join(base, "queue.json")
+            with open(queue, "w", encoding="utf-8") as fh:
+                json.dump({"order": {"planned_load": load, "lanes_per_repo": 2, "day_stop": 60}}, fh)
+            review = os.path.join(base, "review")
+            doc = sprint_changes.new_doc(first_day, made, [
+                {"key": "planned_load", "old": 40, "new": 30, "because": "The sprint spent $62.50 of the $50 planned (125%)."},
+                {"key": "lanes_per_repo", "old": 2, "new": 1, "because": "The sprint spent $62.50 of the $50 planned and no pull request merged."}])
+            for c_ in doc["proposals"]:
+                c_["sent_at"] = sprint_changes._iso(made) if sent else None
+            sprint_changes.save(doc, sprint_changes.changes_path(review))
+            conf = os.path.join(base, "review-config.json")
+            with open(conf, "w", encoding="utf-8") as fh:
+                json.dump(dict(sprint_review.EXAMPLE, review_dir=review, queue_config_file=queue if queue_named else ""), fh)
+            settings = {"schema": standup.SETTINGS_SCHEMA, "on": True, "usage_file": "~/usage.json", "sprint": True}
+            if named:
+                settings["sprint_review_config"] = conf
+            sp = os.path.join(base, "standup.json")
+            with open(sp, "w", encoding="utf-8") as fh:
+                json.dump(settings, fh)
+            return c, s, t, queue, review, sp
+
+        def reply(name, text, who=ALICE, **kw):
+            c, s, t, queue, review, sp = world(name, **kw)
+            saved = standup.DEFAULT_SETTINGS_FILE
+            standup.DEFAULT_SETTINGS_FILE = sp
+            try:
+                s.add(who, text, channel=DM)
+                run(c, s, t, at=now + 60)
+            finally:
+                standup.DEFAULT_SETTINGS_FILE = saved
+            order = json.load(open(queue))["order"]
+            return dm_lines(s), order["planned_load"], order["lanes_per_repo"]
+
+        def case_yes():
+            lines, load, lanes = reply("yes", "apply planned_load 30 %s" % first_day)
+            return load, lanes, "Changed planned_load: 40 -> 30" in lines[-1], "PLANNED_LOAD=30 in queue.conf" in lines[-1]
+        check("ch-the-owners-exact-reply-changes-that-one-key-and-shows-both-values", outcome(case_yes), (30, 2, True, True))
+
+        def case_lane():
+            lines, load, lanes = reply("lane", "apply lanes_per_repo 1 %s" % first_day)
+            return load, lanes, "lanes_per_repo: 2 -> 1" in lines[-1]
+        check("ch-a-yes-names-one-change-and-the-other-is-untouched", outcome(case_lane), (40, 1, True))
+
+        def case_other_member():
+            lines, load, lanes = reply("bob", "apply planned_load 30 %s" % first_day, who=BOB)
+            return load, lanes
+        check("ch-another-members-reply-changes-nothing", outcome(case_other_member), (40, 2))
+
+        def case_longer():
+            lines, load, lanes = reply("longer", "apply planned_load 30 %s please" % first_day)
+            return load, lanes
+        check("ch-a-longer-message-is-not-a-yes", outcome(case_longer), (40, 2))
+
+        def case_value():
+            lines, load, lanes = reply("value", "apply planned_load 31 %s" % first_day)
+            return load, lanes, "I did not propose planned_load 31" in lines[-1]
+        check("ch-a-value-nobody-proposed-changes-nothing", outcome(case_value), (40, 2, True))
+
+        def case_key():
+            lines, load, lanes = reply("key", "apply day_stop 30 %s" % first_day)
+            return load, lanes, "is not a setting a sprint review may change" in lines[-1]
+        check("ch-a-key-outside-the-list-changes-nothing", outcome(case_key), (40, 2, True))
+
+        def case_date():
+            lines, load, lanes = reply("date", "apply planned_load 30 2026-11-17")
+            return load, lanes, "I proposed no change for the sprint starting 2026-11-17" in lines[-1]
+        check("ch-a-reply-naming-another-sprint-changes-nothing", outcome(case_date), (40, 2, True))
+
+        def case_unsent():
+            lines, load, lanes = reply("unsent", "apply planned_load 30 %s" % first_day, sent=False)
+            return load, lanes, any("I have not sent you that question yet" in x for x in lines)
+        check("ch-a-reply-before-the-question-was-sent-changes-nothing", outcome(case_unsent), (40, 2, True))
+
+        def case_stale():
+            lines, load, lanes = reply("stale", "apply planned_load 30 %s" % first_day, load=35)
+            return load, lanes, "is 35 now, not the 40" in lines[-1]
+        check("ch-settings-that-moved-since-the-proposal-are-not-overwritten", outcome(case_stale), (35, 2, True))
+
+        def case_unnamed():
+            lines, load, lanes = reply("unnamed", "apply planned_load 30 %s" % first_day, named=False)
+            return load, lanes, any("sprint change" in x for x in lines)
+        check("ch-with-no-sprint-review-config-it-is-an-ordinary-message", outcome(case_unnamed), (40, 2, False))
+
+        def case_no_queue():
+            lines, load, lanes = reply("noqueue", "apply planned_load 30 %s" % first_day, queue_named=False)
+            return load, lanes, any("nothing was changed" in x for x in lines)
+        check("ch-with-no-queue-settings-named-it-is-an-ordinary-message", outcome(case_no_queue), (40, 2, False))

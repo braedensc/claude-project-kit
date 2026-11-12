@@ -23,8 +23,14 @@ the rung the other three are built on, and the one to start from.
 **One ordering matters before any of this.** `delivery.json`'s existence is the entire
 discriminator (§2), which makes it a one-way switch: the commit that adds it turns every
 pipeline guard live at once, including guards for machinery the project has not ported
-yet. Port or build the pieces first and commit the config last — configured early, a
+yet. Port or build the pieces first and commit the config after them — configured early, a
 project reads as enforcing while nothing enforces ([`LESSONS.md`](LESSONS.md)).
+**But not after the dispatcher's first session.** On a dispatcher that writes no pin, the
+hook and the lane marker *are* the enforcement. The hook's pipeline guards run only
+once the config exists. Without the config, a dispatched session meets no pipeline
+guard. With it but no marker, the hook takes the session for a person's: it can create
+tickets, write any ticket and set its own supervision labels. So the config and the marker both come
+before that first session — [`START-HERE.md`](START-HERE.md), part 2, steps 3 to 6.
 
 One thing *is* required before any of it works: **[the push credential](#the-push-credential--required-before-any-tier-does-anything)**.
 Without it the dispatcher and the bounce workflow skip, on purpose.
@@ -531,6 +537,11 @@ ruleset, targeting the default branch:
 - **Require a pull request before merging**, with at least **1 approving review**
 - **Require linear history**
 - **Block force pushes**
+
+With the validator approving merges in your place, its `Validator` check takes the place of
+the approving review: `scripts/pipeline_validator_app.py` adds the check with the validator's
+own app as its source, and drops the review, on your typed yes (docs/VALIDATOR-OPERATOR.md,
+*Make the check required*).
 
 Then create the label the grader-path job needs:
 

@@ -223,6 +223,18 @@ def open_blockers(child):
             for b, st in blockers_of(child) if not blocker_done(st)]
 
 
+# KIT-239 (B9): what the owner hears when a piece of a plan is handed to the agent by hand while
+# what it waits on is not Done. Pinned word for word by the bridge's selftest.
+ORDER_PAGE = ("%s was handed to the agent while it still waits on %s. I did not stop it or "
+              "change anything. Its pull request may fail, or repeat work that is not merged "
+              "yet. To stop it, take the agent off %s in Linear.")
+ORDER_UNREAD = "more tickets than I can read at once"
+ORDER_SEEN_KEPT = 1000          # sessions judged, remembered so none is judged twice
+ORDER_OWN_KEPT = 500            # tickets the bridge itself handed over, so it never pages its own
+ORDER_OWN_SECONDS = 600         # a session this close to the bridge's own hand-over is the bridge's
+ORDER_SLACK_SECONDS = 300       # a session this much older than the check's first pass is not new
+
+
 def in_order(children):
     """The children in dependency order: each after the siblings that block it, ties by
     ticket number. A loop in the plan leaves the rest in ticket order."""
@@ -425,8 +437,8 @@ def approve_parts(epic, requester, cfg, by_bot=False, dm=False, terms=None, ques
     if len(kids) > 12:
         listing += ", and %d more" % (len(kids) - 12)
     if by_bot:
-        # The tech lead only when it is the chat bot the config names: any other bot is "a bot".
-        who = "the tech lead" if requester == cfg.get("chat_bot_user_id") else "a bot"
+        # Every bot is "a bot": the tech lead's own lines name it in their terms (KIT-492).
+        who = "a bot"
     else:
         who = ("<@%s>" % requester) if SLACK_USER_RE.match(requester or "") else "a bot"
     then = (APPROVE_THEN_BIND % cfg["epic_wip"] if cfg["act"] else APPROVE_OFF_THEN_BIND)
@@ -463,8 +475,8 @@ def plan_move_parts(kind, epic, at_work, requester, cfg, by_bot=False, dm=False,
     pieces, as approve_parts (KIT-351). The body names the plan and its pieces at work; the
     bind states what a yes does, and a cancel's that a piece at work keeps going."""
     if by_bot:
-        # The tech lead only when it is the chat bot the config names: any other bot is "a bot".
-        who = "the tech lead" if requester == cfg.get("chat_bot_user_id") else "a bot"
+        # Every bot is "a bot": the tech lead's own lines name it in their terms (KIT-492).
+        who = "a bot"
     else:
         who = ("<@%s>" % requester) if SLACK_USER_RE.match(requester or "") else "a bot"
     if not cfg["act"]:
@@ -499,8 +511,8 @@ def plan_stop_parts(idea, going, requester, cfg, by_bot=False, dm=False, terms=N
     planning it (KIT-444), in the writer's pieces as plan_move_parts. The bind says that a
     planning run already going is not stopped."""
     if by_bot:
-        # The tech lead only when it is the chat bot the config names: any other bot is "a bot".
-        who = "the tech lead" if requester == cfg.get("chat_bot_user_id") else "a bot"
+        # Every bot is "a bot": the tech lead's own lines name it in their terms (KIT-492).
+        who = "a bot"
     else:
         who = ("<@%s>" % requester) if SLACK_USER_RE.match(requester or "") else "a bot"
     then = STOP_PLANNING_THEN_BIND if cfg["act"] else APPROVE_OFF_THEN_BIND
@@ -1839,12 +1851,96 @@ class PlansMixin(object):
             return since
         return at if since < at <= self.now + JUST_MADE_SECONDS else since
 
+    def order_check(self):
+        """KIT-239 (B9): for each agent session that started since the last pass on a piece of a
+        plan the idea gate filed (`provenance:epic`), in a managed team: if what the piece waits
+        on is not all Done, the owner is told, once for that session. It is a report and no
+        more: the hand-over stands, the session runs, and nothing is changed.
+
+        The bridge's own hand-overs (and the queue's) are never reported: it checks the order
+        before it hands anything over, and records when it handed each ticket over. Only a
+        session that starts within ORDER_OWN_SECONDS of that is the bridge's; a hand-over by
+        hand of the same ticket later is a new one, and is judged. A pass that
+        cannot read the sessions or a piece says so loudly and judges nothing it did not read.
+        The first pass of this check only learns what is already there."""
+        seen = self.state.get("order_seen")
+        if not isinstance(seen, dict):
+            seen = self.state["order_seen"] = {}
+        own = self.state.get("order_own")
+        if not isinstance(own, dict):
+            own = self.state["order_own"] = {}
+        try:
+            sessions = self.tracker.recent_sessions()
+        except BridgeError as exc:
+            self.release_errors.append("order check: %s" % self.clean(str(exc))[:160])
+            return
+        base = self.state.get("order_baseline")
+        if self.first or not isinstance(base, (int, float)):
+            for n in sessions:
+                if isinstance(n.get("id"), str):
+                    seen[n["id"]] = self.now
+            self.state["order_baseline"] = self.now
+            self.say("  order check: %d session(s) already there are passed over" % len(sessions))
+            self.save()
+            return
+        paged = 0
+        for n in sessions:
+            sid = n.get("id")
+            if not isinstance(sid, str) or sid in seen:
+                continue
+            try:
+                if self.order_judge(n, base, own):
+                    paged += 1
+            except BridgeError as exc:
+                # Not judged, so not remembered: the next pass reads it again.
+                self.release_errors.append("order check on %s: %s" % (
+                    (n.get("issue") or {}).get("identifier") or "a session",
+                    self.clean(str(exc))[:160]))
+                continue
+            seen[sid] = self.now
+        for table, kept in ((seen, ORDER_SEEN_KEPT), (own, ORDER_OWN_KEPT)):
+            for old in sorted(table, key=table.get)[:-kept]:
+                del table[old]
+        if paged:
+            self.say("  order check: %d hand-over(s) made out of order reported" % paged)
+        self.save()
+
+    def order_judge(self, node, base, own):
+        """True when this session's piece was handed over out of order and the owner was told.
+        False for any session that is not one to report."""
+        issue = node.get("issue") or {}
+        ident, team = issue.get("identifier"), (issue.get("team") or {}).get("key")
+        created = node.get("createdAt")
+        try:
+            at = datetime.fromisoformat(created.replace("Z", "+00:00")).timestamp()
+        except (AttributeError, ValueError):
+            return False                        # a time not in the tracker's form is no new session
+        if not ident or team not in self.cfg["team_keys"] or at < base - ORDER_SLACK_SECONDS:
+            return False
+        handed = own.get(ident)
+        if isinstance(handed, (int, float)) and abs(at - handed) <= ORDER_OWN_SECONDS:
+            return False                        # the bridge's own: it checked the order first
+        child = self.tracker.epic(ident)
+        if not child or GATE_CHILD_LABEL not in label_names(child):
+            return False
+        waits = open_blockers(child)
+        if not waits:
+            return False
+        waits = [ORDER_UNREAD if w.startswith("more blockers than") else notify.safe_title(w)
+                 for w in waits]
+        text = ORDER_PAGE % (ident, ", ".join(waits), ident)
+        for channel in self.watch_destinations():
+            self.post(channel, None, text, kind="order-page",
+                      facts={"ticket": ident, "waits_on": waits})
+        return True
+
     def hand_over(self, issue_id, ident, agent_id, body, record=None):
         """The one hand-over, the bridge's own and the queue's (KIT-454): the ticket to the
         agent, then the comment saying why. `record` notes the start before the save. The
         hand-over stands if the comment fails, since it cannot be taken back: the comment is
         owed, and the words returned say so."""
         self.delegate_to(issue_id, agent_id)
+        self.state.setdefault("order_own", {})[ident] = self.now      # KIT-239: never paged
         if record:
             record()
         self.save()
@@ -3434,15 +3530,15 @@ def cases_approve(kit):
             check("a-dispatcher-mode-label-is-refused:" + where,
                   ("`Graphite`" in posted(s)[-1], t.moves), (True, []))
 
-        # The approve question credits a bot in words too, never with a mention.
-        c, s, t = world("approve-bot-credit", act=True, agent_user_name="Agent",
-                        chat_bot_user_id=CHATBOT)
+        # The approve question credits a bot in words too, never with a mention, and every
+        # bot is "a bot": none speaks as the tech lead since the cutover (KIT-492).
+        c, s, t = world("approve-bot-credit", act=True, agent_user_name="Agent")
         t.add_epic("PROD-50", (("PROD-51", ()),))
         run(c, s, t)
         s.add(CHATBOT, "approve PROD-50", bot_id="B0CHATBOT1")
         run(c, s, t)
         check("an-approve-asked-by-a-bot-is-credited-in-words-never-mentioned",
-              ("Asked for by the tech lead" in posted(s)[-1], "<@%s>" % CHATBOT in posted(s)[-1]),
+              ("Asked for by a bot" in posted(s)[-1], "<@%s>" % CHATBOT in posted(s)[-1]),
               (True, False))
 
         # REVIEW OF KIT-223 (2026-10-10, second review) ----------------------------------
@@ -4333,6 +4429,293 @@ def cases_approve(kit):
                 check("mutant: %s is caught" % what, got != good, True)
         finally:
             starter.decide, starter.record_start = real
+
+        # -- KIT-239 (B9): the order check. A piece of a plan handed to the agent by hand while
+        #    what it waits on is not Done is reported to the owner, once per session, and nothing is
+        #    undone. Each case runs alone, as a scene: a first pass that learns what is there, then
+        #    a session. Every scene is also run with the check broken in one way, and must show it.
+        def order_world(name, sessions_at=30, setup=None, session=True, **over):
+            c, s, t = world(name, act=True, agent_user_name="Agent", **over)
+            t.add_epic("PROD-50", (("PROD-51", ()), ("PROD-52", ("PROD-51",))))
+            if setup:
+                setup(t)
+            run(c, s, t)                                    # the first pass: the baseline
+            if session:
+                t.sessions["uuid-52"] = [{"id": "sess-52", "status": "active",
+                                          "createdAt": iso(now + sessions_at)}]
+            return c, s, t
+
+        def order_pages(s):
+            return [p for p in posted(s) if "was handed to the agent while it still waits" in p]
+
+        def moved_nothing(t):
+            return (t.delegations, t.moves, t.comments)
+        waits_text = ("PROD-52 was handed to the agent while it still waits on PROD-51 "
+                      "(Backlog). I did not stop it or change anything. Its pull request may "
+                      "fail, or repeat work that is not merged yet. To stop it, take the agent "
+                      "off PROD-52 in Linear.")
+
+        def scene_open(name):
+            c, s, t = order_world(name)
+            run(c, s, t, at=now + 60)
+            return order_pages(s), moved_nothing(t)
+
+        def scene_repeat(name):
+            c, s, t = order_world(name)
+            run(c, s, t, at=now + 60)
+            run(c, s, t, at=now + 120)
+            run(c, s, t, at=now + 180)
+            once = len(order_pages(s))
+            t.sessions["uuid-52"].append({"id": "sess-52b", "status": "active",
+                                          "createdAt": iso(now + 200)})
+            run(c, s, t, at=now + 240)
+            return once, len(order_pages(s))
+
+        def scene_done(name):
+            c, s, t = order_world(name, setup=lambda t: t.set_state("PROD-51", "completed"))
+            run(c, s, t, at=now + 60)
+            return order_pages(s)
+
+        def reopened(t):
+            t.set_state("PROD-51", "completed")
+            t.set_state("PROD-51", "started")
+
+        def scene_reopened(name):
+            c, s, t = order_world(name, setup=reopened)
+            run(c, s, t, at=now + 60)
+            return [p.split(". I did not")[0] for p in order_pages(s)]
+
+        def not_gate(t):
+            t.issues["PROD-52"]["labels"] = []
+
+        def scene_not_gate(name):
+            c, s, t = order_world(name, setup=not_gate)
+            run(c, s, t, at=now + 60)
+            return order_pages(s)
+
+        def scene_other_team(name):
+            c, s, t = order_world(name)
+            t.issues["PROD-52"]["team"] = {"key": "OPS"}
+            run(c, s, t, at=now + 60)
+            return order_pages(s)
+
+        def scene_old_session(name):
+            c, s, t = order_world(name, sessions_at=-4000)
+            run(c, s, t, at=now + 60)
+            return order_pages(s)
+
+        def scene_baseline(name):
+            c, s, t = world(name, act=True, agent_user_name="Agent")
+            t.add_epic("PROD-50", (("PROD-51", ()), ("PROD-52", ("PROD-51",))))
+            t.sessions["uuid-52"] = [{"id": "sess-there", "status": "active",
+                                      "createdAt": iso(now + 5)}]
+            run(c, s, t)
+            run(c, s, t, at=now + 60)
+            return order_pages(s)
+
+        def scene_own(name, later=False):
+            c, s, t = order_world(name, session=False)
+            t.set_state("PROD-51", "completed")
+            root = s.add(ALICE, "approve PROD-50")
+            run(c, s, t, at=now + 30)
+            s.add(BOB, "yes", thread=root)
+            run(c, s, t, at=now + 60)                     # the bridge starts PROD-51 itself
+            t.set_state("PROD-51", "completed")
+            run(c, s, t, at=now + 90)                     # ... then PROD-52, in order
+            t.set_state("PROD-51", "started")             # PROD-51 is reopened after
+            t.sessions["uuid-52"] = [{"id": "sess-own", "status": "active",
+                                      "createdAt": iso(now + 95)}]
+            run(c, s, t, at=now + 120)
+            if later:                                     # ... and you hand it over again, later
+                t.sessions["uuid-52"].append({"id": "sess-later", "status": "active",
+                                              "createdAt": iso(now + 5000)})
+                run(c, s, t, at=now + 5100)
+            return delegated(t), len(order_pages(s))
+
+        def scene_unreadable(name):
+            c, s, t = order_world(name, session=False)
+            t.sessions["uuid-52"] = [{"id": "sess-52", "status": "active",
+                                      "createdAt": iso(now + 30)}]
+            t.sessions_error = True
+            code, _out = run(c, s, t, at=now + 60)
+            t.sessions_error = False
+            run(c, s, t, at=now + 120)
+            return code, len(order_pages(s))
+
+        def scene_child_unreadable(name):
+            c, s, t = order_world(name)
+            real = t.epic
+            t.epic_fails = {"PROD-52": True}
+
+            def epic(ident, _real=real):
+                if t.epic_fails.get(ident):
+                    raise BridgeError("the tracker could not be read (simulated)")
+                return _real(ident)
+            t.epic = epic
+            code, _out = run(c, s, t, at=now + 60)
+            t.epic_fails["PROD-52"] = False
+            run(c, s, t, at=now + 120)
+            return code, len(order_pages(s))
+
+        opened = scene_open("order-open")
+        check("order: a piece handed over while what it waits on is open is reported, naming it "
+              "and the open blocker with its state, word for word", opened[0], [waits_text])
+        check("order: reported and never undone: nothing was delegated, moved or commented",
+              opened[1], ([], [], []))
+        check("order: the same session is reported once, however many passes find it, and a "
+              "second session on the piece is a new hand-over, reported on its own",
+              scene_repeat("order-repeat"), (1, 2))
+        check("order: every blocker Done reports nothing", scene_done("order-done"), [])
+        check("order: a blocker reopened after it was Done is open again, and named as it is now",
+              scene_reopened("order-reopened"),
+              ["PROD-52 was handed to the agent while it still waits on PROD-51 (In Progress)"])
+        check("order: a ticket the idea gate did not file is not checked",
+              scene_not_gate("order-not-gate"), [])
+        check("order: a team the bridge does not manage is not checked",
+              scene_other_team("order-other-team"), [])
+        check("order: a session older than the check's first pass is not new",
+              scene_old_session("order-old-session"), [])
+        check("order: a session already there when the check first ran is only learned, never "
+              "reported", scene_baseline("order-baseline-first"), [])
+        check("order: a piece the bridge itself handed over is never reported, even when its "
+              "blocker is reopened later", scene_own("order-own"), (["uuid-52"], 0))
+        check("order: the bridge's own hand-over covers only the session it made: you handing "
+              "the same piece over again later is reported", scene_own("order-own-later", True),
+              (["uuid-52"], 1))
+        check("order: sessions that cannot be read end the pass loud and report nothing; the "
+              "next pass that can read them reports", scene_unreadable("order-unreadable"),
+              (EXIT_ERROR, 1))
+        check("order: a piece that cannot be read is not judged, not remembered, and judged the "
+              "next pass", scene_child_unreadable("order-child-unreadable"), (EXIT_ERROR, 1))
+
+        # The same scenes with the check broken one way each (the ticket asks for a mutant for
+        # each case, and the selftest carries them). A broken check must be seen to differ.
+        def order_broken(name, attr, make, scene, owner=PlansMixin):
+            saved = getattr(owner, attr)
+            setattr(owner, attr, make(saved))
+            try:
+                return scene(name)
+            finally:
+                setattr(owner, attr, saved)
+
+        def order_global(name, attr, value, scene):
+            saved = globals()[attr]
+            globals()[attr] = value
+            try:
+                return scene(name)
+            finally:
+                globals()[attr] = saved
+
+        def judge_with(change):
+            def make(saved):
+                def order_judge(self, node, base, own):
+                    return change(saved, self, node, base, own)
+                return order_judge
+            return make
+
+        def check_with(change):
+            def make(saved):
+                def order_check(self):
+                    return change(saved, self)
+                return order_check
+            return make
+
+        def judge_undoing(saved, self, node, base, own):
+            paged = saved(self, node, base, own)
+            if paged:
+                self.tracker.delegate(node["issue"]["id"], None)
+            return paged
+
+        def judge_every_team(saved, self, node, base, own):
+            teams = self.cfg["team_keys"]
+            self.cfg["team_keys"] = list(teams) + ["OPS"]
+            try:
+                return saved(self, node, base, own)
+            finally:
+                self.cfg["team_keys"] = teams
+
+        def judge_unread_kept(saved, self, node, base, own):
+            try:
+                return saved(self, node, base, own)
+            except BridgeError:
+                return False
+
+        def check_forgetting(saved, self):
+            try:
+                return saved(self)
+            finally:
+                self.state["order_seen"] = {}
+
+        def check_no_baseline(saved, self):
+            self.first = False
+            self.state.setdefault("order_baseline", 0)
+            return saved(self)
+
+        def check_quiet(saved, self):
+            before = len(self.release_errors)
+            try:
+                return saved(self)
+            finally:
+                del self.release_errors[before:]
+
+        def hand_over_unrecorded(saved):
+            def hand_over(self, *args, **kwargs):
+                try:
+                    return saved(self, *args, **kwargs)
+                finally:
+                    self.state.get("order_own", {}).clear()
+            return hand_over
+        for what, got, good in (
+                ("every blocker taken as Done",
+                 order_global("order-m1", "open_blockers", lambda child: [], scene_open),
+                 opened),
+                ("a Done blocker taken as open",
+                 order_global("order-m2", "blocker_done", lambda st: False, scene_done), []),
+                ("a blocker reopened after it was Done taken as Done",
+                 order_global("order-m3", "blocker_done",
+                              lambda st: (st or {}).get("type") in ("completed", "started"),
+                              scene_reopened),
+                 ["PROD-52 was handed to the agent while it still waits on PROD-51 "
+                  "(In Progress)"]),
+                ("a ticket the idea gate did not file checked",
+                 order_global("order-m4", "label_names", lambda node: ["provenance:epic"],
+                              scene_not_gate), []),
+                ("a team the bridge does not manage checked",
+                 order_broken("order-m5", "order_judge", judge_with(judge_every_team),
+                              scene_other_team), []),
+                ("a session older than the first pass judged",
+                 order_broken("order-m6", "order_judge", judge_with(
+                     lambda saved, self, node, base, own: saved(self, node, 0, own)),
+                     scene_old_session), []),
+                ("the first pass reporting what is already there",
+                 order_broken("order-m7", "order_check", check_with(check_no_baseline),
+                              scene_baseline), []),
+                ("a session reported again on every pass",
+                 order_broken("order-m8", "order_check", check_with(check_forgetting),
+                              scene_repeat), (1, 2)),
+                ("the bridge's own hand-over reported",
+                 order_broken("order-m9", "order_judge", judge_with(
+                     lambda saved, self, node, base, own: saved(self, node, base, {})),
+                     scene_own), (["uuid-52"], 0)),
+                ("the bridge's own hand-over not recorded",
+                 order_broken("order-m10", "hand_over", hand_over_unrecorded, scene_own),
+                 (["uuid-52"], 0)),
+                ("the bridge's own hand-over covering every later session",
+                 order_global("order-m11", "ORDER_OWN_SECONDS", 10 ** 9,
+                              lambda name: scene_own(name, True)), (["uuid-52"], 1)),
+                ("the delegation undone after the report",
+                 order_broken("order-m12", "order_judge", judge_with(judge_undoing), scene_open),
+                 opened),
+                ("the report's words changed",
+                 order_global("order-m13", "ORDER_PAGE", "%s waits on %s %s", scene_open),
+                 opened),
+                ("sessions that cannot be read passed over quietly",
+                 order_broken("order-m14", "order_check", check_with(check_quiet),
+                              scene_unreadable), (EXIT_ERROR, 1)),
+                ("a piece that cannot be read taken as judged",
+                 order_broken("order-m15", "order_judge", judge_with(judge_unread_kept),
+                              scene_child_unreadable), (EXIT_ERROR, 1))):
+            check("mutant: %s is caught" % what, got != good, True)
         kit.keep(approved=approved, delegated=delegated, followed=followed)
 
 
@@ -4342,10 +4725,10 @@ def cases_finish(kit):
     from pipeline_bridge import (ALICE, BOB, CHAN, DM, EXAMPLE_CONFIG, EXIT_ERROR,
                                  EXIT_OK, FakeSlack, ME, OWNER, _config_error, state_path)
     with kit as tmp:
-        check, FakeWriter, approved = kit.take("check", "FakeWriter", "approved")
+        check, approved = kit.take("check", "approved")
         cfg_for, delegated, dmworld = kit.take("cfg_for", "delegated", "dmworld")
         followed, now, outcome, posted = kit.take("followed", "now", "outcome", "posted")
-        run, writer_bin, wrun = kit.take("run", "writer_bin", "wrun")
+        run = kit.run
         # 17. A FINISHED PLAN CLOSES ITSELF (KIT-299). Every child Done, every pull request
         #     the GitHub integration linked merged: the epic moves to the done state, one
         #     comment, one wrap-up where it was approved, and the plan is let go. The notes its
@@ -5104,75 +5487,6 @@ def cases_finish(kit):
         check("the integration's source list and PR pattern are the review poller's own",
               outcome(case_copies), (True, True, [True, True, True, True]))
 
-        # THE WRITER ON A FINISHED PLAN (KIT-297 on KIT-299): the wrap-up, the follow-up
-        # question and its answer are written when sent. The notes a yes files and the
-        # question's terms follow verbatim, and the writer is given what asks nothing.
-        def case_finished_written():
-            fw = FakeWriter()
-            c, s, t, root = approved("fin-written", kids=(("PROD-51", ()),
-                                                          ("PROD-52", ("PROD-51",))))
-            for n, k in enumerate(t.epics["PROD-50"]):
-                link(t, k, 437 + n)
-                t.set_state(k, "completed")
-            with_notes(t)
-            c.update(writer=True, writer_bin=writer_bin)
-            wrun(c, s, t, fw)
-            s.add(BOB, "yes", thread=root)
-            wrun(c, s, t, fw)
-            wrun(c, s, t, fw)
-            wrap = [x for _ch, _th, x in s.posts if "2 review notes are left:" in x]
-            asked = [x for _ch, _th, x in s.posts if "I'll file these 2 notes" in x]
-            calls = dict((x["kind"], x) for x in fw.calls)
-            bad = [(x["kind"], why) for x in fw.calls
-                   for why in [voice.check_text(x["fallback"], 100000, x["keep"],
-                                                voice.fact_links(x["facts"]),
-                                                voice.fact_ids(x["facts"], x["keep"]))]
-                   if why]
-            return ([k for k in ("plan-finished", "question-followup", "followup-filed")
-                     if k not in calls], len(t.filed), bad,
-                    [(x.startswith("I have news on"), "All 2 pieces" in x,
-                      x.split("\n\n", 1)[-1].startswith("2 review notes are left:\n• PROD-51"),
-                      "Log the retry" in x) for x in wrap],
-                    asked == ["I have news on PROD-50.\n\nSay `yes` in this thread within 24 "
-                              "hours and I'll file these 2 notes as one follow-up ticket in "
-                              "PROD. It starts no work. Say `no` to leave them."],
-                    (calls.get("question-followup") or {}).get("fallback"),
-                    [x.startswith("I have news on ") for _ch, _th, x in s.posts
-                     if "PROD-900" in x],
-                    (calls.get("plan-finished") or {}).get("fallback", "").endswith(
-                        " The notes below name PROD-51."),
-                    # KIT-482 review: only the question's bind asks, so only its writer
-                    # may take the model's own questions out; the wrap-up still refuses one.
-                    [(calls.get(k) or {}).get("asks") for k in ("plan-finished",
-                                                               "question-followup",
-                                                               "followup-filed")])
-        check("writer: a finished plan's wrap-up, question and answer are written; the notes "
-              "and the question's terms follow verbatim", outcome(case_finished_written),
-              ([], 1, [], [(True, False, True, True)], True,
-               "The reviews of PROD-50's pieces left 2 notes.",
-               [True], True, [False, True, False]))
-
-        def case_followup_expired_written():
-            # A closed plan's question has no request to ask again: its fixed line says
-            # where the notes are, after the writer's words.
-            fw = FakeWriter()
-            c, s, t, root = approved("fin-expired-written", kids=(("PROD-51", ()),
-                                                                  ("PROD-52", ("PROD-51",))))
-            for n, k in enumerate(t.epics["PROD-50"]):
-                link(t, k, 437 + n)
-                t.set_state(k, "completed")
-            with_notes(t)
-            c.update(writer=True, writer_bin=writer_bin)
-            wrun(c, s, t, fw)
-            s.add(BOB, "yes", thread=root, ts="%.6f" % (now + 25 * 3600))
-            wrun(c, s, t, fw, at=now + 25 * 3600 + 60)
-            return [x for _ch, _th, x in s.posts if x.endswith(
-                "\n\nThe notes stay in my wrap-up; file them yourself if you want them.")]
-        check("writer: an expired follow-up question's fixed line follows the writer's words",
-              outcome(case_followup_expired_written),
-              ["I have news on PROD-50.\n\nThe notes stay in my wrap-up; file them yourself if "
-               "you want them."])
-
         def case_note_ids_whole():
             # PROD-512 in the text does not name PROD-51, which only the notes hold.
             pieces = [{"ident": "PROD-512", "title": "A", "prs": [], "review": None,
@@ -5548,21 +5862,6 @@ def cases_answer(kit):
         check("a-yes-refused-because-the-plan-changed-asks-the-approve-question-again "
               "(KIT-334)", outcome(case_refused_at_yes), (2, []))
 
-        FakeWriter, wrun, wworld = kit.take("FakeWriter", "wrun", "wworld")
-
-        def case_writer():
-            fw = FakeWriter()
-            c, s, t = wworld("answer-writer", dm_user_ids=[ALICE], act=True,
-                             agent_user_name="Agent")
-            wrun(c, s, t, fw)             # the DM's first read: a baseline
-            t.add_epic("PROD-50", (("PROD-51", ()),))
-            s.add(ALICE, "answer PROD-50: " + words, channel=DM)
-            wrun(c, s, t, fw)
-            question = answer_asks(s)
-            return len(question), words in (question or [""])[0]
-        check("with-the-writer-on-the-answer-question-still-quotes-the-words-word-for-word "
-              "(KIT-334)", outcome(case_writer), (1, True))
-
         def case_off():
             c, s, t = says("answer PROD-50: " + words, "answer-off", act=False)
             question = (answer_asks(s) or [""])[-1]
@@ -5610,8 +5909,8 @@ def cases_plan_moves(kit):
     from pipeline_bridge_requests import NAMED_YES_BIND, read_ask
     with kit as _tmp:
         check, now, posted, run, world = kit.take("check", "now", "posted", "run", "world")
-        dmworld, dm_lines, tlworld, tl_root, tl_says = kit.take(
-            "dmworld", "dm_lines", "tlworld", "tl_root", "tl_says")
+        dmworld, dm_lines, tlworld, turned = kit.take(
+            "dmworld", "dm_lines", "tlworld", "turned")
 
         def followed(c):
             return sorted(json.load(open(state_path(c))).get("epics", {}))
@@ -5819,27 +6118,26 @@ def cases_plan_moves(kit):
                t.moves[-1], followed(c), "switched off" in posted(s)[-1]),
               (True, ("uuid-50", "st-todo"), ["uuid-50"], True))
 
-        # 7. As the tech lead's line (ACT-1): a pause it set up takes a bare yes; a cancel it
-        #    set up acts only on `yes <the plan>`, as a resume does.
-        def tl_set_up(name, line):
+        # 7. As the tech lead's line (ACT-1), set up by its own turn's tools (KIT-492): a pause
+        #    it set up takes a bare yes; a cancel it set up acts only on `yes <the plan>`, as a
+        #    resume does.
+        def tl_set_up(name, verb):
             c, s, t = tlworld(name, act=True, agent_user_name="Agent", epic_wip=1)
             t.add_epic("PROD-50", (("PROD-51", ()), ("PROD-52", ("PROD-51",))))
             root = s.add(BOB, "approve PROD-50")
             run(c, s, t)
             s.add(BOB, "yes", thread=root)
             run(c, s, t)
-            s.add(ALICE, "can we hold the light mode work for now", channel=DM)
-            run(c, s, t, at=now + 60)
-            tl_says(s, tl_root(c), "For ask 1:\n%s" % line)
-            run(c, s, t, at=now + 120)
+            turned(c, s, t, "can we hold the light mode work for now", [(verb, "PROD-50")],
+                   at=now + 120)
             return c, s, t, dm_lines(s)[-1]
-        c, s, t, q = tl_set_up("pm-tl-pause", "pause PROD-50")
+        c, s, t, q = tl_set_up("pm-tl-pause", "pause")
         s.add(ALICE, "yes", channel=DM)
         run(c, s, t, at=now + 180)
         check("a-pause-the-tech-lead-set-up-takes-a-bare-yes",
               ("Reply `yes` here" in q, q.endswith("The tech lead picked PROD-50."),
                t.moves[-1]), (True, True, ("uuid-50", "st-backlog")))
-        c, s, t, q = tl_set_up("pm-tl-cancel", "cancel PROD-50")
+        c, s, t, q = tl_set_up("pm-tl-cancel", "cancel")
         s.add(ALICE, "yes", channel=DM)
         run(c, s, t, at=now + 180)
         bare = (t.moves[-1], dm_lines(s)[-1].endswith(NAMED_YES_BIND % ("PROD-50", "PROD-50")))

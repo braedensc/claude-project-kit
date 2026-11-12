@@ -85,13 +85,15 @@ if HERE not in sys.path:
 from pipeline_status_local import clean_title, DEFAULT_STATUS_FILE  # noqa: E402
 from pipeline_bridge_transport import _http_json  # noqa: E402
 
-# The guides, and the folder they are read from, as the tech lead's rules name them
+# The guides, and the folder they are read from: the chat lane installer's one list
 # (pipeline_chat_lane_setup: KIT_GUIDES, KIT_DOCS_DEFAULT, KIT-469). That installer is not in
 # the role account's clone, so it cannot be imported here: the selftest holds these equal to it.
 KIT_DOCS_DEFAULT = "~/.stage-e/kit/docs"
 KIT_GUIDES = (
-    ("BRIDGE-OPERATOR.md", "the bridge, the commands above, the stand-up and your wakes"),
-    ("CHAT-LANE-OPERATOR.md", "you, the tech lead, and what you may do"),
+    ("BRIDGE-OPERATOR.md", "the bridge: the one chat, the commands a member types, and the "
+                           "stand-up"),
+    ("CHAT-LANE-OPERATOR.md", "the dispatcher's own chat lane, which stays off since the "
+                              "cutover"),
     ("STAGE-A-OPERATOR.md", "planning: how an idea becomes a plan"),
     ("STAGE-E-OPERATOR.md", "reviews of pull requests, and the fixes they send back"),
     ("QUEUE-OPERATOR.md", "the queue: what starts each day, and the limits"),
@@ -374,7 +376,9 @@ def tracker(cfg, query, variables):
         # is "could not read", never "not found".
         try:
             doc = json.loads((exc.read() or b"").decode("utf-8") or "{}")
-        except (AttributeError, OSError, ValueError):
+        except (AttributeError, KeyError, OSError, ValueError):
+            # KeyError: on Python 3.9 (the Mac's) an HTTPError with no body raises it from
+            # read(); newer Pythons give an empty body (KIT-653).
             doc = None
         if not (isinstance(doc, dict) and doc.get("errors")):
             raise ToolError("the tracker could not be read (HTTP %s)" % exc.code)
@@ -972,10 +976,10 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
 
     # The server runs from the role account's kit clone, which holds the jobs' scripts and not
     # the installers. So it may import no installer, and holds its own guide list, equal to the
-    # one the tech lead's rules name.
+    # chat lane installer's.
     import pipeline_chat_lane_setup as lane
     import pipeline_stage_e_setup as stage_e
-    expect("the guides are the ones the tech lead's rules name",
+    expect("the guides are the chat lane installer's own list",
            (KIT_GUIDES, KIT_DOCS_DEFAULT), (lane.KIT_GUIDES, lane.KIT_DOCS_DEFAULT))
     import ast
     with open(os.path.abspath(__file__), encoding="utf-8") as fh:

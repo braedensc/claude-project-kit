@@ -43,6 +43,8 @@ THE REVIEW POLLER'S RECORDS
     review-left-behind  a partial record the poller marked `left_behind` (KIT-455): the PR
                       moved on, so no review of those files is coming. It pages at once,
                       under review-partial's key, so that page never follows it.
+                      A partial record marked `parts_ceiling` (KIT-613) pages at once too, as
+                      review-partial: the parts ceiling stopped it, so no review is coming.
 
 THE STATUS FILE (KIT-350)
 
@@ -65,6 +67,33 @@ THE STATUS FILE (KIT-350)
   says its own listing was cut short, and its own heartbeat carries that.
 
   Every source now takes a fourth argument, `asked`; the review source does not use it.
+
+THE ACCEPTANCE POLLER'S LEDGER (KIT-555)
+
+  `acceptance_ledger`, schema pipeline-acceptance-ledger/1 (pipeline_acceptance_poller). The
+  poller records each check's verdict in its row for the plan and head, with the page's facts
+  beside it, before it posts the verdict comment. One page per check, while the verdict is under
+  two days old, under one mark per verdict. A check is its plan, its head and when it started: a
+  check the owner asked to run again at the same head (contract section 26) takes the place of
+  its row with a new start, so its verdict pages too.
+
+    acceptance-passed            the check passed
+    acceptance-held              a problem or a failed run holds the plan open
+    acceptance-could-not-check   it could not check, and why, as a closed word. Never a pass
+
+  The page's detail is counts, flags and closed words, never the session's text. A verdict
+  whose comment was not confirmed (`failed`, or `writing` for longer than
+  WRITING_SETTLE_SECONDS) still pages, and says so. A row whose page facts are missing pages
+  in the mark's general words.
+
+  The screenshots: up to four `<run id>/<name>` paths the poller chose, each in the look
+  tool's own shape, joined under `look_record_dir/<plan>/`. With `look_record_dir` empty or
+  `page_images` off, no screenshot goes, and the page says so. A path out of shape is a
+  problem, named, and never read.
+
+  An empty `acceptance_ledger` is off, with nothing said here (the notifier's summary says it).
+  A ledger that is not there yet is no check yet: the poller writes it at its first start. Its
+  folder not being there, or a ledger that cannot be read, is a problem.
 """
 import calendar
 import json
@@ -121,6 +150,24 @@ SESSION_MARK = "session-ended-empty"
 SESSION_ENDED = ("complete", "error", "stale")
 UNION_KEY_RE = re.compile(r"^[0-9a-f]{16}\Z")
 QUESTION_FLAGS = ("agent:blocked", "agent:needs-human")
+# KIT-555: pipeline_acceptance_poller.LEDGER_SCHEMA, its verdict words and its causes, its page
+# fields and its screenshot paths. The notifier's selftest pins each to the poller's own.
+ACCEPTANCE_LEDGER_SCHEMA = "pipeline-acceptance-ledger/1"
+ACCEPTANCE_MARKS = {"passed": "acceptance-passed", "held": "acceptance-held",
+                    "could-not-check": "acceptance-could-not-check"}
+ACCEPTANCE_CAUSES = ("no-result", "no-record", "session-said", "could-not-run", "disagree",
+                     "malformed", "timed-out", "unknown")
+ACCEPTANCE_PAGE_KEYS = ("holds", "failed_runs", "followups", "mechanical", "shots")
+ACCEPTANCE_SHOT_RE = re.compile(
+    r"^([0-9]{3,4}-[0-9]{8}T[0-9]{6}Z)/([A-Za-z0-9][A-Za-z0-9._-]{0,199}\.png)\Z")
+ACCEPTANCE_MAX_SHOTS = 4
+# A check's own record folder under look_record_dir: its acceptance ticket's id (the live pass).
+ACCEPTANCE_FOLDER_RE = re.compile(r"^[A-Z][A-Z0-9]{1,9}-[0-9]{1,6}\Z")
+ACCEPTANCE_MAX_BYTES = 2 * 1024 * 1024
+SHA_RE = re.compile(r"^[0-9a-f]{40}\Z")
+# The poller writes `writing`, posts, then writes `written`, in seconds. One still `writing` after
+# this is a poller that stopped between the two: its page says the comment is not confirmed.
+WRITING_SETTLE_SECONDS = 15 * 60
 
 
 def declined_why(reason):
@@ -211,11 +258,15 @@ def review_outcome_events(cfg, sent_keys, now, asked=None):
         if not doc["usable"]:
             kind, mark, detail = "declined", DECLINED_MARK, {"why": declined_why(doc.get("reason"))}
         elif doc.get("coverage") == "partial":
-            left = doc.get("left_behind")
+            left, ceiling = doc.get("left_behind"), doc.get("parts_ceiling")
             if isinstance(left, dict) and _at_seconds(left.get("at")) is not None:
                 # KIT-455: the PR moved on, so no review of these files is coming: page at
                 # once, under the partial page's own key, so that page never follows.
                 mark = LEFT_BEHIND_MARK
+            elif isinstance(ceiling, dict) and _at_seconds(ceiling.get("at")) is not None:
+                # KIT-613: the poller's ceiling on review parts stopped this review, so no
+                # review of the rest is coming either: page at once, in the partial words.
+                mark = PARTIAL_MARK
             elif age < PARTIAL_SETTLE_SECONDS:
                 continue                  # its withheld files may still get their own review
             else:
@@ -310,7 +361,133 @@ def status_file_events(cfg, sent_keys, now, asked):
     return events, problems
 
 
-SOURCES = (review_outcome_events, status_file_events)
+def _acceptance_page_problem(page, word):
+    """What is wrong with a verdict's page facts, or "": the poller's own rule
+    (pipeline_acceptance_poller.page_problem), spelled here because this file imports nothing of
+    the kit's. The notifier's selftest feeds both the same facts."""
+    if not isinstance(page, dict):
+        return "are not an object"
+    if set(page) - {"folder"} != (set(ACCEPTANCE_PAGE_KEYS)
+                                  | ({"cause"} if word == "could-not-check" else set())):
+        return "do not hold exactly the page's fields"
+    if "folder" in page and not (isinstance(page["folder"], str)
+                                 and ACCEPTANCE_FOLDER_RE.match(page["folder"])):
+        return "name a record folder that is not a ticket id"
+    for key in ("holds", "failed_runs", "followups"):
+        if type(page[key]) is not int or not 0 <= page[key] <= 999:
+            return "hold a %s that is not a whole number from 0 to 999" % key
+    if type(page["mechanical"]) is not bool:
+        return "say neither yes nor no about the record"
+    shots = page["shots"]
+    if (not isinstance(shots, list) or len(shots) > ACCEPTANCE_MAX_SHOTS
+            or not all(isinstance(s, str) and ACCEPTANCE_SHOT_RE.match(s) for s in shots)
+            or len(set(shots)) != len(shots)):
+        return "list screenshots out of their shape"
+    if word == "could-not-check" and page["cause"] not in ACCEPTANCE_CAUSES:
+        return "name a cause this page does not know"
+    return ""
+
+
+def _acceptance_page(cfg, word, status, page, plan):
+    """(detail, images, problem) for one verdict. `detail` is counts, flags and closed words;
+    `images` the screenshots to send, as full paths under look_record_dir/[<folder>/]<plan>/;
+    `problem` what was out of shape, or "". Facts out of shape are dropped whole, so the page
+    goes in its mark's general words."""
+    detail, problem, listed, folder = {"posted": status == "written"}, "", [], []
+    if page is not None:
+        why = _acceptance_page_problem(page, word)
+        if why:
+            problem, page = "its page facts %s" % why, None
+    if page is not None:
+        if word == "held":
+            detail.update(holds=page["holds"], failed_runs=page["failed_runs"])
+        if word in ("passed", "held"):
+            detail["followups"] = page["followups"]
+        if word == "could-not-check":
+            detail["cause"] = page["cause"]
+        detail["mechanical"] = page["mechanical"]
+        listed = page["shots"]
+        folder = [page["folder"]] if page.get("folder") else []
+    root = cfg.get("look_record_dir") or ""
+    images = []
+    if listed and root and cfg.get("page_images") is True:
+        images = [os.path.join(root, *(folder + [plan] + list(ACCEPTANCE_SHOT_RE.match(p).groups())))
+                  for p in listed]
+    detail["shots"] = len(images)
+    if not images:
+        detail["no_shots"] = "off" if listed else "none"
+    return detail, images, problem
+
+
+def acceptance_events(cfg, sent_keys, now, asked=None):
+    """The acceptance poller's verdicts as pages, one per check: its plan, its head and when it
+    started (KIT-555). Off, with nothing said, while `acceptance_ledger` is empty. Fields only: a
+    page's words are its mark's."""
+    path = cfg.get("acceptance_ledger") or ""
+    if not path:
+        return [], []
+    folder = os.path.dirname(path)
+    if not os.path.isdir(folder):
+        return [], ["the acceptance poller's ledger folder %s is not there, so no check's verdict "
+                    "was read" % folder]
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = fh.read(ACCEPTANCE_MAX_BYTES + 1)
+    except FileNotFoundError:
+        return [], []                     # no check has started yet: the poller writes it then
+    except (OSError, ValueError) as exc:
+        return [], ["the acceptance ledger %s could not be read (%s)" % (path, type(exc).__name__)]
+    if len(raw) > ACCEPTANCE_MAX_BYTES:
+        return [], ["the acceptance ledger %s is larger than %d characters, so it was not read"
+                    % (path, ACCEPTANCE_MAX_BYTES)]
+    try:
+        doc = json.loads(raw)
+    except (ValueError, RecursionError) as exc:
+        return [], ["the acceptance ledger %s could not be read (%s)" % (path, type(exc).__name__)]
+    if (not isinstance(doc, dict) or doc.get("schema") != ACCEPTANCE_LEDGER_SCHEMA
+            or not isinstance(doc.get("rows"), list)):
+        return [], ["the acceptance ledger %s is not a %s document"
+                    % (path, ACCEPTANCE_LEDGER_SCHEMA)]
+    template = cfg.get("ticket_url_template") or ""
+    events, problems = [], []
+    for row in doc["rows"]:
+        verdict = row.get("verdict") if isinstance(row, dict) else None
+        if verdict is None:
+            continue                      # a check with no verdict yet
+        plan = row.get("plan")
+        head = row.get("head")
+        word = verdict.get("word") if isinstance(verdict, dict) else None
+        status = verdict.get("status") if isinstance(verdict, dict) else None
+        at = verdict.get("at") if isinstance(verdict, dict) else None
+        started = row.get("at")
+        if not (isinstance(plan, str) and TICKET_ID_RE.match(plan) and isinstance(head, str)
+                and SHA_RE.match(head) and row.get("status") == "started"
+                and word in ACCEPTANCE_MARKS and status in ("writing", "written", "failed")
+                and _at_seconds(at) is not None and _at_seconds(started) is not None):
+            problems.append("a verdict in the acceptance ledger %s is not in its shape, so it was "
+                            "not paged" % path)
+            continue
+        age = now - _at_seconds(at)
+        if age > WINDOW_SECONDS:
+            continue
+        if status == "writing" and age < WRITING_SETTLE_SECONDS:
+            continue                      # the poller may be posting it right now
+        key = "acceptance:%s@%s@%s" % (plan, head, started)
+        if key in sent_keys:
+            continue
+        detail, images, problem = _acceptance_page(cfg, word, status, verdict.get("page"), plan)
+        if problem:
+            problems.append("the acceptance verdict for %s at %s: %s, so it pages in its mark's "
+                            "general words" % (plan, head[:8], problem))
+        # The plan's own ticket, from the notifier's template. A join, not a str method whose
+        # name the notifier's source check reads as a file rename.
+        events.append({"key": key, "mark": ACCEPTANCE_MARKS[word], "ticket_id": plan,
+                       "ticket_title": "", "url": plan.join(template.split("{id}")),
+                       "detail": detail, "images": images, "at": at})
+    return events, problems
+
+
+SOURCES = (review_outcome_events, status_file_events, acceptance_events)
 
 
 def file_events(cfg, sent_keys, now, room, asked=None):

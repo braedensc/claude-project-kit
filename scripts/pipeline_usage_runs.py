@@ -624,7 +624,29 @@ def read_logs(cfg, now, src):
 # --------------------------------------------------------------------------- #
 # What a run was, and what it cost
 # --------------------------------------------------------------------------- #
-def classify(runs, cfg, planners, reprompts, firsts):
+def read_reviewers(cfg, src):
+    """The tickets the review poller filed, by identifier, from its own record in Stage E's
+    state folder (KIT-596): a review on a work team runs in a folder named like any coding
+    ticket. A record that cannot be read is said on `src`, the Stage E source, never read
+    as "no reviews"; an absent one is an empty answer."""
+    if not cfg.get("stage_e_state_dir"):
+        return frozenset()
+    if not os.path.isdir(cfg["stage_e_state_dir"]):
+        return None     # read_ledger has said the folder is missing; nothing more to ask
+    if HERE not in sys.path:
+        sys.path.insert(0, HERE)
+    import pipeline_machine_tickets as machine
+    src.ask()
+    try:
+        record = machine.read_review_record(cfg["stage_e_state_dir"])
+    except machine.RecordError as exc:
+        src.fail("the review poller's record could not be read (%s)" % exc)
+        return None
+    src.answer()
+    return frozenset(str((v or {}).get("identifier") or "") for v in record.values()) - {""}
+
+
+def classify(runs, cfg, planners, reprompts, firsts, reviewers=frozenset()):
     """Each run's kind, and how it was told: by its folder, the idea gate's record, being the
     folder's first run, a ledger row, or its opening prompt. In that order. Nothing a
     session can write decides a run's kind, except an opening prompt's fixed words."""
@@ -632,7 +654,9 @@ def classify(runs, cfg, planners, reprompts, firsts):
         ws = r["workspace"]
         if ws.startswith(CHAT_PREFIX):
             r["kind"], r["how"] = "tech_lead", "folder"
-        elif ws.startswith(cfg["reviews_team_key"] + "-"):
+        elif reviewers and ws in reviewers:
+            r["kind"], r["how"] = "review", "record"       # KIT-596: on a work team
+        elif cfg.get("reviews_team_key") and ws.startswith(cfg["reviews_team_key"] + "-"):
             r["kind"], r["how"] = "review", "folder"
         elif planners and ws in planners:
             r["kind"], r["how"] = "planner", "record"
@@ -686,15 +710,17 @@ def scan(cfg, now):
     it, and compares each run with what its log was written to say."""
     planners, planner_src = read_planner(cfg, now)
     reprompts, ledger_src = read_ledger(cfg, now)
+    reviewers = read_reviewers(cfg, ledger_src)
     logs_src = Source(now)
     found = read_logs(cfg, now, logs_src)
     scanned = {"planners": planners, "reprompts": reprompts, "runs": None, "baselines": [],
+               "reviewers": reviewers or frozenset(),
                "pendings": [], "sources": {"logs": logs_src, "ledger": ledger_src,
                                            "planner": planner_src}}
     if found is None:
         return scanned
     runs, baselines, pendings, firsts = found
-    classify(runs, cfg, planners, reprompts, firsts)
+    classify(runs, cfg, planners, reprompts, firsts, reviewers or frozenset())
     price(runs, baselines)
     for r in runs:
         r["seconds"] = (int(max(0.0, r["last_at"] - r["first_at"]))
@@ -1196,7 +1222,7 @@ def _cases(check):
               [(s, recs[s]["state"], recs[s]["asked"], recs[s]["answered"], recs[s]["read_at"])
                for s in SOURCES],
               [("logs", READ, 48, 48, "2026-11-03T12:00:00Z"),
-               ("ledger", READ, 3, 3, "2026-11-03T12:00:00Z"),
+               ("ledger", READ, 4, 4, "2026-11-03T12:00:00Z"),   # KIT-596: + the review record
                ("planner", READ, 1, 1, "2026-11-03T12:00:00Z")])
         check("a placeholder no run follows is a run that never reached the model: three of the "
               "25 read, one of them with no start, and none of the 22 that match",
@@ -1293,8 +1319,36 @@ def _cases(check):
         check("a review record that cannot be read, or ledger lines that are not rows, leave the "
               "ledger partly read, said and counted",
               (rec(w_rec, "ledger"), rec(w_torn, "ledger")),
-              ((PARTLY, 4, 3, "a review record could not be read"),
-               (PARTLY, 3, 2, "2 line(s) of the bounce ledger could not be read")))
+              ((PARTLY, 5, 4, "a review record could not be read"),
+               (PARTLY, 4, 3, "2 line(s) of the bounce ledger could not be read")))
+
+        # KIT-596: the review poller's own record. scan() carries it into each run's kind and
+        # into the summary's reviewers; reading it is one question on the ledger; a record
+        # that cannot be read is unknown, never "no reviews", and is said.
+        if HERE not in sys.path:
+            sys.path.insert(0, HERE)
+        import pipeline_machine_tickets as machine
+        w_rv, ids_rv = std_world(os.path.join(tmp, "rv"))
+        machine.add_to_review_record(w_rv["stage_e_state_dir"], "iss-15", "ENG-15", "acme/app", 9)
+        check("KIT-596 a run in a recorded ticket's folder is a review, told by the record, and "
+              "the record reaches the summary",
+              (facts_for(w_rv, ids_rv)["E15"][:2], scan(w_rv, lambda: T)["reviewers"]),
+              (("review", "record"), frozenset({"ENG-15"})))
+        w_bad = std_world(os.path.join(tmp, "rv-bad"))[0]
+        with open(machine.review_record_path(w_bad["stage_e_state_dir"]), "w") as fh:
+            fh.write("{")
+        absent, bad = Source(lambda: T), Source(lambda: T)
+        check("KIT-596 an absent review record is an empty answer, asked and answered; an "
+              "unreadable one is unknown, asked, not answered, and said",
+              (read_reviewers(std_world(os.path.join(tmp, "rv-none"))[0], absent),
+               (absent.asked, absent.answered, absent.problems),
+               read_reviewers(w_bad, bad), (bad.asked, bad.answered),
+               "the review poller's record could not be read" in (bad.problems or [""])[0]),
+              (frozenset(), (1, 1, []), None, (1, 0), True))
+        bad_ledger = rec(w_bad, "ledger")
+        check("KIT-596 an unreadable review record is said on the ledger, which is partly read",
+              (bad_ledger[0], "the review poller's record could not be read" in (bad_ledger[3] or "")),
+              (PARTLY, True))
         check("an idea-gate record that is not JSON, or holds no triggers, is could-not-read: "
               "no planning run is guessed",
               (rec(w_gate, "planner"), rec(w_none, "planner")),
@@ -1467,6 +1521,11 @@ def _cases(check):
             classify([r], {"reviews_team_key": "REV"}, planners, reprompts,
                      firsts if firsts is not None else {ws: (0.0, "s0")})
             return r["kind"], r["how"]
+        r596 = {"workspace": "ENG-12", "start": 5.0, "session": "s", "prompt": None}
+        classify([r596], {"reviews_team_key": ""}, frozenset(), [], {"ENG-12": (0.0, "s0")},
+                 frozenset({"ENG-12"}))
+        check("KIT-596 a review on a work team is told by the poller's record",
+              (r596["kind"], r596["how"]), ("review", "record"))
         check("a ledger row names the run that starts from 60 seconds before it to 30 minutes "
               "after it, and no other", [kind_of(s)[0] for s in (939.0, 940.0, 2800.0, 2801.0)],
               ["other_later", "bounce_fix", "bounce_fix", "other_later"])

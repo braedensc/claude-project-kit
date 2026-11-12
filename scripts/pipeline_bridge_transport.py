@@ -68,8 +68,15 @@ class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
 _OPENER = urllib.request.build_opener(_RefuseRedirect)
 
 
-def _http_json(url, headers, payload=None, timeout=20):
-    data = None if payload is None else json.dumps(payload).encode("utf-8")
+def _http_json(url, headers, payload=None, timeout=20, form=False):
+    """The answer's JSON. A form call's payload goes form-encoded, every other call's as JSON:
+    a JSON body labelled as a form is what Slack refuses with invalid_form_data (KIT-616)."""
+    if payload is None:
+        data = None
+    elif form:
+        data = urllib.parse.urlencode(payload).encode("utf-8")
+    else:
+        data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=headers,
                                  method="GET" if payload is None else "POST")
     with _OPENER.open(req, timeout=timeout) as resp:
@@ -167,7 +174,12 @@ class SlackClient(object):
                    "Content-Type": ("application/x-www-form-urlencoded" if form
                                     else "application/json; charset=utf-8")}
         try:
-            doc = _http_json("%s/%s" % (self.base, method), headers, payload)
+            # Only a form call names `form`, so a JSON call reaches _http_json (and every
+            # stand-in other modules' selftests put there) exactly as before (KIT-616).
+            if form:
+                doc = _http_json("%s/%s" % (self.base, method), headers, payload, form=True)
+            else:
+                doc = _http_json("%s/%s" % (self.base, method), headers, payload)
         except (urllib.error.URLError, OSError, ValueError) as exc:
             raise BridgeError("Slack %s failed (%s)" % (method, type(exc).__name__))
         if not isinstance(doc, dict) or not doc.get("ok"):
@@ -461,7 +473,7 @@ def selftest():
     def through(answer, call):
         sent = []
 
-        def stub(url, headers, payload=None, timeout=20):
+        def stub(url, headers, payload=None, timeout=20, form=False):
             sent.append((url, dict(headers), payload))
             return answer(url, payload)
         real_http = globals()["_http_json"]
@@ -610,6 +622,56 @@ def selftest():
     finally:
         server.shutdown()
         server.server_close()
+        for k, v in saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    # 3a. A FORM CALL SENDS A FORM (KIT-616), through the real transport, not the stub: the body
+    #     and content type a local server receives. apps.connections.open is form-encoded; a JSON
+    #     body labelled as a form is what Slack refused with invalid_form_data on the first live
+    #     run. Every other call still sends JSON.
+    class _Recorder(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            self.server.hits.append((self.path.rsplit("/", 1)[-1],
+                                     self.headers.get("Content-Type"), body))
+            reply = json.dumps({"ok": True,
+                                "url": "wss://wss-primary.slack.com/l/?ticket=T"}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(reply)))
+            self.end_headers()
+            self.wfile.write(reply)
+
+        def log_message(self, *_args):
+            pass
+
+    recorder = http.server.HTTPServer(("127.0.0.1", 0), _Recorder)
+    recorder.hits = []
+    threading.Thread(target=recorder.serve_forever, daemon=True).start()
+    saved_env = dict((k, os.environ.get(k)) for k in ("no_proxy", "NO_PROXY"))
+    os.environ["no_proxy"] = os.environ["NO_PROXY"] = "127.0.0.1,localhost"
+    try:
+        local = SlackClient({"chat_api_base": "http://127.0.0.1:%d/api"
+                             % recorder.server_address[1]}, "form-test-token")
+        try:
+            opened = local.open_socket_url("xapp-test")
+            local.delete_message("D0DM000001", "1.0")
+        except BridgeError as exc:
+            opened = "BridgeError: %s" % exc
+        hits = dict((h[0], (h[1], h[2])) for h in recorder.hits)
+        deleted = hits.get("chat.delete") or (None, b"{}")
+        check("real-slack:the-socket-call-sends-a-real-form-body-and-other-calls-send-json",
+              (opened, hits.get("apps.connections.open"), deleted[0],
+               json.loads(deleted[1].decode("utf-8") or "{}")),
+              ("wss://wss-primary.slack.com/l/?ticket=T",
+               ("application/x-www-form-urlencoded", b""),
+               "application/json; charset=utf-8", {"channel": "D0DM000001", "ts": "1.0"}))
+    finally:
+        recorder.shutdown()
+        recorder.server_close()
         for k, v in saved_env.items():
             if v is None:
                 os.environ.pop(k, None)

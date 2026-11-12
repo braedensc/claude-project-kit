@@ -215,10 +215,77 @@ fails or times out fails the check too: it has not shown that it cleans up.
 every battery again and sends each one SIGTERM one second in, with nothing gentler first,
 to its whole process group. That is how a session's Bash timeout ends a run. Anything left
 then fails, and so does a battery that does not end within 15 seconds of the signal.
-**Kit checks** runs both passes after every battery has run on its own.
+The **Temp-leak sweeps** job runs both passes, beside **Kit checks** (KIT-617).
 
 **A new selftest needs a `test:*` script in package.json.** The check runs only what
 package.json lists.
+
+---
+
+## Job limits and what to do near one
+
+CI's jobs in `.github/workflows/ci.yml` each have their own `timeout-minutes`. A run that hits
+the limit is cancelled, and a cancelled run reads as red CI although nothing failed.
+
+| Job | Limit | Required to merge | Measured |
+| --- | --- | --- | --- |
+| Kit checks | 15 minutes | yes | 5.8 and 6.5 minutes (was 12 to 14) |
+| Temp-leak sweeps | 20 minutes | not until the owner adds it | 7.7 and 7.6 minutes |
+| Provenance scan | 10 minutes | yes | under a minute |
+
+**Why the sweeps have their own job (KIT-617).** They ran as the last steps of Kit checks and
+took about 7.5 minutes together (6.5 and 1), which put Kit checks at 12.6 to 14.4 minutes against 15. Now they
+run beside the selftests.
+
+**Adding the job to the required checks.** A job that is not required does not block a merge.
+Until the owner adds it, a leak turns the PR red and nothing stops the merge. The owner runs this
+once, after the PR that adds the job has merged and the job has reported on main (a context
+that has never reported wedges every open PR):
+
+```bash
+gh api -X POST repos/braedensc/claude-project-kit/branches/main/protection/required_status_checks/contexts -f 'contexts[]=Temp-leak sweeps'
+```
+
+That adds one context and keeps the others. It assumes classic branch protection, which the
+kit's `main` uses today. If the rules live in a ruleset instead, add the check there.
+A session never changes branch protection.
+
+**When a run comes within three minutes of its limit.**
+
+1. Read the step times in the run (`gh run view <id> --json jobs`). Find the slowest steps.
+2. Move work to a new job before raising a limit. A job's limit is a ceiling for one runner.
+3. Raise a limit only with a comment beside it that says what was measured.
+4. Never add a battery to a job that is already within three minutes of its limit.
+
+Good: a new job beside the others, its limit set from three measured runs.
+Not that: a limit raised until the cancelling stops.
+
+---
+
+## Which Python each job runs (KIT-653)
+
+Every job and hook on the owner's Mac runs Apple's `/usr/bin/python3`, which is 3.9.6.
+Code that is fine on a newer Python can break there, so one job runs on it.
+
+| Job | Runner | Python |
+| --- | --- | --- |
+| Kit checks | `ubuntu-24.04` | the runner's own, 3.12 |
+| Temp-leak sweeps | `ubuntu-24.04` | the runner's own, 3.12 |
+| CI on the newest image | `ubuntu-latest` | the newest 3.x |
+| Kit checks (Python 3.9, the Mac's) | `macos-15` | `/usr/bin/python3`, 3.9.x |
+| The Mac | the owner's | `/usr/bin/python3`, 3.9.6 |
+
+The Python 3.9 job (`.github/workflows/ci-mac-python.yml`) puts a `python3` link to
+`/usr/bin/python3` first on the PATH, then fails unless `python3 -V` says 3.9 and matches
+`/usr/bin/python3 -V`. It byte-compiles every tracked `.py`, then runs `npm run check:temp-leaks`
+(the hook battery and every other battery, one at a time). A failure turns the PR red.
+
+It is **not a required context until the owner adds it**, the same way as Temp-leak sweeps
+above (context name `Kit checks (Python 3.9, the Mac's)`). If it nears its limit, split the
+job; do not trim batteries.
+
+macOS minutes are free on a public repository. A private copy of the kit is billed for them at
+a high rate (a multiple of the Linux rate), so check the plan before copying this workflow there.
 
 ---
 
@@ -239,6 +306,15 @@ a choice made in a PR:
    own Kit checks, now on the new image, are the proof.
 3. `python3 scripts/check_runner_pin.py` fails any `-latest` runner outside the newest-image
    workflow, so a new workflow cannot quietly bring the problem back.
+
+## Standard library only
+
+`python3 scripts/check_stdlib_only.py` reads every tracked `.py` file and fails on an import that
+is neither the standard library nor a kit module, naming the file, line and module. The few
+exceptions are the `ALLOWED` list in the script, each with a reason; an entry matching no import
+fails too. Its standard-library list is one constant, so Python 3.9 and 3.12 agree; the selftest
+fails when the running Python knows a module the constant lacks (add it). `npm run
+test:stdlib-only` runs the selftest, `npm run lint:stdlib-only` the real check.
 
 ## What CI never does
 
@@ -263,5 +339,19 @@ from a production eval harness and its de-rot arc:
 - **Dedicated non-prod eval API key** (e.g. `EVAL_ANTHROPIC_API_KEY`), and the
   harness hard-refuses any non-local backend — an eval run must never touch prod
   data or spend against the prod key.
+- **Load that key for one command, from the macOS Keychain — never export it from a
+  shell profile.** Every Claude session inherits the shell's environment, so an
+  exported key sits in every session, subagent and `claude -p` it starts, where a
+  steered session could read it. Store it once (the `-w` with no value prompts you;
+  nothing lands in shell history), then read it only for the eval run:
+
+  ```sh
+  security add-generic-password -s eval-anthropic-key -a "$USER" -w
+  EVAL_ANTHROPIC_API_KEY="$(security find-generic-password -s eval-anthropic-key -w)" npm run eval
+  ```
+
+  Good: the variable is set for that one process and gone when it ends.
+  Not that: `export EVAL_ANTHROPIC_API_KEY=…` in `~/.zshrc`. Open a fresh terminal and
+  `env | grep -c EVAL_` prints `0`.
 - **Evals rot alongside the prompts they pin:** when prompts churn, schedule a
   de-rot pass over the suite in the same arc, not "someday".

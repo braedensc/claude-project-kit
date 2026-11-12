@@ -56,6 +56,24 @@ WHAT THIS IS
   |                          | (KIT-350)             | the other open PRs                |                |
   | session-ended-empty      | the status file       | the session ended with no PR and  | no             |
   |                          | (KIT-350)             | no question; links the ticket     |                |
+  | acceptance-passed        | the acceptance        | the plan's check passed; with its | no             |
+  |                          | poller's ledger       | screenshots (KIT-555)             |                |
+  | acceptance-held          | the acceptance        | a problem or a failed run holds   | no             |
+  |                          | poller's ledger       | the plan open                     |                |
+  | acceptance-could-not-    | the acceptance        | the check could not check, and    | no             |
+  | check                    | poller's ledger       | why. Never a pass                 |                |
+
+  THE ACCEPTANCE PAGE (KIT-555). After a plan's acceptance check, the acceptance poller records
+  its verdict in its own ledger, with the page's facts beside it: counts, flags, one closed word
+  for why a check could not check, and up to four screenshots the look tool kept. They are read
+  through scripts/pipeline_notify_events.py, never from a comment, which a session can write.
+  One mark per verdict, so the words of a pass can never be a could-not-check's, and only the
+  two that need a person @mention anyone. The page goes first, as text, and the screenshots go
+  into its thread (send_page_with_images, KIT-568). Without them it still goes, and says why.
+  With the writer on, the words of a could-not-check page must keep "could not check" and "not
+  a pass", and none of the three may say a verdict that is not its own: a page the writer words
+  any other way goes out as the fixed text. `acceptance_ledger` names the ledger and
+  `look_record_dir` where the look tool keeps its screenshots. Empty, each is off and said.
 
   A STUCK PULL REQUEST (KIT-336). The review lane's "NOT reviewed" verdict was first left
   unpaged, as a verdict CI shows. It is paged now: a review that couldn't run, or that left
@@ -504,9 +522,12 @@ HEALTH_MARKS = (ESC_HEALTH_INCIDENT, ESC_HEALTH_RECOVERED)
 # The bounce driver's page (KIT-225). Accepted only from `bounce_actor_ids`.
 ESC_READY_TO_MERGE = "ready-to-merge"
 READY_MARKS = (ESC_READY_TO_MERGE,)
-# The finding job's page (KIT-243). Accepted only from `finding_actor_ids`.
+# The finding job's pages (KIT-243). Accepted only from `finding_actor_ids`, and one page
+# per finding ticket across both. The second is for a follow-up the acceptance check asked
+# for (KIT-607), so its words say the check asked, not a dev.
 ESC_FINDING_FILED = "finding-filed"
-FINDING_MARKS = (ESC_FINDING_FILED,)
+ESC_ACCEPTANCE_FINDING_FILED = "acceptance-finding-filed"
+FINDING_MARKS = (ESC_FINDING_FILED, ESC_ACCEPTANCE_FINDING_FILED)
 # KIT-336: the review poller's two pages, read from its own records by
 # scripts/pipeline_notify_events.py, which spells these marks too (the selftest pins them).
 # Never from a comment: a session can write one.
@@ -518,8 +539,14 @@ ESC_REVIEW_LEFT_BEHIND = "review-left-behind"
 ESC_CONFLICT_GAVE_UP = "conflict-gave-up"
 ESC_UNION_RED = "union-red"
 ESC_SESSION_ENDED_EMPTY = "session-ended-empty"
+# KIT-555: the acceptance check's page, one mark per verdict, read from the acceptance poller's
+# ledger, never from a comment. scripts/pipeline_notify_events.py spells them too (pinned).
+ESC_ACCEPTANCE_PASSED = "acceptance-passed"
+ESC_ACCEPTANCE_HELD = "acceptance-held"
+ESC_ACCEPTANCE_NOT_CHECKED = "acceptance-could-not-check"
+ACCEPTANCE_MARKS = (ESC_ACCEPTANCE_PASSED, ESC_ACCEPTANCE_HELD, ESC_ACCEPTANCE_NOT_CHECKED)
 FILE_MARKS = (ESC_REVIEW_DECLINED, ESC_REVIEW_PARTIAL, ESC_CONFLICT_GAVE_UP, ESC_UNION_RED,
-              ESC_SESSION_ENDED_EMPTY, ESC_REVIEW_LEFT_BEHIND)
+              ESC_SESSION_ENDED_EMPTY, ESC_REVIEW_LEFT_BEHIND) + ACCEPTANCE_MARKS
 # The only shape a ready-to-merge page may link: a pull request on the code host, whole.
 PR_URL_RE = re.compile(r"^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[0-9]+$")
 # KIT-350: the one other link a file page may carry: its own ticket on the tracker, whole.
@@ -631,6 +658,45 @@ REVIEW_PARTIAL_WORDS = ("The review of this ticket's pull request left %s unread
 REVIEW_LEFT_BEHIND_WORDS = ("The review of this ticket's pull request left %s unread, and the "
                             "pull request has changed since, so %s won't be reviewed "
                             "automatically. A person needs to read %s.")
+# KIT-555: the words the acceptance page is built from. Each count, flag and cause in its detail
+# is put into words held here, so nothing the session wrote reaches a page. A could-not-check
+# page names why from ACCEPTANCE_CAUSE_WORDS, keyed by the poller's closed causes; `unknown` is
+# a reason it can't name, and it then names none.
+ACCEPTANCE_PASSED_OPENING = ("The acceptance check on this plan passed: nothing it found in the "
+                             "browser holds the plan open.")
+ACCEPTANCE_PASSED_TAIL = "Nothing is needed from you for the check."
+ACCEPTANCE_HELD_OPENING = "The acceptance check held this plan open"
+ACCEPTANCE_HELD_TAIL = ("The plan stays open until a new push passes the check. The plan's "
+                        "ticket lists what holds it.")
+ACCEPTANCE_NOT_CHECKED_OPENING = "The acceptance check could not check this plan"
+ACCEPTANCE_NOT_CHECKED_TAIL = ("so this is not a pass. A person needs to look: the plan's ticket "
+                               "says what happened.")
+ACCEPTANCE_CAUSE_WORDS = {
+    "no-result": "the session left no result it could read",
+    "no-record": "the look tool has no record of its runs that it could read",
+    "session-said": "the session said it could not check",
+    "could-not-run": "some of its runs could not run",
+    "disagree": "the session and the look tool's record disagree about what ran",
+    "malformed": "some problems the session listed were not in the agreed shape",
+    "timed-out": "it ran past its time limit, so the check was stopped",
+    "unknown": None,
+}
+ACCEPTANCE_FOLLOWUP_ONE = "It sent one follow-up to the backlog."
+ACCEPTANCE_FOLLOWUPS = "It sent %d follow-ups to the backlog."
+ACCEPTANCE_NOT_MECHANICAL = ("Part of the result rests on test code the change itself could "
+                             "alter, so read the screenshots with that in mind.")
+ACCEPTANCE_UNPOSTED = ("Its verdict may not have reached the plan's ticket: the poller could not "
+                       "confirm the comment.")
+ACCEPTANCE_SHOT_ONE = "One screenshot follows in the thread."
+ACCEPTANCE_SHOTS = "%d screenshots follow in the thread."
+ACCEPTANCE_NO_SHOTS = {
+    "none": "No screenshots came with it.",
+    "off": "No screenshots came with it: this notifier is set not to send them.",
+}
+# A kept screenshot under `look_record_dir/<plan>/`: the look tool's run id and its name rule
+# (pipeline_look.SHOT_NAME_RE), the only thing an acceptance page may send (KIT-567, KIT-555).
+ACCEPTANCE_IMAGE_RE = re.compile(
+    r"^[0-9]{3,4}-[0-9]{8}T[0-9]{6}Z/[A-Za-z0-9][A-Za-z0-9._-]{0,199}\.png\Z")
 
 MARKS = {
     ESC_AWAITING_APPROVAL: {
@@ -735,6 +801,14 @@ MARKS = {
         "label": None,
         "why_no_label": "a backlog ticket for a person to read, not a block",
     },
+    ESC_ACCEPTANCE_FINDING_FILED: {
+        "page": "The acceptance check asked for this follow-up when it tried out a plan's "
+                "work, and it was filed in the backlog. Nothing is needed from you unless you "
+                "want it done.",
+        "needs_you": False,
+        "label": None,
+        "why_no_label": "a backlog ticket for a person to read, not a block",
+    },
     ESC_FIX_NOT_PUSHED: {
         "page": "A fix was asked for on this ticket's pull request, and nothing has been "
                 "pushed since. The dev may have stopped: the ticket says when the fix was "
@@ -787,6 +861,34 @@ MARKS = {
         "label": None,
         "why_no_label": "the session asked for nothing, so no supervision label fits",
     },
+    # KIT-555: from the acceptance poller's ledger, never a comment. With its detail read,
+    # page_words builds each from the ACCEPTANCE_* words above. `keep` is what the writer must
+    # copy word for word, and `forbid` what it may never say: each page forbids the other two
+    # verdicts by name, so no page is worded as a verdict that is not its own.
+    ESC_ACCEPTANCE_PASSED: {
+        "page": "%s %s" % (ACCEPTANCE_PASSED_OPENING, ACCEPTANCE_PASSED_TAIL),
+        "needs_you": False,
+        "label": None,
+        "why_no_label": "a check that passed asks nothing of anyone",
+        "keep": ("passed",),
+        "forbid": ("could not check", "not a pass", "held"),
+    },
+    ESC_ACCEPTANCE_HELD: {
+        "page": "%s. %s" % (ACCEPTANCE_HELD_OPENING, ACCEPTANCE_HELD_TAIL),
+        "needs_you": True,
+        "label": None,
+        "why_no_label": "the plan stays open by itself, and its follow-ups are filed",
+        "keep": ("held",),
+        "forbid": ("passed", "could not check"),
+    },
+    ESC_ACCEPTANCE_NOT_CHECKED: {
+        "page": "%s, %s" % (ACCEPTANCE_NOT_CHECKED_OPENING, ACCEPTANCE_NOT_CHECKED_TAIL),
+        "needs_you": True,
+        "label": None,
+        "why_no_label": "the plan stays open by itself until a check passes",
+        "keep": ("could not check", "not a pass"),
+        "forbid": ("passed", "held"),
+    },
 }
 
 # The mark as every producer writes it, matched on a body's FIRST line only.
@@ -805,8 +907,9 @@ MARK_PRECEDENCE = [ESC_NEEDS_HUMAN, ESC_NEEDS_HUMAN_SESSION, ESC_NEEDS_HUMAN_ROU
                    ESC_NO_OUTPUT, ESC_NEEDS_INPUT,
                    ESC_REJECTED, ESC_AWAITING_APPROVAL, ESC_HEALTH_INCIDENT,
                    ESC_HEALTH_RECOVERED, ESC_READY_TO_MERGE, ESC_FINDING_FILED,
-                   ESC_REVIEW_DECLINED, ESC_REVIEW_PARTIAL, ESC_CONFLICT_GAVE_UP,
-                   ESC_UNION_RED, ESC_SESSION_ENDED_EMPTY, ESC_REVIEW_LEFT_BEHIND]
+                   ESC_ACCEPTANCE_FINDING_FILED, ESC_REVIEW_DECLINED, ESC_REVIEW_PARTIAL, ESC_CONFLICT_GAVE_UP,
+                   ESC_UNION_RED, ESC_SESSION_ENDED_EMPTY, ESC_REVIEW_LEFT_BEHIND,
+                   ESC_ACCEPTANCE_NOT_CHECKED, ESC_ACCEPTANCE_HELD, ESC_ACCEPTANCE_PASSED]
 
 # Deliberately NOT a mark. The plan executor writes it on informational notes; paging on it
 # would turn every filed plan's footnote into a notification.
@@ -849,6 +952,14 @@ CONFIG_KEYS = {
                    "ended with no pull request and no question (KIT-350). Optional: empty or "
                    "absent, none pages and every pass says 'status file: OFF'. Never inside a "
                    "git worktree, where a session could write one",
+    "acceptance_ledger": "the acceptance poller's ledger (pipeline-acceptance-ledger/1). Each "
+                         "check's verdict there pages once, with its facts (KIT-555). Optional: "
+                         "empty or absent, none pages and every pass says 'acceptance pages: "
+                         "OFF'. Never inside a git worktree, where a session could write one",
+    "look_record_dir": "the look tool's record_dir, where it keeps each check's screenshots. An "
+                       "acceptance page sends up to four from there into its thread, with "
+                       "page_images on (KIT-555). Optional: empty or absent, no page carries "
+                       "one, and each says so. Never inside a git worktree",
     "max_events_per_pass": "flood guard; above it the pass sends one summary and declines",
     "lookback_comments": "how many recent comments per ticket to examine",
     "run_timeout_seconds": "wall clock for one pass; exceeding it is exit 4, not exit 1",
@@ -948,6 +1059,8 @@ EXAMPLE_CONFIG = {
     "finding_actor_ids": ["<finding-job author uuid>"],
     "review_state_dir": "",
     "status_file": "",
+    "acceptance_ledger": "",
+    "look_record_dir": "",
     "max_events_per_pass": 25,
     "lookback_comments": 20,
     "run_timeout_seconds": 240,
@@ -1024,6 +1137,8 @@ def load_config(path):
         "finding_actor_ids": raw.get("finding_actor_ids", []),
         "review_state_dir": raw.get("review_state_dir", ""),
         "status_file": raw.get("status_file", ""),
+        "acceptance_ledger": raw.get("acceptance_ledger", ""),
+        "look_record_dir": raw.get("look_record_dir", ""),
         "max_events_per_pass": raw.get("max_events_per_pass") or 25,
         "lookback_comments": raw.get("lookback_comments") or 20,
         "run_timeout_seconds": raw.get("run_timeout_seconds") or 240,
@@ -1160,6 +1275,22 @@ def load_config(path):
                 "write one there and page you" % cfg["status_file"])
     else:
         cfg["status_file"] = ""
+
+    # KIT-555: the acceptance poller's ledger, and where the look tool keeps its screenshots.
+    # Each is refused by name where a session could write it.
+    for key, what in (("acceptance_ledger", "the acceptance poller's ledger"),
+                      ("look_record_dir", "the look tool's record folder")):
+        value = cfg[key]
+        if not isinstance(value, str):
+            errors.append("config %r must be %s, or empty to leave it OFF, got %r"
+                          % (key, what, value))
+        elif value.strip():
+            cfg[key] = os.path.realpath(os.path.expanduser(value.strip()))
+            if _inside_git_worktree(cfg[key]):
+                errors.append("config %r (%s) is inside a git working tree — a session could "
+                              "write there and page you" % (key, cfg[key]))
+        else:
+            cfg[key] = ""
 
     # KIT-281: who a page that asks something of a person @mentions. Each id goes inside
     # `<@…>` in the chat text, so anything but a whole member id is refused: a value like
@@ -1824,6 +1955,8 @@ def check_detail(mark, detail):
             raise NotifierError("the %s page takes only files, a whole number from 1 to 9999"
                                 % mark)
         return dict(detail)
+    if mark in ACCEPTANCE_MARKS:
+        return _check_acceptance_detail(mark, detail)
     if mark != ESC_READY_TO_MERGE:
         raise NotifierError("the %s page takes no detail (%s)" % (mark, ", ".join(sorted(detail))))
     unknown = sorted(set(detail) - {"notes", "label_owed"})
@@ -1837,6 +1970,91 @@ def check_detail(mark, detail):
         raise NotifierError("a page's label_owed is True or absent, not %r"
                             % (detail["label_owed"],))
     return dict(detail)
+
+
+# KIT-555: the detail each acceptance page takes besides `posted`, `shots` and `no_shots`.
+ACCEPTANCE_DETAIL_KEYS = {
+    ESC_ACCEPTANCE_PASSED: ("followups", "mechanical"),
+    ESC_ACCEPTANCE_HELD: ("holds", "failed_runs", "followups", "mechanical"),
+    ESC_ACCEPTANCE_NOT_CHECKED: ("cause", "mechanical"),
+}
+
+
+def _check_acceptance_detail(mark, detail):
+    """An acceptance page's detail, or NotifierError (KIT-555). `posted`, a flag: the verdict
+    comment was confirmed on the plan. `shots`, how many screenshots go with the page, 0 to
+    MAX_PAGE_IMAGES, and `no_shots`, why none go, a key of ACCEPTANCE_NO_SHOTS, present exactly
+    when `shots` is 0. Then the page's own: counts from 0 to 999, `mechanical` a flag, and a
+    could-not-check's `cause`, a key of ACCEPTANCE_CAUSE_WORDS. Each is put into words this file
+    holds, so no text rides in on one."""
+    allowed = {"posted", "shots", "no_shots"} | set(ACCEPTANCE_DETAIL_KEYS[mark])
+    if not {"posted", "shots"} <= set(detail) or set(detail) - allowed:
+        raise NotifierError("the %s page takes posted and shots, and besides them only %s (%s)"
+                            % (mark, ", ".join(sorted(allowed - {"posted", "shots"})),
+                               ", ".join(sorted(detail))))
+    if type(detail["posted"]) is not bool:
+        raise NotifierError("an acceptance page's posted is True or False, not %r"
+                            % (detail["posted"],))
+    shots = detail["shots"]
+    if type(shots) is not int or not 0 <= shots <= MAX_PAGE_IMAGES:
+        raise NotifierError("an acceptance page's shots is a whole number from 0 to %d, not %r"
+                            % (MAX_PAGE_IMAGES, shots))
+    if ((shots == 0) != ("no_shots" in detail)
+            or detail.get("no_shots", "none") not in ACCEPTANCE_NO_SHOTS):
+        raise NotifierError("an acceptance page with no screenshots says why, one of %s, and only "
+                            "then" % ", ".join(sorted(ACCEPTANCE_NO_SHOTS)))
+    for key in ("holds", "failed_runs", "followups"):
+        if key in detail and (type(detail[key]) is not int or not 0 <= detail[key] <= 999):
+            raise NotifierError("an acceptance page's %s is a whole number from 0 to 999, not %r"
+                                % (key, detail[key]))
+    if "mechanical" in detail and type(detail["mechanical"]) is not bool:
+        raise NotifierError("an acceptance page's mechanical is True or False, not %r"
+                            % (detail["mechanical"],))
+    if "cause" in detail and (not isinstance(detail["cause"], str)
+                              or detail["cause"] not in ACCEPTANCE_CAUSE_WORDS):
+        raise NotifierError("an acceptance page's cause is one of %s"
+                            % ", ".join(sorted(ACCEPTANCE_CAUSE_WORDS)))
+    return dict(detail)
+
+
+def _acceptance_words(mark, detail):
+    """The acceptance page with its detail read (KIT-555): what the check concluded, in this
+    file's words, then what it sent on, whether the record is the runner's alone, whether the
+    verdict reached the plan, and the screenshots. A could-not-check page is never worded as a
+    pass: its words are this file's, and the writer may not say otherwise (write_page)."""
+    words = []
+    if mark == ESC_ACCEPTANCE_PASSED:
+        words.append(ACCEPTANCE_PASSED_OPENING)
+    elif mark == ESC_ACCEPTANCE_HELD:
+        parts = []
+        holds, failed = detail.get("holds", 0), detail.get("failed_runs", 0)
+        if holds:
+            parts.append("one problem is still serious after a second look" if holds == 1 else
+                         "%d problems are still serious after a second look" % holds)
+        if failed:
+            parts.append("one run failed in the browser" if failed == 1 else
+                         "%d runs failed in the browser" % failed)
+        words.append("%s%s." % (ACCEPTANCE_HELD_OPENING, ": " + " and ".join(parts) if parts else ""))
+    else:
+        why = ACCEPTANCE_CAUSE_WORDS.get(detail.get("cause") or "unknown")
+        words.append("%s: %s, %s" % (ACCEPTANCE_NOT_CHECKED_OPENING, why, ACCEPTANCE_NOT_CHECKED_TAIL)
+                     if why else "%s, %s" % (ACCEPTANCE_NOT_CHECKED_OPENING,
+                                             ACCEPTANCE_NOT_CHECKED_TAIL))
+    n = detail.get("followups", 0)
+    if n and mark != ESC_ACCEPTANCE_NOT_CHECKED:
+        words.append(ACCEPTANCE_FOLLOWUP_ONE if n == 1 else ACCEPTANCE_FOLLOWUPS % n)
+    if mark == ESC_ACCEPTANCE_HELD:
+        words.append(ACCEPTANCE_HELD_TAIL)
+    if detail.get("mechanical") is False and mark != ESC_ACCEPTANCE_NOT_CHECKED:
+        words.append(ACCEPTANCE_NOT_MECHANICAL)
+    if not detail["posted"]:
+        words.append(ACCEPTANCE_UNPOSTED)
+    elif mark == ESC_ACCEPTANCE_PASSED:
+        words.append(ACCEPTANCE_PASSED_TAIL)
+    shots = detail["shots"]
+    words.append(ACCEPTANCE_NO_SHOTS[detail["no_shots"]] if not shots else
+                 ACCEPTANCE_SHOT_ONE if shots == 1 else ACCEPTANCE_SHOTS % shots)
+    return " ".join(words)
 
 
 def _check_failed_detail(detail):
@@ -1994,6 +2212,8 @@ def page_words(mark, detail=None):
         n = detail["files"]
         return REVIEW_LEFT_BEHIND_WORDS % (("one file", "it", "it") if n == 1
                                            else ("%d files" % n, "they", "them"))
+    if mark in ACCEPTANCE_MARKS:
+        return _acceptance_words(mark, detail)
     words = [READY_OPENING]
     if "notes" in detail:
         n = detail["notes"]
@@ -2048,11 +2268,15 @@ def write_page(cfg, writer, event, plain, deadline=None):
         return plain, "fallback", "the writer could not be loaded"
     if not writer_has_time(cfg, deadline):
         return plain, "fallback", "too little of this pass was left to wait for the writer"
+    # KIT-555: a mark may name words the writer must keep, word for word, and words it may never
+    # say: a could-not-check page keeps "could not check" and never says "passed" or "held".
+    rules = MARKS.get(event["mark"]) or {}
     try:
         res = writer(cfg, event["mark"], page_facts(event["mark"], event["ticket_id"],
                                                     event["ticket_title"], event["url"],
                                                     event.get("detail")),
-                     fallback=plain, keep=[event["ticket_id"], event["url"]])
+                     fallback=plain,
+                     keep=[event["ticket_id"], event["url"]] + list(rules.get("keep", ())))
     except Exception as exc:                                      # noqa: BLE001
         return plain, "fallback", "the writer failed (%s)" % type(exc).__name__
     if not isinstance(res, dict) or res.get("by") not in ("model", "fallback"):
@@ -2062,7 +2286,20 @@ def write_page(cfg, writer, event, plain, deadline=None):
     text = res.get("text")
     if not isinstance(text, str) or not text.strip():
         return plain, "fallback", "the writer said it wrote the page but gave no text"
+    for word in rules.get("keep", ()):
+        if not _says(word, text, ignore_case=False):
+            return plain, "fallback", "the writer's words left out \"%s\"" % word
+    for word in rules.get("forbid", ()):
+        if _says(word, text, ignore_case=True):
+            return (plain, "fallback",
+                    "the writer's words say \"%s\", which this page never says" % word)
     return text, "model", ""
+
+
+def _says(words, text, ignore_case):
+    """Whether `text` holds `words` as whole words: "passed" is not in "passedown" (KIT-555)."""
+    return re.search(r"(?<![A-Za-z0-9])%s(?![A-Za-z0-9])" % re.escape(words), text,
+                     re.IGNORECASE if ignore_case else 0) is not None
 
 
 def mention_prefix(mark, cfg):
@@ -2474,14 +2711,46 @@ def make_asked(tickets):
     return asked
 
 
-def _file_link_fits(mark, ticket_id, url):
-    """A session page links its own ticket on Linear; every other file page a pull request."""
+def _file_link_fits(mark, ticket_id, url, cfg=None):
+    """A session page links its own ticket on Linear, an acceptance page its plan's ticket, made
+    from this config's own template (KIT-555); every other file page a pull request."""
     if not isinstance(url, str):
         return False
     if mark == ESC_SESSION_ENDED_EMPTY:
         match = LINEAR_ISSUE_URL_RE.match(url)
         return bool(match) and match.group(1) == ticket_id
+    if mark in ACCEPTANCE_MARKS:
+        return bool(cfg) and url == ticket_url(cfg, ticket_id)
     return bool(PR_URL_RE.match(url))
+
+
+def _page_images_fit(cfg, ticket_id, images):
+    """The screenshots an acceptance page carries (KIT-555): full paths straight under
+    `look_record_dir/[<check folder>/]<plan>/<run id>/`, the check folder a ticket id, each
+    named in the look tool's shape, at most MAX_PAGE_IMAGES. Anything else and the page carries
+    none. send_page_with_images then reads each once, never through a link."""
+    root = cfg.get("look_record_dir") or ""
+    if not isinstance(images, list) or len(images) > MAX_PAGE_IMAGES or (images and not root):
+        return False
+    for path in images:
+        if (not isinstance(path, str) or os.path.normpath(path) != path
+                or not path.startswith(root + os.sep)):
+            return False
+        parts = path[len(root) + 1:].split(os.sep)
+        if len(parts) == 4 and TICKET_ID_RE.match(parts[0]):
+            parts = parts[1:]                      # the check's own record folder
+        if (len(parts) != 3 or parts[0] != ticket_id
+                or not ACCEPTANCE_IMAGE_RE.match("/".join(parts[1:]))):
+            return False
+    return True
+
+
+def _page_count_fits(detail, images):
+    """Whether an acceptance page's `shots`, the number its words say follow in its thread, is
+    the number of screenshots it carries (KIT-555). Its words are built from `shots` before any
+    is sent, so a page saying three that carries none would promise what never comes."""
+    shots = detail.get("shots") if isinstance(detail, dict) else None
+    return type(shots) is int and isinstance(images, list) and shots == len(images)
 
 
 def file_events(cfg, sent_keys, now, chosen, asked=None):
@@ -2489,7 +2758,8 @@ def file_events(cfg, sent_keys, now, chosen, asked=None):
     as select_events builds one, in the room the cap leaves after `chosen`: (events,
     problems, held). Nothing on the board is written for them: no label, no comment, no
     thread. Each must carry one of FILE_MARKS, a ticket id and a link in their exact shapes
-    (_file_link_fits), or it is a problem and pages nobody; its detail is check_detail's,
+    (_file_link_fits), and an acceptance page exactly as many screenshots as its words say
+    (_page_count_fits), or it is a problem and pages nobody; its detail is check_detail's,
     like any page's. `asked` is make_asked's, for the session page; None tells nothing."""
     try:
         import pipeline_notify_events as nev
@@ -2502,17 +2772,25 @@ def file_events(cfg, sent_keys, now, chosen, asked=None):
     events = []
     for f in found:
         tid, url, key = f.get("ticket_id"), f.get("url"), f.get("key")
+        images = f.get("images") or []
         if (f.get("mark") not in FILE_MARKS or not isinstance(key, str) or not key
                 or not isinstance(tid, str) or not TICKET_ID_RE.match(tid)
-                or not _file_link_fits(f.get("mark"), tid, url)):
+                or not _file_link_fits(f.get("mark"), tid, url, cfg)
+                or (images and (f["mark"] not in ACCEPTANCE_MARKS
+                                or not _page_images_fit(cfg, tid, images)))):
             problems.append("a page read from a file was not in its shape, so it was not sent "
                             "(mark %r, ticket %r)" % (f.get("mark"), tid))
+            continue
+        if f["mark"] in ACCEPTANCE_MARKS and not _page_count_fits(f.get("detail"), images):
+            problems.append("an acceptance page read from a file says a number of screenshots "
+                            "that is not the number it carries, so it was not sent (ticket %r)"
+                            % tid)
             continue
         events.append({"key": key, "mark": f["mark"], "comment_id": None, "thread_id": None,
                        "settle": False, "ticket_id": tid, "ticket_uuid": None,
                        "ticket_title": f.get("ticket_title") or "", "url": url,
                        "detail": f.get("detail") or {}, "general": "", "author_id": "",
-                       "label": None, "existing_labels": []})
+                       "label": None, "existing_labels": [], "images": list(images)})
     return events, problems, held
 
 
@@ -3470,8 +3748,12 @@ def relay_replies(cfg, tracker, chat, relay_state, dry_run, now, out=sys.stdout,
     return result
 
 
-def page_dms(cfg, chat, dm_state, bridge_state, event, text, now, paged, secrets=()):
+def page_dms(cfg, chat, dm_state, bridge_state, event, text, now, paged, secrets=(), notes=None):
     """Post one page, top-level, to each person in `dm_user_ids`, in order (KIT-296).
+
+    A page with screenshots (KIT-555) goes through send_page_with_images: the page first, then
+    its screenshots in its thread. A screenshot that could not be sent is said in that thread,
+    and in `notes` when given, and never stops the page or changes what it returns.
 
     Returns (landed, reached, problems, unrecorded). `landed` is True only when every person
     has the page: posted now, or posted on an earlier pass and held in the DM ledger.
@@ -3513,7 +3795,14 @@ def page_dms(cfg, chat, dm_state, bridge_state, event, text, now, paged, secrets
             reached = True
         else:
             try:
-                reply = chat.post_message(text, channel=channel) or {}
+                if event.get("images"):
+                    reply, shot_note = send_page_with_images(chat, cfg, channel, text,
+                                                             event["images"])
+                    reply = reply or {}
+                    if shot_note and notes is not None:
+                        notes.append("%s: to %s, %s" % (tid, user_id, shot_note))
+                else:
+                    reply = chat.post_message(text, channel=channel) or {}
             except Deadline:
                 raise
             except Exception as exc:                              # noqa: BLE001
@@ -3648,6 +3937,7 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None, 
                 writer_notes.append("I could not load the writer (%s), so every page went out "
                                     "as its plain text" % type(exc).__name__)
     bridge_failures, dm_failures = [], []
+    image_notes = []                    # KIT-555: screenshots a page could not carry, and why
     tickets, read_failures = [], []
     for team in cfg["team_keys"]:
         try:
@@ -3860,6 +4150,9 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None, 
                 else:
                     out.write("WOULD SEND  %s  %s\n" % (event["ticket_id"], event["mark"]))
                 out.write("            %s\n" % text.replace("\n", " | "))
+                if event.get("images"):
+                    out.write("            and %d screenshot(s) in its thread\n"
+                              % len(event["images"]))
                 if event["label"]:
                     out.write("WOULD LABEL %s  %s\n"
                               % (event["ticket_id"], event["label"]))
@@ -3878,7 +4171,7 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None, 
                 try:
                     landed, reached, dm_problems, unrecorded = page_dms(
                         cfg, chat, dm_state, bridge_state if bridge_on else None, event, text,
-                        now, sent_keys, secrets)
+                        now, sent_keys, secrets, notes=image_notes)
                 except ChatDMScopeError as exc:
                     # Every DM would answer the same: said once, and no DM is opened after it.
                     declined += 1
@@ -3902,7 +4195,15 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None, 
                     # may have taken the label off since, as they can after a channel ping.
                     continue
             else:
-                reply = chat.post_message(text)
+                if event.get("images"):
+                    # KIT-555: the page first, then its screenshots in its thread. One that
+                    # could not be sent is said there, and here, and never stops the page.
+                    reply, shot_note = send_page_with_images(chat, cfg, None, text,
+                                                             event["images"])
+                    if shot_note:
+                        image_notes.append("%s: %s" % (event["ticket_id"], shot_note))
+                else:
+                    reply = chat.post_message(text)
                 if not (reply or {}).get("ok"):
                     declined += 1
                     problems.append("%s: chat refused (%s)"
@@ -4161,6 +4462,23 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None, 
         summary += (" | status file: OFF (status_file is empty) — a conflict the fix gave up "
                     "on, a pull request red only with the others, and a session that ended "
                     "with nothing page nobody")
+    # KIT-555: the acceptance pages, and whether they can carry their screenshots.
+    if cfg.get("acceptance_ledger"):
+        summary += " | acceptance pages: ON, read from %s" % cfg["acceptance_ledger"]
+        if not os.path.exists(cfg["acceptance_ledger"]):
+            summary += " (no ledger yet: no check has started)"
+        if cfg.get("look_record_dir") and cfg.get("page_images") is True:
+            summary += ", with screenshots from %s" % cfg["look_record_dir"]
+        else:
+            summary += (", with no screenshots: %s, and each page says so"
+                        % ("look_record_dir is empty" if not cfg.get("look_record_dir")
+                           else "page_images is off"))
+    else:
+        summary += (" | acceptance pages: OFF (acceptance_ledger is empty) — a plan's "
+                    "acceptance check pages nobody")
+    if image_notes:
+        summary += " | screenshots not all sent: " + "; ".join(redact(n, secrets)
+                                                             for n in image_notes)
     if declined and code == EXIT_OK:
         code = EXIT_DECLINED
     if problems:
@@ -4316,13 +4634,14 @@ def selftest():
     # ── §1. The mark table matches the ADR, and nothing extra pages ────────────────
     # Spelled as the ADR spells them, not through the constants: a renamed constant must not
     # carry the contract string along with it.
-    ok("all twenty-one ADR marks are known", set(MARKS) == {
+    ok("all twenty-five ADR marks are known", set(MARKS) == {
         ESC_AWAITING_APPROVAL, ESC_NEEDS_INPUT, ESC_NO_OUTPUT, ESC_REJECTED,
         ESC_BLOCKED, ESC_NEEDS_HUMAN, "daemon-health-incident", "daemon-health-recovered",
-        "ready-to-merge", "finding-filed",
+        "ready-to-merge", "finding-filed", "acceptance-finding-filed",
         "needs-human-session", "needs-human-routing", "fixes-spent", "planning-failed",
         "fix-not-pushed", "review-declined", "review-partial",
-        "conflict-gave-up", "union-red", "session-ended-empty", "review-left-behind"},
+        "conflict-gave-up", "union-red", "session-ended-empty", "review-left-behind",
+        "acceptance-passed", "acceptance-held", "acceptance-could-not-check"},
        sorted(MARKS))
     for mark in MARKS:
         ok("mark %s is found on a first line" % mark,
@@ -4440,6 +4759,10 @@ def selftest():
         "finding-filed":
             "A dev asked for this follow-up while working on another ticket, and it was "
             "filed in the backlog. Nothing is needed from you unless you want it done.",
+        "acceptance-finding-filed":
+            "The acceptance check asked for this follow-up when it tried out a plan's work, "
+            "and it was filed in the backlog. Nothing is needed from you unless you want it "
+            "done.",
         "fix-not-pushed":
             "A fix was asked for on this ticket's pull request, and nothing has been pushed "
             "since. The dev may have stopped: the ticket says when the fix was asked for.",
@@ -4463,6 +4786,15 @@ def selftest():
         "session-ended-empty":
             "The agent's session on this ticket ended without a pull request or a question. "
             "Someone needs to look at what it did, and hand it over again if it should go on.",
+        "acceptance-passed":
+            "The acceptance check on this plan passed: nothing it found in the browser holds "
+            "the plan open. Nothing is needed from you for the check.",
+        "acceptance-held":
+            "The acceptance check held this plan open. The plan stays open until a new push "
+            "passes the check. The plan's ticket lists what holds it.",
+        "acceptance-could-not-check":
+            "The acceptance check could not check this plan, so this is not a pass. A person "
+            "needs to look: the plan's ticket says what happened.",
     }
     # Every mark AND every pinned page: a mark added without a pinned page fails here, and
     # so does a pinned page for a mark that is gone.
@@ -4679,8 +5011,10 @@ def selftest():
     ok("KIT-321: the question's flag needs direct messages and replan_in_dm True itself",
        _flags == [{"bind": True}, {}, {}, {}], _flags)
     _needs_you = sorted(m for m in MARKS if MARKS[m].get("needs_you") is True)
-    ok("every page asks something of a person except a recovery and a filed finding",
-       _needs_you == sorted(set(MARKS) - {"daemon-health-recovered", "finding-filed"})
+    ok("every page asks something of a person except a recovery, a filed finding and an "
+       "acceptance check that passed",
+       _needs_you == sorted(set(MARKS) - {"daemon-health-recovered", "finding-filed",
+                                          "acceptance-finding-filed", "acceptance-passed"})
        and all(isinstance(MARKS[m].get("needs_you"), bool) for m in MARKS), _needs_you)
     # A title is ticket text anyone can write, so it is a FIELD: never part of the sentence,
     # never a line of its own, and inside quotes it cannot close (the review's M2).
@@ -5341,6 +5675,29 @@ def selftest():
            and not any(is_authorised(m, FINDER, cfg_f)
                        for m in planning + (HEALTH_IN, READY)),
            [(m, is_authorised(m, FINDER, cfg_f)) for m in planning])
+        # The finding job's second mark: a follow-up the ACCEPTANCE CHECK asked for. The same
+        # gate and the same one page per finding ticket, in its own words: no dev asked.
+        ACC_FOUND = "acceptance-finding-filed"
+        chat_af = _FakeChat()
+        acc_tkt = found_tkt("KIT-44", ["af1"])
+        acc_tkt[0]["comments"].append(dict(acc_tkt[0]["comments"][0], id="af2",
+                                           body=marker(ACC_FOUND) + "\nKIT-100"))
+        acc_tkt[0]["comments"][0]["body"] = marker(ACC_FOUND) + "\nKIT-100"
+        res_af = run_once(cfg_f, _FakeTracker(acc_tkt), chat_af, False, out=buf)
+        ok("the acceptance check's filed follow-up pages once, says the acceptance check "
+           "asked, and names no dev",
+           len(chat_af.posts) == 1 and "acceptance check asked" in chat_af.posts[0]
+           and "dev" not in chat_af.posts[0] and "KIT-44" in chat_af.posts[0]
+           and res_af["exit"] == EXIT_OK, (chat_af.posts, res_af["summary"]))
+        chat_afx = _FakeChat()
+        run_once(cfg_f, _FakeTracker(found_tkt("KIT-44", ["af1", "af2", "af3"])), chat_afx,
+                 False, out=buf)
+        ok("…one page per finding ticket across both marks: a later copy pages nobody",
+           chat_afx.posts == [], chat_afx.posts)
+        ok("…and the same gate: only the finding job's author ids",
+           ACC_FOUND in MARKS and is_authorised(ACC_FOUND, FINDER, cfg_f)
+           and not is_authorised(ACC_FOUND, EXEC, cfg_f)
+           and not is_authorised(ACC_FOUND, FINDER, cfg_f_off), ACC_FOUND in MARKS)
 
         # ── §7k. Who a page @mentions (KIT-281) ─────────────────────────────────────
         # A page that asks something of a person opens with the configured member ids; the
@@ -5700,6 +6057,9 @@ def selftest():
         # ── §14. A page's screenshots in its thread (KIT-568) — off by default ────────
         _page_images_selftest(ok, tmp, good)
 
+        # ── §15. The acceptance check's page, from the acceptance poller's ledger (KIT-555)
+        _selftest_acceptance_page(ok, tmp, good)
+
     # ── §10. What it never does — asserted against this file's own source ────────
     source = open(__file__, encoding="utf-8").read()
     # Scan EVERYTHING except the selftest body: a prefix split left main() unscanned, so a
@@ -6015,6 +6375,35 @@ def selftest():
             return got == want, got
         case336("KIT-455: a partial review the PR moved on from pages at once that its files "
                 "won't be reviewed, and the two-hour page never follows", left_behind_pages_now)
+
+        def parts_ceiling_pages_now():
+            # KIT-613: the poller's ceiling on one PR's review parts stopped this review, so no
+            # review of the rest is coming. That pages at once, in the partial page's words and
+            # under its key, so the two-hour page never follows it. A mark out of shape is not
+            # read: the record waits like any partial one.
+            stop = os.path.join(tmp336, "ceiling")
+            path = os.path.join(stop, "outcomes", "acme__app__pr-52.json")
+            os.makedirs(os.path.dirname(path))
+            got = []
+            for mark, sent in (({"parts": 25, "at": _iso_at(now336 - 60)}, ()),
+                               ({"parts": 25, "at": _iso_at(now336 - 60)},
+                                ("review:acme/app#52@%s:partial" % ("f" * 40),)),
+                               ({"parts": 25}, ()), ("stopped", ())):
+                doc = {"outcome_schema": "pipeline-review-outcome/1", "repo": "acme/app",
+                       "pr": 52, "head_sha": "f" * 40, "ticket_id": "TOD-7", "usable": True,
+                       "coverage": "partial", "withheld_files": ["big.lock", "big.py", "big.js"],
+                       "at": _iso_at(now336 - 600), "parts_ceiling": mark}
+                with open(path, "w", encoding="utf-8") as fh:
+                    json.dump(doc, fh)
+                evs, problems, _h = nev.file_events(cfg336("ceiling", review_state_dir=stop),
+                                                    set(sent), now336, 10)
+                got.append(([(e["key"], e["mark"], e["detail"]) for e in evs], problems))
+            want = [([("review:acme/app#52@%s:partial" % ("f" * 40), "review-partial",
+                       {"files": 3})], []), ([], []), ([], []), ([], [])]
+            return got == want, got
+        case336("KIT-613: a review its parts ceiling stopped pages at once that the rest won't be "
+                "reviewed, in the partial page's words, and the two-hour page never follows",
+                parts_ceiling_pages_now)
 
         def no_head():
             # Stage E's review of #316: an older poller wrote head_sha "", so a record with no
@@ -8709,6 +9098,600 @@ def _page_images_selftest(ok, tmp, good):
     finally:
         srv.shutdown()
         srv.server_close()
+
+
+def _selftest_acceptance_page(ok, tmp, good):
+    """§15 — KIT-555: the acceptance check's page. The acceptance poller's own conclude() and
+    write_verdict() write the ledger it reads; the REAL chat client runs every pass with the
+    network swapped for recorders, as §12 and §14 do. Lives in the span §10's own-source scan
+    skips, like the relay's own selftest."""
+    import io
+    import pipeline_acceptance_poller as acc
+    import pipeline_notify_events as nev
+    G = globals()
+    NOW = 1800000000.0
+    H1, H2, H3, H4 = "a" * 40, "b" * 40, "c" * 40, "d" * 40
+    R1 = "001-20261110T120000Z"
+    U1, D1 = "U0SYNTH0001", "D0SYNTH0001"
+    # The words, spelled out and not read from the constants, as §4b spells every page.
+    PASSED = ("The acceptance check on this plan passed: nothing it found in the browser holds "
+              "the plan open.")
+    NEED_NOTHING = "Nothing is needed from you for the check."
+    HELD = "The acceptance check held this plan open"
+    HELD_TAIL = ("The plan stays open until a new push passes the check. The plan's ticket lists "
+                 "what holds it.")
+    NOT_CHECKED = "The acceptance check could not check this plan"
+    NOT_CHECKED_TAIL = ("so this is not a pass. A person needs to look: the plan's ticket says "
+                        "what happened.")
+    NO_SHOTS = "No screenshots came with it."
+    SHOTS_OFF = "No screenshots came with it: this notifier is set not to send them."
+    UNPOSTED = ("Its verdict may not have reached the plan's ticket: the poller could not confirm "
+                "the comment.")
+    NOT_MECH = ("Part of the result rests on test code the change itself could alter, so read the "
+                "screenshots with that in mind.")
+
+    def case(name, fn):
+        try:
+            cond, detail = fn()
+        except Exception as exc:                                  # noqa: BLE001
+            cond, detail = False, "raised %r" % (exc,)
+        ok(name, cond, detail)
+
+    base = os.path.join(tmp, "acceptance")
+    look = os.path.join(base, "look")
+    state = os.path.join(base, "poller")
+    ledger = os.path.join(state, "acceptance-ledger.json")
+    os.makedirs(look)
+    os.makedirs(state)
+
+    def keep_shots(plan, names):
+        folder = os.path.join(look, plan, R1)
+        os.makedirs(folder, exist_ok=True)
+        for name in names:
+            with open(os.path.join(folder, name), "wb") as fh:
+                fh.write(PNG_MAGIC + name.encode())
+        return ["%s/%s" % (R1, name) for name in names]
+
+    def cfg_for(name, **over):
+        doc = dict(good, state_dir=os.path.join(tmp, "acc-" + name), acceptance_ledger=ledger,
+                   look_record_dir=look, page_images=True)
+        doc.update(over)
+        return load_config_from(doc, tmp)
+
+    def rows(*specs):
+        """A ledger, each spec (plan, head, word, status, age in seconds, page or None)."""
+        doc = {"schema": "pipeline-acceptance-ledger/1", "rows": []}
+        for plan, head, word, status, age, page in specs:
+            verdict = {"word": word, "status": status, "at": _iso_at(NOW - age)}
+            if page is not None:
+                verdict["page"] = page
+            doc["rows"].append({"plan": plan, "head": head, "status": "started",
+                                "at": _iso_at(NOW - age - 60), "verdict": verdict})
+        with open(ledger, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh)
+
+    def page(shots=(), **over):
+        doc = {"holds": 0, "failed_runs": 0, "followups": 0, "mechanical": True,
+               "shots": list(shots)}
+        doc.update(over)
+        return doc
+
+    def run(cfg, writer=None, dry=False, now=NOW, files_error=None):
+        """One pass, the real ChatClient, every network call recorded. Returns (result, calls,
+        out): each call (kind, method, payload)."""
+        calls, out = [], io.StringIO()
+
+        def rec_json(url, payload, headers, timeout=20):
+            calls.append(("json", url.rsplit("/", 1)[-1], dict(payload)))
+            if url.endswith("/conversations.open"):
+                return {"ok": True, "channel": {"id": D1}}
+            return {"ok": True, "channel": payload.get("channel") or "C0123456789",
+                    "ts": "%.6f" % (now + len(calls))}
+
+        def rec_form(url, fields, headers, timeout=20):
+            calls.append(("form", url.rsplit("/", 1)[-1], dict(fields)))
+            if url.endswith("files.getUploadURLExternal"):
+                if files_error:
+                    return {"ok": False, "error": files_error}
+                return {"ok": True, "upload_url": "https://files.slack.com/upload/v1/x",
+                        "file_id": "F0SYNTH%02d" % len(calls)}
+            return {"ok": True}
+
+        def rec_upload(url, data, timeout=60):
+            calls.append(("upload", url, len(data)))
+        saved = (G["_post_json"], G["_post_form"], G["_upload_bytes"])
+        G["_post_json"], G["_post_form"], G["_upload_bytes"] = rec_json, rec_form, rec_upload
+        try:
+            res = run_once(cfg, _FakeTracker([]), ChatClient(cfg, "test-token"), dry, out=out,
+                           now=now, writer=writer)
+        finally:
+            G["_post_json"], G["_post_form"], G["_upload_bytes"] = saved
+        return res, calls, out.getvalue()
+
+    def pages(calls):
+        return [c[2]["text"] for c in calls
+                if c[1] == "chat.postMessage" and "thread_ts" not in c[2]]
+
+    def thread_lines(calls):
+        return [c[2]["text"] for c in calls if c[1] == "chat.postMessage" and "thread_ts" in c[2]]
+
+    def link(plan):
+        return good["ticket_url_template"].replace("{id}", plan)
+
+    # ── the words, for each mark and its detail, word for word ─────────────────────────
+    for mark, detail, want in (
+            ("acceptance-passed", {"posted": True, "shots": 3, "followups": 2, "mechanical": True},
+             "%s It sent 2 follow-ups to the backlog. %s 3 screenshots follow in the thread."
+             % (PASSED, NEED_NOTHING)),
+            ("acceptance-passed", {"posted": True, "shots": 1, "followups": 1, "mechanical": False},
+             "%s It sent one follow-up to the backlog. %s %s One screenshot follows in the thread."
+             % (PASSED, NOT_MECH, NEED_NOTHING)),
+            ("acceptance-passed", {"posted": False, "shots": 0, "no_shots": "none"},
+             "%s %s %s" % (PASSED, UNPOSTED, NO_SHOTS)),
+            ("acceptance-held", {"posted": True, "shots": 4, "holds": 2, "failed_runs": 1,
+                                 "followups": 3, "mechanical": True},
+             "%s: 2 problems are still serious after a second look and one run failed in the "
+             "browser. It sent 3 follow-ups to the backlog. %s 4 screenshots follow in the thread."
+             % (HELD, HELD_TAIL)),
+            ("acceptance-held", {"posted": True, "shots": 0, "no_shots": "off", "holds": 1,
+                                 "failed_runs": 0, "followups": 0, "mechanical": True},
+             "%s: one problem is still serious after a second look. %s %s"
+             % (HELD, HELD_TAIL, SHOTS_OFF)),
+            ("acceptance-held", {"posted": True, "shots": 0, "no_shots": "none"},
+             "%s. %s %s" % (HELD, HELD_TAIL, NO_SHOTS)),
+            ("acceptance-could-not-check", {"posted": True, "shots": 2, "cause": "could-not-run",
+                                            "mechanical": False},
+             "%s: some of its runs could not run, %s 2 screenshots follow in the thread."
+             % (NOT_CHECKED, NOT_CHECKED_TAIL)),
+            ("acceptance-could-not-check", {"posted": False, "shots": 0, "no_shots": "none",
+                                            "cause": "unknown"},
+             "%s, %s %s %s" % (NOT_CHECKED, NOT_CHECKED_TAIL, UNPOSTED, NO_SHOTS))):
+        case("KIT-555: the %s page with %r is its words, word for word" % (mark, detail),
+             lambda m=mark, d=detail, w=want: (lambda got: (got == w, got))(page_words(m, d)))
+    for cause, words in (("no-result", "the session left no result it could read"),
+                         ("no-record", "the look tool has no record of its runs that it could "
+                                       "read"),
+                         ("session-said", "the session said it could not check"),
+                         ("disagree", "the session and the look tool's record disagree about "
+                                      "what ran"),
+                         ("malformed", "some problems the session listed were not in the agreed "
+                                       "shape"),
+                         ("timed-out", "it ran past its time limit, so the check was stopped")):
+        case("KIT-555: a could-not-check page names %s in its own words" % cause,
+             lambda c=cause, w=words: (lambda got: (got.startswith("%s: %s, %s" % (
+                 NOT_CHECKED, w, NOT_CHECKED_TAIL)), got))(page_words(
+                     "acceptance-could-not-check", {"posted": True, "shots": 0,
+                                                    "no_shots": "none", "cause": c})))
+
+    def never_passed():
+        said = []
+        for cause in list(ACCEPTANCE_CAUSE_WORDS) + [None]:
+            for posted in (True, False):
+                detail = {"posted": posted, "shots": 0, "no_shots": "none"}
+                if cause:
+                    detail["cause"] = cause
+                said.append(page_words("acceptance-could-not-check", detail))
+        said.append(MARKS["acceptance-could-not-check"]["page"])
+        return (all("could not check" in s and "not a pass" in s
+                    and not _says("passed", s, True) for s in said)), said
+    case("KIT-555: every could-not-check page says it could not check and is not a pass, and "
+         "never says passed", never_passed)
+    for mark, bad in (("acceptance-passed", {"shots": 0, "no_shots": "none"}),
+                      ("acceptance-passed", {"posted": True, "shots": 0}),
+                      ("acceptance-passed", {"posted": True, "shots": 2, "no_shots": "off"}),
+                      ("acceptance-passed", {"posted": True, "shots": 5}),
+                      ("acceptance-passed", {"posted": "yes", "shots": 1}),
+                      ("acceptance-passed", {"posted": True, "shots": 1, "holds": 1}),
+                      ("acceptance-passed", {"posted": True, "shots": 1, "cause": "unknown"}),
+                      ("acceptance-held", {"posted": True, "shots": 1, "holds": "2"}),
+                      ("acceptance-held", {"posted": True, "shots": 1, "holds": True}),
+                      ("acceptance-held", {"posted": True, "shots": 0, "no_shots": "melted"}),
+                      ("acceptance-held", {"posted": True, "shots": 1, "what": "the text"}),
+                      ("acceptance-could-not-check", {"posted": True, "shots": 1,
+                                                      "cause": "the session's words"}),
+                      ("acceptance-could-not-check", {"posted": True, "shots": 1,
+                                                      "followups": 1})):
+        case("KIT-555: a %s detail of %r is refused" % (mark, bad),
+             lambda m=mark, b=bad: (_raises_notifier(lambda: check_detail(m, b)), b))
+
+    # ── the pages a pass sends, from a ledger the poller wrote ──────────────────────────
+    def from_the_poller():
+        # The poller's own conclude() and write_verdict() write the ledger: what it records is
+        # what this reads, with no hand-made row in between.
+        if os.path.exists(ledger):
+            os.unlink(ledger)
+        shot_paths = keep_shots("TOD-700", ["home--phone--dark--home.png",
+                                            "home--desktop--dark--home.png"])
+        facts = os.path.join(state, "facts.json")
+        with open(facts, "w", encoding="utf-8") as fh:
+            json.dump({"schema": "pipeline-acceptance-facts/1", "plans": [
+                {"plan": "TOD-700", "repo": "acme/app", "acceptance": True,
+                 "pieces": [{"id": "TOD-701", "state": "done"},
+                            {"id": "TOD-702", "state": "review",
+                             "pr": {"number": 9, "head": H1, "open": True, "checks": "green",
+                                    "review": "reviewed"}}]}]}, fh)
+        acc.run_pass(facts, ledger, NOW - 600, lambda p, h: None)
+        judged = acc._verdict("found-problems", None, not_mechanical=False, ran_in_record=2,
+                              problems=[{"id": "white-card", "severity": "high", "check": "home",
+                                         "viewport": "phone", "mode": "dark",
+                                         "screenshot": "home",
+                                         "what": "<!-- x --> @everyone a white card"}],
+                              kept_shots=[{"path": p, "name": p.split("/")[1], "check": "home",
+                                           "viewport": p.split("--")[1], "mode": "dark",
+                                           "status": "passed"} for p in shot_paths])
+        done = acc.conclude(judged, "TOD-700", H1, lambda p: {"refuted": False, "why": "seen"})
+        wrote = acc.write_verdict(ledger, "TOD-700", H1, done["comment"], lambda p, t: None,
+                                  NOW - 300, page=done["page"])
+        res, calls, out = run(cfg_for("poller", dm_user_ids=[U1], chat_channel_id=""))
+        texts = pages(calls)
+        uploads = [c for c in calls if c[0] == "upload"]
+        shared = [c for c in calls if c[1] == "files.completeUploadExternal"]
+        return ((wrote[0], done["verdict"], len(texts), len(uploads), len(shared),
+                 texts[0].startswith(HELD + ": one problem is still serious after a second look."),
+                 "2 screenshots follow in the thread." in texts[0],
+                 texts[0].endswith("Ticket: TOD-700\n%s" % link("TOD-700")),
+                 "everyone" not in texts[0] and "<!--" not in texts[0],
+                 shared[0][2].get("thread_ts") if shared else None, res["exit"])
+                == ("written", "held", 1, 2, 1, True, True, True, True,
+                    "%.6f" % (NOW + 2), EXIT_OK)), (wrote, texts, calls, out)
+    case("KIT-555: a held verdict the poller wrote pages the owner's DM once, in this file's "
+         "words, no session text, and its two screenshots go into the page's thread",
+         from_the_poller)
+
+    def once_only():
+        cfg = cfg_for("poller", dm_user_ids=[U1], chat_channel_id="")
+        _res, calls, _out = run(cfg)
+        return (pages(calls) == [] and not [c for c in calls if c[0] == "upload"]), calls
+    case("KIT-555: a verdict that paged is never paged again", once_only)
+
+    def every_word_and_state():
+        shot_paths = keep_shots("TOD-710", ["home--phone--dark--home.png"])
+        rows(("TOD-710", H1, "passed", "written", 600, page(shot_paths, followups=1)),
+             ("TOD-711", H2, "could-not-check", "failed", 600, dict(page(), cause="no-record")),
+             ("TOD-712", H3, "held", "writing", 3600, page(holds=1)),
+             ("TOD-713", H4, "passed", "writing", 60, page()),               # still being posted
+             ("TOD-714", H1, "passed", "written", 3 * 86400, page()))        # two days old
+        res, calls, out = run(cfg_for("states"))
+        texts = sorted(pages(calls))
+        return ((len(texts), res["exit"],
+                 [t.split(":")[0].split(".")[0] for t in texts],
+                 UNPOSTED in [t for t in texts if "TOD-711" in t][0],
+                 UNPOSTED in [t for t in texts if "TOD-712" in t][0],
+                 UNPOSTED in [t for t in texts if "TOD-710" in t][0])
+                == (3, EXIT_OK, [NOT_CHECKED, HELD, PASSED.split(":")[0]], True, True, False)), (texts, out)
+    case("KIT-555: each verdict pages once, in its own mark's words; one whose comment failed or "
+         "was never confirmed says so; one still being posted, or two days old, waits or is "
+         "history", every_word_and_state)
+
+    def missing_shots():
+        rows(("TOD-720", H1, "passed", "written", 600, page()),
+             ("TOD-721", H2, "held", "written", 600, page([R1 + "/gone.png"], holds=1)),
+             ("TOD-722", H3, "passed", "written", 600, None))
+        res, calls, out = run(cfg_for("missing"))
+        texts = {t.split("Ticket: ")[1].split("\n")[0]: t for t in pages(calls)}
+        notes = thread_lines(calls)
+        return ((sorted(texts), NO_SHOTS in texts["TOD-720"], NO_SHOTS in texts["TOD-722"],
+                 "One screenshot follows in the thread." in texts["TOD-721"],
+                 len(notes) == 1 and "gone.png was not sent: it could not be read" in notes[0],
+                 "screenshots not all sent: TOD-721" in out, res["exit"])
+                == (["TOD-720", "TOD-721", "TOD-722"], True, True, True, True, True, EXIT_OK)), (texts, notes, out)
+    case("KIT-555: without screenshots the page still goes and says so, a verdict with no page "
+         "facts pages in its general words, and a screenshot that cannot be read is said in the "
+         "thread and the summary, never stopping the page", missing_shots)
+
+    def shots_off():
+        shot_paths = keep_shots("TOD-730", ["home--phone--dark--home.png"])
+        rows(("TOD-730", H1, "passed", "written", 600, page(shot_paths)))
+        out_texts = []
+        for name, over in (("off-images", {"page_images": False}),
+                           ("off-root", {"look_record_dir": ""})):
+            _res, calls, _out = run(cfg_for(name, **over))
+            out_texts.append((len(pages(calls)), SHOTS_OFF in pages(calls)[0],
+                              [c for c in calls if c[0] in ("form", "upload")]))
+        return out_texts == [(1, True, []), (1, True, [])], out_texts
+    case("KIT-555: with page_images off or no look_record_dir, no files call is made and the "
+         "page says screenshots are off", shots_off)
+
+    def scope_missing():
+        shot_paths = keep_shots("TOD-740", ["home--phone--dark--home.png"])
+        rows(("TOD-740", H1, "passed", "written", 600, page(shot_paths)))
+        res, calls, out = run(cfg_for("scope"), files_error="missing_scope")
+        notes = thread_lines(calls)
+        return ((len(pages(calls)), len(notes), "files:write" in (notes or [""])[0],
+                 "screenshots not all sent" in out, res["exit"])
+                == (1, 1, True, True, EXIT_OK)), (notes, out)
+    case("KIT-555: a token without files:write still pages; the thread and the summary say why",
+         scope_missing)
+
+    def rerun_pages_again():
+        # A check run again at the same head (an owner's `check`, contract section 26) takes the
+        # place of its row, with a new start: its verdict is a page of its own. The same run never
+        # pages twice.
+        rows(("TOD-790", H1, "could-not-check", "written", 900, page()))
+        cfg = cfg_for("rerun")
+        _r, first, _o = run(cfg)
+        _r, again, _o = run(cfg, now=NOW + 60)
+        rows(("TOD-790", H1, "passed", "written", 30, page()))
+        _r, rerun, _o = run(cfg, now=NOW + 120)
+        got = (len(pages(first)), len(pages(again)), len(pages(rerun)))
+        return got == (1, 0, 1), got
+    case("KIT-555: a check run again at the same head pages again; the same run never twice",
+         rerun_pages_again)
+
+    def bad_rows():
+        with open(ledger, "w", encoding="utf-8") as fh:
+            json.dump({"schema": "pipeline-acceptance-ledger/1", "rows": [
+                {"plan": "TOD-750", "head": H1, "status": "started", "at": _iso_at(NOW),
+                 "verdict": {"word": "great", "status": "written", "at": _iso_at(NOW - 60)}},
+                {"plan": "TOD-753", "head": H4, "status": "started", "at": _iso_at(NOW),
+                 "verdict": {"word": "passed", "status": "sent", "at": _iso_at(NOW - 60)}},
+                {"plan": "TOD-754", "head": H4, "status": "starting", "at": _iso_at(NOW),
+                 "verdict": {"word": "passed", "status": "written", "at": _iso_at(NOW - 60)}},
+                {"plan": "TOD-755", "head": H4, "status": "started", "at": "yesterday",
+                 "verdict": {"word": "passed", "status": "written", "at": _iso_at(NOW - 60)}},
+                {"plan": "TOD-751", "head": H2, "status": "started", "at": _iso_at(NOW),
+                 "verdict": {"word": "passed", "status": "written", "at": _iso_at(NOW - 60),
+                             "page": page(["../../../../etc/passwd.png"])}},
+                {"plan": "TOD-752", "head": H3, "status": "started", "at": _iso_at(NOW)}]}, fh)
+        res, calls, out = run(cfg_for("bad-rows"))
+        texts = pages(calls)
+        return ((len(texts), NO_SHOTS in texts[0], [c for c in calls if c[0] == "upload"],
+                 "not in its shape" in out, "TOD-751" in out and "general words" in out,
+                 res["exit"]) == (1, True, [], True, True, EXIT_DECLINED)), (texts, out)
+    case("KIT-555: a verdict out of shape is named and not paged; page facts out of shape are "
+         "named, read no file, and the page goes in its general words; a check with no verdict "
+         "yet pages nothing", bad_rows)
+
+    def ledger_states():
+        os.unlink(ledger)
+        absent = nev.acceptance_events(cfg_for("absent"), set(), NOW)
+        gone = nev.acceptance_events(cfg_for("gone", acceptance_ledger=os.path.join(
+            base, "nowhere", "ledger.json")), set(), NOW)
+        off = nev.acceptance_events(cfg_for("off", acceptance_ledger=""), set(), NOW)
+        with open(ledger, "w", encoding="utf-8") as fh:
+            fh.write("{not json")
+        broken = nev.acceptance_events(cfg_for("broken"), set(), NOW)
+        with open(ledger, "w", encoding="utf-8") as fh:
+            json.dump({"schema": "other/1", "rows": []}, fh)
+        other = nev.acceptance_events(cfg_for("other"), set(), NOW)
+        _r, _c, out_off = run(cfg_for("say-off", acceptance_ledger=""))
+        os.unlink(ledger)
+        _r, _c, out_yet = run(cfg_for("say-yet"))
+        return ((absent, len(gone[1]), off, len(broken[1]), len(other[1]),
+                 "acceptance pages: OFF" in out_off, "no ledger yet" in out_yet)
+                == (([], []), 1, ([], []), 1, 1, True, True)), (absent, gone, broken, other)
+    case("KIT-555: no ledger yet is no check yet; a folder that is not there, a ledger that "
+         "cannot be read, or one in another shape is named; empty is OFF, and said", ledger_states)
+
+    def images_out_of_place():
+        # The notifier checks every path itself, whatever its source handed it: straight under
+        # look_record_dir/<plan>/<run id>/, a PNG name in the look tool's shape, four at most.
+        real, cfg, got = nev.SOURCES, cfg_for("out-of-place"), []
+        mine = os.path.join(look, "TOD-780", R1, "a.png")
+        for mark, paths in (
+                ("acceptance-passed", ["/etc/passwd"]),
+                ("acceptance-passed", [os.path.join(look, "TOD-780", "..", "TOD-781", R1, "a.png")]),
+                ("acceptance-passed", [os.path.join(look, "TOD-781", R1, "a.png")]),
+                ("acceptance-passed", [os.path.join(look, "TOD-780", R1, "a.jpg")]),
+                ("acceptance-passed", [os.path.join(look, "TOD-780", "a.png")]),
+                ("acceptance-passed", [mine] * 5),
+                ("review-declined", [mine]),
+                ("acceptance-passed", [os.path.join(look, "acc", "TOD-780", R1, "a.png")]),
+                ("acceptance-passed", [os.path.join(look, "ACC-1", "ACC-2", "TOD-780", R1,
+                                                    "a.png")]),
+                ("acceptance-passed", [os.path.join(look, "ACC-1", "TOD-781", R1, "a.png")]),
+                ("acceptance-passed", [mine]),
+                ("acceptance-passed", [os.path.join(look, "ACC-1", "TOD-780", R1, "a.png")])):
+            ev = {"key": "acceptance:TOD-780@" + H1, "mark": mark, "ticket_id": "TOD-780",
+                  "ticket_title": "", "images": paths, "at": _iso_at(NOW),
+                  "detail": ({"posted": True, "shots": len(paths), "followups": 0, "mechanical": True}
+                             if mark != "review-declined" else {}),
+                  "url": (link("TOD-780") if mark != "review-declined"
+                          else "https://github.com/acme/app/pull/4")}
+            nev.SOURCES = (lambda c, s, n, asked=None, ev=ev: ([dict(ev)], []),)
+            try:
+                events, problems, _held = file_events(cfg, set(), NOW, [])
+            finally:
+                nev.SOURCES = real
+            got.append((len(events), len(problems)))
+        return got == [(0, 1)] * 10 + [(1, 0)] * 2, got
+    case("KIT-555: a screenshot path out of place, out of shape, past four, in a check folder "
+         "that is not a ticket id, or on a page that is not an acceptance page is refused by "
+         "the notifier itself; one straight under the plan, or under the check's own folder, "
+         "goes", images_out_of_place)
+
+    def count_is_the_images():
+        # The page says how many screenshots follow in its thread, so the event must carry exactly
+        # that many: a page saying three with none to send would promise what never comes.
+        real, cfg, got = nev.SOURCES, cfg_for("count"), []
+        one = os.path.join(look, "TOD-785", R1, "a.png")
+        two = os.path.join(look, "TOD-785", R1, "b.png")
+        for shots, paths in ((3, []), (1, [one, two]), (2, [one]), (0, [one]), (True, [one]),
+                             ("1", [one]), (None, [one]), (1, [one]), (2, [one, two]), (0, [])):
+            detail = {"posted": True, "shots": shots, "followups": 0, "mechanical": True}
+            if shots is None:
+                del detail["shots"]
+            elif shots == 0:
+                detail["no_shots"] = "none"
+            ev = {"key": "acceptance:TOD-785@" + H1, "mark": "acceptance-passed",
+                  "ticket_id": "TOD-785", "ticket_title": "", "detail": detail, "images": paths,
+                  "at": _iso_at(NOW), "url": link("TOD-785")}
+            nev.SOURCES = (lambda c, s, n, asked=None, ev=ev: ([dict(ev)], []),)
+            try:
+                events, problems, _held = file_events(cfg, set(), NOW, [])
+            finally:
+                nev.SOURCES = real
+            got.append((len(events), len(problems),
+                        "screenshots" in (problems or [""])[0] if problems else None))
+        return got == [(0, 1, True)] * 7 + [(1, 0, None)] * 3, got
+    case("KIT-555: an acceptance page whose count of screenshots is not the number it carries is "
+         "named and not sent, so it never promises a screenshot that never comes",
+         count_is_the_images)
+
+    def fixed_words_keep_their_rules():
+        # The fixed text is what goes out when the writer's words break a rule, so every fixed
+        # page keeps its own words and says none it forbids, whatever its detail.
+        bad = []
+        for mark in ACCEPTANCE_MARKS:
+            rules = MARKS[mark]
+            texts = [rules["page"]]
+            for posted in (True, False):
+                for shots, why in ((0, "none"), (0, "off"), (1, None), (4, None)):
+                    for n in (0, 1, 3):
+                        for mech in (True, False):
+                            detail = {"posted": posted, "shots": shots, "mechanical": mech}
+                            if why:
+                                detail["no_shots"] = why
+                            if mark == ESC_ACCEPTANCE_HELD:
+                                detail.update(holds=n, failed_runs=3 - n, followups=n)
+                            elif mark == ESC_ACCEPTANCE_PASSED:
+                                detail["followups"] = n
+                            for cause in (ACCEPTANCE_CAUSE_WORDS
+                                          if mark == ESC_ACCEPTANCE_NOT_CHECKED else [None]):
+                                if cause:
+                                    detail["cause"] = cause
+                                texts.append(page_words(mark, dict(detail)))
+            for text in texts:
+                if (not all(_says(w, text, False) for w in rules["keep"])
+                        or any(_says(w, text, True) for w in rules["forbid"])):
+                    bad.append((mark, text))
+        return not bad, bad[:3]
+    case("KIT-555: every fixed acceptance page keeps its own words and says none it forbids",
+         fixed_words_keep_their_rules)
+
+    def no_page_names_another_verdict():
+        # Each page forbids the other two verdicts by name (the docstring's rule).
+        names = {ESC_ACCEPTANCE_PASSED: "passed", ESC_ACCEPTANCE_HELD: "held",
+                 ESC_ACCEPTANCE_NOT_CHECKED: "could not check"}
+        missing = [(mark, other) for mark in names for other_mark, other in names.items()
+                   if other_mark != mark and other not in MARKS[mark]["forbid"]]
+        return not missing, missing
+    case("KIT-555: no acceptance page may name a verdict that is not its own",
+         no_page_names_another_verdict)
+
+    def check_folder():
+        # The live pass gives each check its own record folder, named by its acceptance ticket.
+        folder = os.path.join(look, "ACC-9", "TOD-790", R1)
+        os.makedirs(folder)
+        with open(os.path.join(folder, "home--phone--dark--home.png"), "wb") as fh:
+            fh.write(PNG_MAGIC + b"in its own folder")
+        rows(("TOD-790", H1, "passed", "written", 600,
+              dict(page([R1 + "/home--phone--dark--home.png"]), folder="ACC-9")),
+             ("TOD-791", H2, "passed", "written", 600, dict(page(), folder="../up")))
+        res, calls, out = run(cfg_for("folder"))
+        texts = {t.split("Ticket: ")[1].split("\n")[0]: t for t in pages(calls)}
+        uploads = [c for c in calls if c[0] == "upload"]
+        return ((len(uploads), "One screenshot follows in the thread." in texts.get("TOD-790", ""),
+                 NO_SHOTS in texts.get("TOD-791", ""), "TOD-791" in out, res["exit"])
+                == (1, True, True, True, EXIT_DECLINED)), (texts, out)
+    case("KIT-555: a check's screenshots are read from its own record folder; a folder that is "
+         "not a ticket id is named, and that page goes without them", check_folder)
+
+    # ── the writer: from facts, with the fixed text when it fails ──────────────────────
+    class Writer:
+        def __init__(self, text=None, raises=None):
+            self.text, self.raises, self.calls = text, raises, []
+
+        def __call__(self, cfg, kind, facts, fallback, keep=(), bind="", runner=None, now=None):
+            self.calls.append({"kind": kind, "facts": facts, "keep": list(keep)})
+            if self.raises:
+                raise self.raises
+            return {"text": self.text % facts if self.text else fallback, "by": "model",
+                    "why": "", "cost_usd": 0.001}
+
+    runs = [0]
+
+    def writer_run(word, text=None, raises=None, cause="could-not-run"):
+        extra = {"cause": cause} if word == "could-not-check" else {}
+        rows(("TOD-760", H1, word, "written", 600, dict(page(), **extra)))
+        writer = Writer(text, raises)
+        runs[0] += 1                      # a state folder of its own: the page is new each time
+        cfg = cfg_for("writer-%d" % runs[0], writer=True, writer_bin="/usr/local/bin/claude")
+        res, calls, out = run(cfg, writer=writer)
+        return pages(calls), writer, out
+
+    def written_from_facts():
+        texts, writer, _out = writer_run("could-not-check",
+                                         text="I could not check %(ticket_id)s, so this is not "
+                                              "a pass. %(link)s")
+        call = writer.calls[0] if writer.calls else {}
+        return ((texts, set(call.get("facts") or {}), call.get("keep"))
+                == (["I could not check TOD-760, so this is not a pass. %s" % link("TOD-760")],
+                    {"moment", "ticket_id", "title", "link"},
+                    ["TOD-760", link("TOD-760"), "could not check", "not a pass"])
+                and "some of its runs could not run" in call["facts"]["moment"]), (texts, writer.calls)
+    case("KIT-555: the writer gets the page's facts and nothing else, must keep could not check "
+         "and not a pass, and its words go out", written_from_facts)
+
+    for name, word, text, raises in (
+            ("the writer fails", "held", None, RuntimeError("down")),
+            ("the writer calls a could-not-check a pass", "could-not-check",
+             "I could not check %(ticket_id)s, so this is not a pass. It passed. %(link)s", None),
+            ("the writer drops could not check", "could-not-check",
+             "Not a pass for %(ticket_id)s. %(link)s", None),
+            ("the writer calls a held plan passed", "held",
+             "The check held %(ticket_id)s, though it Passed. %(link)s", None),
+            ("the writer leaves out held", "held", "Something about %(ticket_id)s. %(link)s",
+             None),
+            ("the writer calls a held plan could not check", "held",
+             "The check held %(ticket_id)s, as it could not check one screen. %(link)s", None),
+            ("the writer calls a passed plan held", "passed",
+             "The check passed %(ticket_id)s, though one screen is held. %(link)s", None),
+            ("the writer calls a could-not-check plan held", "could-not-check",
+             "I could not check %(ticket_id)s, so this is not a pass: it is held. %(link)s", None)):
+        def fell_back(word=word, text=text, raises=raises):
+            texts, _writer, out = writer_run(word, text, raises)
+            fixed = build_message(nev.ACCEPTANCE_MARKS[word], "TOD-760", "", link("TOD-760"),
+                                  _acceptance_detail_for(word))
+            return (texts == [fixed] and "1 fell back to the plain text" in out), (texts, fixed, out)
+        case("KIT-555: when %s, the fixed text goes out instead" % name, fell_back)
+
+    # ── pinned: the events module, the poller and this file agree ───────────────────────
+    def pinned():
+        return ((nev.ACCEPTANCE_LEDGER_SCHEMA == acc.LEDGER_SCHEMA,
+                 set(nev.ACCEPTANCE_MARKS) == set(acc.VERDICTS),
+                 sorted(nev.ACCEPTANCE_MARKS.values()) == sorted(ACCEPTANCE_MARKS),
+                 tuple(nev.ACCEPTANCE_CAUSES) == tuple(acc.CAUSES),
+                 set(ACCEPTANCE_CAUSE_WORDS) == set(acc.CAUSES),
+                 tuple(nev.ACCEPTANCE_PAGE_KEYS) == tuple(acc.PAGE_KEYS),
+                 nev.ACCEPTANCE_MAX_SHOTS == acc.MAX_PAGE_SHOTS == MAX_PAGE_IMAGES,
+                 nev.ACCEPTANCE_SHOT_RE.pattern.replace("(", "").replace(")", "")
+                 == acc.SHOT_PATH_RE.pattern == ACCEPTANCE_IMAGE_RE.pattern)
+                == (True,) * 8), "a constant drifted"
+    case("KIT-555: the events module, the poller and the notifier agree on the ledger, the "
+         "marks, the causes, the page facts and the screenshot paths", pinned)
+
+    def same_rule():
+        # The poller's page_problem and the events module's own spelling of it judge alike.
+        samples = [page(), page([R1 + "/a.png"]), dict(page(), cause="unknown"), page(holds=-1),
+                   page(holds=1000), page(mechanical=1), page(["a.png"]), page([R1 + "/a.png"] * 2),
+                   page(["%s/s%d.png" % (R1, i) for i in range(5)]), "x", {}, dict(page(), extra=1),
+                   dict(page(), folder="ACC-1"), dict(page(), folder="../up"),
+                   dict(page(), folder=""), dict(page(), folder=7)]
+        got = [(bool(acc.page_problem(s, w)), bool(nev._acceptance_page_problem(s, w)))
+               for s in samples for w in ("passed", "held", "could-not-check")]
+        return all(a == b for a, b in got), got
+    case("KIT-555: the events module judges page facts exactly as the poller does", same_rule)
+
+
+def _raises_notifier(fn):
+    try:
+        fn()
+    except NotifierError:
+        return True
+    return False
+
+
+def _acceptance_detail_for(word):
+    """The detail the §15 writer cases' one row gives: a page with no counts and no screenshots."""
+    detail = {"posted": True, "shots": 0, "no_shots": "none", "mechanical": True}
+    if word == "held":
+        detail.update(holds=0, failed_runs=0, followups=0)
+    elif word == "passed":
+        detail["followups"] = 0
+    else:
+        detail["cause"] = "could-not-run"
+    return detail
 
 
 def load_config_from(doc, tmpdir):

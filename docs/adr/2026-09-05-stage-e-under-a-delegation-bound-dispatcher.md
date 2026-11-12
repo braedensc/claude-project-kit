@@ -405,8 +405,10 @@ fence tags; it writes exactly one routing tag of its own, in its trusted header
 carrying an owner-scoped Linear key, a review ticket in a dedicated Reviews team: title
 `Review PR #<n> — <TICKET-ID>`, description = the review brief with the diff inlined under
 a size cap (above the cap ⇒ whole files are withheld, largest first, and the review is
-marked `coverage: partial` — *amended 2026-09-17, KIT-138*; a change where no single file
-fits alone is still declined, reason *diff too large to deliver*), **never
+marked `coverage: partial` — *amended 2026-09-17, KIT-138*; a file too big for any one
+review is cut at its hunks, a hunk at its lines, and a file deleted whole goes as one notice,
+so only a single line longer than the cap is still declined, reason *diff too large to
+deliver* — *amended 2026-11-11, KIT-612*), **never
 parented** (a sub-issue would be based on its parent's branch), never linked to the PR by
 branch, title or body. The dispatcher sees a delegation by the owner and starts a session
 in the Reviews entry, exactly as it starts any other. The poller then reads that ticket's
@@ -1140,3 +1142,74 @@ not changed here; it can only name a listed worktree that is a real directory ma
 the transcript folder. `PATH` is the session's too, through the same env file: a planted
 `git` (or `python3`, which runs the hooks) is a KIT-240 matter, not one a hook can close
 from inside.
+
+## Update 2026-11-11 — the fallback fix ticket is retired (KIT-593)
+
+Review tickets are moving off the separate Reviews team onto each project's own work team.
+The owner decided on 11 Nov to retire the fix ticket rather than give it a new home.
+
+**What it was.** When a bounce could not reach the coding session's own thread, the
+bounce driver filed a fix ticket on the Reviews team. Its description opened with
+`[repo=<name>#<pr-branch>]`, so the dispatcher would cut the worktree from the PR's
+branch. It never ran live, and the thread re-prompt is proven. On a work team, a fix
+ticket whose tag failed to route would fall to that team's coding entry, cut from the
+default branch and told to push to the PR's branch.
+
+**Decision.** The driver files no ticket of any kind. With no agent-session thread on the
+original ticket, nothing is sent and no bounce is spent: the pull request is told a
+person is needed (a decline, exit 2). When the thread reply itself fails, the bounce is
+spent and recorded as undelivered, the pull request is told, and telemetry records the
+error. That was already the path for a fix ticket that could not be filed. `--selftest`
+pins that the driver holds no `issueCreate`. Its config no longer reads
+`reviews_team_id`, `model_label_id` or `dispatcher_repo_names`; an older config that
+carries them still loads.
+
+**The re-prompt no longer names the review ticket.** It said "(review ticket <id>)". The
+session it reaches writes the pull request's title, body and commits. On a work team,
+that id copied there could link the pull request to the review ticket, and the team's git
+automations would then move it. Done deletes the reviewer's working copy. The ledger and
+the outcome file still keep the id.
+
+**This supersedes:** the fix-ticket sentence in the 2026-09-06 update's *Bounce (5)*; the
+fallback fix ticket in the 2026-09-12 update's list of unexercised paths; decision 5's
+last sentence ("A fix ticket pinned to the PR branch is the fallback..."); decision 5's
+heading clause "a fix ticket is the fallback", and its *Fallback — a fix ticket* bullet;
+and, in the coupling table, the fix-ticket half of the base-branch-override row. The
+poller still strips that tag from everything it copies.
+
+## Update 2026-11-11 — review tickets move onto the work teams; the Reviews team retires (KIT-599)
+
+The owner decided on 11 Nov that each project should be self-contained, and retired the
+separate Reviews team. He accepted the risk this note names, behind the idea gate's full
+control set.
+
+**What changed.** A review ticket is filed on the coding ticket's own work team. It carries
+the `[repo=reviews-<name>]` tag and a workspace label `reviews-<name>`. Each review entry
+routes on that label and claims no team key. The installer creates no team and no workflow
+state, and never reads or writes a git automation. It ensures the routing labels, and only
+reads the agent's membership of each work team (card CK-4). Card CK-3 and sign-off
+A-AUTOMATIONS are retired. `REVIEWS_TEAM_KEY` and `REVIEWS_TEAM_NAME` are accepted and
+ignored for one release.
+
+**The risk, and what guards it.** The dispatcher reads a ticket's team key with no fetch,
+so it always answers; tag and label reads that fail count as "none". On the Reviews team
+that key sat on a read-only reviewer. On a work team it is the coding entry's, with Bash
+and Write, and a review ticket's body is a diff the coding session wrote. So the review
+poller does what the planner job does for planning: the label is a second net; the
+earliest routing note is read in the same pass; a wrong note or none cancels the ticket,
+writes a stop and pages the owner; and reviews pause until the routing probe is signed
+again on the dispatcher version it pins. The probe, stop file and version pin are shared
+with the idea gate. A misroute pauses one repository's reviews, and planning while the
+shared stop stands. What stays: a misrouted ticket can run in the coding setup for up to
+the routing wait before it is caught.
+
+**The move.** Rewriting the review entries restarts the dispatcher. The installer will not
+do it while the review poller has a review in flight (card CK-13). The old team is archived
+by hand afterwards, with its history kept.
+
+**This supersedes:** the 2026-09-06 update's "review ticket in a dedicated *Reviews* team";
+the 2026-09-08 update's "The fallback stays where it was", including "exactly one review
+entry keeps `teamKeys`"; decision 1's Reviews-team wording; the activation text that
+creates the team; the duplicate search "in the Reviews team"; "Where Stage E lives" on the
+team; the coupling row for `teamKeys` routing; and the Verified entry that the Reviews team
+runs with its automations off.

@@ -28,7 +28,8 @@ jobs:
   kit-checks:
     name: Kit checks
     runs-on: ubuntu-24.04
-    # 15, not 10: the last step runs every battery a second time, one at a time (KIT-450).
+    # 15: the leak sweeps (KIT-450) moved to their own job (KIT-617), so this runs the
+    # selftests alone. docs/TESTING.md says what to do when a run nears the limit.
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -110,6 +111,14 @@ jobs:
           python3 -m pip install --quiet pyyaml
           python3 scripts/check_runner_pin.py --selftest
           python3 scripts/check_runner_pin.py
+
+      # KIT-652. The kit's Python imports only the standard library, bar a short named list,
+      # because its jobs and hooks run on a Python with nothing added to it.
+      - name: Standard-library-only selftest
+        run: python3 scripts/check_stdlib_only.py --selftest
+
+      - name: Standard-library-only check (no outside import beyond the allow list)
+        run: python3 scripts/check_stdlib_only.py
 
       - name: Validate all tracked JSON/YAML
         run: |
@@ -319,11 +328,22 @@ jobs:
       # watcher's own self-check.
       - name: Watcher setup selftest (one yes; the workers cannot edit the watcher)
         run: python3 scripts/pipeline_watcher_setup.py --selftest
+      # The watcher's read-only copier (KIT-573): a root job that copies the workers' usage file into root's
+      # folder. Offline, with hostile sources: a link, a file of another account, a second name, a pipe, an
+      # oversize file and a folder others can write are each refused, the old copy removed, and no path the
+      # rules did not name is ever opened.
+      - name: Watcher copier selftest (a link, a stranger's file and an oversize file are refused)
+        run: python3 scripts/pipeline_watcher_copy.py --selftest
       # The hold (KIT-515, contract section 20): the watcher's one power, and the owner's alone to
       # clear. Offline: absent is no hold, anything else that is not a valid hold holds, a later clean
       # pass never clears one, the owner's clear is refused in an agent's environment.
       - name: Hold selftest (a hold holds; only the owner clears it)
         run: python3 scripts/pipeline_hold.py --selftest
+      # The validator's settings (KIT-533, contract section 23): plain on/off switches. Offline: absent,
+      # invalid, unreadable or untrusted is every switch off, a file naming the safety system is
+      # refused, and the loader has no write path.
+      - name: Validator settings selftest (anything but a valid, trusted file is every switch off)
+        run: python3 scripts/pipeline_validator_settings.py --selftest
       # The watcher's urgent page (KIT-519): its own way to the owner, not through the workers'
       # bridge. Offline, with a fake sender: sent once per change of answer, a failed page sent
       # again and never recorded as sent, cleared said once, the watcher's own silence paged, no
@@ -349,6 +369,23 @@ jobs:
       # merge state; anything it cannot read is no.
       - name: Validator evidence selftest (no when it cannot tell; never PR text in its answer)
         run: python3 scripts/pipeline_validator_evidence.py --selftest
+      # The validator's ledger (KIT-535, contract section 24): one row per decision, written by one
+      # function. Offline: append-only and atomic, one verdict per head, an approval only when all three
+      # layers pass, and a ledger that cannot be trusted gives no rows, never an empty list.
+      - name: Validator ledger selftest (one writer; an unreadable ledger approves nothing)
+        run: python3 scripts/pipeline_validator_ledger.py --selftest
+      # The validator's verdict as the Validator check (KIT-540), posted by its own GitHub app.
+      # Offline, against a stubbed code host: success only for an approval recorded at that
+      # exact head, nothing for a head with no decision, a ledger it cannot read posts nothing,
+      # a refused post holds in words, and no credential reaches an answer.
+      - name: Validator check selftest (the ledger's decision, at its own head, as its own app)
+        run: python3 scripts/pipeline_validator_check.py --selftest
+      # The validator's owner script (KIT-541): its app, and its check made a required one.
+      # Offline, against a stubbed code host: refused in an agent's environment, nothing
+      # changes without a typed yes, a second run changes nothing, a ruleset that does not
+      # keep the check's source app is put back, and no key or token reaches any output.
+      - name: Validator app selftest (one yes; the check required from its own app; no key shown)
+        run: python3 scripts/pipeline_validator_app.py --selftest
       # The queue's order and limits (KIT-434, MVP 2 part 2b): what starts next. A pure function,
       # so the selftest stands in for everything it is given: priority, then the plan approved
       # first, then the plan's dependency order; an open blocker never starts; lanes in each
@@ -356,6 +393,16 @@ jobs:
       # runaway stop holding every start; every number the config's; a mutant for each rule.
       - name: Queue order selftest (priority, blockers, lanes, the day's load, the runaway stops)
         run: python3 scripts/pipeline_queue_order.py --selftest
+      # The validator agent's brief and answer (KIT-536): code builds what the agent reads and reads
+      # what it says. Offline, no model: a payload cannot close its fence, an over-cap diff is said,
+      # the answer's grammar is closed, the reason is cleaned, and the agent can only hold.
+      - name: Validator brief selftest (fenced input; a closed answer; it can only hold)
+        run: python3 scripts/pipeline_validator_brief.py --selftest
+      # The validator's hard limits (KIT-538): layer 1, plain code with no model. Offline, in a
+      # temp folder: one case per rule and every reason reached; each fact read by the part of
+      # the kit that owns it; the safety-system floor is never a switch; closed words only.
+      - name: Validator limits selftest (pass or closed reasons; what it cannot tell fails)
+        run: python3 scripts/pipeline_validator_limits.py --selftest
       # The usage runs (KIT-422, contract §17): the dispatcher's logs, and the Stage E and
       # idea-gate records beside them, read into runs. Offline, reading only, in a temp folder:
       # a run's spend is its share of its session's running totals, a crash is unpriced and
@@ -519,6 +566,10 @@ jobs:
       # yes, then runs the Stage A installer. Refused under a model before it reads anything.
       - name: One-command installer selftest (order, agent-refused, never merges)
         run: python3 scripts/pipeline_install.py --selftest
+      # Every part listed once, as data (KIT-624): each installer and job writer owned, needs
+      # acyclic, cards real, commands from a fixed list, and docs/PARTS.md equal to its render.
+      - name: Parts list (one row per part, guides named, the page in step)
+        run: python3 scripts/pipeline_parts.py --selftest && python3 scripts/pipeline_parts.py check
 
       # The chat-lane composer: prints every piece of the dispatcher's built-in Slack lane.
       # compose, verify and card write nothing; merge --apply, env-names and
@@ -534,12 +585,6 @@ jobs:
       # that passes cwd.
       - name: Chat lane composer selftest (grant, fence, deny drift, agent-refused)
         run: python3 scripts/pipeline_chat_lane_setup.py --selftest
-
-      # The chat-lane probe (KIT-344, KIT-354): the owner's one run that measures what the
-      # tech lead can reach. Offline: stand-ins for the dispatcher, Slack and the tracker,
-      # and the role account's own program run for real on fixture folders.
-      - name: Chat lane probe selftest (agent-refused, put back, never a NO from a failed read)
-        run: python3 scripts/pipeline_chat_lane_probe.py --selftest
 
       # The tech lead's model switch (KIT-385): the owner's one script. It refuses under a
       # model, as root and without a terminal; stops before its one question when a
@@ -584,13 +629,13 @@ jobs:
           python3 scripts/pipeline_bridge_watch.py --selftest
           python3 scripts/pipeline_bridge_direct.py --selftest
           python3 scripts/pipeline_bridge_bind.py --selftest
-          python3 scripts/pipeline_bridge_wake.py --selftest
           python3 scripts/pipeline_bridge_push.py --selftest
+          python3 scripts/pipeline_bridge_push_setup.py --selftest
       - name: Slack bridge installer selftest (token, install, verify, agent-refused)
         run: python3 scripts/pipeline_bridge_setup.py --selftest
 
-      # The tech lead's voice (KIT-294): the notifier and the bridge may have a model
-      # rewrite a message they already wrote. One tool-less `claude -p` run, its command
+      # The voice (KIT-294): the notifier may have a model rewrite a page it already
+      # wrote. One tool-less `claude -p` run, its command
       # line and its seven-variable environment pinned (one subscription token, never an
       # API key), the facts fenced on stdin, a fresh folder as its home and removed after.
       # Its text is posted only with every keep string, no link outside the facts, no
@@ -601,6 +646,20 @@ jobs:
 
       - name: Daily stand-up selftest (asks first, old news never sent, plain text fallback)
         run: python3 scripts/pipeline_standup.py --selftest
+
+      # Sprint planning (KIT-575): one proposal per sprint, built by code from the pool's verdicts; the owner's
+      # exact reply records the plan; a damaged file is never planned over; the queue puts planned pieces first.
+      - name: Sprint plan selftest (one proposal a sprint; only the exact yes records; nothing is admitted)
+        run: python3 scripts/pipeline_sprint_plan.py --selftest
+      # The sprint review (KIT-576): a recap built by code, written as a Linear document, linked from one DM
+      # message once a sprint. Offline, with GitHub and Linear stood in for.
+      - name: Sprint review selftest (once a sprint; never silent; no model)
+        run: python3 scripts/pipeline_sprint_review.py --selftest
+
+      # The changes the sprint review proposes (KIT-577): at most three, tightening only, from a short allowed list;
+      # only the owner's exact reply makes one; the old and new value are always shown.
+      - name: Sprint changes selftest (a key outside the list is dropped; a yes names one change; no reply changes nothing)
+        run: python3 scripts/pipeline_sprint_changes.py --selftest
 
       - name: Telemetry scrape selftest (contract §4, §10)
         run: python3 scripts/telemetry_scrape.py --selftest
@@ -695,6 +754,23 @@ jobs:
       - name: Union check selftest (green alone, red together, bisected, report-only)
         run: python3 scripts/check_pr_union.py --selftest
 
+      # KIT-617. These batteries had no step of their own: they ran in CI only inside the leak
+      # sweeps (check_temp_leaks.py runs every package.json test:* script). The sweeps are a
+      # separate job now, which is not required to merge until the owner adds it, so each one
+      # is named here to keep blocking a merge. A new test:* script needs a step above or here.
+      - name: Batteries with no step of their own (kept required after the leak sweeps moved)
+        run: |
+          python3 scripts/pipeline_ws_client.py --selftest
+          python3 scripts/pipeline_bridge_handover.py --selftest
+          python3 scripts/pipeline_tech_lead_tools.py --selftest
+          python3 scripts/pipeline_tech_lead_turn.py --selftest
+          python3 scripts/pipeline_sprint.py --selftest
+          python3 scripts/pipeline_acceptance_poller.py --selftest
+          python3 scripts/pin_hooks_path.py --selftest
+          python3 scripts/pipeline_machine_tickets.py --selftest
+          python3 scripts/pipeline_routing_tags.py --selftest
+          python3 .claude/skills/sync-kit/compare.py --selftest
+
       - name: Dashboard selftest (self-contained page, one summary object)
         run: python3 scripts/telemetry_dashboard.py --selftest
 
@@ -765,18 +841,31 @@ jobs:
       - name: Cleanup probe selftest (what a run left behind; unread is never clean)
         run: python3 scripts/pipeline_cleanup_probe.py --selftest
 
-      # Last, after npm ci (the secret-scan battery needs secretlint): every `test:*` battery
-      # in package.json once more, one at a time, each with its own empty TMPDIR. A folder it
-      # leaves there, a process it leaves running, a new file in the checkout, or — here,
-      # where nothing else runs — a new entry in /tmp fails the job (docs/TESTING.md, "A
-      # selftest leaves nothing behind"). It also runs the selftests no step above names.
+  # KIT-617. The two leak sweeps used to be the last steps of Kit checks and took about
+  # 7.5 minutes together (6.5 and 1), which put Kit checks at 12.6 to 14.4 minutes against a
+  # 15-minute limit. Measured as a job on #511: 7.6 and 7.7 minutes, so 20 leaves room.
+  # A busy runner then cancelled PRs that had failed nothing. They are their own job now, beside the selftests, with their own limit. NOT a required check until the owner adds it
+  # (docs/TESTING.md, "Job limits and what to do near one"): until then a leak is red on the
+  # PR but does not block the merge.
+  temp-leak-sweeps:
+    name: Temp-leak sweeps
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # The secret-scan battery needs secretlint.
+      - name: Install dependencies
+        run: npm ci
+
       - name: Selftests leave nothing behind (every battery, its own TMPDIR)
         run: python3 scripts/check_temp_leaks.py
 
-      # The same batteries again, each sent SIGTERM one second in and nothing gentler first.
-      # A session's Bash timeout ends a run that way, and Python then runs no `finally`, so
-      # only a battery inside scratch_run.contained(), which turns the signal into a clean
-      # exit, passes. About a minute and a half.
       - name: Selftests leave nothing behind on a SIGTERM either (each stopped 1 s in)
         run: python3 scripts/check_temp_leaks.py --sigterm 1
 

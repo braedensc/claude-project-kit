@@ -3,11 +3,13 @@
 Design: docs/adr/2026-11-05-the-validator-approves-inside-limits-that-code-enforces.md, "Layer 2".
 
     from pipeline_validator_evidence import evidence_for, judge
-    evidence_for(owner_repo, number, head, ...)   THE ONE FUNCTION: read the platform once, then judge
-    judge(facts, head, ...)                       the rules alone, over facts already read
+    evidence_for(owner_repo, number, head, settings, ...)   THE ONE FUNCTION: read the platform
+                                                  once, then judge; `settings` is what the
+                                                  validator's settings `load()` returned
+    judge(facts, head, review_login, ...)         the rules alone, over facts already read
 
     python3 scripts/pipeline_validator_evidence.py check --repo OWNER/NAME --pr N --head SHA \\
-        --review-author LOGIN --last-piece no [--acceptance passed] [--bar medium] [--own-check NAME]
+        --settings-file PATH --last-piece no [--acceptance passed] [--bar medium] [--own-check NAME]
     python3 scripts/pipeline_validator_evidence.py --selftest
 
 WHAT IT ANSWERS.  `yes` or `no` for one pull request at one head, with closed reasons. Never text from
@@ -21,14 +23,18 @@ THE RULES, each one tested. Every one says `no` when it cannot tell.
     same-named job elsewhere cannot stand in for it. A re-run counts once, its latest, and a run not
     yet finished makes it pending. No check at all, no required check configured, or a list that
     cannot be read is `no`.
-  * Stage E's review. Read only from comments by a bot login named to post it, that is not the pull
-    request's author and not one a workflow of the pull request can post as. A person's login is one
-    any session holding that person's credential can post as, so a review from one is `no`
-    (review-login-shared). Read at the comment's second-line coverage marker (contract §14), and only
-    for this exact head. A full review is needed. A missing, partial, stale, declined or skipped one is
-    `no`, and so is a review comment for the head that was edited after it was posted. Every review
-    comment for the head counts, and the worst of them decides: a later comment cannot hide an earlier
-    one.
+  * Stage E's review. Read only from comments by Stage E's own bot login, which the validator's
+    settings name (`stage_e_login`, contract §23) and nothing in this code does. A comment counts
+    only when its author is exactly that login and a bot. GitHub's GraphQL names a bot without the
+    `[bot]` its REST API and pages show, so a bot's login gets the suffix before it is compared; a
+    person's login never has one, so no person's comment can count. No login named, or settings
+    that were not read, is `no` (review-login-unset); a login that is not a bot login is `no`
+    (review-login-malformed); the pull request's author, or a login its own workflow can post as,
+    is `no` (review-login-shared). Read at the comment's second-line coverage marker (contract §14),
+    and only for this exact head. A full review is needed. A missing, partial, stale, declined or
+    skipped one is `no`, and so is a review comment for the head that was edited after it was
+    posted. Every review comment for the head counts, and the worst of them decides: a later
+    comment cannot hide an earlier one.
   * The review's findings. Nothing at or above the bar. A full review whose findings line cannot be read
     is `no`, never `yes`.
   * The acceptance check. For a plan's last piece it must have passed. None recorded is `no`, and so is
@@ -46,6 +52,9 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pipeline_review_local import REVIEW_MARKER, SEVERITY_RANK, coverage_marker  # noqa: E402
+from pipeline_validator_settings import LOGIN_KEY, is_bot_login  # noqa: E402
+from pipeline_validator_settings import READ as SETTINGS_READ  # noqa: E402
+from pipeline_validator_settings import load as load_settings  # noqa: E402
 
 GOOD_CONCLUSIONS = ("SUCCESS", "NEUTRAL", "SKIPPED")
 PENDING_STATES = ("PENDING", "EXPECTED")
@@ -61,21 +70,23 @@ NO_FINDINGS_RE = re.compile(r"No findings against correctness, security, test as
 # Every reason, in the order an answer lists them. Closed words only.
 REASONS = ("pr-not-open", "head-moved", "checks-unreadable", "checks-none", "check-pending",
            "check-failed", "required-checks-unknown", "required-checks-none", "check-missing",
-           "review-authors-unset", "review-bar-unknown", "review-login-shared",
-           "review-unreadable", "review-missing",
+           "review-login-unset", "review-login-malformed", "review-bar-unknown",
+           "review-login-shared", "review-unreadable", "review-missing",
            "review-stale", "review-edited", "review-partial", "review-declined",
            "review-finding-at-bar", "last-piece-unknown", "acceptance-none",
            "acceptance-not-passed", "merge-conflicting", "merge-unknown", "merge-behind",
            "merge-draft")
-# Bots a pull request's own workflow can post as: never a login a review can be trusted from.
-SHARED_BOTS = ("github-actions[bot]", "github-actions")
+# The bot a pull request's own workflow can post as: never a login a review can be trusted from.
+# The one login this code names, and only to refuse it; the trusted one is the settings'.
+SHARED_BOTS = ("github-actions[bot]",)
+BOT_SUFFIX = "[bot]"
 MAX_COMMENTS = 100
 MAX_CONTEXTS = 100
 
 QUERY = (
     "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){"
     "pullRequest(number:$number){state isDraft headRefOid baseRefName mergeable mergeStateStatus "
-    "author{login} "
+    "author{__typename login} "
     "baseRef{branchProtectionRule{requiredStatusCheckContexts}} "
     "commits(last:1){nodes{commit{oid statusCheckRollup{contexts(first:100){totalCount "
     "pageInfo{hasNextPage} nodes{__typename "
@@ -114,26 +125,47 @@ def latest_checks(checks):
     return dict((key, v[1]) for key, v in best.items())
 
 
-def review_reasons(comments, head, authors, bar, pr_author=None):
+def actor_login(actor):
+    """An author's login as GitHub's REST API and pages give it. GraphQL names a bot without its
+    `[bot]` suffix, so a bot's login gets it here; a person's login never has one."""
+    if not isinstance(actor, dict):
+        return None
+    login = actor.get("login")
+    if (actor.get("__typename") == "Bot" and isinstance(login, str)
+            and not login.endswith(BOT_SUFFIX)):
+        return login + BOT_SUFFIX
+    return login
+
+
+def trusted_login(settings):
+    """Stage E's bot login, from the validator's settings as `load()` returned them, or None when
+    they name none or were not read. The only place the evidence gets a login to trust."""
+    if not isinstance(settings, dict) or settings.get("state") != SETTINGS_READ:
+        return None
+    return settings.get(LOGIN_KEY)
+
+
+def review_reasons(comments, head, login, bar, pr_author=None):
     """The review's reasons, [] when a full, unedited review of `head` shows nothing at the bar.
 
-    A review counts only from a named login that is a bot, is not the pull request's author, and
-    is not one a workflow of the pull request can post as. A person's login is one any session
-    holding that person's credential can post as, so a review comment from one is refused, and
-    the answer is `no` until Stage E posts from a login no session can use."""
-    if not authors:
-        return ["review-authors-unset"]
+    A review counts only from exactly `login`, Stage E's bot login from the settings, posted as a
+    bot. The login must not be the pull request's author, nor one a workflow of the pull request
+    can post as. A comment by anyone else is not Stage E's review."""
+    if login is None or login == "":
+        return ["review-login-unset"]
+    if not is_bot_login(login):
+        return ["review-login-malformed"]
     if bar not in SEVERITY_RANK:
         return ["review-bar-unknown"]
     if comments is None:
         return ["review-unreadable"]
-    if pr_author in authors or set(authors) & set(SHARED_BOTS):
+    if login == pr_author or login in SHARED_BOTS:
         return ["review-login-shared"]
     ours, other_heads, shared = [], 0, False
     for c in comments:
         body = c.get("body") or ""
         lines = body.splitlines()
-        if c.get("author") not in authors or not lines or REVIEW_MARKER not in lines[0]:
+        if c.get("author") != login or not lines or REVIEW_MARKER not in lines[0]:
             continue
         mark = coverage_marker(body)
         if mark is None:
@@ -176,10 +208,11 @@ def review_reasons(comments, head, authors, bar, pr_author=None):
     return out
 
 
-def judge(facts, head, review_authors, bar, last_piece, acceptance, own_check=None):
+def judge(facts, head, review_login, bar, last_piece, acceptance, own_check=None):
     """{"verdict": "yes"|"no", "head", "reasons"} for the pull request `facts` describe, at `head`.
-    `facts` is what `read_facts()` returns. `last_piece` is True, False, or None for not known;
-    `acceptance` is the plan's recorded acceptance result for that last piece, or None."""
+    `facts` is what `read_facts()` returns. `review_login` is Stage E's bot login, as
+    `trusted_login()` gives it from the settings. `last_piece` is True, False, or None for not
+    known; `acceptance` is the plan's recorded acceptance result for that last piece, or None."""
     reasons = []
     if not isinstance(head, str) or not SHA_RE.fullmatch(head):
         reasons.append("head-moved")
@@ -208,7 +241,7 @@ def judge(facts, head, review_authors, bar, last_piece, acceptance, own_check=No
                 reasons.append("required-checks-none")
             if needed - set(name for _group, name in states):
                 reasons.append("check-missing")
-    reasons += review_reasons(facts.get("comments"), head, set(review_authors or ()), bar,
+    reasons += review_reasons(facts.get("comments"), head, review_login, bar,
                               facts.get("pr_author"))
     if last_piece is None:
         reasons.append("last-piece-unknown")
@@ -261,7 +294,7 @@ def read_facts(owner_repo, number, run=_gh):
     facts.update(state=pr.get("state"), draft=pr.get("isDraft"), head=pr.get("headRefOid"),
                  base=pr.get("baseRefName"), mergeable=pr.get("mergeable"),
                  merge_state=pr.get("mergeStateStatus"),
-                 pr_author=(pr.get("author") or {}).get("login"))
+                 pr_author=actor_login(pr.get("author")))
     try:
         commit = pr["commits"]["nodes"][-1]["commit"]
         facts["rollup_head"] = commit.get("oid")
@@ -274,7 +307,7 @@ def read_facts(owner_repo, number, run=_gh):
     try:
         comments = pr["comments"]
         if comments["totalCount"] <= MAX_COMMENTS:
-            facts["comments"] = [{"author": (n.get("author") or {}).get("login"),
+            facts["comments"] = [{"author": actor_login(n.get("author")),
                                   "author_type": (n.get("author") or {}).get("__typename"),
                                   "body": n.get("body") or "", "created_at": n.get("createdAt"),
                                   "edited": n.get("lastEditedAt") is not None}
@@ -323,15 +356,17 @@ def _required(pr, owner_repo, base, run):
     return sorted(names)
 
 
-def evidence_for(owner_repo, number, head, review_authors, bar, last_piece, acceptance,
+def evidence_for(owner_repo, number, head, settings, bar, last_piece, acceptance,
                  own_check=None, run=_gh):
     """THE ONE FUNCTION: layer 2's answer for pull request `number` at `head`, read from the
-    platform now. {"verdict": "yes"|"no", "head", "reasons"}: closed words, never its text."""
+    platform now. `settings` is what the validator's settings `load()` returned: Stage E's login
+    comes from there and nowhere else. {"verdict": "yes"|"no", "head", "reasons"}: closed words,
+    never its text."""
     if (not isinstance(owner_repo, str) or not REPO_RE.fullmatch(owner_repo)
             or isinstance(number, bool) or not isinstance(number, int) or number < 1):
         return {"verdict": "no", "head": head, "reasons": ["pr-not-open"]}
-    return judge(read_facts(owner_repo, number, run), head, review_authors, bar, last_piece,
-                 acceptance, own_check)
+    return judge(read_facts(owner_repo, number, run), head, trusted_login(settings), bar,
+                 last_piece, acceptance, own_check)
 
 
 def main(argv=None):
@@ -342,7 +377,8 @@ def main(argv=None):
     p.add_argument("--repo", required=True)
     p.add_argument("--pr", type=int, required=True)
     p.add_argument("--head", required=True)
-    p.add_argument("--review-author", action="append", default=[])
+    p.add_argument("--settings-file", required=True,
+                   help="the validator's settings; Stage E's login is read from there")
     p.add_argument("--bar", default="medium")
     p.add_argument("--last-piece", choices=("yes", "no"), required=True)
     p.add_argument("--acceptance", default=None)
@@ -352,7 +388,11 @@ def main(argv=None):
         from scratch_run import contained
         return contained(selftest, "validator-evidence-selftest-")
     if args.cmd == "check":
-        got = evidence_for(args.repo, args.pr, args.head, args.review_author, args.bar,
+        path = os.path.expanduser(args.settings_file)
+        if not os.path.isabs(path):
+            print("COULD NOT RUN: --settings-file must be an absolute path, or start with ~/.")
+            return 2
+        got = evidence_for(args.repo, args.pr, args.head, load_settings(path), args.bar,
                            args.last_piece == "yes", args.acceptance, args.own_check)
         print(json.dumps(got))
         return 0 if got["verdict"] == "yes" else 1
@@ -374,10 +414,13 @@ def selftest():
             failures.append("FAIL %s: got %r, want %r" % (name, str(got)[:300], str(want)[:300]))
 
     H, OLD = "a" * 40, "b" * 40
-    AUTHORS = ("stage-e-bot",)
+    # Stage E's login comes from the settings, as load() returns them. A minimal read result is
+    # all trusted_login() looks at; a real file is read end to end in part 8.
+    LOGIN = "acme-stage-e[bot]"
+    SETTINGS = {"state": SETTINGS_READ, LOGIN_KEY: LOGIN}
 
     def review(coverage="full", head=H, findings=(), summary="The change does what the ticket asks.",
-               reason="the reviewer could not run", author="stage-e-bot", edited=False, partial=None,
+               reason="the reviewer could not run", author=LOGIN, edited=False, partial=None,
                author_type="Bot"):
         if coverage in ("declined",):
             body = prl.render_comment({"usable": False, "reason": reason, "head": head}, "KIT-9", None)
@@ -409,9 +452,9 @@ def selftest():
             "comments": [{"author": "someone", "author_type": "User", "body": "Looks fine to me.",
                           "created_at": "x", "edited": False}, review()]}
 
-    def run(facts=None, head=H, authors=AUTHORS, bar="medium", last_piece=False,
+    def run(facts=None, head=H, login=LOGIN, bar="medium", last_piece=False,
             acceptance=None, own_check=None):
-        return judge(good if facts is None else facts, head, authors, bar, last_piece,
+        return judge(good if facts is None else facts, head, login, bar, last_piece,
                      acceptance, own_check)
 
     def with_(**over):
@@ -496,6 +539,10 @@ def selftest():
             ("missing", [], ["review-missing"]),
             ("partial", [review("partial", partial={"withheld": ["big.py"], "shown": 3,
                                                     "total": 4})], ["review-partial"]),
+            ("partial, thousands of files withheld: the marker names some and counts the rest",
+             [review("partial", partial={"withheld": ["vendor/package_%04d/%s.js" % (i, "n" * 80)
+                                                      for i in range(4000)],
+                                         "shown": 3, "total": 4003})], ["review-partial"]),
             ("stale: another head", [review(head=OLD)], ["review-stale"]),
             ("declined", [review("declined")], ["review-declined"]),
             ("skipped: no ticket", [review("skipped")], ["review-declined"]),
@@ -503,41 +550,60 @@ def selftest():
             ("by a login not trusted to post it", [review(author="a-session")],
              ["review-missing"]),
             ("its marker anywhere but the second line",
-             [{"author": "stage-e-bot", "author_type": "Bot", "edited": False, "created_at": "x",
+             [{"author": LOGIN, "author_type": "Bot", "edited": False, "created_at": "x",
                "body": "## review %s\n\n<!-- stage-e-coverage {\"coverage\": \"full\", \"head\": "
                        "\"%s\"} -->\nNo findings against correctness, security, test assertions, "
                        "or scope." % (REVIEW_MARKER, H)}], ["review-missing"]),
             ("a reply that quotes a marker, with no review heading",
-             [{"author": "stage-e-bot", "author_type": "Bot", "edited": False, "created_at": "x",
+             [{"author": LOGIN, "author_type": "Bot", "edited": False, "created_at": "x",
                "body": "Answering the review\n<!-- stage-e-coverage {\"coverage\": \"full\", "
                        "\"head\": \"%s\"} -->\nNo findings against correctness, security, test "
                        "assertions, or scope." % H}], ["review-missing"]),
             ("a full marker with no findings line",
-             [{"author": "stage-e-bot", "author_type": "Bot", "edited": False, "created_at": "x",
+             [{"author": LOGIN, "author_type": "Bot", "edited": False, "created_at": "x",
                "body": "## review %s\n<!-- stage-e-coverage {\"coverage\": \"full\", \"head\": "
                        "\"%s\"} -->\nAll good." % (REVIEW_MARKER, H)}], ["review-unreadable"])):
         check("review %s" % label, run(with_(comments=comments))["reasons"], want)
     # Stage E on the first version (high): a session posting as the review login could forge a
     # clean review for a head Stage E never reviewed. A review counts only from a bot login that is
     # not the pull request's author and that no workflow of the pull request can post as.
-    forged_only = with_(comments=[review(author="braedensc", author_type="User")],
-                        pr_author="braedensc")
-    check("a clean review for a new head, posted as a person's login, is no",
-          run(forged_only, authors=("braedensc",))["reasons"], ["review-login-shared"])
-    check("...even when that person is not the pull request's author",
-          run(with_(comments=[review(author="owner", author_type="User")]),
-              authors=("owner",))["reasons"], ["review-login-shared"])
+    # KIT-580: the one login comes from the settings, and is a bot's: `<app slug>[bot]`.
+    check("login: the settings name the login that posted the review: yes",
+          run(login=LOGIN)["verdict"], "yes")
+    check("login: the settings name a different bot: its review is not Stage E's",
+          run(login="other-app[bot]")["reasons"], ["review-missing"])
+    check("login: the settings name none: no review is trusted, said",
+          run(login=None)["reasons"], ["review-login-unset"])
+    check("login: an empty login is none", run(login="")["reasons"], ["review-login-unset"])
+    for label, bad in (("a person's login", "a-person"),
+                       ("the bot's login as GraphQL names it, without [bot]", "acme-stage-e"),
+                       ("a bot login in capitals", "Acme-Stage-E[bot]"),
+                       ("a login with a line break after it", LOGIN + "\n"),
+                       ("a list of logins", [LOGIN]), ("a number", 7)):
+        check("login: %s is malformed: no review is trusted, said" % label,
+              run(login=bad)["reasons"], ["review-login-malformed"])
+    for label, settings in (("settings that were not read", dict(SETTINGS, state="absent")),
+                            ("settings that were refused", dict(SETTINGS, state="untrusted")),
+                            ("no settings at all", None), ("settings that are a list", [SETTINGS]),
+                            ("read settings with no login", {"state": SETTINGS_READ,
+                                                             LOGIN_KEY: None})):
+        check("login: %s give no login" % label, trusted_login(settings), None)
+    check("login: read settings give their login", trusted_login(SETTINGS), LOGIN)
+    forged_only = with_(comments=[review(author="a-person", author_type="User")],
+                        pr_author="a-person")
+    check("a clean review for a new head, posted as a person's login, is not Stage E's",
+          run(forged_only)["reasons"], ["review-missing"])
+    check("a comment under the login that the platform says a person posted is no",
+          run(with_(comments=[review(author_type="User")]))["reasons"], ["review-login-shared"])
     check("a review by the pull request's own author, bot or not, is no",
-          run(with_(pr_author="stage-e-bot"))["reasons"], ["review-login-shared"])
+          run(with_(pr_author=LOGIN))["reasons"], ["review-login-shared"])
     check("a review posted as github-actions, which a PR's own workflow can post as, is no",
           run(with_(comments=[review(author="github-actions[bot]")]),
-              authors=("github-actions[bot]",))["reasons"], ["review-login-shared"])
+              login="github-actions[bot]")["reasons"], ["review-login-shared"])
     check("a bot nobody named is not Stage E",
-          run(with_(comments=[review(author="other-bot")]))["reasons"], ["review-missing"])
+          run(with_(comments=[review(author="other-app[bot]")]))["reasons"], ["review-missing"])
     check("review: comments that could not all be read are no",
           run(with_(comments=None))["reasons"], ["review-unreadable"])
-    check("review: no trusted login configured is no",
-          run(authors=())["reasons"], ["review-authors-unset"])
     check("review: a bar that is not a severity is no",
           run(bar="whatever")["reasons"], ["review-bar-unknown"])
 
@@ -562,7 +628,7 @@ def selftest():
     check("reviewer text that mimics a clean findings line cannot hide the real one",
           run(with_(comments=[hostile]))["reasons"], ["review-finding-at-bar"])
     check("an invented severity word is unreadable, never clean",
-          run(with_(comments=[{"author": "stage-e-bot", "author_type": "Bot", "edited": False, "created_at": "x",
+          run(with_(comments=[{"author": LOGIN, "author_type": "Bot", "edited": False, "created_at": "x",
                                "body": review()["body"].replace(
                                    "No findings against correctness, security, test assertions, "
                                    "or scope.", "**1 finding(s)** %s highest `none` %s threshold "
@@ -601,16 +667,17 @@ def selftest():
     check("the answer holds closed words only, and no text from the pull request",
           (sorted(got), all(r in REASONS for r in got["reasons"]),
            "SECRET-PR-TEXT" in json.dumps(got)), (["head", "reasons", "verdict"], True, False))
-    every = judge({}, "x", (), "?", None, None)
+    every = judge({}, "x", None, "?", None, None)
     check("an empty fact sheet is no, for every reason it can tell",
           (every["verdict"], every["reasons"]),
-          ("no", ["pr-not-open", "head-moved", "checks-unreadable", "review-authors-unset",
+          ("no", ["pr-not-open", "head-moved", "checks-unreadable", "review-login-unset",
                   "last-piece-unknown", "merge-unknown", "merge-draft"]))
 
     # 8. Reading the platform: one GraphQL query and one REST read, through `gh`, stubbed here.
     gql = {"data": {"repository": {"pullRequest": {
         "state": "OPEN", "isDraft": False, "headRefOid": H, "baseRefName": "main",
-        "mergeable": "MERGEABLE", "mergeStateStatus": "BLOCKED", "author": {"login": "a-session"},
+        "mergeable": "MERGEABLE", "mergeStateStatus": "BLOCKED",
+        "author": {"__typename": "User", "login": "a-session"},
         "baseRef": {"branchProtectionRule": {"requiredStatusCheckContexts": ["Kit checks"]}},
         "commits": {"nodes": [{"commit": {"oid": H, "statusCheckRollup": {"contexts": {
             "totalCount": 3, "pageInfo": {"hasNextPage": False}, "nodes": [
@@ -623,7 +690,7 @@ def selftest():
                 {"__typename": "StatusContext", "context": "legacy/ci", "state": "SUCCESS",
                  "createdAt": "2026-11-10T21:00:00Z", "isRequired": False}]}}}}]},
         "comments": {"totalCount": 1, "nodes": [{
-            "author": {"__typename": "Bot", "login": "stage-e-bot"}, "body": review()["body"],
+            "author": {"__typename": "Bot", "login": "acme-stage-e"}, "body": review()["body"],
             "createdAt": "2026-11-10T22:00:00Z", "lastEditedAt": None}]}}}}}
     rules = [{"type": "required_status_checks", "parameters": {"required_status_checks": [
         {"context": "Provenance scan", "integration_id": 1}]}}, {"type": "deletion"}]
@@ -644,25 +711,24 @@ def selftest():
           (H, H, ["Kit checks", "Provenance scan"], "a-session",
            [("Kit checks", "github-actions/CI", "green", True),
             ("Provenance scan", "?/?", "green", True), ("legacy/ci", "status", "green", False)],
-           [("stage-e-bot", "Bot", False)]))
+           [(LOGIN, "Bot", False)]))
     check("read: the query asks who wrote each comment and which workflow ran each check",
-          all(part in QUERY for part in ("author{login}", "author{__typename login}",
-                                         "checkSuite{app{slug} workflowRun{workflow{name}}}")),
-          True)
+          (QUERY.count("author{__typename login}"),
+           "checkSuite{app{slug} workflowRun{workflow{name}}}" in QUERY), (2, True))
     check("read: two reads only, a query and a GET, and no mutation anywhere",
           ([c[:2] for c in calls], "mutation" in QUERY.lower(),
            any("-X" in c or "--method" in c for c in calls)),
           ([["api", "graphql"], ["api", "repos/acme/app/rules/branches/main"]], False, False))
     check("read then judge: yes",
-          evidence_for("acme/app", 12, H, AUTHORS, "medium", False, None,
+          evidence_for("acme/app", 12, H, SETTINGS, "medium", False, None,
                        run=stub({"graphql": gql, "rules": rules}))["verdict"], "yes")
-    broken = evidence_for("acme/app", 12, H, AUTHORS, "medium", False, None,
+    broken = evidence_for("acme/app", 12, H, SETTINGS, "medium", False, None,
                           run=stub({"graphql": None, "rules": rules}))
     check("a query that fails is no, never yes",
           (broken["verdict"], "checks-unreadable" in broken["reasons"],
            "review-unreadable" in broken["reasons"]), ("no", True, True))
     check("rulesets that cannot be read are no",
-          evidence_for("acme/app", 12, H, AUTHORS, "medium", False, None,
+          evidence_for("acme/app", 12, H, SETTINGS, "medium", False, None,
                        run=stub({"graphql": gql, "rules": None}))["reasons"],
           ["required-checks-unknown"])
     many = copy.deepcopy(gql)
@@ -670,25 +736,65 @@ def selftest():
     many["data"]["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"][
         "statusCheckRollup"]["contexts"]["pageInfo"]["hasNextPage"] = True
     check("more comments or checks than one read holds is no",
-          evidence_for("acme/app", 12, H, AUTHORS, "medium", False, None,
+          evidence_for("acme/app", 12, H, SETTINGS, "medium", False, None,
                        run=stub({"graphql": many, "rules": rules}))["reasons"],
           ["checks-unreadable", "review-unreadable"])
     edited = copy.deepcopy(gql)
     edited["data"]["repository"]["pullRequest"]["comments"]["nodes"][0]["lastEditedAt"] = "x"
     check("a review comment the platform says was edited is no",
-          evidence_for("acme/app", 12, H, AUTHORS, "medium", False, None,
+          evidence_for("acme/app", 12, H, SETTINGS, "medium", False, None,
                        run=stub({"graphql": edited, "rules": rules}))["reasons"],
           ["review-edited"])
     person = copy.deepcopy(gql)
     person["data"]["repository"]["pullRequest"]["comments"]["nodes"][0]["author"] = {
-        "__typename": "User", "login": "stage-e-bot"}
-    check("a review the platform says a person posted is no",
-          evidence_for("acme/app", 12, H, AUTHORS, "medium", False, None,
+        "__typename": "User", "login": "acme-stage-e"}
+    check("a review the platform says a person posted is not Stage E's, whatever the name",
+          evidence_for("acme/app", 12, H, SETTINGS, "medium", False, None,
                        run=stub({"graphql": person, "rules": rules}))["reasons"],
+          ["review-missing"])
+    suffixed = copy.deepcopy(gql)
+    suffixed["data"]["repository"]["pullRequest"]["comments"]["nodes"][0]["author"] = {
+        "__typename": "Bot", "login": LOGIN}
+    check("a bot login the platform already gives with [bot] does not get it twice",
+          evidence_for("acme/app", 12, H, SETTINGS, "medium", False, None,
+                       run=stub({"graphql": suffixed, "rules": rules}))["verdict"], "yes")
+    bot_pr = copy.deepcopy(gql)
+    bot_pr["data"]["repository"]["pullRequest"]["author"] = {"__typename": "Bot",
+                                                             "login": "acme-stage-e"}
+    check("a pull request Stage E's own bot opened is no: the review would be its own",
+          evidence_for("acme/app", 12, H, SETTINGS, "medium", False, None,
+                       run=stub({"graphql": bot_pr, "rules": rules}))["reasons"],
           ["review-login-shared"])
+
+    # A real settings file, read by the settings' own load(): the login comes from it, and only
+    # from it (KIT-580). A matching login, a different one, none, and one that is not a bot's.
+    import tempfile
+    import pipeline_validator_settings as pvs
+    here = os.path.dirname(os.path.abspath(__file__))
+    with open(os.path.join(os.path.dirname(here), "validator-settings.example.json"),
+              encoding="utf-8") as fh:
+        example = json.load(fh)
+    with tempfile.TemporaryDirectory() as tmp:
+        os.chmod(tmp, 0o700)
+        path = os.path.join(tmp, "settings.json")
+        for label, login, want in (("its login, the review's", LOGIN, []),
+                                   ("a different login", "other-app[bot]", ["review-missing"]),
+                                   ("no login, as the example ships", None, ["review-login-unset"]),
+                                   ("a person's login: the file is refused", "a-person",
+                                    ["review-login-unset"])):
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(dict(example, stage_e_login=login), fh)
+            os.chmod(path, 0o600)
+            check("a settings file with %s" % label,
+                  evidence_for("acme/app", 12, H, pvs.load(path), "medium", False, None,
+                               run=stub({"graphql": gql, "rules": rules}))["reasons"], want)
+        check("no settings file: no review is trusted",
+              evidence_for("acme/app", 12, H, pvs.load(os.path.join(tmp, "none.json")), "medium",
+                           False, None, run=stub({"graphql": gql, "rules": rules}))["reasons"],
+              ["review-login-unset"])
     check("a malformed repository or number is no, and reads nothing",
-          (evidence_for("acme app", 12, H, AUTHORS, "medium", False, None, run=None)["verdict"],
-           evidence_for("acme/app", 0, H, AUTHORS, "medium", False, None, run=None)["verdict"]),
+          (evidence_for("acme app", 12, H, SETTINGS, "medium", False, None, run=None)["verdict"],
+           evidence_for("acme/app", 0, H, SETTINGS, "medium", False, None, run=None)["verdict"]),
           ("no", "no"))
 
     # 9. It writes nothing and runs nothing but `gh`.
@@ -698,6 +804,9 @@ def selftest():
     banned = ("os.replace", "os.rename", "os.unlink", "os.remove", "shutil", "os.makedirs",
               "os.chmod", "json.dump(", ".write(", "os.system", "socket", "urlopen", "eval(",
               "exec(", "Popen")
+    check("no login is named in the code but the one it refuses: the trusted one is the settings'",
+          (re.findall(r'"[A-Za-z0-9-]+\[bot\]"', above), "stage-e" in above),
+          (['"github-actions[bot]"'], False))
     check("it writes nothing, and runs no process but gh",
           ([b for b in banned if b in above], re.findall(r"open\(", above),
            above.count("subprocess.run(["), "[\"gh\"] + list(args)" in above),

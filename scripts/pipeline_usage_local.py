@@ -130,8 +130,8 @@ CONFIG_KEYS = {
                          % DEFAULT_STAGE_A_STATE,
     "judge_file": "the watcher judge's judge-calls.json, whose calls the judge's cost is read "
                   "from (default: empty, which turns this source off)",
-    "reviews_team_key": "the team KEY of the reviews team, e.g. \"REV\": a run in a folder "
-                        "that starts with KEY- is a review (required)",
+    "reviews_team_key": "optional: the KEY of an old Reviews team, e.g. \"REV\": a run in a folder "
+                        "that starts with KEY- is a review (default: empty, which leaves it out)",
     "out": "where the file is written; absolute or ~/, outside every git working tree "
            "(default %s)" % DEFAULT_OUT,
     "lookback_days": "how many local days the file covers, 1-%d (default %d); the plan's "
@@ -217,10 +217,12 @@ def load_config(path):
     unknown = sorted(set(raw) - set(CONFIG_KEYS))
     if unknown:
         raise ConfigError("unknown config key(s): %s (see --example-config)" % ", ".join(unknown))
-    team = raw.get("reviews_team_key")
-    if not isinstance(team, str) or not TEAM_RE.match(team):
-        raise ConfigError("config 'reviews_team_key' is required: the reviews team's KEY, "
-                          "e.g. \"REV\"")
+    # KIT-596: optional. A review on a work team is told by the review poller's own record;
+    # this key only names an old Reviews team, whose folders are still reviews.
+    team = raw.get("reviews_team_key", "")
+    if not isinstance(team, str) or not (team == "" or TEAM_RE.match(team)):
+        raise ConfigError("config 'reviews_team_key' must be a team KEY, e.g. \"REV\", or "
+                          "left out")
     days = raw.get("lookback_days", DEFAULT_LOOKBACK_DAYS)
     if (not isinstance(days, int) or isinstance(days, bool)
             or not 1 <= days <= MAX_LOOKBACK_DAYS):
@@ -367,9 +369,10 @@ def cap_models(by_model):
     return kept
 
 
-def workspace_kind(ws, cfg, planners):
+def workspace_kind(ws, cfg, planners, reviewers=frozenset()):
     """A piece's kind is its workspace's: review, planner, or coding for any other ticket."""
-    if ws.startswith(cfg["reviews_team_key"] + "-"):
+    if ws in (reviewers or ()) or (cfg.get("reviews_team_key")
+                                   and ws.startswith(cfg["reviews_team_key"] + "-")):
         return "review"
     return "planner" if planners and ws in planners else "coding"
 
@@ -441,7 +444,8 @@ def summarize(cfg, scanned, now, started):
             p["usd"] += r["cost"] or 0.0
             p["last"] = max(p["last"], r["last"])
     listed = sorted(pieces.values(), key=lambda p: (-p["usd"], -p["last"], p["id"]))[:PIECES_CAP]
-    pieces = [{"id": p["id"], "kind": workspace_kind(p["id"], cfg, scanned["planners"]),
+    pieces = [{"id": p["id"], "kind": workspace_kind(p["id"], cfg, scanned["planners"],
+                                                     scanned.get("reviewers")),
                "usd": round(p["usd"], 6), "runs": p["runs"], "last_at": _iso(p["last"])}
               for p in listed]
     windows = {}
@@ -743,7 +747,7 @@ def _cases(check):
                 dig(doc, "sources", s, "answered"), dig(doc, "sources", s, "read_at"))
                for s in SOURCES],
               [("logs", READ, 48, 48, "2026-11-03T12:00:00Z"),
-               ("ledger", READ, 3, 3, "2026-11-03T12:00:00Z"),
+               ("ledger", READ, 4, 4, "2026-11-03T12:00:00Z"),   # KIT-596: + the review record
                ("planner", READ, 1, 1, "2026-11-03T12:00:00Z")])
         check("…and every pass says it, in the sources' own words",
               ([l.split()[0] for l in said[1:4]], said[-2], said[-1].startswith("  written to ")),
@@ -799,6 +803,15 @@ def _cases(check):
                ("ENG-14", "coding", 0.5, 1, "2026-11-03T05:00:30Z"),
                ("ENG-13", "coding", 0.4, 1, "2026-11-03T07:01:00Z"),
                ("ENG-17", "coding", 0.0, 1, "2026-11-03T11:00:00Z")])
+        # KIT-596: a ticket the review poller recorded is a review in the pieces too, with no
+        # Reviews team key to tell it by.
+        import pipeline_machine_tickets as machine
+        cfg_rv, _ = std_world(os.path.join(tmp, "rv-pieces"), reviews_team_key="")
+        machine.add_to_review_record(cfg_rv["stage_e_state_dir"], "iss-11", "ENG-11", "acme/app", 4)
+        go(cfg_rv)
+        check("KIT-596 a ticket in the review poller's record is a review in the week's pieces",
+              [p["kind"] for p in dig(written(cfg_rv), "pieces") if p["id"] in ("ENG-11", "REV-9")],
+              ["review", "coding"])
         check("the newest event for each window, and a window or word the list lacks is "
               "other", dig(doc, "status", "windows"), {
                   "five_hour": {"status": "allowed_warning", "utilization": 0.3,
@@ -1050,7 +1063,7 @@ def _cases(check):
         check("a review record that cannot be read: the ledger is partly read, said, exit 3",
               (code, [dig(doc_p, "sources", "ledger", k)
                       for k in ("state", "asked", "answered", "reason")]),
-              (EXIT_PARTIAL, [PARTLY, 4, 3, "a review record could not be read"]))
+              (EXIT_PARTIAL, [PARTLY, 5, 4, "a review record could not be read"]))
         cfg_t, _ = std_world(os.path.join(tmp, "torn"))
         with open(os.path.join(cfg_t["stage_e_state_dir"], "bounce-ledger.jsonl"), "a") as fh:
             fh.write('{"at": "2026-11-02T21:00:00Z", "repo": "acme/ap\n[1, 2]\n')
@@ -1060,7 +1073,7 @@ def _cases(check):
               "exit 3",
               (code, [dig(doc_t, "sources", "ledger", k)
                       for k in ("state", "asked", "answered", "reason")]),
-              (EXIT_PARTIAL, [PARTLY, 3, 2, "2 line(s) of the bounce ledger could not be read"]))
+              (EXIT_PARTIAL, [PARTLY, 4, 3, "2 line(s) of the bounce ledger could not be read"]))
         for n, (label, content) in enumerate((("a record that is not JSON", "not json"),
                                               ("a record with no triggers", "{}"))):
             cfg_a, _ = std_world(os.path.join(tmp, "planner-%d" % n))
@@ -1344,11 +1357,16 @@ def _cases(check):
               ("REV", DEFAULT_LOOKBACK_DAYS, os.path.join(tmp, "o", "usage.json")))
         check("an unknown key is refused", "unknown config key" in refused(dict(example, x=1)),
               True)
-        check("the reviews team key is required, and is a team key",
+        check("KIT-596 the reviews team key is optional, and when given is a team key",
               ["reviews_team_key" in refused(d) for d in (
                   dict((k, v) for k, v in example.items() if k != "reviews_team_key"),
                   dict(example, reviews_team_key="rev"), dict(example, reviews_team_key=5))],
-              [True, True, True])
+              [False, True, True])
+        check("KIT-596 a review on a work team is told by the review poller's record",
+              (workspace_kind("ENG-12", {"reviews_team_key": ""}, set(), {"ENG-12"}),
+               workspace_kind("ENG-13", {"reviews_team_key": ""}, set(), {"ENG-12"}),
+               workspace_kind("REV-4", {"reviews_team_key": "REV"}, set())),
+              ("review", "coding", "review"))
         check("lookback_days is a whole number of days from 1 to 31",
               ["lookback_days" in refused(dict(example, lookback_days=v))
                for v in (0, 32, True, 1.5, "8")]

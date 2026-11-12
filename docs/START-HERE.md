@@ -60,15 +60,51 @@ there is no override.
 
 3. **Turn it on for the project.** Copy `delivery.example.json` to `delivery.json`, fill it in,
    and run `python3 scripts/check_delivery_config.py`. The `/setup-board` skill makes the
-   matching Linear board. The formats are in `docs/PIPELINE-CONTRACT.md`.
+   matching Linear board. The formats are in `docs/PIPELINE-CONTRACT.md`. Commit
+   `delivery.json` and merge it into the default branch before the dispatcher's first session
+   in this repo. The hook turns on its pipeline guards only when it finds this file. Without
+   it, a dispatcher session has none.
    *Works:* the checker prints no errors. *Fails:* it names the key that is wrong.
 
-4. **The dispatcher.** Build it by its own guide and run one coding session by hand. Stage E
-   needs that first session to have happened.
+4. **The host and the dispatcher.** `docs/HOST.md` says what a correct host is. Build the host
+   and the dispatcher by the dispatcher's own guide. Do not delegate a ticket yet.
+   *Works:* the host passes the checklist at the end of `docs/HOST.md`. *Fails:* a line there
+   does not hold. Fix it before the next step.
+
+5. **The lane marker.** Write it before any dispatcher session. It is one empty file, owned by
+   root, named for the role account. No installer writes it: you run these lines, and each asks
+   for your Mac password. `<role>` is the role account's name.
+
+   ```sh
+   sudo install -d -o root -g wheel -m 755 /etc/claude-pipeline /etc/claude-pipeline/dispatched-lane
+   ```
+   Good: no output, and the prompt comes back.
+   Not that: `is not in the sudoers file`. Run it from an admin account.
+
+   ```sh
+   sudo install -o root -g wheel -m 444 /dev/null /etc/claude-pipeline/dispatched-lane/<role>
+   ```
+   Good: no output, and the prompt comes back.
+   Not that: `No such file or directory`. The first line did not run. Run it again.
+
+   ```sh
+   ls -l /etc/claude-pipeline/dispatched-lane
+   ```
+   Good: one file named for the role account, owned by root, mode `-r--r--r--`.
+   Not that: the file is owned by the role account, or anyone can write it.
+
+   Without the marker, the hook reads a dispatcher session as your own. That session could
+   create tickets, edit any ticket, set its own supervision labels and rewrite its acceptance
+   criteria. Your own account gets no marker.
+   *Works:* the `ls` line shows the Good line above.
+   *Fails:* the review installer's lane-marker row stops and says what is wrong. Its card also
+   prints extra lines for a repo whose hook predates this marker.
+
+6. **The first dispatcher session.** Delegate one throwaway ticket.
    *Works:* a delegated ticket starts a session. *Fails:* nothing starts. Read
    `docs/SESSION-BRIEF.md` for what a session is told and what it can do.
 
-5. **Stage E, the review layer.** Copy `stage-e.conf.example` to `stage-e.conf` and fill it in.
+7. **Stage E, the review layer.** Copy `stage-e.conf.example` to `stage-e.conf` and fill it in.
    Then run `python3 scripts/pipeline_stage_e_setup.py run` and repeat it until it stops asking.
    Guide: `docs/STAGE-E-OPERATOR.md`. It also installs the finding poller
    (`docs/FINDING-POLLER.md`), the catch-up poller (`docs/CATCH-UP.md`), the heartbeat monitor
@@ -77,21 +113,21 @@ there is no override.
    *Fails:* a row says FAILED or NOT MEASURED. Each row names what to do. A row that could
    not look never counts as a pass.
 
-6. **The idea gate.** `python3 scripts/pipeline_install.py` pulls the kit, then runs Stage E's
+8. **The idea gate.** `python3 scripts/pipeline_install.py` pulls the kit, then runs Stage E's
    check and the idea gate's installer. Run it again after each stop. Guide:
    `docs/STAGE-A-OPERATOR.md`, section 5.
    *Works:* `python3 scripts/pipeline_stage_a_setup.py verify` exits 0, and a throwaway idea
    moved to **Plan it** becomes a plan.
    *Fails:* the planner says the routing is unknown. Nothing new starts until it is known.
 
-7. **The notifier.** One short ping to you for each event that needs a person. Copy
+9. **The notifier.** One short ping to you for each event that needs a person. Copy
    `notifier.conf.example` to `notifier.conf`, then run
    `python3 scripts/pipeline_notifier_setup.py run`. Guide: `docs/NOTIFIER-OPERATOR.md`.
    *Works:* `python3 scripts/pipeline_notifier_setup.py verify` exits 0 and a test ping arrives.
    *Fails:* a dead notifier does not ping you. Its heartbeat file and the monitor are how you
    find out.
 
-8. **The chat lane, then the bridge.** The chat lane lets you mention the dispatcher's bot in
+10. **The chat lane, then the bridge.** The chat lane lets you mention the dispatcher's bot in
    Slack. The bridge lets a trusted member answer "yes" and act as you. Read the trusted-members
    rule first: anyone who can say yes has your reach. Guides: `docs/CHAT-LANE-OPERATOR.md`,
    `docs/BRIDGE-OPERATOR.md`. Commands:
@@ -100,19 +136,21 @@ there is no override.
    *Works:* both exit 0 and the bridge answers a test message.
    *Fails:* `UNKNOWN` on a fresh chat lane until its first live check. Run it again after.
 
-9. **Cleanup and health.** The sweep removes what finished runs leave behind (`docs/SWEEP.md`,
+11. **Cleanup and health.** The sweep removes what finished runs leave behind (`docs/SWEEP.md`,
    `python3 scripts/pipeline_sweep_setup.py run`). The health watch and the update review say
    what is out of date (`docs/UPDATE-OPERATOR.md`, `python3 scripts/pipeline_update.py review`).
    *Works:* the sweep's dry run lists only what you expect. `review` shows every part current.
    *Fails:* the sweep never loads itself. You read its dry run first.
 
-10. **Optional, off by default.** The queue and workers that start approved work without you
-    (`docs/QUEUE-OPERATOR.md`, `docs/AUTONOMY.md`). The watcher (`docs/WATCHER.md`). Leave these
-    off until the parts above have run for a while.
+12. **Optional, off by default.** The queue and workers that start approved work without you
+    (`docs/QUEUE-OPERATOR.md`, `docs/AUTONOMY.md`). The acceptance check, which looks at a finished
+    plan's app in a real browser (`docs/ACCEPTANCE-POLLER-OPERATOR.md`, *The installer*). The watcher
+    (`docs/WATCHER.md`). Leave these off until the parts above have run for a while.
     *Works:* for the queue, `python3 scripts/pipeline_queue_setup.py run --dry-run` ends with
     `DRY RUN: nothing was changed` and each row reads `ALREADY-DONE` or `WOULD-CHANGE`. For the
     watcher, `python3 scripts/pipeline_watcher_local.py run --config <watcher.json> --dry-run`
-    prints what it sees and changes nothing.
+    prints what it sees and changes nothing. For the acceptance check,
+    `python3 scripts/pipeline_acceptance_setup.py verify` ends `DONE — every row holds`.
     *Fails:* a row says `UNKNOWN` or `FAILED`, or the queue installer lists problems in your
     conf. `UNKNOWN` means it could not look, which is not a pass. The watcher has no scheduled
     job yet (`docs/WATCHER.md`), so it only runs when you start it.
@@ -128,6 +166,7 @@ No installer does these. Plan for them.
 - Add the guard-change label when a pull request touches a guard. A session cannot.
 - Type your login password when an installer asks, and sign each card it prints.
 - Run the `launchctl` lines a card prints. The installers never load a job for you.
+- Write the lane marker as root, before the first dispatcher session.
 
 ## When something looks wrong
 
@@ -142,4 +181,5 @@ not proven" list: read it before you trust a part.
 - **That the order is the only one that works.** It is the order each guide's "what you need
   first" implies. KIT-59.
 - **Part 2 on Linux.** The installers write launchd jobs. No ticket yet.
-- **A dispatcher guide the kit ships.** There is none here. KIT-54.
+- **A dispatcher the kit ships.** There is none here. `docs/HOST.md` says what a correct host
+  is, but not how to build one. No ticket yet.

@@ -25,6 +25,10 @@ exists to prevent.
 | [Hold file](#20-hold-file) | the watcher account's home, in a folder no worker can write | the watcher | every job that starts work |
 | [Acceptance result block](#21-acceptance-result-block) | the acceptance session's result | the acceptance session | the acceptance poller |
 | [Acceptance verdict comment](#22-acceptance-verdict-comment) | a comment on the plan's epic | the acceptance poller | the bridge, before it closes a plan (later) |
+| [Validator settings file](#23-validator-settings-file) | the user's own home, outside every worktree | the owner, by hand | the validator |
+| [Validator ledger](#24-validator-ledger) | the user's own home, outside every worktree | the validator, by one writer function | the stand-up, the recap, the watcher |
+| [Acceptance follow-up request](#25-acceptance-follow-up-request) | a comment on the plan's epic | the acceptance poller's live pass | the finding poller |
+| [Acceptance check request](#26-acceptance-check-request) | a comment on the plan's epic | the Slack bridge, on the owner's yes | the acceptance poller's live pass |
 
 > **§8 onwards are appended rather than slotted in beside their topical neighbours.**
 > These section numbers are cited by name from `.claude/hooks/session-start.py`, the
@@ -115,7 +119,7 @@ the reader happens to run.
 | `stateIds.working` | string (UUID) | dispatcher | A session holds it. Counts against `budgets.wipLimit`. |
 | `stateIds.review` | string (UUID) | dispatcher, reviewer | PR open, awaiting review/CI — the "waiting on a human" lane that keeps it distinguishable from `working`. Reached by the tracker's *pull request opened* git automation and/or a session's §8 `ticket-state` request; same target, so the two do not race, and on a lane with no safe-outputs executor the automation is the only mechanism. Neither authorises anything — approval is `ready` and is read specifically (§5). |
 | `stateIds.needsApproval` | string (UUID) | Stage E bounce driver | **Provisioned as type `unstarted` — never `started`, never `completed`** (see below). AI review has concluded and a person should accept the work: the findings were clean or below `budgets.reviewSeverityThreshold`, or the bounce budget is spent (then `agent:needs-human` is on the ticket too, and that label is what tells the two apart). Reached ONLY by the bounce driver's own move — no git automation, and never a session: the `ticket-state` kind (§8) excludes it, because the conclusion of a review is not something the reviewed party may report. It authorises nothing; approval is `ready` and is read specifically (§5). |
-| `stateIds.done` | string (UUID) | dispatcher | Merged/closed. |
+| `stateIds.done` | string (UUID) | dispatcher | Merged/closed. Reached by the tracker's *pull request merged* git automation, seconds after the merge, or by a person. Never by a session: the `ticket-state` kind (§8) refuses `done`. **Decided (KIT-51): the automation keeps this move.** It closes tickets and starts the dispatcher's worktree clean-up with no person involved; turned off, tickets would close only by hand and worktrees would pile up. The accepted cost: Done makes the dispatcher force-remove the ticket's worktree, so a merge while that ticket's session still runs loses its uncommitted work, and any ticket id in a PR's title, branch or body moves that ticket too (`docs/OPERATIONS.md`). The tracker sets these moves per team, so each team with a repository needs them. |
 | `labels.ids` | object → string (UUID) | dispatcher, guards | Map of **canonical key → Linear label ID**. The key is the stable name used in code; the Linear display name may drift from it. |
 | `labels.required` | string[] | validator | Subset of `labels.ids` keys that must resolve before the pipeline may dispatch. **Floored at §6's dispatcher-owned set** (`agent:queued`, `agent:working`, `agent:blocked`, `agent:needs-human`, `blocked:capacity`) — a project may require more, never fewer. |
 | `findingTicket` | object \| absent | safe-outputs executor | **Opt-in.** Present ⇒ the `ticket-create` kind (§8) is available: a session may *request* a follow-up finding ticket. Absent ⇒ that kind is refused and findings stay `ticket-comment`s. |
@@ -276,7 +280,7 @@ credential so a runaway queue cannot exhaust a human's session capacity.
 | `epicApprovers` | string[] (optional) | KIT-161. Tracker user ids of the people whose move of an epic into `ready` approves its tree (§5 rule 2). The approve tier reads who moved the epic from the tracker's history (`readyBy`) and holds every child unless that id is on this list. Empty or absent: nothing is approved. Never the agent user or a machine account. |
 | `autoMergeMaxLines` | integer | Diff-size ceiling under which an *out-of-session* automation may merge. `0` disables. **No Claude Code session may ever act on this** — the merge command is hook-blocked in every form, including `--auto`. If this is ever non-zero, the merge is performed by CI or a GitHub App, never by an agent. The full tier is §11. |
 | `autoMergeMethod` | string (optional) | `squash` \| `merge` \| `rebase`. How the platform merges a qualifying PR. Default `squash`. Cosmetic — it decides nothing about *whether* a PR merges. |
-| `riskPaths` | string[] | Globs that force human review regardless of diff size or provenance. Ships with the guard machinery, CI, git hooks, skills (prompts and rubrics are graders), `delivery.json`, and key material. |
+| `riskPaths` | string[] | Globs that force human review regardless of diff size or provenance. Ships with the guard machinery, CI, git hooks, skills (prompts and rubrics are graders), `delivery.json`, and key material. **What it means today: paths that protect the pipeline from the agent, not paths where a mistake is expensive.** The kit's floor (`REQUIRED_RISK_PATHS` in `scripts/check_delivery_config.py`) lists only guard machinery. A database migration, an auth module or a billing file is covered only if the project adds it. The validator requires the floor and allows more, so a project extends its own list; the kit does not widen the floor for everyone. Whether to add the data layer is the project's decision, and it must be made before the auto-merge tier is turned on. |
 
 ### `dispatch`
 
@@ -1772,7 +1776,7 @@ read. The comment's **second line**, under its heading, is one HTML comment:
 | `coverage` | Meaning | Extra key |
 |---|---|---|
 | `full` | the reviewer saw the whole change | — |
-| `partial` | whole files were withheld over the size cap | `withheld`: the paths |
+| `partial` | whole files, or pieces of one, were withheld over the size cap | `withheld`: the paths or pieces, up to a fixed budget, in order (one name is cut at 300 characters); `withheld_more`: how many more there were, only when the list was cut |
 | `declined` | no review was made | `reason` |
 | `skipped` | Stage E will not review it: its branch names no ticket | `reason` |
 
@@ -1780,7 +1784,8 @@ read. The comment's **second line**, under its heading, is one HTML comment:
 written `-\u002d`, so no path can close the comment early. **Read the second line only.**
 The rest of the comment carries reviewer text, and a marker there is not Stage E's.
 `pipeline_review_local.coverage_marker()` is the reader. Only `full` says the change was
-reviewed, and only at `head`.
+reviewed, and only at `head`. A `withheld` list that was cut is still `partial`: a reader
+takes `coverage`, never the list, and the PR's outcome file holds every name (KIT-618).
 
 ---
 
@@ -1992,6 +1997,7 @@ both pieces.
 | `other_pull_requests` | pull request[] (optional) | KIT-487. Each open pull request in a repository `required_checks` names by key that no listed plan's piece links to, read the same way, in repository and number order. At most 200. A file from before KIT-487 has none. |
 | `other_pull_requests_complete` | boolean \| null (optional) | KIT-487. `true`: every such repository's open pull requests were listed. `false`: at least one was not, or there were more than 200, and `sources.github` says why. `null`: `required_checks` is a list, so it names no repository and none was looked for. An empty list means "none open" only when this is `true`. |
 | `queue_room` | object \| null (optional) | KIT-474. The queue's room hold, from the bridge's record (the `room_file` setting; empty turns it off). `null`: the job is told not to look, or the queue has not yet read the machine. See *The queue's room*. |
+| `kit_clone` | object \| null (optional) | KIT-581. Whether the checkout these jobs run from, the role account's copy of the kit, is behind main. `null`: the job is not told a repository (`kit_repo`). See *The kit copy*. |
 | `findings` | finding[] | The heartbeat monitor's view of `sources`, in the health watch's words. |
 | `firing` | string[] | Empty unless `result` is `failed`: then the sources that failed, which the monitor pages on. |
 
@@ -2008,6 +2014,22 @@ Times are UTC to the second (`2026-11-03T18:05:00Z`), or null where the source g
 | `read_at` | time \| null | When this pass last had an answer from it. |
 
 A reader says "I couldn't check" for a source that is not `read`. It never guesses (KIT-348).
+
+### The kit copy
+
+A merged fix runs nowhere until the role account's clone moves, and only the one command moves it (KIT-309). The status job runs from that clone, so it can say when the clone is behind. It reads the clone's head from the files in `.git` (no process), reads which files the jobs run out of the clone's own copy of the installer's lists (`REQUIRED_SCRIPTS`, the sibling jobs' files and `RUNTIME_DATA_DIRS`, with `ast.literal_eval` and no import), and asks GitHub one read-only question: compare the head with the branch (`kit_repo`, `kit_branch`; `kit_clone` names another checkout). It does not count against `sources`, and a question it cannot answer never fails the pass.
+
+| Field | Type | Notes |
+|---|---|---|
+| `state` | `current` \| `behind` \| `unknown` | `behind`: a file the jobs run, or a schema they read, changed between the head and the branch. `current`: none did (a document or a test may have): the same rule `verify` in the Stage E installer uses, so it does not cry wolf on every merge. `unknown`: the question could not be answered, or GitHub listed too few of the changed files to say none was a job file; never read as current. |
+| `head` | string \| null | The checkout's head commit, twelve characters. |
+| `merges_behind` | integer \| null | How many commits the branch is ahead. |
+| `files` | string[] | At most ten of the changed job files. A name is kept only when it is one of the jobs' own files under `scripts/` or `schemas/`. |
+| `files_total` | integer \| null | How many changed job files there were. Null when GitHub listed too few to say. |
+| `checked_at` | time \| null | When this pass asked. |
+| `reason` | string \| null | Why it is `unknown`, in fixed words (no .git, a HEAD it does not read, an installer it cannot read, GitHub not knowing the head, no token, a checkout holding commits the branch lacks, more files changed than GitHub lists); also on a `behind` that GitHub's cut-off list shows is true but whose count is only a floor (`files_total` is then null). |
+
+The stand-up says `behind` in one plain line in both rundowns while it stands, and `unknown` as not known. It says nothing when the copy is current or the field is absent. A clone with local edits, and a job not installed on this machine, are not seen here: the line counts every job's files.
 
 ### The queue's room
 
@@ -2193,7 +2215,7 @@ A run is the first of these that fits:
 | Kind | A run is this when | Told from |
 |---|---|---|
 | `tech_lead` | its folder starts with `slack-` | the folder |
-| `review` | its folder starts with the reviews team's key (`reviews_team_key`) and a `-` | the folder |
+| `review` | its ticket is in the review poller's own record (`<stage_e_state_dir>/review-tickets.json`), or, for an old Reviews team, its folder starts with `reviews_team_key` and a `-` (KIT-596) | `record`, or the folder |
 | `planner` | its folder is a planning run's ticket in the idea gate's record | the idea gate's record |
 | `coding` | it is the first run in its folder, by the log file names: an older log outside the window still counts as the first | the file names |
 | `bounce_fix`, `conflict_fix` | it starts from 60 seconds before to 30 minutes after a `delivered` (or `conflict-delivered`) ledger row for that ticket; failing that, its first prompt carries the bounce driver's fixed line for a bounce (or a conflict fix) | the ledger, then the prompt |
@@ -2464,7 +2486,7 @@ that shows.
 | `stage_e_state_dir` | `~/.stage-e/state` | Stage E's state folder. An empty string turns the `ledger` source off. |
 | `stage_a_state_dir` | `~/.stage-a/state` | The idea gate's state folder. An empty string turns the `planner` source off. |
 | `judge_file` | empty: off | The watcher judge's `judge-calls.json` (KIT-569): each call's time and dollars, no words. Empty turns the judge's cost off, and the file's `judge` says `off`. |
-| `reviews_team_key` | none: required | The reviews team's key, such as `REV`. |
+| `reviews_team_key` | empty | Optional (KIT-596): the key of an old separate Reviews team, such as `REV`. A review on a work team is told by the review poller's record, and a record that cannot be read is said in the Stage E source. |
 | `out` | `~/.stage-e/usage/usage.json` | Where the file is written, outside every git working tree. |
 | `lookback_days` | 8 | How many local dates the file covers, from 1 to 31. |
 
@@ -2624,6 +2646,10 @@ newer than the writer is an error, not a quiet gap in the file.
 
 ---
 
+### The sprint plan file
+
+`pipeline-sprint-plan/1`, written by the morning job (the proposal) and by the bridge (the owner's yes), whole by a rename (KIT-575). One JSON object with exactly these keys: `schema`; `sprint` (the usage file's `week.starts_at`, the sprint's id); `first_day` (its first working day, a local date, which the owner's reply names); `resets_at`; `proposed_at`; `announced_at` (null until the stand-up has sent it); `budget_usd`, `spent_usd` and `planned_usd`; `planned` (pieces: `ticket`, `effort`, `usd`, `title`); `not_planned` (`ticket`, `why`, `reply`); and `plan` (null, or `recorded_at` and `tickets`). A file that is not exactly this is never used and never written over. The queue reads only `plan.tickets`, for the sprint that is current, to put those pieces first; it is not read as an approval to start anything.
+
 ## 19. Watcher status file
 
 One file says what the watcher saw this pass: for each of its ten monitors, whether it was clear, flagged, blind or off, what it asked and what the answer was, and each finding as fields (KIT-514). The watcher, `scripts/pipeline_watcher_local.py`, writes it each pass. It runs with no AI, as its own account, from files the workers cannot edit (`docs/adr/2026-11-05-the-watcher-an-independent-auditor.md`, status Proposed). It reads files and GitHub, sends nothing but a GET, and writes one file. It stops nothing and changes nothing: the hold that would stop the system is a later piece (KIT-515). Machine-readable: `schemas/pipeline-watcher.schema.json`. The job checks its document against that schema before it writes, and writes nothing that does not conform.
@@ -2691,6 +2717,17 @@ Times are UTC to the second, or null where the source gave none.
 ### The install
 
 With `install_manifest` named, every pass first checks the watcher's own files (KIT-517): `manifest.json`, `pipeline-watcher-manifest/1`, lists each file under `scripts/` and `schemas/` by the SHA-256 of its content, and the commit it came from. A file that differs, is a link, is not a plain file, is writable by group or other, or is owned by an account but root and the one running; a module in those folders the manifest does not list; and a manifest that is itself any of these, makes every monitor that could be on `blind`, by name, and the pass exits 4. The installer is `scripts/pipeline_watcher_setup.py`.
+
+### The copy
+
+The usage file is written by the workers' account, so the watcher reads a copy of it that only root writes (KIT-573). With `usage_copy_status` named, `usage_file` is that copy, and the usage file counts only if the copier's status says so. `scripts/pipeline_watcher_copy.py` runs as root from the install folder, reads its own rules (`pipeline-watcher-copier/1`: `status_file` and up to eight `copies` of `source`, `owner`, `dest` and `max_bytes`) and nothing else, and for each copy opens the source's last name without following a link, then requires a plain file owned by `owner`, with one link, no larger than the cap. It writes the copy `root:wheel` 0644 to a temp file and renames it over the old one, and writes a status file beside it, `pipeline-watcher-copy-status/1`:
+
+- `schema`: `"pipeline-watcher-copy-status/1"`. A reader that does not know the value refuses the file.
+- `written_at`: when the copier last ran. Older than `usage_max_age_minutes` makes the monitor `blind`.
+- `result`: `copied`, or `refused` if any copy was.
+- `copies`: one row per copy, holding `dest`, `state` (`copied` or `refused`), `reason` (null, or fixed words, when refused), `bytes`, `sha256` and `copied_at` (null when refused).
+
+A refused source removes the old copy, so a reader sees it missing and never stale good figures. The watcher is `blind`, in the copier's own words, when the status is missing, old, unreadable, not this schema, has no row for the usage file, says `refused`, carries no hash, or when the copy it reads does not have the row's hash. Exit 4 when any copy was refused; 2 when its rules are wrong; 1 when it could not write its status. It cannot tell a true figure from a false one the workers' account wrote on purpose.
 
 ### The page
 
@@ -2865,3 +2902,203 @@ The verdict is the first of these that matches:
 - No verdict is not a pass. Neither is `held` or `could-not-check`.
 
 `scripts/pipeline_acceptance_poller.py`'s `read_verdict_mark()` is the reference reader, and its selftest holds the shape.
+
+---
+
+## 23. Validator settings file
+
+What the validator may approve, as plain on/off switches (KIT-533). The owner decided there is no trust ladder: nothing gains or loses trust by itself, and a switch changes only when a person changes it. Every part of the validator reads the file through `scripts/pipeline_validator_settings.py`'s `load()`, which has no write path. Machine-readable: `schemas/pipeline-validator-settings.schema.json`. Design: `docs/adr/2026-11-05-the-validator-approves-inside-limits-that-code-enforces.md`. The operator guide is `docs/VALIDATOR-OPERATOR.md`.
+
+**Absent is every switch off. So is anything that is not a valid, trusted settings file.** A file that does not parse, names another schema or the first version (`/1`, from before `merge_repos`), gives a key twice, misses a key or adds one, lists a repository that is not `owner/name` in lower case, names one twice or more than 100, is larger than a settings file, or cannot be read means every switch off, every limit 0, no login and no repository, with that reason said. So does a file a session could have written: one inside a git working tree, a link, one writable by group or other, one owned by another account, or one in or under a folder others can write without the sticky bit. It never means on. Absent, invalid and unreadable are decided the same way, toward the safe side, as the hold's are (§20).
+
+**No switch for the safety system.** Changes to hooks, guards, CI and workflows, branch protection and rulesets, settings, the watcher and the validator's own limits stay human, fixed in code. A file that names one as a key, anywhere, on or off, is refused: every switch off, said in words.
+
+**Fields only.** Switches, two whole numbers, one bot login and a list of repository names, each of a fixed shape. No free text.
+
+**Whose file it is.** The owner's, under the user's own login, outside every git working tree. Only a person edits it. The example, `validator-settings.example.json`, has every switch off, every limit 0, no login and no repository listed.
+
+### The file
+
+| Field | Type | Notes |
+|---|---|---|
+| `schema` | `"pipeline-validator-settings/2"` | A reader that does not know the value treats every switch as off. The first version, `/1`, has no `merge_repos`, and is read as every switch off, said. |
+| `approve` | approve | What it may approve in the owner's place. |
+| `limits` | limits | How big a change it may approve. |
+| `allow` | allow | Which human-only classes the owner lets it approve. |
+| `stage_e_login` | bot login, or `null` | Stage E's own bot login: the one login whose reviews the evidence trusts. `null`: none yet, so no review is trusted. |
+| `merge_repos` | list of `owner/name` | The repositories where a merge may be approved. Empty: none. |
+
+### Approve
+
+| Field | Type | Notes |
+|---|---|---|
+| `plans` | boolean | A plan, in place of the owner's `approve <plan>`. |
+| `pieces` | boolean | A ready piece of an approved plan starting. |
+| `merges` | boolean | A pull request merging. A job asks GitHub to enable its own auto-merge; no agent merges. |
+
+### Limits
+
+| Field | Type | Notes |
+|---|---|---|
+| `max_changed_lines` | 0 to 100000 | Most lines added plus removed. 0: nothing passes. |
+| `max_files` | 0 to 10000 | Most files changed. 0: nothing passes. |
+
+### Allow
+
+Off keeps a change in that class for the owner, whatever else is on.
+
+| Field | Type | Notes |
+|---|---|---|
+| `credentials` | boolean | Env files, keys, tokens, secrets stores. |
+| `billing_and_accounts` | boolean | Billing, accounts, the plan or subscription. |
+| `production_deploy` | boolean | The deploy workflow and its config. |
+| `deleting_data` | boolean | Migrations that drop, bulk deletes, branch or release removal. |
+
+### Stage E's login
+
+`stage_e_login` is the login Stage E's own GitHub App posts its reviews under: the app's slug, then `[bot]`, as GitHub's REST API and its pages name it and as `scripts/pipeline_github_app.py`'s `bot_login()` makes it (`^[a-z0-9][a-z0-9-]{0,62}\[bot\]$`). No person's login has the `[bot]` suffix, so no person's login fits. A value of any other shape is a file that is not a settings file: every switch off.
+
+The validator's evidence (`scripts/pipeline_validator_evidence.py`, KIT-580) takes the login from what `load()` returns, never from its own code or a flag, and counts a review comment only when its author is exactly that login and a bot. GitHub's GraphQL API names a bot without the suffix, so the evidence gives a bot's login the suffix before it compares. No login, or settings that were not read, means no review is trusted (`review-login-unset`).
+
+### Repositories for merges
+
+`merge_repos` makes the merges switch per project (KIT-604). A merge may be approved only when `approve.merges` is on **and** the pull request's repository is listed. Any other combination is a closed reason, never a pass: the switch off is `switch-off`, and a repository not listed is `repo-not-listed`.
+
+Each entry is `owner/name` as GitHub shapes it, in lower case: an owner of 1 to 39 letters, digits and hyphens that starts with a letter or digit, then a name of 1 to 100 letters, digits, `.`, `_` and `-` that is not `.` or `..` (`^[a-z0-9][a-z0-9-]{0,38}/(?!\.\.?$)[a-z0-9._-]{1,100}$`). Each is listed once, and at most 100. A list that breaks any of these is a file that is not a settings file: every switch off, said in words, and the entry is never quoted back.
+
+One helper gives the answer: `scripts/pipeline_validator_settings.py`'s `merge_allowed(settings, repo)`. It is true only for settings `load()` read, with the merges switch on and the repository listed. GitHub's names ignore case, so it compares the asked repository in lower case, and only when it is plain ASCII. The hard limits ask it, and the merge path asks it too; neither keeps a copy of the rule.
+
+### Who reads the switches
+
+`scripts/pipeline_validator_settings.py show`, for a person, and the hard limits (`scripts/pipeline_validator_limits.py`), which are handed what `load()` returned. The validator's other parts read it through `load()` as they are built: its merge path and its approvals.
+
+---
+
+## 24. Validator ledger
+
+The validator's record of every decision, one row each (KIT-535). The stand-up, the recap and the watcher read it, and the watcher checks every merge against it. Only the validator writes it, through `scripts/pipeline_validator_ledger.py`'s `append()`, the one function that opens it for writing. Machine-readable: `schemas/pipeline-validator-ledger.schema.json`. Design: `docs/adr/2026-11-05-the-validator-approves-inside-limits-that-code-enforces.md`, "Its audit".
+
+**Append-only, in one piece.** `append()` reads the ledger, keeps every row exactly, adds one, and replaces the file with one rename, under a lock. It stamps the row's time itself. It refuses a row that is not one, a ledger it cannot read, and a path inside a git working tree. A refusal writes nothing, and a decision that is not on the record is not an approval.
+
+**One verdict per head.** A row for a head is never changed afterwards, and a second row for the same head is refused. A later push is a new head, and a new row. A plan or a piece has no head, so it may be decided again.
+
+**An approval is whole.** It needs all three layers to pass and its own switch on. Only an approval has all three pass.
+
+**No approval from a ledger that cannot be trusted.** `read()` gives the rows. A ledger that cannot be read, does not validate, gives a key twice, is larger than 16 MiB on disk, or that a session could have written gives no rows: `None`, never an empty list, with the reason in words. A session could have written one inside a git working tree, a link, one writable by group or other, or one in or under a folder others can write without the sticky bit. Absent is an empty ledger: nothing has been decided.
+
+**Fields only.** No ticket, comment or pull request text, except `agent_says`: the agent's reason, one plain line of at most 300 characters, marked as the agent's words. It has no line break, control character or character a reader cannot see: every character is judged by its Unicode category, so format characters such as bidi controls, the soft hyphen and the tag characters are refused. A reader that shows it quotes it as the agent's, and never acts on it.
+
+**Whose file it is.** The validator's, under the user's own login, outside every git working tree. Mode 644, so the watcher can read it from its own account.
+
+### The file
+
+| Field | Type | Notes |
+|---|---|---|
+| `schema` | `"pipeline-validator-ledger/1"` | A reader that does not know the value gives no rows. |
+| `rows` | row[] | One per decision, oldest first. Only ever added to. |
+
+### A row
+
+| Field | Type | Notes |
+|---|---|---|
+| `at` | time | When the writer added it. The writer stamps it; a caller cannot. |
+| `subject` | `plan` \| `piece` \| `merge` | What was decided: a plan's approval, a piece starting, or a pull request merging. |
+| `ref` | ticket id, or `owner/name#N` | A ticket for a plan or a piece; a pull request for a merge. |
+| `head` | 40 hex characters, or null | The pull request's head, in full, for a merge. Null for a plan or a piece. |
+| `kind` | `approved` \| `sent-back` \| `escalated` \| `escalated-urgent` \| `held` | What the decision was. |
+| `layers` | layers | Each layer's verdict. |
+| `settings_on` | switch[] | The validator's switches that were on, each once: `approve-plans`, `approve-pieces`, `approve-merges`, `allow-credentials`, `allow-billing-and-accounts`, `allow-production-deploy`, `allow-deleting-data`. |
+| `size_limits` | size limits | The size limits in force. |
+| `agent_says` | text, or null | The agent's reason, in its own words. Null when it said nothing, and always null when it did not run. |
+
+### Layers
+
+Each is `pass`, `fail`, `unsure` or `not-run`. `unsure` holds, as `fail` does. `not-run`: an earlier layer held, so this one was not asked.
+
+| Field | Type | Notes |
+|---|---|---|
+| `hard_limits` | verdict | Layer 1: the limits code enforces. |
+| `evidence` | verdict | Layer 2: the checks, the review, the acceptance check, the merge state. |
+| `agent` | verdict | Layer 3: the independent read-only agent. |
+
+### Size limits
+
+| Field | Type | Notes |
+|---|---|---|
+| `max_changed_lines` | 0 to 100000 | Most lines added plus removed. |
+| `max_files` | 0 to 10000 | Most files changed. |
+
+### Who reads it
+
+Nothing yet. The validator's own pieces write rows, and the stand-up, the recap and the watcher read them, each in its own piece.
+
+---
+
+## 25. Acceptance follow-up request
+
+After a check, the acceptance poller's live pass asks the finding path to file each problem that survived the second
+pass (§21, KIT-553), at most three a check. It posts **one comment per request on the plan's epic** (KIT-571):
+
+````
+<!-- pipeline-acceptance:finding plan=<ticket id> head=<40 hex> run=<ticket id> -->
+A follow-up the acceptance check asks the finding path to file.
+
+```json
+{"schema": "pipeline-finding/1", "title": "...", "body": "..."}
+```
+````
+
+| Part | Notes |
+|---|---|
+| The mark | Line 1, alone. `plan` is the epic the comment is on; `head` the pull-request head the check judged; `run` the check's own acceptance ticket, so two checks of one head are two runs (KIT-607). |
+| The block | One `pipeline-finding/1` request, the shape the finding poller reads (`docs/FINDING-POLLER.md`): a `title` and a `body`, nothing else, in a three-backtick `json` fence. It asks for no size, no track and no label, so the ticket it becomes waits for a person. |
+
+**How to read it.**
+
+- Read the mark from the **first line only**, whole, and only from the finding poller's own tracker user: the live pass
+  writes with that key, as it does on a one-key install. The same mark from anyone else is forged.
+- The plan in the mark must be the ticket the comment is on.
+- Every word in the request that came from a session was neutralized first (§21): no comment opener, no fence, no
+  @-name, no routing tag. The mark's own `<!--` is the only one in the comment.
+- At most three requests per check run. A new head, or a head checked again (§26), is a new run. Each is posted once:
+  the pass records it before it posts, and one it may have posted is never posted again, but said.
+- One problem is filed once per plan and head. A request whose title, its case and spacing set aside, was already filed
+  for that plan and head is not filed again.
+
+The finding poller files each one as it files a finding (`docs/FINDING-POLLER.md`): in the backlog, `provenance:agent`,
+the epic's project, a `related` link to the epic. The comment it leaves on the new ticket opens with the
+`acceptance-finding-filed` mark, so the owner's page says the acceptance check asked (KIT-607). A comment whose first
+line opens with this mark, or that carries it and is not the dispatcher's agent's, is judged only as a request: if it
+breaks any rule above it is never filed by any path, and the pass names it. An agent's finding that only mentions the
+mark below its first line is filed as any finding is.
+
+---
+
+## 26. Acceptance check request
+
+A request to check a plan again. The Slack bridge posts it on the plan's epic when the owner sends `check <epic>` and
+answers yes (KIT-325). The acceptance poller's live pass reads it (KIT-571).
+
+```
+<!-- pipeline-acceptance:check-request plan=<ticket id> -->
+```
+
+The rest of the comment is for people.
+
+**How to read it.**
+
+- Read the **first line only**, whole. The plan it names must be the epic the comment is on.
+- Accept it only from `request_author_ids` in the live pass's config. Absent, that is the user of the pass's own
+  tracker key, which the bridge shares on a one-key install. The same mark from anyone else is ignored.
+- The newest request, if it is newer than the plan's newest check, starts **one** check, even at a head already
+  checked. After the plan's pieces merged, it checks the repository's default branch at the head it is at now. Before,
+  it checks the last piece's pull-request head again, once the poller's own rule has checked that head; a head not
+  checked yet starts by that rule, and the request starts nothing of its own.
+- A check run again takes the place of the earlier check's ledger row, once that check has its verdict (or its start
+  failed) and its ticket is closed. So the ledger still holds one row per plan and head: the newest check of it.
+- A request is acted on once: when its check starts, or its start fails. One that has to wait (the starts a pass may
+  make, the ledger's lock, a head GitHub can't name, an earlier ticket not closed yet) is acted on at a later pass.
+- Never while one of the plan's checks is running.
+- A plan whose pieces all merged before any check of it ran is checked the same way, with no request: the bridge waits
+  for a verdict before it closes a plan, so one must come.
+
