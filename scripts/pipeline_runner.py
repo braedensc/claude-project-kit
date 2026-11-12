@@ -48,8 +48,11 @@ HOME, TMPDIR, LANG, the sign-in token under the one name the program reads, and 
 
 ITS PROCESS.  Each session runs under a small wrapper, this file's `session` command, in its own
 process group and session, writing its output and its exit to the run's folder. The runner holds
-no pipe to it. A lock the wrapper and the program hold for their whole life says whether the run
-is alive. So a restart of the runner ends no session: the next pass finds each one again.
+no pipe to it. A lock only the wrapper holds says whether the run is alive: the program never gets
+it, so a session cannot release it. So a restart of the runner ends no session: the next pass finds
+each one again. A run whose wrapper is gone without its exit is finished only once nothing of its
+process group is left: the runner kills what is, first. Off, the runner takes no request and
+resumes nothing; it still finishes runs already started.
 
 WHAT IT DOES NOT DO YET.  Limits on time, memory and disk (KIT-643). The data for each kind of
 session and the live proof of its walls, and the kit's guard from a root-owned copy (KIT-704).
@@ -68,6 +71,7 @@ import json
 import os
 import pwd
 import re
+import shutil
 import signal
 import stat
 import subprocess
@@ -429,11 +433,15 @@ def branch_name(kind, ticket, title):
     return "%s/%s-%s" % (btype, ticket.lower(), word or slug(title or ""))
 
 
+def workspace_path(cfg, kind, ticket):
+    return os.path.join(os.path.realpath(cfg["work_dir"]), kind, ticket)
+
+
 def make_workspace(git, cfg, proj, kind, ticket, branch):
     """(path, why): a fresh worktree at <work_dir>/<kind>/<TICKET> on a new branch, from
     origin/<base>. No repository hook runs. A folder already there is never reused."""
-    parent = os.path.join(cfg["work_dir"], kind)
-    path = os.path.join(parent, ticket)
+    path = workspace_path(cfg, kind, ticket)
+    parent = os.path.dirname(path)
     if os.path.lexists(path):
         return None, "a %s workspace for %s is there already: a start needs a fresh one" % (kind, ticket)
     try:
@@ -644,10 +652,16 @@ def build_argv(cfg, kind, workspace, rdir, session_id, resume, budget):
                "--max-budget-usd", "%g" % budget["maxUsd"]])
 
 
-def child_env(cfg, rdir, token):
+def run_tmp(cfg, run_id):
+    """The run's own temp folder: outside the store, the pins and the sessions' home, which its
+    settings wall off, and outside every workspace."""
+    return os.path.join(cfg["work_dir"], ".tmp", run_id)
+
+
+def child_env(cfg, tmpdir, token):
     """Exactly what the program sees, and nothing more."""
     return {"PATH": voice.DEFAULT_PATH, "HOME": cfg["session_home"],
-            "TMPDIR": os.path.join(rdir, "tmp"), "LANG": voice.DEFAULT_LANG,
+            "TMPDIR": tmpdir, "LANG": voice.DEFAULT_LANG,
             voice.CHILD_TOKEN_VAR: token, "DISABLE_AUTOUPDATER": "1",
             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"}
 
@@ -656,7 +670,7 @@ def child_env(cfg, rdir, token):
 # The process: the wrapper, its lock, and what it leaves
 # --------------------------------------------------------------------------- #
 def lock_held(rdir):
-    """True while the run's wrapper or its program is alive: both hold the run's lock."""
+    """True while the run's wrapper is alive: it alone holds the run's lock."""
     try:
         fd = os.open(os.path.join(rdir, "alive.lock"), os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
     except FileNotFoundError:
@@ -690,6 +704,19 @@ def spawn(rdir, env):
     finally:
         os.close(fd)
     return proc
+
+
+def group_alive(pid):
+    """True while any process of the run's group is left."""
+    if not (isinstance(pid, int) and pid > 1):
+        return False
+    try:
+        os.killpg(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 def signal_group(pid, sig):
@@ -728,9 +755,9 @@ def read_result(rdir):
 def session_main(rdir, fd):
     """The wrapper: run the program the run's launch file names, with the run's prompt on stdin,
     its output and errors to files, and the run's lock held for the whole of it. Then write the
-    exit. A signal to the group reaches the program itself; the wrapper only waits for it."""
-    fd = int(fd)
-    os.set_inheritable(fd, True)
+    exit. A signal to the group reaches the program itself; the wrapper only waits for it. The
+    lock stays the wrapper's own: the program is never given it."""
+    os.set_inheritable(int(fd), False)
     for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
         signal.signal(sig, lambda *_: None)
     store.write_json(os.path.join(rdir, "wrapper.json"), {"pid": os.getpid()})
@@ -741,7 +768,7 @@ def session_main(rdir, fd):
             open(os.path.join(rdir, "err.log"), "wb") as ferr:
         try:
             child = subprocess.Popen(launch["argv"], cwd=launch["cwd"], stdin=fin, stdout=fout,
-                                     stderr=ferr, env=os.environ, pass_fds=(fd,))
+                                     stderr=ferr, env=os.environ)
         except OSError as exc:
             ferr.write(("could not start the program: %s\n" % type(exc).__name__).encode())
         else:
@@ -783,9 +810,18 @@ class Runner(object):
         return got["runs"]
 
     def reap(self):
+        """Collect every ended child of this process, each wrapper included: an ended wrapper
+        left as a zombie would keep its process group looking alive."""
         for pid, proc in list(self.children.items()):
             if proc.poll() is not None:
                 del self.children[pid]
+        while True:
+            try:
+                pid, _status = os.waitpid(-1, os.WNOHANG)
+            except ChildProcessError:
+                return
+            if pid == 0:
+                return
 
     # -- one pass --------------------------------------------------------- #
     def pass_once(self):
@@ -810,7 +846,7 @@ class Runner(object):
                 if done:
                     out["ended"].append(done)
         for rec in self.runs() or []:
-            if rec["state"] == "interrupted" and rec["auto_resume"] == "pending":
+            if cfg["enabled"] and rec["state"] == "interrupted" and rec["auto_resume"] == "pending":
                 self.auto_resume(rec, out)
         if not cfg["enabled"]:
             out.update(state="off", why="the runner is off: no request is taken")
@@ -838,12 +874,23 @@ class Runner(object):
             return None
         if alive:
             signal_group(pid, signal.SIGKILL)      # the program ended; nothing of it may stay
+        if exit_doc is None:
+            # The wrapper is gone without its exit. Whatever is left of the run's group goes
+            # first: a run is never finished, or resumed, while any of it still runs.
+            signal_group(pid, signal.SIGKILL)
+            self.reap()
+            if group_alive(pid):
+                return None
         result = read_result(rdir)
+        started_up = os.path.lexists(os.path.join(rdir, "wrapper.json"))
         stopping = rec["state"] == store.STOPPING
         code = exit_doc.get("exit") if isinstance(exit_doc, dict) else None
         code = code if isinstance(code, int) and not isinstance(code, bool) else None
         if stopping:
             state, reason, why = "stopped", "stopped", "stopped on request"
+        elif exit_doc is None and result is None and not started_up:
+            state, reason = "failed", "could-not-start"
+            why = "the session never started: the runner stopped before it could start it"
         elif exit_doc is None and result is None:
             state, reason = "interrupted", "interrupted"
             why = "the session left no result and no exit: it was interrupted"
@@ -862,6 +909,7 @@ class Runner(object):
         if state == "interrupted" and rec["started_for"] != "interrupted":
             rec["auto_resume"] = "pending"
         remove_pin(rec["pin"], rec["run"])
+        shutil.rmtree(run_tmp(self.cfg, rec["run"]), ignore_errors=True)
         store.write_run(self.store_dir(), rec)
         self.say("runner: %s %s %s %s: %s" % (rec["run"], rec["kind"], rec["ticket"], state, why))
         return rec["run"]
@@ -914,6 +962,14 @@ class Runner(object):
         (out["started"] if verdict == "started" else out["refused"]).append(run_id or rid)
         self.say("runner: request %s %s: %s" % (rid, "done" if verdict == "started" else "refused",
                                                 why or run_id))
+
+    def undo(self, proj, made, branch):
+        """Remove a workspace this start made and then refused, and its branch: a later start
+        of the same ticket needs a fresh one, and must find none."""
+        if not made:
+            return
+        self.git(["git", "-C", proj["repo"], "worktree", "remove", "--force", made])
+        self.git(["git", "-C", proj["repo"], "branch", "-D", branch])
 
     def stop(self, doc):
         """(ok, run, why). The group gets SIGTERM now, and SIGKILL past the grace."""
@@ -993,30 +1049,35 @@ class Runner(object):
         pins, why = pins_root(delivery, proj["repo"], self.git)
         if pins is None:
             return "refused", None, why
-        run_id = "run-" + uuid.uuid4().hex
+        run_id, made = "run-" + uuid.uuid4().hex, None
         if resumes is not None:
             workspace, branch = resumes["workspace"], resumes["branch"]
-            session_id = resumes["session_id"]
-            attempt = len(starts) or 1
+            session_id, attempt = resumes["session_id"], len(starts) or 1
         else:
             branch = branch_name(kind, ticket, node.get("title"))
             if not store.BRANCH_RE.match(branch):
                 return "refused", None, "the branch name the pattern made is not a valid one"
-            workspace, why = make_workspace(self.git, cfg, proj, kind, ticket, branch)
-            if workspace is None:
-                return "refused", None, why
-            session_id = str(uuid.uuid4())
-            attempt = len(starts) + 1
+            workspace = workspace_path(cfg, kind, ticket)
+            session_id, attempt = str(uuid.uuid4()), len(starts) + 1
         now = self.clock()
         pin, why = build_pin(delivery, node, kind, run_id, workspace, branch, attempt, now)
         if pin is None:
-            return "refused", None, why
+            return "refused", None, why             # refused before anything is made
+        if resumes is None:
+            made, why = make_workspace(self.git, cfg, proj, kind, ticket, branch)
+            if made is None:
+                return "refused", None, why
+            if made != workspace:
+                self.undo(proj, made, branch)
+                return "refused", None, "the workspace was made somewhere other than planned"
         ppath, why = write_pin(pins, pin)
         if ppath is None:
+            self.undo(proj, made, branch)
             return "refused", None, why
-        rdir = self.rdir(run_id)
+        rdir, tmpdir = self.rdir(run_id), run_tmp(cfg, run_id)
         try:
-            os.makedirs(os.path.join(rdir, "tmp"), mode=0o700)
+            os.makedirs(rdir, mode=0o700)
+            os.makedirs(tmpdir, mode=0o700)
             instructions = committed_file(self.git, proj["repo"], proj["base"], "CLAUDE.md") or ""
             store.write_json(os.path.join(rdir, "settings.json"), settings_doc(cfg, kind, proj, pins))
             store.write_json(os.path.join(rdir, "mcp.json"), {"mcpServers": {}})
@@ -1028,6 +1089,7 @@ class Runner(object):
             store.write_json(os.path.join(rdir, "launch.json"), {"argv": argv, "cwd": workspace})
         except OSError as exc:
             remove_pin(ppath, run_id)
+            self.undo(proj, made, branch)
             return "refused", None, "the run's files could not be written (%s)" % type(exc).__name__
         rec = dict((k, None) for k in store.RUN_KEYS)
         rec.update(schema=store.RUN_SCHEMA, run=run_id, request=request_id, caller=caller,
@@ -1039,9 +1101,10 @@ class Runner(object):
                    started_at=iso(now))
         store.write_run(self.store_dir(), rec)
         try:
-            proc = spawn(rdir, child_env(cfg, rdir, token))
+            proc = spawn(rdir, child_env(cfg, tmpdir, token))
         except OSError as exc:
             remove_pin(ppath, run_id)
+            self.undo(proj, made, branch)
             rec.update(state="failed", reason="could-not-start", ended_at=iso(self.clock()),
                        seconds=0.0, why="the wrapper could not start (%s)" % type(exc).__name__)
             store.write_run(self.store_dir(), rec)
@@ -1183,11 +1246,26 @@ sid = argv[argv.index("--resume") + 1] if "--resume" in argv else argv[argv.inde
 key = hashlib.sha256(cwd.encode("utf-8")).hexdigest()[:16]
 with open(os.path.join(HERE, "calls.jsonl"), "a") as fh:
     fh.write(json.dumps({"argv": argv, "cwd": cwd, "env": sorted(os.environ), "prompt": prompt,
+                         "pid": os.getpid(), "tmpdir": os.environ.get("TMPDIR"),
+                         "tmp_ready": os.path.isdir(os.environ.get("TMPDIR") or "/nonexistent"),
                          "pin_seen": os.path.exists(os.path.join(%(pins)r, key + ".json"))}) + "\n")
 m = re.search(r"STANDIN:([a-z]+)(?:=([0-9]+))?", prompt)
 mode, n = (m.group(1), int(m.group(2) or 0)) if m else ("quick", 0)
 if "was interrupted before it ended" in prompt:
     mode, n = "sleep", 30           # the runner's own resume: it runs until the selftest ends it
+if mode == "unlock":                # try to release any lock it was handed, then keep running
+    import fcntl
+    for fd in range(3, 64):
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+    with open(os.path.join(HERE, "calls.jsonl"), "a") as fh:
+        fh.write(json.dumps({"cwd": cwd, "unlocked": True}) + "\n")
+    mode, n = "sleep", 30
+if mode == "killwrapper":           # kill the wrapper that watches it, then keep running
+    os.kill(os.getppid(), 9)
+    mode, n = "sleep", 30
 if mode == "sleep":
     end = time.time() + n
     while time.time() < end:
@@ -1326,6 +1404,11 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
     ticket("ENG-8", "Made in ready by the owner", [], creator="owner-1")
     ticket("OPS-9", "Another team's ticket", [move("owner-1", "st-ready")], team="OPS")
     ticket("ENG-10", "Cannot read the history", None)
+    ticket("ENG-11", "Fake its death STANDIN:unlock", [move("owner-1", "st-ready")])
+    ticket("ENG-12", "Kill its own wrapper STANDIN:killwrapper", [move("owner-1", "st-ready")])
+    ticket("ENG-13", "Criteria come later", [move("owner-1", "st-ready")])
+    nodes["ENG-13"]["description"] = "Context only, no sections yet."
+    ticket("ENG-14", "A pin is in the way", [move("owner-1", "st-ready")])
 
     class Tracker(object):
         down = False
@@ -1466,6 +1549,10 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                [k for k in first["env"] if k not in ("__CF_USER_TEXT_ENCODING", "PWD", "SHLVL", "_")],
                sorted(["PATH", "HOME", "TMPDIR", "LANG", "CLAUDE_CODE_OAUTH_TOKEN",
                        "DISABLE_AUTOUPDATER", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"]))
+        expect("its temp folder is its own, there while it runs, and outside every wall",
+               (first["tmp_ready"], [w for w in (sdir, pins, cfg["session_home"], ws1)
+                                     if _inside(first["tmpdir"], w)]), (True, []))
+        expect("…and it goes when the run ends", os.path.exists(first["tmpdir"]), False)
         expect("the ticket reached it fenced as data, with no tag it could close",
                ("<untrusted-ticket-data>" in first["prompt"], first["prompt"].count("</untrusted-ticket-data>")),
                (True, 1))
@@ -1595,7 +1682,8 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
         _wait(lambda: os.path.exists(os.path.join(store.run_dir(sdir, rec5["run"]), "wrapper.json")), 10)
         _wait(lambda: signal_group(rec5["pid"], signal.SIGKILL) or          # again, past a fork
               not lock_held(store.run_dir(sdir, rec5["run"])), 10)
-        runner.pass_once()
+        _wait(lambda: runner.pass_once() and
+              store.read_run(sdir, rec5["run"])["state"] != store.RUNNING, 10)
         rec5 = store.read_run(sdir, rec5["run"])
         expect("a session that died is marked interrupted, and resumed once",
                (rec5["state"], rec5["reason"], rec5["auto_resume"], bool(rec5["resumed_by"])),
@@ -1607,11 +1695,84 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
         _wait(lambda: os.path.exists(os.path.join(store.run_dir(sdir, rec6["run"]), "wrapper.json")), 10)
         _wait(lambda: signal_group(rec6["pid"], signal.SIGKILL) or          # again, past a fork
               not lock_held(store.run_dir(sdir, rec6["run"])), 10)
-        runner.pass_once()
+        _wait(lambda: runner.pass_once() and
+              store.read_run(sdir, rec6["run"])["state"] != store.RUNNING, 10)
         rec6 = store.read_run(sdir, rec6["run"])
         expect("…and never twice", (rec6["state"], rec6["reason"], rec6["auto_resume"]),
                ("interrupted", "interrupted", None))
         expect("no third run for it", len([r for r in runner.runs() if r["ticket"] == "ENG-4"]), 2)
+
+        # ---- a session cannot fake its own death ----------------------------- #
+        store.ask(sdir, "queue", "start", "code", "app", "ENG-11")
+        runner.pass_once()
+        rec7 = [r for r in runner.runs() if r["ticket"] == "ENG-11"][0]
+        _wait(lambda: any(c.get("unlocked") and c["cwd"].endswith("/ENG-11") for c in _calls(calls)), 10)
+        runner.pass_once()
+        expect("a session that releases every lock it can reach is still alive to the runner",
+               store.read_run(sdir, rec7["run"])["state"], store.RUNNING)
+        store.ask(sdir, "queue", "start", "code", "app", "ENG-12")
+        runner.pass_once()
+        rec8 = [r for r in runner.runs() if r["ticket"] == "ENG-12"][0]
+        _wait(lambda: not lock_held(store.run_dir(sdir, rec8["run"])), 10)
+        off2 = Runner(dict(cfg, enabled=False), tracker, environ=environ, git_env=genv, say=said.append)
+        _wait(lambda: off2.pass_once() and store.read_run(sdir, rec8["run"])["state"] != store.RUNNING, 15)
+        rec8 = store.read_run(sdir, rec8["run"])
+        pids8 = [c["pid"] for c in _calls(calls) if c.get("pid") and c["cwd"].endswith("/ENG-12")]
+        expect("a session that killed its wrapper is killed before it is called interrupted",
+               (rec8["state"], bool(pids8), [p for p in pids8 if _pid_alive(p)]), ("interrupted", True, []))
+        expect("off: an interrupted run is not resumed; it waits",
+               (rec8["auto_resume"], rec8["resumed_by"]), ("pending", None))
+        runner.pass_once()
+        expect("on again: it is resumed once", store.read_run(sdir, rec8["run"])["auto_resume"], "started")
+
+        # ---- a refused start leaves nothing behind ------------------------------ #
+        rq = store.ask(sdir, "queue", "start", "code", "app", "ENG-13")
+        runner.pass_once()
+        ws13 = workspace_path(cfg, "code", "ENG-13")
+        expect("a start refused for its ticket makes no workspace and no branch",
+               (store.answer(sdir, rq)["why"], os.path.exists(ws13),
+                sh("git", "-C", repo, "branch", "--list", "feat/eng-13-*").strip()),
+               ("the ticket has no acceptance criteria, and none will be invented", False, ""))
+        nodes["ENG-13"]["description"] = node("ENG-13", "x")["description"]
+        rq = store.ask(sdir, "queue", "start", "code", "app", "ENG-13")
+        runner.pass_once()
+        expect("…so once the ticket is fixed, it starts", store.answer(sdir, rq)["ok"], True)
+        ws14 = workspace_path(cfg, "code", "ENG-14")
+        with open(pin_path(pins, ws14), "w") as fh:
+            json.dump({"dispatch_id": "another run"}, fh)
+        rq = store.ask(sdir, "queue", "start", "code", "app", "ENG-14")
+        runner.pass_once()
+        expect("a start refused after its workspace was made removes it, and its branch",
+               (store.answer(sdir, rq)["why"], os.path.exists(ws14),
+                sh("git", "-C", repo, "branch", "--list", "feat/eng-14-*").strip()),
+               ("a pin already governs this workspace", False, ""))
+        os.unlink(pin_path(pins, ws14))
+
+        # ---- a run whose wrapper never started is never resumed ----------------- #
+        ghost = dict(store.read_run(sdir, run1), run="run-" + "7" * 32, ticket="ENG-15",
+                     state=store.RUNNING, ended_at=None, reason=None, why=None, exit=None,
+                     seconds=None, cost_usd=None, turns=None, pid=None, pin=None, request=None,
+                     auto_resume=None, resumed_by=None, stop_asked_at=None)
+        store.write_run(sdir, ghost)               # the runner died before it started the wrapper
+        runner.pass_once()
+        g = store.read_run(sdir, ghost["run"])
+        expect("a run whose wrapper never started is failed, and never resumed",
+               (g["state"], g["reason"], g["auto_resume"]), ("failed", "could-not-start", None))
+        ghost2 = dict(ghost, run="run-" + "8" * 32, ticket="ENG-16")
+        store.write_run(sdir, ghost2)
+        store.write_json(os.path.join(store.run_dir(sdir, ghost2["run"]), "wrapper.json"), {"pid": 0})
+        real_alive = globals()["group_alive"]
+        globals()["group_alive"] = lambda _pid: True      # a process of its group is left
+        try:
+            held_back = runner.check(store.read_run(sdir, ghost2["run"]))
+        finally:
+            globals()["group_alive"] = real_alive
+        expect("while anything of its group is left, a run is never called interrupted",
+               (held_back, store.read_run(sdir, ghost2["run"])["state"]), (None, store.RUNNING))
+        expect("…and once nothing is, it is",
+               (runner.check(store.read_run(sdir, ghost2["run"])),
+                store.read_run(sdir, ghost2["run"])["state"]), (ghost2["run"], "interrupted"))
+        store.write_run(sdir, dict(store.read_run(sdir, ghost2["run"]), auto_resume="refused"))
 
         # ---- what the usage job reads ---------------------------------------- #
         got = store.read_runs(sdir)
@@ -1650,6 +1811,16 @@ def _load(path):
 def _calls(path):
     with open(path) as fh:
         return [json.loads(line) for line in fh if line.strip()]
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 def _ended(rdir):

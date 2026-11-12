@@ -22,9 +22,11 @@ WHO MAY ASK.  Five jobs, each for its own kinds of session (CALLERS):
     fix-driver   the fix driver         fix and conflict, which are resumes of a code run
     acceptance   the acceptance job     acceptance
 
-A caller names itself, and its word is not the authority. The runner checks every request against
-the tracker's history before it starts anything (scripts/pipeline_runner.py). What this file checks
-is the shape, and that the named caller may ask for that kind at all.
+A caller names itself, and its word is not the authority. Under one account any process that can
+write the store can name any caller, so `caller` is reporting: it narrows what a request may ask.
+The runner checks every request against the tracker's history before it starts anything
+(scripts/pipeline_runner.py). What keeps a session from writing a request at all is the walls below,
+and its sandbox. What this file checks is the shape, and that the named caller may ask for that kind.
 
 THE WALLS.  A session must never write here: a request it wrote could start a session nobody
 approved. So the store must be an absolute path, outside every git working tree, a real folder
@@ -380,7 +382,10 @@ def answer(store, request_id):
     path = os.path.join(store, "taken", request_id + ".json")
     if not os.path.lexists(path):
         return None
-    return read_json(path).get("answer")
+    doc = read_json(path)
+    if not isinstance(doc, dict) or not isinstance(doc.get("answer"), dict):
+        raise StoreError("the answer is not an object")
+    return doc["answer"]
 
 
 # --------------------------------------------------------------------------- #
@@ -508,6 +513,10 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
     expect("a request file is mode 0600",
            stat.S_IMODE(os.stat(os.path.join(store, "requests", rid + ".json")).st_mode), 0o600)
     expect("no answer while it waits", answer(store, rid), None)
+    with open(os.path.join(store, "taken", "rq-" + "e" * 32 + ".json"), "w") as fh:
+        fh.write("[]")
+    expect("an answer file that is not an object is named, never a crash",
+           refused(lambda: answer(store, "rq-" + "e" * 32)), "the answer is not an object")
     for name, fn, want in (
             ("another job's kind", lambda: ask(store, "review", "start", "code", "app", "ENG-1"),
              "the review job may not ask to start a code session"),

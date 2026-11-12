@@ -3215,10 +3215,16 @@ states: the newest move for a `code` or `plan` start, any move for the kinds tha
 ticket. A ticket the owner made in such a state, with no move recorded, counts as his move. The old
 dispatcher's own user never approves. A history that cannot be read whole approves nothing.
 
+**Who asked is reporting.** Under one account any process that can write the store can name any
+caller, so `caller` narrows what a request may ask and nothing more. What keeps a session from
+writing a request at all is the store's walls and the session's sandbox. A resume's text, whoever
+wrote it, reaches the session only fenced as data.
+
 **The answer.** Each request is answered once, in `taken/<id>.json`: `{"request", "answer": {"at",
 "ok", "run", "why"}}`. A request the runner cannot judge now waits, and is not answered: the tracker
 did not answer, git could not fetch, or the watcher's hold (§20) is set. Everything else is answered
-`ok: false` with the reason in words.
+`ok: false` with the reason in words. A start refused after its workspace was made removes the
+workspace and its branch. Off (`enabled` false), the runner takes no request and resumes nothing.
 
 ### A run record
 
@@ -3249,8 +3255,10 @@ did not answer, git could not fetch, or the watcher's hold (§20) is set. Everyt
 | `resumed_by` | run id, or null | The run that resumed it. |
 
 **A run that died is resumed once.** A run whose process is gone with no result and no exit is
-`interrupted`. The runner resumes it once, as itself, with fixed words. A run that is itself that
-resume is never resumed again.
+`interrupted`, once whatever is left of its process group has been killed. The runner resumes it
+once, as itself, with fixed words. A run that is itself that resume is never resumed again. A run
+whose wrapper never started is `failed` with `could-not-start`, and is never resumed. A lock only
+the wrapper holds says whether a run is alive: the session is never given it.
 
 **How to read it.** `read_runs()` gives every record, oldest first, and says `read`, `partly-read`
 (a record it could not read is named) or `could-not-read`. Then the runs are `None`, never an empty

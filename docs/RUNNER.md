@@ -25,7 +25,9 @@ Two pieces come before any lane moves:
 Each pass, every few seconds:
 
 1. **Finds each live run again.** A run whose process is gone gets its record finished and its pin
-   removed. A run that left no result and no exit is *interrupted*, and is resumed once.
+   removed. Anything left of its process group is killed first. A run that left no result and no
+   exit is *interrupted*, and is resumed once. A lock only the wrapper holds says a run is alive;
+   the session never gets it, so it cannot fake its own end.
 2. **Answers each waiting request, oldest first.** It starts, resumes or stops a session, or refuses
    with a reason. A request it cannot judge now waits for a later pass.
 
@@ -38,6 +40,10 @@ Before it starts anything, it checks the request against the tracker:
 Good: the owner moved ENG-12 to Todo. The queue asks for a code session. It starts.
 Not: someone else moved ENG-12 to Todo. The request is refused, and says why.
 
+Who asked is reporting, not authority. Under one account any process that can write the store can
+name any caller. The tracker check is the authority. The store's walls and the session's sandbox
+keep sessions from writing a request at all.
+
 ## What a start makes
 
 | Thing | Where | Notes |
@@ -46,6 +52,10 @@ Not: someone else moved ENG-12 to Todo. The request is refused, and says why.
 | A branch | `<type>/<ticket, lower case>-<title or kind>` | One fixed pattern. Every git command is a list of arguments. No repository hook runs. |
 | A pin | the project's pins root | Written before the program runs, removed when the run ends. Budget, mode, criteria and out of scope. |
 | The run's folder | `<store_dir>/runs/<run>/` | The command's inputs, the program's output, its exit, and the run's record. |
+| A temp folder | `<work_dir>/.tmp/<run>` | The session's TMPDIR, outside every wall. Removed when the run ends. |
+
+A start refused after its workspace was made removes the workspace and its branch, so the next start
+of that ticket finds none.
 
 The session's budget comes from the project's committed `delivery.json`: `budgets.perEffort` for the
 ticket's effort label.
@@ -66,7 +76,7 @@ One JSON file. The example is `runner.example.json`. `~/` means the account's ow
 
 | Key | What it is | Default |
 | --- | --- | --- |
-| `enabled` | Takes requests when true. Off, it still finishes runs already started. | `false` |
+| `enabled` | Takes requests and resumes runs when true. Off, it still finishes runs already started. | `false` |
 | `store_dir` | The runner's store. Outside every git working tree, mode 0700. | required |
 | `work_dir` | Where workspaces go. | required |
 | `session_home` | The sessions' own home folder. Holds nothing of the account's setup. | required |
@@ -118,3 +128,4 @@ The runner refuses to start from inside a Claude session, or as root.
 - That a session outlives a restart of the runner under launchd. The selftest proves it for a runner
   killed with its whole process group. One live check is owed.
 - That one sign-in serves the runner and the tech lead together (KIT-629).
+- That sandboxed Bash may write the session's temp folder. Each kind's walls are measured in KIT-704.
