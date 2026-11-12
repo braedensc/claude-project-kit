@@ -110,7 +110,8 @@ def iso(seconds):
 
 def may(caller, action, kind):
     """True when this caller may ask for this action on this kind at all."""
-    if caller not in CALLERS or action not in ACTIONS or kind not in CALLERS[caller]:
+    if not isinstance(caller, str) or caller not in CALLERS or action not in ACTIONS \
+            or kind not in CALLERS[caller]:
         return False
     return action != "start" or kind in STARTS
 
@@ -139,7 +140,7 @@ def request_problems(doc):
         bad.append("the request's id is not one")
     if not (isinstance(doc["at"], str) and TIME_RE.match(doc["at"])):
         bad.append("the request's time is not one")
-    if doc["caller"] not in CALLERS:
+    if not (isinstance(doc["caller"], str) and doc["caller"] in CALLERS):
         bad.append("the caller is not one of the five that may ask")
     if doc["action"] not in ACTIONS:
         bad.append("the action is not start, resume or stop")
@@ -185,8 +186,8 @@ def run_problems(doc):
         ("schema", doc["schema"] == RUN_SCHEMA),
         ("run", isinstance(doc["run"], str) and bool(RUN_RE.match(doc["run"]))),
         ("request", _opt(doc, "request", lambda v: isinstance(v, str) and bool(REQUEST_RE.match(v)))),
-        ("caller", doc["caller"] in CALLERS or (doc["caller"] == "runner"
-                                                and doc["started_for"] == "interrupted")),
+        ("caller", isinstance(doc["caller"], str) and (doc["caller"] in CALLERS or (
+            doc["caller"] == "runner" and doc["started_for"] == "interrupted"))),
         ("kind", doc["kind"] in KINDS),
         ("project", isinstance(doc["project"], str) and bool(PROJECT_RE.match(doc["project"]))),
         ("ticket", isinstance(doc["ticket"], str) and bool(TICKET_RE.match(doc["ticket"]))),
@@ -254,8 +255,8 @@ def walls(path):
         return ["the store is a link or not a folder"]
     if st.st_uid != os.getuid():
         return ["the store belongs to another account"]
-    if st.st_mode & 0o022:
-        return ["others can write the store: it must be mode 0700"]
+    if st.st_mode & 0o077:
+        return ["others can read or write the store: it must be mode 0700"]
     return []
 
 
@@ -349,9 +350,14 @@ def pending(store):
             continue
         try:
             doc = read_json(os.path.join(folder, name))
-            out.append((name[:-5], doc, request_problems(doc)))
         except StoreError as exc:
             out.append((name[:-5], None, ["the request could not be read: %s" % exc]))
+            continue
+        try:
+            problems = request_problems(doc)
+        except (TypeError, ValueError, AttributeError):   # never one file stopping every pass
+            problems = ["the request could not be judged"]
+        out.append((name[:-5], doc, problems))
     return sorted(out, key=lambda i: ((i[1] or {}).get("at") if isinstance(i[1], dict)
                                       and isinstance(i[1].get("at"), str) else "", i[0]))
 
@@ -401,9 +407,9 @@ def read_run(store, run_id):
     """One run's record, or None when there is none or it is not well formed."""
     try:
         doc = read_json(os.path.join(run_dir(store, run_id), "run.json"))
-    except (StoreError, ValueError):
+        return doc if not run_problems(doc) else None
+    except (StoreError, TypeError, ValueError, AttributeError):
         return None
-    return doc if not run_problems(doc) else None
 
 
 def read_runs(store):
@@ -476,7 +482,10 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
     os.makedirs(loose)
     os.chmod(loose, 0o777)
     expect("a store others can write is refused", walls(loose),
-           ["others can write the store: it must be mode 0700"])
+           ["others can read or write the store: it must be mode 0700"])
+    os.chmod(loose, 0o755)
+    expect("a store others can read is refused too: its runs hold the fenced ticket", walls(loose),
+           ["others can read or write the store: it must be mode 0700"])
     expect("a relative store is refused", walls("store"), ["the store must be an absolute path"])
 
     # Who may ask for what.
@@ -528,7 +537,12 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
         fh.write("{not json")
     forged = dict(doc, id="rq-" + "c" * 32, extra=1)
     write_json(os.path.join(store, "requests", forged["id"] + ".json"), forged)
+    odd = dict(doc, id="rq-" + "a" * 32, caller=[])
+    write_json(os.path.join(store, "requests", odd["id"] + ".json"), odd)
+    expect("a caller that is a list is named, never a crash", may([], "start", "code"), False)
     got = {i[0]: i[2][:1] for i in pending(store)}
+    expect("…and the request is named, not a crash of every pass", got["rq-" + "a" * 32],
+           ["the caller is not one of the five that may ask"])
     expect("a broken request is named", got["rq-" + "b" * 32],
            ["the request could not be read: it could not be read (JSONDecodeError)"])
     expect("an extra field is named", got["rq-" + "c" * 32],
@@ -572,10 +586,15 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
     os.makedirs(os.path.join(store, "runs", "run-" + "3" * 32))
     with open(os.path.join(store, "runs", "run-" + "3" * 32, "run.json"), "w") as fh:
         fh.write("[]")
+    os.makedirs(os.path.join(store, "runs", "run-" + "4" * 32))
+    write_json(os.path.join(store, "runs", "run-" + "4" * 32, "run.json"),
+               dict(ended, run="run-" + "4" * 32, caller={}))
+    expect("a record whose caller is an object is not a record", run_problems(dict(ended, caller={})),
+           ["the record's caller is not valid"])
     got = read_runs(store)
     expect("a record that cannot be read is named, and the rest are given",
            (got["state"], len(got["runs"]), got["why"]),
-           ("partly-read", 2, "1 record(s) could not be read, the first run-" + "3" * 32))
+           ("partly-read", 2, "2 record(s) could not be read, the first run-" + "3" * 32))
     os.chmod(os.path.join(store, "runs"), 0o777)
     got = read_runs(store)
     expect("a runs folder that fails its walls gives None, never an empty list",
