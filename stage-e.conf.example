@@ -146,9 +146,12 @@ OWNER_LINEAR_EMAIL=you@example.com
 
 # The team keys whose tickets Stage E treats as pipeline work, comma-separated.
 # Review tickets are filed on these teams: on the coding ticket's own team, so a
-# ticket on a team not named here gets no review.  The agent must already be a
-# member of each (card CK-4 says which, if not); the installer never changes a
-# team's members.
+# ticket on a team not named here gets no review.  The agent must take
+# delegations on each.  Linear gives an agent that through the team access chosen
+# when it was installed, which is not team membership, and the installer cannot
+# read it.  So it looks for proof on each team: the agent is a member, or a
+# ticket there is delegated to it (card CK-4 names a team with neither).  It only
+# reads both; the installer never changes a team.
 #
 # REQUIRED, AND EMPTY IS NOT "ANY TEAM".  The finding poller scans exactly these
 # teams for the side-findings a session reports, and it refuses an empty list —

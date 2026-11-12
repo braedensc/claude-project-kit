@@ -1465,6 +1465,10 @@ Q_AGENT_USER = ("query FindAgentUser($filter: UserFilter!) "
                 "{ users(filter: $filter, first: 10) { nodes { id name displayName active } } }")
 Q_MEMBERS = ("query TeamMembers($id: String!) { team(id: $id) "
              "{ members(first: 100) { nodes { id displayName } } } }")
+# KIT-662: one ticket on a team that is delegated to the agent, which proves a delegation there
+# reaches it. Team access, which is what delegation needs, is not something this key can read.
+Q_DELEGATED = ("query DelegatedOnTeam($filter: IssueFilter!) "
+               "{ issues(filter: $filter, first: 1) { nodes { id identifier } } }")
 M_LABEL_CREATE = ("mutation LabelCreate($input: IssueLabelCreateInput!) "
                   "{ issueLabelCreate(input: $input) { success issueLabel { id name } } }")
 
@@ -1784,17 +1788,25 @@ CARDS = {
         "attest": None,
     },
     "CK-4": {
-        "title": "Add the dispatcher's agent to a work team",
-        "why": ("Review tickets are filed on the work teams (KIT-599), and a ticket cannot be "
-                "delegated to an agent in a team it is not a member of. The agent is "
-                "normally a member of every work team already, since coding tickets are "
-                "delegated there too. The installer only reads the membership: it never "
-                "changes a work team."),
-        "do": ["In the tracker: the work team the run named -> Members -> add the agent",
-               "whose DISPLAY NAME is your AGENT_DISPLAY_NAME. It is usually lower-case,",
-               "and is not the capitalised label the members list shows.",
-               "Then run the installer again; it re-reads the membership and carries on."],
-        "good": "the agent appears in each MANAGED_TEAM_KEYS team's member list",
+        "title": "Show that the dispatcher's agent takes delegations on a work team",
+        "why": ("Review tickets are filed on the work teams (KIT-599) and delegated to the "
+                "dispatcher's agent. Linear lets an agent take delegations on the teams it was "
+                "given access to when it was installed. That access is not team membership, "
+                "and this installer cannot read it. So it looks for proof on each work team: "
+                "the agent is a member, or a ticket there is delegated to it. It found neither "
+                "on the team the run named. The installer only reads both: it never changes a "
+                "work team."),
+        "do": ["In the tracker: Settings -> AI & Agents -> Installed Agents -> the agent:",
+               "make sure it has access to the team the run named.",
+               "Then give the run its proof, either way:",
+               "  - delegate one ticket on that team to the agent. That starts a session,",
+               "    so pick one you want worked; or",
+               "  - add the agent to that team's members. Its DISPLAY NAME is your",
+               "    AGENT_DISPLAY_NAME, usually lower-case, not the capitalised label the",
+               "    members list shows.",
+               "Then run the installer again; it reads both again and carries on."],
+        "good": ("each MANAGED_TEAM_KEYS team has a ticket delegated to the agent, or the agent "
+                 "among its members"),
         "attest": None,
     },
     "CK-5": {
@@ -2160,6 +2172,8 @@ class Ctx(object):
         # Daemons this run stopped and has not started again. A run that ends
         # early with these set has switched the review loop OFF, and must say so.
         self.unloaded = []
+        # …and the ones `run` loaded again on its way out, after a stop (KIT-661).
+        self.reloaded = []
         # Jobs other installers own (the notifier, the Slack bridge) that launchd would not
         # load again after `code` stopped them for the clone's move (KIT-199). No later step
         # loads them, so the notice on the way out names them; the ledger keeps them too
@@ -3115,6 +3129,15 @@ def _clone_jobs_notes(jobs, unknown, owed, held=None):
                      "the Stage E jobs"]
 
 
+def _launchd_holds(r, label):
+    """Does launchd hold `label` (KIT-661)? Only its own "Could not find service" (exit 113)
+    is a no. A look that fails any other way counts as a yes: a job `code` stops is loaded
+    again on a stop, so one counted in by mistake is at worst named, never forgotten."""
+    got = r.as_root(["launchctl", "print", "system/" + label])
+    text = (got.out or "") + (got.err or "")
+    return got.ok or not (got.rc == 113 or "Could not find service" in text)
+
+
 def step_code(ctx, apply_it):
     """The role account's own clone, and the scripts the daemons exec."""
     r, conf = ctx.runner, ctx.conf
@@ -3213,6 +3236,12 @@ def step_code(ctx, apply_it):
         return True, same, []
 
     stop_labels = all_daemon_labels(conf)
+    # ONLY A JOB launchd HOLDS NOW IS ONE THIS RUN STOPS (KIT-661). On any stop after this
+    # step, `run` loads again on its way out each job it stopped, so each of the three is asked
+    # here, before anything stops. One launchd does not hold (a first install, or a job a
+    # person booted out on purpose) is still unloaded below, which does nothing, and is never
+    # loaded on a stop: loading it is `enable`'s, as before.
+    held_now = [label for label in stop_labels if _launchd_holds(r, label)]
     # The catch-up poller execs from the same clone, and is stopped only when it is loaded:
     # a job never installed (its first count unsigned, or `off`) is not one to report as off.
     if r.as_root(["launchctl", "print", "system/" + catchup_label(conf)]).ok:
@@ -3257,9 +3286,12 @@ def step_code(ctx, apply_it):
     if not r.dry_run:
         # Loading the three again is the `enable` step, several checkpoints
         # downstream, and loading the monitor is the `heartbeat-monitor` step after
-        # it. If this run stops before them, those jobs are OFF and the only thing
-        # that says so is the notice cmd_run prints off this list.
-        ctx.unloaded = list(stop_labels)
+        # it. A run that stops before them loads each listed here again on its way
+        # out, and names any launchd would not take back (KIT-661). The catch-up
+        # poller, the status job and the monitor are in `stop_labels` only when
+        # launchd held them.
+        ctx.unloaded = held_now + [label for label in stop_labels
+                                   if label not in all_daemon_labels(conf)]
 
     if head.ok and head.out.strip():
         res = r.as_role(ctx.account,
@@ -3443,18 +3475,49 @@ def step_tracker(ctx, apply_it):
                          % (conf["OWNER_LINEAR_EMAIL"], len(owners)))
     ids["owner_user_id"] = owners[0]["id"]
 
-    # The agent's membership of each work team, READ and never changed: a work team is the
-    # owner's, and this installer does not add members to it.
-    outside = []
+    # WHAT DELEGATION NEEDS, READ AS PROOF (KIT-662). Linear lets an agent take delegations on
+    # the teams it was given access to when it was installed, and that access is not team
+    # membership: on 11 Nov the agent was a member of neither work team and took every
+    # delegation on both, while this step blocked on membership. This key cannot read team
+    # access, so each team needs proof: the agent is a member, or a ticket there is delegated
+    # to it. Neither is card CK-4. Both are READ: a work team is the owner's, and this
+    # installer never changes one.
+    outside, proven = [], []
     for key in keys:
         d = api.post(Q_MEMBERS, {"id": ids["team_ids"][key]})
         members = (((d.get("team") or {}).get("members") or {}).get("nodes")) or []
-        if not any(m.get("id") == ids["agent_user_id"] for m in members):
+        if any(m.get("id") == ids["agent_user_id"] for m in members):
+            continue
+        try:
+            d = api.post(Q_DELEGATED, {"filter": {
+                "team": {"id": {"eq": ids["team_ids"][key]}},
+                "delegate": {"id": {"eq": ids["agent_user_id"]}}}})
+        except SetupError as exc:
+            # COULD NOT TELL is not "no": a read that failed is never the card, and never a pass.
+            raise Unknown("the agent is not a member of %s, and the tracker would not say whether "
+                          "a ticket there is delegated to it: %s" % (key, str(exc)[:200]),
+                          "run this again once the tracker answers. Or add the agent to %s's "
+                          "members, which is proof on its own (card CK-4 says how)" % key)
+        found = (((d.get("issues") or {}).get("nodes")) or [])
+        if found:
+            proven.append((key, found[0].get("identifier") or found[0].get("id") or "a ticket"))
+        else:
             outside.append(key)
     st.data["ids"] = ids
     if outside:
-        raise Blocked("CK-4", "the agent is not a member of %s, so a review ticket filed there "
-                              "could not be delegated" % ", ".join(outside))
+        raise Blocked("CK-4", "the agent is not a member of %s, and no ticket there is delegated to "
+                              "it, so nothing shows a review ticket filed there would reach it"
+                              % ", ".join(outside))
+    # WHAT THE PROOF SAYS, AND NO MORE (Stage E review): a delegated ticket shows a delegation
+    # reached the agent there once. Access removed since is caught where it matters: the review
+    # poller's same-pass routing check stops that repository's reviews and pages the owner.
+    notes.extend("the agent is not a member of %s, and %s is delegated to it there, so a "
+                 "delegation has reached it on that team. Delegation needs the team access "
+                 "Linear gave the agent when it was installed, not membership, so this does not "
+                 "block. That ticket may be an old one: if the access was removed since, the "
+                 "review poller's routing check stops that repository's reviews at its first "
+                 "review ticket and pages you" % (key, ident)
+                 for key, ident in proven)
 
     detail = "work teams %s, routing labels %s, agent=%s, label=%s, owner=%s" % (
         ", ".join("%s=%s" % (k, ids["team_ids"][k]) for k in keys),
@@ -4948,6 +5011,23 @@ def _reviews_in_flight(ctx):
                   and rec.get("status") in REVIEWS_IN_FLIGHT_STATUSES)
 
 
+def _poller_off_at_the_gate(ctx, poller, in_flight, moving):
+    """What the drain gate says when reviews are in flight and the review poller is not loaded
+    (KIT-661): they cannot settle, so it stops rather than wait on CK-13. When this run stopped
+    the poller, the run loads it again on its way out; when it was off before, the line that
+    loads it."""
+    said = ("%d review(s) are in flight (%s), and the review entries %s are about to change or "
+            "go. The review poller (system/%s) is not loaded, and only it settles a review, so "
+            "waiting for them on card CK-13 would never end. Nothing was written."
+            % (len(in_flight), ", ".join(in_flight[:10]), ", ".join(moving), poller))
+    if poller in ctx.unloaded:
+        return said + ("\n  This run stopped the poller so the clone could move. It loads it again "
+                       "on its way out, and says below whether it could.\n  Once the reviews "
+                       "above have settled, run the same command again.")
+    return said + ("\n  Load it, wait for the reviews above to settle, then run the same command "
+                   "again:\n    sudo launchctl bootstrap system %s" % _dispatcher_plist(poller))
+
+
 def step_dispatcher_entry(ctx, apply_it):
     r, conf = ctx.runner, ctx.conf
     want = reviews_entries(ctx)
@@ -5046,6 +5126,13 @@ def step_dispatcher_entry(ctx, apply_it):
                           for k in ("teamKeys", "routingLabels"))] + list(stale)
         if moving:
             in_flight = _reviews_in_flight(ctx)
+            poller = daemon_labels(conf)[0]
+            if in_flight and (poller in ctx.unloaded or not _service_in_domain(r, poller)):
+                # ONLY THE REVIEW POLLER SETTLES A REVIEW (KIT-661). Unloaded, by `code` on
+                # this run or before it, the wait on CK-13 would never end: on 11 Nov it
+                # waited on reviews only the unloaded poller could settle. So the gate says so
+                # and stops instead, and the run loads the poller again on its way out.
+                raise SetupError(_poller_off_at_the_gate(ctx, poller, in_flight, moving))
             if in_flight:
                 raise Blocked("CK-13", "%d review(s) are in flight (%s); the review entries %s "
                                        "are about to change or go, and the restart would end "
@@ -5803,7 +5890,38 @@ def step_daemons(ctx, apply_it):
 
     for label in sorted(stale):
         _install_plist(r, label, want[label])
+    if not r.dry_run:
+        # Owed to `enable` until launchd loads each, in the ledger: a run may stop first.
+        owed = _plists_not_loaded(ctx)
+        owed.update((label, now_iso()) for label in stale)
+        ctx.state.data.setdefault("notes", {})[PLISTS_NOT_LOADED_NOTE] = owed
     return False, "installed " + ", ".join(sorted(stale)) + " (not loaded yet — CK-5)", []
+
+
+# THE PLISTS `daemons` WROTE THAT launchd HAS NOT LOADED YET (Stage E review of KIT-661), as
+# {label: when written}. launchd keeps the definition it loaded until the job is loaded again,
+# so a plist written under a loaded daemon changes nothing by itself, and `enable` used to
+# read a loaded daemon with its heartbeats as done. A daemon a stopped run loaded again on its
+# way out runs the plist on disk then, which the next run may replace. In the ledger, not only
+# on ctx: a run that writes a plist and stops before `enable` leaves the load owed to the next.
+# Each entry goes once launchd loads that daemon from the plist on disk: in `enable`, or on a
+# stopped run's way out.
+PLISTS_NOT_LOADED_NOTE = "plists-not-loaded-yet"
+
+
+def _plists_not_loaded(ctx):
+    return dict((ctx.state.data.get("notes") or {}).get(PLISTS_NOT_LOADED_NOTE) or {})
+
+
+def _plist_loaded(ctx, label):
+    """launchd has loaded `label` from the plist on disk: it owes `enable` nothing more."""
+    owed = _plists_not_loaded(ctx)
+    if owed.pop(label, None) is not None:
+        notes = ctx.state.data.setdefault("notes", {})
+        if owed:
+            notes[PLISTS_NOT_LOADED_NOTE] = owed
+        else:
+            notes.pop(PLISTS_NOT_LOADED_NOTE, None)
 
 
 def _install_plist(r, label, body):
@@ -6130,13 +6248,20 @@ def step_enable(ctx, apply_it):
             % (ctx.stage_home,
                " (%s)" % " ".join(paused.out.split())[:120] if paused.out.strip() else ""))
 
-    if not missing and set(DAEMON_HEARTBEATS) <= set(have_beats):
+    # A LOADED DAEMON MAY RUN AN OLDER PLIST (Stage E review of KIT-661): `daemons` wrote a newer
+    # one after launchd loaded it, and launchd keeps what it loaded until the job is loaded again.
+    owed = [l for l in labels if l in _plists_not_loaded(ctx)]
+    if not missing and set(DAEMON_HEARTBEATS) <= set(have_beats) and not owed:
         ctx.unloaded = [l for l in ctx.unloaded if l not in labels]
         return True, "all %d daemons loaded and all heartbeats present" % len(
             DAEMON_HEARTBEATS), pause_notes
     if not apply_it:
-        return False, "would load %s; heartbeats present: %s" % (
-            ", ".join(missing) or "none", ", ".join(have_beats) or "none"), pause_notes
+        again = [l for l in owed if l not in missing]
+        return False, "would load %s%s; heartbeats present: %s" % (
+            ", ".join(missing) or "none",
+            ("; would load %s again: launchd runs an older plist than the one on disk"
+             % ", ".join(again)) if again else "",
+            ", ".join(have_beats) or "none"), pause_notes
 
     # THIS STEP RE-ARMS A DAEMON YOU STOPPED ON PURPOSE, and says so before it
     # does. `launchctl bootout` is the documented way to pause one half — but the
@@ -6171,6 +6296,11 @@ def step_enable(ctx, apply_it):
                         why="load %s" % label)
         if not res.ok and not res.skipped:
             raise SetupError("could not load %s: %s" % (label, (res.err or "")[:200]))
+        # Off the list as soon as launchd takes it (KIT-661): a stop later in this loop then
+        # loads again, on the way out, only the ones still off. And it runs the plist on disk.
+        ctx.unloaded = [l for l in ctx.unloaded if l != label]
+        if not res.skipped:
+            _plist_loaded(ctx, label)
     # Only these four: a heartbeat monitor `code` stopped is the next step's to load.
     ctx.unloaded = [l for l in ctx.unloaded if l not in labels]
     if ctx.runner.dry_run:
@@ -7599,12 +7729,22 @@ def cmd_run(ctx, dry_run):
     # the other seven rows and another pass to see them. That matters most on
     # the very first dry run, when no key is stored yet and the tracker row is
     # the one that cannot be measured.
-    code, rows = run_steps(ctx, apply_it=not dry_run, keep_going=dry_run,
-                           resume="run --dry-run" if dry_run else "run")
-    _unloaded_notice(ctx)
-    # LAST, so it is the final thing on the screen. It is the most serious
-    # state this command can end in, and the two notices can both be true.
-    _dispatcher_down_notice(ctx)
+    # ON EVERY WAY OUT (a card, a could-not-tell, a failure, a crash or Ctrl-C), each job `code`
+    # stopped for the clone's move that no later step loaded is loaded again (KIT-661). On 11
+    # Nov a run stopped at a card after the move, and every Stage E job stayed off for an hour
+    # with nothing saying so.
+    ctx.reloaded, off = [], {}
+    try:
+        code, rows = run_steps(ctx, apply_it=not dry_run, keep_going=dry_run,
+                               resume="run --dry-run" if dry_run else "run")
+    finally:
+        try:
+            off = _load_stopped_jobs_again(ctx)
+        finally:
+            _unloaded_notice(ctx, off)
+            # LAST, so it is the final thing on the screen. It is the most serious
+            # state this command can end in, and the two notices can both be true.
+            _dispatcher_down_notice(ctx)
     if dry_run:
         say("")
         if ctx.runner.writes:
@@ -7626,6 +7766,10 @@ def cmd_run(ctx, dry_run):
         say("clearing a row above:")
         say("    python3 %s run --dry-run" % _self_path())
         return code
+    if _jobs_still_off(ctx):
+        # NOT DONE, whatever the rows say: a job this run stopped is still off. The notice
+        # above names each one, with the line that loads it (KIT-661).
+        return EX_FAILED
     if code == EX_OK:
         done = sum(1 for _, o, _ in rows if o in (DONE, ALREADY_DONE))
         say("")
@@ -7634,16 +7778,93 @@ def cmd_run(ctx, dry_run):
     return code
 
 
-def _unloaded_notice(ctx):
-    """Say it out loud when a run ends with the loops switched off.
+def _left_off_by_conf(conf, label):
+    """True for a job `code` stopped that the conf now declines by name. Its own step unloads
+    it and removes its plist, so a stop never loads it again (KIT-661)."""
+    return ((label == catchup_label(conf) and catchup_off(conf))
+            or (label == status_label(conf) and status_off(conf))
+            or (label == monitor_label(conf) and monitor_ticket(conf) == "off"))
 
-    `code` stops every daemon before it moves the clone under them. The
-    far-downstream `enable` step starts the four again, and the
-    `heartbeat-monitor` step after it starts the monitor. A run that blocks in
-    between leaves those jobs OFF, and silence there looks exactly like a
-    healthy install. Each is named for what it is: a run that stops at the
-    monitor's step has review, bounce, finding and catch-up running, and saying they are
-    off would send a person to look at loops that are fine."""
+
+def _jobs_still_off(ctx):
+    """The jobs `code` stopped that are still off, less the ones the conf declines."""
+    return [label for label in ctx.unloaded if not _left_off_by_conf(ctx.conf, label)]
+
+
+def _rearm_sh(ctx):
+    """The heartbeat monitor's rearm, as the role account runs it."""
+    return ("/usr/bin/python3 %s/kit/scripts/%s rearm --config %s/%s"
+            % (ctx.stage_home, MONITOR_SCRIPT, ctx.stage_home, MONITOR_CONFIG))
+
+
+def _load_one_again(ctx, label):
+    """'' once launchd holds `label` again, else why it does not (KIT-661)."""
+    r = ctx.runner
+    if _service_in_domain(r, label):
+        # Told to stop by `code` and still on its way out, or loaded again since, by hand. A
+        # job told to stop is gone once its exit timeout has run out, so one launchd still
+        # holds after that was loaded again: it is not off.
+        gone, _waited = _wait_until_gone(r, label, _exit_timeout(r, _dispatcher_plist(label))
+                                         + EXIT_TIMEOUT_HEADROOM)
+        if not gone:
+            return ""
+    if label == monitor_label(ctx.conf):
+        # Rearmed first, as its own step does, so its first pass does not judge the heartbeats
+        # this stop made old as stale.
+        rearm = r.as_role(ctx.account, _rearm_sh(ctx),
+                          why="rearm %s's run clock before loading it again" % label)
+        if not rearm.ok and not rearm.skipped:
+            return ("its rearm failed (exit %d), so it was not loaded: %s"
+                    % (rearm.rc, ((rearm.err or rearm.out).strip() or "no output")[-160:]))
+    said = _load_again(r, label)
+    if said:
+        return "launchd said: " + said
+    # Loaded from the plist on disk, so `enable` owes it no load of a newer one.
+    _plist_loaded(ctx, label)
+    return ""
+
+
+def _load_stopped_jobs_again(ctx):
+    """{label: why it is still off}, after loading again each job `code` stopped for the
+    clone's move that no later step loaded (KIT-661). The monitor goes last, after the jobs
+    it watches. A job the conf declines is left off: its own step removes it. Each one
+    launchd takes back moves from `ctx.unloaded` to `ctx.reloaded`. A fault while loading one
+    is said as why it is off, and never stops the loads after it."""
+    if ctx.runner.dry_run:
+        return {}
+    mlabel = monitor_label(ctx.conf)
+    todo = _jobs_still_off(ctx)
+    todo = [label for label in todo if label != mlabel] + [l for l in todo if l == mlabel]
+    off = {}
+    for label in todo:
+        try:
+            said = _load_one_again(ctx, label)
+        except Exception as exc:  # noqa: BLE001 — said as why it is off, never swallowed
+            said = "loading it raised %s: %s" % (type(exc).__name__, str(exc)[:160])
+        if said:
+            off[label] = said
+            continue
+        ctx.unloaded = [l for l in ctx.unloaded if l != label]
+        ctx.reloaded.append(label)
+    if ctx.reloaded:
+        # `run_steps` saved the ledger before this ran, and a load clears what it owed.
+        ctx.state.save()
+    return off
+
+
+def _unloaded_notice(ctx, off=None):
+    """Say what became of the jobs `code` stopped, and say it loudest when one is still off.
+
+    `code` stops every job that runs from the clone before it moves the clone under them.
+    `enable` loads the three daemons again, and the catch-up, status and heartbeat-monitor
+    steps load their own jobs. A run that stops before one of them loads it again on its way
+    out (`_load_stopped_jobs_again`, KIT-661), and this names each one it loaded. Each one
+    still off is said under NOT DONE, with launchd's words when it said any and the lines
+    that load it: silence there looks exactly like a healthy install (§13). Each is named for
+    what it is: a run that stops at the monitor's step has review, bounce, finding and
+    catch-up running, and saying they are off would send a person to look at loops that are
+    fine."""
+    off = off or {}
     if ctx.clone_jobs_off:
         one = len(ctx.clone_jobs_off) == 1
         it = "it" if one else "them"
@@ -7661,30 +7882,43 @@ def _unloaded_notice(ctx):
             % (it, it, it))
         for label in ctx.clone_jobs_off:
             say("    sudo launchctl disable system/%s" % label)
+    reloaded = list(getattr(ctx, "reloaded", None) or ())
+    if reloaded:
+        one = len(reloaded) == 1
+        say("")
+        say("A JOB THIS RUN STOPPED IS LOADED AGAIN. The run unloaded it so the clone could move,"
+            if one else
+            "THE JOBS THIS RUN STOPPED ARE LOADED AGAIN. The run unloaded them so the clone could")
+        say("and ended before the step that loads it. So it was loaded on the way out:" if one
+            else "move, and ended before the steps that load them. So they were loaded on the "
+                 "way out:")
+        for label in reloaded:
+            say("    system/%s" % label)
+        say("%s the clone as it is now." % ("It runs" if one else "They run"))
     if not ctx.unloaded:
         return
     mlabel = monitor_label(ctx.conf)
     clabel = catchup_label(ctx.conf)
     slabel = status_label(ctx.conf)
-    core = [l for l in ctx.unloaded if l not in (mlabel, clabel, slabel)]
-    advice = list(core)
-    if clabel in ctx.unloaded and not catchup_off(ctx.conf):
-        advice.append(clabel)
-    if slabel in ctx.unloaded and not status_off(ctx.conf):
-        advice.append(slabel)
-    if core or clabel in advice or slabel in advice:
-        named = ["review", "bounce", "finding"] if core else []
-        if clabel in advice:
-            named.append("catch-up")
-        if slabel in advice:
-            named.append("status")
+    still = _jobs_still_off(ctx)
+    daemons = [l for l in still if l != mlabel]
+    if still:
         say("")
-        say("THE STAGE E DAEMONS ARE UNLOADED. This run stopped them so the clone could move")
-        say("under them, and did not get as far as the step that loads them again — so %s %s"
-            % (", ".join(named[:-1]) + (" and " if len(named) > 1 else "") + named[-1],
-               "is OFF until it does:" if len(named) == 1 else "are OFF until it does:"))
-        for label in advice:
-            say("    %s" % label)
+        say("NOT DONE: %s." % ("A STAGE E JOB IS OFF" if len(still) == 1
+                                else "%d STAGE E JOBS ARE OFF" % len(still)))
+    if daemons:
+        names = dict(zip(daemon_labels(ctx.conf) + (finding_label(ctx.conf), clabel, slabel),
+                         ("review", "bounce", "finding", "catch-up", "status")))
+        named = [names.get(l, l) for l in daemons]
+        it = "it" if len(named) == 1 else "them"
+        say("THE STAGE E DAEMONS ARE UNLOADED. This run stopped %s so the clone could move" % it)
+        say("under %s, ended before the step that loads %s again, and could not load" % (it, it))
+        say("%s on its way out, so %s %s"
+            % (it, ", ".join(named[:-1]) + (" and " if len(named) > 1 else "") + named[-1],
+               "is OFF until it is loaded:" if len(named) == 1
+               else "are OFF until they are loaded:"))
+        for label in daemons:
+            say("    system/%s%s" % (label, "  (%s)" % off[label] if off.get(label) else ""))
     if clabel in ctx.unloaded and catchup_off(ctx.conf):
         say("")
         say("The catch-up poller was stopped too. CATCHUP_INTERVAL_SECONDS=off, so leave it")
@@ -7695,7 +7929,6 @@ def _unloaded_notice(ctx):
         say("The status job was stopped too. STATUS_INTERVAL_SECONDS=off, so leave it")
         say("unloaded. The `status` step removes its plist; until that step runs, the next")
         say("boot loads it again.")
-    rearm = None
     if mlabel in ctx.unloaded:
         say("")
         if monitor_ticket(ctx.conf) == "off":
@@ -7703,22 +7936,23 @@ def _unloaded_notice(ctx):
             say("unloaded. The `heartbeat-monitor` step removes its plist; until that step runs,")
             say("the next boot loads it again.")
         else:
-            say("THE HEARTBEAT MONITOR IS UNLOADED. This run stopped it with the daemons and did")
-            say("not get as far as its own step, so nothing reads their heartbeats until it does:")
-            say("    %s" % mlabel)
-            advice.append(mlabel)
+            say("THE HEARTBEAT MONITOR IS UNLOADED. This run stopped it with the daemons and could")
+            say("not load it again, so nothing reads their heartbeats until it is loaded:")
+            say("    system/%s%s" % (mlabel, "  (%s)" % off[mlabel] if off.get(mlabel) else ""))
+    if not still:
+        return
+    say("")
+    say("Load %s yourself, then check that launchd holds it:"
+        % ("it" if len(still) == 1 else "each one"))
+    for label in still:
+        if label == mlabel:
             # Rearmed first, as its step does, so its first pass does not page on the
             # heartbeats this stop made old.
-            rearm = ("sudo -u %s -H /bin/sh -c 'cd / && /usr/bin/python3 %s/kit/scripts/%s "
-                     "rearm --config %s/%s'" % (ctx.account, ctx.stage_home, MONITOR_SCRIPT,
-                                                ctx.stage_home, MONITOR_CONFIG))
-    if not advice:
-        return
-    say("Clear the row above and run the same command again, or load them yourself:")
-    for label in advice:
-        if label == mlabel and rearm:
-            say("    %s" % rearm)
+            say("    sudo -u %s -H /bin/sh -c 'cd / && %s'" % (ctx.account, _rearm_sh(ctx)))
         say("    sudo launchctl bootstrap system %s" % _dispatcher_plist(label))
+        say("    sudo launchctl print system/%s" % label)
+    say("Or clear the row above and run the same command again: its later steps load %s too."
+        % ("it" if len(still) == 1 else "them"))
 
 
 def _dispatcher_down_notice(ctx):
@@ -8097,11 +8331,13 @@ def _no_real_app_signer(key_file, account):
 
 class FakeLinear(object):
     def __init__(self, teams=None, labels=None, users=None, members=None, refuse=(),
-                 no_field=(), reject_key=False):
+                 no_field=(), reject_key=False, delegated=None):
         self.teams = teams if teams is not None else []
         self.labels = labels if labels is not None else []
         self.users = users if users is not None else []
         self.members = members if members is not None else []
+        # Tickets delegated to an agent: {"team": team id, "delegate": user id, "identifier"}.
+        self.delegated = list(delegated or [])
         # `refuse`: operations that answer `success: false` and do nothing —
         # HTTP 200, no GraphQL error, no change. `no_field`: operations this
         # workspace's schema does not expose, which arrive as a GraphQL error.
@@ -8159,6 +8395,13 @@ class FakeLinear(object):
             return {"users": {"nodes": [u for u in self.users if u.get(field) == want]}}
         if op == "TeamMembers":
             return {"team": {"members": {"nodes": list(self.members)}}}
+        if op == "DelegatedOnTeam":
+            f = variables["filter"]
+            team, who = f["team"]["id"]["eq"], f["delegate"]["id"]["eq"]
+            return {"issues": {"nodes": [{"id": "i-" + d["identifier"],
+                                          "identifier": d["identifier"]}
+                                         for d in self.delegated
+                                         if d["team"] == team and d["delegate"] == who][:1]}}
         if op == "TeamCreate":
             self._n += 1
             t = {"id": "team%d" % self._n, "key": variables["input"]["key"],
@@ -9025,18 +9268,71 @@ def _selftest_body():
     expect("tracker-unknown-team", "NOPE" in refusedK,
            "an unknown work team was not refused by name: %r" % refusedK)
 
-    # The agent's membership is READ: a missing one is card CK-4, naming the team, and
-    # nothing is added to a work team.
+    # KIT-662: CK-4 CHECKS WHAT DELEGATION NEEDS. Linear lets an agent take delegations on the
+    # teams it was given access to when it was installed, and that access is not membership:
+    # on 11 Nov the agent was a member of neither work team and took every delegation on both.
+    # So the step reads proof: the agent is a member, or a ticket on the team is delegated to
+    # it. An agent with neither on a team cannot be reached there: card CK-4, naming the team.
+    # Nothing is ever added to a work team.
     ctxM, fakeM = _tracker(members=[])
     try:
         _quiet(lambda: step_tracker(ctxM, apply_it=True))
         blockedM = ""
     except Blocked as exc:
         blockedM = "%s %s" % (exc.card_id, exc.extra)
-    expect("tracker-membership-read-only",
-           blockedM.startswith("CK-4") and "KIT" in blockedM and "MemberCreate" not in fakeM.asked,
-           "a missing membership was not CK-4 naming the work team: %r, asked %s"
-           % (blockedM, fakeM.asked))
+    expect("tracker-unreachable-agent-is-ck-4",
+           blockedM.startswith("CK-4") and "KIT" in blockedM and "MemberCreate" not in fakeM.asked
+           and "DelegatedOnTeam" in fakeM.asked,
+           "an agent with no membership and no delegation on KIT was not CK-4 naming the team, "
+           "or no delegation was asked for: %r, asked %s" % (blockedM, fakeM.asked))
+    # …an agent that is NOT a member, but takes delegations on the team, passes, and the row's
+    # note names the ticket that proves it.
+    cases += 1
+    ctxD, fakeD = _tracker(members=[], delegated=[{"team": "t-kit", "delegate": "u-agent",
+                                                    "identifier": "KIT-70"}])
+    try:
+        (_okD, _detailD, notesD), _x = _quiet(lambda: step_tracker(ctxD, apply_it=True))
+        heldD = ""
+    except (Blocked, Unknown, SetupError) as exc:
+        notesD, heldD = [], "%s: %s" % (type(exc).__name__, exc)
+    expect("tracker-delegation-without-membership-passes",
+           not heldD and "MemberCreate" not in fakeD.asked
+           and any("KIT-70" in n and "not a member" in n for n in notesD),
+           "an agent that takes delegations on KIT without being a member was held, or the "
+           "note did not name its proof: %r; %r" % (heldD, notesD))
+    # …a ticket delegated to someone else on the team, or to the agent on another team, proves
+    # nothing about this team.
+    cases += 1
+    ctxO, _fakeO = _tracker(members=[], delegated=[
+        {"team": "t-kit", "delegate": "u-owner", "identifier": "KIT-71"},
+        {"team": "t-other", "delegate": "u-agent", "identifier": "OTH-1"}])
+    try:
+        _quiet(lambda: step_tracker(ctxO, apply_it=True))
+        blockedO = ""
+    except Blocked as exc:
+        blockedO = exc.card_id
+    expect("tracker-another-delegation-proves-nothing", blockedO == "CK-4",
+           "a delegation to someone else, or on another team, was taken as proof: %r" % blockedO)
+    # …a member needs no second read, and a read that fails is UNKNOWN: never a pass, never
+    # the card.
+    cases += 1
+    ctxP, fakeP = _tracker()
+    _quiet(lambda: step_tracker(ctxP, apply_it=True))
+    expect("tracker-member-needs-no-delegation-read", "DelegatedOnTeam" not in fakeP.asked,
+           "a member's team was asked for a delegation too: %s" % fakeP.asked)
+    cases += 1
+    ctxU, _fakeU = _tracker(members=[], no_field=("DelegatedOnTeam",))
+    try:
+        _quiet(lambda: step_tracker(ctxU, apply_it=True))
+        heldU = "no stop"
+    except Unknown as exc:
+        heldU = "unknown: %s || %s" % (exc.what, exc.remedy)
+    except (Blocked, SetupError) as exc:
+        heldU = "%s: %s" % (type(exc).__name__, exc)
+    expect("tracker-delegation-read-fails-is-unknown",
+           heldU.startswith("unknown:") and "KIT" in heldU and "CK-4" in heldU,
+           "a delegation read that failed was not UNKNOWN naming the team and the card: %r"
+           % heldU)
 
     # The retired keys are a note, never an error.
     ctxR, _fR = _tracker(dict(conf, REVIEWS_TEAM_KEY="REV", REVIEWS_TEAM_NAME="Reviews"),
@@ -10313,10 +10609,14 @@ def _selftest_body():
     seen_doc = {"schema": "pipeline-review-poller-seen/2", "seen": {
         "example-org/kit#7": {"status": "pending", "review_ticket": "REV-40"},
         "example-org/kit#6": {"status": "collected", "review_ticket": "REV-39"}}}
+    # The review poller runs: only then do the reviews in flight settle, and only then is
+    # CK-13 a wait with an end (KIT-661).
+    poller_runs = ("launchctl print system/" + daemon_labels(conf)[0], 0, "\tstate = not running\n")
     cases += 1
     ctxG, fakeG = _settled_ctx(conf)
     _old_shape(ctxG)
-    fakeG.answers = [("state/seen-prs.json", 0, json.dumps(seen_doc))] + list(fakeG.answers)
+    fakeG.answers = [("state/seen-prs.json", 0, json.dumps(seen_doc)),
+                     poller_runs] + list(fakeG.answers)
     try:
         _quiet(lambda: step_dispatcher_entry(ctxG, apply_it=True))
         blockedG = ""
@@ -10420,7 +10720,8 @@ def _selftest_body():
     retired = dict(rowsG6[0], id=REVIEW_ENTRY_PREFIX + "retired",
                    name=REVIEW_ENTRY_PREFIX + "retired")
     ctxG6.dispatcher["entries"].append(retired)
-    fakeG6.answers = [("state/seen-prs.json", 0, json.dumps(seen_doc))] + list(fakeG6.answers)
+    fakeG6.answers = [("state/seen-prs.json", 0, json.dumps(seen_doc)),
+                      poller_runs] + list(fakeG6.answers)
     try:
         _quiet(lambda: step_dispatcher_entry(ctxG6, apply_it=True))
         blockedG6 = ""
@@ -11197,7 +11498,7 @@ def _selftest_body():
     ctxUN, _fUN = _settled_ctx(conf)
     ctxUN.unloaded = [catchup_label(conf)]
     _x, saidUN = _quiet(lambda: _unloaded_notice(ctxUN))
-    expect("catchup-unloaded-notice", "catch-up is OFF until it does" in saidUN
+    expect("catchup-unloaded-notice", "catch-up is OFF until it is loaded" in saidUN
            and "review" not in saidUN.split("so ", 1)[-1].split("OFF")[0],
            "the notice for a stopped catch-up poller named the wrong jobs: %r" % saidUN[-400:])
     ctxUO, _fUO = _settled_ctx(dict(conf, CATCHUP_INTERVAL_SECONDS="off"))
@@ -11543,7 +11844,7 @@ def _selftest_body():
         _x, saidSU = _quiet(lambda: _unloaded_notice(ctxSU))
     except Exception as exc:  # noqa: BLE001 — an escape fails this case, by name
         saidSU = "the notice raised %s: %s" % (type(exc).__name__, exc)
-    expect("status-unloaded-notice", "status is OFF until it does" in saidSU
+    expect("status-unloaded-notice", "status is OFF until it is loaded" in saidSU
            and "review" not in saidSU.split("so ", 1)[-1].split("OFF")[0],
            "the notice for a stopped status job named the wrong jobs: %r" % saidSU[-400:])
 
@@ -12130,7 +12431,10 @@ def _selftest_body():
             return sum(("bootstrap system " + _dispatcher_plist(label)) in s for s in run.seq)
 
         cases += 1
-        outM, ctxM, runM = _behind_run({labN: True, labB: True})
+        # The three Stage E daemons are loaded too, so `code` records each as one it stopped
+        # (KIT-661: only a job launchd held is one a stop loads again).
+        outM, ctxM, runM = _behind_run(dict({labN: True, labB: True},
+                                            **dict.fromkeys(all_daemon_labels(conf), True)))
         moved_at = _at(runM.seq, "pull --ff-only")
         stage_e_at = min([i for i in (_at(runM.seq, "launchctl bootout system/" + lb)
                                       for lb in all_daemon_labels(conf)) if i > -1] or [-1])
@@ -12650,6 +12954,456 @@ def _selftest_body():
                "a first install: %r; looked for jobs %d time(s)" % (outF, len(lookedF)))
 
     _kit280_clone_jobs()
+
+    # -- KIT-661. A RUN THAT STOPS AFTER THE MOVE NEVER LEAVES STAGE E OFF ---------------- #
+    # 11 Nov: `run` moved the clone, unloading the poller, bounce, finding, catch-up and status
+    # jobs first, then stopped at card CK-4, before `enable`. All five stayed off for an hour
+    # and nothing said so. The drain gate (CK-13) then waited on reviews only the unloaded
+    # poller could settle. Every stop after `code` ends one of two ways: each job `code`
+    # stopped is loaded again, or the run ends NOT DONE and names each one still off with the
+    # line that loads it. A silent stop fails the case.
+    def _kit661_stops_after_the_move():
+        nonlocal cases
+        beef = "beef000000000000000000000000000000000000\tHEAD\n"
+        level = "abc1234000000000000000000000000000000000\tHEAD\n"
+        eio = "Bootstrap failed: 5: Input/output error"
+        five = list(all_daemon_labels(conf)) + [catchup_label(conf), status_label(conf)]
+        never = "reconcile the review entries"
+
+        class _Jobs(FakeRunner):
+            """launchd per label, as a domain answers it: `print` says whether it holds the
+            job, `bootout` lets it go, and `bootstrap` loads it unless `refuse` names it. A job
+            in `linger` is let go only after that many more looks, as one finishing a pass is;
+            a load into a domain that still holds it answers EIO. The fast-forward exits
+            `pull`; after one that worked, `after_pull` answers first (by default, origin level
+            with the clone). `seq` is every command, in order."""
+
+            def __init__(self, answers, loaded, refuse=(), pull=0, after_pull=None, linger=None,
+                         plists=None):
+                FakeRunner.__init__(self, answers)
+                self.loaded, self.refuse, self.seq = dict(loaded), set(refuse), []
+                self.linger, self.leaving = dict(linger or {}), {}
+                self.pull = pull
+                self.after_pull = ([("ls-remote origin HEAD", 0, level)] if after_pull is None
+                                   else list(after_pull))
+                # The plist on disk for each label in `plists`, and the one launchd loaded from
+                # (`running`): launchd keeps the definition it loaded until the job is loaded
+                # again, whatever is written to disk meanwhile.
+                self.plists = None if plists is None else dict(plists)
+                self.running = dict((label, body) for label, body in (plists or {}).items()
+                                    if self.loaded.get(label))
+
+            def look(self, label):
+                """One look at `label`, as time passing: a job letting go goes after its looks."""
+                if label in self.leaving:
+                    self.leaving[label] -= 1
+                    if self.leaving[label] < 0:
+                        del self.leaving[label]
+                        self.loaded[label] = False
+
+            def _exec(self, argv, stdin, timeout, cwd=None):
+                line = _fmt(argv)
+                self.seq.append(line)
+                if self.plists is not None and "/Library/LaunchDaemons/" in line:
+                    label = os.path.basename(line.split()[-1])[:-len(".plist")]
+                    if label in self.plists and " cat /Library/LaunchDaemons/" in line:
+                        return Result(0, self.plists[label])
+                    if label in self.plists and " install -o root " in line:
+                        with open(argv[-2], encoding="utf-8") as fh:
+                            self.plists[label] = fh.read()
+                        return Result(0)
+                if line.startswith("plutil -lint "):
+                    return Result(0, "OK\n")
+                if " launchctl bootstrap system " in line:
+                    label = os.path.basename(line.split()[-1])[:-len(".plist")]
+                    if self.loaded.get(label) or label in self.refuse:
+                        return Result(5, "", eio)
+                    self.loaded[label] = True
+                    if self.plists is not None and label in self.plists:
+                        self.running[label] = self.plists[label]
+                    return Result(0)
+                for verb in ("print", "bootout"):
+                    if " launchctl %s system/" % verb in line:
+                        label = line.split("system/", 1)[1]
+                        if verb == "print":
+                            self.look(label)
+                        was = self.loaded.get(label, False)
+                        if verb == "bootout" and was:
+                            if label in self.linger:
+                                self.leaving[label] = self.linger[label]
+                            else:
+                                self.loaded[label] = False
+                        return (Result(0, "\tstate = not running\n") if was else
+                                Result(113 if verb == "print" else 3, "", "Could not find service"))
+                if "pull --ff-only" in line:
+                    if self.pull == 0:
+                        self.answers = self.after_pull + self.answers
+                    return Result(self.pull, "", "" if self.pull == 0 else
+                                  "fatal: Not possible to fast-forward, aborting.")
+                return FakeRunner._exec(self, argv, stdin, timeout, cwd=cwd)
+
+        def _machine(cconf=None, loaded=None, behind=True, old_plists=False, **kw):
+            """A settled machine whose clone is behind origin (or level, `behind` False).
+            launchd holds each job in `loaded`: by default the dispatcher and the five Stage E
+            jobs, as on 11 Nov. With `old_plists`, the three daemons' plists on disk, and the
+            ones launchd runs, are older than what this run renders."""
+            cc = cconf or conf
+            ctxX, fakeX, _apiX = _healthy_ctx(cc)
+            held = dict((label, True) for label in [cc["DISPATCHER_SERVICE"]]
+                        + list(all_daemon_labels(cc)) + [catchup_label(cc), status_label(cc)])
+            if old_plists:
+                kw["plists"] = dict((label, "<plist>an older one</plist>\n")
+                                    for label in all_daemon_labels(cc))
+            runX = _Jobs(([("ls-remote origin HEAD", 0, beef)] if behind else [])
+                         + [("/Library/LaunchDaemons/*.plist", 0, "END\n")]
+                         + [a for a in fakeX.answers
+                            if not (behind and a[0] == "ls-remote origin HEAD")],
+                         held if loaded is None else loaded, **kw)
+            ctxX.runner = runX
+            return ctxX, runX
+
+        def _run(ctxX, stop_at="tracker", how="CK-4"):
+            """`run`, end to end and never sleeping, with the step `stop_at` replaced by one
+            that stops the way `how` names: a card by its id, "unknown", "failed" or "crash".
+            By default, card CK-4 at `tracker`, as on 11 Nov. (its exit code, or the crash, and
+            what it printed)"""
+            import io as _io
+            saved_steps, saved_pause = globals()["STEPS"], globals()["_pause"]
+
+            def _stop(_ctx, _apply_it):
+                what = "a stop at %s" % stop_at
+                if how.startswith("CK-"):
+                    raise Blocked(how, what)
+                if how == "unknown":
+                    raise Unknown(what, "nothing to clear")
+                if how == "failed":
+                    raise SetupError(what)
+                raise RuntimeError(what)
+
+            globals()["STEPS"] = tuple((sid, t, _stop if sid == stop_at else fn)
+                                       for sid, t, fn in saved_steps)
+            globals()["_pause"] = lambda _s: None
+            buf, real = _io.StringIO(), sys.stdout
+            sys.stdout = buf
+            try:
+                try:
+                    got = cmd_run(ctxX, dry_run=False)
+                except RuntimeError as exc:
+                    got = exc
+            finally:
+                sys.stdout = real
+                globals()["STEPS"], globals()["_pause"] = saved_steps, saved_pause
+            return got, buf.getvalue()
+
+        def _off(runX, labels):
+            return [label for label in labels if not runX.loaded.get(label)]
+
+        def _silent(runX, said, labels):
+            """Each of `labels` that ends neither loaded nor named as off, under NOT DONE, with
+            the line that loads it: a silent stop."""
+            return [label for label in _off(runX, labels)
+                    if not ("NOT DONE" in said and "system/" + label in said
+                            and "sudo launchctl bootstrap system " + _dispatcher_plist(label)
+                            in said)]
+
+        def _row(ctxX, sid):
+            return (ctxX.state.data.get("steps") or {}).get(sid) or {}
+
+        # (1) 11 Nov: the clone moves, then the `tracker` step stops on card CK-4.
+        cases += 1
+        ctx1, run1 = _machine()
+        code1, said1 = _run(ctx1)
+        expect("KIT-661 the-11-nov-stop-loads-the-jobs-again",
+               code1 == EX_BLOCKED and _row(ctx1, "tracker").get("detail") == "CK-4"
+               and any("pull --ff-only" in s for s in run1.seq)
+               and not _off(run1, five) and ctx1.unloaded == [] and "NOT DONE" not in said1
+               and all("system/" + label in said1 for label in five),
+               "exit %r; tracker %r; still off %s; unloaded %s; said %r"
+               % (code1, _row(ctx1, "tracker"), _off(run1, five), ctx1.unloaded, said1[-700:]))
+
+        # (2) A stop at EVERY step after `code`, in each way a step stops: a card, a
+        # could-not-tell, a failure, and a crash nothing caught.
+        order = [sid for sid, _t, _f in STEPS]
+        kinds = (("CK-1", EX_BLOCKED), ("unknown", EX_UNKNOWN), ("failed", EX_FAILED),
+                 ("crash", None))
+        for at, sid in enumerate(order[order.index("code") + 1:]):
+            cases += 1
+            how, want = kinds[at % len(kinds)]
+            ctxS, runS = _machine()
+            gotS, saidS = _run(ctxS, stop_at=sid, how=how)
+            expect("KIT-661 a-stop-at-%s-ends-with-the-jobs-loaded" % sid,
+                   not _silent(runS, saidS, five) and not _off(runS, five)
+                   and ctxS.unloaded == [] and "NOT DONE" not in saidS
+                   and any("pull --ff-only" in s for s in runS.seq)
+                   and (isinstance(gotS, RuntimeError) if want is None else gotS == want),
+                   "%s (%s): exit %r; still off %s; silent %s; said %r"
+                   % (sid, how, gotS, _off(runS, five), _silent(runS, saidS, five),
+                      saidS[-600:]))
+
+        # (3) …and the stops inside `code` itself, once it has unloaded the jobs: a
+        # fast-forward that fails, scripts still absent after the move (CK-1), and a clone
+        # still not level with origin after it.
+        for why, kw, want in (
+                ("the fast-forward failed", {"pull": 1}, EX_FAILED),
+                ("scripts absent after the move",
+                 {"after_pull": [("ls-remote origin HEAD", 0, level),
+                                 ("ls $HOME/.stage-e/kit/scripts", 0, "\n")]}, EX_BLOCKED),
+                ("the clone still not level", {"after_pull": []}, EX_FAILED)):
+            cases += 1
+            ctxC, runC = _machine(**kw)
+            gotC, saidC = _run(ctxC, stop_at=None)
+            expect("KIT-661 a-stop-inside-code-after-the-unload-loads-them-again",
+                   gotC == want and _row(ctxC, "code").get("outcome") in (FAILED, BLOCKED)
+                   and not _silent(runC, saidC, five) and not _off(runC, five)
+                   and ctxC.unloaded == [],
+                   "%s: exit %r; code %r; still off %s; said %r"
+                   % (why, gotC, _row(ctxC, "code"), _off(runC, five), saidC[-600:]))
+
+        # (4) A job launchd will not load again is NAMED: NOT DONE, the job, launchd's own
+        # words and the line that loads it. The run exits FAILED, and the others are loaded.
+        cases += 1
+        bounce = daemon_labels(conf)[1]
+        ctx4, run4 = _machine(refuse=(bounce,))
+        code4, said4 = _run(ctx4)
+        expect("KIT-661 a-job-launchd-will-not-take-back-is-named",
+               code4 == EX_FAILED and "NOT DONE" in said4 and eio in said4
+               and "system/" + bounce in said4
+               and "sudo launchctl bootstrap system " + _dispatcher_plist(bounce) in said4
+               and ctx4.unloaded == [bounce] and _off(run4, five) == [bounce]
+               and not _silent(run4, said4, five),
+               "exit %r; unloaded %s; still off %s; said %r"
+               % (code4, ctx4.unloaded, _off(run4, five), said4[-800:]))
+
+        # (5) Only what THIS run stopped is loaded again. A job launchd did not hold when the
+        # run began (a first install, or a job a person stopped on purpose) stays as it was,
+        # and is not named as off: no part of this run turned it off.
+        cases += 1
+        ctx5, run5 = _machine(loaded=dict(
+            (label, True) for label in [conf["DISPATCHER_SERVICE"]] + five if label != bounce))
+        code5, said5 = _run(ctx5)
+        expect("KIT-661 only-the-jobs-this-run-stopped-are-loaded-again",
+               code5 == EX_BLOCKED and not run5.loaded.get(bounce)
+               and not [s for s in run5.seq if " launchctl bootstrap system "
+                        + _dispatcher_plist(bounce) in s]
+               and _off(run5, five) == [bounce] and "NOT DONE" not in said5
+               and "system/" + bounce not in said5,
+               "exit %r; launchd %r; said %r" % (code5, run5.loaded, said5[-600:]))
+
+        # (6) The heartbeat monitor `code` stopped is rearmed, then loaded again after the jobs
+        # it watches, as its own step does: its first pass does not judge the heartbeats this
+        # stop made old. A rearm that fails leaves it off, and named.
+        cm6 = validate_conf(parse_conf(GOOD_CONF.replace(
+            "HEARTBEAT_MONITOR_TICKET=off", "HEARTBEAT_MONITOR_TICKET=KIT-7"))[0])[0]
+        m6 = monitor_label(cm6)
+        for rearm_rc in (0, 1):
+            cases += 1
+            ctx6, run6 = _machine(cconf=cm6)
+            run6.loaded[m6] = True
+            run6.answers = [(" rearm --config ", rearm_rc, "")] + run6.answers
+            code6, said6 = _run(ctx6)
+            boots = [i for i, s in enumerate(run6.seq) if " launchctl bootstrap system " in s]
+            m_boot = next((i for i in boots if _dispatcher_plist(m6) in run6.seq[i]), -1)
+            rearm_at = next((i for i, s in enumerate(run6.seq) if " rearm --config " in s), -1)
+            if rearm_rc == 0:
+                expect("KIT-661 the-monitor-is-rearmed-then-loaded-last",
+                       code6 == EX_BLOCKED and run6.loaded.get(m6) is True
+                       and -1 < rearm_at < m_boot == max(boots) and not _off(run6, five),
+                       "exit %r; rearm at %d, monitor loaded at %d of %s; said %r"
+                       % (code6, rearm_at, m_boot, boots, said6[-600:]))
+            else:
+                expect("KIT-661 a-monitor-whose-rearm-fails-is-named-off",
+                       code6 == EX_FAILED and not run6.loaded.get(m6) and m_boot == -1
+                       and "NOT DONE" in said6 and " rearm --config " in said6
+                       and "sudo launchctl bootstrap system " + _dispatcher_plist(m6) in said6
+                       and not _off(run6, five),
+                       "exit %r; monitor %r; said %r" % (code6, run6.loaded.get(m6), said6[-800:]))
+
+        # (7) CK-13 never waits while the review poller is unloaded. The run that moves the
+        # clone stops at the gate, says why, and loads the poller again on its way out. The
+        # next run, with the poller running, waits on CK-13 as before.
+        poller = daemon_labels(conf)[0]
+
+        def _moving_with_a_review_in_flight(ctxX, runX):
+            """The review entries in an older installer's shape, so this run rewrites them, and
+            one review in flight (example-org/kit#7, REV-40)."""
+            for at, row in enumerate(e for e in ctxX.dispatcher["entries"]
+                                     if _owns_review_entry(e)):
+                row["routingLabels"] = ["stage-e-review-entry-never-label-routed"]
+                if at == 0:
+                    row["teamKeys"] = ["REV"]
+            runX.answers = [("state/seen-prs.json", 0, json.dumps(seen_doc))] + [
+                a for a in runX.answers if a[0] != "workspace_base_dirs"] + [
+                ("workspace_base_dirs", 0, json.dumps(ctxX.dispatcher))]
+
+        ctx7, run7 = _machine()
+        _moving_with_a_review_in_flight(ctx7, run7)
+        cases += 1
+        code7, said7 = _run(ctx7, stop_at=None)
+        row7 = _row(ctx7, "dispatcher-entry")
+        expect("KIT-661 ck-13-never-waits-on-an-unloaded-poller",
+               code7 == EX_FAILED and row7.get("outcome") == FAILED
+               and "example-org/kit#7 (REV-40)" in said7 and "system/" + poller in said7
+               and "loads it again on its way out" in said7
+               and "bootstrap system " + _dispatcher_plist(poller) not in said7
+               and run7.loaded.get(poller) is True and not _off(run7, five)
+               and "NOT DONE" not in said7
+               and not [w for w in run7.writes if never in (w.get("why") or "")],
+               "exit %r; row %r; poller loaded %r; said %r"
+               % (code7, row7, run7.loaded.get(poller), said7[-900:]))
+        cases += 1
+        code7b, said7b = _run(ctx7, stop_at=None)
+        row7b = _row(ctx7, "dispatcher-entry")
+        expect("KIT-661 ck-13-waits-once-the-poller-runs",
+               code7b == EX_BLOCKED and row7b.get("outcome") == BLOCKED
+               and row7b.get("detail") == "CK-13" and run7.loaded.get(poller) is True
+               and not [w for w in run7.writes if never in (w.get("why") or "")],
+               "exit %r; row %r; said %r" % (code7b, row7b, said7b[-600:]))
+
+        # (8) A poller that was off before this run is named with the line that loads it.
+        # This run did not stop it, so this run does not load it.
+        cases += 1
+        ctx8, fake8 = _settled_ctx(conf)
+        _old_shape(ctx8)
+        fake8.answers = [("state/seen-prs.json", 0, json.dumps(seen_doc))] + list(fake8.answers)
+        try:
+            _quiet(lambda: step_dispatcher_entry(ctx8, apply_it=True))
+            said8 = "no stop"
+        except Blocked as exc:
+            said8 = "card %s" % exc.card_id
+        except SetupError as exc:
+            said8 = str(exc)
+        expect("KIT-661 ck-13-names-a-poller-that-was-off-before",
+               "sudo launchctl bootstrap system " + _dispatcher_plist(poller) in said8
+               and "would never end" in said8 and "example-org/kit#7 (REV-40)" in said8
+               and not [w for w in fake8.writes if never in (w.get("why") or "")],
+               "%r" % said8)
+
+        # (9) …and one this run stopped that launchd still lets go of when the gate runs is
+        # not read as running: the gate stops rather than wait on CK-13.
+        cases += 1
+        ctx9, run9 = _machine(linger={poller: 6})
+        _moving_with_a_review_in_flight(ctx9, run9)
+        code9, said9 = _run(ctx9, stop_at=None)
+        expect("KIT-661 ck-13-never-waits-on-a-poller-still-letting-go",
+               code9 == EX_FAILED and _row(ctx9, "dispatcher-entry").get("outcome") == FAILED
+               and not [w for w in run9.writes if never in (w.get("why") or "")],
+               "exit %r; row %r; said %r" % (code9, _row(ctx9, "dispatcher-entry"),
+                                            said9[-600:]))
+
+        # (10) A job still letting go when the run stops is waited for, then loaded. One seen
+        # in the domain on its way out is not one that is loaded: it is gone a moment later.
+        cases += 1
+        ctx10, run10 = _machine(linger={poller: 3})
+        code10, said10 = _run(ctx10)
+        for _ in range(5):
+            run10.look(poller)
+        expect("KIT-661 a-job-still-letting-go-is-waited-for-then-loaded",
+               code10 == EX_BLOCKED and run10.loaded.get(poller) is True
+               and poller not in run10.leaving and not _off(run10, five)
+               and "NOT DONE" not in said10,
+               "exit %r; poller loaded %r, letting go %r; said %r"
+               % (code10, run10.loaded.get(poller), run10.leaving, said10[-500:]))
+
+        # (11) A stop inside `enable` loads again only what is still off. The daemon it
+        # loaded before the stop is neither loaded twice nor said to be.
+        cases += 1
+        ctx11, run11 = _machine(refuse=(bounce,))
+        code11, said11 = _run(ctx11, stop_at=None)
+        finding = finding_label(conf)
+        expect("KIT-661 a-stop-inside-enable-loads-only-what-is-still-off",
+               code11 == EX_FAILED and _row(ctx11, "enable").get("outcome") == FAILED
+               and ctx11.reloaded == [finding, catchup_label(conf), status_label(conf)]
+               and ctx11.unloaded == [bounce] and run11.loaded.get(poller) is True
+               and "NOT DONE" in said11 and "system/" + bounce in said11,
+               "exit %r; enable %r; reloaded %s; unloaded %s; said %r"
+               % (code11, _row(ctx11, "enable"), ctx11.reloaded, ctx11.unloaded,
+                  said11[-600:]))
+
+        # (12) A job the conf now turns off is left off on a stop: its own step removes it.
+        cases += 1
+        coff = dict(conf, CATCHUP_INTERVAL_SECONDS="off")
+        ctx12, run12 = _machine(cconf=coff)
+        code12, said12 = _run(ctx12)
+        expect("KIT-661 a-job-the-conf-turns-off-stays-off-on-a-stop",
+               code12 == EX_BLOCKED and not run12.loaded.get(catchup_label(conf))
+               and "NOT DONE" not in said12 and "CATCHUP_INTERVAL_SECONDS=off" in said12
+               and all(run12.loaded.get(l) for l in five if l != catchup_label(conf)),
+               "exit %r; launchd %r; said %r" % (code12, run12.loaded, said12[-600:]))
+
+        # (13) The re-run of 12 Nov: an A-ENTRY-LOADED sign-off from before KIT-149 names no
+        # entries, so `dispatcher-entry` cannot prove their load. It stops UNKNOWN after `code`
+        # moved the clone, and the jobs come back all the same.
+        cases += 1
+        ctx13, run13 = _machine()
+        ctx13.state.data["notes"].pop(ENTRY_PROOF_NOTE, None)
+        ctx13.state.data["attestations"]["A-ENTRY-LOADED"] = {
+            "initials": "bc", "note": "saw the banner", "at": "2026-09-08T03:31:23Z"}
+        code13, said13 = _run(ctx13, stop_at=None)
+        expect("KIT-661 an-unproven-entry-load-after-the-move-loads-the-jobs-again",
+               code13 == EX_UNKNOWN and _row(ctx13, "dispatcher-entry").get("outcome") == UNKNOWN
+               and "names no entries" in said13 and not _off(run13, five)
+               and ctx13.unloaded == [] and "NOT DONE" not in said13,
+               "exit %r; entry row %r; still off %s; said %r"
+               % (code13, _row(ctx13, "dispatcher-entry"), _off(run13, five), said13[-600:]))
+
+        owed_key = globals().get("PLISTS_NOT_LOADED_NOTE", "plists-not-loaded-yet")
+
+        # (14) Stage E on this PR: a daemon loaded again on the way out runs the plist on disk
+        # then, which may be older than the one this run renders. launchd keeps the definition
+        # it loaded until the job is loaded again, so the next run that writes the new plist
+        # must load the daemon again, though it is loaded and its heartbeats are there.
+        cases += 1
+        ctx14, run14 = _machine(old_plists=True)
+        _run(ctx14)
+        older = dict(run14.running)
+        code14, said14 = _run(ctx14, stop_at=None)
+        stale14 = [label for label in all_daemon_labels(conf)
+                   if run14.running.get(label) != run14.plists.get(label)]
+        expect("KIT-661 a-daemon-loaded-on-the-way-out-runs-the-next-plist",
+               not stale14 and all(older.get(l) != run14.plists.get(l)
+                                   for l in all_daemon_labels(conf))
+               and _row(ctx14, "enable").get("outcome") == DONE
+               and not (ctx14.state.data.get("notes") or {}).get(owed_key),
+               "launchd still runs an older plist for %s; enable %r; owed %r; said %r"
+               % (stale14, _row(ctx14, "enable"),
+                  (ctx14.state.data.get("notes") or {}).get(owed_key),
+                  said14[-500:]))
+
+        # (15) …and a plist written by a run that stops before `enable`, with nothing unloaded
+        # (the clone was level), is owed to the next run: `verify` says so, and the next
+        # `enable` loads it.
+        cases += 1
+        ctx15, run15 = _machine(old_plists=True, behind=False)
+        _run(ctx15, stop_at="dry-run", how="failed")
+        # …read from the ledger on disk, as the next process reads it.
+        owed15 = dict((State(ctx15.state.root).data.get("notes") or {}).get(owed_key) or {})
+        ok15, said15v, _n15 = _quiet(lambda: step_enable(ctx15, apply_it=False))[0]
+        _run(ctx15, stop_at=None)
+        stale15 = [label for label in all_daemon_labels(conf)
+                   if run15.running.get(label) != run15.plists.get(label)]
+        expect("KIT-661 a-plist-written-before-a-stop-is-loaded-by-the-next-enable",
+               sorted(owed15) == sorted(all_daemon_labels(conf)) and ok15 is False
+               and "again" in said15v and not stale15,
+               "owed %s; verify %r %r; launchd still runs an older plist for %s"
+               % (sorted(owed15), ok15, said15v, stale15))
+
+        # (16) …while a daemon loaded on the way out FROM the newer plist owes nothing: the next
+        # `verify` reads `enable` as done, rather than ask for a restart that changes nothing.
+        cases += 1
+        ctx16, run16 = _machine(old_plists=True)
+        _run(ctx16, stop_at="dry-run", how="failed")
+        ok16, said16v, _n16 = _quiet(lambda: step_enable(ctx16, apply_it=False))[0]
+        stale16 = [label for label in all_daemon_labels(conf)
+                   if run16.running.get(label) != run16.plists.get(label)]
+        expect("KIT-661 a-daemon-loaded-on-the-way-out-from-the-new-plist-owes-nothing",
+               ok16 is True and not stale16
+               and not (ctx16.state.data.get("notes") or {}).get(owed_key)
+               and not (State(ctx16.state.root).data.get("notes") or {}).get(owed_key),
+               "verify %r %r; older plist for %s; owed %r"
+               % (ok16, said16v, stale16,
+                  (ctx16.state.data.get("notes") or {}).get(owed_key)))
+
+    _kit661_stops_after_the_move()
     # …and the key it used is the STORED one, read out of the env file rather
     # than requested. Same value, different provenance, and only one of the two
     # costs the owner a keystroke on every single pass.

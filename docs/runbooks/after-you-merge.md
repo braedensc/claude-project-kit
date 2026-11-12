@@ -39,12 +39,16 @@ A part with its own settings file and installer, such as the work queue or the w
 
 | It asks | Answer |
 | --- | --- |
-| Your Mac password | Type it. Asked once for the whole run. |
+| How should this run go? | `1` for Automatic ("things just work"), `2` for Manual ("show me each change and ask"). Enter keeps the default: the way you chose last time, or Automatic. |
+| The consent page: "Type yes to agree" | Read it, then type `yes`. Anything else changes nothing and the command stops with exit 10. It is asked the first time. After that it is asked again only when the mode, a setting or the page's words differ from what you agreed to. |
+| Your Mac password | Type it. Asked once for the whole run, right after you agree, to save the record of your consent where only the administrator can write. |
 | Replace the skills in your home folder? | `y`. |
 | Update the review jobs now | `y`, when nothing the session runner works on is In Progress. It may restart the session runner and stop the notifier and tech lead jobs for a few seconds. |
 | Open the repository's `delivery.json` pull request now | `y`. Only asked when a planned repository does not switch plans on yet. |
 | Run the probe now | `y` after a session runner upgrade or a planning stop. Otherwise it is not asked. |
 | Run the routing drill now | `n`, unless you have not run it yet. |
+
+**In Automatic, the one command answers its own two questions yes for you.** Those are the skills and the review jobs. It says so out loud, because you agreed on the consent page. In Manual it asks each one. The installers still ask their own, such as the probe, the drill and the pull request. The consent page names them.
 
 **The session runner restarts only when a setting it reads changes.** A kit merge that changes neither the review setup nor the planning setup restarts nothing.
 
