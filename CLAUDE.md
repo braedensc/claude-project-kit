@@ -354,6 +354,8 @@ npm run test:sprint-plan     # sprint planning (KIT-575): one proposal a sprint,
                              #   reply records the plan; the queue puts planned pieces first and admits nothing
 npm run test:sprint-review   # the sprint review (KIT-576): a recap built by code from the usage file and GitHub,
                              #   one Linear document, one DM message, once a sprint; a failure is said, never silent
+npm run test:sprint-changes  # the changes it proposes (KIT-577): at most three, lower settings only, from a short
+                             #   allowed list; only the owner's exact reply makes one, and it shows old and new
 npm run test:standup         # the daily stand-up (KIT-349): asks first with exact replies,
                              #   old news never sent, its facts built by code alone (KIT-492)
 npm run test:window          # the working window (KIT-437): open or closed at a time, DST and midnight

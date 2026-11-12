@@ -78,6 +78,7 @@ import pipeline_notify_local as notify  # noqa: E402
 import pipeline_sprint as sprint  # noqa: E402  (KIT-574: the sprint's one line)
 import pipeline_sprint_plan as sprint_plan  # noqa: E402  (KIT-575: the sprint's proposal)
 import pipeline_sprint_review as sprint_review  # noqa: E402  (KIT-576: the sprint's recap)
+import pipeline_sprint_changes as sprint_changes  # noqa: E402  (KIT-577: the changes it proposes)
 import pipeline_status_local as status_job  # noqa: E402
 
 EXIT_OK, EXIT_FAILED, EXIT_USAGE, EXIT_PARTIAL = 0, 1, 2, 3
@@ -1277,7 +1278,63 @@ def _sprint_tick(p):
 REVIEW_MIN_SECONDS = 40      # a review is not started with less than this left of the pass; it stays due
 
 
+def _changes_tick(p):
+    """KIT-577: each change the sprint review proposed and nobody has been asked about yet goes to the owner's DM as ONE
+    fixed question, built by code from the key and the two values, as the bridge's own message (no kind, so no
+    writer). It is marked sent BEFORE the post, so one that cannot be recorded is never sent and one that is sent is
+    never sent twice, and the mark is put back when the post fails. Nothing is asked until the sprint's review itself
+    has been posted. Returns a sentence for the end of the pass when something could not be done, else None."""
+    settings = load_settings()
+    if not settings["on"] or not settings["sprint_review_config"]:
+        return None
+    cfg, bad = sprint_review.load_config(settings["sprint_review_config"])
+    if bad or not cfg["queue_config_file"]:
+        return None                       # the review's own tick says a config that cannot be used
+    path = sprint_changes.changes_path(cfg["review_dir"])
+    doc, why = sprint_changes.load(path)
+    if why:
+        return "%s, so no change is proposed" % why
+    todo = sprint_changes.unsent(doc)
+    if not todo:
+        return None
+    sprints, _why = sprint_review.load_record(cfg)
+    if _why or any(v.get("posted") is False for v in sprints.values()):
+        return None                       # the review is not posted yet; the questions follow it
+    users = p.cfg.get("dm_user_ids") or []
+    channel = (p.state.get("dms") or {}).get(users[0]) if users else None
+    if not isinstance(channel, str) or not channel:
+        p.say("  stand-up: a sprint change is ready and the owner's DM is not open yet; it stays unsent")
+        return None
+    if p.dry:
+        p.say("  [dry-run] stand-up: would send %d sprint change question%s" % (len(todo), "" if len(todo) == 1 else "s"))
+        return None
+    for index, text in todo:
+        try:
+            sprint_changes.mark_sent(path, index, _local(p.now))
+        except sprint_changes.ChangesError as exc:
+            return "a sprint change was not sent: %s" % exc
+        try:
+            p.post(channel, None, text)
+        except transport.BridgeError as exc:
+            try:
+                sprint_changes.mark_sent(path, index, _local(p.now), sent=False)
+                after = "it stays unsent"
+            except sprint_changes.ChangesError:
+                after = "its mark could not be put back, so it is not sent again"
+            return "a sprint change could not be posted (%s); %s" % (exc, after)
+        p.save()
+        p.say("  stand-up: sent a sprint change question")
+    return None
+
+
 def _sprint_review_tick(p, http=None, environ=None):
+    """The review (below), then the questions about any change it proposed (KIT-577)."""
+    said = _sprint_review_core(p, http, environ)
+    more = _changes_tick(p)
+    return "; ".join(x for x in (said, more) if x) or None
+
+
+def _sprint_review_core(p, http=None, environ=None):
     """KIT-576: on the sprint's last working day, ONE review: the recap built by code, written as a Linear document,
     and one message to the owner's DM that links it (or says it could not be written, and where the copy is). It is
     due at the afternoon time, or an hour before the plan's reset when that comes first. The record is written BEFORE
@@ -3064,6 +3121,69 @@ def _selftest():
             said = _sprint_review_tick(badc, fake_http, rv_env)
             same("sprint-review-a-config-that-cannot-be-read-sends-nothing-and-says-so",
                  (badc.posts, "config cannot be used" in (said or "")), ([], True))
+            # KIT-577: each change the review proposed is one fixed question, sent after the review, once
+            qfile = os.path.join(tmp, "hook", "queue.json")
+            with open(qfile, "w", encoding="utf-8") as fh:
+                json.dump({"order": {"planned_load": 40, "lanes_per_repo": 2, "day_stop": 60}}, fh)
+            with open(rv_conf, "w", encoding="utf-8") as fh:
+                json.dump(dict(sprint_review.EXAMPLE, review_dir=rv_dir, weekly_budget_usd=25, queue_config_file=qfile), fh)
+            cpath = sprint_changes.changes_path(rv_dir)
+            with open(rv_settings, "w", encoding="utf-8") as fh:
+                json.dump({"schema": SETTINGS_SCHEMA, "on": True, "status_file": status_path, "usage_file": rv_usage, "sprint": True,
+                           "sprint_review_config": rv_conf, "days": list(DAY_NAMES), "morning_at": "00:00",
+                           "afternoon_at": "00:02", "late_by_minutes": 1,
+                           "record_file": os.path.join(tmp, "hook", "record3.json")}, fh)
+
+            class _NoQuestionPass(_FakePass):
+                def post(self, channel, thread_ts, text, kind="", bind=""):
+                    if text.startswith("Sprint change"):
+                        raise transport.BridgeError("Slack said no")
+                    return _FakePass.post(self, channel, thread_ts, text, kind, bind)
+
+            class _NothingPass(_FakePass):
+                def post(self, channel, thread_ts, text, kind="", bind=""):
+                    if text.startswith("Sprint change"):
+                        return _FakePass.post(self, channel, thread_ts, text, kind, bind)
+                    raise transport.BridgeError("Slack said no")
+            usage_for()
+            forget()
+            qp = _NoQuestionPass(now.timestamp(), dms={"U-OWNER": "D-OWNER"})
+            said_q = _sprint_review_tick(qp, fake_http, rv_env)
+            same("sprint-change-a-question-that-cannot-be-posted-is-said-and-stays-unsent",
+                 (len(qp.posts), "could not be posted" in (said_q or ""), len(sprint_changes.unsent(sprint_changes.load(cpath)[0]))),
+                 (1, True, 1))
+            q1 = _FakePass(now.timestamp() + 60, dms={"U-OWNER": "D-OWNER"})
+            said_1 = _sprint_review_tick(q1, fake_http, rv_env)
+            same("sprint-change-the-next-pass-sends-the-one-fixed-question-and-nothing-else",
+                 (said_1, [x[2][:56] for x in q1.posts], q1.posts[0][3:] if q1.posts else None),
+                 (None, ["Sprint change 1 of 1: lower planned_load from 40 to 30. "[:56]], ("", "")))
+            q2 = _FakePass(now.timestamp() + 120, dms={"U-OWNER": "D-OWNER"})
+            _sprint_review_tick(q2, fake_http, rv_env)
+            same("sprint-change-a-question-is-never-sent-twice", q2.posts, [])
+            forget()
+            usage_for()
+            save_doc = sprint_changes.load(cpath)[0]
+            sprint_changes.save(sprint_changes.new_doc(save_doc["first_day"], now, save_doc["proposals"]), cpath)
+            nop = _NothingPass(now.timestamp() + 180, dms={"U-OWNER": "D-OWNER"})
+            said_n = _sprint_review_tick(nop, fake_http, rv_env)
+            same("sprint-change-no-question-is-asked-before-the-review-itself-is-posted",
+                 (nop.posts, "could not be posted" in (said_n or ""), len(sprint_changes.unsent(sprint_changes.load(cpath)[0]))),
+                 ([], True, 1))
+            dry = _FakePass(now.timestamp() + 240, dms={"U-OWNER": "D-OWNER"})
+            sprint_review.save_record(sprint_review.load_config(rv_conf)[0], {})
+            dry.dry = True
+            _changes_tick(dry)
+            same("sprint-change-a-dry-run-sends-and-marks-nothing",
+                 (dry.posts, len(sprint_changes.unsent(sprint_changes.load(cpath)[0]))), ([], 1))
+            closed = _FakePass(now.timestamp() + 300, dms={})
+            _changes_tick(closed)
+            same("sprint-change-with-the-owners-dm-not-open-it-stays-unsent",
+                 (closed.posts, len(sprint_changes.unsent(sprint_changes.load(cpath)[0]))), ([], 1))
+            with open(cpath, "w", encoding="utf-8") as fh:
+                fh.write("{nope")
+            bad_c = _FakePass(now.timestamp() + 360, dms={"U-OWNER": "D-OWNER"})
+            same("sprint-change-a-damaged-proposals-file-sends-nothing-and-says-so",
+                 (bad_c.posts, "cannot be read" in (_changes_tick(bad_c) or "")), ([], True))
         finally:
             globals()["DEFAULT_SETTINGS_FILE"] = hook_settings
         def _forget():

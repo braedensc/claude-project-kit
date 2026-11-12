@@ -644,6 +644,11 @@ jobs:
       - name: Sprint review selftest (once a sprint; never silent; no model)
         run: python3 scripts/pipeline_sprint_review.py --selftest
 
+      # The changes the sprint review proposes (KIT-577): at most three, tightening only, from a short allowed list;
+      # only the owner's exact reply makes one; the old and new value are always shown.
+      - name: Sprint changes selftest (a key outside the list is dropped; a yes names one change; no reply changes nothing)
+        run: python3 scripts/pipeline_sprint_changes.py --selftest
+
       - name: Telemetry scrape selftest (contract §4, §10)
         run: python3 scripts/telemetry_scrape.py --selftest
 

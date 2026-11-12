@@ -500,6 +500,8 @@ class RequestsMixin(object):
                 return
         if channel in self.dm_channels and not reply and self.sprint_reply(channel, msg, text):
             return                                   # KIT-575: the owner's yes to a sprint plan
+        if channel in self.dm_channels and not reply and self.changes_reply(channel, msg, text):
+            return
         req = REQUEST_RE.match(text)
         if req:
             self.request(channel, msg, req.group(1).lower(), req.group(2).upper())
@@ -781,6 +783,39 @@ class RequestsMixin(object):
         self.post(channel, None, words)
         self.mark(channel, msg, "sprint plan: %s" % state)
         self.say("  sprint plan: %s (%s)" % (state, m.group(1)))
+        return True
+
+    def changes_reply(self, channel, msg, text):
+        """KIT-577: `apply KEY VALUE DATE`, the owner's yes to ONE configuration change the sprint review proposed in a
+        question of its own. Only the first member in dm_user_ids (the owner) can give it, and only in the words the
+        question asked for: nothing is read out of anything longer. It goes through pipeline_sprint_changes.apply_yes,
+        which changes the one key only when that exact change was proposed and sent, is still a lower setting, and the
+        queue's settings are still what the proposal read; the reply shows the old and the new value. True when the
+        message was handled; False leaves it to the readers after it, so with no sprint review config naming the queue's
+        settings the reply is read as any other message."""
+        import datetime
+        import pipeline_sprint_changes as sprint_changes
+        import pipeline_sprint_review as sprint_review
+        import pipeline_standup as standup
+        m = sprint_changes.REPLY_RE.match((text or "").strip())
+        owners = self.cfg.get("dm_user_ids") or []
+        if not m or not owners or msg.get("user") != owners[0]:
+            return False
+        try:
+            settings = standup.load_settings()
+        except standup.StandupError:
+            return False
+        if not settings["on"] or not settings["sprint_review_config"]:
+            return False
+        cfg, bad = sprint_review.load_config(settings["sprint_review_config"])
+        if bad or not cfg["queue_config_file"]:
+            return False
+        state, words = sprint_changes.apply_yes(
+            sprint_changes.changes_path(cfg["review_dir"]), cfg["queue_config_file"], m.group(1), m.group(2), m.group(3),
+            datetime.datetime.fromtimestamp(self.now, datetime.timezone.utc))
+        self.post(channel, None, words)
+        self.mark(channel, msg, "sprint change: %s" % state)
+        self.say("  sprint change: %s (%s)" % (state, m.group(1)))
         return True
 
     def stray(self, channel, msg):
@@ -1872,7 +1907,7 @@ def cases_sprint(kit):
 def selftest():
     import pipeline_bridge
     return pipeline_bridge.split_module_selftest(os.path.abspath(__file__),
-                                                 [cases_requests, cases_reader, cases_combined, cases_sprint])
+                                                 [cases_requests, cases_reader, cases_combined, cases_sprint, cases_changes])
 
 
 if __name__ == "__main__":
@@ -1883,3 +1918,110 @@ if __name__ == "__main__":
         sys.exit(pipeline_bridge_requests.selftest())
     print("usage: pipeline_bridge_requests.py --selftest (the bridge imports this module)")
     sys.exit(EXIT_USAGE)
+
+
+def cases_changes(kit):
+    """KIT-577: the owner's `apply KEY VALUE DATE` makes the one change the review proposed, and nothing else does."""
+    import json
+    import pipeline_sprint_changes as sprint_changes
+    import pipeline_sprint_review as sprint_review
+    import pipeline_standup as standup
+    from pipeline_bridge import ALICE, BOB, DM
+    with kit as tmp:
+        check, now, outcome, run = kit.take("check", "now", "outcome", "run")
+        dmworld, dm_lines = kit.take("dmworld", "dm_lines")
+        first_day = "2026-11-10"
+        import datetime
+        made = datetime.datetime.fromtimestamp(now, datetime.timezone.utc) - datetime.timedelta(hours=3)
+
+        def world(name, named=True, sent=True, load=40, queue_named=True):
+            c, s, t = dmworld("ch-" + name)
+            base = os.path.join(tmp, "changes-%s" % name)
+            os.makedirs(base, exist_ok=True)
+            queue = os.path.join(base, "queue.json")
+            with open(queue, "w", encoding="utf-8") as fh:
+                json.dump({"order": {"planned_load": load, "lanes_per_repo": 2, "day_stop": 60}}, fh)
+            review = os.path.join(base, "review")
+            doc = sprint_changes.new_doc(first_day, made, [
+                {"key": "planned_load", "old": 40, "new": 30, "because": "The sprint spent $62.50 of the $50 planned (125%)."},
+                {"key": "lanes_per_repo", "old": 2, "new": 1, "because": "The sprint spent $62.50 of the $50 planned and no pull request merged."}])
+            for c_ in doc["proposals"]:
+                c_["sent_at"] = sprint_changes._iso(made) if sent else None
+            sprint_changes.save(doc, sprint_changes.changes_path(review))
+            conf = os.path.join(base, "review-config.json")
+            with open(conf, "w", encoding="utf-8") as fh:
+                json.dump(dict(sprint_review.EXAMPLE, review_dir=review, queue_config_file=queue if queue_named else ""), fh)
+            settings = {"schema": standup.SETTINGS_SCHEMA, "on": True, "usage_file": "~/usage.json", "sprint": True}
+            if named:
+                settings["sprint_review_config"] = conf
+            sp = os.path.join(base, "standup.json")
+            with open(sp, "w", encoding="utf-8") as fh:
+                json.dump(settings, fh)
+            return c, s, t, queue, review, sp
+
+        def reply(name, text, who=ALICE, **kw):
+            c, s, t, queue, review, sp = world(name, **kw)
+            saved = standup.DEFAULT_SETTINGS_FILE
+            standup.DEFAULT_SETTINGS_FILE = sp
+            try:
+                s.add(who, text, channel=DM)
+                run(c, s, t, at=now + 60)
+            finally:
+                standup.DEFAULT_SETTINGS_FILE = saved
+            order = json.load(open(queue))["order"]
+            return dm_lines(s), order["planned_load"], order["lanes_per_repo"]
+
+        def case_yes():
+            lines, load, lanes = reply("yes", "apply planned_load 30 %s" % first_day)
+            return load, lanes, "Changed planned_load: 40 -> 30" in lines[-1], "PLANNED_LOAD=30 in queue.conf" in lines[-1]
+        check("ch-the-owners-exact-reply-changes-that-one-key-and-shows-both-values", outcome(case_yes), (30, 2, True, True))
+
+        def case_lane():
+            lines, load, lanes = reply("lane", "apply lanes_per_repo 1 %s" % first_day)
+            return load, lanes, "lanes_per_repo: 2 -> 1" in lines[-1]
+        check("ch-a-yes-names-one-change-and-the-other-is-untouched", outcome(case_lane), (40, 1, True))
+
+        def case_other_member():
+            lines, load, lanes = reply("bob", "apply planned_load 30 %s" % first_day, who=BOB)
+            return load, lanes
+        check("ch-another-members-reply-changes-nothing", outcome(case_other_member), (40, 2))
+
+        def case_longer():
+            lines, load, lanes = reply("longer", "apply planned_load 30 %s please" % first_day)
+            return load, lanes
+        check("ch-a-longer-message-is-not-a-yes", outcome(case_longer), (40, 2))
+
+        def case_value():
+            lines, load, lanes = reply("value", "apply planned_load 31 %s" % first_day)
+            return load, lanes, "I did not propose planned_load 31" in lines[-1]
+        check("ch-a-value-nobody-proposed-changes-nothing", outcome(case_value), (40, 2, True))
+
+        def case_key():
+            lines, load, lanes = reply("key", "apply day_stop 30 %s" % first_day)
+            return load, lanes, "is not a setting a sprint review may change" in lines[-1]
+        check("ch-a-key-outside-the-list-changes-nothing", outcome(case_key), (40, 2, True))
+
+        def case_date():
+            lines, load, lanes = reply("date", "apply planned_load 30 2026-11-17")
+            return load, lanes, "I proposed no change for the sprint starting 2026-11-17" in lines[-1]
+        check("ch-a-reply-naming-another-sprint-changes-nothing", outcome(case_date), (40, 2, True))
+
+        def case_unsent():
+            lines, load, lanes = reply("unsent", "apply planned_load 30 %s" % first_day, sent=False)
+            return load, lanes, any("I have not sent you that question yet" in x for x in lines)
+        check("ch-a-reply-before-the-question-was-sent-changes-nothing", outcome(case_unsent), (40, 2, True))
+
+        def case_stale():
+            lines, load, lanes = reply("stale", "apply planned_load 30 %s" % first_day, load=35)
+            return load, lanes, "is 35 now, not the 40" in lines[-1]
+        check("ch-settings-that-moved-since-the-proposal-are-not-overwritten", outcome(case_stale), (35, 2, True))
+
+        def case_unnamed():
+            lines, load, lanes = reply("unnamed", "apply planned_load 30 %s" % first_day, named=False)
+            return load, lanes, any("sprint change" in x for x in lines)
+        check("ch-with-no-sprint-review-config-it-is-an-ordinary-message", outcome(case_unnamed), (40, 2, False))
+
+        def case_no_queue():
+            lines, load, lanes = reply("noqueue", "apply planned_load 30 %s" % first_day, queue_named=False)
+            return load, lanes, any("nothing was changed" in x for x in lines)
+        check("ch-with-no-queue-settings-named-it-is-an-ordinary-message", outcome(case_no_queue), (40, 2, False))
