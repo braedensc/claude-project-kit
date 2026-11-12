@@ -76,6 +76,24 @@ WHERE IT SAYS SO.
     heartbeat monitor reads it and pages through the notifier, as it does for the daemons.
   Either one empty means that channel is OFF, and every pass says so.
 
+THE KEYS' END DATES (KIT-667).  Two commands over the same list, names and dates only:
+    pipeline_watch.py --conf update.conf dates
+        A header, then one tab-separated row per stored key the parts list knows (pipeline-parts.json,
+        listed once even when several parts share it, and only when a part that uses it has its settings
+        file in the kit folder): its clock name, what it is, the date on record or `missing`, days left
+        or `-`, and where to read the date. Names in CREDENTIAL_EXPIRIES the list does not know are
+        listed as kept as written. Asks nothing, writes nothing, runs anywhere.
+          0 every date that should be set is set and none is within CREDENTIAL_WARN_DAYS
+          10 a key that ends (`one-year`, `set-when-made`) has no date, or a date is due or past
+             (an `unknown` end is listed and never makes a missing date a failure)
+          4 update.conf or the parts list could not be read
+    pipeline_watch.py --conf update.conf dates --apply   (name:YYYY-MM-DD lines on standard input)
+        Replaces or adds those entries, keeps every other entry, changes only the CREDENTIAL_EXPIRIES
+        line (every other byte stays), writes atomically with the file's mode, reads it back, and prints
+        the rows. A person runs it: it is refused in a Claude session before it reads anything.
+          0 written and read back   2 a bad line (named by number), nothing written
+          1 the write or the read-back failed, or the files could not be read   3 refused
+
 EXIT CODES — contract §13.
   0   every kind is ok, and every change was delivered
   1   a change could NOT be delivered (it is sent again next pass)
@@ -1055,12 +1073,20 @@ def _path_env():
     return ":".join(dirs + ["/usr/bin", "/bin", "/usr/sbin", "/sbin"])
 
 
+INSTALL_WHY = ("It loads or removes a job that runs as you every hour; a session\n"
+               "  does not install its own supervision.")
+# Each action's own reason and its read-only command (KIT-667): `dates --apply` writes no job.
+REFUSAL_WORDS = {
+    "dates --apply": ("It writes the end dates the health check warns from; a session\n"
+                      "  does not set its own warnings.", "dates"),
+}
+
+
 def refuse_if_agent(action, environ):
-    """The update script's refusal, naming THIS script's command for the person to run."""
-    pu.refuse_if_agent(action, environ, script="pipeline_watch.py",
-                       why="It loads or removes a job that runs as you every hour; a session\n"
-                           "  does not install its own supervision.",
-                       read_only="run --dry-run")
+    """The update script's refusal, naming THIS script's command for the person to run, with the
+    reason and the read-only command that belong to the action."""
+    why, read_only = REFUSAL_WORDS.get(action, (INSTALL_WHY, "run --dry-run"))
+    pu.refuse_if_agent(action, environ, script="pipeline_watch.py", why=why, read_only=read_only)
 
 
 def _load(env, domain, label, plist):
@@ -1141,9 +1167,232 @@ def install(env, conf, uninstall_only=False):
 
 
 # --------------------------------------------------------------------------- #
+# dates: each stored key's end date (KIT-667)
+# --------------------------------------------------------------------------- #
+DATES_HEADER = "clock\twhat\tdate\tdays_left\tdate_from"
+ENDS_NEEDING_A_DATE = ("one-year", "set-when-made")
+KEPT_WHAT = "kept as written; the parts list does not know it"
+APPLY_STDIN_MAX = 65536
+
+
+class PartsUnreadable(Exception):
+    pass
+
+
+def _one_line(text):
+    return " ".join(str(text).split())
+
+
+def listed_keys(kit):
+    """[{clock, what, ends, date_from}] from the parts list: one row per clock, in list order, for each
+    stored key that has a clock and that at least one part with its settings file in `kit` uses. A part
+    whose settings file is not in the kit folder is off on this Mac and lists nothing. Names and words
+    only; it never opens a settings file or an env file. PartsUnreadable, in words, when the list is
+    missing or in a shape this reader does not know."""
+    try:
+        with open(os.path.join(kit, "pipeline-parts.json"), encoding="utf-8") as fh:
+            doc = json.load(fh)
+        rows, seen = [], set()
+        for part in doc["parts"]:
+            name = part["settings"]["file"]
+            on = bool(name) and os.path.isfile(os.path.join(kit, name))
+            for secret in part["secrets"]:
+                ends = secret["ends"]
+                if ends not in ("one-year", "set-when-made", "never", "unknown"):
+                    raise ValueError("a key's end is not one of the four")
+                clock = secret.get("clock")
+                if ends != "never" and not (clock and secret.get("date_from")):
+                    raise ValueError("a key that ends has no clock or no place for its date")
+                if not clock or not on:
+                    continue
+                if not pu.CREDENTIAL_ENTRY_RE.match(clock + ":2000-01-01"):
+                    raise ValueError("a clock is not a valid entry name")
+                if clock in seen:
+                    continue
+                seen.add(clock)
+                rows.append({"clock": clock, "what": _one_line(secret["what"]), "ends": ends,
+                             "date_from": _one_line(secret.get("date_from") or "")})
+        return rows
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        raise PartsUnreadable("pipeline-parts.json could not be read (%s)" % type(exc).__name__)
+
+
+def date_rows(keys, clocks, today, warn):
+    """(rows, exit code) from the listed keys, the dates on record [(name, date)] and today's date.
+    A row is (clock, what, date or None, days left or None, date_from). Exit 10 when a key that ends
+    has no date, or any date is within `warn` days or past; otherwise 0. A key whose end is unknown,
+    or that never ends, is listed and is never made a failure by having no date."""
+    on_record = dict(clocks)
+    rows, bad, known = [], False, set()
+    for key in keys:
+        known.add(key["clock"])
+        when = on_record.get(key["clock"])
+        days = (when - today).days if when else None
+        rows.append((key["clock"], key["what"], when, days, key["date_from"]))
+        if when is None and key["ends"] in ENDS_NEEDING_A_DATE:
+            bad = True
+    for name, when in clocks:
+        if name not in known:
+            rows.append((name, KEPT_WHAT, when, (when - today).days, "-"))
+    if any(r[3] is not None and r[3] <= warn for r in rows):
+        bad = True
+    return rows, (EX_FIRING if bad else EX_OK)
+
+
+def print_date_rows(rows):
+    say(DATES_HEADER)
+    for clock, what, when, days, date_from in rows:
+        say("\t".join((clock, what, when.isoformat() if when else "missing",
+                       "-" if days is None else str(days), date_from)))
+
+
+def _today(env):
+    import datetime
+    return datetime.datetime.fromtimestamp(_now(env), datetime.timezone.utc).date()
+
+
+def parse_apply_lines(text, allowed):
+    """([(name, date)], [problems]) from `name:YYYY-MM-DD` lines. A problem names its line number, never
+    its text: a person may have pasted a token."""
+    import datetime
+    out, problems, seen = [], [], set()
+    for n, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line:
+            continue
+        m = pu.CREDENTIAL_ENTRY_RE.match(line)
+        try:
+            when = datetime.date(int(m.group(2)), int(m.group(3)), int(m.group(4))) if m else None
+        except ValueError:
+            when = None
+        if m is None:
+            problems.append("line %d is not name:YYYY-MM-DD (a short lower-case name, a colon, a date)" % n)
+        elif when is None:
+            problems.append("line %d has a date that does not exist" % n)
+        elif m.group(1) not in allowed:
+            problems.append("line %d names a key that is not listed and not already in CREDENTIAL_EXPIRIES" % n)
+        elif m.group(1) in seen:
+            problems.append("line %d repeats a name from an earlier line" % n)
+        else:
+            seen.add(m.group(1))
+            out.append((m.group(1), when))
+    return out, problems
+
+
+def merged_expiries(existing, new):
+    """(value, entries) for CREDENTIAL_EXPIRIES: every existing entry in place (a new date replaces its old
+    one), then the entries that were not there, in the order given."""
+    changed = dict(new)
+    out = [(name, changed.pop(name, when)) for name, when in existing]
+    out += [(name, when) for name, when in new if name in changed]
+    return ",".join("%s:%s" % (name, when.isoformat()) for name, when in out), out
+
+
+def rewrite_expiries(raw, value):
+    """`raw` (the conf's bytes) with ONLY its CREDENTIAL_EXPIRIES line replaced by `value`, or added at the
+    end when it has none. Every other byte stays, line endings included."""
+    lines = raw.splitlines(keepends=True)
+    new = b"CREDENTIAL_EXPIRIES=" + value.encode("ascii")
+    for i, line in enumerate(lines):
+        body = line.rstrip(b"\r\n")
+        if re.match(rb"^\s*CREDENTIAL_EXPIRIES\s*=", body):
+            lines[i] = new + line[len(body):]
+            return b"".join(lines)
+    if lines and not lines[-1].endswith((b"\n", b"\r")):
+        lines[-1] += b"\n"
+    return b"".join(lines) + new + b"\n"
+
+
+def write_atomic(path, data):
+    """Write `data` beside `path` and rename it over, with the old file's mode. Follows a link to the file
+    it points at. Raises OSError; the temp file is removed on any failure."""
+    import tempfile
+    target = os.path.realpath(path)
+    mode = os.stat(target).st_mode & 0o7777
+    fd, tmp = tempfile.mkstemp(prefix=".update.conf-", dir=os.path.dirname(target))
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, target)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def cmd_dates(env, conf_path, apply, stdin):
+    """`dates` and `dates --apply`. Exit codes in the module doc."""
+    kit = getattr(env, "kit", KIT)
+    could_not = EX_FAILED if apply else EX_UNKNOWN
+    if apply:
+        # Before anything is read: a session does not write its own supervision's dates.
+        try:
+            refuse_if_agent("dates --apply", env.environ)
+        except pu.Refusal as exc:
+            say(str(exc))
+            return EX_REFUSED
+    try:
+        conf = pu.load_conf(conf_path)
+        keys = listed_keys(kit)
+    except (pu.ConfError, PartsUnreadable) as exc:
+        say("CONFIG: %s" % exc)
+        return could_not
+    clocks, problems = pu.credential_clocks(conf.get("CREDENTIAL_EXPIRIES"))
+    if problems:
+        say("CONFIG: CREDENTIAL_EXPIRIES could not be read: " + "; ".join(problems))
+        return could_not
+    warn = int(conf.get("CREDENTIAL_WARN_DAYS") or 30)
+    if not apply:
+        rows, code = date_rows(keys, clocks, _today(env), warn)
+        print_date_rows(rows)
+        return code
+    text = stdin.read(APPLY_STDIN_MAX + 1)
+    if len(text) > APPLY_STDIN_MAX:
+        say("NOT WRITTEN: the input is longer than %d characters." % APPLY_STDIN_MAX)
+        return EX_USAGE
+    allowed = {k["clock"] for k in keys} | {name for name, _ in clocks}
+    new, bad = parse_apply_lines(text, allowed)
+    if not bad and not new:
+        bad = ["no line was given: send name:YYYY-MM-DD lines on standard input"]
+    value, merged = ("", [])
+    if not bad:
+        value, merged = merged_expiries(clocks, new)
+        if len(merged) > pu.CREDENTIAL_ENTRIES_MAX:
+            bad = ["that would make more than %d entries" % pu.CREDENTIAL_ENTRIES_MAX]
+    if bad:
+        say("NOT WRITTEN: %d problem(s); nothing was changed:\n  " % len(bad) + "\n  ".join(bad))
+        return EX_USAGE
+    path = conf["__source__"]
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read()
+        data = rewrite_expiries(raw, value)
+        write_atomic(path, data)
+        with open(path, "rb") as fh:
+            back = fh.read()
+        after = pu.load_conf(path)
+        got, why = pu.credential_clocks(after.get("CREDENTIAL_EXPIRIES"))
+    except (OSError, pu.ConfError) as exc:
+        say("FAILED: update.conf was not written, or could not be read back (%s)." % type(exc).__name__)
+        return EX_FAILED
+    if back != data or why or got != merged:
+        say("FAILED: update.conf was written but reads back differently; check it by hand.")
+        return EX_FAILED
+    rows, _code = date_rows(keys, got, _today(env), warn)
+    say("WRITTEN: %d date(s) in CREDENTIAL_EXPIRIES; every other line is as it was." % len(new))
+    print_date_rows(rows)
+    return EX_OK
+
+
+# --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
-def main(argv=None, env=None):
+def main(argv=None, env=None, stdin=None):
     p = argparse.ArgumentParser(prog="pipeline_watch.py", description=__doc__.split("\n")[0])
     p.add_argument("--conf", default=os.path.join(KIT, "update.conf"))
     p.add_argument("--selftest", action="store_true")
@@ -1153,6 +1402,8 @@ def main(argv=None, env=None):
     sub.add_parser("status")
     sub.add_parser("install")
     sub.add_parser("uninstall")
+    dates = sub.add_parser("dates")
+    dates.add_argument("--apply", action="store_true")
     args = p.parse_args(argv)
     if args.selftest:
         from scratch_run import contained   # KIT-450: its temp folders go when it ends
@@ -1161,6 +1412,8 @@ def main(argv=None, env=None):
         p.print_help()
         return EX_USAGE
     env = env or pu.Env()
+    if args.cmd == "dates":
+        return cmd_dates(env, args.conf, args.apply, stdin or sys.stdin)
     try:
         if args.cmd in ("install", "uninstall"):
             refuse_if_agent(args.cmd, env.environ)
@@ -2213,6 +2466,165 @@ def selftest():
               (code, os.path.isabs(doc["ProgramArguments"][3]),
                os.path.realpath(doc["ProgramArguments"][3])),
               (EX_OK, True, os.path.realpath(os.path.join(home, "watch-rel.conf"))))
+
+        # -- the stored keys' end dates (KIT-667): `dates` reads, `dates --apply` writes ------------------
+        import io as _io
+
+        class NoRead(object):
+            def read(self, *_a):
+                raise AssertionError("standard input was read")
+
+        d_kit = os.path.join(home, "dates-kit")
+        os.makedirs(d_kit)
+
+        def secret(key, name, ends, clock=None):
+            s = {"key": key, "default_name": name, "what": "The %s key." % name.lower(), "ends": ends}
+            if clock:
+                s.update(clock=clock, date_from="Read it at the %s page." % clock)
+            return s
+        gh_tok = secret("GITHUB_TOKEN_ENV", "GH_TOKEN", "set-when-made", "gh-tok")
+        parts_doc = {"schema": "pipeline-parts/1", "parts": [
+            {"id": "p1", "settings": {"file": "a.conf"}, "secrets": [
+                gh_tok, secret("TURN_TOKEN_ENV", "TURN_TOKEN", "one-year", "claude-tok"),
+                secret("APP_TOKEN_ENV", "APP_TOKEN", "unknown", "unk-tok"),
+                secret("LINEAR_KEY_ENV", "TRACKER_KEY", "never")]},
+            {"id": "p2", "settings": {"file": "b.conf"}, "secrets": [gh_tok]},
+            {"id": "p3", "settings": {"file": "c.conf"}, "secrets": [secret("X_ENV", "OFF_TOKEN", "one-year", "off-tok")]},
+            {"id": "p4", "settings": {"file": None}, "secrets": []}]}
+        parts_path = os.path.join(d_kit, "pipeline-parts.json")
+
+        def put_parts(doc):
+            with open(parts_path, "w", encoding="utf-8") as fh:
+                json.dump(doc, fh)
+        put_parts(parts_doc)
+        for name in ("a.conf", "b.conf"):
+            open(os.path.join(d_kit, name), "w").close()      # present and empty: never opened
+        d_conf = os.path.join(d_kit, "update.conf")
+
+        def put_conf(expiries=None, tail="", **over):
+            lines = ["# my settings\r\n" if tail == "crlf" else "# my settings\n"]
+            lines += ["%s=%s\n" % (k, v) for k, v in conf(**over).items()
+                      if not k.startswith("__") and k != "CREDENTIAL_EXPIRIES"]
+            if expiries is not None:
+                lines.insert(3, "CREDENTIAL_EXPIRIES=%s\n" % expiries)
+            with open(d_conf, "w", encoding="utf-8", newline="") as fh:
+                fh.write("".join(lines))
+            os.chmod(d_conf, 0o640)
+
+        def d_run(*args, environ=None, stdin=None, now=T):
+            env = make_env(home, environ=environ, now=now)
+            env.kit = d_kit
+            mark = len(quiet)
+            code = main(["--conf", d_conf] + list(args), env=env, stdin=stdin)
+            return code, list(quiet[mark:])
+
+        def d_rows(out):
+            return [line.split("\t") for line in "\n".join(out).splitlines() if "\t" in line]
+
+        def d_file():
+            with open(d_conf, "rb") as fh:
+                return fh.read()
+        put_conf()
+        before = d_file()
+        code, out = d_run("dates")
+        rows = d_rows(out)
+        check("dates prints the header, then one row of five fields per listed key, each once",
+              (out[0], [r[0] for r in rows[1:]], {len(r) for r in rows}),
+              ("clock\twhat\tdate\tdays_left\tdate_from", ["gh-tok", "claude-tok", "unk-tok"], {5}))
+        check("…a part whose settings file is not in the kit folder lists nothing, and a key that never ends has no row",
+              any("off-tok" in line or "tracker" in line.lower() for line in out), False)
+        check("…a missing date reads `missing` with no days, and where to read it is the last field",
+              rows[1], ["gh-tok", "The gh_token key.", "missing", "-", "Read it at the gh-tok page."])
+        check("…a one-year or set-when-made key with no date makes it exit 10", code, EX_FIRING)
+        check("…and it wrote nothing", d_file(), before)
+        put_conf(expiries="gh-tok:%s,claude-tok:%s" % (on(200), on(300)))
+        code, out = d_run("dates")
+        check("every date set and far, with a key of unknown end still missing: exit 0, and that row says missing",
+              (code, d_rows(out)[1][3], d_rows(out)[3][2:4]), (EX_OK, "200", ["missing", "-"]))
+        put_conf(expiries="gh-tok:%s,claude-tok:%s,unk-tok:%s" % (on(200), on(300), on(30)))
+        check("a date on the warning's last day is due: exit 10; one day further is not",
+              (d_run("dates")[0],
+               (put_conf(expiries="gh-tok:%s,claude-tok:%s,unk-tok:%s" % (on(200), on(300), on(31))),
+                d_run("dates")[0])[1]), (EX_FIRING, EX_OK))
+        put_conf(expiries="gh-tok:%s,claude-tok:%s,old-key:%s" % (on(200), on(300), on(-2)))
+        code, out = d_run("dates")
+        kept = d_rows(out)[-1]
+        check("a name the parts list does not know is listed, marked kept as written, and a past date is due",
+              (code, kept[0], "kept as written" in kept[1], kept[3]), (EX_FIRING, "old-key", True, "-2"))
+        put_parts({"parts": "x"})
+        check("a parts list that cannot be read is exit 4 for dates and 1 for --apply, with nothing written",
+              (d_run("dates")[0], d_run("dates", "--apply", stdin=_io.StringIO("gh-tok:2027-01-01\n"))[0],
+               d_file().count(b"2027-01-01")), (EX_UNKNOWN, EX_FAILED, 0))
+        put_parts(parts_doc)
+        put_conf(expiries="not-a-date")
+        check("a conf that cannot be read is exit 4", d_run("dates")[0], EX_UNKNOWN)
+
+        # --apply
+        put_conf(expiries="gh-tok:%s,old-key:%s" % (on(200), on(250)))
+        before = d_file()
+        code, out = d_run("dates", "--apply", environ={"CLAUDECODE": "1"}, stdin=NoRead())
+        check("--apply in a Claude session is refused (exit 3) before it reads standard input or the file",
+              (code, d_file() == before, "REFUSED" in out[0]), (EX_REFUSED, True, True))
+        said = "\n".join(out)
+        check("…and says it writes the end dates the health check warns from, points to `dates`, and speaks of no job",
+              ("writes the end dates the health check warns from" in said,
+               "pipeline_watch.py dates\n" in said + "\n", "run --dry-run" in said, "loads or removes" in said),
+              (True, True, False, False))
+        try:
+            refuse_if_agent("install", {"CLAUDECODE": "1"})
+            said_install = ""
+        except pu.Refusal as exc:
+            said_install = str(exc)
+        check("…while install's refusal keeps its own words and its `run --dry-run`",
+              ("loads or removes a job" in said_install, "pipeline_watch.py run --dry-run" in said_install,
+               "end dates" in said_install), (True, True, False))
+        check("…while plain dates is not refused there",
+              d_run("dates", environ={"CLAUDECODE": "1"})[0] in (EX_OK, EX_FIRING), True)
+        code, out = d_run("dates", "--apply", stdin=_io.StringIO("claude-tok:2027-03-04\ngh-tok:2027-05-06\n\nunk-tok:2027-07-08\n"))
+        after = d_file()
+        want_value = "gh-tok:2027-05-06,old-key:%s,claude-tok:2027-03-04,unk-tok:2027-07-08" % on(250)
+        expect_bytes = before.replace(("gh-tok:%s,old-key:%s" % (on(200), on(250))).encode(), want_value.encode())
+        check("--apply replaces a date in place, adds the new ones, keeps the other entry, exit 0",
+              (code, after == expect_bytes), (EX_OK, True))
+        check("…every other byte of the file is as it was, and the mode is kept",
+              (after.replace(want_value.encode(), b"") == before.replace(
+                  ("gh-tok:%s,old-key:%s" % (on(200), on(250))).encode(), b""),
+               oct(os.stat(d_conf).st_mode & 0o7777)), (True, "0o640"))
+        check("…and the rows afterwards show the new dates",
+              (out[0].startswith("WRITTEN: 3"), d_rows(out)[1][2], d_rows(out)[2][2]),
+              (True, "2027-05-06", "2027-03-04"))
+        put_conf(tail="crlf")
+        raw = d_file()
+        code, _out = d_run("dates", "--apply", stdin=_io.StringIO("gh-tok:2027-05-06"))
+        check("with no CREDENTIAL_EXPIRIES line, --apply adds one at the end and changes nothing above it",
+              (code, d_file() == raw + b"CREDENTIAL_EXPIRIES=gh-tok:2027-05-06\n"), (EX_OK, True))
+        put_conf(expiries="gh-tok:%s" % on(200))
+        before = d_file()
+        bads = ["gh-tok:2027-02-30\n", "gh-tok:2027-5-6\n", "nothing-listed:2027-05-06\n", "gh-tok:2027-05-06\ngh-tok:2027-06-06\n",
+                "claude-tok:2027-05-06\n" + TOKENISH + "\n", "", "\n\n"]
+        results = [d_run("dates", "--apply", stdin=_io.StringIO(b)) for b in bads]
+        check("a bad line (impossible date, short date, unlisted name, repeat, a token, nothing at all) is exit 2 and writes nothing",
+              ([r[0] for r in results], d_file() == before), ([EX_USAGE] * 7, True))
+        check("…and names the line by its number, never its text",
+              ("line 2" in " ".join(results[4][1]), TOKENISH in " ".join(results[4][1])), (True, False))
+        real_write = write_atomic
+        try:
+            def broken(path, data):
+                raise OSError("disk full")
+
+            def lying(path, data):
+                real_write(path, data.replace(b"2027-05-06", b"2027-05-07"))
+            globals()["write_atomic"] = broken
+            code_w = d_run("dates", "--apply", stdin=_io.StringIO("gh-tok:2027-05-06\n"))[0]
+            same_w = d_file() == before
+            globals()["write_atomic"] = lying
+            code_l = d_run("dates", "--apply", stdin=_io.StringIO("gh-tok:2027-05-06\n"))[0]
+        finally:
+            globals()["write_atomic"] = real_write
+        check("a write that fails, and one that reads back differently, are exit 1",
+              (code_w, same_w, code_l), (EX_FAILED, True, EX_FAILED))
+        leftovers = [n for n in os.listdir(d_kit) if n.startswith(".update.conf-")]
+        check("…and a failed write leaves no temp file beside the conf", leftovers, [])
 
     check("the probe names itself: Cloudflare refuses Python's default user agent",
           _request("https://door.example.com/status").get_header("User-agent"), USER_AGENT)

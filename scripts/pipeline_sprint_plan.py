@@ -56,6 +56,7 @@ WHY = {
     "delegated": "an agent already has it", "running": "it is running", "finished": "it is finished",
     "wrong-state": "it is not in a ready state", "not-ready": "it is not ready to start",
     "plan-invalid": "its plan cannot be read", "plan-paused": "its plan is paused",
+    "plan-waits": "it waits for another piece of its plan",
     "record-unreadable": "a record could not be read", "history-unreadable": "its history could not be read",
     "count-unknown": "today's count could not be read", "backlog-off": "the backlog is not on",
     "agent-off": "agent-filed work is off", "actor-unknown": "who moved it is not known",

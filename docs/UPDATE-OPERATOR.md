@@ -201,6 +201,17 @@ CREDENTIAL_WARN_DAYS=30
 Good: `credentials OK none expires within 30 days; the next is dispatcher-token on 2027-07-27`.
 Not: `CREDENTIAL_EXPIRIES is not set` once you hold a year-long token, which means nothing is watching it.
 
+- **List the dates.** `python3 scripts/pipeline_watch.py --conf update.conf dates` prints one row per stored key: its
+  name, what it is, the date on record or `missing`, the days left, and where to read the date. It asks nothing and
+  writes nothing. Exit 0 all set; 10 a date is missing or due; 4 a file could not be read.
+  Good: `gh-tok  ...  2027-05-06  240  ...` and exit 0.
+  Not that: a row that says `missing` for a key that ends in a year, which means nothing watches it.
+- **Record new dates.** `printf 'gh-tok:2027-05-06\n' | python3 scripts/pipeline_watch.py --conf update.conf dates --apply`
+  changes only the `CREDENTIAL_EXPIRIES` line, then reads the file back. Run it yourself: it refuses inside a Claude
+  session. Exit 0 written; 2 a bad line (named by number), nothing written; 1 the write failed; 3 refused.
+  Good: `WRITTEN: 1 date(s) in CREDENTIAL_EXPIRIES; every other line is as it was.`
+  Not that: a token pasted as a line. It is refused by line number, and the text is never printed.
+
 **The two clerks (KIT-286).** The notifier cannot page about itself, and nothing scheduled read the
 monitor's own heartbeat. So each is a kind here, and each opens a GitHub issue, since Slack is what a
 dead notifier cannot reach. Each file must be one **your account can read**, and the role account's state

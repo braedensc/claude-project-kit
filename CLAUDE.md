@@ -375,6 +375,11 @@ npm run test:queue-read      # the queue's reader (KIT-445): the tracker and thr
                              #   a history whole or null, what it could not read said
 npm run test:queue-start     # the queue's starter (KIT-452): what may start now, inside the window
                              #   only; the ledger row written before each start, never a title
+npm run test:runner-store    # the runner's store (KIT-642): requests and run records behind
+                             #   walls, each caller for its own kinds; unreadable runs are None
+npm run test:runner          # the runner (KIT-642): start, resume, stop and a restart against a
+                             #   stand-in; the owner's approval from the history; the pin; the one
+                             #   command line; a run that died resumed once; leaves nothing behind
 npm run test:queue-setup     # the queue's installer (KIT-456): configs pass the jobs' own loaders; no plist
                              #   overwritten, no job loaded; refused under a model
 npm run test:day-plan        # the day plan file (KIT-438): the queue's decision as fields only, each
@@ -440,11 +445,10 @@ auto-merge, grader-path, safe-outputs, conflict-loop, union-check, telemetry, da
 and weekly-review selftests, the secret-scan selftest, and, as its first step, the secret
 scan on every PR. A separate job, **Temp-leak sweeps**, runs every battery again, each in
 its own empty TMPDIR, once to the end and once stopped by a SIGTERM, and fails on anything
-one leaves behind (KIT-450, KIT-617). `main` is protected: **three** contexts are required —
-**Kit checks**, **Provenance scan** and **Hooks change guard** — with admins enforced.
-**Temp-leak sweeps is not required until the owner adds it**, so a leak turns the PR red
-without blocking the merge. Each job's limit, and what to do near one, is in
-`docs/TESTING.md` ("Job limits and what to do near one").
+one leaves behind (KIT-450, KIT-617). `main` is protected: **four** contexts are required —
+**Kit checks**, **Provenance scan**, **Hooks change guard** and **Temp-leak sweeps** (since
+12 Nov 2026, KIT-699) — with admins enforced, so a leak blocks the merge. Each job's limit,
+and what to do near one, is in `docs/TESTING.md` ("Job limits and what to do near one").
 A fourth workflow, **PR base** (`.github/workflows/pr-base.yml`), fails any PR not
 based on a base branch and re-runs on a retarget. It is deliberately not required:
 every PR into `main` passes it, and branch protection never covers a PR based on a

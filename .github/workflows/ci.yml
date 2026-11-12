@@ -111,6 +111,11 @@ jobs:
           python3 -m pip install --quiet pyyaml
           python3 scripts/check_runner_pin.py --selftest
           python3 scripts/check_runner_pin.py
+      - name: Agent trigger author check (@claude needs a trusted author)
+        run: |
+          python3 -m pip install --quiet pyyaml
+          python3 scripts/check_agent_trigger_author.py --selftest
+          python3 scripts/check_agent_trigger_author.py
 
       # KIT-652. The kit's Python imports only the standard library, bar a short named list,
       # because its jobs and hooks run on a Python with nothing added to it.

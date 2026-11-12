@@ -383,6 +383,21 @@ reply "which ones?" to get the list.
 Not that: a stand-up that names a pull request the facts don't hold. The check refuses it, and the
 short version goes out.
 
+### Plans changed without you
+
+A plan the bridge follows can change without you when a piece's note asks for a reorder that
+stays inside the plan you approved (KIT-320; `docs/BRIDGE-OPERATOR.md`, "When a piece says the
+plan needs changing"). Each such change gets one line at the end of the next stand-up, after
+the tech lead's words or the short version, under *Changed without you, inside plans you
+approved*. Every word comes from the bridge's ledger:
+ticket ids and fixed words, never the piece's own. A line is marked said only once the rundown
+has gone out, so one that failed to post says it again next time. Switch the stand-up off with
+a line still unsaid, and the bridge says it in the plan's own thread on its next pass.
+
+Good: *PROD-52 now waits for PROD-53 before it starts, in PROD-50. PROD-51 asked for it, and it
+stays inside the plan you approved.*
+Not: the same change in two rundowns, or a change you only find in Linear.
+
 Every text `compose` returns, and the tech lead's words, has Slack's `&`, `<` and `>` escaped, so
 nothing in it can mention anyone, make a link or broadcast.
 

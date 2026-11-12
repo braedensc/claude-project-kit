@@ -1,0 +1,29 @@
+{
+  "enabled": false,
+  "store_dir": "~/.pipeline-runner/store",
+  "work_dir": "~/.pipeline-runner/work",
+  "session_home": "~/.pipeline-runner/home",
+  "claude_bin": "/opt/homebrew/bin/claude",
+  "model": "sonnet",
+  "token_env": "CLAUDE_WRITER_OAUTH_TOKEN",
+  "linear_key_file": "~/.pipeline-runner/tracker-key",
+  "owner_user_ids": ["<the owner's tracker user id>"],
+  "dispatcher_user_ids": ["<the old dispatcher's own tracker user id>"],
+  "poll_seconds": 5,
+  "stop_grace_seconds": 30,
+  "max_starts_per_ticket": 20,
+  "hold": {"file": ""},
+  "projects": {
+    "app": {
+      "repo": "/Users/<role-account>/repos/app",
+      "base": "main",
+      "approval_states": {
+        "code": ["<the ready state's id>"],
+        "review": ["<the ready state's id>"],
+        "plan": ["<the plan-it state's id>"],
+        "acceptance": ["<the ready state's id>"]
+      },
+      "allowed_hosts": ["github.com", "api.github.com"]
+    }
+  }
+}
