@@ -490,6 +490,8 @@ def _plain_fields(part):
         yield "person_steps", step["words"]
     for secret in part["secrets"]:
         yield "secrets", secret["what"]
+        if secret.get("date_from"):
+            yield "secrets.date_from", secret["date_from"]
     for kind, why in sorted(part["docs"]["missing"].items()):
         yield "docs.missing." + kind, why
     if part["settings"]["file"]:
@@ -924,6 +926,8 @@ def selftest():
           lambda d: a(d)["jobs"][0].update(label="com." + "braeden" + "claw.alpha"), "words:")
     fails("words: a product name in a settings file name fails",
           lambda d: a(d)["settings"].update(file="cy" + "rus.conf"), "words:")
+    fails("words: a product name in a secret's date_from fails",
+          lambda d: a(d)["secrets"][0].update(date_from="Read it on the " + "git" + "hub page."), "words:")
     fails("words: an internal name as the plain name fails",
           lambda d: a(d).update(name="The bridge"), "words:")
     # page

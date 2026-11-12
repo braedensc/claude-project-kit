@@ -1073,12 +1073,20 @@ def _path_env():
     return ":".join(dirs + ["/usr/bin", "/bin", "/usr/sbin", "/sbin"])
 
 
+INSTALL_WHY = ("It loads or removes a job that runs as you every hour; a session\n"
+               "  does not install its own supervision.")
+# Each action's own reason and its read-only command (KIT-667): `dates --apply` writes no job.
+REFUSAL_WORDS = {
+    "dates --apply": ("It writes the end dates the health check warns from; a session\n"
+                      "  does not set its own warnings.", "dates"),
+}
+
+
 def refuse_if_agent(action, environ):
-    """The update script's refusal, naming THIS script's command for the person to run."""
-    pu.refuse_if_agent(action, environ, script="pipeline_watch.py",
-                       why="It loads or removes a job that runs as you every hour; a session\n"
-                           "  does not install its own supervision.",
-                       read_only="run --dry-run")
+    """The update script's refusal, naming THIS script's command for the person to run, with the
+    reason and the read-only command that belong to the action."""
+    why, read_only = REFUSAL_WORDS.get(action, (INSTALL_WHY, "run --dry-run"))
+    pu.refuse_if_agent(action, environ, script="pipeline_watch.py", why=why, read_only=read_only)
 
 
 def _load(env, domain, label, plist):
@@ -2557,6 +2565,19 @@ def selftest():
         code, out = d_run("dates", "--apply", environ={"CLAUDECODE": "1"}, stdin=NoRead())
         check("--apply in a Claude session is refused (exit 3) before it reads standard input or the file",
               (code, d_file() == before, "REFUSED" in out[0]), (EX_REFUSED, True, True))
+        said = "\n".join(out)
+        check("…and says it writes the end dates the health check warns from, points to `dates`, and speaks of no job",
+              ("writes the end dates the health check warns from" in said,
+               "pipeline_watch.py dates\n" in said + "\n", "run --dry-run" in said, "loads or removes" in said),
+              (True, True, False, False))
+        try:
+            refuse_if_agent("install", {"CLAUDECODE": "1"})
+            said_install = ""
+        except pu.Refusal as exc:
+            said_install = str(exc)
+        check("…while install's refusal keeps its own words and its `run --dry-run`",
+              ("loads or removes a job" in said_install, "pipeline_watch.py run --dry-run" in said_install,
+               "end dates" in said_install), (True, True, False))
         check("…while plain dates is not refused there",
               d_run("dates", environ={"CLAUDECODE": "1"})[0] in (EX_OK, EX_FIRING), True)
         code, out = d_run("dates", "--apply", stdin=_io.StringIO("claude-tok:2027-03-04\ngh-tok:2027-05-06\n\nunk-tok:2027-07-08\n"))
