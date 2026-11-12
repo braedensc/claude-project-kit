@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/braedensc/claude-project-kit/schemas/pipeline-acceptance-second-look.schema.json",
+  "title": "Acceptance check second look block",
+  "description": "The machine-readable definition of docs/PIPELINE-CONTRACT.md §27 — the acceptance session's second look at one problem it reported, asked for by the live pass in the session's own thread (KIT-608). One block per problem. The block is written by a model: it can refute a problem or lower its severity, and it can never raise one, grant a pass or file anything.",
+  "$comment": "DATA, NEVER AUTHORITY. A block for another plan or head, a block out of this shape, or a problem answered twice answers nothing: that problem stays not judged, is filed, and a high one still holds the plan. A severity above the one reported is read as the one reported.",
+  "type": "object",
+  "required": ["schema", "plan", "head", "id", "refuted", "why", "severity"],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {"const": "pipeline-acceptance-second-look/1", "description": "The marker. A block without it is not an answer."},
+    "plan": {"type": "string", "pattern": "^[A-Z][A-Z0-9]{1,9}-[0-9]{1,6}$", "description": "The epic the check is about, as the prompt names it."},
+    "head": {"type": "string", "pattern": "^[0-9a-f]{40}$", "description": "The head the check judged, in full, as the prompt names it."},
+    "id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,39}$", "description": "The problem's own id, from the session's result block."},
+    "refuted": {"type": "boolean", "description": "True only when the second look shows the problem is not real."},
+    "why": {"type": "string", "pattern": "^[^\\n\\r]{1,300}$", "description": "One line, at most 300 characters. The live pass neutralizes it before any comment carries it."},
+    "severity": {"enum": ["high", "medium", "low"], "description": "The severity after the second look: the one reported or lower."}
+  }
+}

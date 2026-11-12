@@ -166,9 +166,15 @@ session cannot write that folder, and cannot choose the folder the dispatcher st
 **Not:** a check started from the status file. A session can write a ticket's title and labels; the status file only
 reports them.
 
-**The second pass is not wired yet.** Every problem goes on as one the second pass could not judge: it is filed,
-marked "not confirmed by the second pass", and a high one still holds the plan. The session is told to try to disprove
-each problem itself before it reports it.
+**The second look comes before anything is filed** (contract §27). When the result lists a problem, the pass
+replies in the session's own thread on the acceptance ticket. The reply names each problem and its screenshot, and
+asks the same session to try to show it is not real, with one block per problem. A later pass reads the answer and
+only then posts the follow-ups and the verdict. The second look gets `time_limit_minutes` of its own, counted from
+the reply; the check's own limit never stops it.
+**Good:** `TOD-100    asked OPS-12 for a second look at 2 problem(s)`, then, a pass or two later,
+`TOD-100    second look on OPS-12: answered, 2 of 2 judged, 4 minute(s)`.
+**Not:** `second look on OPS-12: no answer in time, 0 of 2 judged`. Every problem is filed not judged, and a high
+one holds the plan. Look at the ticket's thread: the session may not have taken the reply.
 
 **After the merge, a check of the default branch.** A plan whose pieces all merged before any check ran gets one, at
 the head the default branch is at then. The bridge waits for a verdict before it closes a plan, so one must come. No
@@ -232,13 +238,17 @@ Every pass but a dry run leaves `<state_dir>/acceptance-heartbeat.json`: when, t
 ## The second pass, and what gets filed
 
 The session lists the problems it saw. Before any is filed, a second pass tries to show each one is
-**not real**.
+**not real**: the second look, the same session asked again in its own thread (contract §27).
 
 - A problem the second pass **disproves** is not filed. It is listed in the verdict with its reason.
-- A problem it **confirms** is filed.
-- A problem it **could not judge** (the second pass failed, or gave no usable answer) is **not**
-  disproved. It is filed, marked "not confirmed by the second pass". A broken checker never loses a real
-  problem, and the mark says it was not checked.
+- A problem it **confirms** is filed. The verdict lists it as confirmed.
+- A problem it **could not judge** is **not** disproved. It is filed, marked "not confirmed by the second
+  pass", and the verdict lists it as not judged. That is a second look with no answer in time, a session
+  error, a reply that could not be posted, or an answer out of shape: another plan or head, a field it
+  does not know, no `why`, or one problem answered twice. A broken checker never loses a real problem.
+
+**What it costs.** One more turn of the same session, after its result. The pass records it with the check, in
+its own state file: one prompt, its minutes, the outcome, and how many problems it judged.
 
 **Severity is a proposal.** The session proposes. The second pass may lower it and never raise it. Only a
 problem that survives and is still `high` holds the plan open.

@@ -79,6 +79,7 @@ SCHEMAS = {
     "pipeline-validator-ledger": ("pipeline-validator-ledger.schema.json", "24.", "name"),
     "pipeline-acceptance": ("pipeline-acceptance.schema.json", "21.", "name"),
     "pipeline-validator-settings": ("pipeline-validator-settings.schema.json", "23.", "name"),
+    "pipeline-acceptance-second-look": ("pipeline-acceptance-second-look.schema.json", "27.", "name"),
     # The kit's own list of its parts (KIT-624): no contract section, so no parity. Its
     # cross-field rules are scripts/pipeline_parts.py's.
     "pipeline-parts": ("pipeline-parts.schema.json", "-", "none"),
@@ -865,6 +866,11 @@ ACCEPTANCE_NOTHING = {**VALID_ACCEPTANCE, "outcome": "found-nothing", "problems"
 ACCEPTANCE_COULD_NOT = {**VALID_ACCEPTANCE, "outcome": "could-not-check", "problems": [], "ran": [],
                         "reason": "The build failed, so there was nothing to look at."}
 
+# §27: the acceptance session's second look at one problem (KIT-608): not refuted, kept high.
+VALID_SECOND_LOOK = {"schema": "pipeline-acceptance-second-look/1", "plan": "TOD-135",
+                     "head": "0123456789abcdef0123456789abcdef01234567", "id": "white-card",
+                     "refuted": False, "why": "Still white on the dark board at 375 wide.", "severity": "high"}
+
 # §24: the validator's ledger (KIT-535): an approved merge, a send-back on the next head, a plan.
 _LEDGER_MERGE = {"at": "2026-11-10T15:00:00Z", "subject": "merge", "ref": "acme/app#12",
                  "head": "a" * 40, "kind": "approved",
@@ -886,6 +892,22 @@ VALID_VALIDATOR_LEDGER = {
 
 # (schema name, fixture label, instance, must_be_valid, keyword expected when invalid)
 FIXTURES = [
+    ("pipeline-acceptance-second-look", "valid", VALID_SECOND_LOOK, True, None),
+    ("pipeline-acceptance-second-look", "refuted-and-lowered",
+     {**VALID_SECOND_LOOK, "refuted": True, "severity": "low"}, True, None),
+    ("pipeline-acceptance-second-look", "wrong-marker",
+     _with(VALID_SECOND_LOOK, "schema", "pipeline-acceptance-second-look/2"), False, "const"),
+    ("pipeline-acceptance-second-look", "no-verdict", _without(VALID_SECOND_LOOK, "refuted"), False, "required"),
+    ("pipeline-acceptance-second-look", "a-verdict-in-words",
+     _with(VALID_SECOND_LOOK, "refuted", "no"), False, "type"),
+    ("pipeline-acceptance-second-look", "an-invented-severity",
+     _with(VALID_SECOND_LOOK, "severity", "urgent"), False, "enum"),
+    ("pipeline-acceptance-second-look", "an-empty-why", _with(VALID_SECOND_LOOK, "why", ""), False, "pattern"),
+    ("pipeline-acceptance-second-look", "a-why-on-two-lines",
+     _with(VALID_SECOND_LOOK, "why", "one\ntwo"), False, "pattern"),
+    ("pipeline-acceptance-second-look", "a-short-head", _with(VALID_SECOND_LOOK, "head", "abc123"), False, "pattern"),
+    ("pipeline-acceptance-second-look", "an-extra-field",
+     _with(VALID_SECOND_LOOK, "approve", True), False, "additionalProperties"),
     ("pin", "valid", VALID_PIN, True, None),
     ("pin", "no-pin_version", _without(VALID_PIN, "pin_version"), False, "required"),
     ("pin", "future-pin_version", _with(VALID_PIN, "pin_version", 2), False, "const"),
