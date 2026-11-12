@@ -23,12 +23,21 @@ module's name for `_http_json` (pipeline_bridge_tracker), which is this same fun
 test standing in for the tracker's HTTP replaces it there, and one standing in for
 Slack's replaces it here.
 
-It makes no tracker call. Its only Slack writes are a message (`chat.postMessage`) and the
-opening of a member's DM with the app (`conversations.open`); the selftest pins both.
+  AnswerStream  an answer shown as it is written (KIT-565): it sends a line only after the line
+                is whole and a caller's judge has passed it, and ends by making the message
+                hold exactly the words the whole-answer path posts.
+
+It makes no tracker call. Its Slack writes are a message (`chat.postMessage`), the opening
+of a member's DM with the app (`conversations.open`), the thread's status line and the
+removal of the "on it" line (KIT-560), and the streamed answer (`chat.startStream`,
+`chat.appendStream`, `chat.stopStream`, and `chat.update` to make it exact: KIT-565); the
+selftest pins them all.
 """
 import json
 import os
+import queue
 import sys
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -197,6 +206,26 @@ class SlackClient(object):
         """One of this app's own messages (KIT-560): the "on it" line the answer replaces."""
         self._call("chat.delete", {"channel": channel, "ts": ts})
 
+    def start_stream(self, channel, thread_ts, text, user_id, team_id):
+        """Open a streamed message in a thread with its first text (KIT-565); its `ts`. The
+        recipient is the member whose DM it is. Slack's own refusal word is the error."""
+        doc = self._call("chat.startStream", {
+            "channel": channel, "thread_ts": thread_ts, "markdown_text": text,
+            "recipient_user_id": user_id, "recipient_team_id": team_id})
+        if not isinstance(doc.get("ts"), str) or not doc["ts"]:
+            raise BridgeError("Slack chat.startStream gave no message")
+        return doc["ts"]
+
+    def append_stream(self, channel, ts, text):
+        self._call("chat.appendStream", {"channel": channel, "ts": ts, "markdown_text": text})
+
+    def stop_stream(self, channel, ts):
+        self._call("chat.stopStream", {"channel": channel, "ts": ts})
+
+    def update_message(self, channel, ts, text):
+        """One of this app's own messages, made to say `text` (KIT-565)."""
+        self._call("chat.update", {"channel": channel, "ts": ts, "text": text})
+
     def post(self, channel, thread_ts, text):
         payload = {"channel": channel, "text": text, "unfurl_links": False,
                    "unfurl_media": False}
@@ -212,6 +241,212 @@ class SlackClient(object):
             raise BridgeError("Slack chat.postMessage refused: %s"
                               % ((doc or {}).get("error") if isinstance(doc, dict) else "?"))
         return doc["ts"]
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════
+# A streamed answer (KIT-565)
+# ══════════════════════════════════════════════════════════════════════════════════════
+class AnswerStream(object):
+    """An answer shown in its thread as it is written, with nothing raw in it.
+
+    The model's text is fed in as it arrives. A line is sent only once it is whole (its newline
+    has come), and only after `judge` has passed it: judge(raw line) is (held, text), where
+    `held` is a reason ("" when none) that stops the stream, and `text` is the line as it may be
+    shown, or None when the line is left out. A left-out line leaves nothing in its place. The
+    lines the whole-answer path would fold or trim (blank lines at either end, a run of them after
+    a left-out line) are folded or trimmed the same way here, so the lines sent are the lines that
+    path would post, up to its cuts.
+
+    It ends one of three ways, and each leaves Slack holding exactly one message:
+      settle(words)   the stream stops and the message is updated to `words`, the whole-answer
+                      path's text, always: the stream is Slack's markdown and that path posts
+                      Slack's own markup, so the closing update is what makes the two the same
+                      even when the lines sent already read as those words;
+      replace(text)   the stream stops and the message holds `text` instead of anything streamed
+                      (the held-back line: nothing of the answer stays in Slack);
+      discard()       the stream stops and the message is removed (a turn that gave no answer).
+
+    With `threaded` the text is handed to a worker that judges and sends it, so a slow Slack never
+    holds up the reader of the CLI's output (and its timeout); the three endings wait for the worker
+    to finish first. Without it, as the selftest runs it, each piece is handled where it is fed.
+    Each returns True when Slack now holds the target message, False when it does not and the
+    caller must post it. Slack refusing any call is never an error here: `why` says it, in
+    Slack's own word, the stream stops, and the caller's whole-answer post stands.
+
+    Nothing here knows what a filter is, which words are banned or what a secret looks like; the
+    judge does. No call is made until a line has passed it."""
+
+    JOIN_SECONDS = 60
+
+    def __init__(self, slack, channel, thread_ts, judge, user_id, team_id, max_chars, read_max,
+                 threaded=False):
+        self.slack, self.channel, self.thread_ts = slack, channel, thread_ts
+        self.judge, self.user_id, self.team_id = judge, user_id, team_id
+        self.max_chars, self.read_max = max_chars, read_max
+        self.ts = None                    # the streaming message, until it is ended
+        self.final_ts = None              # the message that holds the answer, once ended
+        self.started = False
+        self.lines = []                   # what Slack was sent, line by line
+        self.size = 0                     # the length of "\n".join(self.lines)
+        self.raw = 0                      # raw characters taken in, to the read cap
+        self.pending = ""                 # the start of a line whose end has not come
+        self.blanks = 0                   # blank lines waiting for a line to follow them
+        self.last_blank = False
+        self.removed_any = False
+        self.held = ""                    # why a line stopped the stream
+        self.cut = False                  # the answer ran past what may be shown
+        self.why = ""                     # Slack's refusal, in its own word; "" when none
+        self.broken = False               # Slack refused: nothing more is sent
+        self._q = queue.Queue() if threaded else None
+        self._worker = None
+
+    def _stopped(self):
+        return bool(self.held or self.cut or self.broken)
+
+    def feed(self, piece):
+        """Text as the model writes it. Never raises, and with `threaded` never waits on Slack."""
+        if self._q is None:
+            self._feed_now(piece)
+            return
+        if self._worker is None:
+            self._worker = threading.Thread(target=self._drain, daemon=True)
+            self._worker.start()
+        self._q.put(piece)
+
+    def _drain(self):
+        while True:
+            item = self._q.get()
+            if item is None:
+                return
+            if isinstance(item, threading.Event):
+                item.set()
+                continue
+            self._feed_now(item)
+
+    def flush(self):
+        """Wait until everything fed so far has been handled (the selftest's door)."""
+        if self._q is not None and self._worker is not None and self._worker.is_alive():
+            done = threading.Event()
+            self._q.put(done)
+            done.wait(self.JOIN_SECONDS)
+
+    def _close_input(self):
+        """No more text will come: let the worker finish what it has. A worker that does not finish
+        in time is told to stop sending, and the ending goes on without it."""
+        if self._q is None or self._worker is None:
+            return
+        self._q.put(None)
+        self._worker.join(self.JOIN_SECONDS)
+        if self._worker.is_alive():
+            self.broken = True
+            self.why = self.why or "Slack did not answer in time"
+
+    def _feed_now(self, piece):
+        try:
+            if self._stopped() or not isinstance(piece, str):
+                return
+            self.pending += piece
+            while "\n" in self.pending and not self._stopped():
+                line, self.pending = self.pending.split("\n", 1)
+                self._line(line)
+        except Exception as exc:                                       # noqa: BLE001
+            self.broken = True
+            self.why = self.why or "the stream failed (%s)" % type(exc).__name__
+
+    def _refused(self, exc):
+        self.why = self.why or str(exc)[:120]
+
+    def _line(self, raw):
+        self.raw += len(raw) + 1
+        if self.raw > self.read_max:
+            self.cut = True
+            return
+        held, text = self.judge(raw)
+        if held:
+            self.held = held
+            return
+        if text is None:
+            self.removed_any = True
+            return
+        if not text.strip():
+            if self.lines and not (self.removed_any and self.last_blank):
+                self.blanks += 1
+                self.last_blank = True
+            return
+        added = (self.blanks + 1 + len(text)) if self.lines else len(text)
+        if self.size + added > self.max_chars:
+            self.cut = True
+            return
+        chunk = ("\n" * (self.blanks + 1) + text) if self.lines else text
+        try:
+            if self.ts is None:
+                self.ts = self.slack.start_stream(self.channel, self.thread_ts, chunk,
+                                                  self.user_id, self.team_id)
+                self.started = True
+            else:
+                self.slack.append_stream(self.channel, self.ts, chunk)
+        except BridgeError as exc:
+            self.broken = True
+            self._refused(exc)
+            return
+        self.lines.extend([""] * self.blanks + [text])
+        self.size += added
+        self.blanks, self.last_blank = 0, False
+
+    def _finish_line(self):
+        """The turn is over: a last line with no newline after it is whole."""
+        if self.pending and not self._stopped():
+            line, self.pending = self.pending, ""
+            try:
+                self._line(line)
+            except Exception as exc:                                   # noqa: BLE001
+                self.broken = True
+                self.why = self.why or "the stream failed (%s)" % type(exc).__name__
+
+    def _stop(self, ts):
+        try:
+            self.slack.stop_stream(self.channel, ts)
+        except BridgeError as exc:
+            self._refused(exc)
+
+    def _end(self, target):
+        self._close_input()
+        ts = self.ts
+        if ts is None:
+            return False
+        self.ts, self.final_ts = None, ts
+        self._stop(ts)
+        try:
+            self.slack.update_message(self.channel, ts, target)
+            return True
+        except BridgeError as exc:
+            self._refused(exc)
+        try:
+            self.slack.delete_message(self.channel, ts)
+        except BridgeError as exc:
+            self._refused(exc)
+        self.final_ts = None
+        return False
+
+    def settle(self, words):
+        self._close_input()
+        self._finish_line()
+        return self._end(words)
+
+    def replace(self, text):
+        return self._end(text)
+
+    def discard(self):
+        self._close_input()
+        ts = self.ts
+        if ts is None:
+            return
+        self.ts = None
+        self._stop(ts)
+        try:
+            self.slack.delete_message(self.channel, ts)
+        except BridgeError as exc:
+            self._refused(exc)
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════
@@ -477,6 +712,220 @@ def selftest():
     check("real-slack:a-write-that-fails-is-an-error", str(got),
           "BridgeError: Slack chat.delete failed (URLError)")
 
+    # 3c. THE STREAM'S FOUR CALLS (KIT-565): what each sends, and Slack's word when it refuses.
+    got, sent = through(lambda _u, _p: {"ok": True, "ts": "7.0"},
+                        lambda: slack.start_stream("D0DM000001", "1.0", "first line", ALICE, TEAM))
+    check("real-slack:start-stream-opens-in-the-thread-for-the-member",
+          (got, sent[0][0].endswith("/chat.startStream"), sent[0][2], sent[0][1].get("Authorization")),
+          ("7.0", True, {"channel": "D0DM000001", "thread_ts": "1.0", "markdown_text": "first line",
+                         "recipient_user_id": ALICE, "recipient_team_id": TEAM}, "Bearer xoxb-test"))
+    got, _s = through(lambda _u, _p: {"ok": True}, lambda: slack.start_stream("D1", "1.0", "x", ALICE, TEAM))
+    check("real-slack:a-stream-that-opens-with-no-message-is-an-error",
+          str(got), "BridgeError: Slack chat.startStream gave no message")
+    got, sent = through(lambda _u, _p: {"ok": True}, lambda: slack.append_stream("D1", "7.0", "\nmore"))
+    check("real-slack:append-stream-names-the-message-and-the-text",
+          (got, sent[0][0].endswith("/chat.appendStream"), sent[0][2]),
+          (None, True, {"channel": "D1", "ts": "7.0", "markdown_text": "\nmore"}))
+    got, sent = through(lambda _u, _p: {"ok": True}, lambda: slack.stop_stream("D1", "7.0"))
+    check("real-slack:stop-stream-sends-no-text",
+          (got, sent[0][0].endswith("/chat.stopStream"), sent[0][2]),
+          (None, True, {"channel": "D1", "ts": "7.0"}))
+    got, sent = through(lambda _u, _p: {"ok": True}, lambda: slack.update_message("D1", "7.0", "the words"))
+    check("real-slack:update-names-the-message-and-the-words",
+          (got, sent[0][0].endswith("/chat.update"), sent[0][2]),
+          (None, True, {"channel": "D1", "ts": "7.0", "text": "the words"}))
+    got, _s = through(lambda _u, _p: {"ok": False, "error": "message_not_in_streaming_state"},
+                      lambda: slack.append_stream("D1", "7.0", "x"))
+    check("real-slack:a-refused-append-is-an-error-naming-slacks-word", str(got),
+          "BridgeError: Slack chat.appendStream refused: message_not_in_streaming_state")
+
+    # 3d. THE ANSWER STREAM (KIT-565), against a Slack that records every call. The judge here
+    #     stands in for the bridge's: it holds a line with SECRET in it, leaves out a line with
+    #     TYPE THIS, and shows the rest in capitals so what was sent is told from what was fed.
+    class Recorder(object):
+        def __init__(self, fail=()):
+            self.calls, self.fail = [], set(fail)
+
+        def _do(self, name, *args):
+            self.calls.append((name,) + args)
+            if name in self.fail:
+                raise BridgeError("Slack %s refused: simulated" % name)
+
+        def start_stream(self, channel, thread, text, user, team):
+            self._do("start", channel, thread, text, user, team)
+            return "7.0"
+
+        def append_stream(self, channel, ts, text):
+            self._do("append", ts, text)
+
+        def stop_stream(self, channel, ts):
+            self._do("stop", ts)
+
+        def update_message(self, channel, ts, text):
+            self._do("update", ts, text)
+
+        def delete_message(self, channel, ts):
+            self._do("delete", ts)
+
+    def judge(raw):
+        if "SECRET" in raw:
+            return "a credential shape", None
+        if "TYPE THIS" in raw:
+            return "", None
+        return "", raw.upper()
+
+    def stream(slack_, **kw):
+        return AnswerStream(slack_, "D1", "1.0", kw.get("judge", judge), ALICE, TEAM,
+                            kw.get("max_chars", 100), kw.get("read_max", 400))
+
+    def sent_text(rec):
+        return "".join(c[3] if c[0] == "start" else c[2]
+                       for c in rec.calls if c[0] in ("start", "append"))
+
+    rec = Recorder()
+    st = stream(rec)
+    st.feed("one\ntw")
+    check("stream:nothing-is-sent-until-a-line-is-whole",
+          [c[0] for c in rec.calls], ["start"])
+    check("stream:the-first-line-opens-the-stream-in-the-thread-for-the-member",
+          rec.calls[0], ("start", "D1", "1.0", "ONE", ALICE, TEAM))
+    st.feed("o\nthree")
+    check("stream:the-next-whole-line-is-appended-with-its-newline-first",
+          [c[:3] for c in rec.calls[1:]], [("append", "7.0", "\nTWO")])
+    check("stream:a-line-with-no-newline-yet-is-not-sent", sent_text(rec), "ONE\nTWO")
+    check("stream:the-last-line-is-sent-when-the-turn-ends-and-the-message-is-always-updated-to-the-"
+          "words-even-when-the-lines-sent-already-read-as-them",
+          (st.settle("ONE\nTWO\nTHREE"), [c[0] for c in rec.calls], rec.calls[-1], st.final_ts),
+          (True, ["start", "append", "append", "stop", "update"],
+           ("update", "7.0", "ONE\nTWO\nTHREE"), "7.0"))
+
+    rec = Recorder()
+    st = stream(rec)
+    st.feed("keep\nTYPE THIS now\nkeep two\n")
+    check("stream:a-line-the-judge-leaves-out-is-never-sent-and-leaves-nothing-behind",
+          (sent_text(rec), st.lines), ("KEEP\nKEEP TWO", ["KEEP", "KEEP TWO"]))
+
+    rec = Recorder()
+    st = stream(rec)
+    st.feed("\n\nfirst\n\n\nsecond\nTYPE THIS\n\n\nthird\n\n\n")
+    check("stream:blank-lines-are-trimmed-and-folded-as-the-whole-answer-path-does",
+          st.lines, ["FIRST", "", "", "SECOND", "", "THIRD"])
+    check("stream:trailing-blank-lines-are-never-sent", sent_text(rec).endswith("THIRD"), True)
+
+    rec = Recorder()
+    st = stream(rec)
+    st.feed("fine\nthe SECRET is here\nnever sent\n")
+    check("stream:a-line-that-looks-like-a-secret-stops-the-stream-and-nothing-after-it-is-sent",
+          (st.held, sent_text(rec), [c[0] for c in rec.calls]),
+          ("a credential shape", "FINE", ["start"]))
+    st.feed("more\n")
+    check("stream:a-stopped-stream-takes-no-more", [c[0] for c in rec.calls], ["start"])
+    check("stream:a-held-stream-is-replaced-by-the-held-back-line-in-the-same-message",
+          (st.replace("I did not pass that on."), rec.calls[1:], st.final_ts),
+          (True, [("stop", "7.0"), ("update", "7.0", "I did not pass that on.")], "7.0"))
+
+    rec = Recorder()
+    st = stream(rec)
+    st.feed("a secret SECRET first line\n")
+    check("stream:a-secret-in-the-first-line-sends-nothing-at-all",
+          (rec.calls, st.started, st.replace("held")), ([], False, False))
+
+    rec = Recorder()
+    st = stream(rec)
+    st.feed("one\ntwo\n")
+    check("stream:words-that-differ-from-what-was-streamed-are-made-exact-by-an-update",
+          (st.settle("ONE\nTWO (the whole path's words)"), rec.calls[-2:]),
+          (True, [("stop", "7.0"), ("update", "7.0", "ONE\nTWO (the whole path's words)")]))
+
+    rec = Recorder(fail=("update",))
+    st = stream(rec)
+    st.feed("one\n")
+    check("stream:when-slack-will-not-update-the-message-it-is-removed-and-the-caller-posts",
+          (st.settle("different"), [c[0] for c in rec.calls], st.final_ts, st.why),
+          (False, ["start", "stop", "update", "delete"], None,
+           "Slack update refused: simulated"))
+
+    rec = Recorder()
+    st = stream(rec)
+    st.feed("one\n")
+    check("stream:a-turn-that-gave-no-answer-removes-what-was-streamed",
+          ([st.discard(), [c[0] for c in rec.calls]][1]), ["start", "stop", "delete"])
+
+    for name, fails, want_calls, want_why in (
+            ("start", ("start",), ["start"], "Slack start refused: simulated"),
+            ("append", ("append",), ["start", "append"], "Slack append refused: simulated")):
+        rec = Recorder(fail=fails)
+        st = stream(rec)
+        st.feed("one\ntwo\nthree\n")
+        check("stream:a-refused-%s-stops-the-stream-and-says-slacks-word" % name,
+              ([c[0] for c in rec.calls], st.why, st.broken), (want_calls, want_why, True))
+    rec = Recorder(fail=("start",))
+    st = stream(rec)
+    st.feed("one\n")
+    check("stream:a-stream-slack-refused-to-open-leaves-nothing-to-settle-and-the-caller-posts",
+          (st.settle("ONE"), [c[0] for c in rec.calls]), (False, ["start"]))
+    rec = Recorder(fail=("stop",))
+    st = stream(rec)
+    st.feed("one\n")
+    check("stream:a-stop-slack-refuses-is-said-and-the-message-is-still-made-exact",
+          (st.settle("ONE"), st.why, st.final_ts), (True, "Slack stop refused: simulated", "7.0"))
+
+    rec = Recorder()
+    st = stream(rec, max_chars=12)
+    st.feed("aaaa\nbbbb\ncccc\n")
+    check("stream:a-line-past-the-length-the-answer-may-show-stops-the-stream",
+          (st.lines, st.cut), (["AAAA", "BBBB"], True))
+    rec = Recorder()
+    st = stream(rec, read_max=9)
+    st.feed("aaaa\nbbbb\ncccc\n")
+    check("stream:text-past-the-read-cap-is-never-judged", (st.lines, st.cut),
+          (["AAAA"], True))
+
+    # a slow Slack never holds up the reader of the CLI's output (KIT-565 review)
+    import time as _time
+
+    class SlowRecorder(Recorder):
+        def append_stream(self, channel, ts, text):
+            _time.sleep(0.2)
+            Recorder.append_stream(self, channel, ts, text)
+    rec = SlowRecorder()
+    st = AnswerStream(rec, "D1", "1.0", judge, ALICE, TEAM, 100, 400, threaded=True)
+    t0 = _time.monotonic()
+    for piece in ("one\n", "two\n", "three\n", "four\n"):
+        st.feed(piece)
+    fed_in = _time.monotonic() - t0
+    check("stream:threaded-feeding-never-waits-on-slack",
+          (fed_in < 0.15, len(rec.calls) < 5), (True, True))
+    check("stream:threaded-the-ending-waits-for-the-worker-and-the-message-is-exact",
+          (st.settle("ONE\nTWO\nTHREE\nFOUR"), st.lines, [c[0] for c in rec.calls][-2:]),
+          (True, ["ONE", "TWO", "THREE", "FOUR"], ["stop", "update"]))
+    rec = Recorder()
+    st = AnswerStream(rec, "D1", "1.0", judge, ALICE, TEAM, 100, 400, threaded=True)
+    st.feed("a\nb\n")
+    st.flush()
+    check("stream:threaded-flush-waits-until-what-was-fed-is-handled",
+          [c[0] for c in rec.calls], ["start", "append"])
+    st.discard()
+    check("stream:threaded-discard-removes-what-was-streamed",
+          [c[0] for c in rec.calls][-2:], ["stop", "delete"])
+    rec = Recorder()
+    st = AnswerStream(rec, "D1", "1.0", judge, ALICE, TEAM, 100, 400, threaded=True)
+    st.feed("fine\nthe SECRET is here\nnever sent\n")
+    check("stream:threaded-a-secret-stops-it-as-before",
+          (st.replace("held") and st.held != "", [c[0] for c in rec.calls], rec.calls[-1]),
+          (True, ["start", "stop", "update"], ("update", "7.0", "held")))
+
+    calls_judged = []
+
+    def boom(raw):
+        calls_judged.append(raw)
+        raise ValueError("a fault in the judge")
+    rec = Recorder()
+    st = stream(rec, judge=boom)
+    st.feed("one\n")
+    check("stream:a-fault-in-the-judge-never-raises-and-sends-nothing",
+          (rec.calls, st.broken, st.why), ([], True, "the stream failed (ValueError)"))
+
     # 4. THE ERROR carries its exit code: the bridge's error code unless one is given.
     check("bridge-error-codes", (BridgeError("x").code, BridgeError("x", 2).code,
                                  str(BridgeError("said"))), (EXIT_ERROR, 2, "said"))
@@ -487,8 +936,9 @@ def selftest():
                        "commentCreate") if w in body], [])
     check("only-these-slack-methods",
           sorted(set(re.findall(r'["/]([a-z]+(?:\.[a-zA-Z]+)+)"', body))),
-          ["apps.connections.open", "assistant.threads.setStatus", "auth.test", "chat.delete",
-           "chat.postMessage", "conversations.history", "conversations.open",
+          ["apps.connections.open", "assistant.threads.setStatus", "auth.test",
+           "chat.appendStream", "chat.delete", "chat.postMessage", "chat.startStream",
+           "chat.stopStream", "chat.update", "conversations.history", "conversations.open",
            "conversations.replies", "users.info"])
     check("one-http-call", (body.count("_OPENER.open("), body.count("urlopen(")), (1, 0))
 

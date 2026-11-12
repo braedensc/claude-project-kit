@@ -43,7 +43,7 @@ if HERE not in sys.path:
 
 import pipeline_notify_local as notify  # noqa: E402
 import pipeline_tech_lead_turn as turn  # noqa: E402  (KIT-489: the tech lead's own turn)
-from pipeline_bridge_transport import BridgeError  # noqa: E402
+from pipeline_bridge_transport import AnswerStream, BridgeError  # noqa: E402
 from pipeline_bridge_config import (EXIT_USAGE, OPEN, TICKET_RE, key_of,  # noqa: E402
                                     ts_float)
 from pipeline_bridge_config import WRITER_POST_SECONDS  # noqa: E402
@@ -195,11 +195,11 @@ def plain_links(text, hosts):
     return _LINK_RE.sub(one, text or ""), len(made)
 
 
-def _uncut_words(raw, hosts):
-    """(text, n): the chat bot's reply before its cut. Every mention, broadcast and channel
-    link made plain text, so the post notifies nobody but the member whose DM it is: settled
-    to a fixed point, since removing one sequence can join the pieces of another. Then each
-    link to anywhere but `hosts` made plain (plain_links, KIT-343)."""
+def _plain_words(raw, hosts):
+    """(text, n): `raw` with every mention, broadcast and channel link made plain text, so the
+    post notifies nobody but the member whose DM it is: settled to a fixed point, since removing
+    one sequence can join the pieces of another. Then each link to anywhere but `hosts` made
+    plain (plain_links, KIT-343). Nothing is trimmed: a streamed line keeps its indent (KIT-565)."""
     text = raw or ""
     for _ in range(notify.RELAY_CLEAN_MAX_ROUNDS):
         settled = _SLACK_CONTROL_RE.sub(_plain_control, text)
@@ -207,8 +207,21 @@ def _uncut_words(raw, hosts):
             break
         text = settled
     # Belt and braces: anything still opening a control sequence loses its bracket.
-    text, made = plain_links(re.sub(r"<(?=[@!#])", "", text), hosts)
+    return plain_links(re.sub(r"<(?=[@!#])", "", text), hosts)
+
+
+def _uncut_words(raw, hosts):
+    """(text, n): the chat bot's reply before its cut, made plain (_plain_words) and trimmed."""
+    text, made = _plain_words(raw, hosts)
     return text.strip(), made
+
+
+def stream_line(line, hosts):
+    """One whole line of an answer as the stream may show it (KIT-565), or None when it is left
+    out: exactly the steps tech_lead_words takes, one line at a time. The line is made plain as
+    the whole answer is, and a line that tells him what to type is taken out and leaves nothing."""
+    text, _made = _plain_words(line, hosts)
+    return None if _TELLS_HOW_RE.search(text) else text
 
 
 def drop_telling_lines(text):
@@ -409,6 +422,38 @@ class TechLeadMixin(object):
         """The turn runs through this, so a case can stand in for the CLI (KIT-489)."""
         return turn.run_turn(*args, **kwargs)
 
+    def stream_judge(self, raw):
+        """(held, text) for one whole line of an answer, for the stream (KIT-565): every check the
+        whole-answer path makes, on the one line. `held` is the reason a line that looks like a
+        credential stops the stream; `text` is the line as it may be shown, or None when it is
+        left out. The redaction a post gets is applied here too."""
+        hosts = self.cfg["tech_lead_link_hosts"]
+        held = withheld([raw], hosts)
+        if held:
+            return held, None
+        text = stream_line(raw, hosts)
+        return "", None if text is None else self.clean(text)
+
+    def open_stream(self, channel, msg):
+        """The stream for this turn's answer, or None (KIT-565): only with `stream_answers` on,
+        in the thread the push job answers in, and never in a dry run."""
+        if not (self.cfg.get("stream_answers") is True and self.reply_thread and not self.dry
+                and channel == self.reply_channel):
+            return None
+        return AnswerStream(self.slack, channel, self.reply_thread, self.stream_judge,
+                            msg.get("user"), (self.me or {}).get("team_id"),
+                            TECH_LEAD_MAX_CHARS, RELAY_READ_MAX, threaded=True)
+
+    def stream_told(self, stream):
+        """What a stream came to, counted (KIT-565): the heartbeat and the pass's line say it. A
+        stream Slack refused is said with Slack's own word, and its answer went out whole."""
+        if stream.started:
+            self.counts["streamed"] = self.counts.get("streamed", 0) + 1
+        if stream.why:
+            self.counts["stream_refused"] = self.counts.get("stream_refused", 0) + 1
+            self.stream_why = stream.why
+            self.say("  the answer stream: %s; the answer went out whole" % stream.why)
+
     def read_outbox(self):
         """What the tool server's acting tools recorded during the turn, read once and
         removed (KIT-511). A case stands in for it, as for run_turn."""
@@ -441,27 +486,53 @@ class TechLeadMixin(object):
         # Counted before it runs, so a crash cannot be a way round the hourly limit.
         self.state["forwarded_at"].append(self.now)
         self.save()
-        res = self.run_turn(dict(self.cfg, turn_timeout_seconds=seconds), text,
-                            sessions.get(skey), self.now, **({"note": note} if note else {}))
-        # Read once, whatever the turn did: a turn that failed after the tools ran leaves no
-        # action waiting. What it recorded is asked about only after its reply is posted.
-        acts, left_out = self.read_outbox()
-        hosts = self.cfg["tech_lead_link_hosts"]
-        words, made, held, removed = "", 0, "", 0
-        if res["text"]:
-            held = withheld([res["text"]], hosts)
-            if not held:
-                words, made, removed = tech_lead_words(res["text"], hosts)
-        if removed:
-            # KIT-558: nothing of it in the chat; counted in the heartbeat, where the watcher reads.
-            self.counts["lines_left_out"] = self.counts.get("lines_left_out", 0) + removed
-            self.say("  left %d line(s) out of a turn's answer: they told him what to type"
-                     % removed)
-        if res["session_id"] and res["text"]:
-            sessions[skey] = {"id": res["session_id"], "last_at": self.now}
+        stream = self.open_stream(channel, msg)
+        more = {"note": note} if note else {}
+        if stream:
+            more["on_text"] = stream.feed
+        # Everything from the turn to the stream's ending is under one guard: a fault anywhere in it
+        # (the turn, the outbox, the checks, the redaction) removes the half-written message
+        # instead of leaving a stream open in the thread.
+        try:
+            res = self.run_turn(dict(self.cfg, turn_timeout_seconds=seconds), text,
+                                sessions.get(skey), self.now, **more)
+            # Read once, whatever the turn did: a turn that failed after the tools ran leaves no
+            # action waiting. What it recorded is asked about only after its reply is posted.
+            acts, left_out = self.read_outbox()
+            hosts = self.cfg["tech_lead_link_hosts"]
+            words, made, held, removed = "", 0, "", 0
+            if res["text"]:
+                held = withheld([res["text"]], hosts)
+                if not held:
+                    words, made, removed = tech_lead_words(res["text"], hosts)
+            if removed:
+                # KIT-558: nothing of it in the chat; counted in the heartbeat, where the watcher reads.
+                self.counts["lines_left_out"] = self.counts.get("lines_left_out", 0) + removed
+                self.say("  left %d line(s) out of a turn's answer: they told him what to type"
+                         % removed)
+            if res["session_id"] and res["text"]:
+                sessions[skey] = {"id": res["session_id"], "last_at": self.now}
+            # KIT-565: what was streamed ends as exactly the message the whole-answer path would have
+            # posted, or as the held-back line, or not at all; True means Slack holds it already.
+            in_place = False
+            if stream:
+                if held:
+                    in_place = stream.replace(TL_WITHHELD_BIND)
+                elif words:
+                    in_place = stream.settle(self.clean(words))
+                else:
+                    stream.discard()
+                self.stream_told(stream)
+                if in_place:
+                    self.state["posted"][key_of(channel, stream.final_ts)] = self.now
+        except BaseException:
+            if stream:
+                stream.discard()
+            raise
         if held:
-            self.post(channel, None, "", kind="tl-withheld", bind=TL_WITHHELD_BIND,
-                      in_thread=True)
+            if not in_place:
+                self.post(channel, None, "", kind="tl-withheld", bind=TL_WITHHELD_BIND,
+                          in_thread=True)
             self.mark(channel, msg, "turn answer withheld")
             self.say("  did not pass on a turn's answer: it has %s" % held)
             self.drop_recorded(acts, left_out)
@@ -472,8 +543,10 @@ class TechLeadMixin(object):
                 threads[key_of(channel, self.reply_thread)] = self.now
                 for old in sorted(threads, key=threads.get)[:-TURN_THREADS_KEPT]:
                     del threads[old]
-            self.tech_lead_posted(channel, self.post(channel, None, words, in_thread=True),
-                                  words)
+            # The tech lead's own words, recorded with the tickets they name, wherever they landed:
+            # the streamed message made exact in place, or the whole-answer post (KIT-492).
+            ts = stream.final_ts if in_place else self.post(channel, None, words, in_thread=True)
+            self.tech_lead_posted(channel, ts, words)
             if made:
                 self.post(channel, None, "", kind="tl-links-plain", bind=TL_LINKS_PLAIN_BIND,
                           in_thread=True)
@@ -1917,6 +1990,165 @@ def cases_tech_lead(kit):
                     [(k, st, sp) for k, _t, st, sp in open_questions(c)])
         check("outbox-the-bridges-own-hourly-limit-still-applies-to-what-a-turn-records",
               outcome(case_outbox_hourly), (3, True, [("plan", "open", True)]))
+
+
+        # -- KIT-565: the stream. Every filter the whole-answer path applies is applied to each
+        #    line before Slack sees it, so a streamed answer is the answer that path would post.
+        #    A Slack that holds one message per stream stands in for the real one.
+        from pipeline_bridge_transport import AnswerStream
+
+        class StreamSlack(object):
+            def __init__(self):
+                self.text, self.calls, self.open = None, [], False
+
+            def start_stream(self, channel, thread, text, user, team):
+                self.calls.append("start")
+                self.text, self.open = text, True
+                return "7.0"
+
+            def append_stream(self, channel, ts, text):
+                self.calls.append("append")
+                self.text += text
+
+            def stop_stream(self, channel, ts):
+                self.calls.append("stop")
+                self.open = False
+
+            def update_message(self, channel, ts, text):
+                self.calls.append("update")
+                self.text = text
+
+            def delete_message(self, channel, ts):
+                self.calls.append("delete")
+                self.text = None
+
+        hosts_ok = ["github.com"]
+
+        def real_judge(raw):
+            held = withheld([raw], hosts_ok)
+            if held:
+                return held, None
+            line = stream_line(raw, hosts_ok)
+            return "", line
+
+        def fed(answer, judge=real_judge, pieces=7):
+            """The answer fed in small pieces, as the CLI gives it, and not yet ended."""
+            slack = StreamSlack()
+            st = AnswerStream(slack, "D1", "1.0", judge, "U1", "T1", TECH_LEAD_MAX_CHARS,
+                              RELAY_READ_MAX)
+            for i in range(0, len(answer), pieces):
+                st.feed(answer[i:i + pieces])
+            return slack, st
+
+        def streamed(answer, judge=real_judge, pieces=7):
+            """The answer fed, then ended as the bridge ends one that was not held back: what
+            Slack holds, whether the stream had to be updated to get there, whether Slack holds
+            the message, and the stream."""
+            slack, st = fed(answer, judge, pieces)
+            words = tech_lead_words(answer, hosts_ok)[0]
+            ok = st.settle(words)
+            return slack.text, "update" in slack.calls, ok, st
+
+        battery = {
+            "plain": "PROD-6 is ready.\nIt waits on PROD-5.\nNothing else.",
+            "no final newline": "One line only",
+            "blank runs": "\n\nfirst\n\n\nsecond\n\n",
+            "indent kept": "Two plans:\n  - PROD-6 is ready\n    and tested\n  - PROD-5 waits",
+            "a line that tells him what to type": "I asked.\nType approve PROD-6 to start it.\nBack soon.",
+            "removal folds the blank run": "A\n\nType approve PROD-6 now.\n\n\nB",
+            "every line tells him": "Reply with yes PROD-6.\nSend `plan PROD-5`.",
+            "a link to a site not allowed": "See evil.example.com/x and <https://evil.example.com|here> too.",
+            "a link to an allowed site": "See https://github.com/acme/app/pull/3 now.",
+            "mentions and broadcasts": "Ask <@U0BOSS001> or <!channel> about <#C0ROOM0001|room>.",
+            "markup split by a bracket": "A < b and c > d, <@U1",
+        }
+        want_equal = {}
+        for name, answer in battery.items():
+            words = tech_lead_words(answer, hosts_ok)[0]
+            final, updated, ok, st = streamed(answer)
+            want_equal[name] = (final, updated, ok)
+            check("stream-the-lines-sent-are-the-whole-answers-words:%s" % name,
+                  ("\n".join(st.lines) == words, final == words if words else final is None, ok),
+                  (True, True, bool(words)))
+        check("stream-the-message-is-always-updated-to-the-words-so-it-is-Slack-markup-as-the-whole-"
+              "answer-path-posts-it, whenever anything was streamed",
+              [n for n, (_f, upd, _o) in want_equal.items() if not upd],
+              ["every line tells him"])
+
+        # a left-out line leaves nothing in its place, and is counted by the whole-answer path
+        final, _u, _ok, st = streamed(battery["a line that tells him what to type"])
+        check("stream-a-line-that-tells-him-what-to-type-never-reaches-slack-and-leaves-no-note",
+              (final, "approve" in (final or ""), tech_lead_words(
+                  battery["a line that tells him what to type"], hosts_ok)[2]),
+              ("I asked.\nBack soon.", False, 1))
+        final, _u, ok, st = streamed(battery["every line tells him"])
+        check("stream-an-answer-where-every-line-tells-him-sends-nothing-and-the-caller-posts-the-line",
+              (final, ok, st.started), (None, False, False))
+        final, _u, _ok, st = streamed(battery["a link to a site not allowed"])
+        check("stream-links-are-made-plain-line-by-line-exactly-as-the-whole-path-does",
+              (final, "evil.example.com" in final, "[.]" in final,
+               final == tech_lead_words(battery["a link to a site not allowed"], hosts_ok)[0]),
+              (final, False, True, True))
+        final, _u, _ok, st = streamed(battery["mentions and broadcasts"])
+        check("stream-mentions-and-broadcasts-are-made-plain-text-in-each-line",
+              ("<@" in final, "<!" in final, "<#" in final), (False, False, False))
+
+        # an answer past what may be shown is cut by the stream, then made exact in one update
+        longer = "\n".join("line %d of an answer that runs long" % i for i in range(200))
+        final, updated, ok, st = streamed(longer)
+        check("stream-an-answer-past-the-cap-stops-streaming-and-ends-exactly-as-the-cut-answer",
+              (final == tech_lead_words(longer, hosts_ok)[0], updated, ok, st.cut),
+              (True, True, True, True))
+
+        # a secret: held per line, and also found by the whole check when it spans lines
+        key = "sk-ant-api03-" + "Ab1" * 20
+        slack, st = fed("fine\nthe key is %s\nnever sent" % key, pieces=5)
+        check("stream-a-line-that-looks-like-a-secret-stops-the-stream-and-is-never-sent",
+              (st.held != "", key in (slack.text or ""), "never sent" in (slack.text or ""),
+               slack.text), (True, False, False, "fine"))
+        slack, st = fed("one\nthe key is %s\n" % key)
+        st.replace(TL_WITHHELD_BIND)
+        check("stream-the-message-is-replaced-with-the-held-back-line-so-nothing-of-it-stays",
+              (slack.text, slack.calls), (TL_WITHHELD_BIND, ["start", "stop", "update"]))
+        slack, st = fed("before\na run: %s\nafter" % ("A" * 150))
+        check("stream-a-long-run-of-key-characters-in-one-line-stops-the-stream",
+              (st.held != "", "A" * 150 in (slack.text or ""), slack.text), (True, False, "before"))
+
+        # THE MUTANTS: each filter taken away on the streaming path is caught by the battery.
+        def shown(answer, judge=None):
+            final, _upd, _ok, st = streamed(answer, **({"judge": judge} if judge else {}))
+            return final, tuple(st.lines)
+
+        def judge_without(skip):
+            def judge(raw):
+                held = "" if skip == "secret" else withheld([raw], hosts_ok)
+                if held:
+                    return held, None
+                if skip == "type":
+                    return "", _plain_words(raw, hosts_ok)[0]
+                if skip == "links":
+                    return "", None if _TELLS_HOW_RE.search(raw) else raw
+                return "", stream_line(raw, hosts_ok)
+            return judge
+
+        for what, answer, judge in (
+                ("the telling-lines filter dropped", battery["a line that tells him what to type"],
+                 judge_without("type")),
+                ("the links made plain skipped", battery["a link to a site not allowed"],
+                 judge_without("links")),
+                ("the secret check skipped", "fine\nthe key is %s\nnever" % key,
+                 judge_without("secret"))):
+            good = shown(answer)
+            check("mutant: %s on the streaming path is caught" % what,
+                  shown(answer, judge) != good, True)
+
+        check("mutant: a line's indent trimmed is caught",
+              shown(battery["indent kept"], lambda raw: ("", raw.strip()))
+              != shown(battery["indent kept"]), True)
+        check("mutant: a left-out line replaced by a blank is caught",
+              shown(battery["removal folds the blank run"],
+                    lambda raw: ("", "" if _TELLS_HOW_RE.search(raw) else raw))
+              != shown(battery["removal folds the blank run"]), True)
 
 
 def selftest():

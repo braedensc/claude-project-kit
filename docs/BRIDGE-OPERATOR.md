@@ -1324,6 +1324,7 @@ heard, how many events it handled, and how many times it reconnected.
 |---|---|
 | `push_mode` | `true` lets the job run, and makes the pass reply in a thread. Default `false`: the bridge behaves as it always did. It needs `tech_lead_turn`. |
 | `push_token_env` | The NAME of the env var holding the app-level token. Default `BRIDGE_PUSH_APP_TOKEN`. It may not be the bot token's or the tracker key's name. |
+| `stream_answers` | `true` shows the answer in the thread as it is written (*The answer, as it is written*, below). Default `false`: the answer goes out whole. It needs `push_mode`. |
 
 Good: you write *hello*, a status line shows within seconds, and a reply lands in a thread under it.
 Not that: a reply that comes a minute later. Check `push_mode`, then the heartbeat's `connected`.
@@ -1391,6 +1392,48 @@ Not that: the token pasted at the shell, into a ticket or into the conf. It goes
 To turn it off: boot the job out (`launchctl bootout`, then `disable`), set `PUSH_MODE=no`, and run
 `install --apply`. The once-a-minute pass answers as before. The streamed answer (`stream_answers`)
 has no installer key yet.
+
+### The answer, as it is written (KIT-565)
+
+Off by default. With `stream_answers` true (and `push_mode` on), the answer appears in the thread
+a line at a time while the tech lead is still writing it, like a chat app. Nothing raw reaches
+Slack. A line is sent only after it is whole and has passed every check the whole answer gets:
+
+- A line that tells you what to type is left out. It leaves no note in the thread, and it is
+  counted the same way (*N line(s) of replies left out* in the pass's summary).
+- A link to a site you have not allowed is made plain text, one line at a time.
+- A mention, a broadcast and a channel link are made plain text.
+- A line that looks like a password or a key stops the stream. The message is then replaced with
+  the bridge's own held-back line, so nothing of the answer stays in Slack.
+
+When the answer is finished the stream is stopped and the message is updated, always, to exactly the
+text the whole-answer path would have posted. The stream is Slack's markdown and that path posts
+Slack's own markup, so the closing update is what makes the finished message read the same, even
+when the lines already sent were those words. It also cuts a long answer as that path does, and
+drops anything an earlier round of work wrote that the final answer does not hold. The *some links were made plain* note, when it applies, still
+follows as its own message. A turn that fails after it began writing has its half answer removed,
+and the thread gets the one fixed line.
+
+If Slack refuses the stream, or refuses to update it, the answer goes out whole, as it does with the
+key off. The push job's heartbeat then says why, in Slack's own word:
+
+```
+"stream": {"streamed": 12, "refused": 1, "last_refusal": "Slack chat.startStream refused: ..."}
+```
+
+The `stream` block is there only when `stream_answers` is on. The pass's summary line carries the
+same counts.
+
+Good: the answer fills in line by line, and the finished message reads as it would have whole.
+Not that: a line telling you to type a command, a link to an unknown site, or anything shaped like
+a key. If you ever see one, turn `stream_answers` off and tell the build.
+Not that: the same answer twice. A stream Slack refused is posted once, whole.
+
+The lines go to Slack from a worker of their own, so a slow Slack never holds up the turn's
+timeout. A fault anywhere between the turn and the ending removes the half-written message.
+
+Not yet proven: a live DM watched as it streams, and that Slack lets a streamed message be updated
+(its reference does not say). If it will not, the message is removed and the answer posted whole.
 
 ---
 

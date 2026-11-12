@@ -285,7 +285,9 @@ npm run test:bridge-push-setup  # switching instant replies on (KIT-561): the co
                              #   judged (down or too old is no pass; unreadable is UNKNOWN)
 npm run test:bridge-push     # the push-connection job (KIT-560): Slack's Socket Mode, an owner's DM
                              #   acked and answered at once in a thread, a status line, the
-                             #   bridge's lock, reconnects, and the pass as the catch-up
+                             #   bridge's lock, reconnects, and the pass as the catch-up; and the
+                             #   answer streamed line by line (KIT-565): each filter on the line,
+                             #   the secret stop, the refused-stream fallback
 npm run test:bridge-modules  # the rest of the bridge, split by concern (KIT-312): each module's
                              #   own cases and pins (no HTTP call or GraphQL write of its own;
                              #   the tracker calls only the transport's); test:bridge runs all
