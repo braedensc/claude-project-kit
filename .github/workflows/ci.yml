@@ -571,6 +571,11 @@ jobs:
       # yes, then runs the Stage A installer. Refused under a model before it reads anything.
       - name: One-command installer selftest (order, agent-refused, never merges)
         run: python3 scripts/pipeline_install.py --selftest
+      # The one command's asking (KIT-735): one plain question per missing value (the keys' end
+      # dates, the tech lead's name), listed on the consent page, written and read back only after
+      # the yes. Real settings files in a folder of its own; the terminal scripted.
+      - name: One-command asking selftest (missing values, one yes, written and read back)
+        run: python3 scripts/pipeline_ask.py --selftest
       # Every part listed once, as data (KIT-624): each installer and job writer owned, needs
       # acyclic, cards real, commands from a fixed list, and docs/PARTS.md equal to its render.
       - name: Parts list (one row per part, guides named, the page in step)

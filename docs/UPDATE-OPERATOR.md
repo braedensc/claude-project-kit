@@ -211,6 +211,7 @@ Not: `CREDENTIAL_EXPIRIES is not set` once you hold a year-long token, which mea
   session. Exit 0 written; 2 a bad line (named by number), nothing written; 1 the write failed; 3 refused.
   Good: `WRITTEN: 1 date(s) in CREDENTIAL_EXPIRIES; every other line is as it was.`
   Not that: a token pasted as a line. It is refused by line number, and the text is never printed.
+- **The one command asks for these.** `python3 scripts/pipeline_install.py` asks for each missing end date, lists the answers on its consent page, and writes them through `dates --apply` after you type `yes`.
 
 **The two clerks (KIT-286).** The notifier cannot page about itself, and nothing scheduled read the
 monitor's own heartbeat. So each is a kind here, and each opens a GitHub issue, since Slack is what a

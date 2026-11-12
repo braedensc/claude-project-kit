@@ -2591,7 +2591,8 @@
         "idea-gate"
       ],
       "scripts": [
-        "scripts/pipeline_install.py"
+        "scripts/pipeline_install.py",
+        "scripts/pipeline_ask.py"
       ],
       "installer": "scripts/pipeline_install.py",
       "check": null,
@@ -2611,7 +2612,8 @@
       "person_steps": [],
       "ceiling": null,
       "consent": [
-        "Runs each part's installer in order; never merges, approves or labels anything."
+        "Runs each part's installer in order; never merges, approves or labels anything.",
+        "Writes the values you give it (key end dates, your tech lead's name) into your settings files, after you agree."
       ],
       "docs": {
         "guide": "docs/START-HERE.md",

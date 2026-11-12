@@ -40,6 +40,8 @@ A part with its own settings file and installer, such as the work queue or the w
 | It asks | Answer |
 | --- | --- |
 | How should this run go? | `1` for Automatic ("things just work"), `2` for Manual ("show me each change and ask"). Enter keeps the default: the way you chose last time, or Automatic. |
+| What do you want to call your tech lead? | A name, or Enter for `Tech lead`. Asked only when `bridge.conf` names none. It is written to `bridge.conf` after you agree on the consent page, and read back. |
+| The end date of a key | `YYYY-MM-DD`, like `2027-03-15`. For a key that lasts a year, `made YYYY-MM-DD` also works. Enter skips it, or keeps the date on record. Asked for a key with no date, and for one inside its warning (30 days by default) or past. Written to `update.conf` after you agree, and read back. |
 | The consent page: "Type yes to agree" | Read it, then type `yes`. Anything else changes nothing and the command stops with exit 10. It is asked the first time. After that it is asked again only when the mode, a setting or the page's words differ from what you agreed to. |
 | Your Mac password | Type it. Asked once for the whole run, right after you agree, to save the record of your consent where only the administrator can write. |
 | Replace the skills in your home folder? | `y`. |

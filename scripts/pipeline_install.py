@@ -24,6 +24,18 @@ THE FIRST SCREEN, THE CONSENT AND THE RECORD (KIT-717; docs/adr/2026-11-11-one-c
   else can write them. A matching record asks nothing; a difference is shown, old and new, and
   asked again in either mode. A missing or untrusted record is never a match.
 
+THE VALUES ONLY YOU HAVE (KIT-735; scripts/pipeline_ask.py)
+  Between the first screen and the consent page, in both modes, it asks one plain question for
+  each value that is still missing: the end date of each stored key that ends (`update.conf`'s
+  CREDENTIAL_EXPIRIES; a key already inside its warning, or past, is asked again) and the tech
+  lead's name (`bridge.conf`). Enter skips a date, or keeps the one on record; for the name it
+  takes `Tech lead`. Nothing is written yet. The consent page then lists each answer as a file,
+  a key, the old value and the new one, and your one yes covers them. Right after the yes, and
+  before any installer, they are written and read back. Decline and nothing is written. A write
+  that fails stops the run, naming the file. It does not ask again when it has started itself
+  again on new code, and a second run with nothing missing asks nothing. `--update-conf` and
+  `--bridge-conf` (hidden from the help) name the two files; a file that is absent asks nothing.
+
 WHAT IT DOES, IN ORDER
   1. The kit checkout. It must be on its default branch with no uncommitted changes to
      tracked files. It fast-forwards it to origin, and when that moved the code it starts
@@ -374,6 +386,27 @@ class Io(object):
 
     def is_tty(self):
         return sys.stdin.isatty()
+
+    # The values only a person has, and writing them (KIT-735). `kit` is the folder whose
+    # parts list and settings files say which stored keys this Mac has.
+    kit = KIT
+
+    def today(self):
+        """Today's date in UTC, from `now`, so a scripted clock moves it."""
+        import datetime
+        return datetime.date.fromisoformat(self.now()[:10])
+
+    def missing_values(self, update_conf, bridge_conf):
+        """The questions for every value still missing: a read of the two settings files that
+        changes nothing (pipeline_ask.missing_values)."""
+        import pipeline_ask
+        return pipeline_ask.missing_values(update_conf, bridge_conf, self.kit, self.today())
+
+    def write_settings(self, changes):
+        """Write what the person typed and the consent page listed, and read it back. None when
+        all of it is written, else why not, naming the file (pipeline_ask.write_answers)."""
+        import pipeline_ask
+        return pipeline_ask.write_answers(self, changes, self.kit)
 
 
 def heading(io, text):
@@ -737,6 +770,26 @@ def first_screen(io, default):
     return None
 
 
+def step_ask(io, update_conf, bridge_conf):
+    """The changes the person typed, as a list; nothing is written yet (KIT-735). One plain question
+    for each value only a person has that is still missing, in both modes. A file it cannot ask
+    about is said in a line. Prints nothing when nothing is missing and nothing could not be asked."""
+    import pipeline_ask
+    found = io.missing_values(update_conf, bridge_conf)
+    notes = list(getattr(found, "notes", ()))
+    if not found and not notes:
+        return []
+    heading(io, "0b2. Values only you have")
+    for note in notes:
+        io.say(note)
+    if not found:
+        return []
+    io.say("I need %d thing%s from you. Nothing is written until you agree on the next page."
+           % (len(found), "" if len(found) == 1 else "s"))
+    changes, _skipped = pipeline_ask.ask_all(io, found)
+    return changes
+
+
 def parse_conf(text):
     """{KEY: value} from a KEY=value settings file. Comments and anything else are skipped."""
     out = {}
@@ -976,41 +1029,61 @@ def load_record(path, lstat=os.lstat, realpath=os.path.realpath, read=_read_smal
     return "ok", data, ""
 
 
-def step_consent(io, record_path, mode, state, rec, why, cands, files, unreadable):
+def step_consent(io, record_path, mode, state, rec, why, cands, files, unreadable, writes=()):
     """None to carry on, or an exit code. Asks the one consent unless the trusted record
-    already matches this mode, these settings and these words; then writes the record."""
+    already matches this mode, these settings and these words; then writes the record.
+
+    `writes` is what the person typed in the ask (KIT-735). The page lists it after its own lines,
+    and the one yes covers it. It is no part of the page the record keeps, so a date or a name
+    never makes the record differ. When the record matches and there is something to write, only
+    that list is shown, and the yes is for it alone."""
     heading(io, "0c. What this run may do")
     if unreadable:
         return stop(io, "the list of parts could not be read, so there is no consent page to "
                         "agree to. Nothing was changed.", EX_UNMEASURED)
     lines = consent_lines(cands)
     snap = snapshot(io, cands, files)
+    record_needed = True
     if state == "ok":
         diffs = record_diffs(rec, mode, snap, lines)
-        if not diffs:
+        if not diffs and not writes:
             io.say("This matches what you agreed to on %s: the same mode, settings and words. "
                    "Nothing to agree to again." % rec["agreed_at"])
             return None
-        io.say("Since you agreed (%s), this changed:" % rec["agreed_at"])
-        for diff in diffs:
-            io.say("  - %s" % diff)
+        if not diffs:
+            io.say("This matches what you agreed to on %s: the same mode, settings and words."
+                   % rec["agreed_at"])
+            record_needed = False
+        else:
+            io.say("Since you agreed (%s), this changed:" % rec["agreed_at"])
+            for diff in diffs:
+                io.say("  - %s" % diff)
     elif state == "unreadable":
         io.say("The record of your last consent cannot be trusted (%s), so you are asked "
                "again." % why)
     else:
         io.say("There is no record of a consent yet, so you are asked once.")
     io.say("")
-    for line in lines:
-        io.say(line)
-    io.say("")
-    io.say("%s: %s" % (MODE_WORDS[mode], "after you agree it answers its own questions yes. "
-                       "Each installer above may still ask its own."
-                       if mode == MODE_AUTO else
-                       "it shows each change and asks, as before."))
-    reply = io.line("Type yes to agree. Anything else changes nothing: ")
+    if record_needed:
+        for line in lines:
+            io.say(line)
+        io.say("")
+    if writes:
+        import pipeline_ask
+        for line in pipeline_ask.settings_lines(writes) + [""]:
+            io.say(line)
+    if record_needed:
+        io.say("%s: %s" % (MODE_WORDS[mode], "after you agree it answers its own questions yes. "
+                           "Each installer above may still ask its own."
+                           if mode == MODE_AUTO else
+                           "it shows each change and asks, as before."))
+    reply = io.line("Type yes to agree. Anything else changes nothing: " if record_needed else
+                    "Type yes to write these settings. Anything else changes nothing: ")
     if (reply or "").strip().lower() != "yes":
         return stop(io, "nothing was agreed to, so nothing was changed. Run this again when "
                         "you are ready.", EX_BLOCKED)
+    if not record_needed:
+        return None
     if not io.sudo_once("it saves the record of what you agreed to in a folder only the "
                         "administrator can write, so a Claude session cannot edit it."):
         return stop(io, "saving the record needs your Mac password and did not get it. "
@@ -1024,6 +1097,21 @@ def step_consent(io, record_path, mode, state, rec, why, cands, files, unreadabl
     if state != "ok":
         io.say("Saved, but it cannot be trusted yet (%s), so you will be asked again next "
                "time." % why)
+    return None
+
+
+def step_write_settings(io, writes):
+    """None to carry on, or an exit code. Writes what the person typed and the consent page
+    listed, now that they said yes, and reads it back (KIT-735). It runs before any installer."""
+    if not writes:
+        return None
+    io.say("")
+    io.say("Writing the settings listed above.")
+    failed = io.write_settings(writes)
+    if failed:
+        return stop(io, "your settings were not all written: %s. Nothing after this ran. Fix "
+                        "that, then run this again; it asks again for what is still missing."
+                    % failed, 1)
     return None
 
 
@@ -1243,10 +1331,13 @@ def commit_id(value):
 
 
 def step_consent_and_mode(io, record_path, mode, state, rec, why, parts, files, skip_stage_e,
-                          unreadable):
-    """The consent, then (in Automatic) this command's own questions are answered by it."""
+                          unreadable, writes=()):
+    """The consent, then what the person typed is written (KIT-735), then (in Automatic) this
+    command's own questions are answered by it."""
     cands = [] if unreadable else candidates(io, parts, files, skip_stage_e)
-    code = step_consent(io, record_path, mode, state, rec, why, cands, files, unreadable)
+    code = step_consent(io, record_path, mode, state, rec, why, cands, files, unreadable, writes)
+    if code is None:
+        code = step_write_settings(io, writes)
     if code is None:
         io.auto = mode == MODE_AUTO
     return code
@@ -1273,6 +1364,10 @@ def main(argv=None, io=None):
     parser.add_argument("--chosen-mode", default=None, choices=sorted(MODE_WORDS),
                         help=argparse.SUPPRESS)
     parser.add_argument("--consent-record", default=DEFAULT_RECORD, help=argparse.SUPPRESS)
+    parser.add_argument("--update-conf", default=os.path.join(KIT, "update.conf"),
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--bridge-conf", default=os.path.join(KIT, "bridge.conf"),
+                        help=argparse.SUPPRESS)
     parser.add_argument("--selftest", action="store_true")
     args = parser.parse_args(argv)
     if args.selftest:
@@ -1331,8 +1426,22 @@ def main(argv=None, io=None):
                         "type 1 or 2.", EX_BLOCKED)
         return finish(io, parts, rep, files, False, code, True, unreadable)
 
+    # THE ASK (KIT-735). Right after the first screen and before the consent, in both modes: one
+    # plain question for each value only a person has that is still missing. Nothing is written
+    # here; what was typed is listed on the consent page and written after the yes. Not after a
+    # restart on new code (the person answered before it), and not when the parts list is unread.
+    writes = []
+    if not args.pulled_from and not unreadable:
+        try:
+            writes = step_ask(io, os.path.abspath(args.update_conf),
+                              os.path.abspath(args.bridge_conf))
+        except KeyboardInterrupt:
+            code = stop(io, "interrupted while asking, so nothing was changed. Run it again when "
+                            "you are ready.", EX_BLOCKED)
+            return finish(io, parts, rep, files, False, code, True, unreadable)
+
     steps = (lambda: step_consent_and_mode(io, record_path, mode, state, rec, why, parts, files,
-                                           args.skip_stage_e, unreadable),
+                                           args.skip_stage_e, unreadable, writes),
              lambda: step_checkout(io, argv, args.no_pull, rep, args.pulled_from, mode),
              lambda: step_skills(io, rep),
              lambda: step_stage_e(io, files["stage-e.conf"], args.skip_stage_e, rep),
@@ -1371,7 +1480,14 @@ class FakeIo(Io):
         self.record_reads = []
         self.conf = dict(conf or {})
         self.conf_reads = []
-        self.events = []                   # "sudo" and "write", in order
+        # The ask (KIT-735) finds nothing unless a case scripts it, so a machine's own settings
+        # files can never reach a case written before it. Its battery (pipeline_ask.py) puts the
+        # real seams back over files of its own.
+        self.questions = []
+        self.asked_files = []              # (update conf, bridge conf) it was asked to read
+        self.settings_failure = None
+        self.settings_log = []             # the changes it was asked to write
+        self.events = []                   # "sudo", "write" and "settings", in order
         self.sudo_ok = True
         self.write_failure = None
         self.written = []                  # (path, text)
@@ -1475,6 +1591,15 @@ class FakeIo(Io):
     def read_conf(self, path):
         self.conf_reads.append(path)
         return self.conf.get(path)
+
+    def missing_values(self, update_conf, bridge_conf):
+        self.asked_files.append((update_conf, bridge_conf))
+        return self.questions
+
+    def write_settings(self, changes):
+        self.events.append("settings")
+        self.settings_log.append(list(changes))
+        return self.settings_failure
 
     def sudo_once(self, why):
         self.events.append("sudo")

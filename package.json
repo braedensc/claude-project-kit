@@ -40,6 +40,7 @@
     "test:github-app": "python3 scripts/pipeline_github_app.py --selftest",
     "test:stage-a-setup": "python3 scripts/pipeline_stage_a_setup.py --selftest",
     "test:install": "python3 scripts/pipeline_install.py --selftest",
+    "test:ask": "python3 scripts/pipeline_ask.py --selftest",
     "test:parts": "python3 scripts/pipeline_parts.py --selftest && python3 scripts/pipeline_parts.py check",
     "test:chat-lane-setup": "python3 scripts/pipeline_chat_lane_setup.py --selftest",
     "test:model-switch": "python3 scripts/pipeline_model_switch.py --selftest",
