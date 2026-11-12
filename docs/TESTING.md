@@ -237,10 +237,10 @@ the limit is cancelled, and a cancelled run reads as red CI although nothing fai
 took about 7.5 minutes together (6.5 and 1), which put Kit checks at 12.6 to 14.4 minutes against 15. Now they
 run beside the selftests.
 
-**Adding the job to the required checks.** A job that is not required does not block a merge.
-Until the owner adds it, a leak turns the PR red and nothing stops the merge. The owner runs this
-once, after the PR that adds the job has merged and the job has reported on main (a context
-that has never reported wedges every open PR):
+**The job is a required check.** The owner added it on 12 Nov 2026 (KIT-699), so a leak blocks
+the merge. A job that is not required only turns the PR red. A copy of the kit adds it the same
+way: the owner runs this once, after the PR that adds the job has merged and the job has
+reported on that copy's main (a context that has never reported wedges every open PR):
 
 ```bash
 gh api -X POST repos/braedensc/claude-project-kit/branches/main/protection/required_status_checks/contexts -f 'contexts[]=Temp-leak sweeps'
@@ -280,9 +280,9 @@ The Python 3.9 job (`.github/workflows/ci-mac-python.yml`) puts a `python3` link
 `/usr/bin/python3 -V`. It byte-compiles every tracked `.py`, then runs `npm run check:temp-leaks`
 (the hook battery and every other battery, one at a time). A failure turns the PR red.
 
-It is **not a required context until the owner adds it**, the same way as Temp-leak sweeps
-above (context name `Kit checks (Python 3.9, the Mac's)`). If it nears its limit, split the
-job; do not trim batteries.
+It is **not a required context**, so a failure turns the PR red without blocking the merge. The
+owner can add it with the same command as Temp-leak sweeps above, using the context name
+`Kit checks (Python 3.9, the Mac's)`. If it nears its limit, split the job; do not trim batteries.
 
 macOS minutes are free on a public repository. A private copy of the kit is billed for them at
 a high rate (a multiple of the Linux rate), so check the plan before copying this workflow there.
