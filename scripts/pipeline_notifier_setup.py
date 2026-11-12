@@ -1541,16 +1541,32 @@ class SudoOnce(object):
     kept fresh by a daemon thread (`sudo -n -v`, which can never prompt) until this process
     exits. The Stage E installer's shape, with this installer's own words."""
 
-    def __init__(self, validate=None, refresh=None, interval=60):
+    def __init__(self, validate=None, refresh=None, interval=60, probe=None):
         self._validate = validate or (lambda: _sudo_validate())
         self._refresh = refresh or _sudo_refresh
+        # Is a password already live in this terminal? `sudo -n -v` can never prompt.
+        # A session given a stand-in password (a selftest) never probes the real sudo.
+        self._probe = probe or (_sudo_refresh if validate is None else (lambda: 1))
         self._interval = interval
         self.acquisitions = 0
         self.held = False
         self._stop = None
 
+    def _live(self):
+        # Only an exit 0 is live. A password needed, no sudo, or a probe that failed to
+        # look is today's banner and prompt.
+        try:
+            return self._probe() == 0
+        except Exception:
+            return False
+
     def acquire(self, why, resume):
         if self.held:
+            return True
+        if self._live():
+            # ALREADY LIVE — an earlier step of the same run asked a moment ago, in this
+            # terminal. Held and kept fresh, with no second banner claiming to ask again.
+            self._hold()
             return True
         self.acquisitions += 1
         say("")
@@ -1573,6 +1589,10 @@ class SudoOnce(object):
                 % ("`sudo` is not on this machine." if rc == 127 else
                    "`sudo` refused (exit %d): no password, a wrong one, or not an administrator."
                    % rc, _self_path(), resume))
+        self._hold()
+        return True
+
+    def _hold(self):
         self.held = True
         self._stop = threading.Event()
         thread = threading.Thread(target=self._keepalive, name="sudo-keepalive")
@@ -5266,13 +5286,18 @@ def _selftest_body():
         conf_file = os.path.join(root, "good.conf")
         with open(conf_file, "w", encoding="utf-8") as fh:
             fh.write(good_text)
+        # No password live in this terminal either: a CI runner's passwordless sudo would
+        # otherwise answer the real `sudo -n -v` probe and skip the refused prompt.
         saved_validate = globals()["_sudo_validate"]
+        saved_refresh = globals()["_sudo_refresh"]
         globals()["_sudo_validate"] = lambda: 1
+        globals()["_sudo_refresh"] = lambda: 1
         try:
             code, out = quiet(lambda: main(["verify", "--conf", conf_file, "--state",
                                             os.path.join(root, "nopriv")]))
         finally:
             globals()["_sudo_validate"] = saved_validate
+            globals()["_sudo_refresh"] = saved_refresh
         ok("exit: declined administrator access is 5, with nothing attempted",
            code == EX_NOPRIV and "NO ADMINISTRATOR ACCESS" in out and "-- steps --" not in out, out[-500:])
 
@@ -6470,6 +6495,41 @@ def _selftest_body():
         acquire_privilege(person_ctx, "verify", False)
         ok("agent: no administrator password is acquired under a model, and one is in a "
            "person's shell", under_model == [] and len(acquired) == 1, repr(acquired))
+
+        # A password already live in this terminal (`sudo -n -v` exits 0) is held and kept
+        # fresh with no banner; anything else is today's one banner and one prompt.
+        live_v = []
+        live = SudoOnce(validate=lambda: (live_v.append(1), 0)[1], refresh=lambda: 0,
+                        probe=lambda: 0, interval=3600)
+        _lv, live_out = quiet(lambda: [live.acquire("why", "run") for _ in range(3)])
+        live.release()
+        ok("sudo: a live password is held with no banner and no prompt, and kept fresh",
+           live.held and not live_v and live.acquisitions == 0
+           and "ADMINISTRATOR PASSWORD" not in live_out and live._stop is not None,
+           repr((live_v, live_out)))
+
+        def _probe_raises():
+            raise OSError("probe could not look")
+
+        for label, probe in (("needs a password", lambda: 1), ("sudo missing", lambda: 127),
+                             ("probe raised", _probe_raises)):
+            cold_v = []
+            cold = SudoOnce(validate=lambda: (cold_v.append(1), 0)[1], refresh=lambda: 0,
+                            probe=probe, interval=3600)
+            _cv, cold_out = quiet(lambda: [cold.acquire("why", "run") for _ in range(3)])
+            cold.release()
+            ok("sudo: %s is today's one banner and one prompt" % label,
+               len(cold_v) == 1 and cold.acquisitions == 1 and "ONCE" in cold_out
+               and "WHY IT IS NEEDED: why" in cold_out, repr((cold_v, cold_out)))
+        refused = SudoOnce(validate=lambda: 1, refresh=lambda: 0, probe=lambda: 1)
+        try:
+            quiet(lambda: refused.acquire("why", "run"))
+            refused_ok = False
+        except NoPrivilege:
+            refused_ok = not refused.held
+        ok("sudo: a refused password still raises NoPrivilege and holds nothing", refused_ok)
+        ok("sudo: a test double for the password never reaches the real sudo probe",
+           SudoOnce(validate=lambda: 0)._probe() != 0 and SudoOnce()._probe is _sudo_refresh)
 
         cfg_ctx, _f3 = machine_ctx(os.path.join(tmp_root, "mode644"))
         saved_probe = globals()["_probe_credentials"]

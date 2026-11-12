@@ -1303,9 +1303,13 @@ class SudoSession(object):
     it to be killed mid-sleep.
     """
 
-    def __init__(self, validate=None, refresh=None, interval=SUDO_REFRESH_SECONDS):
+    def __init__(self, validate=None, refresh=None, interval=SUDO_REFRESH_SECONDS,
+                 probe=None):
         self._validate = validate or _sudo_validate
         self._refresh = refresh or _sudo_refresh
+        # Is a password already live in this terminal? `sudo -n -v` can never prompt.
+        # A session given a stand-in password (a selftest) never probes the real sudo.
+        self._probe = probe or (_sudo_refresh if validate is None else (lambda: 1))
         self._interval = interval
         self.acquisitions = 0     # `--selftest` asserts this never exceeds 1
         self.refreshes = 0
@@ -1318,6 +1322,12 @@ class SudoSession(object):
         untouched. Idempotent: the second call through any path is a no-op, so
         no code path can turn this back into a prompt per probe."""
         if self.held:
+            return True
+        if self._live():
+            # ALREADY LIVE — an earlier step of the same run asked a moment ago, in this
+            # terminal. Held and kept fresh, with no second banner claiming to ask again.
+            self.held = True
+            self._start_keepalive()
             return True
         self.acquisitions += 1
         say("")
@@ -1350,6 +1360,15 @@ class SudoSession(object):
         self.held = True
         self._start_keepalive()
         return True
+
+    def _live(self):
+        """True only when the probe exits 0. Anything else — a password needed, no
+        sudo, the probe itself failing — is a check that could not see a live password,
+        so the caller asks exactly as before."""
+        try:
+            return self._probe() == 0
+        except Exception:
+            return False
 
     def _start_keepalive(self):
         # At most one keeper at a time. `acquire` already guards on `held`, so
@@ -14087,6 +14106,52 @@ def _selftest_body():
            "a session that forgets it holds access still validated %d time(s) — the "
            "at-most-once check cannot see a prompt per probe" % len(validations2))
 
+    # -- 19a2. a password already live in this terminal is held, not asked again ----
+    # One run of the one command starts several installers; each used to print its own
+    # banner and prompt. A live timestamp (`sudo -n -v` exits 0) is now held silently;
+    # anything else — a password needed, sudo missing, the probe itself raising — is
+    # today's banner and prompt, word for word.
+    cases += 1
+    validationsR = []
+    sudoR = SudoSession(validate=lambda: (validationsR.append(1), 0)[1],
+                        refresh=lambda: 0, probe=lambda: 0, interval=3600)
+    _vR, printedR = _quiet(lambda: [sudoR.acquire("because %d" % i, "run") for i in range(3)])
+    expect("sudo-reuse-live", sudoR.held and not validationsR and sudoR.acquisitions == 0,
+           "a live timestamp was asked for again: %d validation(s)" % len(validationsR))
+    expect("sudo-reuse-live", "ADMINISTRATOR PASSWORD" not in printedR
+           and "WHY IT IS NEEDED" not in printedR,
+           "a live timestamp still printed the password banner: %r" % printedR)
+    expect("sudo-reuse-live", sudoR._thread is not None and sudoR._thread.daemon,
+           "a reused timestamp is not kept fresh by the daemon keep-alive")
+    sudoR.release()
+
+    def _probe_raises():
+        raise OSError("probe could not look")
+
+    for labelN, probeN in (("needs a password", lambda: 1), ("sudo missing", lambda: 127),
+                           ("probe raised", _probe_raises)):
+        validationsN = []
+        sudoN = SudoSession(validate=lambda: (validationsN.append(1), 0)[1],
+                            refresh=lambda: 0, probe=probeN, interval=3600)
+        _vN, printedN = _quiet(lambda: [sudoN.acquire("because %d" % i, "run")
+                                        for i in range(3)])
+        sudoN.release()
+        expect("sudo-reuse-not-live", len(validationsN) == 1 and sudoN.acquisitions == 1
+               and "ONCE" in printedN and "WHY IT IS NEEDED: because 0" in printedN,
+               "%s: not today's one banner and one prompt (%d validation(s))"
+               % (labelN, len(validationsN)))
+    sudoF = SudoSession(validate=lambda: 1, refresh=lambda: 0, probe=lambda: 1)
+    try:
+        _quiet(lambda: sudoF.acquire("because", "run"))
+        failures.append("sudo-reuse-not-live: a refused password did not raise NoPrivilege")
+    except NoPrivilege:
+        expect("sudo-reuse-not-live", not sudoF.held, "a refused password left `held` set")
+    # A test double for the password never touches the real sudo, and the real probe can
+    # never prompt.
+    expect("sudo-reuse-not-live", SudoSession(validate=lambda: 0)._probe() != 0
+           and SudoSession()._probe is _sudo_refresh,
+           "an injected validate falls through to the machine's real sudo probe")
+
     # -- 19b. sudo refused: stop at once, distinctly, having done nothing ----
     cases += 1
     ctxSU, fakeSU, apiSU = _healthy_ctx(conf)
@@ -14248,14 +14313,15 @@ def _selftest_body():
     with open(main_conf, "w") as fh:
         fh.write(GOOD_CONF)
 
-    def _drive(argv):
-        """Run main(argv) with the machine stubbed out; return (rc, order)."""
+    def _drive(argv, live=False):
+        """Run main(argv) with the machine stubbed out; return (rc, order). `live` is
+        whether a password is already live in this terminal (the `sudo -n -v` probe)."""
         del order[:]
         g = globals()
         saved_globals = {k: g[k] for k in ("Runner", "_sudo_validate", "_sudo_refresh")}
         g["Runner"] = lambda dry_run=False: _OrderRunner(dry_run=dry_run)
         g["_sudo_validate"] = lambda: (order.append("acquire"), 0)[1]
-        g["_sudo_refresh"] = lambda: 0
+        g["_sudo_refresh"] = lambda: 0 if live else 1
         try:
             rc, _printed = _quiet(lambda: main(list(argv) + [
                 "--conf", main_conf, "--state", os.path.join(main_tmp, "state")]))
@@ -14279,6 +14345,10 @@ def _selftest_body():
     expect("main-acquires-once", orderD.count("acquire") == 1 and orderD[:1] == ["acquire"],
            "`run --dry-run` through main() acquired %d time(s) and began with %r"
            % (orderD.count("acquire"), (orderD[:1] or ["nothing"])))
+    _rcL, orderL = _drive(["verify"], live=True)
+    expect("main-acquires-once", orderL.count("acquire") == 0 and "probe" in orderL,
+           "`verify` through main() with a password already live asked again %d time(s)"
+           % orderL.count("acquire"))
     for read_only in (["status"], ["card", "CK-1"]):
         _rcQ, orderQ = _drive(read_only)
         expect("main-acquires-once", orderQ.count("acquire") == 0,
