@@ -420,6 +420,76 @@ GOOD_APPROVAL = {
 }
 
 
+def bounce_arg(text):
+    """--bounces: a count, or `unknown`/empty when the workflow could not look it up."""
+    if text in ("", "unknown"):
+        return None
+    try:
+        n = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError("%r is not a count or `unknown`" % text)
+    if n < 0:
+        raise argparse.ArgumentTypeError("a bounce count cannot be negative")
+    return n
+
+
+def bounce_block():
+    """The bounce-count shell of pipeline-auto-merge.yml, exactly as the runner runs it."""
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "templates", "workflows", "pipeline-auto-merge.yml")
+    with open(path, encoding="utf-8") as fh:
+        text = fh.read()
+    start = text.index('PRNUM=$(jq -r .number "$E/pr.json")')
+    end_marker = 'echo "Found $n prior bounce run(s) for PR #$PRNUM."'
+    end = text.index(end_marker, start) + len(end_marker)
+    return "\n".join(line[10:] if line.startswith(" " * 10) else line
+                     for line in text[start:end].splitlines())
+
+
+STUB_GH = """#!/bin/sh
+case "$*" in
+  *pipeline-bounce.yml/runs*)
+    [ "$SCENARIO" = list-fails ] && exit 1
+    if [ "$SCENARIO" = empty ]; then echo '{"workflow_runs":[]}'; else
+      echo '{"workflow_runs":[{"id":11,"created_at":"2026-01-02T00:00:00Z"}]}'; fi ;;
+  *actions/runs/11/jobs*)
+    [ "$SCENARIO" = jobs-fail ] && exit 1
+    if [ "$SCENARIO" = skipped-fix ]; then echo skipped; else echo success; fi ;;
+  *) exit 1 ;;
+esac
+"""
+
+
+def run_bounce_block(scenario):
+    """Run the workflow's bounce block under bash with a stub `gh`; return the bounces= value."""
+    import subprocess
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="auto-merge-bounce-") as tmp:
+        bindir = os.path.join(tmp, "bin")
+        os.makedirs(bindir)
+        gh = os.path.join(bindir, "gh")
+        with open(gh, "w", encoding="utf-8") as fh:
+            fh.write(STUB_GH)
+        os.chmod(gh, 0o755)
+        evidence = os.path.join(tmp, "evidence")
+        os.makedirs(evidence)
+        with open(os.path.join(evidence, "pr.json"), "w", encoding="utf-8") as fh:
+            json.dump({"number": 7, "createdAt": "2026-01-01T00:00:00Z"}, fh)
+        out = os.path.join(tmp, "output")
+        env = dict(os.environ, PATH=bindir + os.pathsep + os.environ.get("PATH", ""),
+                   SCENARIO=scenario, E=evidence, REPO="o/r", GITHUB_OUTPUT=out)
+        subprocess.run(["bash", "-c", "set -uo pipefail\n" + bounce_block()], env=env,
+                       capture_output=True, text=True, timeout=60)
+        try:
+            with open(out, encoding="utf-8") as fh:
+                for line in fh:
+                    if line.startswith("bounces="):
+                        return line.strip().split("=", 1)[1]
+        except OSError:
+            pass
+    return None
+
+
 def selftest():
     import copy
 
@@ -555,6 +625,33 @@ def selftest():
     if len({h["gate"] for h in many["held"]}) < 3:
         failures.append("a PR failing several gates must report all of them, not the first")
 
+    # ── the workflow's bounce lookup (KIT-669): could not look is not zero ───
+    # The block that counts bounces is cut out of the workflow and run under bash against a
+    # stub `gh`, so the test judges the shell the runner runs, not a copy of it.
+    for scenario, want, label in (
+        ("list-fails", "unknown", "a run listing that fails reads unknown"),
+        ("empty", "0", "a listing that succeeds with no runs still reads 0"),
+        ("jobs-fail", "unknown", "a job listing that fails reads unknown"),
+        ("one-bounce", "1", "a run with a fix job for this PR reads 1"),
+        ("skipped-fix", "0", "a skipped fix job is not a bounce"),
+    ):
+        cases[0] += 1
+        got = run_bounce_block(scenario)
+        if got != want:
+            failures.append("%s: bounces=%s, want %s" % (label, got, want))
+    for text, want in (("unknown", None), ("", None), ("0", 0), ("3", 3)):
+        cases[0] += 1
+        if bounce_arg(text) != want:
+            failures.append("--bounces %r parses to %r, want %r" % (text, bounce_arg(text), want))
+    cases[0] += 1
+    try:
+        bounce_arg("-1")
+        failures.append("--bounces -1 must be refused")
+    except argparse.ArgumentTypeError:
+        pass
+    expect("an unknown count (what the workflow now writes) holds",
+           run(bounces=bounce_arg("unknown")), False, "bounces")
+
     if failures:
         print("FAIL: %d of %d auto-merge case(s) failed:" % (len(failures), cases[0]))
         for f in failures:
@@ -573,7 +670,8 @@ def main():
     ap.add_argument("--changed", help="file with one changed path per line (base...head)")
     ap.add_argument("--lines-added", type=int, default=None)
     ap.add_argument("--lines-removed", type=int, default=None)
-    ap.add_argument("--bounces", type=int, default=None, help="prior bounce runs on this branch")
+    ap.add_argument("--bounces", type=bounce_arg, default=None,
+                    help="prior bounce runs on this branch, or `unknown` when they could not be counted")
     ap.add_argument("--merge-state", default="", help="GitHub mergeStateStatus")
     ap.add_argument("--kill-switch", default="", help="PIPELINE_AUTO_MERGE_ENABLED value")
     ap.add_argument("--json", action="store_true", dest="as_json")

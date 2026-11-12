@@ -199,19 +199,34 @@ jobs:
           # with `jobs.fix.name` in pipeline-bounce.yml.
           PRNUM=$(jq -r .number "$E/pr.json")
           PR_CREATED=$(jq -r .createdAt "$E/pr.json")
+          # COULD NOT LOOK is not NOTHING FOUND (§13, KIT-669): a listing that fails must
+          # never become an empty one, because an empty one counts 0 and 0 passes. A failed
+          # lookup writes `bounces=unknown`, which the gate holds on.
           n=0
-          gh api "repos/$REPO/actions/workflows/pipeline-bounce.yml/runs?per_page=100" \
-            > "$E/bounce-runs.json" 2>/dev/null || echo '{"workflow_runs":[]}' > "$E/bounce-runs.json"
-          runs=$(jq -r --arg since "$PR_CREATED" \
-                   '.workflow_runs[] | select($since == "" or .created_at >= $since) | .id' \
-                   "$E/bounce-runs.json")
+          lookup_failed=0
+          if gh api "repos/$REPO/actions/workflows/pipeline-bounce.yml/runs?per_page=100" \
+               > "$E/bounce-runs.json" 2>/dev/null; then
+            runs=$(jq -r --arg since "$PR_CREATED" \
+                     '.workflow_runs[] | select($since == "" or .created_at >= $since) | .id' \
+                     "$E/bounce-runs.json") || lookup_failed=1
+          else
+            runs=""
+            lookup_failed=1
+          fi
           for id in $runs; do
-            if gh api "repos/$REPO/actions/runs/$id/jobs?per_page=50" \
+            if ! fix_jobs=$(gh api "repos/$REPO/actions/runs/$id/jobs?per_page=50" \
                  --jq ".jobs[] | select(.name | startswith(\"Fix PR #$PRNUM (\")) | .conclusion" \
-                 2>/dev/null | grep -qvE '^(skipped)?$'; then
+                 2>/dev/null); then
+              lookup_failed=1
+              break
+            fi
+            if printf '%s\n' "$fix_jobs" | grep -qvE '^(skipped)?$'; then
               n=$((n + 1))
             fi
           done
+          if [ "$lookup_failed" = 1 ]; then
+            n=unknown
+          fi
           echo "bounces=$n" >> "$GITHUB_OUTPUT"
           echo "Found $n prior bounce run(s) for PR #$PRNUM."
 
