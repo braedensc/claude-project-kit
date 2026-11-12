@@ -107,6 +107,7 @@
     "test:acceptance-setup": "python3 scripts/pipeline_acceptance_setup.py --selftest",
     "test:pr-base": "python3 scripts/check_pr_base.py --selftest",
     "test:hooks-path": "python3 scripts/pin_hooks_path.py --selftest",
+    "test:agent-trigger": "python3 scripts/check_agent_trigger_author.py --selftest && python3 scripts/check_agent_trigger_author.py",
     "test:runner-pin": "python3 scripts/check_runner_pin.py --selftest && python3 scripts/check_runner_pin.py",
     "test:stdlib-only": "python3 scripts/check_stdlib_only.py --selftest",
     "lint:stdlib-only": "python3 scripts/check_stdlib_only.py",
