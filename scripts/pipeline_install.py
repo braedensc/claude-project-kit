@@ -53,6 +53,11 @@ and Ctrl-C included; the refusals read nothing, so they print nothing)
   "Only you can do these" and "Sign-offs still asked for", or "Nothing is waiting on you."
   The lines are built as data first, one record per part (id, name, outcome, detail).
 
+  Two limits, plainly. "Off on this Mac" means the part's settings file is not in the kit
+  folder (or the folder you named with --conf and its kin); settings kept elsewhere read as
+  off. Checks that need the Mac password read "could not be measured", because they run
+  without a terminal and cannot ask for it.
+
 Usage:
     pipeline_install.py [--conf stage-a.conf] [--stage-e-conf stage-e.conf]
                         [--no-pull] [--skip-stage-e]
@@ -291,6 +296,14 @@ def default_branch(io):
     return "main"
 
 
+def missing(path):
+    """Where a settings file was looked for, in words: in the kit folder, or the folder it
+    was named in (--conf and its kin can point elsewhere)."""
+    here = os.path.dirname(os.path.abspath(path))
+    where = "the kit folder" if here == KIT else here
+    return "no %s in %s" % (os.path.basename(path), where)
+
+
 def look_first(io, rep, key):
     """The exit code of the part's own read-only check, run before a step that can only
     `run`, so the step can say whether it changed anything. None when the parts list gave
@@ -349,7 +362,7 @@ def step_checkout(io, argv, no_pull, rep):
     io.say("Kit checkout: %s" % KIT)
     if no_pull:
         io.say("Not pulled (--no-pull).")
-        rep.note("checkout", OUT_OK, "used as it is (--no-pull)")
+        rep.note("checkout", OUT_OK, "used as it is, without pulling")
         return None
     want = default_branch(io)
     code, branch = git(io, "rev-parse", "--abbrev-ref", "HEAD")
@@ -423,7 +436,7 @@ def step_stage_e(io, conf, skip, rep):
         rep.note("stage_e", OUT_UNMEASURED, "skipped (--skip-stage-e), so not checked")
         return None
     if not os.path.exists(conf):
-        rep.note("stage_e", OUT_OFF, "no %s" % os.path.basename(conf))
+        rep.note("stage_e", OUT_OFF, missing(conf))
         io.say("Stage E is not set up on this Mac (no %s), so there is nothing to bring up "
                "to date." % os.path.relpath(conf, KIT))
         io.say("The idea gate asks for the dispatcher's details itself.")
@@ -522,7 +535,7 @@ def step_sweep(io, conf, rep):
     run, then loads the job), and that never holds back the idea gate."""
     heading(io, "3b. The sweep, what finished runs leave behind")
     if not os.path.exists(conf):
-        rep.note("sweep", OUT_OFF, "no %s" % os.path.basename(conf))
+        rep.note("sweep", OUT_OFF, missing(conf))
         io.say("No %s, so the sweep is not set up on this Mac. Copy sweep.conf.example to switch it on."
                % os.path.relpath(conf, KIT))
         return None
@@ -608,6 +621,10 @@ def outcome_of_check(code, out):
         return OUT_OK, ""
     if code == EX_BLOCKED:
         return OUT_WAITING, "its check found something outstanding"
+    if code == 5 or (code is not None and re.search(r"password", out or "", re.I)
+                     and re.search(r"need|requir|ask|enter|type", out or "", re.I)):
+        return OUT_UNMEASURED, ("it needs your Mac password, which a check run without a "
+                                "terminal cannot ask for")
     if code is None:
         return OUT_UNMEASURED, "its check did not finish (%s)" % (out or "no reason given")[:120]
     return OUT_UNMEASURED, "its check stopped with exit %d" % code
@@ -642,7 +659,7 @@ def build_records(io, parts, rep, files, reached):
             path = settings_path(part, files)
             if path and not io.exists(path):
                 rec["outcome"] = OUT_OFF
-                rec["detail"] = "no %s" % os.path.basename(path)
+                rec["detail"] = missing(path)
             elif reached and not io.interrupted:
                 argv = check_argv(part, files)
                 if tuple(argv) not in seen:
@@ -1252,6 +1269,10 @@ def selftest():
           any(ln.startswith("No check of their own: ") for ln in io.lines), True)
     check("lines-parts-with-no-check-are-not-records",
           [r for r in io.records if r["id"] == "guards"], [])
+    check("lines-off-detail-says-where-it-looked",
+          [r["detail"] for r in io.records if r["id"] == "paging"], ["no notifier.conf in the kit folder"])
+    check("lines-off-detail-outside-the-kit-names-the-folder",
+          [r["detail"] for r in io.records if r["id"] == "cleanup"], ["no sweep.conf in %s" % tmp])
     check("lines-a-part-off-never-runs-its-check",
           "pipeline_notifier_setup.py run" in io.measured, False)
 
@@ -1332,6 +1353,18 @@ def selftest():
         code = main(base, io=io)
         check("lines-check-%s-is-unmeasured-and-exits-4" % name,
               (by_id(io)["paging"], code), (OUT_UNMEASURED, EX_UNMEASURED))
+    for name, rc, words in (("exit-5", 5, ""), ("its-own-words", 1, "Mac password needed to continue")):
+        io = FakeIo(codes=dict(healthy))
+        io.present = {paging_conf}
+        io.measure_codes = {"pipeline_notifier_setup.py run": rc}
+        io.measure_out = {"pipeline_notifier_setup.py run": words}
+        main(base, io=io)
+        check("lines-password-%s-detail" % name,
+              [r["detail"] for r in io.records if r["id"] == "paging"],
+              ["it needs your Mac password, which a check run without a terminal cannot ask for"])
+    code, io = go(argv=["--no-pull"])
+    check("lines-no-pull-detail", [r["detail"] for r in io.records if r["id"] == "one-command"],
+          ["used as it is, without pulling"])
     code, io = go(argv=["--skip-stage-e"])
     check("lines-skipped-stage-e-is-unmeasured-not-up-to-date",
           (by_id(io)["review"], code), (OUT_UNMEASURED, EX_UNMEASURED))
