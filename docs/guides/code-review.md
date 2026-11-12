@@ -38,9 +38,9 @@ Every string it copies is cleaned first. Routing tags and fence tags in the diff
 
 A diff over the size cap is reviewed in parts. The job withholds whole files, largest first, and files a second ticket for the rest. The comment says which files wait.
 
-### 3. The route check: seconds after filing
+### 3. The route check: right after filing
 
-On a work team, a failed routing read falls back to the coding setup, which can edit and run anything. So the job checks. The session runner posts a routing note at the start of each session. The job reads the earliest one and waits up to two minutes.
+On a work team, a failed routing read falls back to the coding setup, which can edit and run anything. So the job checks. The session runner posts a routing note at the start of each session. The job reads the earliest one. It waits up to two minutes, or five and a half while a repository setup hook runs.
 
 - The note names the review setup: the review is collected.
 - Anything else, or no note: the job cancels the ticket, writes the evidence and pages you.
@@ -151,7 +151,7 @@ An approval claims that someone else read the code. A program supplying one make
 **Where it is thin, today:**
 
 - **"Cannot approve" is a fact about the code, not the key.** The token that posts comments could also post an approval. Nothing does. The tests assert there is no such path.
-- **A misrouted review ticket runs for a few seconds** in the coding setup before the cancel lands.
+- **A misrouted review ticket can run in the coding setup for up to the wait** before the cancel lands. That is two minutes, or five and a half with a setup hook.
 - **A review that could not see the change can read as clean.** Read the summary of every clean review.
 - **A pull request over the size cap gets parts, not one review.** A person reads any part that cannot be made.
 - **Without the app, every comment appears under your login.**

@@ -98,7 +98,7 @@ If the diff is too large for one ticket, the job withholds whole files, largest 
 
 The session runner reads each address with a separate network call, and a failed call counts as "no address". On a work team the fallback is the coding setup, which has hands. That is rare, and it is the one way a diff could meet tools that act.
 
-So the job checks the receipt. The session runner posts a note at the start of every session, before any AI runs, saying which setup answered. The job reads the earliest one. If it names the review setup, fine. If it names anything else, or none arrives in two minutes, the job cancels the ticket, writes down what it saw and pages you. Reviews for that repository stop until the probe is signed again.
+So the job checks the receipt. The session runner posts a note at the start of every session, before any AI runs, saying which setup answered. The job reads the earliest one. The wait is two minutes, or five and a half with a setup hook. If it names the review setup, fine. If it names anything else, or none arrives within the wait, the job cancels the ticket, writes down what it saw and pages you. Reviews for that repository stop until the probe is signed again.
 
 ### Stop 5: the reviewer reads and answers
 
@@ -191,7 +191,7 @@ Four signals, in the order you would look:
 - **No ticket id in the branch name, no review.** A branch named `fix/typo` is skipped, and one comment says so once.
 - **A repository with no `delivery.json` gets advice only.** The comment says a fix pass would start, but none does. You have to read it before merging.
 - **A review that could not see the change can read as clean.** Read the summary of every clean review.
-- **A misrouted ticket runs for seconds.** The check catches it quickly. It does not prevent it.
+- **A misrouted ticket can run for up to the wait.** That is two minutes, or five and a half with a setup hook. The check catches it and collects nothing from it. It does not prevent the run.
 - **The fence is a deny list.** A tool added later reaches the reviewer until someone names it, and a live probe is what catches that.
 - **A review can ask for a fix no session can make.** Anything under `.github/workflows/` is out of a session's reach.
 - **Cost.** Nothing limits what a coding session spends. The fix-round budget is the only cap on the lane.
