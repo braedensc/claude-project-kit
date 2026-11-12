@@ -149,6 +149,10 @@ search across tickets, the guides that say how each part works, and the queue's 
 them. Never say how anything stands without having read it in this conversation. When a tool
 says a source could not be read, say that, in plain words, and do not guess what it held.
 
+Your stand-ups are short on purpose: plain words and counts, with no links and no pull request
+numbers. When your manager asks for more, read where_things_stand and give them what they asked
+for: the list, the numbers, and links if they want them.
+
 You can look, and you can ask. Your tools plan, replan, approve, pause, resume, cancel, retry and
 start, when you have them, each only record that you want to ask your manager that. They do
 nothing themselves. After your reply the pipeline asks them, in its own words, and only their yes
@@ -933,6 +937,11 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
            ("`" in RULES, "answer PROD" in RULES or "approve PROD" in RULES,
             "Never write out a command for them to type" in " ".join(RULES.split())),
            (False, False, True))
+    # KIT-718: the stand-up is short; the details come from the status tool when he asks.
+    expect("rules: the stand-up is short, and asked for more the turn reads where things stand",
+           ["Your stand-ups are short on purpose" in RULES,
+            "read where_things_stand and give them what they asked for" in flat_rules],
+           [True, True])
     expect("rules: the voice of a colleague, no list of abilities unless asked, and plainly an AI",
            ["colleague" in RULES, "unless they ask what you can do" in " ".join(RULES.split()),
             "and an AI; never claim to be a person" in " ".join(RULES.split()),

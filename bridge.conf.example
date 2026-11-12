@@ -159,6 +159,10 @@ TURN_BIN=/opt/homebrew/bin/claude
 #STANDUP_DAYS=mon, tue, wed, thu, fri, sat
 # The status job's file: stage-e.conf's STATUS_FILE, if you set one.
 #STANDUP_STATUS_FILE=~/.stage-e/status/pipeline-status.json
+# Your project's own repositories, OWNER/REPO, comma-separated (KIT-718). The
+# stand-up speaks of their pull requests and the plans of TEAM_KEYS, and no
+# others. Empty: every repository the status file lists.
+#STANDUP_REPOS=acme/app
 # The afternoon wrap's spend (KIT-471). The day plan file adds one line: today's
 # spend against the day's planned load and hard stop. The usage file adds a short
 # week on the weekly day (one of STANDUP_DAYS; empty: the last of them). Empty
