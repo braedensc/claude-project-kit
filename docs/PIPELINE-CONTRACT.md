@@ -2908,23 +2908,24 @@ The verdict is the first of these that matches:
 
 What the validator may approve, as plain on/off switches (KIT-533). The owner decided there is no trust ladder: nothing gains or loses trust by itself, and a switch changes only when a person changes it. Every part of the validator reads the file through `scripts/pipeline_validator_settings.py`'s `load()`, which has no write path. Machine-readable: `schemas/pipeline-validator-settings.schema.json`. Design: `docs/adr/2026-11-05-the-validator-approves-inside-limits-that-code-enforces.md`. The operator guide is `docs/VALIDATOR-OPERATOR.md`.
 
-**Absent is every switch off. So is anything that is not a valid, trusted settings file.** A file that does not parse, names another schema, gives a key twice, misses a key or adds one, is larger than a settings file, or cannot be read means every switch off, every limit 0 and no login, with that reason said. So does a file a session could have written: one inside a git working tree, a link, one writable by group or other, one owned by another account, or one in or under a folder others can write without the sticky bit. It never means on. Absent, invalid and unreadable are decided the same way, toward the safe side, as the hold's are (§20).
+**Absent is every switch off. So is anything that is not a valid, trusted settings file.** A file that does not parse, names another schema or the first version (`/1`, from before `merge_repos`), gives a key twice, misses a key or adds one, lists a repository that is not `owner/name` in lower case, names one twice or more than 100, is larger than a settings file, or cannot be read means every switch off, every limit 0, no login and no repository, with that reason said. So does a file a session could have written: one inside a git working tree, a link, one writable by group or other, one owned by another account, or one in or under a folder others can write without the sticky bit. It never means on. Absent, invalid and unreadable are decided the same way, toward the safe side, as the hold's are (§20).
 
 **No switch for the safety system.** Changes to hooks, guards, CI and workflows, branch protection and rulesets, settings, the watcher and the validator's own limits stay human, fixed in code. A file that names one as a key, anywhere, on or off, is refused: every switch off, said in words.
 
-**Fields only.** Switches, two whole numbers and one bot login of a fixed shape. No free text.
+**Fields only.** Switches, two whole numbers, one bot login and a list of repository names, each of a fixed shape. No free text.
 
-**Whose file it is.** The owner's, under the user's own login, outside every git working tree. Only a person edits it. The example, `validator-settings.example.json`, has every switch off, every limit 0 and no login.
+**Whose file it is.** The owner's, under the user's own login, outside every git working tree. Only a person edits it. The example, `validator-settings.example.json`, has every switch off, every limit 0, no login and no repository listed.
 
 ### The file
 
 | Field | Type | Notes |
 |---|---|---|
-| `schema` | `"pipeline-validator-settings/1"` | A reader that does not know the value treats every switch as off. |
+| `schema` | `"pipeline-validator-settings/2"` | A reader that does not know the value treats every switch as off. The first version, `/1`, has no `merge_repos`, and is read as every switch off, said. |
 | `approve` | approve | What it may approve in the owner's place. |
 | `limits` | limits | How big a change it may approve. |
 | `allow` | allow | Which human-only classes the owner lets it approve. |
 | `stage_e_login` | bot login, or `null` | Stage E's own bot login: the one login whose reviews the evidence trusts. `null`: none yet, so no review is trusted. |
+| `merge_repos` | list of `owner/name` | The repositories where a merge may be approved. Empty: none. |
 
 ### Approve
 
@@ -2958,9 +2959,17 @@ Off keeps a change in that class for the owner, whatever else is on.
 
 The validator's evidence (`scripts/pipeline_validator_evidence.py`, KIT-580) takes the login from what `load()` returns, never from its own code or a flag, and counts a review comment only when its author is exactly that login and a bot. GitHub's GraphQL API names a bot without the suffix, so the evidence gives a bot's login the suffix before it compares. No login, or settings that were not read, means no review is trusted (`review-login-unset`).
 
+### Repositories for merges
+
+`merge_repos` makes the merges switch per project (KIT-604). A merge may be approved only when `approve.merges` is on **and** the pull request's repository is listed. Any other combination is a closed reason, never a pass: the switch off is `switch-off`, and a repository not listed is `repo-not-listed`.
+
+Each entry is `owner/name` as GitHub shapes it, in lower case: an owner of 1 to 39 letters, digits and hyphens that starts with a letter or digit, then a name of 1 to 100 letters, digits, `.`, `_` and `-` that is not `.` or `..` (`^[a-z0-9][a-z0-9-]{0,38}/(?!\.\.?$)[a-z0-9._-]{1,100}$`). Each is listed once, and at most 100. A list that breaks any of these is a file that is not a settings file: every switch off, said in words, and the entry is never quoted back.
+
+One helper gives the answer: `scripts/pipeline_validator_settings.py`'s `merge_allowed(settings, repo)`. It is true only for settings `load()` read, with the merges switch on and the repository listed. GitHub's names ignore case, so it compares the asked repository in lower case, and only when it is plain ASCII. The hard limits ask it, and the merge path asks it too; neither keeps a copy of the rule.
+
 ### Who reads the switches
 
-Today, only `scripts/pipeline_validator_settings.py show`, for a person. The validator's other parts read it through `load()` as they are built: its hard limits, its merge path and its approvals.
+`scripts/pipeline_validator_settings.py show`, for a person, and the hard limits (`scripts/pipeline_validator_limits.py`), which are handed what `load()` returned. The validator's other parts read it through `load()` as they are built: its merge path and its approvals.
 
 ---
 

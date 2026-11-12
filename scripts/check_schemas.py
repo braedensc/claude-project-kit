@@ -829,14 +829,15 @@ VALID_HOLD = {
 }
 
 # §23: the validator's settings as the owner might set them (KIT-533): plans on, the rest off,
-# and Stage E's own bot login (KIT-580).
+# Stage E's own bot login (KIT-580), and one repository where merges may be approved (KIT-604).
 VALID_VALIDATOR_SETTINGS = {
-    "schema": "pipeline-validator-settings/1",
+    "schema": "pipeline-validator-settings/2",
     "approve": {"plans": True, "pieces": False, "merges": False},
     "limits": {"max_changed_lines": 400, "max_files": 20},
     "allow": {"credentials": False, "billing_and_accounts": False, "production_deploy": False,
               "deleting_data": False},
     "stage_e_login": "acme-stage-e[bot]",
+    "merge_repos": ["acme/app"],
 }
 
 # §21: what the acceptance session reports (KIT-531): two problems, one of them high.
@@ -1456,7 +1457,27 @@ FIXTURES = [
     ("pipeline-validator-settings", "a-login-that-is-a-number",
      _with(VALID_VALIDATOR_SETTINGS, "stage_e_login", 7), False, "type"),
     ("pipeline-validator-settings", "wrong-marker",
-     _with(VALID_VALIDATOR_SETTINGS, "schema", "pipeline-validator-settings/2"), False, "const"),
+     _with(VALID_VALIDATOR_SETTINGS, "schema", "pipeline-validator-settings/3"), False, "const"),
+    ("pipeline-validator-settings", "the-first-version",
+     _with(VALID_VALIDATOR_SETTINGS, "schema", "pipeline-validator-settings/1"), False, "const"),
+    ("pipeline-validator-settings", "no-repository-listed",
+     _with(VALID_VALIDATOR_SETTINGS, "merge_repos", []), True, None),
+    ("pipeline-validator-settings", "no-repository-list",
+     _without(VALID_VALIDATOR_SETTINGS, "merge_repos"), False, "required"),
+    ("pipeline-validator-settings", "a-repository-list-that-is-a-string",
+     _with(VALID_VALIDATOR_SETTINGS, "merge_repos", "acme/app"), False, "type"),
+    ("pipeline-validator-settings", "a-repository-that-is-not-owner-name",
+     _with(VALID_VALIDATOR_SETTINGS, "merge_repos", ["acme"]), False, "pattern"),
+    ("pipeline-validator-settings", "a-repository-in-capitals",
+     _with(VALID_VALIDATOR_SETTINGS, "merge_repos", ["Acme/App"]), False, "pattern"),
+    ("pipeline-validator-settings", "a-repository-named-two-dots",
+     _with(VALID_VALIDATOR_SETTINGS, "merge_repos", ["acme/.."]), False, "pattern"),
+    ("pipeline-validator-settings", "a-repository-twice",
+     _with(VALID_VALIDATOR_SETTINGS, "merge_repos", ["acme/app", "acme/app"]), False,
+     "uniqueItems"),
+    ("pipeline-validator-settings", "more-than-100-repositories",
+     _with(VALID_VALIDATOR_SETTINGS, "merge_repos", ["acme/r%d" % i for i in range(101)]), False,
+     "maxItems"),
     ("pipeline-validator-settings", "no-approve-section",
      _without(VALID_VALIDATOR_SETTINGS, "approve"), False, "required"),
     ("pipeline-validator-settings", "a-missing-switch",

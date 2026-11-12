@@ -1,5 +1,5 @@
 {
-  "schema": "pipeline-validator-settings/1",
+  "schema": "pipeline-validator-settings/2",
   "approve": {
     "plans": false,
     "pieces": false,
@@ -15,5 +15,6 @@
     "production_deploy": false,
     "deleting_data": false
   },
-  "stage_e_login": null
+  "stage_e_login": null,
+  "merge_repos": []
 }

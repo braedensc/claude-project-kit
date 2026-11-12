@@ -14,7 +14,8 @@ Nothing gains or loses trust by itself: a switch changes only when you change it
 |---|---|---|
 | `approve.plans` | It may approve a plan, in place of `approve <plan>`. | You approve each plan. |
 | `approve.pieces` | It may approve a ready piece of an approved plan starting. | You start each piece. |
-| `approve.merges` | It may ask GitHub to merge a pull request. | You merge each pull request. |
+| `approve.merges` | It may ask GitHub to merge a pull request, in a repository in `merge_repos`. | You merge each pull request. |
+| `merge_repos` | The repositories where merges may be approved, as `owner/name`. | `[]`: none. No merge is approved anywhere. |
 | `limits.max_changed_lines` | The most lines added plus removed it may approve. | `0`: nothing passes. |
 | `limits.max_files` | The most files changed it may approve. | `0`: nothing passes. |
 | `allow.credentials` | It may approve a change to env files, keys, tokens or secrets stores. | Those stay yours. |
@@ -34,23 +35,24 @@ auto-merge, which a job switches on.
 
 ### The file
 
-It is JSON, contract §23. Start from `validator-settings.example.json`, which has every switch off
-and every limit `0`:
+It is JSON, contract §23. Start from `validator-settings.example.json`, which has every switch off,
+every limit `0` and no repository listed:
 
 ```json
 {
-  "schema": "pipeline-validator-settings/1",
+  "schema": "pipeline-validator-settings/2",
   "approve": {"plans": false, "pieces": false, "merges": false},
   "limits": {"max_changed_lines": 0, "max_files": 0},
   "allow": {"credentials": false, "billing_and_accounts": false,
             "production_deploy": false, "deleting_data": false},
-  "stage_e_login": null
+  "stage_e_login": null,
+  "merge_repos": []
 }
 ```
 
 Every key must be there. Each switch is `true` or `false`. Each limit is a whole number.
 `stage_e_login` is Stage E's own bot login, or `null` until Stage E has one. Section 3 says where
-it comes from.
+it comes from. `merge_repos` lists repositories, `[]` for none.
 
 Keep it in your own home, outside every repository. Good: `~/.validator/settings.json`, mode 600.
 Not that: a file inside a checkout. A session can write there, so the file is not obeyed.
@@ -61,6 +63,10 @@ Absent is every switch off. So is any file the validator cannot trust. It never 
 
 - the file is not valid JSON, or gives a key twice;
 - it names another schema, misses a key, or adds one;
+- it is the first version, `pipeline-validator-settings/1`, from before `merge_repos`. Write it
+  again as `/2`, with the list;
+- `merge_repos` has an entry that is not `owner/name` in lower case, names a repository twice,
+  or names more than 100;
 - a switch is not `true` or `false`, a limit is out of range, or `stage_e_login` is not a bot
   login;
 - it names a part of the safety system;
@@ -76,8 +82,8 @@ Each says why, in words.
 python3 scripts/pipeline_validator_settings.py show --settings-file ~/.validator/settings.json
 ```
 
-It prints every switch, every limit and Stage E's login, and why when they are off. It changes
-nothing.
+It prints every switch, every limit, Stage E's login and the repositories for merges, and why when
+they are off. It changes nothing.
 
 Good: `read: the validator may approve only what is on below`. Not that: `EVERY SWITCH IS OFF
 (untrusted): the settings file is inside a git working tree, where a session can write, so it is
@@ -90,6 +96,23 @@ absolute.
 
 Edit the file by hand, then run `show`. Turn on one switch at a time. Turn it off the same way.
 Nothing else changes a switch: the validator has no way to write this file.
+
+### List a repository for merges
+
+The merges switch counts only in the repositories you list. A merge needs both: `approve.merges`
+on, and its repository in `merge_repos`. Anything else holds, with a closed reason.
+
+1. Add the repository to `merge_repos`, as `owner/name` in lower case.
+2. Run `show`. Check the line `repositories for merges:` names it.
+3. To stop merges there, take it off the list. The other repositories keep theirs.
+
+Good: `"merge_repos": ["acme/app"]`, with `"merges": true`. Merges in `acme/app` may be approved.
+Not that: `"merge_repos": ["Acme/App", "acme/app"]`. Capitals and a repository twice each make
+every switch read off.
+
+The list alone approves nothing. With `"merges": false`, no merge is approved, listed or not.
+List each repository once, and at most 100. Write it in lower case, even when GitHub shows
+capitals. GitHub's names ignore case, so `acme/app` covers a pull request in `Acme/App`.
 
 ### Until the rest is built
 
@@ -300,7 +323,7 @@ pull request.
 
 | Limit | `pass` needs | Reasons for `fail` |
 |---|---|---|
-| The switch | That kind of approval is on (section 1). | `switch-off` |
+| The switch | That kind of approval is on (section 1). A merge: its repository is in `merge_repos` too. | `switch-off`, `repo-not-listed` |
 | Who it comes from | A plan: an idea you filed yourself. A piece, or its pull request: an idea you filed, or agent-filed work in its first generation. | `provenance-not-owner`, `provenance-later-generation` |
 | Size | A merge: within `max_changed_lines` and `max_files`. | `too-many-lines`, `too-many-files` |
 | The safety system | No file on the kit's guard floor or in the project's `riskPaths`. Never a switch. | `risk-path` |

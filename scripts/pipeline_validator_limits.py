@@ -33,7 +33,9 @@ fill each fact by calling the part of the kit that owns it; nothing is counted o
   hold        the hold file's state (contract §20): hold_state().
 
 THE RULES, each one tested.
-  * The switch. That kind of approval is on in the settings.
+  * The switch. That kind of approval is on in the settings. A merge needs its repository in the
+    settings' `merge_repos` too: the settings' own `merge_allowed()` answers that, and the merge
+    path asks the same helper (`repo-not-listed`).
   * Provenance. A plan only from an idea the owner filed himself: an idea an agent filed, never,
     even one he moved. A piece, and the piece a pull request belongs to, only from an idea he
     filed, or agent-filed work in its first generation.
@@ -93,7 +95,7 @@ ORIGINS = ("owner", "agent-first", "agent-later")
 FILED_SOURCE = "backlog"     # the pool's source for a ticket the owner filed himself, and only that
 AGENT_SOURCE = "agent_filed"
 REASONS = (
-    "kind-unknown", "ref-unknown", "switch-off",
+    "kind-unknown", "ref-unknown", "switch-off", "repo-not-listed",
     "provenance-unknown", "provenance-not-owner", "provenance-later-generation",
     "head-moved", "size-unknown", "too-many-lines", "too-many-files",
     "paths-unknown", "risk-paths-unknown", "risk-path",
@@ -191,6 +193,9 @@ def limits(item, settings, facts):
         reasons.append("ref-unknown")
     if s["approve"].get(SWITCH[kind]) is not True:
         reasons.append("switch-off")
+    elif kind == "merge" and ref is not None and not vsettings.merge_allowed(
+            s, ref.split("#", 1)[0]):
+        reasons.append("repo-not-listed")
 
     origin = facts.get("origin")
     if origin not in ORIGINS:
@@ -459,6 +464,7 @@ def selftest():
               "limits": {"max_changed_lines": 400, "max_files": 20},
               "allow": {"credentials": False, "billing_and_accounts": False,
                         "production_deploy": False, "deleting_data": False},
+              "merge_repos": ["acme/app"],
               "why": "read"}
     BASE = {"origin": "owner", "paths": ["src/app/views.py"], "risk_paths": ["db/**"],
             "window": True, "queue": {"stops": [], "held": None}, "watcher": "fresh",
@@ -516,6 +522,33 @@ def selftest():
               limits(ITEMS["piece"], settings, BASE)["reasons"], ["switch-off"])
     check("a switch that is truthy but not true is off",
           why("piece", settings=with_settings("approve", "pieces", 1)), ["switch-off"])
+
+    # 1b. A merge needs its repository listed too (KIT-604), asked of the settings' own
+    #     merge_allowed(). A plan or a piece does not read the list.
+    check("merge: on and listed passes", why("merge"), [])
+    check("merge: on and not listed",
+          why("merge", settings=dict(ALL_ON, merge_repos=["acme/web"])), ["repo-not-listed"])
+    check("merge: on, with the list empty",
+          why("merge", settings=dict(ALL_ON, merge_repos=[])), ["repo-not-listed"])
+    check("merge: off and listed is the switch, not the list",
+          why("merge", settings=with_settings("approve", "merges", False)), ["switch-off"])
+    check("merge: another repository of the same owner",
+          why("merge", item={"ref": "acme/web#12"}), ["repo-not-listed"])
+    check("merge: the listed repository, as GitHub may spell it in capitals",
+          why("merge", item={"ref": "Acme/App#12"}), [])
+    check("merge: read settings with no list",
+          why("merge", settings=dict((k, v) for k, v in ALL_ON.items() if k != "merge_repos")),
+          ["repo-not-listed"])
+    for kind in ("plan", "piece"):
+        check("%s: the repository list is not read" % kind,
+              why(kind, settings=dict(ALL_ON, merge_repos=[])), [])
+    real_allowed = vsettings.merge_allowed
+    try:
+        vsettings.merge_allowed = lambda settings, repo: False
+        check("the limits ask merge_allowed(), the one helper, and keep no copy of their own",
+              why("merge"), ["repo-not-listed"])
+    finally:
+        vsettings.merge_allowed = real_allowed
     # Stage E on the first version (low): a read result with a section missing crashed.
     for label, settings in (
             ("read, with no sections", {"state": vsettings.READ}),
