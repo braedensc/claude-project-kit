@@ -263,6 +263,10 @@ Good: `settings       DONE     merges on, and acme/app listed`, after `Checked a
 listing the repository by hand while the ruleset still needs a person's review. Then nothing
 merges on its own.
 
+The admin role is role 5 in GitHub's API. GitHub uses that number but does not document it. After
+the first `merges on`, open the ruleset's page on GitHub once. Its bypass list should say
+*Repository admin*, for pull requests only.
+
 A second run changes nothing and says `Nothing to do`.
 
 **Classic branch protection.** If only classic branch protection guards the default branch, it
