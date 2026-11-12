@@ -280,6 +280,15 @@ a choice made in a PR:
 3. `python3 scripts/check_runner_pin.py` fails any `-latest` runner outside the newest-image
    workflow, so a new workflow cannot quietly bring the problem back.
 
+## Standard library only
+
+`python3 scripts/check_stdlib_only.py` reads every tracked `.py` file and fails on an import that
+is neither the standard library nor a kit module, naming the file, line and module. The few
+exceptions are the `ALLOWED` list in the script, each with a reason; an entry matching no import
+fails too. Its standard-library list is one constant, so Python 3.9 and 3.12 agree; the selftest
+fails when the running Python knows a module the constant lacks (add it). `npm run
+test:stdlib-only` runs the selftest, `npm run lint:stdlib-only` the real check.
+
 ## What CI never does
 
 - Never runs the DB-backed suite.
