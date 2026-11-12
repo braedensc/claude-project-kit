@@ -42,10 +42,10 @@ Good, from the owner's morning of 12 Nov:
 Not that: one line per event, every merge listed, a link on every line, and the repository named
 on each.
 
-**Its own project only.** `STANDUP_REPOS` names the project's repositories, and the bridge's
-`TEAM_KEYS` its plans. The stand-up speaks of those alone, so each project's tech lead reports
-its own project. With `STANDUP_REPOS` empty, it speaks of every repository the status file lists. A
-repository is named only when more than one is in play.
+**What it covers.** Everything the pipeline runs: every repository and plan the status file
+lists. No setting is needed. It names a repository only when more than one is in play, which
+keeps the text clean. `STANDUP_REPOS` is an optional override that narrows it to some
+repositories' pull requests; leave it empty.
 
 **Who words it.** The tech lead's own turn, from facts code counted ("The tech lead's words",
 below). Code checks its words. Words that fail, a turn that is off, and a turn that fails each
@@ -301,7 +301,7 @@ settings with no `bridge.conf` key below always take their defaults.
 | `STANDUP_AFTERNOON_AT` | `afternoon_at` | `15:00` | The afternoon wrap's local time, more than 3 hours after the morning's. |
 | `STANDUP_DAYS` | `days` | `mon, tue, wed, thu, fri, sat` | The days it posts, each named once from `mon` to `sun`. |
 | `STANDUP_STATUS_FILE` | `status_file` | `~/.stage-e/status/pipeline-status.json` | The status job's file: stage-e.conf's `STATUS_FILE`, if you set one. |
-| `STANDUP_REPOS` | `repos` | empty: every repository | The project's own repositories, `OWNER/REPO`, comma-separated. The stand-up speaks of their pull requests and the plans of `TEAM_KEYS` alone (KIT-718). |
+| `STANDUP_REPOS` | `repos` | empty: everything | Optional, and normally empty: the stand-up covers every repository and plan the status file lists (KIT-718). Repositories named here, `OWNER/REPO`, comma-separated, narrow it to their pull requests alone. |
 | `BRIDGE_CONFIG` | `bridge_config` | `~/.stage-e/bridge.json` | Where the DM member and the Slack token's variable are named. |
 | `STANDUP_DAY_PLAN_FILE` | `day_plan_file` | empty: off | The day plan file (contract §18), usually `~/.stage-e/queue/day-plan.json`. Set, the afternoon wrap says today's spend against the day's planned load and hard stop. Today's spend comes from the usage file when `STANDUP_USAGE_FILE` is set too. |
 | `STANDUP_USAGE_FILE` | `usage_file` | empty: off | The usage file (contract §17), usually `~/.stage-e/usage/usage.json`. Set, the afternoon wrap on the weekly day adds the week. |

@@ -268,10 +268,10 @@ CONF_KEYS = {
                      "the days it posts, comma-separated, each from mon to sun"),
     "STANDUP_STATUS_FILE": (bridge.standup.DEFAULTS["status_file"],
                             "the status job's file: stage-e.conf's STATUS_FILE, if you set one"),
-    "STANDUP_REPOS": ("", "the project's own repositories, OWNER/REPO, comma-separated: the "
-                          "stand-up speaks of their pull requests and no others, and of the "
-                          "plans of TEAM_KEYS (KIT-718). Empty: every repository the status "
-                          "file lists"),
+    "STANDUP_REPOS": ("", "optional, and normally empty: the stand-up covers everything the "
+                          "pipeline runs, every repository and plan the status file lists "
+                          "(KIT-718). Repositories named here, OWNER/REPO, comma-separated, "
+                          "narrow it to their pull requests alone"),
     "STANDUP_DAY_PLAN_FILE": ("", "the day plan file, to give the afternoon wrap its spend line: "
                                   "~/.stage-e/queue/day-plan.json. Empty: no spend line (KIT-471)"),
     "STANDUP_USAGE_FILE": ("", "the usage file, to give the wrap a short week on STANDUP_WEEKLY_DAY: "
