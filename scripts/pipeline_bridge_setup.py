@@ -526,12 +526,21 @@ def ask_name(conf_path, values, reader=None, tty=None, err=None):
         err.write("No name was written to %s. Run this again to name your tech lead.\n"
                   % conf_path)
         return EX_USAGE, values
+    # A temp file beside the conf, swapped in whole: a failed write never leaves it partial.
+    tmp = "%s.name.%d" % (conf_path, os.getpid())
     try:
         with open(conf_path, encoding="utf-8") as fh:
             text = fh.read()
-        with open(conf_path, "w", encoding="utf-8") as fh:
+        mode = os.stat(conf_path).st_mode & 0o777
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(set_conf_line(text, "APP_NAME", name))
+        os.replace(tmp, conf_path)
     except OSError as exc:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
         err.write("Could not write the name into %s: %s. Nothing was written.\n"
                   % (conf_path, exc))
         return EX_FAILED, values
@@ -3734,6 +3743,26 @@ def selftest():
               (r_asked[0], r_asked[1], r_asked[2] == bare.rstrip("\n") + "\nAPP_NAME=babyclaw\n",
                r_asked[3]),
               (EX_OK, [q], True, ("babyclaw",) * 2))
+        with tempfile.TemporaryDirectory() as wtmp:
+            wpath = os.path.join(wtmp, "bridge.conf")
+            with open(wpath, "w", encoding="utf-8") as fh:
+                fh.write(bare)
+            os.chmod(wpath, 0o600)
+            w_rc = ask_name(wpath, {}, reader=lambda _q: "babyclaw", tty=True,
+                            err=io.StringIO())[0]
+            w_left = (sorted(os.listdir(wtmp)), oct(os.stat(wpath).st_mode & 0o777))
+            os.chmod(wtmp, 0o500)               # the folder refuses the temp file
+            try:
+                f_err = io.StringIO()
+                f_rc = ask_name(wpath, {}, reader=lambda _q: "other", tty=True, err=f_err)[0]
+                with open(wpath, encoding="utf-8") as fh:
+                    f_kept = fh.read().endswith("\nAPP_NAME=babyclaw\n")
+                f_left = sorted(os.listdir(wtmp))
+            finally:
+                os.chmod(wtmp, 0o700)
+        check("name-written-whole-through-a-swap-keeping-the-mode-and-a-failed-write-keeps-the-conf",
+              (w_rc, w_left, f_rc, f_kept, f_left, "Nothing was written" in f_err.getvalue()),
+              (EX_OK, (["bridge.conf"], "0o600"), EX_FAILED, True, ["bridge.conf"], True))
         check("name-saved-line-says-the-name-and-how-to-rename",
               (r_asked[4].startswith("Saved: your tech lead is called 'babyclaw' (APP_NAME in "),
                "change that line and paste the manifest again" in r_asked[4]), (True, True))
