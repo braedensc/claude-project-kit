@@ -478,7 +478,7 @@ def run_bounce_block(scenario):
         out = os.path.join(tmp, "output")
         env = dict(os.environ, PATH=bindir + os.pathsep + os.environ.get("PATH", ""),
                    SCENARIO=scenario, E=evidence, REPO="o/r", GITHUB_OUTPUT=out)
-        subprocess.run(["bash", "-c", "set -uo pipefail\n" + bounce_block()], env=env,
+        subprocess.run(["bash", "-c", "set -euo pipefail\n" + bounce_block()], env=env,
                        capture_output=True, text=True, timeout=60)
         try:
             with open(out, encoding="utf-8") as fh:
@@ -679,7 +679,8 @@ def main():
     args = ap.parse_args()
 
     if args.selftest:
-        return selftest()
+        from scratch_run import contained   # KIT-450: its temp folders go when it ends
+        return contained(selftest, "auto-merge-selftest-run-")
     if not args.config:
         print("FAIL: --config is required (delivery.json from the PR's base sha)", file=sys.stderr)
         return 2
