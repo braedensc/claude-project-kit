@@ -2208,6 +2208,85 @@
       }
     },
     {
+      "id": "runner",
+      "name": "Starts, resumes and stops the pipeline's sessions",
+      "internal_name": "the runner, our own dispatcher",
+      "does": "One always-on job that starts, resumes and stops each session the pipeline asks for, in a fresh workspace with a pin, and keeps one record per run. Built beside the old dispatcher, and off.",
+      "scope": "machine",
+      "state": "built-off",
+      "needs": [],
+      "scripts": [
+        "scripts/pipeline_runner.py",
+        "scripts/pipeline_runner_store.py"
+      ],
+      "installer": null,
+      "check": null,
+      "apply": null,
+      "no_command_reason": "Not installable yet: it is built beside the old dispatcher and ships off. Its installer comes with the first lane that moves to it, on the owner's yes.",
+      "restarts": [],
+      "settings": {
+        "file": "runner settings",
+        "example": "runner.example.json",
+        "keys": [
+          "enabled",
+          "store_dir",
+          "work_dir",
+          "projects"
+        ]
+      },
+      "secrets": [
+        {
+          "key": "token_env",
+          "default_name": "CLAUDE_WRITER_OAUTH_TOKEN",
+          "what": "The sign-in token the sessions use, by the name of the variable that holds it."
+        },
+        {
+          "key": "linear_key_file",
+          "default_name": null,
+          "what": "A file of the account's own that holds the tracker key, to read each ticket and its history."
+        }
+      ],
+      "jobs": [
+        {
+          "label": "local.pipeline-runner",
+          "from_key": null,
+          "account": "role",
+          "loaded_by": "installer",
+          "command": {
+            "program": "<python>",
+            "args": [
+              "<kit>/scripts/pipeline_runner.py",
+              "run",
+              "--config",
+              "<conf file>"
+            ]
+          },
+          "schedule": "always-on",
+          "interval_key": null,
+          "log": "<role home>/.pipeline-runner/runner.log",
+          "switch": {
+            "key": "enabled",
+            "example": "runner.example.json"
+          },
+          "switch_reason": null
+        }
+      ],
+      "person_steps": [],
+      "ceiling": null,
+      "consent": [
+        "Installs an always-on job under the pipeline's account that starts the sessions the pipeline asks for, each held to its ticket's budget."
+      ],
+      "docs": {
+        "guide": "docs/RUNNER.md",
+        "lesson": null,
+        "runbook": null,
+        "missing": {
+          "lesson": "The kit has no lessons yet: teaching pages live outside it, with this install's names.",
+          "runbook": "Its guide's table of refusals stands in until a lane moves to it."
+        }
+      }
+    },
+    {
       "id": "hosted-pipeline",
       "name": "Runs the pipeline on hosted runners instead of this machine",
       "internal_name": "the pipeline workflow templates",

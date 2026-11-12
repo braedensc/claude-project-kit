@@ -1,0 +1,120 @@
+# The runner
+
+The runner is our own dispatcher's one always-on job. Other pipeline jobs ask it to start, resume or
+stop a session. It runs the official `claude` program headless, one process per session, and keeps
+one record per run.
+
+Why it exists, and the plan it is part of: `docs/adr/2026-11-11-our-own-dispatcher-built-new-beside-the-old-one.md`.
+The formats it reads and writes: `docs/PIPELINE-CONTRACT.md` section 28, and section 3 for the pin.
+
+## Where it stands
+
+- **Built, and off.** It is built beside the third-party dispatcher, which still runs every session.
+- **No lane uses it yet.** Each lane moves later, one at a time, on the owner's yes, a drill repository first.
+- **Nothing installs it yet.** Its installer comes with the first lane that moves.
+- **No real session goes through it yet.** Its selftest runs it against a stand-in program.
+
+Two pieces come before any lane moves:
+
+- Limits on time, memory and disk for every run (KIT-643).
+- Each kind of session as measured data, the kit's guard from a root-owned copy, and a live probe of
+  the walls as the role account (KIT-704).
+
+## What it does
+
+Each pass, every few seconds:
+
+1. **Finds each live run again.** A run whose process is gone gets its record finished and its pin
+   removed. A run that left no result and no exit is *interrupted*, and is resumed once.
+2. **Answers each waiting request, oldest first.** It starts, resumes or stops a session, or refuses
+   with a reason. A request it cannot judge now waits for a later pass.
+
+Before it starts anything, it checks the request against the tracker:
+
+- The ticket's whole history must show the owner's own move into an approved state for that kind.
+- The newest move counts for a code or plan start. Any of his moves counts for the kinds that follow.
+- The old dispatcher's own user never approves. A history it cannot read whole approves nothing.
+
+Good: the owner moved ENG-12 to Todo. The queue asks for a code session. It starts.
+Not: someone else moved ENG-12 to Todo. The request is refused, and says why.
+
+## What a start makes
+
+| Thing | Where | Notes |
+| --- | --- | --- |
+| A workspace | `<work_dir>/<kind>/<TICKET>` | A fresh git worktree on a new branch. A folder already there is never reused. |
+| A branch | `<type>/<ticket, lower case>-<title or kind>` | One fixed pattern. Every git command is a list of arguments. No repository hook runs. |
+| A pin | the project's pins root | Written before the program runs, removed when the run ends. Budget, mode, criteria and out of scope. |
+| The run's folder | `<store_dir>/runs/<run>/` | The command's inputs, the program's output, its exit, and the run's record. |
+
+The session's budget comes from the project's committed `delivery.json`: `budgets.perEffort` for the
+ticket's effort label.
+
+## What a session is given
+
+- **Nothing from its workspace.** No settings, hooks, tool servers or `CLAUDE.md` load from it.
+- **The project's instructions,** read from its default branch by the runner, handed in as a file.
+- **The ticket,** as the runner read it, fenced as data.
+- **Its tools, each by the workspace's path.** No file tool is ever allowed by bare name.
+- **A kind with Bash** gets the built-in sandbox, with a deny-read list.
+- **A short environment:** the path, a home of its own, a temp folder, the language, the sign-in
+  token, and two switches.
+
+## Settings
+
+One JSON file. The example is `runner.example.json`. `~/` means the account's own home.
+
+| Key | What it is | Default |
+| --- | --- | --- |
+| `enabled` | Takes requests when true. Off, it still finishes runs already started. | `false` |
+| `store_dir` | The runner's store. Outside every git working tree, mode 0700. | required |
+| `work_dir` | Where workspaces go. | required |
+| `session_home` | The sessions' own home folder. Holds nothing of the account's setup. | required |
+| `claude_bin` | The program's full path. | required |
+| `model` | The model for every session. | `sonnet` |
+| `token_env` | The NAME of the variable that holds the sign-in token. | `CLAUDE_WRITER_OAUTH_TOKEN` |
+| `linear_key_file` | The tracker key, in a file of this account's, mode 0600. | required |
+| `owner_user_ids` | The owner's tracker user ids. Only his moves approve. | required |
+| `dispatcher_user_ids` | The old dispatcher's own users. Never an approver. | required |
+| `poll_seconds` | Time between passes. | `5` |
+| `stop_grace_seconds` | After a stop, how long before the session is killed. | `30` |
+| `max_starts_per_ticket` | A runaway's limit on starts of one ticket and kind. | `20` |
+| `hold` | The watcher's hold file (contract section 20). Set, nothing starts. | none |
+| `projects` | Each project: `repo` (the runner's own clone), `base`, `approval_states` per kind, `allowed_hosts`. | required |
+
+The four folders must not sit inside one another.
+
+## Checking it
+
+```bash
+python3 scripts/pipeline_runner.py show --config <runner.json>
+```
+
+It prints each run: its kind, ticket, state, reason, start, length, cost and turns.
+
+```bash
+npm run test:runner
+```
+
+The selftest starts, resumes and stops sessions of a stand-in program, kills the runner mid-run to
+show the session lives on, and leaves nothing behind.
+
+## When it refuses
+
+Each refusal says why, in the request's answer (`<store_dir>/taken/<id>.json`).
+
+| It says | What to do |
+| --- | --- |
+| the ticket's newest move was not the owner's | The owner moves the ticket himself. |
+| a workspace is there already | The sweep removes old workspaces. A new start needs a fresh one. |
+| the project has no committed delivery.json | The project is not set up for the pipeline. |
+| `<name>` is not set | The sign-in token's variable is missing from the job's environment. |
+| the tracker could not be read | Nothing to do: the request waits, and the next pass tries again. |
+
+The runner refuses to start from inside a Claude session, or as root.
+
+## Not proven yet
+
+- That a session outlives a restart of the runner under launchd. The selftest proves it for a runner
+  killed with its whole process group. One live check is owed.
+- That one sign-in serves the runner and the tech lead together (KIT-629).
