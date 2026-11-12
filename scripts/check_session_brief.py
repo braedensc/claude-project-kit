@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""The session brief's two machine formats match the machines that read them (KIT-231).
+"""The session brief's machine formats match the machines that read them (KIT-231).
 
     python3 scripts/check_session_brief.py              # check docs/SESSION-BRIEF.md
     python3 scripts/check_session_brief.py --selftest
 
-docs/SESSION-BRIEF.md shows a session two lines a machine reads: the escalation mark the
-notifier pages on, and the `pipeline-finding/1` block the finding job files. A session
+docs/SESSION-BRIEF.md shows a session three things a machine reads: the escalation mark the
+notifier pages on, the `pipeline-finding/1` block the finding job files, and the
+`plan-needs-change/1` note the bridge reads from a piece of an approved plan. A session
 copies them word for word, so a brief that drifts from either reader turns every real
 escalation into silence. This reads the brief and judges each example with the readers'
 OWN code, imported:
@@ -20,6 +21,8 @@ OWN code, imported:
   * the brief's worked example comment carries its mark where `find_mark` looks for it:
     the comment's first line;
   * the brief's fenced finding example parses with the finding poller's `parse_finding`;
+  * the brief's fenced plan note example is a note the bridge's own `plan_note` reads
+    (KIT-320), and it is never judged as a finding;
   * the brief and the `/work` skill show the same three gate lines a session ends with, one
     per declared command: `Gate <name>: ran`, `could not run` or `not asked` (KIT-315). A
     person reads these on the ticket, not a machine, so the two documents are pinned to
@@ -27,7 +30,7 @@ OWN code, imported:
     for line. A session told one form by the skill and another by the brief writes neither
     reliably, and a skipped check reads as "nothing left to do".
 
-Exit 0 when all four hold, 1 with every problem named.
+Exit 0 when all five hold, 1 with every problem named.
 """
 import os
 import re
@@ -39,6 +42,7 @@ if HERE not in sys.path:
 
 import pipeline_notify_local as notify  # noqa: E402
 import pipeline_finding_poller as finding  # noqa: E402
+import pipeline_bridge_plans as plans  # noqa: E402  (KIT-320: the plan note's own reader)
 
 BRIEF = os.path.join(os.path.dirname(HERE), "docs", "SESSION-BRIEF.md")
 # The GitHub Actions lane's dispatcher reads a session's mark with its own regex, which is the
@@ -48,6 +52,8 @@ DISPATCH_TEMPLATE = os.path.join(os.path.dirname(HERE), "templates", "workflows"
 _TEMPLATE_READER_RE = re.compile(r'r"<!--\\s\*pipeline-escalation:\\s\*\(([^)]*)\)\\s\*-->"')
 _SHOWN_MARK_RE = re.compile(r"<!--\s*pipeline-escalation:[^>]*-->")
 _FINDING_FENCE_RE = re.compile(r"````markdown\n(```json\n.*?\n```)\n````", re.S)
+# A fenced example holding this word is the plan note, judged by the bridge's reader (KIT-320).
+PLAN_NOTE_WORD = '"schema": "%s"' % plans.PLAN_NOTE_SCHEMA
 # A worked example comment: a ```markdown block. Only one showing a mark is judged as an
 # escalation, so the finding example and any plain comment example are left alone.
 _EXAMPLE_RE = re.compile(r"```markdown\n(.*?)\n```", re.S)
@@ -135,13 +141,20 @@ def problems(text, template=None):
         if not notify.find_mark(body):
             out.append("the brief's example comment does not carry its mark on the first "
                        "line, so the notifier would not read it")
-    fences = _FINDING_FENCE_RE.findall(text)
+    blocks = _FINDING_FENCE_RE.findall(text)
+    fences = [b for b in blocks if PLAN_NOTE_WORD not in b]
     if not fences:
         out.append("the brief shows no fenced pipeline-finding/1 example")
     for block in fences:
         if finding.parse_finding(block) is None:
             out.append("the brief's finding example does not parse with the finding job's "
                        "own parser")
+    notes = [b for b in blocks if PLAN_NOTE_WORD in b]
+    if not notes:
+        out.append("the brief shows no fenced plan-needs-change/1 example")
+    for block in notes:
+        if plans.plan_note(block) is None:
+            out.append("the brief's plan note example is not one the bridge's own reader reads")
     return out
 
 
@@ -179,6 +192,18 @@ def selftest():
     broken = text.replace('{"schema": "pipeline-finding/1"', '{"schema": "pipeline-finding/2"')
     if not problems(broken):
         failures.append("a finding example of the wrong schema passed")
+    # KIT-320: the plan note's example is read by the bridge's own reader, never as a finding.
+    if [p for p in problems(text) if "plan note" in p or "finding" in p]:
+        failures.append("the brief's own plan note or finding example was refused")
+    for name, bad in (("of another kind", ('"kind": "reorder"', '"kind": "cancel"')),
+                      ("with a word the reader does not read", ('"reason": ', '"why": '))):
+        note_at = text.find('{"schema": "plan-needs-change/1"')
+        drifted = text[:note_at] + text[note_at:].replace(bad[0], bad[1], 1)
+        if note_at < 0 or not any("plan note example" in p for p in problems(drifted)):
+            failures.append("a plan note example %s passed" % name)
+    if not any("no fenced plan-needs-change/1 example" in p for p in problems(
+            text.replace('"schema": "plan-needs-change/1"', '"schema": "plan-note/1"'))):
+        failures.append("a brief with no plan note example passed")
 
     # The two drifts a pattern check alone misses. Each silences every copied escalation.
     # 1. The worked example's mark moved off the first line: the notifier reads only that.
@@ -269,8 +294,8 @@ def main(argv=None):
         for p in found:
             print("  - %s" % p)
         return 1
-    print("OK: the session brief's marks and finding block match their readers, and its gate "
-          "lines match the /work skill")
+    print("OK: the session brief's marks, finding block and plan note match their readers, and "
+          "its gate lines match the /work skill")
     return 0
 
 

@@ -314,11 +314,13 @@ What it does, in order:
      read it. It records the sign-off and closes the tickets.
 
      Two more questions come only when a list was not measured. If a list came back but
-     could not be read, it asks about that list alone. If no helper list came back, it
-     says the helper was not measured and asks whether to sign anyway. If a helper list
-     came back but the log shows no helper started, that list is **not counted**, even
-     as prose. It says so and asks the same question. The record says which lists were
-     read, and how. A session list nothing measured is never signed.
+     could not be read, it asks about that list alone. It asks the same when a list names
+     a tool server or a rule, like `mcp__linear__*`, only in a sentence. The sentence may
+     say the session holds those tools or that it does not, so you read it. If no helper
+     list came back, it says the helper was not measured and asks whether to sign anyway.
+     If a helper list came back but the log shows no helper started, that list is **not
+     counted**, even as prose. It says so and asks the same question. The record says
+     which lists were read, and how. A session list nothing measured is never signed.
 
      The same session's log also says whether a helper started and whether the test file
      was read. An older session's log never answers for it. If that log holds no call

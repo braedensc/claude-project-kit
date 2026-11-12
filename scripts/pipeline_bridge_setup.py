@@ -268,6 +268,10 @@ CONF_KEYS = {
                      "the days it posts, comma-separated, each from mon to sun"),
     "STANDUP_STATUS_FILE": (bridge.standup.DEFAULTS["status_file"],
                             "the status job's file: stage-e.conf's STATUS_FILE, if you set one"),
+    "STANDUP_REPOS": ("", "optional, and normally empty: the stand-up covers its own project, "
+                          "the plans of TEAM_KEYS and the repositories the idea gate's planner "
+                          "config pairs with them (KIT-718). Repositories named here, "
+                          "OWNER/REPO, comma-separated, are used instead"),
     "STANDUP_DAY_PLAN_FILE": ("", "the day plan file, to give the afternoon wrap its spend line: "
                                   "~/.stage-e/queue/day-plan.json. Empty: no spend line (KIT-471)"),
     "STANDUP_USAGE_FILE": ("", "the usage file, to give the wrap a short week on STANDUP_WEEKLY_DAY: "
@@ -317,7 +321,7 @@ RETIRED_CONF_KEYS = {
     "WRITER_BIN": "the turn uses TURN_BIN",
     "WRITER_MODEL": "the writer is gone",
     "WRITER_TOKEN_ENV": "the token is under TURN_TOKEN_ENV",
-    "TECH_LEAD_WAKE": "the rundown carries the tech lead's take (KIT-493)",
+    "TECH_LEAD_WAKE": "the stand-up is in the tech lead's own words (KIT-718)",
     "WAKE_MAX_PER_DAY": "the wake is gone",
     "WAKE_QUIET_HOURS": "the wake is gone",
     "WAKE_PR_STUCK_HOURS": "the wake is gone",
@@ -455,7 +459,7 @@ STANDUP_KEY_FOR = {"morning_at": "STANDUP_MORNING_AT", "afternoon_at": "STANDUP_
                    "usage_file": "STANDUP_USAGE_FILE", "weekly_day": "STANDUP_WEEKLY_DAY",
                    "sprint": "STANDUP_SPRINT", "sprint_plan_file": "STANDUP_SPRINT_PLAN_FILE",
                    "sprint_review_config": "STANDUP_SPRINT_REVIEW_CONFIG",
-                   "health_file": "STANDUP_HEALTH_FILE"}
+                   "health_file": "STANDUP_HEALTH_FILE", "repos": "STANDUP_REPOS"}
 
 
 # KIT-477: the app a project's owner talks to is that project's tech lead. Slack's limit on an
@@ -663,6 +667,8 @@ def standup_settings(conf):
             doc[key] = conf[STANDUP_KEY_FOR[key]]
     if conf["STANDUP_SPRINT"] == "yes":       # KIT-574: written only when on
         doc["sprint"] = True
+    if conf["STANDUP_REPOS"]:                 # KIT-718: written only when named
+        doc["repos"] = split_list(conf["STANDUP_REPOS"])
     return doc
 
 
@@ -4788,6 +4794,15 @@ def selftest():
                 "sprint_review_config" in standup_settings(conf_on),
                 any(e.startswith("STANDUP_SPRINT_REVIEW_CONFIG needs STANDUP_SPRINT") for e in errs_srv_off)),
                 ([], "~/.stage-e/sprint-review.json", False, True))
+            # KIT-718: the project's own repositories are written only when named, as a list,
+            # and each must be OWNER/REPO, said by its conf key
+            conf_rp, errs_rp = validate_conf(dict(vals, STANDUP_REPOS="acme/app, acme/site"))
+            _c, errs_rp_bad = validate_conf(dict(vals, STANDUP_REPOS="acme"))
+            check("standup-repos-are-written-only-when-named-and-each-is-owner-slash-repo", (
+                errs_rp, standup_settings(conf_rp).get("repos"), "repos" in standup_settings(conf_on),
+                any(e.startswith("STANDUP_REPOS must name each of the project's repositories once")
+                    for e in errs_rp_bad)),
+                ([], ["acme/app", "acme/site"], False, True))
             _c, errs_nodm = validate_conf(dict(vals, STANDUP="on", DM_USER_IDS=""))
             check("standup-on-needs-a-dm-member",
                   any(e.startswith("STANDUP=on needs DM_USER_IDS") for e in errs_nodm), True)

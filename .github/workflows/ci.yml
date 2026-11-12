@@ -111,6 +111,11 @@ jobs:
           python3 -m pip install --quiet pyyaml
           python3 scripts/check_runner_pin.py --selftest
           python3 scripts/check_runner_pin.py
+      - name: Agent trigger author check (@claude needs a trusted author)
+        run: |
+          python3 -m pip install --quiet pyyaml
+          python3 scripts/check_agent_trigger_author.py --selftest
+          python3 scripts/check_agent_trigger_author.py
 
       # KIT-652. The kit's Python imports only the standard library, bar a short named list,
       # because its jobs and hooks run on a Python with nothing added to it.
@@ -660,6 +665,11 @@ jobs:
       # only the owner's exact reply makes one; the old and new value are always shown.
       - name: Sprint changes selftest (a key outside the list is dropped; a yes names one change; no reply changes nothing)
         run: python3 scripts/pipeline_sprint_changes.py --selftest
+
+      # The one write path into queue.conf (KIT-700): the tech lead's change on the owner's own ask, and the sprint
+      # review's; never a value the queue's own loader refuses; read back, recorded, and carried at the next install.
+      - name: Queue settings selftest (the owner's own words only; the queue's own loader judges; carried at install)
+        run: python3 scripts/pipeline_queue_settings.py --selftest
 
       - name: Telemetry scrape selftest (contract §4, §10)
         run: python3 scripts/telemetry_scrape.py --selftest

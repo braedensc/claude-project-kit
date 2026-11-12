@@ -51,10 +51,18 @@ permissions:
 
 jobs:
   claude:
-    # Only run when someone actually mentions @claude (skips unrelated comments).
+    # Only run when a TRUSTED author mentions @claude (skips unrelated comments, and a
+    # comment from anyone who is not an owner, member or collaborator: on a public repo
+    # anyone can write one, and this job holds write permissions and the API key). The
+    # check is on the author of the thing that fired the event, per event (KIT-672);
+    # scripts/check_agent_trigger_author.py pins it.
     if: >-
-      contains(github.event.comment.body, '@claude') ||
-      contains(github.event.issue.body, '@claude')
+      ((github.event_name == 'issue_comment' || github.event_name == 'pull_request_review_comment') &&
+        contains(github.event.comment.body, '@claude') &&
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)) ||
+      (github.event_name == 'issues' &&
+        contains(github.event.issue.body, '@claude') &&
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.issue.author_association))
     runs-on: ubuntu-24.04
     timeout-minutes: 20 # hard wall-clock cap; a runaway job can't bill indefinitely
     concurrency:

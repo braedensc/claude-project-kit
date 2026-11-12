@@ -61,12 +61,15 @@
           "description": "The keys and tokens it needs, by NAME. Never a value.",
           "items": {
             "type": "object",
-            "required": ["key", "default_name", "what"],
+            "required": ["key", "default_name", "what", "ends"],
             "additionalProperties": false,
             "properties": {
               "key": {"$ref": "#/$defs/keyName", "description": "The settings key that holds the secret's name."},
               "default_name": {"type": ["string", "null"], "pattern": "^[A-Z][A-Z0-9_]*$", "description": "The name the example file gives it."},
-              "what": {"$ref": "#/$defs/text"}
+              "what": {"$ref": "#/$defs/text"},
+              "ends": {"enum": ["one-year", "set-when-made", "never", "unknown"], "description": "When the key stops working: a year after it is made, on a date chosen when it is made, never, or the kit does not say."},
+              "clock": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,31}$", "description": "The name the health check uses for its end date in CREDENTIAL_EXPIRIES. Required unless ends is never."},
+              "date_from": {"$ref": "#/$defs/text", "description": "One plain line: where a person reads the date. Required unless ends is never."}
             }
           }
         },

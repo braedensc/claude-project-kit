@@ -4,7 +4,7 @@ The tech lead is becoming an agent of our own. It answers in your chat by callin
 and the tools decide what it can see and do. This guide covers the tools that **read**, and
 the ten that **ask**: `plan`, `replan`, `approve`, `pause`, `resume`, `cancel`, `retry`, `start`,
 `answer` and `answer_plan`. None of them does what its name says. Only your yes to a question the pipeline asks
-does that.
+does that. One more, `queue_setting`, changes a queue setting only when your own message asked for it (below).
 
 The design is `docs/adr/2026-11-05-one-chat-with-the-tech-lead-per-project.md`. The
 script is `scripts/pipeline_tech_lead_tools.py`.
@@ -22,7 +22,9 @@ starts it. The tech lead's turn, which starts it, comes in the next piece (KIT-4
 | `guide` | One of the kit's guides by name, or the list of them. |
 | `pipeline_file` | One of the queue's files: the day plan, its inputs, the health watch, usage. Only the ones you name in the config. |
 | `reach` | Whether the pipeline can land the work a ticket describes. See below. |
+| `queue_setting` | Record a change to one of three queue settings that your own message asked for. Only with an `outbox_dir`. See *Changing a queue setting*. |
 | `plan`, `replan`, `approve`, `pause`, `resume`, `cancel`, `retry`, `start`, `answer`, `answer_plan` | Record that the tech lead wants to ask you whether to do that to a ticket. Only with an `outbox_dir`. See below. |
+| `plan_change` | Record the tech lead's judgment of a piece's note that its plan needs changing (KIT-320). Only with an `outbox_dir`. See below. |
 
 Ticket text, and every file's contents (a queue file holds each ticket's title as the
 tracker has it), comes back marked as data, not instructions. No text in it can break out of
@@ -109,6 +111,36 @@ The installer writes the `outbox_dir` into this config, and makes the outbox, wh
 lead's turn is on (KIT-520; `docs/BRIDGE-OPERATOR.md`, "The tech lead's own turn"). Until your
 role account's copy of the kit has that change, the config names no outbox and none of the ten
 is offered.
+
+**`plan_change` (KIT-320)** answers a piece's note that its plan needs changing. It records
+fields only: the piece, a kind (`reorder`, `add_prerequisite` or `ask_owner`) and, for a
+reorder, the piece to wait for. It changes nothing either. The bridge reads it only after a plan
+note's turn, and leaves it out of any other turn. Its own code then makes a reorder inside your
+approved plan without you, and asks you about anything else (`docs/BRIDGE-OPERATOR.md`, "When a
+piece says the plan needs changing").
+
+## Changing a queue setting (KIT-700)
+
+`queue_setting` takes a setting and a value: `PLANNED_LOAD`, `DAY_STOP` or `LANES_PER_REPO`. Like the asking
+tools, it does nothing by itself. It records the change in the outbox, and the tool server checks the value's form.
+After the reply, the bridge makes the change, through `scripts/pipeline_queue_settings.py`, the one write path into
+queue.conf. The sprint review's `apply` reply goes through the same path.
+
+The bridge makes it only when:
+
+- the message that started the turn is from you, the first of `dm_user_ids`, as Slack says;
+- that message asks for it in one sentence: a verb such as set, lower or raise, the setting and the value. A question
+  or a sentence with don't, not, never or keep asks for nothing; and
+- the queue's own loader takes the new settings.
+
+Then it writes the installed copy of queue.conf and the queue's config, reads both back, and adds a ledger row. It
+posts the old and the new value. Your next queue install carries the change into your own queue.conf
+(`docs/QUEUE-OPERATOR.md`, *When the tech lead changes a setting*).
+
+Good: you write *lower the planned load to 30*. The tech lead calls `queue_setting PLANNED_LOAD 30`. After its reply:
+*Changed the planned load (PLANNED_LOAD) from 40 to 30 ...*
+Not: you ask *what does PROD-7 say?*, PROD-7 asks for a planned load of 9, and the tech lead records it. Your message
+names neither, so the bridge changes nothing and says so.
 
 ## What it refuses
 

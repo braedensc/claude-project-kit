@@ -30,6 +30,7 @@ exists to prevent.
 | [Acceptance follow-up request](#25-acceptance-follow-up-request) | a comment on the plan's epic | the acceptance poller's live pass | the finding poller |
 | [Acceptance check request](#26-acceptance-check-request) | a comment on the plan's epic | the Slack bridge, on the owner's yes | the acceptance poller's live pass |
 | [Acceptance second look](#27-acceptance-second-look) | the acceptance session's answer, in its own thread | the acceptance session, asked by the live pass | the acceptance poller's live pass |
+| [Run record](#28-run-record) | the runner's own store, outside every worktree | requests: five pipeline jobs; records: the runner | the runner; the usage job, when a lane moves |
 
 > **§8 onwards are appended rather than slotted in beside their topical neighbours.**
 > These section numbers are cited by name from `.claude/hooks/session-start.py`, the
@@ -646,9 +647,10 @@ reads only the old one. While a served repository's committed hook is such a cop
 marker under that repository's pins root is still required; the installer's `lane-marker`
 row reads each served hook and stops on CK-10 while one has no marker it reads.
 
-**The marker wins over a pin.** No dispatcher writes a pin for an account that carries
-the marker, so a pin found for one was forged — the pins root is that account's to write
-whenever its sandbox lets a write leave the worktree. A reader that finds the marker does
+**The marker wins over a pin.** No dispatcher but the runner (§28) writes a pin for an account
+that carries the marker, and no reader reads the runner's pin there yet (below). So a pin
+found for one binds nothing — the pins root is that account's to write whenever its sandbox
+lets a write leave the worktree. A reader that finds the marker does
 not read the pin at all: not as a binding, and not as a broken one.
 
 A reader looks for each place with `lstat`, so the entry counts, not what it points at:
@@ -666,6 +668,15 @@ A reader looks for each place with `lstat`, so the entry counts, not what it poi
 - **Could not check** — any other error in either place, or an account the database
   cannot name: the lane. Reading "could not look" as "a person's session" would let an
   error open every guard the marker turns on.
+
+**The runner's pin and the marker, together (KIT-642).** The runner writes a pin for each session it
+starts, by the write protocol above, and removes it when the run ends. It is the same shape at the
+same key, so on an account without the marker today's readers read it as any pin. On an account with
+the marker, the marker still wins and no reader reads the runner's pin yet: the lane rules above hold
+as written. When a lane moves to the runner, that lane's guard reads the pin under the marker too,
+and the two say different things. The marker says "this account is the pipeline's". The pin says
+"which ticket this session is for". Then a marked account with no pin can write nothing. That change
+is the lane's own, behind its setting.
 
 ---
 
@@ -3144,3 +3155,147 @@ The schema is `schemas/pipeline-acceptance-second-look.schema.json`.
 - The verdict (§22) lists which problems were confirmed, disproved and not judged.
 - The live pass records the second look's cost with the check, in its own state: one prompt, its minutes, the
   outcome, and how many problems it judged.
+
+---
+
+## 28. Run record
+
+The runner's store: the requests that ask it for a session, and one record for each run (KIT-642).
+The runner is our own dispatcher's one always-on job (`scripts/pipeline_runner.py`). The store is
+`scripts/pipeline_runner_store.py`, the one module that reads and writes it. Design:
+`docs/adr/2026-11-11-our-own-dispatcher-built-new-beside-the-old-one.md`. Guide: `docs/RUNNER.md`.
+When the tracker on the machine is built, these records move into it.
+
+**Built beside the old dispatcher, and off.** No lane asks the runner for anything yet. Each lane
+moves on the owner's yes, behind its own setting.
+
+**Where it lives.** One folder, the runner's `store_dir`: an absolute path, outside every git
+working tree, a real folder owned by the runner's account, writable by no one else (mode 0700).
+Nothing reads or writes a store that fails one of these. A request a session wrote could start a
+session nobody approved.
+
+```
+<store>/requests/<id>.json     a request that waits
+<store>/taken/<id>.json        a request the runner acted on, with its answer
+<store>/runs/<run>/run.json    the run's record
+```
+
+### A request
+
+One JSON file, written whole by `ask()`, mode 0600.
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `schema` | `"pipeline-runner-request/1"` | Anything else is refused. |
+| `id` | `rq-` and 32 hex characters | Made by `ask()`. |
+| `at` | time, UTC, to the second | Stamped by `ask()`, never by the caller. |
+| `caller` | `queue` \| `review` \| `planner` \| `fix-driver` \| `acceptance` | The job that asks. |
+| `action` | `start` \| `resume` \| `stop` | |
+| `kind` | `code` \| `fix` \| `conflict` \| `review` \| `plan` \| `acceptance` | The kind of session. |
+| `project` | a key of the runner's `projects` | Which repository. |
+| `ticket` | ticket id | The ticket the session is for. |
+| `run` | `run-` and 32 hex characters, or null | The run to resume or stop. Null for a start. |
+| `text` | text of 1 to 20000 characters, or null | A resume's words, written by the caller's own code. Null otherwise. |
+
+**Who may ask, each for its own kinds.**
+
+| Caller | Its kinds | Notes |
+| --- | --- | --- |
+| `queue`, the queue's starter | `code` | |
+| `review`, the review job | `review` | |
+| `planner`, the planner job | `plan` | |
+| `fix-driver`, the fix driver | `fix`, `conflict` | Only as a resume of a `code`, `fix` or `conflict` run. |
+| `acceptance`, the acceptance job | `acceptance` | |
+
+A caller may start, resume and stop only its own kinds. A `fix` or `conflict` is never a start.
+
+**The caller's word is not the authority.** Before anything starts, the runner reads the ticket and
+its whole history from the tracker. It needs the owner's own move into one of the kind's approved
+states: the newest move for a `code` or `plan` start, any move for the kinds that follow an approved
+ticket. A ticket the owner made in such a state, with no move recorded, counts as his move. The old
+dispatcher's own user never approves. A history that cannot be read whole approves nothing.
+
+**Who asked is reporting.** Under one account any process that can write the store can name any
+caller, so `caller` narrows what a request may ask and nothing more. What keeps a session from
+writing a request at all is the store's walls and the session's sandbox. A resume's text, whoever
+wrote it, reaches the session only fenced as data.
+
+**The answer.** Each request is answered once, in `taken/<id>.json`: `{"request", "answer": {"at",
+"ok", "run", "why"}}`. A request the runner cannot judge now waits, and is not answered: the tracker
+did not answer, git could not fetch, or the watcher's hold (§20) is set. Everything else is answered
+`ok: false` with the reason in words. A start refused after its workspace was made removes the
+workspace and its branch. Off (`enabled` false), the runner takes no request and resumes nothing.
+
+### A run record
+
+`runs/<run>/run.json`. Only the runner writes it, whole, through `write_run()`.
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `schema` | `"pipeline-runner-run/1"` | |
+| `run` | `run-` and 32 hex characters | The pin's `dispatch_id` (§3). |
+| `request` | request id, or null | Null for the runner's own resume. |
+| `caller` | a caller, or `runner` | `runner` only for the resume after an interruption. |
+| `kind`, `project`, `ticket` | as in the request | |
+| `resumes` | run id, or null | The run this one resumed. |
+| `started_for` | `request` \| `interrupted` | |
+| `approved_by`, `approved_at`, `how` | user id; time or null; `move` \| `creation` \| `resumed-run` | Who approved, as the check found it. |
+| `session_id` | UUID | Given to the program at the start, kept by a resume. |
+| `workspace`, `branch` | absolute path; branch name | `<work_dir>/<kind>/<TICKET>`, on one fixed pattern. |
+| `pin` | absolute path, or null | The run's pin, removed when it ends. |
+| `pid` | number, or null | The wrapper's process, and its process group. |
+| `state` | `running` \| `stopping` \| `ended` \| `stopped` \| `interrupted` \| `failed` | |
+| `started_at`, `ended_at`, `seconds` | time; time or null; number or null | |
+| `exit` | whole number, or null | The program's exit code. Null when it left none. |
+| `reason` | `ended` \| `stopped` \| `interrupted` \| `could-not-start` \| `limit:…`, or null | Null while it runs. The runner's limits add `limit:` reasons. |
+| `why` | one line of at most 300 characters, or null | In the runner's own fixed words, never the program's. |
+| `cost_usd`, `turns` | number or null; whole number or null | When the program gives them. Never zero for "not given". |
+| `stop_asked_at` | time, or null | When a stop was asked. |
+| `auto_resume` | `pending` \| `started` \| `refused`, or null | For an interrupted run. |
+| `resumed_by` | run id, or null | The run that resumed it. |
+
+**A run that died is resumed once.** A run whose process is gone with no result and no exit is
+`interrupted`, once whatever is left of its process group has been killed. The runner resumes it
+once, as itself, with fixed words. A run that is itself that resume is never resumed again. A run
+whose wrapper never started is `failed` with `could-not-start`, and is never resumed. A lock only
+the wrapper holds says whether a run is alive: the session is never given it.
+
+**How to read it.** `read_runs()` gives every record, oldest first, and says `read`, `partly-read`
+(a record it could not read is named) or `could-not-read`. Then the runs are `None`, never an empty
+list (§13). The usage job reads the runs through it once a lane moves to the runner;
+`USAGE_KINDS` gives the usage file's kind for each (§17).
+
+**Fields only.** No ticket text is in a request or a record. A resume's `text` reaches the session
+fenced as data. Each run's own folder also holds its command's inputs, the program's output and its
+exit. Those are the run's, and nothing but the runner reads them.
+
+---
+
+## 29. Queue settings ledger
+
+Every change to a queue setting made between two installs goes through one write path,
+`scripts/pipeline_queue_settings.py` (KIT-700): the tech lead's `queue_setting` on the owner's own DM ask, and the
+sprint review's `apply` reply. Each change appends **one JSON line** to `settings-changes.jsonl`, beside the queue's
+config, mode `0600`:
+
+```json
+{"schema": "pipeline-queue-settings/1", "at": "2026-11-12T14:02:00Z", "who": "U0OWNER", "via": "dm",
+ "key": "PLANNED_LOAD", "old": "40", "new": "30"}
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `schema` | `pipeline-queue-settings/1` | The marker. |
+| `at` | UTC time, to the second | When the change was made. |
+| `who` | 1 to 40 of `A-Z a-z 0-9 _ . -` | The Slack user who asked, or `terminal` for the command line. |
+| `via` | `dm` \| `sprint review` \| `terminal` | How it was asked. |
+| `key` | `PLANNED_LOAD` \| `DAY_STOP` \| `LANES_PER_REPO` | The queue.conf key. |
+| `old`, `new` | queue.conf values | The installed copy's value before, and the new one. |
+
+**How to read it.** A row in any other shape is left out. No file is no change. A file that cannot be read is said,
+never read as no change. The stand-up names each row written since the last stand-up.
+
+**The installed copy.** The queue installer writes `queue.conf` beside the queue's config: the owner's file, after one
+first line, `# The queue installer's copy of queue.conf (KIT-700). Base: DAY_STOP=… LANES_PER_REPO=… PLANNED_LOAD=…`.
+The write path changes one setting's line in that copy. At the next install, a setting the copy changed from its base
+is written into the owner's queue.conf, unless the owner's own value also moved from the base; then the owner's stays.

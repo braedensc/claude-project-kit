@@ -357,10 +357,12 @@ npm run test:sprint-plan     # sprint planning (KIT-575): one proposal a sprint,
                              #   reply records the plan; the queue puts planned pieces first and admits nothing
 npm run test:sprint-review   # the sprint review (KIT-576): a recap built by code from the usage file and GitHub,
                              #   one Linear document, one DM message, once a sprint; a failure is said, never silent
+npm run test:queue-settings  # the one write path into queue.conf (KIT-700): the owner's own DM words only, the
+                             #   queue's own loader judges, read back, a ledger row, carried at the next install
 npm run test:sprint-changes  # the changes it proposes (KIT-577): at most three, lower settings only, from a short
                              #   allowed list; only the owner's exact reply makes one, and it shows old and new
-npm run test:standup         # the daily stand-up (KIT-349): asks first with exact replies,
-                             #   old news never sent, its facts built by code alone (KIT-492)
+npm run test:standup         # the daily stand-up (KIT-349): short, in the tech lead's words held
+                             #   to code's facts, else code's short version (KIT-718); no old news
 npm run test:window          # the working window (KIT-437): open or closed at a time, DST and midnight
 npm run test:queue-order     # the queue's order and limits (KIT-434): what starts next, in lanes,
                              #   within the day's load; each runaway stop holds every start
@@ -375,6 +377,11 @@ npm run test:queue-read      # the queue's reader (KIT-445): the tracker and thr
                              #   a history whole or null, what it could not read said
 npm run test:queue-start     # the queue's starter (KIT-452): what may start now, inside the window
                              #   only; the ledger row written before each start, never a title
+npm run test:runner-store    # the runner's store (KIT-642): requests and run records behind
+                             #   walls, each caller for its own kinds; unreadable runs are None
+npm run test:runner          # the runner (KIT-642): start, resume, stop and a restart against a
+                             #   stand-in; the owner's approval from the history; the pin; the one
+                             #   command line; a run that died resumed once; leaves nothing behind
 npm run test:queue-setup     # the queue's installer (KIT-456): configs pass the jobs' own loaders; no plist
                              #   overwritten, no job loaded; refused under a model
 npm run test:day-plan        # the day plan file (KIT-438): the queue's decision as fields only, each
@@ -440,11 +447,10 @@ auto-merge, grader-path, safe-outputs, conflict-loop, union-check, telemetry, da
 and weekly-review selftests, the secret-scan selftest, and, as its first step, the secret
 scan on every PR. A separate job, **Temp-leak sweeps**, runs every battery again, each in
 its own empty TMPDIR, once to the end and once stopped by a SIGTERM, and fails on anything
-one leaves behind (KIT-450, KIT-617). `main` is protected: **three** contexts are required —
-**Kit checks**, **Provenance scan** and **Hooks change guard** — with admins enforced.
-**Temp-leak sweeps is not required until the owner adds it**, so a leak turns the PR red
-without blocking the merge. Each job's limit, and what to do near one, is in
-`docs/TESTING.md` ("Job limits and what to do near one").
+one leaves behind (KIT-450, KIT-617). `main` is protected: **four** contexts are required —
+**Kit checks**, **Provenance scan**, **Hooks change guard** and **Temp-leak sweeps** (since
+12 Nov 2026, KIT-699) — with admins enforced, so a leak blocks the merge. Each job's limit,
+and what to do near one, is in `docs/TESTING.md` ("Job limits and what to do near one").
 A fourth workflow, **PR base** (`.github/workflows/pr-base.yml`), fails any PR not
 based on a base branch and re-runs on a retarget. It is deliberately not required:
 every PR into `main` passes it, and branch protection never covers a PR based on a

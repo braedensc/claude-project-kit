@@ -34,6 +34,7 @@ ALLOWED = (
     ("scripts/check_alert_pages.py", "yaml", "parses the alert workflow templates as YAML; CI installs PyYAML"),
     ("scripts/check_runner_pin.py", "yaml", "parses workflows as YAML, not by pattern; says COULD NOT CHECK without it"),
     ("scripts/check_workflow_calls.py", "yaml", "parses workflows as YAML; CI installs PyYAML"),
+    ("scripts/check_agent_trigger_author.py", "yaml", "parses workflows as YAML; CI installs PyYAML"),
     ("scripts/pipeline_safe_outputs_probe.py", "yaml", "reads a workflow as YAML in the probe; an ImportError is handled"),
     ("scripts/telemetry_scrape.py", "psycopg", "Postgres driver for the optional scrape; psycopg 3 preferred, tried inside try"),
     ("scripts/telemetry_scrape.py", "psycopg2", "Postgres driver fallback to psycopg 3; tried inside try"),

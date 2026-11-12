@@ -3937,9 +3937,21 @@ def probe_tools_body(entry, model=None):
 
 _SECTION_RE = re.compile(r"^[\s#>*_`-]*(%s)\b[\s*_`]*:?[\s*_`]*(.*)$"
                          % "|".join(PROBE_SECTIONS), re.IGNORECASE)
+# A note after the name is allowed only with no capital letter in it: `(deferred)` is a
+# note, and `(and Bash)` names a tool, so that line is not read as a clean one. An
+# `mcp__` name in a note is still read below.
 _TOOL_LINE_RE = re.compile(r"^[\s>*+-]*(?:\d+[.)]\s*)?`?([A-Za-z][A-Za-z0-9_-]*(?:__[A-Za-z0-9_*-]+)*)`?"
-                           r"[\s,.;]*$")
-_MCP_NAME_RE = re.compile(r"\bmcp__[A-Za-z0-9_-]+(?:__[A-Za-z0-9_*-]+)?")
+                           r"(?:\s*\([^()A-Z]*\))?[\s,.;]*$")
+# Kept whole, `*` included: `mcp__linear__*` is a rule, and cutting the star off made it
+# read as a tool.
+_MCP_NAME_RE = re.compile(r"\bmcp__[A-Za-z0-9_*-]+")
+
+
+def _is_fence_rule(name):
+    """True for a server or a rule (`mcp__linear`, `mcp__linear__*`), which no session
+    holds; False for an exact tool name (`mcp__linear__save_issue`)."""
+    _server, _sep, tool = name[len("mcp__"):].partition("__")
+    return "*" in name or not tool
 
 
 def parse_tool_report(body):
@@ -3956,24 +3968,46 @@ def parse_tool_report(body):
     return out
 
 
-def listed_tools(text):
-    """The tool names in one section: every line that is a single tool-shaped name, plus
-    any `mcp__` name anywhere in it — a name inside prose still counts against the fence."""
-    names = []
+def _section_names(text):
+    """(the tool names one section lists, the fence rules it names only in a sentence)."""
+    names, rules = [], set()
     for line in (text or "").splitlines():
         pieces = [p for p in re.split(r"[,;]", line) if p.strip()]
+        on_line = []
         for piece in (pieces if len(pieces) > 1 and all(_TOOL_LINE_RE.match(p) for p in pieces)
                       else [line]):
             m = _TOOL_LINE_RE.match(piece)
             if m and m.group(1).lower() not in ("none", "n/a", "nothing"):
-                names.append(m.group(1))
-        names.extend(_MCP_NAME_RE.findall(line))
+                on_line.append(m.group(1))
+        names.extend(on_line)
+        for name in _MCP_NAME_RE.findall(line):
+            if name not in on_line:
+                if _is_fence_rule(name):
+                    rules.add(name)
+                else:
+                    names.append(name)
     seen, uniq = set(), []
     for name in names:
         if name not in seen:
             seen.add(name)
             uniq.append(name)
-    return uniq
+    return uniq, sorted(rules)
+
+
+def listed_tools(text):
+    """The tool names in one section: every line that is a single tool-shaped name, a note
+    after it or not (`CronList (deferred)`), plus any exact `mcp__` tool name anywhere in
+    it — a tool named inside prose still counts against the fence."""
+    return _section_names(text)[0]
+
+
+def rules_in_sentences(text):
+    """The servers and rules (`mcp__linear`, `mcp__linear__*`) a section names only in a
+    sentence. No session holds a rule, and the sentence may say it holds those tools or
+    that it does not, so each is a person's question: never a pass, never a refusal. In a
+    live probe on 12 Nov 2026, "none of my tools is an `mcp__linear__*` tool" refused a
+    fence that held."""
+    return _section_names(text)[1]
 
 
 TOOL_LISTS = ("session tools", "helper tools")
@@ -4001,14 +4035,15 @@ def judge_tool_lists(sections, measured=None):
     return `unread` before the measured session list was looked at, so a session holding
     a tool outside the keep-set fell to a person's question. Now a bad name in any list
     read is `open` whatever else could not be read, and `unread` names only the lists
-    nothing measured."""
+    nothing measured — or that name a server or a rule in a sentence, which a person reads
+    (`rules_in_sentences`)."""
     found, unread = {}, []
     for which in TOOL_LISTS:
-        names = list(measured) if (which == "session tools" and measured) else \
-            listed_tools(sections.get(which))
+        from_log = which == "session tools" and measured
+        names = list(measured) if from_log else listed_tools(sections.get(which))
         if names:
             found[which] = names
-        else:
+        if not names or (not from_log and rules_in_sentences(sections.get(which))):
             unread.append(which)
     bad = sorted(set(n for names in found.values() for n in names
                      if n.startswith("mcp__") or n not in PLANNER_KEEP_TOOLS))
@@ -4067,12 +4102,20 @@ def settle_unread_lists(ctx, sections, read, unread, log_why, not_counted=()):
             parts.append("helper: not measured (no helper list came back), signed by you "
                          "knowing it")
             continue
-        ctx.say("  The %s list above could not be read as a list of names: read it there."
-                % name)
+        rules = rules_in_sentences(text)
+        if rules:
+            ctx.say("  The %s list above names %s in a sentence, not as a tool on a line of"
+                    % (name, ", ".join(rules)))
+            ctx.say("  its own. The sentence may say it holds them or that it does not:")
+            ctx.say("  read it there.")
+        else:
+            ctx.say("  The %s list above could not be read as a list of names: read it there."
+                    % name)
         if ctx.confirm("Does the %s list hold any tool other than these: %s?"
                        % (name, ", ".join(PLANNER_KEEP_TOOLS))):
             return "open", "you saw a tool outside the keep-set in the %s list" % name
-        parts.append("%s: read by you, nothing outside the keep-set" % name)
+        parts.append("%s: %sread by you, nothing outside the keep-set" % (
+            name, "a sentence naming %s, " % ", ".join(rules) if rules else ""))
     return "ok", "; ".join(parts)
 
 
@@ -6615,6 +6658,28 @@ def _selftest_one_command(check, tmp):
                       reply=prose_helper, helper=False, answers=("y", "n"))
     check("probe-not-counted-helper-and-a-no-signs-nothing",
           ("not counted" in got, c.state.attested("CA-PROBE")), (True, False))
+    # A live probe, 12 Nov 2026: a session whose fence held wrote "no `mcp__linear__*` tool"
+    # under both tool lists, and the probe refused it as a held tool. A rule in a sentence is
+    # the person's question now, and the record names the sentence and every listed tool.
+    denial = ("SESSION TOOLS:\n```\nGlob\nGrep\nRead\nTaskCreate (deferred)\n```\n"
+              "None of my tools is an `mcp__linear__*` or `mcp__cyrus-docs__*` tool.\n\n"
+              "HELPER TOOLS:\n```\nGlob\nGrep\nRead\nTaskCreate (deferred)\n```\n"
+              "It also had no `mcp__linear__*` or `mcp__cyrus-docs__*` tool.\n\n"
+              "CALL RESULTS:\n- `mcp__linear__list_teams` was not found.\n\n"
+              "FILE READ:\nError: denied.\n")
+    clean = ["Glob", "Grep", "Read", "Task", "TaskCreate"]
+    got, c = with_log("probe-fence-rule-in-a-sentence", clean, reply=denial,
+                      answers=("y", "n", "y", "bc"))
+    note = (c.state.data["attestations"].get("CA-PROBE") or {}).get("note") or ""
+    check("probe-fence-rule-in-a-sentence-is-asked-not-refused",
+          (got, len([q for q in with_log.asked if "helper list hold" in q]),
+           "a sentence naming mcp__cyrus-docs__*, mcp__linear__*, read by you" in note,
+           "helper: 4 tools as it said" in note),
+          ("signed", 1, True, True))
+    got, c = with_log("probe-fence-rule-in-a-sentence-yes", clean, reply=denial,
+                      answers=("y", "y"))
+    check("probe-fence-rule-in-a-sentence-and-a-yes-signs-nothing",
+          ("fence should have removed" in got, c.state.attested("CA-PROBE")), (True, False))
     # KIT-261: a log with NO tool-call records cannot say a helper did not start, or a read
     # was not attempted: that is "not measured", with the reason, never a measured "no".
     c0, _a = _probe_world(tmp, "probe-log-no-call-records")
@@ -7201,6 +7266,26 @@ def _wizard_and_key_cases(check, tmp):
         PROBE_REPLY_OK.replace("- Glob\n", "- Glob (and mcp__slack__post)\n")))[0], "open")
     check("tool-report-empty-is-unread", judge_tool_lists(parse_tool_report("hello"))[0],
           "unread")
+    # A note after a name is still a tool line. `(deferred)` dropped five of the eleven helper
+    # tools from the 12 Oct record, and would have dropped a `Bash (deferred)` unjudged.
+    check("tool-report-a-noted-line-is-a-tool",
+          listed_tools("CronList (deferred)\n- `Bash` (deferred)"), ["CronList", "Bash"])
+    check("tool-report-a-noted-line-outside-the-keep-set-is-open", judge_tool_lists(
+        {"session tools": "Read", "helper tools": "Read\nBash (deferred)"})[0], "open")
+    check("tool-report-a-note-naming-a-tool-is-not-a-clean-line", judge_tool_lists(
+        {"session tools": "Read", "helper tools": "Read (and Bash)"})[0], "unread")
+    # A fence RULE named in a sentence is no tool a session holds, and no pass either: the
+    # person reads it (a live probe, 12 Nov 2026). As a line of its own, or as an exact tool
+    # name anywhere, it still refuses.
+    for name, text, want in (
+            ("rule-in-a-sentence", "Read\nIt had no `mcp__linear__*` tool.", "unread"),
+            ("server-in-a-sentence", "Read\nThe mcp__linear server is connected.", "unread"),
+            ("rule-as-a-line", "Read\nmcp__linear__*", "open"),
+            ("exact-name-in-a-sentence", "Read\nIt also holds `mcp__linear__save_issue`.",
+             "open")):
+        check("tool-report-fence-name:%s" % name, judge_tool_lists(
+            {"session tools": "Read", "helper tools": text})[0::2],
+            (want, ["helper tools"] if want == "unread" else []))
     check("canary-answers",
           (judge_canary("x tok y", {}, "tok", None),
            judge_canary("x", {"file read": "denied"}, "tok", True),

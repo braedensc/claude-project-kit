@@ -1,5 +1,7 @@
 # Stage E — operator steps (option 4)
 
+> Plain-language pages: `docs/guides/code-review.md` (how it works), `docs/lessons/code-review.md` (the teaching version) and `docs/runbooks/code-review.md` (set up, keep running, fix). This file stays the dense reference.
+
 Stage E reviews every pull request the dispatcher opens from a ticket, and re-prompts the
 session that opened it to fix what the review found, a bounded number of times. The
 dispatcher does no reviewing of its own; this is the layer that does.
@@ -116,10 +118,13 @@ clone of the kit, and unloads the three daemons first so nothing execs out of a 
 is moving — and the catch-up poller, the status job and the heartbeat monitor too, when they
 are loaded. The `enable` step reloads the three daemons, several checkpoints downstream; the
 `catch-up` step right after it reloads the catch-up poller, the `status` step the status
-job, and the `heartbeat-monitor` step after that the monitor. If the run stops at a card before `enable`, **all the loops are off**. If it stops
-at or before `heartbeat-monitor`, **the monitor is off**. The notice printed on
-the way out names which jobs are off, and it is the only thing that says so. A dry run does
-none of this. It reports one of three things and returns: that no file the jobs run has
+job, and the `heartbeat-monitor` step after that the monitor. **A run that stops before one
+of those steps loads each job it stopped again on its way out** (KIT-661), whatever stopped
+it: a card, a row it could not measure, a failure, a crash or Ctrl-C. It loads the monitor
+last, after rearming it. It names each job it loaded again. Only a job launchd held when the
+run began counts: a first install, or a job you stopped on purpose, stays as it was. A job
+the conf turns `off` stays off too. See *Recovery: a run that stopped part way*, below. A
+dry run does none of this. It reports one of three things and returns: that no file the jobs run has
 moved, so `run` would only fast-forward and restart them; or the names of the files that
 did move; or, when it could not fetch or could not compare, that it does not know — which
 stops the pass with a remedy rather than guessing.
@@ -154,6 +159,42 @@ Not: `code FAILED — system/<label> was told to stop and launchd still holds it
 `bootout` line it prints, then `run` again.
 Not: `A JOB THAT RUNS FROM THE CLONE IS OFF`. Run the `bootstrap` line under it, or the
 `disable` line to keep it off.
+
+### Recovery: a run that stopped part way
+
+A run that stops after it moved the clone loads the jobs it stopped again on its way out. It
+names each one under `THE JOBS THIS RUN STOPPED ARE LOADED AGAIN`. They run the clone as it is
+now, with the configs and plists the run had reached. Clear the row it stopped on, then run the
+same command again. launchd keeps the plist it loaded until the job is loaded again, so when a
+later run writes a newer plist for a daemon, its `enable` step loads that daemon again. Until
+then `verify` says `would load <label> again`.
+
+When launchd will not take one back, the run ends `NOT DONE` and exits 1. It names each job
+still off, with launchd's own words, and prints the lines that load it. Run them for each job:
+
+```bash
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.example.stage-e-poller.plist
+sudo launchctl print system/com.example.stage-e-poller    # names the job once it is loaded
+```
+
+The heartbeat monitor is rearmed first, so its first pass does not page on the heartbeats
+the stop made old. The run prints that line above its `bootstrap` line:
+
+```bash
+sudo -u <role account> -H /bin/sh -c 'cd / && /usr/bin/python3 $HOME/.stage-e/kit/scripts/pipeline_heartbeat_monitor.py rearm --config $HOME/.stage-e/monitor.json'
+```
+
+If launchd says the service is disabled, and you did not disable it on purpose, enable it
+first (`sudo launchctl enable system/<label>`), then run the `bootstrap` line again.
+
+**The drain gate never waits on an unloaded poller.** Only the review poller settles a review.
+With reviews in flight and the poller not loaded, `dispatcher-entry` fails instead of showing
+card `CK-13`, and writes nothing. If this run stopped the poller, it loads it again on its way
+out. Wait for the reviews it names to settle, then run again. `CK-13` appears only while the
+poller runs.
+
+Good: `THE JOBS THIS RUN STOPPED ARE LOADED AGAIN`, after the card. Clear the card, run again.
+Not: `NOT DONE: 2 STAGE E JOBS ARE OFF`. Run the lines under it, then run again.
 
 **`verify` reads `behind` only when a file the jobs run changed.** Those files are every
 script the five jobs load, their imports included, and `schemas/`, which a review and a
@@ -212,8 +253,8 @@ names one or says `off`); read the catch-up poller's first count before it is in
 nothing: until you sign, the catch-up poller is simply not installed, and `run` loads
 everything else and then ends on the card); and watch
 one real ticket become a reviewed pull request (`CK-7`). The other four appear only when the automated path could
-not do the work: no terminal to paste a credential at (`CK-2`), an API that would not name
-a work team the agent is not a member of (`CK-4`), a code host that would not name a
+not do the work: no terminal to paste a credential at (`CK-2`), a work team where nothing
+shows the agent takes delegations (`CK-4`), a code host that would not name a
 repository's required checks (`CK-6`), and reviews still in flight when the review entries'
 routing is about to change (`CK-13`: wait for them, then run again).
 One more you run once, by hand: `CK-10` writes the root-owned lane marker that gives this
@@ -307,7 +348,7 @@ that would change the machine you had only asked it to measure.
 **No team is created, and no team is changed.** Review tickets sit on your work teams
 (KIT-599), so the installer creates no team and no workflow state, and never reads or
 writes a team's git automations: those move your coding tickets into review. It only
-reads each work team, checks the agent is a member, and creates labels.
+reads each work team, checks the agent takes delegations there, and creates labels.
 
 **The sections below stay the reference** for what each step does and why each absent key
 is absent. Read them when a card blocks you, when you want to know what the installer just
@@ -696,8 +737,22 @@ state, and never touches a git automation.
 
 1. Each team in `MANAGED_TEAM_KEYS` must exist. Review tickets are filed on the coding
    ticket's own work team. A key that names no team stops the run, by name.
-2. The dispatcher's agent must be a member of each work team. The installer only reads
-   that; `CK-4` names a team it is missing from.
+2. The dispatcher's agent must take delegations on each work team. **Team membership is not
+   what that needs** (KIT-662). Linear lets an agent take delegations on the teams it was
+   given access to when it was installed (*Settings → AI & Agents → Installed Agents*). On
+   11 Nov the agent was a member of neither work team and took every delegation on both.
+   The installer cannot read team access, so it reads proof on each team: the agent is a
+   member, or a ticket there is delegated to it. `CK-4` names a team with neither. Give the
+   agent access to that team, then delegate one ticket there to it (that starts a session)
+   or add it to the team's members. The installer only reads both; it never changes a team.
+   A delegated ticket may be an old one. If the agent's access is removed later, the review
+   poller's routing check catches it at that team's first review ticket: it stops that
+   repository's reviews and pages you (see *Review tickets on the work teams*).
+
+   Good: `tracker ALREADY-DONE`, with a note that the agent is not a member of a team and
+   takes delegations there, naming the ticket that shows it.
+   Not that: `tracker BLOCKED-ON-HUMAN` on `CK-4`, naming a team. Give the agent access to
+   it, delegate one ticket there or add the agent to its members, and run again.
 3. For each repository in `REVIEW_REPOS`, a **workspace** label `reviews-<repo name>`. Only
    that repository's review entry routes on it. A team-scoped label of the same name stops
    the run: a review ticket may sit on any work team, and the dispatcher matches labels by
@@ -727,7 +782,9 @@ An install made before this change has a Reviews team, `REVIEWS_TEAM_KEY` and
 1. **Let the reviews in flight finish.** The next run rewrites the review entries, which
    restarts the dispatcher and ends every session it is running. The installer will not
    write them while the review poller has a review in flight: it stops on `CK-13`, names
-   each one, and writes nothing. Run it again when they settle.
+   each one, and writes nothing. Run it again when they settle. If the poller is not
+   loaded, it stops without the card, since nothing could settle them (see *Recovery: a run
+   that stopped part way*).
 2. **Delete `REVIEWS_TEAM_KEY` and `REVIEWS_TEAM_NAME`** from `stage-e.conf`. They are
    ignored either way, and the run names them until you do.
 3. **Run the one command.** Stage E creates the routing labels, rewrites the entries and
@@ -1925,7 +1982,8 @@ four daemons exec out of it, so a fix merged to the default branch is inert on t
 until the clone moves. `run` moves it for you — it unloads the four jobs, the status job and
 the heartbeat monitor, fast-forwards, reloads three at its `enable` step, the catch-up poller
 at its `catch-up` step, the status job at its `status` step and the monitor at its
-`heartbeat-monitor` step — and that is the only thing that does. The monitor runs from the
+`heartbeat-monitor` step, or on its way out when it stops before one of them — and that is
+the only thing that does. The monitor runs from the
 same clone, and so do the notifier and the Slack bridge, which `run` stops for the move and
 loads again. Pull it by hand only with every job that runs from it unloaded, never under a
 running pass, and compare its `git rev-parse --short HEAD` against your own clone whenever

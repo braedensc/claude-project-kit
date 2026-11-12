@@ -235,7 +235,7 @@ in its block's `blocked` field (§5). `summary` is prose for a person and stops 
 | **A hard environment block** — a denied path, dead auth, a broken tool with no legitimate route | Explain what is blocked and the exact fix. Halt. No shims, symlinks or sandbox tricks. |
 | **A guard blocked a command** | Say which guard and what you were doing. Stop. Never re-spell it. |
 | **Ambiguous acceptance criteria, or work drifting out of scope** | Post **one** specific, answerable question as a ticket comment, with the `agent:blocked` mark (below) as its first line. End the session. |
-| **The plan is wrong, or needs a ticket nobody filed** — a prerequisite missing, two children that overlap | The same: one comment with the `agent:blocked` mark, saying what the plan is missing. End the session. Never quietly do the other ticket's work. |
+| **The plan is wrong, or needs a ticket nobody filed** — a prerequisite missing, two children that overlap | First the plan note (below), so the tech lead can reorder the plan or ask the owner. Then the same: one comment with the `agent:blocked` mark, saying what the plan is missing. End the session. Never quietly do the other ticket's work. |
 | **`gh` cannot verify TLS** | An environment limit, not a guard. Use `scripts/gh_fallback.py`. It has no merge endpoint by design. |
 | **Your PR is red or conflicted** | `/fix-ci`. Bounded to three attempts on a branch; then report what is still red instead of guessing again. |
 | **The fix lives under `.github/workflows/`** | You cannot land it — not by `git push`, not by the REST contents API. Say which file needs the change and that it needs a person. Stop; do not retry. |
@@ -249,9 +249,9 @@ Good: "Criterion 3 conflicts with criterion 1 — which wins? Requesting `agent:
 Ending session."
 Not: "Criterion 3 probably meant X, so I implemented X."
 
-### The two things a machine reads in your comments
+### The three things a machine reads in your comments
 
-A person reads your comments, but a machine reads these two exactly. Copy them; never
+A person reads your comments, but a machine reads these three exactly. Copy them; never
 reword them.
 
 **1. The escalation mark: the first line of the comment, on its own.** Where the project runs
@@ -286,6 +286,24 @@ ticket.
 You may add `"effort": "S"` (or `M`, `L`) and `"track": "<word>"` to say its size and track; the
 filer applies them only if the team has that label. A finding left unsized waits for a person.
 Nothing else in that comment is read. It creates nothing itself, and moves nothing.
+
+**3. A plan note: one comment on your own ticket holding this block.** Use it when your
+ticket is one piece of an approved plan and the plan itself is wrong: another piece must come
+first, work no piece covers is missing, or the criteria cannot all hold (KIT-320).
+
+````markdown
+```json
+{"schema": "plan-needs-change/1", "kind": "reorder", "reason": "PROD-53 builds the table this piece reads, so it should come first."}
+```
+````
+
+`kind` is `missing-prerequisite`, `reorder`, `scope` or `other`. `reason` says why, in at most
+300 characters. For a missing prerequisite, add `"prerequisite": "<what is missing>"`, at most
+200 characters. Nothing else in that comment is read, and only one note a comment.
+
+Where the project runs the bridge with the tech lead on, the tech lead reads the note. A
+reorder that stays inside the approved plan is then made without the owner. Anything else is
+asked of them. The note changes nothing itself, so still escalate as in 1 if you cannot go on.
 
 ---
 
