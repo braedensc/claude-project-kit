@@ -15,8 +15,10 @@ Every acting tool before this one only asks: its action waits for the owner's ye
 ## Decision
 
 1. **His request is the yes.** `queue_setting` records a change, and the bridge makes it after the turn only when the
-   message that started the turn is the owner's, as Slack says, and names the setting and the value in one sentence.
-   A change the model read in a ticket, a pull request or a session's words is never in his message, so it is refused.
+   message that started the turn is the owner's, as Slack says, and asks for it in one sentence: a verb such as set,
+   lower or raise, the setting, and the value. A question, a negation, or a number in a time, a date or a percentage
+   asks for nothing. The one write path checks his words itself as well. A change the model read in a ticket, a pull
+   request or a session's words is never in his message, so it is refused.
 2. **Three settings.** `PLANNED_LOAD`, `DAY_STOP` and `LANES_PER_REPO`. Who may start work, teams, repositories,
    paths, accounts and jobs stay his own edit. The runaway stop stays: it can be raised, never removed.
 3. **One write path.** `scripts/pipeline_queue_settings.py` writes every change: the tech lead's, and the sprint

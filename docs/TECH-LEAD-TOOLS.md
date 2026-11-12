@@ -121,7 +121,8 @@ queue.conf. The sprint review's `apply` reply goes through the same path.
 The bridge makes it only when:
 
 - the message that started the turn is from you, the first of `dm_user_ids`, as Slack says;
-- that message names the setting and the value in one sentence; and
+- that message asks for it in one sentence: a verb such as set, lower or raise, the setting and the value. A question
+  or a sentence with don't, not, never or keep asks for nothing; and
 - the queue's own loader takes the new settings.
 
 Then it writes the installed copy of queue.conf and the queue's config, reads both back, and adds a ledger row. It

@@ -133,8 +133,10 @@ The morning job then exits 3. A plan file it cannot read is never planned over, 
 
 ## When the tech lead changes a setting
 
-Ask in your DM, naming the setting and the new value in one sentence: *lower the planned load to 30*, *raise the day
-stop to 80*, *two lanes per repo, so lanes 2*. The tech lead can change three settings: `PLANNED_LOAD`, `DAY_STOP` and
+Ask in your DM, in one sentence: a verb such as set, lower or raise, the setting, and the new value. *Lower the planned
+load to 30*, *raise the day stop to 80*, *make it two lanes per repo, so lanes 2*. A question asks for nothing (*can you
+raise the day stop to 80?*), and neither does a sentence with don't, not, never or keep. Neither does a number in a time,
+a date or a percentage. The tech lead can change three settings: `PLANNED_LOAD`, `DAY_STOP` and
 `LANES_PER_REPO`. The rest of queue.conf stays yours to edit.
 
 The jobs' account cannot reach your queue.conf. So the change goes into the installed copy beside the queue's config,

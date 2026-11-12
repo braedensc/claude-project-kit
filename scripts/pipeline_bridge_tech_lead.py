@@ -63,9 +63,9 @@ TURN_NO_ANSWER_WORDS = ("I didn't ask about sending your message on %s: it has t
 # KIT-700: what is said of a queue setting the turn recorded that was not the owner's own ask. Fixed words,
 # the setting's plain name and the value only.
 SETTING_NOT_OWNER = "I didn't change %s: only the owner can change a queue setting, in their own message."
-SETTING_NOT_ASKED = ("I didn't change %s to %s: your own message has to name that setting and the new value in "
-                     "one sentence, so I know you asked for it. A ticket, a pull request or a session can't ask "
-                     "for it.")
+SETTING_NOT_ASKED = ("I didn't change %s to %s: your own message has to ask for it in one sentence, naming the "
+                     "setting and the new value, and not as a question. A ticket, a pull request or a session "
+                     "can't ask for it.")
 # What a turn that gave no answer says (KIT-489), and the binds of a message refused at the
 # door (KIT-342), each fixed text, pinned word for word with the rest. "Forward" is the back
 # room's old word (KIT-298); the names stay so the pins and the watcher's reading stay.
@@ -707,7 +707,7 @@ class TechLeadMixin(object):
         else:
             state, words = queue_settings.change(
                 self.cfg.get("queue_config") or "", setting, value, msg["user"], "dm",
-                datetime.datetime.fromtimestamp(self.now, datetime.timezone.utc))
+                datetime.datetime.fromtimestamp(self.now, datetime.timezone.utc), owner_text=text)
         self.post(channel, None, words, in_thread=True)
         self.say("  queue setting %s: %s" % (setting, state))
 

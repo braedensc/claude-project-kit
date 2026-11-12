@@ -316,8 +316,11 @@ def apply_yes(path, queue_path, key, value, date, now, dry=False, who="terminal"
         save(doc, path)                     # the record first: a change that cannot be recorded is not made
     except ChangesError as exc:
         return "failed", "I could not record the change to %s (%s), so nothing was changed." % (key, exc)
-    state, words = queue_settings.change(queue_path, ALLOWED[key][0], fmt(new), who,
-                                         "terminal" if who == "terminal" else "sprint review", now)
+    try:
+        state, words = queue_settings.change(queue_path, ALLOWED[key][0], fmt(new), who,
+                                             "terminal" if who == "terminal" else "sprint review", now)
+    except Exception as exc:  # noqa: BLE001  (the write path says its faults; this is the backstop)
+        state, words = "failed", "I could not change %s (%s), so it is as it was." % (key, type(exc).__name__)
     if state != "applied":
         doc["proposals"][i]["applied_at"] = None
         try:
@@ -442,7 +445,8 @@ def _selftest():
                 json.dump({"pool": POOL, "order": o, "planner": {"planned_load": o.get("planned_load"),
                                                                  "lanes_per_repo": o.get("lanes_per_repo")},
                            "reader": {"ledger_file": os.path.join(tmp, "ledger.json"), "inputs_file": os.path.join(tmp, "in.json")},
-                           "morning": {"usage_file": os.path.join(tmp, "usage.json")}} if extra else {}, fh)
+                           "morning": {"usage_file": os.path.join(tmp, "usage.json")}, "room": {"min_free_disk_gb": 10}}
+                          if extra else {}, fh)
             os.chmod(qpath, 0o640)
             with open(copy_path, "w", encoding="utf-8") as fh:
                 fh.write(queue_settings.installed_copy("PLANNED_LOAD=%s\nLANES_PER_REPO=%s\n" % (o.get("planned_load"), o.get("lanes_per_repo"))))
@@ -529,8 +533,9 @@ def _selftest():
               ("applied", True, True))
         after = json.load(open(qpath))
         check("only that key moved: the other keys, the other sections and the file's mode are as they were",
-              (after["order"], after["planner"], after["pool"], oct(os.stat(qpath).st_mode & 0o777)),
-              ({"planned_load": 30, "lanes_per_repo": 2, "day_stop": 60}, {"planned_load": 30, "lanes_per_repo": 2}, POOL, "0o640"))
+              (after["order"], after["planner"], after["pool"], after["room"], oct(os.stat(qpath).st_mode & 0o777)),
+              ({"planned_load": 30, "lanes_per_repo": 2, "day_stop": 60}, {"planned_load": 30, "lanes_per_repo": 2}, POOL,
+               {"min_free_disk_gb": 10}, "0o640"))
         check("…and queue.conf's installed copy says it, and the ledger has the owner's yes",
               (queue_settings.effective(open(copy_path).read(), "PLANNED_LOAD"),
                [(r["key"], r["old"], r["new"], r["who"], r["via"]) for r in queue_settings.rows_since(ledger, now - datetime.timedelta(days=1))[0]]),
@@ -574,6 +579,19 @@ def _selftest():
         os.unlink(qpath)
         st, _w = apply_yes(cpath, qpath, "planned_load", "30", "2026-11-10", now)
         check("unreadable queue settings change nothing and are said", (st,), ("unusable",))
+        put_queue()
+        real_change = queue_settings.change
+
+        def change_raises(*_a, **_k):
+            raise RuntimeError("boom")
+        queue_settings.change = change_raises
+        try:
+            st, words = apply_yes(cpath, qpath, "planned_load", "30", "2026-11-10", now)
+        finally:
+            queue_settings.change = real_change
+        check("a write path that raises is a failure: the proposal is not left marked applied",
+              (st, "RuntimeError" in words, [c["applied_at"] for c in load(cpath)[0]["proposals"]]),
+              ("failed", True, [None, None]))
         put_queue()
         os.unlink(copy_path)
         st, words = apply_yes(cpath, qpath, "planned_load", "30", "2026-11-10", now)

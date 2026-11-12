@@ -22,9 +22,14 @@ A VALUE THE QUEUE WOULD REFUSE IS NEVER WRITTEN.  The value must have its key's 
 own rule, pinned below), and the settings with it must pass the queue's own loader (pipeline_queue_start.load).
 Otherwise nothing is written, and the words say why, in the loader's own words.
 
-WHO ASKED.  owner_asked() is the gate for the DM. The owner's own message must name the setting and the new value in
-one sentence. A request the tech lead read in a ticket, a pull request or a session's words is not in his message,
-so it is refused. The bridge checks that the sender is the owner; this checks his words.
+WHO ASKED.  owner_asked() is the gate for the DM, and change() applies it itself to every change made through the DM.
+The owner's own message must ask for it in one sentence: a verb such as set, lower or raise (or `=`), then the new
+value, with the setting named. A question, a "don't", a "keep" or a "never" asks for nothing, and a number in a time, a
+date or a percentage is not a value. A request the tech lead read in a ticket, a pull request or a session's words is
+not in his message, so it is refused. The bridge also checks that the sender is the owner, as Slack says.
+
+ONE AT A TIME.  A change holds an exclusive lock beside the settings file while it reads, writes and records. Nothing
+raises out of change(): a fault is a failure said in words, with what was written put back.
 
 THE LEDGER.  One JSON line per change, appended, mode 0600, beside the settings file: who asked, when, how, the key,
 the old and the new value (contract section 28). The stand-up mentions each change (rows_since).
@@ -34,12 +39,14 @@ and the ledger, each never through a link, and nothing else.
 """
 import copy as _copy
 import datetime
+import fcntl
 import json
 import os
 import re
 import stat
 import sys
 import tempfile
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
@@ -57,6 +64,9 @@ VIA = {"dm": "you asked in the DM", "sprint review": "your yes to the sprint rev
        "terminal": "set at a terminal"}
 ROWS_MAX = 10
 FILE_MAX = 1 << 20
+LOCK_NAME = ".settings.lock"                 # beside the settings file: one change at a time
+LOCK_WAIT_SECONDS = 10
+OLD_RE = re.compile(r"^(?:0|[1-9][0-9]{0,8})(?:\.[0-9]{0,8}[1-9])?\Z")   # an old value, tidied (tidy())
 # Each setting: how it is said, the words his message may name it by, whole numbers only, the places in the queue's
 # settings file it is composed into (the installer's compose(), pinned in the selftest), and its default there.
 ALLOWED = {
@@ -67,8 +77,13 @@ ALLOWED = {
     "LANES_PER_REPO": {"name": "the lanes per repository", "words": ("lanes",), "whole": True,
                        "paths": (("order", "lanes_per_repo"), ("planner", "lanes_per_repo")), "default": "1"},
 }
-SENTENCE_RE = re.compile(r"[.!?;](?=\s|\Z)|\n")
-NUMBER_RE = re.compile(r"(?<![\w.-])[0-9]{1,7}(?:\.[0-9]{1,2})?(?![\w-]|\.[0-9])")   # not inside an id: PROD-30
+SENTENCE_RE = re.compile(r"([.!?;](?=\s|\Z)|\n)")
+# A number on its own: not inside an id (PROD-30), a time (9:30), a date (11/30) or a percentage (30%).
+NUMBER_RE = re.compile(r"(?<![\w.:/-])[0-9]{1,7}(?:\.[0-9]{1,2})?(?![\w%:/-]|\.[0-9])")
+# What makes a sentence a request: one of these verbs before the value, or `=` right before it.
+REQUEST_RE = re.compile(r"(?<![a-z])(?:set|change|lower|raise|make|put|move|bump|drop|reduce|increase|cut|turn)"
+                        r"(?![a-z])")
+NEGATION_RE = re.compile(r"n't(?![a-z])|(?<![a-z])(?:not|never|keep|leave|unchanged|dont|cannot)(?![a-z])")
 
 
 def _iso(dt):
@@ -86,6 +101,15 @@ def canon(value):
     """A value queue.conf takes, in its one spelling: 30.0 is 30, 7.50 is 7.5."""
     f = round(float(value), 2)
     return ("%d" % f) if f == int(f) else ("%.2f" % f).rstrip("0")
+
+
+def tidy(text):
+    """A number as queue.conf may spell it (040, 7.50) in one spelling (40, 7.5), never rounded; other text as it is."""
+    m = re.match(r"^([0-9]+)(?:\.([0-9]+))?\Z", text or "")
+    if not m:
+        return text
+    frac = (m.group(2) or "").rstrip("0")
+    return (m.group(1).lstrip("0") or "0") + ("." + frac if frac else "")
 
 
 def as_number(value):
@@ -195,17 +219,24 @@ def carry_into(path, carried):
 # The gate on his words
 # --------------------------------------------------------------------------- #
 def owner_asked(text, key, value):
-    """True when the owner's own message names `key` and the new `value` in one sentence: one of the setting's words,
-    or its key, and the number. Nothing else of the message is read."""
+    """True when the owner's own message asks for `key` at `value` in one sentence: the setting named (one of its words,
+    or its key), and the value as a number of its own with a request verb, or `=`, before it. A sentence that is a
+    question or holds a negation asks for nothing. Nothing else of the message is read."""
     if key not in ALLOWED or value_problem(key, value) or not isinstance(text, str):
         return False
     want = float(value)
     names = ALLOWED[key]["words"] + (key.lower().replace("_", " "),)
-    for sentence in SENTENCE_RE.split(text.lower().replace("_", " ")):
+    parts = SENTENCE_RE.split(text.lower().replace("_", " ").replace("\u2019", "'"))
+    for sentence, end in zip(parts[0::2], parts[1::2] + [""]):
         said = " ".join(sentence.split())
-        if any(re.search(r"(?<![a-z])%s(?![a-z])" % re.escape(n), said) for n in names) and any(
-                float(m) == want for m in NUMBER_RE.findall(said)):
-            return True
+        if end == "?" or "?" in said or NEGATION_RE.search(said):
+            continue
+        if not any(re.search(r"(?<![a-z])%s(?![a-z])" % re.escape(n), said) for n in names):
+            continue
+        for m in NUMBER_RE.finditer(said):
+            before = said[:m.start()]
+            if float(m.group()) == want and (REQUEST_RE.search(before) or before.rstrip().endswith("=")):
+                return True
     return False
 
 
@@ -255,23 +286,43 @@ def _replace(path, text, mode):
 
 
 def _append(path, row):
-    """One row at the ledger's end: a plain file nobody else can use, never through a link."""
+    """One row at the ledger's end: a plain file nobody else can use, never through a link. A row that cannot be
+    written and synced whole is cut off again, so the ledger never keeps a row for a change that was put back."""
     fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or st.st_mode & 0o077:
             raise ValueError("the ledger is not a plain file of this account's alone")
-        os.write(fd, (json.dumps(row, sort_keys=True) + "\n").encode("utf-8"))
-        os.fsync(fd)
+        try:
+            os.write(fd, (json.dumps(row, sort_keys=True) + "\n").encode("utf-8"))
+            os.fsync(fd)
+        except BaseException:
+            os.ftruncate(fd, st.st_size)
+            raise
     finally:
         os.close(fd)
+
+
+def _lock(path):
+    """An exclusive lock on a file beside the settings file, held for one change; None after LOCK_WAIT_SECONDS."""
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    deadline = time.monotonic() + LOCK_WAIT_SECONDS
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                os.close(fd)
+                return None
+            time.sleep(0.1)
 
 
 def valid_row(row):
     return (isinstance(row, dict) and row.get("schema") == SCHEMA and _parse(row.get("at")) is not None
             and row.get("key") in ALLOWED and row.get("via") in VIA and isinstance(row.get("who"), str)
-            and WHO_RE.match(row["who"]) and all(isinstance(row.get(k), str) and VALUE_RE.match(row[k])
-                                                for k in ("old", "new")))
+            and WHO_RE.match(row["who"]) and isinstance(row.get("old"), str) and OLD_RE.match(row["old"])
+            and isinstance(row.get("new"), str) and VALUE_RE.match(row["new"]))
 
 
 def rows_since(ledger, since):
@@ -304,11 +355,18 @@ def row_words(row, now=None):
 # --------------------------------------------------------------------------- #
 # The change
 # --------------------------------------------------------------------------- #
-def change(queue_file, key, value, who, via, now, judge=None):
+def change(queue_file, key, value, who, via, now, judge=None, owner_text=None):
     """(state, words): `key` set to `value` in the installed copy of queue.conf and in the queue's settings file, both
     read back, and one ledger row. state is applied, same, refused, unusable or failed; the words are fixed, with the
-    old and the new value. `judge` is the queue's own loader (a case stands in for it)."""
-    judge = judge or starter.load
+    old and the new value. `owner_text` is the owner's own message, required when `via` is "dm": the words gate is on
+    this one write path itself. `judge` is the queue's own loader (a case stands in for it). Nothing raises out."""
+    try:
+        return _change(queue_file, key, value, who, via, now, judge or starter.load, owner_text)
+    except Exception as exc:  # noqa: BLE001  (a fault before any write: said by its kind, nothing moved)
+        return "failed", "I could not change %s (%s), so nothing was changed." % (str(key)[:40], type(exc).__name__)
+
+
+def _change(queue_file, key, value, who, via, now, judge, owner_text):
     if key not in ALLOWED:
         return "refused", ("%s is not a queue setting I can change. I can change the planned load, the day stop and "
                            "the lanes per repository; the rest of queue.conf is yours to edit." % str(key)[:40])
@@ -319,8 +377,23 @@ def change(queue_file, key, value, who, via, now, judge=None):
     if via not in VIA or not isinstance(who, str) or not WHO_RE.match(who):
         return "refused", "I don't know who asked for that, so nothing was changed."
     new = canon(value)
+    if via == "dm" and not owner_asked(owner_text, key, value):
+        return "refused", ("I didn't change %s to %s: your own message has to ask for it in one sentence, naming the "
+                           "setting and the new value, and not as a question. A ticket, a pull request or a session "
+                           "can't ask for it." % (name, new))
     if not queue_file:
         return "unusable", "The queue is not set up here, so there is no queue setting to change."
+    lock = _lock(os.path.join(os.path.dirname(queue_file), LOCK_NAME))
+    if lock is None:
+        return "unusable", ("I can't change %s now: another change to the queue's settings is being made. Ask again in "
+                            "a minute." % name)
+    try:
+        return _locked(queue_file, key, new, who, via, now, judge, name)
+    finally:
+        os.close(lock)
+
+
+def _locked(queue_file, key, new, who, via, now, judge, name):
     copy_path, ledger = paths_for(queue_file)
     try:
         copy_text, copy_mode = _read_plain(copy_path)
@@ -338,7 +411,7 @@ def change(queue_file, key, value, who, via, now, judge=None):
     places = ALLOWED[key]["paths"]
     if not isinstance(doc, dict) or not all(isinstance(doc.get(s), dict) for s, _k in places):
         return "unusable", "I can't change %s: the queue's settings file is not in its shape, so nothing was changed." % name
-    old = effective(copy_text, key)
+    old = tidy(effective(copy_text, key))
     if old == new and all(doc[s].get(k) == as_number(new) for s, k in places):
         return "same", "%s is already %s, so nothing was changed." % (name[0].upper() + name[1:], new)
     new_doc = _copy.deepcopy(doc)
@@ -360,7 +433,7 @@ def change(queue_file, key, value, who, via, now, judge=None):
                 or any(back_doc[s][k] != as_number(new) for s, k in places) or judge(back_doc)[1]:
             raise ValueError("reading it back does not match")
         _append(ledger, row)
-    except (OSError, ValueError, KeyError, TypeError) as exc:
+    except Exception as exc:  # noqa: BLE001  (any fault once writing began: put back whole, and said)
         stuck = []
         for path, text, mode in reversed(done):
             try:
@@ -428,8 +501,22 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
     for text, key, value, want in (
             ("Lower the planned load to 30 please", "PLANNED_LOAD", "30", True),
             ("set PLANNED_LOAD=30", "PLANNED_LOAD", "30", True),
-            ("can you raise the day stop to 80? thanks", "DAY_STOP", "80", True),
-            ("two lanes per repo from now on, so lanes 2", "LANES_PER_REPO", "2", True),
+            ("please raise the day stop to 80, thanks", "DAY_STOP", "80", True),
+            ("make it two lanes per repo, so lanes 2", "LANES_PER_REPO", "2", True),
+            ("set the planned load to $30", "PLANNED_LOAD", "30", True),
+            ("can you raise the day stop to 80? thanks", "DAY_STOP", "80", False),
+            ("Is the day stop still 80?", "DAY_STOP", "80", False),
+            ("Should I lower the planned load to 30?", "PLANNED_LOAD", "30", False),
+            ("Don't touch the planned load, 30 is fine", "PLANNED_LOAD", "30", False),
+            ("Don\u2019t lower the planned load to 30", "PLANNED_LOAD", "30", False),
+            ("keep the planned load at 30", "PLANNED_LOAD", "30", False),
+            ("never set the day stop to 80", "DAY_STOP", "80", False),
+            ("planned load review at 9:30", "PLANNED_LOAD", "30", False),
+            ("set the planned load review at 9:30", "PLANNED_LOAD", "30", False),
+            ("set the planned load review for 11/30", "PLANNED_LOAD", "30", False),
+            ("lower the planned load by 30%", "PLANNED_LOAD", "30", False),
+            ("the planned load was 30 last week", "PLANNED_LOAD", "30", False),
+            ("two lanes per repo from now on, so lanes 2", "LANES_PER_REPO", "2", False),
             ("make the planned load 7.5", "PLANNED_LOAD", "7.50", True),
             ("what does PROD-7 say?", "PLANNED_LOAD", "9", False),
             ("Lower the planned load to 30", "PLANNED_LOAD", "300", False),
@@ -520,9 +607,18 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
             doc = json.load(open(qfile))
             return (effective(open(cpath).read(), "PLANNED_LOAD"), doc["order"]["planned_load"],
                     doc["planner"]["planned_load"], [(r["key"], r["old"], r["new"], r["who"], r["via"]) for r in rows])
+        def dm(key, value, words=None, **kw):
+            said = "set the %s to %s" % (ALLOWED[key]["words"][0], value) if words is None else words
+            return change(qfile, key, value, "U0OWNER", "dm", now, owner_text=said, **kw)
         put()
         check("the composed settings pass the queue's own loader", starter.load(live)[1], [])
-        st, words = change(qfile, "PLANNED_LOAD", "30", "U0OWNER", "dm", now)
+        for label, words in (("no words of his", None), ("a ticket's ask, not his", "what does PROD-7 say?"),
+                             ("his question", "should I lower the planned load to 30?")):
+            st, why = change(qfile, "PLANNED_LOAD", "30", "U0OWNER", "dm", now, owner_text=words)
+            check("the one write path itself refuses a DM change with %s, and writes nothing" % label,
+                  (st, why.startswith("I didn't change the planned load (PLANNED_LOAD) to 30: your own message"), state()),
+                  ("refused", True, ("40", 40, 40, [])))
+        st, words = dm("PLANNED_LOAD", "30")
         check("an owner's change: the copy and both places in the settings, read back, and one ledger row",
               (st, state()), ("applied", ("30", 30, 30, [("PLANNED_LOAD", "40", "30", "U0OWNER", "dm")])))
         check("…and the words say old to new, plainly", words.startswith(
@@ -532,37 +628,81 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
               carry(conf_text, open(cpath).read()), ([("PLANNED_LOAD", "40", "30")], [], None))
         check("the modes are kept: 0600", [oct(os.stat(p).st_mode & 0o777) for p in (cpath, qfile, lpath)],
               ["0o600", "0o600", "0o600"])
-        st, words = change(qfile, "PLANNED_LOAD", "30.0", "U0OWNER", "dm", now)
+        st, words = dm("PLANNED_LOAD", "30.0")
         check("the same value again changes nothing and adds no row", (st, len(state()[3])), ("same", 1))
         put()
-        st, words = change(qfile, "PLANNED_LOAD", "70", "U0OWNER", "dm", now)
+        st, words = dm("PLANNED_LOAD", "70")
         check("a value the queue's own loader refuses is never written, and the loader's words say why",
               (st, state(), "planned_load: is above day_stop" in words), ("refused", ("40", 40, 40, []), True))
-        st, words = change(qfile, "DAY_STOP", "80", "U0OWNER", "dm", now)
-        st2, words2 = change(qfile, "PLANNED_LOAD", "70", "U0OWNER", "dm", now)
+        st, words = dm("DAY_STOP", "80")
+        st2, words2 = dm("PLANNED_LOAD", "70")
         check("…and the same value fits once the day stop is raised", (st, st2, state()[:3]), ("applied", "applied", ("70", 70, 70)))
         put()
         for label, args in (("a key off the list", ("OWNER_USER_IDS", "30")), ("a value of the wrong form", ("PLANNED_LOAD", "3e2")),
                             ("a fraction of a lane", ("LANES_PER_REPO", "1.5")), ("zero", ("DAY_STOP", "0"))):
-            st, _w = change(qfile, args[0], args[1], "U0OWNER", "dm", now)
+            st, _w = change(qfile, args[0], args[1], "U0OWNER", "dm", now, owner_text="set it to %s" % args[1])
             check("%s is refused and nothing is written" % label, (st, state()), ("refused", ("40", 40, 40, [])))
-        check("who asked must be said", change(qfile, "PLANNED_LOAD", "30", "", "dm", now)[0], "refused")
+        check("who asked must be said", change(qfile, "PLANNED_LOAD", "30", "", "terminal", now)[0], "refused")
         check("…and how", change(qfile, "PLANNED_LOAD", "30", "U0OWNER", "a ticket", now)[0], "refused")
-        check("no queue here is said", change("", "PLANNED_LOAD", "30", "U0OWNER", "dm", now)[0], "unusable")
+        check("no queue here is said", change("", "PLANNED_LOAD", "30", "U0OWNER", "terminal", now)[0], "unusable")
         for label, copy_text in (("no installed copy", False), ("a copy with no base line", conf_text)):
             put(copy_text=copy_text)
-            check("%s changes nothing" % label, (change(qfile, "PLANNED_LOAD", "30", "U0OWNER", "dm", now)[0],
+            check("%s changes nothing" % label, (dm("PLANNED_LOAD", "30")[0],
                                                  json.load(open(qfile))["order"]["planned_load"]), ("unusable", 40))
+        put(copy_text=installed_copy("PLANNED_LOAD=040\n"))
+        st, _w = dm("PLANNED_LOAD", "30")
+        check("an old value in a spelling the installer takes is recorded tidy, and the stand-up keeps the row",
+              (st, state()[3]), ("applied", [("PLANNED_LOAD", "40", "30", "U0OWNER", "dm")]))
+        # nothing raises out of the one write path: a fault anywhere is a failure, put back
+        put()
+
+        def explodes(_doc):
+            raise RecursionError("too deep")
+        st, words = dm("PLANNED_LOAD", "30", judge=explodes)
+        check("a fault inside the write path is a failure said in words, never an exception, and nothing moves",
+              (st, "RecursionError" in words, state()), ("failed", True, ("40", 40, 40, [])))
+        # a ledger row whose sync fails is taken back with the files: the ledger never reports an undone change
+        put()
+        real_fsync, calls = os.fsync, []
+
+        def fsync_fails_third(fd):
+            calls.append(fd)
+            if len(calls) == 3:
+                raise OSError("fsync failed")
+            return real_fsync(fd)
+        os.fsync = fsync_fails_third
+        try:
+            st, words = dm("PLANNED_LOAD", "30")
+        finally:
+            os.fsync = real_fsync
+        check("a ledger row that cannot be synced is cut off again, and the files are put back",
+              (st, state(), os.path.getsize(lpath) if os.path.exists(lpath) else 0), ("failed", ("40", 40, 40, []), 0))
+        # one change at a time: the lock beside the settings file
+        put()
+        import fcntl
+        global LOCK_WAIT_SECONDS
+        saved_wait, LOCK_WAIT_SECONDS = LOCK_WAIT_SECONDS, 0.3
+        holder = os.open(os.path.join(folder, LOCK_NAME), os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        try:
+            st, words = dm("PLANNED_LOAD", "30")
+        finally:
+            fcntl.flock(holder, fcntl.LOCK_UN)
+            os.close(holder)
+            LOCK_WAIT_SECONDS = saved_wait
+        check("while another change holds the lock, nothing is written and it says to try again",
+              (st, "another change" in words, state()), ("unusable", True, ("40", 40, 40, [])))
+        check("…and once it is free the change goes through", dm("PLANNED_LOAD", "30")[0], "applied")
         put()
         os.rename(cpath, cpath + ".real")
         os.symlink(cpath + ".real", cpath)
-        check("a copy that is a link is never written through", (change(qfile, "PLANNED_LOAD", "30", "U0OWNER", "dm", now)[0],
+        check("a copy that is a link is never written through", (dm("PLANNED_LOAD", "30")[0],
               effective(open(cpath + ".real").read(), "PLANNED_LOAD")), ("unusable", "40"))
         os.unlink(cpath)
         os.unlink(cpath + ".real")
         put()
         os.mkdir(lpath)
-        st, words = change(qfile, "PLANNED_LOAD", "30", "U0OWNER", "dm", now)
+        st, words = dm("PLANNED_LOAD", "30")
         os.rmdir(lpath)
         check("a change that cannot be recorded is put back whole, and said",
               (st, words.endswith("so it is as it was."), state()), ("failed", True, ("40", 40, 40, [])))
@@ -572,18 +712,18 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
         def changes_its_mind(doc):
             judged.append(doc)
             return doc, ([] if len(judged) == 1 else ["order: planned_load: refused on reading it back"])
-        st, words = change(qfile, "PLANNED_LOAD", "30", "U0OWNER", "dm", now, judge=changes_its_mind)
+        st, words = dm("PLANNED_LOAD", "30", judge=changes_its_mind)
         check("what is written is read back and judged again: a read-back the loader refuses is put back whole",
               (st, len(judged), words.endswith("so it is as it was."), state()), ("failed", 2, True, ("40", 40, 40, [])))
         put()
-        st, _w = change(qfile, "PLANNED_LOAD", "30", "U0OWNER", "dm", now, judge=lambda d: (d, []))
+        st, _w = dm("PLANNED_LOAD", "30", judge=lambda d: (d, []))
         check("the judge is the one that decides: a stand-in that takes anything is what lets 30 through here", st, "applied")
         put()
         for v in ("2", "3"):
             check("lanes %s: the order's and the day planner's loaders both take it" % v,
-                  (change(qfile, "LANES_PER_REPO", v, "U0OWNER", "dm", now)[0],
+                  (dm("LANES_PER_REPO", v)[0],
                    planner.config(json.load(open(qfile))["planner"])[1]), ("applied", []))
-        check("…and four lanes is refused by the queue's own loader", change(qfile, "LANES_PER_REPO", "4", "U0OWNER", "dm", now)[0],
+        check("…and four lanes is refused by the queue's own loader", dm("LANES_PER_REPO", "4")[0],
               "refused")
         # the ledger, for the stand-up
         rows, why = rows_since(lpath, now - datetime.timedelta(minutes=1))
@@ -591,10 +731,10 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
               ([("LANES_PER_REPO", "2"), ("LANES_PER_REPO", "3")], None))
         check("…none since now", rows_since(lpath, now)[0], [])
         with open(lpath, "a") as fh:
-            fh.write("{not json\n" + json.dumps(dict(rows[0], key="OWNER_USER_IDS")) + "\n")
+            fh.write("{not json\n" + json.dumps(dict(rows[0] if rows else {}, key="OWNER_USER_IDS")) + "\n")
         check("a row not in its shape is left out", len(rows_since(lpath, now - datetime.timedelta(minutes=1))[0]), 2)
         check("no ledger is no rows, and nothing said", rows_since(os.path.join(tmp, "none.jsonl"), now), ([], None))
-        check("one row in plain words", row_words(rows[0], now),
+        check("one row in plain words", row_words(rows[0], now) if rows else None,
               "the lanes per repository from 1 to 2 (you asked in the DM, %s)" % now.astimezone().strftime("%H:%M"))
     src = open(os.path.abspath(__file__), encoding="utf-8").read()
     above = src.split("def _selftest(")[0]
