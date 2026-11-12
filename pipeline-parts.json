@@ -2283,12 +2283,16 @@
         {
           "key": "token_env",
           "default_name": "CLAUDE_WRITER_OAUTH_TOKEN",
-          "what": "The sign-in token the sessions use, by the name of the variable that holds it."
+          "what": "The sign-in token the sessions use, by the name of the variable that holds it.",
+          "ends": "one-year",
+          "clock": "claude-writer-token",
+          "date_from": "The day you made it with `claude setup-token`, plus one year."
         },
         {
           "key": "linear_key_file",
           "default_name": null,
-          "what": "A file of the account's own that holds the tracker key, to read each ticket and its history."
+          "what": "A file of the account's own that holds the tracker key, to read each ticket and its history.",
+          "ends": "never"
         }
       ],
       "jobs": [
