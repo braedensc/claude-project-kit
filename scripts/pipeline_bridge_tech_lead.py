@@ -378,7 +378,7 @@ class TechLeadMixin(object):
     """Pass's questions to the tech lead, and its answers back (KIT-312)."""
 
     # -- the tech lead, from the DM (KIT-298, KIT-489, KIT-492) ----------------------
-    def forward(self, channel, msg, note=""):
+    def forward(self, channel, msg, note="", earlier=""):
         """What a member writes at the top of their DM that is not a command or a yes or no,
         answered by the tech lead's own turn (take_turn). Only a person's own message goes: a
         bot's post, or any special message type, is passed over in silence, and one the
@@ -455,7 +455,7 @@ class TechLeadMixin(object):
             self.say("  [dry-run] would ask the tech lead about a DM message from %s"
                      % msg["user"])
             return
-        self.take_turn(channel, msg, text, note)
+        self.take_turn(channel, msg, text, note, earlier)
 
     def run_turn(self, *args, **kwargs):
         """The turn runs through this, so a case can stand in for the CLI (KIT-489)."""
@@ -548,7 +548,7 @@ class TechLeadMixin(object):
             return limit
         return min(limit, int(self.deadline - self.clock() - WRITER_POST_SECONDS))
 
-    def take_turn(self, channel, msg, text, note=""):
+    def take_turn(self, channel, msg, text, note="", earlier=""):
         """What a member writes in their DM that is not a command, a yes or a no, answered by
         one turn of the claude CLI over the tech lead's read tools (KIT-489). The message was
         cleaned and judged by forward() as one for the chat bot is. The model's words are
@@ -562,13 +562,17 @@ class TechLeadMixin(object):
                      % max(seconds, 0))
             return
         sessions = self.state["turn_sessions"]
-        # KIT-560: under the push-connection job a thread is a conversation of its own.
-        skey = channel if not self.reply_thread else "%s:%s" % (channel, self.reply_thread)
+        # KIT-751: one conversation per DM, as a person keeps one: every turn in it resumes the
+        # same session (within turn_session_hours), wherever the message sits. Under push mode
+        # reply_thread now decides only where the answer is posted (KIT-560).
+        skey = channel
         # Counted before it runs, so a crash cannot be a way round the hourly limit.
         self.state["forwarded_at"].append(self.now)
         self.save()
         stream = self.open_stream(channel, msg)
         more = {"note": note} if note else {}
+        if earlier:
+            more["earlier"] = earlier          # KIT-751: the post they replied under, as data
         if stream:
             more["on_text"] = stream.feed
         # Everything from the turn to the stream's ending is under one guard: a fault anywhere in it
@@ -618,8 +622,11 @@ class TechLeadMixin(object):
             self.say("  did not pass on a turn's answer: it has %s" % held)
             self.drop_recorded(acts, left_out)
         elif words:
-            if self.reply_thread:
+            if self.reply_thread and key_of(channel, self.reply_thread) \
+                    not in self.state["relayed_posts"]:
                 # The thread is the conversation's: a reply in it is answered, not ignored (KIT-560).
+                # Not one under the tech lead's own post (KIT-751): each reply there goes on being
+                # read as a reply under that post, so it keeps the post's words and its note.
                 threads = self.state["turn_threads"]
                 threads[key_of(channel, self.reply_thread)] = self.now
                 for old in sorted(threads, key=threads.get)[:-TURN_THREADS_KEPT]:
@@ -706,8 +713,13 @@ class TechLeadMixin(object):
         under it follows up with the turn (Stage E on #494). The record, relayed_posts, has
         its name from the relay, which posted the chat bot's words before the cutover."""
         if ts:
-            self.state["relayed_posts"][key_of(channel, ts)] = {"at": self.now,
-                                                                "ids": ticket_ids(words)}
+            rec = {"at": self.now, "ids": ticket_ids(words)}
+            if not self.reply_thread:
+                # KIT-751: a post at the top of the DM (a stand-up, a plan note's question) keeps
+                # its words, so a reply under it reaches the turn with them. One in a thread needs
+                # none: a reply there is in a thread of the turn's own.
+                rec["words"] = self.clean(words or "")[:TECH_LEAD_MAX_CHARS]
+            self.state["relayed_posts"][key_of(channel, ts)] = rec
 
     def drop_recorded(self, acts, left_out):
         """What a turn recorded, when its reply was not posted: said in the log and asked about
@@ -802,7 +814,8 @@ def cases_tech_lead(kit):
                                  EXAMPLE_CONFIG, EXIT_ERROR, EXIT_OK, GUEST, ME, OWNER,
                                  Deadline, Pass, SlackClient, TEAM, _chan, _config_error, iso,
                                  run_command, untimed,
-                                 load_state, run_once, state_path, validate_config)
+                                 load_state, run_once, save_state, state_path,
+                                 validate_config)
     with kit as tmp:
         check, cfg_for = kit.take("check", "cfg_for")
         dm_help, dmworld, in_dm, now = kit.take("dm_help", "dmworld", "in_dm", "now")
@@ -1418,6 +1431,61 @@ def cases_tech_lead(kit):
                                   "yours here that named PROD-6.")],
                 "Nobody has picked it up yet."),
                [dm_help]])
+
+        # KIT-751: a reply under one of the tech lead's own top-level posts reaches the turn with
+        # that post's words. With push_mode on it is answered in that thread and the root is never a
+        # turn_thread; with push_mode off it answers at the top, as before. Either way the session
+        # is the DM's one: a later top-level message resumes it too.
+        POST_WORDS = "Stand-up: PROD-6 waits on a review."
+
+        def case_reply_under_post(push):
+            c, s, t = tlworld("turn-under-post-%s" % push, push_mode=push, **turn_on)
+            root = relayed(c, s, POST_WORDS)
+            st = json.load(open(state_path(c)))
+            st["relayed_posts"][key_of(DM, root)]["words"] = POST_WORDS
+            save_state(c, st)
+            fake = FakeTurn({"text": "Nobody picked it up.", "session_id": t_sid},
+                            {"text": "Still nobody.", "session_id": t_sid, "resumed": True},
+                            {"text": "Fresh topic.", "session_id": t_sid, "resumed": True})
+            s.add(ALICE, "why is that?", thread=root, channel=DM, at=now + 100)
+            with_turn(fake, lambda: run(c, s, t, at=now + 120))
+            s.add(ALICE, "and now?", thread=root, channel=DM, at=now + 200)
+            with_turn(fake, lambda: run(c, s, t, at=now + 220))
+            s.add(ALICE, "something else", channel=DM, at=now + 300)
+            with_turn(fake, lambda: run(c, s, t, at=now + 320))
+            st = json.load(open(state_path(c)))
+            return ([(x["text"], x["note"], x["earlier"]) for x in fake.calls[:2]],
+                    [(x["session"] or {}).get("id") for x in fake.calls],
+                    sorted(st["turn_sessions"]) == [DM],
+                    key_of(DM, root) in st["turn_threads"],
+                    [th == root if push else th is None
+                     for th, x in in_dm(s) if x in ("Nobody picked it up.", "Still nobody.")])
+        note_under = "They wrote this as a reply under an earlier message of yours here that " \
+                     "named PROD-6."
+        for push in (True, False):
+            check("turn-a-reply-under-its-own-post-gets-its-words-push-%s-%s" % (
+                      push, "answers-in-that-thread-and-the-root-is-not-a-turn-thread" if push else "uses-the-dm-wide-key-and-answers-at-the-top"),
+                  outcome(lambda push=push: case_reply_under_post(push)),
+                  ([("why is that?", note_under, POST_WORDS), ("and now?", note_under, POST_WORDS)],
+                   [None, t_sid, t_sid], True, False, [True, True]))
+
+        def case_posted_words(top):
+            class Poster(object):
+                state = {"relayed_posts": {}}
+                now = 5.0
+                reply_thread = None if top else "1.5"
+
+                def clean(self, words):
+                    return words
+                tech_lead_posted = TechLeadMixin.tech_lead_posted
+            poster = Poster()
+            poster.tech_lead_posted(DM, "100.1", "PROD-6 " + "x" * (TECH_LEAD_MAX_CHARS + 50))
+            return poster.state["relayed_posts"][key_of(DM, "100.1")]
+        top_rec, thread_rec = outcome(lambda: case_posted_words(True)), \
+            outcome(lambda: case_posted_words(False))
+        check("turn-a-top-level-post-keeps-its-words-cut-to-the-limit-and-one-in-a-thread-keeps-none",
+              (len(top_rec["words"]), top_rec["words"].startswith("PROD-6 x"), top_rec["ids"],
+               "words" in thread_rec), (TECH_LEAD_MAX_CHARS, True, ["PROD-6"], False))
 
         def case_turn_config():
             base = dict(EXAMPLE_CONFIG, channel_ids=[CHAN], owner_user_id=OWNER,
