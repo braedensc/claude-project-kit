@@ -314,8 +314,9 @@ The job **Install proof (a clean Mac)** (`.github/workflows/install-proof.yml`) 
 `scripts/pipeline_install.py --check` on a hosted `macos-15` machine that has never seen the kit,
 with `HOME` set to a new empty folder. It runs by hand and on a pull request that touches the
 install script, `pipeline_ask.py`, the parts list, its schema or the workflow itself. It is **not a
-required context** until the owner adds it, so a failure turns the PR red without blocking the merge.
-It holds and uses no secret.
+required context**, so a failure turns the PR red without blocking the merge, and it must stay that
+way while it runs only on those paths: a required check that never starts on a PR touching none of
+them would hold that PR forever. It holds and uses no secret.
 
 **What it proves.**
 

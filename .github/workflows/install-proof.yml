@@ -18,16 +18,14 @@ name: Install proof
 #   6. Look for token shapes in everything the job printed.
 #
 # It holds and uses no secret; its token is read-only. It is a NEW workflow with its own job name on
-# purpose: "Kit checks" is a required status context. This job is NOT required until the owner
-# adds it (docs/TESTING.md, "The one command on a clean Mac"). No `continue-on-error`: a failure
-# that succeeds tells nobody. Every step after the setup runs even when an earlier one failed, so
-# one run reports every broken claim, not only the first; the job is red if any step is.
+# purpose: "Kit checks" is a required status context. This job is NOT a required check, and must not
+# become one while it runs only on the paths below: a PR that touches none of them would wait for
+# a check that never starts (docs/TESTING.md, "The one command on a clean Mac"). No
+# `continue-on-error`: a failure that succeeds tells nobody. Every step after the setup runs even
+# when an earlier one failed, so one run reports every broken claim, not only the first; the job
+# is red if any step is.
 
 on:
-  push:
-    # TEMPORARY, while this job is proven on a real hosted Mac: a push to this branch runs it with
-    # no pull request. Removed before the pull request opens.
-    branches: [feat/kit-745-install-proof]
   workflow_dispatch:
   pull_request:
     types: [opened, synchronize, reopened]
