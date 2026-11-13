@@ -34,7 +34,9 @@ THE VALUES ONLY YOU HAVE (KIT-735; scripts/pipeline_ask.py)
   before any installer, they are written and read back. Decline and nothing is written. A write
   that fails stops the run, naming the file. It does not ask again when it has started itself
   again on new code, and a second run with nothing missing asks nothing. `--update-conf` and
-  `--bridge-conf` (hidden from the help) name the two files; a file that is absent asks nothing.
+  `--bridge-conf` (hidden from the help) name the two files. A file that is not there asks
+  nothing and is said in one line, once, with where it looked (`Not asked: no bridge.conf in the
+  kit folder, so the tech lead's name was not asked.`).
 
 WHAT IT DOES, IN ORDER
   1. The kit checkout. It must be on its default branch with no uncommitted changes to

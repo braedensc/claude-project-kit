@@ -17,6 +17,10 @@ WHAT IT ASKS, AND WHEN
       parts list does not know is never asked about. The dates live in the health check's
       settings file (update.conf); `pipeline_watch.py dates` lists them.
     * The tech lead's name, when bridge.conf names none (neither APP_NAME nor PROJECT_NAME).
+  A settings file that is not there asks nothing and is said in one plain line, before the first
+  question: `Not asked: no bridge.conf in the kit folder, so the tech lead's name was not asked.`
+  (and the same for update.conf and the key end dates). It says where it looked. A file that is
+  there gives no such line, and each line is said once per run.
 
 HOW IT ASKS
   One question at a time, in plain words: the question, one line saying where to find the value,
@@ -37,9 +41,10 @@ WHAT IT WRITES, AND HOW
     * Dates go through `pipeline_watch.py dates --apply`'s own function, so its checks, its
       atomic write, the file's mode, every other entry and its read-back are the ones that
       command has.
-    * The name is set as APP_NAME with the tech lead installer's `set_conf_line` and a swap of the
+    * The name is set as APP_NAME by a small writer of its own (`set_name_line`) and a swap of the
       whole file (a temp file beside it, made new and never through a link, the old mode kept,
-      renamed over). Every other line stays as it was. The file is read back and compared.
+      renamed over). Only the active APP_NAME line changes: every other line keeps every byte, line
+      endings and a missing final newline included. The file is read back and its bytes compared.
   Before writing, each file is read again: if it is no longer as it was when the person was asked
   (the value on record changed), nothing is written to it. A write that fails, or reads back
   differently, is named by its file and stops the run before any installer. It removes nothing but
@@ -156,10 +161,19 @@ def days_words(days):
 # --------------------------------------------------------------------------- #
 # What is missing: a pure read
 # --------------------------------------------------------------------------- #
+def absent_line(path, what):
+    """The one plain line for a settings file that is not there: where it looked, and what was not
+    asked because of it. `what` is the end of the sentence, such as "the key end dates were not asked"."""
+    here = os.path.dirname(os.path.abspath(path))
+    return "Not asked: no %s in %s, so %s." % (os.path.basename(path),
+                                               "the kit folder" if here == KIT else here, what)
+
+
 class Questions(list):
     """The questions, as a plain list of Question. `notes` holds the plain lines for what could
-    not be asked about (a settings file that cannot be used, or that is absent where something
-    would have been asked of it). It is a read: nothing is changed and no terminal is needed."""
+    not be asked about: a settings file that is not there (one line for each, said whatever is
+    stored on this Mac), or one that cannot be used. A file that is there and fine gives none. It is
+    a read: nothing is changed and no terminal is needed."""
 
     def __init__(self, items=(), notes=()):
         list.__init__(self, items)
@@ -170,7 +184,7 @@ def missing_values(update_conf, bridge_conf, kit=KIT, today=None):
     """The questions for every value that is still missing: the name first, then each key's date.
 
     `update_conf` is the health check's settings file and `bridge_conf` the tech lead's; either may
-    be absent. A file absent on a Mac that does not run its part asks nothing and says nothing."""
+    be absent. A file that is absent asks nothing and is said in one line in `notes`."""
     today = today or utc_today()
     notes, found = [], []
     for what, read in (("what to call your tech lead", lambda: _name_questions(bridge_conf, notes)),
@@ -184,7 +198,8 @@ def missing_values(update_conf, bridge_conf, kit=KIT, today=None):
 
 def _name_questions(bridge_conf, notes):
     if not os.path.isfile(bridge_conf):
-        return []            # no bridge.conf: this Mac does not run the tech lead; nothing to ask
+        notes.append(absent_line(bridge_conf, "the tech lead's name was not asked"))
+        return []
     bs = _bridge()
     name = label(bridge_conf)
     try:
@@ -207,23 +222,15 @@ def _name_questions(bridge_conf, notes):
 
 
 def _date_questions(update_conf, kit, today, notes):
+    if not os.path.isfile(update_conf):
+        notes.append(absent_line(update_conf, "the key end dates were not asked"))
+        return []
     pw, pu = _watch(), _update()
     name = label(update_conf)
     try:
         keys = pw.listed_keys(kit)
     except pw.PartsUnreadable:
         notes.append("The parts list could not be read, so I did not ask for any key's end date.")
-        return []
-    needing = [k["clock"] for k in keys if k["ends"] in pw.ENDS_NEEDING_A_DATE]
-    if not os.path.isfile(update_conf):
-        # Absent, and the keys that end are stored on this Mac: the dates would have been asked
-        # of it. Say so once. With no such key there is nothing to say.
-        if needing:
-            here = os.path.dirname(os.path.abspath(update_conf))
-            notes.append("No %s in %s, so I did not ask for the end dates of %d stored key%s (%s). "
-                         "Create it from update.conf.example to record them, then run this again."
-                         % (os.path.basename(update_conf), "the kit folder" if here == KIT else here,
-                            len(needing), "" if len(needing) == 1 else "s", ", ".join(needing)))
         return []
     try:
         conf = pu.load_conf(update_conf)
@@ -441,21 +448,54 @@ def write_dates(io, path, items, kit):
     return "%s: %s" % (name, " ".join(said.getvalue().split())[:300] or "exit %d" % code)
 
 
+def set_name_line(text, name):
+    """`text` with its active APP_NAME line set to `APP_NAME=<name>`, and no other byte changed.
+
+    The active line is found the way the tech lead installer's `set_conf_line` finds it: its key (the
+    part before the first `=`), stripped, is APP_NAME, and the line is not a comment. A line that
+    matches is replaced and keeps its own ending (none, if it is the last line and has none). A
+    commented `#APP_NAME=` example stays as it is. With no active line, one is added after the last
+    line, ended like the file's lines: CRLF when the last line that has an ending ends in CRLF, else
+    LF. A last line with no ending is ended in that style first. An empty file gets the line alone,
+    ended with LF. (`set_conf_line` joins every line again with LF, so it rewrites CRLF endings and
+    a missing final newline, which this does not.)"""
+    out, done, style, last_end = [], False, "\n", None
+    for piece in text.splitlines(keepends=True):
+        body = piece.splitlines()[0]
+        end = piece[len(body):]
+        last_end = end
+        if end:
+            style = "\r\n" if end == "\r\n" else "\n"
+        stripped = body.strip()
+        if stripped.split("=", 1)[0].strip() == NAME_KEY and not stripped.startswith("#"):
+            out.append("%s=%s%s" % (NAME_KEY, name, end))
+            done = True
+        else:
+            out.append(piece)
+    if not done:
+        if last_end == "":
+            out.append(style)            # the last line had no ending: end it first, in the file's style
+        out.append("%s=%s%s" % (NAME_KEY, name, style))
+    return "".join(out)
+
+
 def write_name(io, path, change):
     """None when the name is written and read back; else why not, naming the file. The whole file is
-    swapped in: a temp file beside it, made new and never through a link, with the old mode."""
+    swapped in: a temp file beside it, made new and never through a link, with the old mode. Only
+    the active APP_NAME line changes (`set_name_line`); every other byte of the file stays."""
     bs = _bridge()
     name = label(path)
     try:
-        with open(path, encoding="utf-8") as fh:
-            old = fh.read()
+        with open(path, "rb") as fh:
+            old_bytes = fh.read()
         mode = os.stat(path).st_mode & 0o777
+        old = old_bytes.decode("utf-8")
     except (OSError, ValueError) as exc:
         return "%s could not be read (%s), so nothing was written to it" % (name, type(exc).__name__)
     values, errors = bs.parse_conf(old)
     if errors or bs.names_its_lead(values) or (values.get(NAME_KEY) or None) != change.old:
         return "%s changed while you were answering, so nothing was written to it" % name
-    new = bs.set_conf_line(old, NAME_KEY, change.new)
+    new = set_name_line(old, change.new).encode("utf-8")
     tmp = "%s.name.%d" % (path, os.getpid())
     try:
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
@@ -463,7 +503,7 @@ def write_name(io, path, change):
         return "%s could not be written (%s); it is as it was" % (name, type(exc).__name__)
     swapped = False
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        with os.fdopen(fd, "wb") as fh:
             os.fchmod(fh.fileno(), mode)
             fh.write(new)
             fh.flush()
@@ -479,12 +519,12 @@ def write_name(io, path, change):
             except OSError:
                 pass
     try:
-        with open(path, encoding="utf-8") as fh:
+        with open(path, "rb") as fh:
             back = fh.read()
+        back_values, back_errors = bs.parse_conf(back.decode("utf-8"))
     except (OSError, ValueError) as exc:
         return "%s was written but could not be read back (%s); check it by hand" % (
             name, type(exc).__name__)
-    back_values, back_errors = bs.parse_conf(back)
     if back != new or back_errors or back_values.get(NAME_KEY) != change.new:
         return "%s was written but reads back differently; check it by hand" % name
     io.say("Wrote %s in %s and read it back: it matches." % (NAME_KEY, name))
@@ -626,21 +666,27 @@ def run_cases(check):
             return "ESCAPED " + type(exc).__name__
 
     # A. WHAT IS MISSING (point 1): a pure read of the two settings files.
+    update_line = "Not asked: no update.conf in %s, so the key end dates were not asked." % kit
+    bridge_line = "Not asked: no bridge.conf in %s, so the tech lead's name was not asked." % kit
     forget()
     found = ask()
     check("kit735-absent-files-ask-nothing", list(found), [])
-    note = (found.notes or [""])[0]
-    check("kit735-absent-update-conf-says-so-once-when-keys-end",
-          (len(found.notes), "No update.conf in " in note, "gh-tok" in note, "claude-tok" in note),
-          (1, True, True, True))
-    check("kit735-absent-update-conf-does-not-name-a-key-that-has-no-known-end", "unk-tok" in note, False)
-    check("kit735-absent-bridge-conf-says-nothing",
-          [n for n in found.notes if "bridge" in n], [])
-    check("kit735-absent-and-nothing-would-be-asked-says-nothing", ask(kit2).notes, [])
+    check("kit735-an-absent-bridge-conf-says-so-in-one-line-and-where-it-looked",
+          [n for n in found.notes if "bridge.conf" in n], [bridge_line])
+    check("kit735-an-absent-update-conf-says-so-in-one-line-and-where-it-looked",
+          [n for n in found.notes if "update.conf" in n], [update_line])
+    check("kit735-two-absent-files-are-two-lines-the-name-first", found.notes, [bridge_line, update_line])
+    check("kit735-an-absent-update-conf-is-said-even-when-no-stored-key-ends",
+          ask(kit2).notes, [bridge_line, update_line])
+    check("kit735-the-line-says-the-kit-folder-for-a-file-that-belongs-there",
+          absent_line(os.path.join(KIT, "bridge.conf"), "the tech lead's name was not asked"),
+          "Not asked: no bridge.conf in the kit folder, so the tech lead's name was not asked.")
     put_bridge("APP_NAME=Rex\n")
-    check("kit735-absent-update-conf-still-says-so-with-a-bridge-conf", len(ask().notes), 1)
+    check("kit735-a-present-bridge-conf-gives-no-line", ask().notes, [update_line])
     forget()
     put_update()
+    check("kit735-a-present-update-conf-gives-no-line", ask().notes, [bridge_line])
+    put_bridge("APP_NAME=Rex\n")                     # both there, the tech lead named
     found = ask()
     check("kit735-a-missing-date-is-asked-for-each-key-that-ends",
           [(q.kind, q.key, q.ends, q.current, q.days) for q in found],
@@ -652,7 +698,7 @@ def run_cases(check):
     check("kit735-unknown-end-missing-is-not-asked", "unk-tok" in [q.key for q in found], False)
     check("kit735-a-key-that-never-ends-is-not-asked", "tracker" in " ".join(q.key for q in found), False)
     check("kit735-a-part-that-is-off-asks-nothing", "off-tok" in [q.key for q in found], False)
-    check("kit735-a-file-that-exists-gives-no-note", found.notes, [])
+    check("kit735-two-present-files-give-no-line", found.notes, [])
     put_update(expiries=FAR)
     check("kit735-a-second-run-with-nothing-missing-asks-nothing", list(ask()), [])
     put_update(expiries="gh-tok:%s,claude-tok:%s,unk-tok:%s" % (on(200), on(300), on(30)))
@@ -879,6 +925,37 @@ def run_cases(check):
     check("kit735-nothing-here-uses-a-hidden-prompt", ("get" + "pass") in src, False)
 
     # C. WRITING (point 3): written, then read back; a failure names the file and leaves the old one.
+    #    The name goes in by a writer of its own: only the active APP_NAME line changes, byte for byte.
+    def named(text):
+        return set_name_line(text, "Rex")
+    for label_, text in (("no-name-line", "# c\nACT=no\n"),
+                         ("an-empty-name-line", "# c\nAPP_NAME=\nACT=no\n"),
+                         ("an-indented-empty-name-line", "ACT=no\n  APP_NAME = \nINTERVAL_SECONDS=60\n"),
+                         ("empty-quotes", 'ACT=no\nAPP_NAME=""\nINTERVAL_SECONDS=60\n'),
+                         ("a-commented-example-only", "#APP_NAME=Tech lead\nACT=no\n"),
+                         ("an-export-line-is-not-active", "export APP_NAME=\nACT=no\n")):
+        check("kit735-on-an-ordinary-file-the-two-writers-agree:%s" % label_,
+              named(text), bs.set_conf_line(text, "APP_NAME", "Rex"))
+    check("kit735-a-crlf-file-keeps-its-endings-when-the-line-is-added",
+          named("# c\r\nACT=no\r\n"), "# c\r\nACT=no\r\nAPP_NAME=Rex\r\n")
+    check("kit735-a-crlf-file-has-its-active-line-replaced-in-place-with-its-own-ending",
+          named("# c\r\nAPP_NAME=\r\nACT=no\r\n"), "# c\r\nAPP_NAME=Rex\r\nACT=no\r\n")
+    check("kit735-a-file-with-no-final-newline-is-ended-first-in-its-own-style:lf",
+          named("# c\nACT=no"), "# c\nACT=no\nAPP_NAME=Rex\n")
+    check("kit735-a-file-with-no-final-newline-is-ended-first-in-its-own-style:crlf",
+          named("# c\r\nACT=no"), "# c\r\nACT=no\r\nAPP_NAME=Rex\r\n")
+    check("kit735-a-replaced-last-line-keeps-its-missing-final-newline",
+          named("ACT=no\nAPP_NAME="), "ACT=no\nAPP_NAME=Rex")
+    check("kit735-a-commented-example-is-left-as-it-is",
+          named("#APP_NAME=Tech lead\n"), "#APP_NAME=Tech lead\nAPP_NAME=Rex\n")
+    check("kit735-an-active-line-is-replaced-and-no-second-line-is-added",
+          named("ACT=no\nAPP_NAME=\nINTERVAL_SECONDS=60\n").count("APP_NAME"), 1)
+    check("kit735-an-empty-file-gets-the-line-alone", named(""), "APP_NAME=Rex\n")
+    check("kit735-every-other-byte-stays:tabs-spaces-accents-and-mixed-endings",
+          named("# Caf" + chr(0xE9) + "\t \nACT=no  \r\nINTERVAL_SECONDS=60\t\n"),
+          "# Caf" + chr(0xE9) + "\t \nACT=no  \r\nINTERVAL_SECONDS=60\t\nAPP_NAME=Rex\n")
+    check("kit735-a-file-of-mixed-endings-takes-the-style-of-its-last-ended-line",
+          named("A=1\nB=2\r\nC=3"), "A=1\nB=2\r\nC=3\r\nAPP_NAME=Rex\r\n")
     forget()
     put_update(expiries="old-key:%s" % on(250))
     put_bridge(mode=0o664)
@@ -914,6 +991,31 @@ def run_cases(check):
     check("kit735-an-empty-name-line-is-set-in-place",
           (write_answers(pi.FakeIo(), [name], kit), get(bridge_conf)), (None, expected))
     check("kit735-nothing-to-write-is-nothing-written", write_answers(pi.FakeIo(), [], kit), None)
+    # the other lines keep every byte on the way through the file
+    put(bridge_conf, "# the tech lead\r\nACT=no\r\nINTERVAL_SECONDS=60", 0o664)
+    before_crlf = get(bridge_conf)
+    check("kit735-a-crlf-file-with-no-final-newline-changes-only-by-the-added-line",
+          (write_answers(pi.FakeIo(), [name], kit), get(bridge_conf)),
+          (None, before_crlf + b"\r\nAPP_NAME=Rex\r\n"))
+    put(bridge_conf, "ACT=no\r\nAPP_NAME=\r\nINTERVAL_SECONDS=60\r\n")
+    check("kit735-a-crlf-file-has-its-name-line-replaced-and-every-other-byte-kept",
+          (write_answers(pi.FakeIo(), [name], kit), get(bridge_conf)),
+          (None, b"ACT=no\r\nAPP_NAME=Rex\r\nINTERVAL_SECONDS=60\r\n"))
+    put(bridge_conf, "#APP_NAME=Tech lead\nACT=no")
+    check("kit735-a-commented-example-and-no-final-newline-is-written-as-the-line-writer-says",
+          (write_answers(pi.FakeIo(), [name], kit), get(bridge_conf)),
+          (None, b"#APP_NAME=Tech lead\nACT=no\nAPP_NAME=Rex\n"))
+    put(bridge_conf, "")
+    check("kit735-an-empty-bridge-conf-gets-the-line-alone",
+          (write_answers(pi.FakeIo(), [name], kit), get(bridge_conf)), (None, b"APP_NAME=Rex\n"))
+    put(bridge_conf, "ACT=no\n")
+    with open(bridge_conf, "ab") as fh:
+        fh.write(b"\xff\xfe\n")
+    not_utf8 = get(bridge_conf)
+    failed = write_answers(pi.FakeIo(), [name], kit)
+    check("kit735-a-file-that-is-not-utf-8-is-a-failure-naming-the-file",
+          (bridge_conf in (failed or ""), "could not be read" in (failed or ""), get(bridge_conf)),
+          (True, True, not_utf8))
     # a write that fails: the file named, the old file in place, nothing left behind
     put_update(expiries="old-key:%s" % on(250))
     put_bridge()
@@ -958,6 +1060,18 @@ def run_cases(check):
     with patched(os, "replace", tampering):
         failed = write_answers(pi.FakeIo(), [name], kit)
     check("kit735-readback-mismatch-is-a-failure:name",
+          (bridge_conf in (failed or ""), "reads back differently" in (failed or "")), (True, True))
+
+    def rewrite_endings(src, dst):          # a file that came out with LF where it was written with CRLF
+        with open(src, "rb") as fh:
+            data = fh.read()
+        with open(src, "wb") as fh:
+            fh.write(data.replace(b"\r\n", b"\n"))
+        real_replace(src, dst)
+    put(bridge_conf, "ACT=no\r\nINTERVAL_SECONDS=60\r\n")
+    with patched(os, "replace", rewrite_endings):
+        failed = write_answers(pi.FakeIo(), [name], kit)
+    check("kit735-the-readback-compares-bytes-so-a-rewritten-ending-is-a-failure",
           (bridge_conf in (failed or ""), "reads back differently" in (failed or "")), (True, True))
     put_bridge()
     bridge_before = get(bridge_conf)
@@ -1026,11 +1140,12 @@ def run_cases(check):
     check("kit735-a-surprise-while-writing-dates-is-a-failure-naming-the-file",
           (update_conf in (failed or ""), "RuntimeError" in (failed or ""), get(update_conf)),
           (True, True, update_before))
-    with patched(bs, "set_conf_line", surprise):
+    with patched(os, "fsync", surprise):
         failed = contained_call(lambda: write_answers(pi.FakeIo(), [name], kit))
     check("kit735-a-surprise-while-writing-the-name-is-a-failure-naming-the-file",
-          (bridge_conf in (failed or ""), "RuntimeError" in (failed or ""), get(bridge_conf)),
-          (True, True, bridge_before))
+          (bridge_conf in (failed or ""), "RuntimeError" in (failed or ""), get(bridge_conf),
+           [n for n in os.listdir(kit) if ".name." in n]),
+          (True, True, bridge_before, []))
     try:
         with patched(os, "replace", interrupt):
             write_answers(pi.FakeIo(), [name], kit)
@@ -1220,7 +1335,7 @@ def run_cases(check):
           (1, [], original, True))
     reset(expiries=FAR)
     original = state()
-    with patched(bs, "set_conf_line", surprise):
+    with patched(os, "fsync", surprise):
         code, io = go(["1", "Rex", "yes"])
     check("kit735-a-surprise-while-writing-stops-the-run-in-words-before-any-step",
           (code, io.ran, state(), any(bridge_conf in ln and "RuntimeError" in ln for ln in io.lines)),
@@ -1250,29 +1365,46 @@ def run_cases(check):
     io.parts_list = OSError("no list")
     pi.main(base, io=io)
     check("kit735-no-parts-list-no-questions", io.finds, 0)
-    # files that are absent
+    # files that are absent: one line for each, once, before the first question or the consent
     reset(body="APP_NAME=Rex\n")
     os.remove(update_conf)
     code, io = go(["1", "yes"])
-    notes = [ln for ln in io.lines if ln.startswith("No update.conf in ")]
-    check("kit735-an-absent-update-conf-is-said-once-where-keys-end",
-          (len(notes), values_asked(io), code), (1, [], pi.EX_OK))
+    check("kit735-an-absent-update-conf-is-said-once-and-nothing-is-asked",
+          (io.lines.count(update_line), io.lines.count(bridge_line), values_asked(io), code),
+          (1, 0, [], pi.EX_OK))
     reset(expiries=FAR)
     os.remove(bridge_conf)
     code, io = go(["1", "yes"])
-    check("kit735-an-absent-bridge-conf-asks-nothing-and-says-nothing",
-          (values_asked(io), "0b2." in said(io), code), ([], False, pi.EX_OK))
+    check("kit735-an-absent-bridge-conf-asks-nothing-and-says-so-once",
+          (io.lines.count(bridge_line), io.lines.count(update_line), values_asked(io), code),
+          (1, 0, [], pi.EX_OK))
     forget()
     io = Watching(codes=dict(healthy), typed=["1", "yes"])
     io.kit = kit2
     code = pi.main(base, io=io)
-    check("kit735-absent-files-with-nothing-that-would-be-asked-say-nothing",
-          ("0b2." in said(io), values_asked(io), code), (False, [], pi.EX_OK))
+    check("kit735-absent-files-are-said-even-when-no-stored-key-ends",
+          (io.lines.count(bridge_line), io.lines.count(update_line), values_asked(io), code),
+          (1, 1, [], pi.EX_OK))
     forget()
     code, io = go(["1", "yes"])
-    check("kit735-both-files-absent-says-one-line-and-never-names-the-bridge-conf",
-          (sum(ln.startswith("No update.conf in ") for ln in io.lines),
-           any("bridge" in ln for ln in section(io, "== 0b2.", "== 0c."))), (1, False))
+    asking_part = section(io, "== 0b2.", "== 0c.")
+    check("kit735-both-files-absent-says-one-line-for-each-before-the-consent",
+          (asking_part.count(bridge_line), asking_part.count(update_line),
+           io.lines.count(bridge_line) + io.lines.count(update_line)), (1, 1, 2))
+    reset()
+    os.remove(update_conf)
+    code, io = go(["1", "Rex", "yes"])
+    at = [io.lines.index(t) if t in io.lines else -1 for t in (update_line, "1 of 1. Your tech lead's name.")]
+    check("kit735-an-absent-file-is-said-before-the-first-question", (-1 not in at, at == sorted(at)), (True, True))
+    reset()
+    os.remove(update_conf)
+    code, io = go(["yes"], argv=["--pulled-from", "abcdef1234", "--no-pull"])
+    check("kit735-an-absent-file-is-not-said-again-after-a-restart",
+          (update_line in io.lines, bridge_line in io.lines, "0b2." in said(io)), (False, False, False))
+    reset(expiries=FAR, body="APP_NAME=Rex\n")
+    code, io = go(["1", "yes"])
+    check("kit735-a-present-file-gives-no-line-and-no-heading",
+          ("Not asked:" in said(io), "0b2." in said(io)), (False, False))
     reset(body="BOGUS=1\n")
     code, io = go(["1", "2027-05-06", "2027-03-15", "yes"])
     check("kit735-a-file-with-a-problem-is-said-and-its-question-is-not-asked",
