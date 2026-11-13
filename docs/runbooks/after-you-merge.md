@@ -19,6 +19,10 @@ python3 scripts/pipeline_install.py
 
 It checks first and changes only what is behind. Running it again when nothing changed is safe, and the check is quick. If the pull has moved the code, it starts itself again on the new code.
 
+| I want | Type |
+| --- | --- |
+| To only look | `python3 scripts/pipeline_install.py --check`. It changes nothing, asks nothing and needs no terminal. It prints one line per part, then what waits on you. Exit 0: every part is up to date or off. Exit 10: something waits on you. Exit 4: something could not be measured. |
+
 ---
 
 ## What it covers
@@ -76,7 +80,7 @@ To bring the idea gate level and skip the review jobs, add `--skip-stage-e`. A r
 
 ## What is not proven
 
-- **The one command has no look-only mode.** Each installer it runs has its own check, and the command itself changes things (no ticket yet).
+- **`--check` has only been run against made-up machines.** A later workflow is meant to run it on a clean hosted Mac.
 - **It has not been run start to finish on a fresh Mac** with every part present (no ticket yet).
 - **Parts with an installer of their own are not moved by it.** `docs/PARTS.md` lists them, and no page yet says when each needs a re-run (no ticket yet).
 - **The review jobs' move onto work teams, and the sweep's first load,** are separate steps that this page does not walk (no ticket yet).
