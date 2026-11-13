@@ -1,0 +1,631 @@
+name: Install proof
+
+# KIT-745. The one command (scripts/pipeline_install.py) is looked at on a clean hosted Mac, and
+# the proof can fail. Until now nothing in CI ran it: its selftests use scripted machines, so
+# "it works on a Mac that has never seen the kit" was a claim, not a measurement.
+#
+# In order:
+#   1. Print what "clean" means on this image: the macOS version, /usr/bin/python3, the developer tools.
+#   2. List six places, with hashes: a NEW EMPTY folder used as HOME (a runner's own home is full
+#      of files that change), /Library/LaunchDaemons, /Library/LaunchAgents and /etc/claude-pipeline,
+#      and two places in the runner's REAL home, ~/Library/LaunchAgents and ~/.claude, which a
+#      command that reaches the real home some way other than $HOME would write to. A place that is
+#      not there lists nothing. The checkout must be clean as well.
+#   3. Run `pipeline_install.py --check` with HOME set to the empty folder. A Mac with no host has
+#      things waiting on a person, so the exit must be 10. Its lines are counted against pipeline-parts.json.
+#   4. List the six places again: nothing may differ. Then plant a file in the empty home, in the
+#      real ~/.claude and in the checkout, and show that each comparison does fail, so a green run
+#      cannot be a comparison that compares nothing.
+#   5. Try the three refusals: an agent marker (exit 3), root (exit 2) and no terminal (exit 2).
+#      Each must print its refusal and nothing else.
+#   6. Look for token shapes in everything the job's commands printed: every step tees its stdout and
+#      stderr into one folder, and that folder is scanned.
+#
+# It holds and uses no secret; its token is read-only. It is a NEW workflow with its own job name on
+# purpose: "Kit checks" is a required status context. This job is NOT a required check, and must not
+# become one while it runs only on the paths below: a PR that touches none of them would wait for
+# a check that never starts (docs/TESTING.md, "The one command on a clean Mac"). No
+# `continue-on-error`: a failure that succeeds tells nobody. Every step after the setup runs even
+# when an earlier one failed, so one run reports every broken claim, not only the first; the job
+# is red if any step is.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - scripts/pipeline_install.py
+      - scripts/pipeline_ask.py
+      - pipeline-parts.json
+      - schemas/pipeline-parts.schema.json
+      - .github/workflows/install-proof.yml
+
+permissions:
+  contents: read
+
+jobs:
+  install-proof:
+    name: Install proof (a clean Mac)
+    runs-on: macos-15
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    env:
+      # Python writes its bytecode next to the scripts it imports, which would dirty the checkout.
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      # No credential is kept in the checkout: the command's own `git ls-remote origin` reads a
+      # public repository, as a new user's Mac would.
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # From here on, every step runs its commands as `{ ... } 2>&1 | tee -a printed.txt`: what the
+      # job prints is also a file, so the last step can scan all of it. (A pipeline, not a
+      # redirection of the whole step, so the step cannot end before the file is written.)
+      - name: A new empty home folder, and the helpers
+        run: |
+          proof="$RUNNER_TEMP/install-proof"
+          mkdir -p "$proof"
+          {
+          home="$(mktemp -d "$RUNNER_TEMP/clean-home.XXXXXX")"
+          if [ -n "$(ls -A "$home")" ]; then
+            echo "::error::the new home folder is not empty"
+            exit 1
+          fi
+          # PROOF_REAL_HOME is the runner's own home, saved before anything sets HOME to another.
+          { echo "PROOF_DIR=$proof"; echo "PROOF_HOME=$home"; echo "PROOF_REAL_HOME=$HOME"; } >> "$GITHUB_ENV"
+          cat > "$proof/lib.sh" <<'LIB'
+          # Helpers for the install proof; each later step sources this file.
+
+          # The six places the command must leave as it found them, by short name. The first four
+          # are the new empty home and the machine's; the last two are in the runner's REAL home
+          # (PROOF_REAL_HOME), for a command that finds the home some other way than $HOME.
+          PLACES="home daemons agents etc realagents realclaude"
+          place_of() {
+            case "$1" in
+              home) echo "$PROOF_HOME" ;;
+              daemons) echo /Library/LaunchDaemons ;;
+              agents) echo /Library/LaunchAgents ;;
+              etc) echo /etc/claude-pipeline ;;
+              realagents) echo "$PROOF_REAL_HOME/Library/LaunchAgents" ;;
+              realclaude) echo "$PROOF_REAL_HOME/.claude" ;;
+            esac
+          }
+
+          # listing PLACE: one line per entry (the place itself first, then what is inside it,
+          # sorted): the sha256 of a regular file ("-" for anything else), the kind, the mode,
+          # owner:group, size and modification time, then the path. A place that is not there
+          # lists nothing, so an absent folder is an empty listing.
+          listing() {
+            local entry sum meta
+            if [ ! -e "$1" ] && [ ! -L "$1" ]; then
+              return 0
+            fi
+            find "$1" | LC_ALL=C sort | while IFS= read -r entry; do
+              if [ -f "$entry" ] && [ ! -L "$entry" ]; then
+                # A file this user cannot read is named as such; its size and time are still listed.
+                sum="$(shasum -a 256 < "$entry" | cut -d ' ' -f 1)" || sum="UNREADABLE"
+              else
+                sum="-"
+              fi
+              meta="$(stat -f '%HT|%Lp|%u:%g|%z|%m' "$entry")"
+              printf '%s|%s|%s\n' "$sum" "$meta" "$entry"
+            done
+          }
+
+          # take LABEL: list the places into $PROOF_DIR/LABEL-<name>.txt
+          take() {
+            local n
+            for n in $PLACES; do
+              listing "$(place_of "$n")" > "$PROOF_DIR/$1-$n.txt"
+            done
+          }
+
+          # show LABEL: print those listings, for the record
+          show() {
+            local n
+            for n in $PLACES; do
+              echo "--- $1: $n ($(place_of "$n")), $(wc -l < "$PROOF_DIR/$1-$n.txt" | tr -d ' ') entries"
+              cat "$PROOF_DIR/$1-$n.txt"
+            done
+          }
+
+          # same A B: the listings taken as A and as B must not differ; says which one does
+          same() {
+            local n bad=0
+            for n in $PLACES; do
+              if ! diff -u "$PROOF_DIR/$1-$n.txt" "$PROOF_DIR/$2-$n.txt"; then
+                echo "::error::$n ($(place_of "$n")) is not the same after as before"
+                bad=1
+              fi
+            done
+            if [ "$bad" = 0 ]; then
+              echo "identical: the $(echo $PLACES | wc -w | tr -d ' ') places listed '$1' and '$2' do not differ"
+            fi
+            return "$bad"
+          }
+
+          # clean_checkout: `git status --porcelain --ignored` must print nothing
+          clean_checkout() {
+            local dirty
+            dirty="$(git status --porcelain --ignored)"
+            if [ -n "$dirty" ]; then
+              echo "::error::the checkout is not clean (git status --porcelain --ignored):"
+              echo "$dirty"
+              return 1
+            fi
+            echo "the checkout is clean: git status --porcelain --ignored prints nothing"
+          }
+
+          # refused NAME OUTFILE CODE START: OUTFILE holds the command's output and OUTFILE.code
+          # its exit code. A refusal is exactly: that exit code, the heading, and one
+          # "Stopped: START..." line. Nothing else may be printed.
+          refused() {
+            local name="$1" out="$2" want="$3" start="$4" got n
+            cat "$out"
+            got="$(cat "$out.code")"
+            echo "(exit code $got)"
+            if [ "$got" != "$want" ]; then
+              echo "::error::$name: exit code $got, expected $want"
+              return 1
+            fi
+            if ! grep -qxF '== 0. Where this is running' "$out"; then
+              echo "::error::$name: the output does not open with the '0. Where this is running' heading"
+              return 1
+            fi
+            if ! grep -q "^Stopped: $start" "$out"; then
+              echo "::error::$name: no line starts 'Stopped: $start'"
+              return 1
+            fi
+            n="$(grep -c . "$out" || true)"
+            if [ "$n" != 2 ]; then
+              echo "::error::$name: expected only the refusal (2 lines that are not blank), found $n"
+              return 1
+            fi
+            echo "ok: $name exits $want and prints only its refusal"
+          }
+
+          # scan_tokens DIR: names every file of DIR that holds a token shape, with the line
+          # numbers and never the line; returns 1 if there is one. The shapes are a subset of what
+          # the repo's secret scan looks for: GitHub's token prefixes (five kinds, and the
+          # fine-grained one), Slack's (the bot, user and app kinds), Anthropic's, AWS's two key
+          # prefixes and a PEM header. Each is written with a bracket in it, so that this file (and
+          # the job's log, which echoes it) holds none.
+          scan_tokens() {
+            local shapes='gh[pousr]_|github_pa[t]_|xo[x]|xap[p]-|sk-an[t]-|A[KS]I[A]|-----BEGI[N]' f found=0
+            for f in "$1"/*; do
+              if [ -f "$f" ] && grep -qE -e "$shapes" "$f"; then
+                echo "::error::a token shape in $(basename "$f"), on line(s): $(grep -nE -e "$shapes" "$f" | cut -d: -f1 | tr '\n' ' ')"
+                found=1
+              fi
+            done
+            return "$found"
+          }
+          LIB
+          } 2>&1 | tee -a "$proof/printed.txt"
+
+      - name: What "clean" means on this image
+        if: ${{ !cancelled() }}
+        run: |
+          {
+          echo "--- sw_vers"
+          sw_vers
+          echo "--- /usr/bin/python3 -V"
+          /usr/bin/python3 -V
+          echo "--- developer tools (xcode-select -p)"
+          if tools="$(xcode-select -p 2>&1)"; then
+            echo "present: $tools"
+          else
+            echo "NOT present: $tools"
+          fi
+          echo "--- machine"
+          uname -m
+          echo "ImageOS=${ImageOS:-unset} ImageVersion=${ImageVersion:-unset}"
+          } 2>&1 | tee -a "$PROOF_DIR/printed.txt"
+
+      - name: Before - list the places, and check the checkout is clean
+        if: ${{ !cancelled() }}
+        run: |
+          {
+          . "$PROOF_DIR/lib.sh"
+          take before
+          show before
+          clean_checkout
+          } 2>&1 | tee -a "$PROOF_DIR/printed.txt"
+
+      - name: "Look: the one command with --check, with HOME set to the empty folder"
+        if: ${{ !cancelled() }}
+        run: |
+          {
+          # The command refuses to run where an agent marker is set; a clean Mac has none.
+          if env | grep -E '^(CLAUDECODE|CLAUDE_CODE_ENTRYPOINT|CLAUDE_PROJECT_DIR|AI_AGENT)=' > /dev/null; then
+            echo "::error::an agent marker is set on this runner, so the look would refuse"
+            exit 1
+          fi
+          rc=0
+          PYTHONDONTWRITEBYTECODE=1 HOME="$PROOF_HOME" /usr/bin/python3 scripts/pipeline_install.py --check > "$PROOF_DIR/look.out" 2>&1 < /dev/null || rc=$?
+          echo "$rc" > "$PROOF_DIR/look.out.code"
+          cat "$PROOF_DIR/look.out"
+          echo "(exit code $rc)"
+          } 2>&1 | tee -a "$PROOF_DIR/printed.txt"
+
+      - name: After the look - the places and the checkout are as they were
+        if: ${{ !cancelled() }}
+        run: |
+          {
+          . "$PROOF_DIR/lib.sh"
+          take afterlook
+          same before afterlook
+          clean_checkout
+          } 2>&1 | tee -a "$PROOF_DIR/printed.txt"
+
+      - name: The look exits 10, with one line for every part, and none set up that is not
+        if: ${{ !cancelled() }}
+        run: |
+          # "Only you can do these:" is NOT printed on a clean Mac, and this step does not expect it.
+          # Every part with a check is off here (its settings file is absent), so no waiting part's
+          # own output names a card, and the command prints that list only for a card. What it prints
+          # is the other form of the same short list: one "<name> is waiting on you; its own lines
+          # above say what for." line for each part that waits (here the skills and the kit
+          # checkout). So this step requires that form, requires it to name every waiting part, and
+          # fails on "Nothing is waiting on you.". The `host` part has no check and no card, so it is
+          # not in the list at all; showing it there is a change to the command, a separate ticket.
+          {
+          # The checks are a file, so a later step can run them on broken copies of the output.
+          cat > "$PROOF_DIR/assert_look.py" <<'PY'
+          import json
+          import os
+          import re
+          import sys
+
+          out_path, code_path = sys.argv[1], sys.argv[2]
+          with open(out_path, encoding="utf-8", errors="replace") as fh:
+              lines = fh.read().split("\n")
+          with open(code_path, encoding="utf-8") as fh:
+              code = int(fh.read().strip())
+          with open("pipeline-parts.json", encoding="utf-8") as fh:
+              parts = json.load(fh)["parts"]
+
+          problems = []
+
+
+          def bad(why):
+              problems.append(why)
+
+
+          # A look can say four things about a part. It changes nothing and stops nowhere, so
+          # "updated" and "not reached" would mean something is wrong.
+          WORDS = ("up to date", "waiting on you", "off on this Mac", "could not be measured")
+          NEVER = ("updated", "not reached")
+          ROW = re.compile(r"^  (%s) +(\S.*)$" % "|".join(re.escape(w) for w in WORDS + NEVER))
+          NOCHECK = "No check of their own: "
+
+
+          def is_checkout(part):
+              # the part whose installer is this command has the kit checkout's own line
+              return os.path.basename(part.get("installer") or "") == "pipeline_install.py"
+
+
+          # 1. The exit code. A Mac with no host has things waiting on a person.
+          if code == 0:
+              bad("exit 0: every part read up to date or off, but a Mac with no host has things waiting on a person")
+          elif code == 4:
+              bad("exit 4: a part could not be measured, or the list of parts could not be read; the lines say which")
+          elif code != 10:
+              bad("exit %d, but a Mac with no host must exit 10" % code)
+
+          # 2. It opens by saying it only looked.
+          if lines[:2] != ["", "== 0. Where this is running"] or not (lines[2:3] or [""])[0].startswith(
+                  "This run only looked and changed nothing (--check)."):
+              bad("the output does not open with the heading and the 'only looked' line: %r" % (lines[:3],))
+
+          # 3. The table of parts: outcome lines, then the closing line, then the short list.
+          try:
+              at = lines.index("== Where every part stands") + 1
+          except ValueError:
+              bad("the output has no '== Where every part stands' heading")
+              at = len(lines)
+          rows = []
+          while at < len(lines) and ROW.match(lines[at]):
+              m = ROW.match(lines[at])
+              rows.append((m.group(1), m.group(2)))
+              at += 1
+          if at < len(lines) and lines[at] != "" and not lines[at].startswith(NOCHECK):
+              bad("a line in the table carries none of the outcome words: %r" % lines[at][:100])
+          closing = None
+          if at < len(lines) and lines[at].startswith(NOCHECK):
+              closing = lines[at][len(NOCHECK):]
+              at += 1
+          tail = lines[at:]
+
+          # 4. Count the lines against the parts list.
+          by_name = {}
+          for p in parts:
+              if p["name"] in by_name:
+                  bad("two parts share the name %r" % p["name"])
+              by_name[p["name"]] = p
+          by_id = dict((p["id"], p) for p in parts)
+          row_of = {}
+          for word, rest in rows:
+              owner = None
+              for name in sorted(by_name, key=len, reverse=True):
+                  if rest == name or rest.startswith(name + " ("):
+                      owner = by_name[name]
+                      break
+              if owner is None:
+                  bad("a line names no part in pipeline-parts.json: %r" % rest[:100])
+              else:
+                  row_of.setdefault(owner["id"], []).append((word, rest))
+          bare = []
+          if closing is not None:
+              if not closing.endswith("."):
+                  bad("the 'No check of their own' line does not end with a full stop")
+              bare = (closing[:-1] if closing.endswith(".") else closing).split("; ")
+          for name in bare:
+              if name not in by_name:
+                  bad("the 'No check of their own' line names no part in pipeline-parts.json: %r" % name[:100])
+          if len(bare) != len(set(bare)):
+              bad("the 'No check of their own' line names a part twice")
+          for p in parts:
+              n = len(row_of.get(p["id"], []))
+              named = bare.count(p["name"])
+              if p.get("check") or is_checkout(p):
+                  # a part with a check has one line; so has the part for this command's own checkout
+                  if n != 1 or named:
+                      bad("%s: wanted one outcome line and no mention on the closing line, found %d line(s) and %d mention(s)" % (p["id"], n, named))
+              elif n or named != 1:
+                  bad("%s: has no check, so wanted its name on the closing line and no outcome line, found %d line(s) and %d mention(s)" % (p["id"], n, named))
+          if len(rows) + len(bare) != len(parts):
+              bad("%d outcome lines and %d names on the closing line do not add up to the %d parts in the list" % (len(rows), len(bare), len(parts)))
+
+          # 5. Each line carries one of the words a look can say, and a part that is not set up on
+          #    this Mac is not "up to date".
+          for pid, got in sorted(row_of.items()):
+              for word, rest in got:
+                  if word in NEVER:
+                      bad("%s reads %r, which a look can never say" % (pid, word))
+                  elif word == "could not be measured":
+                      bad("%s could not be measured: %s" % (pid, rest[:140]))
+                  elif word == "up to date" and not (is_checkout(by_id[pid]) and rest.endswith("(at origin's tip)")):
+                      bad("%s reads 'up to date', but nothing of it is set up on a Mac that has never seen the kit" % pid)
+          for p in parts:
+              f = (p.get("settings") or {}).get("file") or ""
+              if p.get("check") and f.endswith((".conf", ".json")) and not os.path.exists(f):
+                  got = [w for w, _ in row_of.get(p["id"], [])]
+                  if got != ["off on this Mac"]:
+                      bad("%s: its settings file %s is not in the checkout, so it must read 'off on this Mac', not %r" % (p["id"], f, got))
+
+          # 6. The short list at the end names every part that waits. On a Mac where every part is
+          #    off it is the "<name> is waiting on you; ..." form, one line for each part that waits,
+          #    because no waiting part's own output names a card (see the comment above this step).
+          #    The card lists ("Only you can do these:", "Sign-offs still asked for:") are accepted if
+          #    a card is ever named. Nothing waiting would be "Nothing is waiting on you.", which a
+          #    Mac with no host cannot say.
+          waiting = [p for p in parts if [w for w, _ in row_of.get(p["id"], [])] == ["waiting on you"]]
+          text = "\n".join(tail)
+          cards = "Only you can do these:" in tail
+          signs = "Sign-offs still asked for:" in tail
+          lone = [ln for ln in tail if ln.endswith(" is waiting on you; its own lines above say what for.")]
+          if "Nothing is waiting on you." in tail:
+              bad("the short list says nothing is waiting on you")
+          if not (cards or signs or lone):
+              bad("the short list is missing: no card list and no '<name> is waiting on you' line")
+          for p in waiting:
+              if p["name"] not in text:
+                  bad("%s waits on you, but the short list does not name it" % p["id"])
+
+          count = lambda w: sum(1 for r in rows if r[0] == w)
+          print("parts in pipeline-parts.json: %d" % len(parts))
+          print("outcome lines: %d (%s)" % (len(rows), ", ".join("%d %s" % (count(w), w) for w in WORDS)))
+          print("named on the 'No check of their own' line: %d" % len(bare))
+          print("waiting on you: %s" % ("; ".join(p["id"] for p in waiting) or "none"))
+          if cards or signs:
+              form = "a card list is printed ('Only you can do these:' %s, 'Sign-offs still asked for:' %s)" % (
+                  "yes" if cards else "no", "yes" if signs else "no")
+          else:
+              form = ("'Only you can do these:' is not printed, as expected on a Mac where every part is off: "
+                      "no waiting part's own output names a card")
+          print("short list: %s; %d '<name> is waiting on you' line(s)" % (form, len(lone)))
+          if problems:
+              for why in problems:
+                  print("::error::" + why)
+              sys.exit(1)
+          print("ok: exit %d; %d parts, each with its one line or its name on the closing line; none set up that is not" % (code, len(parts)))
+          PY
+          /usr/bin/python3 "$PROOF_DIR/assert_look.py" "$PROOF_DIR/look.out" "$PROOF_DIR/look.out.code"
+          } 2>&1 | tee -a "$PROOF_DIR/printed.txt"
+
+      - name: Refusal - an agent marker is set (exit 3, only the refusal)
+        if: ${{ !cancelled() }}
+        run: |
+          {
+          . "$PROOF_DIR/lib.sh"
+          rc=0
+          CLAUDECODE=1 PYTHONDONTWRITEBYTECODE=1 HOME="$PROOF_HOME" /usr/bin/python3 scripts/pipeline_install.py --check > "$PROOF_DIR/marker.out" 2>&1 < /dev/null || rc=$?
+          echo "$rc" > "$PROOF_DIR/marker.out.code"
+          refused "an agent marker" "$PROOF_DIR/marker.out" 3 "this shell belongs to a Claude session (CLAUDECODE is set)"
+          } 2>&1 | tee -a "$PROOF_DIR/printed.txt"
+
+      - name: Refusal - run as root (exit 2, only the refusal)
+        if: ${{ !cancelled() }}
+        run: |
+          {
+          . "$PROOF_DIR/lib.sh"
+          # A hosted runner's sudo asks for no password. If it ever does, this fails: a refusal
+          # that could not be tried is not one that was shown.
+          if ! sudo -n true; then
+            echo "::error::sudo asks for a password on this runner, so the refusal as root cannot be tried"
+            exit 1
+          fi
+          rc=0
+          sudo -n -E env PYTHONDONTWRITEBYTECODE=1 HOME="$PROOF_HOME" /usr/bin/python3 scripts/pipeline_install.py --check > "$PROOF_DIR/root.out" 2>&1 < /dev/null || rc=$?
+          echo "$rc" > "$PROOF_DIR/root.out.code"
+          refused "root" "$PROOF_DIR/root.out" 2 "do not run this with sudo"
+          } 2>&1 | tee -a "$PROOF_DIR/printed.txt"
+
+      - name: Refusal - no terminal and no --check (exit 2, only the refusal)
+        if: ${{ !cancelled() }}
+        run: |
+          {
+          . "$PROOF_DIR/lib.sh"
+          rc=0
+          PYTHONDONTWRITEBYTECODE=1 HOME="$PROOF_HOME" /usr/bin/python3 scripts/pipeline_install.py > "$PROOF_DIR/bare.out" 2>&1 < /dev/null || rc=$?
+          echo "$rc" > "$PROOF_DIR/bare.out.code"
+          refused "no terminal" "$PROOF_DIR/bare.out" 2 "this needs a person at a terminal"
+          } 2>&1 | tee -a "$PROOF_DIR/printed.txt"
+
+      - name: After the look and the three refusals - nothing changed
+        if: ${{ !cancelled() }}
+        run: |
+          {
+          . "$PROOF_DIR/lib.sh"
+          take end
+          same before end
+          clean_checkout
+          } 2>&1 | tee -a "$PROOF_DIR/printed.txt"
+
+      - name: The comparison can fail - plant a file, expect a difference, remove it
+        if: ${{ !cancelled() }}
+        run: |
+          {
+          . "$PROOF_DIR/lib.sh"
+          planted="$PROOF_HOME/planted-by-the-proof"
+          printf 'planted\n' > "$planted"
+          listing "$PROOF_HOME" > "$PROOF_DIR/planted-home.txt"
+          rc=0
+          diff -u "$PROOF_DIR/before-home.txt" "$PROOF_DIR/planted-home.txt" > "$PROOF_DIR/planted-home.diff" || rc=$?
+          rm -f "$planted"
+          if [ "$rc" != 1 ]; then
+            echo "::error::the listing comparison did not see a file planted in the empty home (diff exit $rc), so it proves nothing"
+            exit 1
+          fi
+          cat "$PROOF_DIR/planted-home.diff"
+          echo "ok: the comparison saw the planted file, which is now removed"
+          # The same for the runner's real ~/.claude, which the empty home would not show: a command
+          # that found the real home some other way than $HOME would write there.
+          real="$PROOF_REAL_HOME/.claude"
+          made=0
+          if [ ! -e "$real" ]; then
+            mkdir "$real"
+            made=1
+          fi
+          printf 'planted\n' > "$real/planted-by-the-proof"
+          listing "$real" > "$PROOF_DIR/planted-realclaude.txt"
+          rc=0
+          diff -u "$PROOF_DIR/before-realclaude.txt" "$PROOF_DIR/planted-realclaude.txt" > "$PROOF_DIR/planted-realclaude.diff" || rc=$?
+          rm -f "$real/planted-by-the-proof"
+          if [ "$made" = 1 ]; then
+            rmdir "$real"
+          fi
+          if [ "$rc" != 1 ]; then
+            echo "::error::the listing comparison did not see a file planted in the real ~/.claude (diff exit $rc), so it proves nothing"
+            exit 1
+          fi
+          cat "$PROOF_DIR/planted-realclaude.diff"
+          echo "ok: the comparison saw the file planted in the real ~/.claude, which is now removed"
+          # The same for the checkout's own check.
+          touch planted-by-the-proof
+          dirty="$(git status --porcelain --ignored)"
+          rm -f planted-by-the-proof
+          if [ -z "$dirty" ]; then
+            echo "::error::git status --porcelain --ignored printed nothing for a file planted in the checkout, so that check proves nothing"
+            exit 1
+          fi
+          echo "$dirty"
+          echo "ok: the checkout check saw the planted file, which is now removed"
+          clean_checkout
+          } 2>&1 | tee -a "$PROOF_DIR/printed.txt"
+
+      # The checks that read text can pass by matching nothing, so each is shown to fail on a broken
+      # input: four broken copies of the real output, a refusal that prints one line too many, and a
+      # planted token of every shape the scan knows. (The complaints they provoke go to files:
+      # printed as they are, they would show up on the run as errors.)
+      - name: The text checks can fail too - broken copies, a broken refusal, planted tokens
+        if: ${{ !cancelled() }}
+        run: |
+          {
+          . "$PROOF_DIR/lib.sh"
+          # mutate SLUG EXPECT AWK [CODE]: a broken copy of the real output must be refused, and
+          # for the reason EXPECT.
+          mutate() {
+            local slug="$1" expect="$2" prog="$3" code="${4:-}" out="$PROOF_DIR/broken-$1.out"
+            awk "$prog" "$PROOF_DIR/look.out" > "$out"
+            if [ -n "$code" ]; then
+              echo "$code" > "$out.code"
+            else
+              cp "$PROOF_DIR/look.out.code" "$out.code"
+              if cmp -s "$out" "$PROOF_DIR/look.out"; then
+                echo "::error::the broken copy '$slug' is the same as the real output"
+                return 1
+              fi
+            fi
+            if /usr/bin/python3 "$PROOF_DIR/assert_look.py" "$out" "$out.code" > "$out.log" 2>&1; then
+              echo "::error::the checks on the look accepted a broken copy of its output: $slug"
+              return 1
+            fi
+            if ! grep -qF -e "$expect" "$out.log"; then
+              echo "::error::the broken copy '$slug' was refused, but not for the reason expected: $expect"
+              return 1
+            fi
+            echo "ok: refused the broken copy '$slug', complaining: $expect"
+          }
+          mutate gone "wanted one outcome line" '/^  off on this Mac/ && !d {d=1; next} {print}'
+          mutate uptodate "reads 'up to date'" '/^  off on this Mac/ && !d {d=1; sub(/^  off on this Mac/, "  up to date")} {print}'
+          mutate exit0 "exit 0" '{print}' 0
+          mutate nolist "short list is missing" '!/is waiting on you; its own lines above say what for\.$/'
+
+          printf '\n== 0. Where this is running\n\nStopped: this needs a person at a terminal: x\nand one line more\n' > "$PROOF_DIR/broken-refusal.out"
+          echo 2 > "$PROOF_DIR/broken-refusal.out.code"
+          if refused "a refusal that printed more" "$PROOF_DIR/broken-refusal.out" 2 "this needs a person at a terminal" > "$PROOF_DIR/broken-refusal.log" 2>&1; then
+            echo "::error::the refusal check accepted output that printed more than the refusal"
+            exit 1
+          fi
+          if ! grep -qF "found 3" "$PROOF_DIR/broken-refusal.log"; then
+            echo "::error::the refusal check refused the broken output, but not for printing one line too many"
+            exit 1
+          fi
+          echo "ok: refused a refusal that printed one line more than itself"
+
+          # The token scan, on a token of every shape it knows, one a line. Each is put together
+          # here from two pieces and written to a folder of its own, which is never printed.
+          dir="$(mktemp -d "$RUNNER_TEMP/planted-token.XXXXXX")"
+          {
+            printf '%s%s\n' 'gh' 'p_0123456789abcdefghijklmnopqrstuvwxyz'
+            printf '%s%s\n' 'gh' 'o_0123456789abcdefghijklmnopqrstuvwxyz'
+            printf '%s%s\n' 'gh' 'u_0123456789abcdefghijklmnopqrstuvwxyz'
+            printf '%s%s\n' 'gh' 's_0123456789abcdefghijklmnopqrstuvwxyz'
+            printf '%s%s\n' 'gh' 'r_0123456789abcdefghijklmnopqrstuvwxyz'
+            printf '%s%s\n' 'github_pa' 't_0123456789ABCDEFGHIJKL_0123456789abcdefghijklmnopqrstuvwxyz0123456789ABCDEF'
+            printf '%s%s\n' 'xo' 'xb-0123456789-0123456789012-abcdefghijklmnopqrstuvwx'
+            printf '%s%s\n' 'xap' 'p-1-A0123456789-0123456789012-0123456789abcdef0123456789abcdef'
+            printf '%s%s\n' 'sk-an' 't-api03-0123456789abcdefghijklmnopqrstuvwxyz'
+            printf '%s%s\n' 'AKI' 'A0123456789ABCDEF'
+            printf '%s%s\n' 'ASI' 'A0123456789ABCDEF'
+            printf '%s%s\n' '-----BEGI' 'N PRIVATE KEY-----'
+          } > "$dir/planted.txt"
+          found=0
+          scan_tokens "$dir" > "$PROOF_DIR/planted-token.log" 2>&1 || found=1
+          rm -f "$dir/planted.txt"
+          rmdir "$dir"
+          if [ "$found" != 1 ] || ! grep -qF "on line(s): 1 2 3 4 5 6 7 8 9 10 11 12 " "$PROOF_DIR/planted-token.log"; then
+            echo "::error::the token scan did not name every one of the 12 planted token shapes, so a pattern in it proves nothing"
+            exit 1
+          fi
+          echo "ok: the token scan saw all 12 planted shapes: $(sed 's/^::error:://' "$PROOF_DIR/planted-token.log")"
+          } 2>&1 | tee -a "$PROOF_DIR/printed.txt"
+
+      - name: No token shape in anything the job printed
+        if: ${{ !cancelled() }}
+        run: |
+          {
+          . "$PROOF_DIR/lib.sh"
+          # The scan is only as good as the capture: printed.txt must hold what the look step printed.
+          if ! grep -q '^(exit code ' "$PROOF_DIR/printed.txt"; then
+            echo "::error::what the job printed was not captured in printed.txt, so the scan would prove nothing"
+            exit 1
+          fi
+          scan_tokens "$PROOF_DIR"
+          echo "ok: no token shape in the $(ls "$PROOF_DIR" | wc -l | tr -d ' ') files of output, printed.txt ($(wc -l < "$PROOF_DIR/printed.txt" | tr -d ' ') lines) among them"
+          } 2>&1 | tee -a "$PROOF_DIR/printed.txt"
