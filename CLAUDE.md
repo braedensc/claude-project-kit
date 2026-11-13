@@ -382,6 +382,9 @@ npm run test:runner-store    # the runner's store (KIT-642): requests and run re
 npm run test:runner          # the runner (KIT-642): start, resume, stop and a restart against a
                              #   stand-in; the owner's approval from the history; the pin; the one
                              #   command line; a run that died resumed once; leaves nothing behind
+npm run test:runner-limits   # the runner's limits (KIT-643): stand-ins that grow without bound
+                             #   in memory (a child that left the group too) and on disk stopped
+                             #   with their whole tree; the floor; each incident told once
 npm run test:queue-setup     # the queue's installer (KIT-456): configs pass the jobs' own loaders; no plist
                              #   overwritten, no job loaded; refused under a model
 npm run test:day-plan        # the day plan file (KIT-438): the queue's decision as fields only, each

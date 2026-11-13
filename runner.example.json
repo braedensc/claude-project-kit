@@ -13,6 +13,13 @@
   "stop_grace_seconds": 30,
   "max_starts_per_ticket": 20,
   "hold": {"file": ""},
+  "limits": {
+    "wall_minutes": 360,
+    "memory_mb": 8192,
+    "disk_mb": 20480,
+    "check_seconds": 60,
+    "room": {"min_free_disk_gb": 25, "max_pressure": "critical", "max_swap_gb": 4}
+  },
   "projects": {
     "app": {
       "repo": "/Users/<role-account>/repos/app",
