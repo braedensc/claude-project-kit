@@ -335,7 +335,9 @@ them would hold that PR forever. It holds and uses no secret.
 
 First measured 13 Nov 2026: macOS 15.8.2 (image `macos-15-arm64` 20261104.0514.1), `/usr/bin/python3`
 3.9.6, the developer tools of Xcode 16.4, passwordless `sudo`. The job ran in 14 seconds, after
-waiting 10 minutes for a macOS runner; the wait does not count against `timeout-minutes`.
+waiting 10 minutes for a macOS runner. A short macOS pool can also fail a run before any step
+starts: on that day one run waited 15 minutes and ended with "The job was not acquired by Runner
+of type hosted even after multiple attempts". That says nothing about the install; re-run the job.
 
 **What it does not prove.** A host: the account, session runner and public address do not exist on
 a runner. Real services: no tracker, code host or chat product, and no key for any of them. Real
