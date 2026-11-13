@@ -183,6 +183,9 @@ MAX_FIX_REQUESTS = 3          # automated attempts per PR, lifetime; the 4th con
 # writes STATES a limit that is not the default (`limit=five`), and the bounce driver reads the
 # limit from that request through `fix_limit`: it holds no number of its own, so the two cannot
 # stop at different counts. A request that states none means MAX_FIX_REQUESTS.
+# The limit is the bot's own word. Only a request the Actions bot wrote is read, and nothing above
+# FIX_LIMIT_MAX is ever stated or counted, but a forged request from the bot account itself could
+# still raise the driver's cap, to that ceiling (KIT-749 tightens it).
 # The number is spelled in letters on purpose. `MARKER_RE` takes only lowercase letters and
 # hyphens in a value, and every copy of this file already deployed (a monitor in another
 # repository, a waker, the role account's clone) runs that grammar until it is updated: `limit=5`
@@ -265,7 +268,11 @@ def fix_limit(mark):
     Only a request marker states one, and `parse_marker` has already refused a request from
     anyone but the Actions bot, so a marker anybody else writes states nothing. The same
     attribute on any other kind is not read. A value that is missing, misspelled, outside 0 to
-    FIX_LIMIT_MAX or not text is the default, never an exception, and never more than the ceiling."""
+    FIX_LIMIT_MAX or not text is the default, never an exception, and never more than the ceiling.
+
+    The limit is the bot's own word, so it is only as trustworthy as the bot's comments: a forged
+    request from the bot account itself could state up to FIX_LIMIT_MAX, the most the driver's cap
+    can ever reach (KIT-749 tightens it)."""
     if not isinstance(mark, dict) or mark.get("kind") != "request":
         return MAX_FIX_REQUESTS
     attrs = mark.get("attrs")

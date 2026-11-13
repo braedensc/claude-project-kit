@@ -133,12 +133,14 @@ WHAT HAPPENS WHEN A PULL REQUEST GOES CONFLICTING (the dispatched lane)
   (`conflict`), then the thread reply, then `conflict-delivered`, then the monitor's own
   `ack` marker on the PR so it holds its page. A later push that leaves the PR
   CONFLICTING is reported once as `result outcome=unresolved`, and the monitor escalates.
-  It spends NO bounce, writes no re-review request and no label, is capped on the ledger
-  at the monitor's budget, and files no ticket (a second session on a branch the first
-  may hold). No thread, or no request, sends nothing and the monitor
-  pages. On a CONCLUDED pull request a conflict is a notice, like any other change. The
-  ack counts on GitHub only when the token this driver posts with belongs to a writer; if
-  it does not, the monitor pages while the session works — loud, never silent.
+  It spends NO bounce, writes no re-review request and no label, and files no ticket (a
+  second session on a branch the first may hold). It is capped on the ledger at the limit
+  the latest request states (three unless the repository set another, never above 20).
+  That limit is the bot's own word, so see `conflict_view` for what the cap does and does
+  not guard. No thread, or no request, sends nothing and the monitor pages. On a CONCLUDED
+  pull request a conflict is a notice, like any other change. The ack counts on GitHub only
+  when the token this driver posts with belongs to a writer; if it does not, the monitor
+  pages while the session works — loud, never silent.
 
 WHERE THIS RUNS, AND WHERE ITS CREDENTIALS LIVE (owner decision 2026-09-06, "C1")
 
@@ -1810,10 +1812,19 @@ def conflict_view(mergeable, episode, rows, head_sha):
 
     THE MONITOR KEEPS THE CLOCK AND THE BUDGET; THIS DRIVER ONLY ANSWERS IT. A conflict is
     sent back to the session only in answer to an open, unclaimed fix `request`, so the
-    monitor's per-PR lifetime budget bounds it — and the ledger caps it again at the same
-    number, so a forged or reset request can never buy one more. The number is the one the
-    request itself states (`prc.fix_limit`: three unless the repository set another, read only
-    from a request the Actions bot wrote), never a constant of this file's. States:
+    monitor's per-PR lifetime budget bounds it. The ledger counts the fixes this driver has
+    sent and caps them at the limit the LATEST request states (`prc.fix_limit`: three unless
+    the repository set another), never above the hard ceiling `prc.FIX_LIMIT_MAX` (20), and
+    never a constant of this file's.
+
+    WHAT THAT CAP GUARDS, AND WHAT IT DOES NOT. It is read from the very request it
+    second-guesses, so it is not independent of it. A request written by anyone but the
+    Actions bot is refused by the parser and states nothing. A forged request from the bot
+    account itself is not refused: it can state a limit above the repository's own, and so
+    raise this cap, at most to the ceiling. The independent second layer is the ceiling and
+    the reset protection: the count is this driver's own ledger, which no comment can lower,
+    so deleting or renumbering the monitor's comments cannot reset it. Tightening the rest
+    is KIT-749. States:
 
       request   an open request nobody has claimed, budget left — send the fix (action
                 `conflict`)
@@ -7508,6 +7519,8 @@ def selftest():
                            conflict_no=n, head_sha="old")
             world["pr_comments"] = [gh_comment(prc.marker("request", 4), bot=True)]
             rc, out = pass_(tmp)
+            # The request states no limit, so the cap here is the default 3. A request the bot wrote
+            # that stated more would raise it, to 20 at most (conflict_view's docstring; KIT-749).
             check("the ledger caps conflict fixes at the monitor's budget, whatever GitHub shows",
                   (rc, calls, "no more are sent" in out), (EXIT_OK, [], True))
 
