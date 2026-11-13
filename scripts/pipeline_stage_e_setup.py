@@ -5994,6 +5994,51 @@ def _say_declines(text):
         say("    …and %d more" % (len(shown) - 20))
 
 
+# A POLLER PAUSED FOR WANT OF THE ROUTING SIGN-OFF IS NOT A FAILED INSTALL (KIT-733). On the
+# work teams the review poller pauses every repository's reviews until the routing probe has
+# written its sign-off, and a pass with a paused repository exits 1. The probe is the idea
+# gate's, and the one command runs the idea gate AFTER this installer, so a machine with no
+# sign-off yet (a first install, or the review entries just changed) could never get past this
+# step to the only place that writes it. Held here for the reason COMPONENT_EXIT_DECLINED is,
+# and pinned the same way: the battery builds these lines from the poller's own code.
+COMPONENT_EXIT_ERROR = 1
+POLLER_PAUSED_LINE = re.compile(r"^PAUSED (\S+): reviews are paused — (.*)$")
+NO_SIGNOFF_PAUSE = re.compile(
+    r"^there is no routing sign-off at .+: the probe has not been signed, or it no longer "
+    r"holds\. The one command offers to run it$")
+# The lines the poller prints beside every error it counts (`result.errors += 1`): its
+# `FAIL:` lines, a review it will try again (`RETRY`), and a telemetry row it lost.
+POLLER_ERROR_LINE = re.compile(r"^(FAIL:|RETRY |TELEMETRY LOST)")
+
+
+def paused_only_for_the_probe(said):
+    """True when the poller's output has a PAUSED line, every PAUSED line gives an absent
+    routing sign-off as its ONLY reason, and none of its error lines (`POLLER_ERROR_LINE`)
+    is there.
+
+    A sign-off that cannot be read or is not one, a stop, a missing routing label and a
+    changed dispatcher version are NOT that: each makes its PAUSED line more than the one
+    sentence, and each still fails the install, because each needs a person to look. The
+    match is the whole sentence, so a second reason joined onto it ("...; stopped since ...")
+    cannot ride in behind it.
+
+    WHAT IT CANNOT SEE. Every other line is ignored. A pass can exit 1 for a cause that
+    prints none of the above: a close or a telemetry row still pending on an earlier review.
+    A dry run says nothing of it, and it shows on the poller's heartbeat and in the heartbeat
+    monitor instead."""
+    paused = 0
+    for raw in said.splitlines():
+        line = raw.strip()
+        if POLLER_ERROR_LINE.match(line):
+            return False
+        found = POLLER_PAUSED_LINE.match(line)
+        if found:
+            if not NO_SIGNOFF_PAUSE.match(found.group(2)):
+                return False
+            paused += 1
+    return paused > 0
+
+
 def step_dry_run(ctx, apply_it):
     """Every component's own dry run, shape-checked. This is what CK-5 reads."""
     r, notes = ctx.runner, []
@@ -6082,7 +6127,12 @@ def step_dry_run(ctx, apply_it):
     # always read this way; the poller was not.
     ok_codes = (0, COMPONENT_EXIT_DECLINED)
     problems = []
-    if poller.rc not in ok_codes:
+    # A FIFTH STATE, for the poller alone (KIT-733): paused for want of the routing sign-off.
+    # Exit 1, and expected until the idea gate's probe writes the sign-off. Only that reason
+    # and only that exit: see `paused_only_for_the_probe` for what is still a failure.
+    probe_unsigned = (poller.rc == COMPONENT_EXIT_ERROR
+                      and paused_only_for_the_probe(poller.out + poller.err))
+    if poller.rc not in ok_codes and not probe_unsigned:
         problems.append("the poller's dry run failed (exit %d). Nothing was created: %s"
                         % (poller.rc, (poller.err or poller.out).strip()[-400:]))
     # A FOURTH STATE, for the same reason as the third. The driver exits 2 when it CANNOT
@@ -6192,8 +6242,17 @@ def step_dry_run(ctx, apply_it):
     if '"unknown"' in blob or "checks_source: unknown" in blob:
         raise Blocked("CK-6", "the bounce driver reports its required-check source as "
                               "UNKNOWN for at least one repository")
+    # ONE PLAIN LINE, and before CK-5 below can stop the run: a pause that counted nothing is
+    # said wherever the step ends. It does not skip the cost gate: with no count signed off,
+    # CK-5 still stops here, and its row says nothing was counted.
+    if probe_unsigned:
+        say("  The poller is paused until the idea gate's routing probe is signed (no routing "
+            "sign-off stands), so this dry run counted no pull requests. That is expected: "
+            "the idea gate's installer asks \"Run the probe now?\" after this one.")
     if not ctx.state.attested("A-DRY-RUN"):
-        raise Blocked("CK-5", "the counts above have not been signed off")
+        raise Blocked("CK-5", "the counts above have not been signed off"
+                              + ("; the poller counted nothing while its reviews are paused"
+                                 if probe_unsigned else ""))
     # EVERY candidate, not the WOULD lines: those are only what one pass posts under the cap,
     # and none while a disabled webhook holds them. Each candidate is a paid session in time.
     # The catch-up step reads this list; it decides, and it never stops the run.
@@ -6201,7 +6260,9 @@ def step_dry_run(ctx, apply_it):
         l.split("] CANDIDATE", 1)[1].strip() for l in catchup_said.splitlines()
         if "] CANDIDATE " in l]
     return True, ("all five dry runs ran and the count is signed off; "
-                  + ("the poller declined at least one pull request"
+                  + ("the poller is paused until the routing probe is signed"
+                     if probe_unsigned else
+                     "the poller declined at least one pull request"
                      if declined else "the poller did not decline")), notes
 
 
@@ -11646,6 +11707,236 @@ def _selftest_body():
     expect("cannot-evaluate-is-not-failed", isinstance(rowD6, SetupError),
            "a real driver failure was excused by a CANNOT EVALUATE line beside it: %r"
            % (rowD6 if not isinstance(rowD6, SetupError) else ""))
+
+    # -- 15j2. a poller paused for want of the routing sign-off is expected (KIT-733) ---- #
+    # THE LIVE STATE, found 12 Nov 2026 in the move onto the work teams: the review entries
+    # were rewritten, so the old routing probe no longer held and its sign-off was gone. The
+    # poller (work-team config) then pauses every repository for want of it and exits 1, this
+    # step read that as a failed install, and the one command stopped here for good: the
+    # probe that writes the sign-off is the idea gate's, which runs AFTER this installer.
+    # Every PAUSED line below is built by the poller's own code (`review_blockers`) from
+    # a real tmp tree, so the wording this file reads is the wording the poller prints.
+    cases += 1
+    import pipeline_machine_tickets as _machine_mod
+    nosig_repos = ["example-org/kit", "example-org/app"]
+    tmpNOSIG = tempfile.mkdtemp(prefix="stage-e-nosignoff.")
+
+    def _nosig_cfg(tag):
+        base = os.path.join(tmpNOSIG, tag)
+        return {"routing_signoff_file": os.path.join(base, ".stage-a", "routing-signoff.json"),
+                "shared_stop_file": os.path.join(base, ".stage-a", "state", "stop.json"),
+                "state_dir": os.path.join(base, "state"),
+                "dispatcher_version_url": "http://127.0.0.1:3456/version",
+                "_route_labels": dict((_poller_mod.review_entry_name(r), "label-" + r)
+                                      for r in nosig_repos)}
+
+    def _poller_says(cfg, seen=None):
+        """The lines the poller prints for these repositories, from its own code."""
+        blockers = _poller_mod.review_blockers(cfg, set(nosig_repos), "key", seen=seen)
+        return ["PAUSED %s: reviews are paused — %s"
+                % (repo, "; ".join(detail for _code, detail in reasons))
+                for repo, reasons in sorted(blockers.items())]
+
+    def _paused_out(lines, extra=""):
+        return ("resolved workspace ws-1, agent user a, model label m, guarded label g\n"
+                + "\n".join(lines) + "\n"
+                + "paused example-org/kit#75: told once on the PR [dry-run]\n" + extra)
+
+    # The frame the lines above are printed in, pinned to the poller's source.
+    with open(_poller_mod.__file__, encoding="utf-8") as fh:
+        poller_source = fh.read()
+    expect("unsigned-probe-is-expected", 'log("PAUSED %s: reviews are paused — %s"' in poller_source,
+           "the poller prints its pause in another frame now, so the lines this file reads "
+           "are no longer the lines it prints")
+    expect("unsigned-probe-is-expected", COMPONENT_EXIT_ERROR == _poller_mod.EXIT_ERROR,
+           "this file says a paused poller exits %d and the poller says %d — a number copied "
+           "out of another module has drifted" % (COMPONENT_EXIT_ERROR, _poller_mod.EXIT_ERROR))
+    missing_cfg = _nosig_cfg("missing")
+    live_lines = _poller_says(missing_cfg)
+    expect("unsigned-probe-is-expected",
+           len(live_lines) == 2 and all("there is no routing sign-off at" in l for l in live_lines),
+           "the fixture is not the live state (both repositories paused for want of the "
+           "sign-off, and nothing else): %r" % live_lines)
+    live_out = _paused_out(live_lines)
+
+    def _nosig_row(poller, attested=True):
+        c, _f = _dry_run_ctx(conf, poller=poller)
+        if not attested:
+            c.state.data["attestations"].pop("A-DRY-RUN", None)
+        return _quiet(lambda: _dry_run_row(c))
+
+    # …expected, while the sign-off is absent: the row passes, and ONE plain line names the
+    # probe, so the pause is neither a failure nor a silence.
+    rowNOSIG, printedNOSIG = _nosig_row((1, live_out))
+    okNOSIG = isinstance(rowNOSIG, tuple) and rowNOSIG[0] is True
+    expect("unsigned-probe-is-expected", okNOSIG,
+           "a poller paused for want of the routing sign-off stopped the install: %s"
+           % (rowNOSIG[1] if isinstance(rowNOSIG, tuple) else rowNOSIG))
+    saidProbe = [l for l in printedNOSIG.splitlines() if "Run the probe now?" in l]
+    expect("unsigned-probe-is-expected",
+           len(saidProbe) == 1 and "routing probe" in saidProbe[0] and "expected" in saidProbe[0],
+           "the pause was not explained in one plain line that names the probe: %r"
+           % printedNOSIG[-600:])
+    expect("unsigned-probe-is-expected",
+           okNOSIG and "paused" in rowNOSIG[1] and "routing probe" in rowNOSIG[1],
+           "…and the row hid the pause behind a clean-sounding verdict: %r"
+           % (rowNOSIG[1] if isinstance(rowNOSIG, tuple) else rowNOSIG))
+    expect("unsigned-probe-is-expected", "there is no routing sign-off at" in printedNOSIG,
+           "the poller's own PAUSED lines were not left on screen for the person to read")
+
+    # …but ONLY that. Every other way the poller is red is still a failure, in the same
+    # output, beside the same line, or alone.
+    sign_bad = _nosig_cfg("unreadable")
+    os.makedirs(sign_bad["routing_signoff_file"])            # a folder where the file should be
+    junk = _nosig_cfg("malformed")
+    os.makedirs(os.path.dirname(junk["routing_signoff_file"]))
+    with open(junk["routing_signoff_file"], "w", encoding="utf-8") as fh:
+        fh.write("{}")
+    stopped = _nosig_cfg("stopped")
+    _machine_mod.write_stop_if_absent(stopped["shared_stop_file"], _machine_mod.stop_document(
+        "a review ticket misrouted", "example-org/kit", "review", {}))
+    nolabel = _nosig_cfg("nolabel")
+    nolabel["_route_labels"].pop(_poller_mod.review_entry_name("example-org/app"))
+    saved_gql = _poller_mod.linear_graphql
+    _poller_mod.linear_graphql = lambda *_a, **_k: {"issueLabels": {"nodes": []}}
+    try:
+        nolabel_lines = _poller_says(nolabel)
+    finally:
+        _poller_mod.linear_graphql = saved_gql
+    expect("unsigned-probe-is-expected", len(nolabel_lines) == 2
+           and all("no routing sign-off" in l for l in nolabel_lines)
+           and len([l for l in nolabel_lines if "exactly once" in l]) == 1,
+           "the fixture for a missing label is not one repository paused for want of the "
+           "sign-off beside one paused for that and a missing label: %r" % nolabel_lines)
+    others = (
+        ("a FAIL line beside the pause", (1, _paused_out(
+            live_lines, "FAIL: could not discover pipeline PRs from Linear (HTTP 502)\n"))),
+        ("a RETRY line beside the pause", (1, _paused_out(
+            live_lines, "RETRY example-org/kit#75: attempt 1 of 3, re-selected next pass\n"))),
+        ("a TELEMETRY LOST line beside the pause", (1, _paused_out(
+            live_lines, "TELEMETRY LOST: example-org/kit#75 is due for a re-review, so its "
+                        "record is being re-opened\n"))),
+        ("a sign-off that cannot be read", (1, _paused_out(_poller_says(sign_bad)))),
+        ("a sign-off that is not one", (1, _paused_out(_poller_says(junk)))),
+        ("a stop that stands, beside a pure pause", (1, _paused_out(_poller_says(stopped)))),
+        # A misroute a dry run counts silently (`settle_misroute` prints nothing there) still
+        # shows in the pause: the seen-set record makes its repository's line carry a stop.
+        ("a misroute in the seen-set, beside a pure pause", (1, _paused_out(_poller_says(
+            _nosig_cfg("misroute"), seen={"k": {
+                "repo": "example-org/kit", "status": _poller_mod.MISROUTING_STATUS,
+                "created_at": "2026-11-10T00:00:00Z",
+                "routing": {"checked_at": "2026-11-10T00:00:00Z", "reason": "wrong team"}}})))),
+        ("a missing routing label, beside a pure pause", (1, _paused_out(nolabel_lines))),
+        ("a usage error beside the pause", (2, live_out)),
+        ("exit 1 with no pause line at all", (1, "resolved workspace ws-1\nboom\n")),
+    )
+    for what, poller in others:
+        cases += 1
+        rowO, _pO = _nosig_row(poller)
+        expect("unsigned-probe-is-expected",
+               isinstance(rowO, SetupError) and "exit %d" % poller[0] in str(rowO),
+               "%s: a poller red for another reason was excused beside the unsigned probe: %r"
+               % (what, rowO if not isinstance(rowO, SetupError) else str(rowO)[:200]))
+
+    # THE COST GATE IS NOT SKIPPED. A pause counted nothing, so the dry-run count was never
+    # read; with no sign-off recorded the step still stops at CK-5, after saying so.
+    cases += 1
+    rowCK, printedCK = _nosig_row((1, live_out), attested=False)
+    expect("unsigned-probe-is-expected",
+           isinstance(rowCK, Blocked) and rowCK.card_id == "CK-5"
+           and "Run the probe now?" in printedCK,
+           "a paused dry run with no count signed off did not stop at CK-5 with the pause "
+           "explained: %r" % (rowCK, ))
+
+    # THE WHOLE RUN, from the live state (every step holds; the poller is paused; no
+    # sign-off). `verify` and `run` both end clean, which is exactly what the one command
+    # reads as "Stage E is up to date" and carries on from, to the idea gate's probe.
+    cases += 1
+    ctxNL, fakeNL, _apiNL = _healthy_ctx(conf)
+    fakeNL.answers = [("scan --dry-run", 1, live_out)] + list(fakeNL.answers)
+    (codeNLv, rowsNLv), _pNLv = _quiet(lambda: run_steps(ctxNL, apply_it=False, keep_going=True))
+    (codeNLr, rowsNLr), _pNLr = _quiet(lambda: run_steps(ctxNL, apply_it=True))
+    expect("unsigned-probe-is-expected", (codeNLv, codeNLr) == (EX_OK, EX_OK),
+           "from the live state, verify exited %s and run exited %s, not 0 and 0: %s"
+           % (codeNLv, codeNLr, [(s, o, d[:80]) for s, o, d in rowsNLv + rowsNLr
+                                 if o not in (ALREADY_DONE, DONE)]))
+    expect("unsigned-probe-is-expected",
+           dict((s, o) for s, o, _d in rowsNLr).get("dry-run") in (ALREADY_DONE, DONE),
+           "the dry-run row is not a pass from the live state: %s" % rowsNLr)
+
+    # THE ONE COMMAND, from the same state (Stage E's review of this change). Its own Stage E
+    # part and idea-gate part are driven here with Stage E answered by THIS file's real `verify`
+    # on the fixture above: it reads Stage E as up to date, carries on, and the next thing it
+    # runs is the idea gate's installer, whose probe step is what asks "Run the probe now?".
+    # That installer is a recording stand-in: its question and the sign-off it then writes are
+    # pinned by its own battery (`test:stage-a-setup`), and the question is pinned below by name.
+    cases += 1
+    import pipeline_install as _install_mod
+
+    class _OneCommand(object):
+        """The one command's seam: Stage E is this file's `verify`, the idea gate is recorded."""
+        interrupted = False
+
+        def __init__(self, ctx):
+            self.ctx, self.ran, self.lines = ctx, [], []
+
+        def say(self, line=""):
+            self.lines.append(line)
+
+        def now(self):
+            return "2026-11-12T00:00:00Z"
+
+        def measure(self, argv, timeout=None):
+            return None, "not measured here"
+
+        def run(self, argv, capture=False):
+            step = (os.path.basename(argv[1]), argv[2])
+            self.ran.append(step)
+            if step == ("pipeline_stage_e_setup.py", "verify"):
+                return cmd_verify(self.ctx), ""
+            if step == ("pipeline_stage_a_setup.py", "run"):
+                return EX_BLOCKED, ""
+            raise AssertionError("an unscripted program ran: %r" % (argv,))
+
+    oc_conf = os.path.join(tmpNOSIG, "stage-e.conf")
+    open(oc_conf, "w", encoding="utf-8").close()
+
+    def _one_command(poller_out):
+        ctxOC, fakeOC, _apiOC = _healthy_ctx(conf)
+        fakeOC.answers = [("scan --dry-run", 1, poller_out)] + list(fakeOC.answers)
+        io, rep = _OneCommand(ctxOC), _install_mod.Report()
+
+        def _steps():
+            """In `main`'s order, and as `main` does: a part that returns a code stops the run."""
+            carry = _install_mod.step_stage_e(io, oc_conf, False, rep)
+            if carry is not None:
+                return carry, None
+            return carry, _install_mod.step_stage_a(
+                io, os.path.join(tmpNOSIG, "stage-a.conf"), oc_conf, rep)
+        (carry, reached), _pOC = _quiet(_steps)
+        return carry, reached, io, rep
+
+    carryOC, reachedOC, ioOC, repOC = _one_command(live_out)
+    expect("unsigned-probe-is-expected",
+           carryOC is None and repOC.steps.get("stage_e", ("",))[0] == _install_mod.OUT_OK
+           and ioOC.ran == [("pipeline_stage_e_setup.py", "verify"),
+                            ("pipeline_stage_a_setup.py", "run")] and reachedOC == EX_BLOCKED,
+           "from the live state the one command did not go from Stage E to the idea gate in one "
+           "run: carried on %r, stage_e %r, ran %r" % (carryOC, repOC.steps.get("stage_e"), ioOC.ran))
+    # …and the same chain STOPS, before the idea gate, when the poller is red for any other
+    # reason: the control that shows the run above is not a chain that cannot fail.
+    carryS, _reachedS, ioS, _repS = _one_command(_paused_out(_poller_says(stopped)))
+    expect("unsigned-probe-is-expected",
+           carryS not in (None, 0) and ("pipeline_stage_a_setup.py", "run") not in ioS.ran,
+           "a poller red for another reason let the one command reach the idea gate: %r %r"
+           % (carryS, ioS.ran))
+    # The question this file's line promises is the idea gate's own, by name.
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "pipeline_stage_a_setup.py"),
+              encoding="utf-8") as fh:
+        stage_a_source = fh.read()
+    expect("unsigned-probe-is-expected", 'ctx.confirm("Run the probe now?")' in stage_a_source,
+           "the idea gate's installer no longer asks \"Run the probe now?\", which Stage E's line "
+           "tells the person to expect")
 
     # -- 15k. the bounce driver is invoked with arguments it accepts -------- #
     # It never was. `decide` with neither --pr nor --all is a usage error, and

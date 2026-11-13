@@ -810,7 +810,9 @@ An install made before this change has a Reviews team, `REVIEWS_TEAM_KEY` and
 3. **Run the one command.** Stage E creates the routing labels, rewrites the entries and
    the configs, and restarts the dispatcher. The idea gate's installer then offers the
    routing probe, which now covers the review entries too. Reviews pause until it is
-   signed: each waiting pull request is told so once, then reviewed.
+   signed: each waiting pull request is told so once, then reviewed. Stage E's own dry run
+   reads that pause as expected and says so in one line (see 3e), so the one command gets to
+   the probe in the same run.
 4. **Archive the old Reviews team by hand** once nothing on it is open: *Settings →
    Teams → Reviews → Archive*. Its history stays readable. No installer deletes a team.
 
@@ -2127,6 +2129,34 @@ declined PR is **not** one of the sessions you are about to pay for — subtract
 the number you sign off. Exits 1 and 2 are still failures. If exit 3 stopped the install,
 Stage E could never be switched on while any open PR's ticket lacked criteria, which is a
 property of your backlog, not of Stage E.
+
+**Exit 1 from a poller paused for want of the routing sign-off is an unsigned probe, not a
+broken install** (KIT-733). On the work teams the poller pauses every repository's reviews
+until the routing probe has written `~/.stage-a/routing-signoff.json`. A pass with a paused
+repository exits 1.
+
+The probe belongs to the idea gate, and the one command runs the idea gate after this
+installer. A Mac with no sign-off yet could never reach the step that writes it. That is a
+first install, or one whose review entries were just rewritten.
+
+So the dry run reads a pause for that one reason as expected. It prints one line naming the
+routing probe, and the run goes on. It excuses nothing beside it. These still fail the step:
+
+- a sign-off that cannot be read, or is not one;
+- a stop, a missing routing label, or a changed dispatcher version;
+- any `FAIL`, `RETRY` or `TELEMETRY LOST` line, and any other exit.
+
+A dry run cannot see every cause of exit 1. A close or a telemetry row still pending on an
+earlier review also exits 1, and prints nothing of it. That shows on the poller's heartbeat
+and in the heartbeat monitor.
+
+A paused poller counts no pull requests, so the count `CK-5` asks you to sign is empty until
+the probe is signed. Read it again with `run --dry-run` once it is.
+
+Good: `The poller is paused until the idea gate's routing probe is signed ... after this one.`,
+then the steps after the dry run.
+Not that: `FAILED at step dry-run: the poller's dry run failed (exit 1)`, with
+`there is no routing sign-off at ...` in it, and the idea gate never reached.
 
 `decide --all` prints one line per PR that has a review outcome on file and says what it
 would do. With no outcomes yet it says so in words, and exits 0.

@@ -2256,13 +2256,14 @@
       "id": "runner",
       "name": "Starts, resumes and stops the pipeline's sessions",
       "internal_name": "the runner, our own dispatcher",
-      "does": "One always-on job that starts, resumes and stops each session the pipeline asks for, in a fresh workspace with a pin, and keeps one record per run. Built beside the old dispatcher, and off.",
+      "does": "One always-on job that starts, resumes and stops each session the pipeline asks for, in a fresh workspace with a pin, holds each to time, memory and disk limits, and keeps one record per run. Built beside the old dispatcher, and off.",
       "scope": "machine",
       "state": "built-off",
       "needs": [],
       "scripts": [
         "scripts/pipeline_runner.py",
-        "scripts/pipeline_runner_store.py"
+        "scripts/pipeline_runner_store.py",
+        "scripts/pipeline_runner_limits.py"
       ],
       "installer": null,
       "check": null,
@@ -2276,6 +2277,7 @@
           "enabled",
           "store_dir",
           "work_dir",
+          "limits",
           "projects"
         ]
       },
@@ -2591,7 +2593,8 @@
         "idea-gate"
       ],
       "scripts": [
-        "scripts/pipeline_install.py"
+        "scripts/pipeline_install.py",
+        "scripts/pipeline_ask.py"
       ],
       "installer": "scripts/pipeline_install.py",
       "check": null,
@@ -2599,7 +2602,7 @@
         "script": "scripts/pipeline_install.py",
         "args": []
       },
-      "no_command_reason": "It has no look-only mode yet; each installer it runs has its own check.",
+      "no_command_reason": "Its look-only mode is its own --check flag, which runs each part's check, so it has no separate check script.",
       "restarts": [],
       "settings": {
         "file": "stage-e.conf",
@@ -2611,7 +2614,8 @@
       "person_steps": [],
       "ceiling": null,
       "consent": [
-        "Runs each part's installer in order; never merges, approves or labels anything."
+        "Runs each part's installer in order; never merges, approves or labels anything.",
+        "Writes the values you give it (key end dates, your tech lead's name) into your settings files, after you agree."
       ],
       "docs": {
         "guide": "docs/START-HERE.md",

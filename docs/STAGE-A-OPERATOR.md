@@ -223,6 +223,37 @@ enough for those skips: each only spares work.
 - Lists children whose titles look like recent tickets, leaving out the idea and every
   planning ticket.
 
+**The executor's prerequisite mode (KIT-611)**
+
+A started piece of an approved plan may say work no piece covers is missing. When the
+Slack bridge decides to file it, it runs the executor with `--prerequisite`, its request,
+and `--approvals`, its own state file. Nothing else runs this mode, and no session can
+select it. It:
+- Files one ticket: under the epic, in its team and project, in the team's first backlog
+  state, with `provenance:agent` and no other label. One `blocks` edge runs to the piece.
+- Takes the parent from the bridge's approval record alone. It refuses an epic the record
+  does not hold, a piece the record does not approve under it, and an identifier. It also
+  refuses an epic now on another team, and a piece the tracker no longer lists under it.
+- Refuses a record a session could have written: a link, another account's file, a file
+  or folder others may write, or one inside a git working tree.
+- Files at most 15 under one plan in a day, counted from the tracker. The 16th is refused.
+- Files a request once: the ticket carries a `Prerequisite id:` receipt. A retry makes
+  only an edge that is missing, and never touches a ticket a person cancelled or took the
+  label off.
+- Posts no comment, moves nothing, and runs no readiness gate: no approval releases a
+  `provenance:agent` ticket. It waits for a person to hand it over.
+
+Exit codes are the executor's own: 0 filed, 3 refused, 2 failed. A partial filing, the
+ticket made but not its edge, is 2, and its verdict names the ticket.
+
+Good: `filed PROD-61 under PROD-50, in the backlog with provenance:agent, blocking PROD-51.`
+Good: a refusal at the cap, `15 prerequisites were filed under PROD-50 in the last day`, and
+the bridge asks you instead.
+Not that: `the epic is not a plan the bridge's approval record holds`. The request named an
+epic the bridge never approved; report it as a bug. Nothing was filed.
+Not that: `the approval record is inside a git working tree`. The bridge's `state_dir` must
+sit outside every checkout; fix the config, never the check.
+
 **Other jobs on the same team** skip planning tickets. The finding poller skips one by its
 label or its opening tag. The review poller's discovery and the criteria snapshot also need
 the dispatcher's own routing note to confirm it: a coding session can write the label or
@@ -316,7 +347,16 @@ What it does, in order:
      Two more questions come only when a list was not measured. If a list came back but
      could not be read, it asks about that list alone. It asks the same when a list names
      a tool server or a rule, like `mcp__linear__*`, only in a sentence. The sentence may
-     say the session holds those tools or that it does not, so you read it. If no helper
+     say the session holds those tools or that it does not, so you read it.
+
+     A line that may name a tool is never passed over in silence, however many clean lines
+     sit beside it (KIT-734). That covers a note such as `Read (and Bash)`, a sentence such
+     as `I also hold Bash and Write`, and a name wrapped in punctuation, such as `**Bash**`.
+     The probe shows you the line and asks the same question. An exact `mcp__` tool name
+     still stops the probe, wrapped in underscores or not. A line with no capital letter and
+     no `mcp__` in it, such as a code fence or `sorted by name`, names no tool and is
+     ignored. So is a lower-case sentence that uses `read` or `write` as a verb. A lower-case
+     `bash`, `webfetch` or `notebookedit` is not ignored: no English word looks like them. If no helper
      list came back, it says the helper was not measured and asks whether to sign anyway.
      If a helper list came back but the log shows no helper started, that list is **not
      counted**, even as prose. It says so and asks the same question. The record says
@@ -593,6 +633,11 @@ else happened (`created`, `already-filed`, `asked`, `no-proposal`, `no-message`,
   this happens on a live session is not yet seen. If the log shows no helper started, a
   helper list in the answer is not counted, and the record says so. A fenced tool named
   in it still stops the probe (KIT-261).
+- **A helper's list is the session's own words.** The probe asks about every line that may
+  name a tool (KIT-734). It cannot catch a paraphrase that names none, such as "a shell",
+  or a lower-case `read`, `write` or `edit`, which are also ordinary verbs. Only a helper
+  whose tools the runner records closes that. The dispatcher's log records the session's
+  tools, never a helper's.
 - **The duplicate check compares titles, not intent.**
 - **The heartbeat monitor watches the job, once the Stage E installer has run.** It reads
   `~/.stage-a/state/heartbeat.json` as its seventh job (`docs/HEARTBEAT-MONITOR.md`): a stale

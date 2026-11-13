@@ -39,7 +39,8 @@ THE ACTING TOOLS (KIT-490), offered only when the config names an `outbox_dir`.
                       changing (KIT-320), as fields only: the piece, a kind (reorder,
                       add_prerequisite, ask_owner) and, for a reorder, the piece to wait for.
                       It changes NOTHING. The bridge reads it only after a plan note's turn,
-                      and its own code decides what is made and what is asked.
+                      and its own code decides what is made, what is filed (a prerequisite,
+                      through the plan executor, KIT-611) and what is asked.
 THE REACH CHECK.  A dev session's push credential cannot change CI workflows, by design, so
 no session can land a ticket that names `.github/workflows`, branch protection or an
 installer. `plan` and `replan` refuse such a ticket and say why, whatever the tech lead's
@@ -818,8 +819,9 @@ def do_plan_change(cfg, args):
         raise ToolError("only a reorder names a piece in `after`")
     record(cfg, PLAN_CHANGE, ident, kind=kind, after=after)
     return ("Recorded. After this turn the pipeline checks it against the plan your manager "
-            "approved: a reorder inside that plan is made without them, and anything else is "
-            "asked of them. Nothing has changed yet.")
+            "approved: a reorder inside that plan is made without them, a missing prerequisite "
+            "is filed under it for them to hand over, and anything else is asked of them. "
+            "Nothing has changed yet.")
 
 
 def do_ticket(cfg, args):

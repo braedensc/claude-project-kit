@@ -43,6 +43,10 @@ THE THINGS THIS FILE IS SHAPED AROUND
      child's PARENT — to the epic it created in THIS batch, never a
      session-supplied id. A session that could name an already-approved parent
      could have its children auto-approve; it cannot, because it names none.
+     ONE PATH RELAXES THIS, and no session can select it (KIT-611, the owner's yes of
+     12 Nov 2026): the prerequisite mode, which only the Slack bridge runs, files one
+     `provenance:agent` ticket under an epic the bridge's own approval record holds,
+     the parent taken from that record and never from text ("The prerequisite mode").
 
   2. Nothing this executor writes is ever `ready`, and it never MOVES a ticket.
      Every issue is CREATED in the backlog state and left there; the executor
@@ -96,6 +100,8 @@ Usage:
                               --repo-root <planned repo checkout>
                               [--idea TEAM-122] [--key-env NAME] [--model-tag MODEL]
                               [--verdict-file PATH] [--defer-mark] [--dry-run]
+    pipeline_plan_executor.py --prerequisite REQUEST --approvals BRIDGE_STATE
+                              [--key-env NAME] [--verdict-file PATH]   (the bridge's, KIT-611)
     pipeline_plan_executor.py --selftest
 
   WHAT EACH ARGUMENT MUST BE (the config seam, KIT-136):
@@ -138,18 +144,30 @@ Usage:
   It passes --defer-mark on every run, with automatic re-runs on or off, and pages for
   itself, once, under its own planning-failed mark, when a move ends without a plan
   (KIT-375, KIT-338).
+  The Slack bridge alone runs the prerequisite mode (KIT-611), and passes only these:
+    --prerequisite  KIT-611: a pipeline-prerequisite/1 request the Slack bridge wrote: the
+                 epic and the piece by the ids its approval record keys them by, and a plan
+                 note's `needs` and `reason`. It takes only --approvals, --key-env and
+                 --verdict-file beside it; every plan argument is refused.
+    --approvals  the bridge's state file, which holds that record. One a session could have
+                 written (a link, another account's, writable by others, or in a git working
+                 tree) is refused.
 
 Exit: 0 = materialised, a question delivered, or nothing to do; 3 = tree REJECTED
       (read and refused — reported back, nothing created); 2 = usage/config/tracker
       error, including a question that could not be delivered.
 """
 import argparse
+import calendar
+import hashlib
 import http.client
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -167,6 +185,9 @@ import pipeline_routing_tags as _routing  # noqa: E402
 # The review poller's one-line rule, imported rather than copied (KIT-409): what reads as a
 # line break once Linear stores the text.
 import pipeline_review_poller as _review  # noqa: E402
+# The one test for "inside a git working tree", where a session can write (KIT-611 reads the
+# bridge's approval record only from outside one).
+import pipeline_hold as _hold  # noqa: E402
 
 # --------------------------------------------------------------------------- #
 # Constants
@@ -1370,6 +1391,32 @@ class LinearClient:
             "{ success } }",
             {"issueId": issue_id, "body": body})
 
+    def prerequisite_epic(self, epic_id):
+        """KIT-611: the epic a prerequisite is filed under, by its tracker id: its team, project
+        and labels, and each piece with what the cap and the receipt read (when it was made,
+        its state, its labels, its description and the edges it holds). None when there is
+        no such ticket. A read that fails raises: "could not look" is never "none there"."""
+        data = self._gql(
+            "query($id: String!) { issue(id: $id) { id identifier team { id key } "
+            "project { id } labels(first: 50) { nodes { id name } } "
+            "children(first: 100) { pageInfo { hasNextPage } nodes { id identifier createdAt "
+            "description state { type } labels(first: 20) { nodes { name } } "
+            "relations(first: 50) { nodes { type relatedIssue { id } } } } } } }",
+            {"id": epic_id})
+        return data.get("issue")
+
+    def team_backlog(self, team_id):
+        """KIT-611: (id, name) of the team's first backlog state by position, where a
+        prerequisite lands: the state the bridge parks a re-planned idea in (KIT-244). None
+        when the team has none."""
+        data = self._gql(
+            "query($id: String!) { team(id: $id) { states(first: 100) { nodes { id name "
+            "type position } } } }", {"id": team_id})
+        nodes = (((data.get("team") or {}).get("states") or {}).get("nodes")) or []
+        backlog = sorted((s for s in nodes if isinstance(s, dict) and s.get("id")
+                          and s.get("type") == "backlog"), key=lambda s: s.get("position") or 0)
+        return (backlog[0]["id"], backlog[0].get("name") or "Backlog") if backlog else None
+
 
 # --------------------------------------------------------------------------- #
 # Driver
@@ -2066,9 +2113,11 @@ def verdict_reasons(lines):
 EPIC_ID_RE = re.compile(r"^[A-Z][A-Z0-9]{0,15}-[0-9]{1,9}\Z")
 
 
-def _end(code, cls, kind, reasons=(), filed=False, questions=0, epic=None):
+def _end(code, cls, kind, reasons=(), filed=False, questions=0, epic=None, prerequisite=None):
     """Record what the run came to, and return its exit code unchanged. `epic`: the
-    identifier of the epic the plan became, when one was filed or found (KIT-532)."""
+    identifier of the epic the plan became, when one was filed or found (KIT-532).
+    `prerequisite`: the prerequisite mode's ticket, when one was filed or found (KIT-611); a
+    plan's verdict carries no such key."""
     if cls not in VERDICT_CLASSES:
         raise ValueError("an exit named the class %r, which no reader knows" % cls)
     RUN["verdict"] = {"schema": VERDICT_SCHEMA, "class": cls, "kind": kind,
@@ -2076,6 +2125,9 @@ def _end(code, cls, kind, reasons=(), filed=False, questions=0, epic=None):
                       "reasons": verdict_reasons(reasons), "exit": code,
                       "epic": epic if isinstance(epic, str) and EPIC_ID_RE.match(epic)
                       else None}
+    if prerequisite is not None:
+        RUN["verdict"]["prerequisite"] = (prerequisite if isinstance(prerequisite, str)
+                                          and EPIC_ID_RE.match(prerequisite) else None)
     return code
 
 
@@ -2150,6 +2202,342 @@ def _live_client(args=None):
     about where the key lives without one of them saying so."""
     key = os.environ.get(_key_env(args))
     return LinearClient(key) if key else None
+
+
+# --------------------------------------------------------------------------- #
+# The prerequisite mode (KIT-611)
+# --------------------------------------------------------------------------- #
+# RULE 1, RELAXED FOR ONE PATH THE BRIDGE GATES (KIT-611; the owner's yes, 12 Nov 2026). A
+# started piece of an approved plan can say that work no piece covers is missing (KIT-320's
+# plan note). The tech lead judges the note, and the Slack bridge's own code decides. When the
+# bridge decides to file, it runs this mode over a request it wrote: the epic and the piece, by
+# the ids its approval record keys them by, and the note's two fields. The parent is never
+# taken from text. It must be an epic in that record, the piece one of its approved pieces
+# there, and the tracker must still list the piece under it, on the team it was approved on.
+#
+# The one ticket filed carries `provenance:agent`, which no tier ever approves (§5), lands in
+# the team's backlog, and blocks the piece. Rules 2 to 5 hold as written: nothing is moved;
+# nothing is made until the whole request is checked, and what a failure leaves is said; a
+# refusal (3) is never a failure (2); and the record is a file only the bridge's own account
+# could have written, outside every git working tree. The readiness gate judges what an
+# approval may release; a `provenance:agent` ticket is never released by one, so, like the
+# epic, it is a draft a person makes ready, and the gate does not run on it.
+PREREQUISITE_SCHEMA = "pipeline-prerequisite/1"
+PREREQUISITE_KEYS = frozenset(("epic", "needs", "piece", "reason", "schema"))
+PREREQUISITE_NEEDS_MAX = 200          # the plan note's own limits (KIT-320)
+PREREQUISITE_REASON_MAX = 300
+PREREQUISITE_REQUEST_MAX_BYTES = 64 * 1024
+# A runaway cap, never a normal-use limit (the owner, 12 Nov 2026): the prerequisites filed
+# under one epic in a day. The next is refused, and the bridge asks the owner instead.
+MAX_PREREQUISITES_PER_DAY = 15
+PREREQUISITE_DAY_SECONDS = 86400
+PREREQUISITE_RECEIPT_PREFIX = "Prerequisite id: "
+# The Slack bridge's state file holds its approval record (pipeline_bridge_config's
+# STATE_SCHEMA; the bridge's selftest pins that the two agree). Its `epics` maps each approved
+# epic's id to its ticket, its team, and its approved pieces by id.
+APPROVAL_RECORD_SCHEMA = "pipeline-bridge-state/1"
+APPROVAL_RECORD_MAX_BYTES = 32 * 1024 * 1024
+# The ids the record keys epics and pieces by: the tracker's own, in lower case. An identifier
+# such as PROD-50, which is what a note's text names, is never one.
+_RECORD_ID_RE = re.compile(r"^[0-9a-z][0-9a-z-]{0,63}\Z")
+GATE_AGENT_LABEL = "provenance:agent"
+_CREATED_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.\d+)?Z\Z")
+
+
+def read_prerequisite_request(path):
+    """(request, None), or (None, (kind, why)): the request the bridge wrote, read whole. Its
+    exact keys: the schema, the epic and the piece by their record ids, and the note's `needs`
+    and `reason` within the note's own limits. Anything more (a parent, a team, a label) is
+    refused, so a request can name nothing the executor forces. A file that cannot be read is
+    `unreadable`, a failure; one that reads and is wrong is `request`, a refusal."""
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read(PREREQUISITE_REQUEST_MAX_BYTES + 1)
+    except OSError as exc:
+        return None, ("unreadable", "the request could not be read (%s)"
+                      % (exc.strerror or type(exc).__name__))
+    if len(raw) > PREREQUISITE_REQUEST_MAX_BYTES:
+        return None, ("request", "the request is larger than a request")
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+    except (ValueError, RecursionError):
+        return None, ("request", "the request is not readable JSON")
+    if not isinstance(doc, dict) or doc.get("schema") != PREREQUISITE_SCHEMA:
+        return None, ("request", "the request is not a %s document" % PREREQUISITE_SCHEMA)
+    extra = sorted(str(k) for k in doc if k not in PREREQUISITE_KEYS)
+    if extra:
+        return None, ("request", "the request carries more than its own keys: %s"
+                      % ", ".join(repr(k)[:40] for k in extra[:5]))
+    for key in ("epic", "piece"):
+        if not isinstance(doc.get(key), str) or not _RECORD_ID_RE.match(doc[key]):
+            return None, ("request", "the request's %s is not an id from the bridge's approval "
+                                     "record (an identifier a note names never is)" % key)
+    needs, reason = doc.get("needs", ""), doc.get("reason")
+    if not isinstance(needs, str) or len(needs) > PREREQUISITE_NEEDS_MAX:
+        return None, ("request", "the request's needs is not text of at most %d characters"
+                      % PREREQUISITE_NEEDS_MAX)
+    if not isinstance(reason, str) or not reason.strip() \
+            or len(reason) > PREREQUISITE_REASON_MAX:
+        return None, ("request", "the request's reason is not text of 1 to %d characters"
+                      % PREREQUISITE_REASON_MAX)
+    return {"epic": doc["epic"], "piece": doc["piece"], "needs": needs.strip(),
+            "reason": reason.strip()}, None
+
+
+def read_approval_record(path):
+    """({epic id: {"ticket", "team", "approved"}}, None), or (None, why): the Slack bridge's own
+    record of the plans it was told to follow, read from its state file (rule 5). A file a
+    session could have written is no record: a link or anything but a plain file, a file this
+    account does not own, one others may write or that sits in a folder others may write, and
+    one inside a git working tree. Nor is a file that is not the bridge's state."""
+    # One descriptor, opened without following a link (and without waiting on a pipe), is
+    # judged and read: a file swapped between a check and a read cannot pass (Stage E on #552).
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
+    except OSError as exc:
+        if os.path.islink(path):
+            return None, "the approval record is a link, or not a plain file"
+        return None, "the approval record could not be read (%s)" % (exc.strerror
+                                                                     or type(exc).__name__)
+    with os.fdopen(fd, "rb") as fh:
+        st = os.fstat(fh.fileno())
+        if not stat.S_ISREG(st.st_mode):
+            return None, "the approval record is a link, or not a plain file"
+        if st.st_uid != os.getuid():
+            return None, "the approval record belongs to another account"
+        if st.st_mode & 0o022:
+            return None, "others may write the approval record"
+        folder = os.path.dirname(os.path.abspath(path))
+        try:
+            fst = os.stat(folder)
+        except OSError as exc:
+            return None, "the approval record's folder could not be read (%s)" % (
+                exc.strerror or type(exc).__name__)
+        if fst.st_mode & 0o022 and not fst.st_mode & stat.S_ISVTX:
+            return None, "others may write the approval record's folder"
+        if _hold.inside_git_worktree(folder):
+            return None, ("the approval record is inside a git working tree, where a session "
+                          "can write")
+        if st.st_size > APPROVAL_RECORD_MAX_BYTES:
+            return None, "the approval record is larger than the bridge's state"
+        try:
+            doc = json.loads(fh.read(APPROVAL_RECORD_MAX_BYTES + 1).decode("utf-8"))
+        except (OSError, ValueError, RecursionError) as exc:
+            return None, "the approval record is not readable JSON (%s)" % type(exc).__name__
+    if not isinstance(doc, dict) or doc.get("schema") != APPROVAL_RECORD_SCHEMA \
+            or not isinstance(doc.get("epics"), dict):
+        return None, ("the approval record is not the bridge's state (%s) with its approved "
+                      "plans" % APPROVAL_RECORD_SCHEMA)
+    record = {}
+    for eid, rec in doc["epics"].items():
+        if isinstance(rec, dict) and isinstance(rec.get("ticket"), str) \
+                and isinstance(rec.get("team"), str) and isinstance(rec.get("approved"), dict):
+            record[eid] = {"ticket": rec["ticket"], "team": rec["team"],
+                           "approved": frozenset(k for k in rec["approved"]
+                                                 if isinstance(k, str))}
+    return record, None
+
+
+def prerequisite_receipt(request):
+    """The line a prerequisite carries, so a second run over the same request files nothing:
+    the piece's id and a digest of the note's words."""
+    digest = hashlib.sha256(json.dumps([request["piece"], request["needs"], request["reason"]],
+                                       ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
+    return "%s%s/%s" % (PREREQUISITE_RECEIPT_PREFIX, request["piece"], digest)
+
+
+def _as_data(text):
+    """A session's words as data in a filed ticket: every routing directive and page mark made
+    inert, and each line quoted."""
+    clean = _sanitize(neutralize_routing(text or ""))
+    return "\n".join("> " + line for line in (clean.splitlines() or [""]))
+
+
+def prerequisite_title(piece_ident, needs):
+    """`Prerequisite for <piece>: <what the note says it needs>`, on one line."""
+    words = " ".join(_sanitize(neutralize_routing(needs or "")).split())
+    title = ("Prerequisite for %s: %s" % (piece_ident, words) if words
+             else "Prerequisite for %s" % piece_ident)
+    return title[:MAX_TITLE]
+
+
+PREREQUISITE_HEAD = (
+    "> **Prerequisite for %(piece)s, under the approved plan %(epic)s.** %(piece)s's note said "
+    "it needs work no piece of the plan covers. The tech lead judged the note, and the Slack "
+    "bridge filed this through the plan executor. It carries `provenance:agent`, so no "
+    "approval releases it: it starts only when a person hands it to the agent, and %(piece)s "
+    "is marked as blocked by it. To undo it, cancel this ticket.\n>\n> %(receipt)s")
+
+
+def prerequisite_description(epic_ident, piece_ident, request, receipt):
+    """What the prerequisite says: its place and what it does, every word of it from fields,
+    then the note's two fields quoted as data."""
+    return (PREREQUISITE_HEAD % {"piece": piece_ident, "epic": epic_ident, "receipt": receipt}
+            + "\n\n## What the note says it needs\n\n"
+            + _as_data(request["needs"] or "(the note named nothing more; its reason follows)")
+            + "\n\n## Why, in the note's words\n\n" + _as_data(request["reason"]) + "\n")
+
+
+def _created_epoch(text):
+    m = _CREATED_RE.match(text) if isinstance(text, str) else None
+    if not m:
+        return None
+    try:
+        return calendar.timegm(time.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S"))
+    except ValueError:
+        return None
+
+
+def _label_names(node):
+    return set((x or {}).get("name") for x in (((node or {}).get("labels") or {}).get("nodes")
+                                               or []) if isinstance(x, dict))
+
+
+def prerequisites_filed_today(children, now):
+    """How many of the epic's pieces carry `provenance:agent` and were made in the last day: the
+    prerequisites filed under it, since the plan's own pieces carry `provenance:epic`. A piece
+    whose time cannot be read counts, so the cap is never undercounted; a person who adds the
+    label to a piece only lowers what is left."""
+    count = 0
+    for k in children:
+        if GATE_AGENT_LABEL not in _label_names(k):
+            continue
+        made = _created_epoch(k.get("createdAt"))
+        if made is None or now - made < PREREQUISITE_DAY_SECONDS:
+            count += 1
+    return count
+
+
+def file_prerequisite(args, client=None, now=None):
+    """The prerequisite mode (KIT-611): one ticket under an approved epic, for the Slack bridge.
+    Everything is checked before the one create, in order: the request, the approval record,
+    the epic and the piece in it, the tracker's own view of both, the receipt, the cap, and the
+    team's backlog state. Returns an exit code; RUN["verdict"] says what the run came to."""
+    RUN.pop("verdict", None)
+    RUN.pop("created", None)
+    RUN.pop("filed_earlier", None)
+    now = time.time() if now is None else now
+
+    def refused(kind, why):
+        print("::error:: %s. Nothing was filed." % why, file=sys.stderr)
+        return _end(EXIT_REJECTED, "refused", kind, [why])
+
+    def failed(kind, why, made=None):
+        print("::error:: %s" % why, file=sys.stderr)
+        return _end(EXIT_ERRORED, "errored", kind,
+                    [why] + (["created: %s" % made] if made else []), filed=bool(made),
+                    prerequisite=made)
+
+    request, bad = read_prerequisite_request(args.prerequisite)
+    if request is None:
+        return failed("config", bad[1]) if bad[0] == "unreadable" else refused("request", bad[1])
+    if credential_shaped(request["needs"]) or credential_shaped(request["reason"]):
+        return refused("credential-shape", "the note carried text shaped like a credential, "
+                                            "so nothing is filed and it is not quoted here")
+    record, why = read_approval_record(args.approvals)
+    if record is None:
+        return failed("config", why)
+    approved = record.get(request["epic"])
+    if approved is None:
+        return refused("not-approved", "the epic is not a plan the bridge's approval record "
+                                       "holds; a parent comes from that record alone")
+    if request["piece"] not in approved["approved"]:
+        return refused("not-approved", "the piece is not an approved piece of %s in the "
+                                       "bridge's approval record" % approved["ticket"])
+    client = client or _live_client(args)
+    if client is None:
+        return failed("config", "the tracker key's variable %s is unset" % _key_env(args))
+    try:
+        epic = client.prerequisite_epic(request["epic"])
+    except ExecutorError as exc:
+        return failed("tracker", "the epic could not be read: %s" % exc)
+    if not isinstance(epic, dict) or epic.get("id") != request["epic"]:
+        return refused("epic-gone", "the tracker holds no epic %s" % approved["ticket"])
+    team = epic.get("team") or {}
+    if team.get("key") != approved["team"] or not team.get("id"):
+        return refused("team", "%s is on the team %s now, not %s, where it was approved"
+                       % (approved["ticket"], team.get("key") or "(none)", approved["team"]))
+    if epic.get("identifier") != approved["ticket"]:
+        return refused("not-approved", "the tracker's ticket under that id is %s, not %s"
+                       % (epic.get("identifier") or "(none)", approved["ticket"]))
+    prov = [x.get("id") for x in (((epic.get("labels") or {}).get("nodes")) or [])
+            if isinstance(x, dict) and x.get("name") == GATE_AGENT_LABEL and x.get("id")]
+    if not prov:
+        return refused("not-the-gates", "%s does not carry `%s`, so the idea gate did not "
+                                        "file it" % (approved["ticket"], GATE_AGENT_LABEL))
+    kids = epic.get("children") or {}
+    if (kids.get("pageInfo") or {}).get("hasNextPage"):
+        return failed("tracker", "%s has more pieces than one read takes, so the cap cannot "
+                                 "be counted" % approved["ticket"])
+    kids = [k for k in (kids.get("nodes") or []) if isinstance(k, dict)]
+    piece = next((k for k in kids if k.get("id") == request["piece"]), None)
+    if piece is None:
+        return refused("not-a-piece", "the tracker does not list the piece under %s"
+                       % approved["ticket"])
+    receipt = prerequisite_receipt(request)
+    earlier = next((k for k in kids if receipt in (k.get("description") or "")), None)
+    if earlier is not None:
+        # Filed before, by a run that may have stopped short of its edge: made now, once. One a
+        # person cancelled or took the label off was undone, and is never linked again; a
+        # finished one needs no edge (Stage E on #552).
+        RUN["filed_earlier"] = True
+        now_is = (earlier.get("state") or {}).get("type")
+        if now_is == "canceled" or GATE_AGENT_LABEL not in _label_names(earlier):
+            return refused("undone", "%s, filed earlier for this note, was cancelled or lost "
+                                     "`%s`: a person undid it, so nothing is filed again and "
+                                     "no edge is made" % (earlier.get("identifier"),
+                                                          GATE_AGENT_LABEL))
+        held = now_is == "completed" or any(r.get("type") == "blocks"
+                   and (r.get("relatedIssue") or {}).get("id") == piece["id"]
+                   for r in (((earlier.get("relations") or {}).get("nodes")) or [])
+                   if isinstance(r, dict))
+        try:
+            if not held:
+                client.create_relation(earlier["id"], piece["id"])
+        except ExecutorError as exc:
+            return failed("tracker", "%s was filed earlier, but its edge to %s could not be "
+                                     "made: %s" % (earlier.get("identifier"),
+                                                   piece.get("identifier"), exc),
+                          made=earlier.get("identifier"))
+        print("::notice:: %s was filed earlier for this request; nothing was filed again."
+              % earlier.get("identifier"))
+        return _end(EXIT_OK, "filed", "already-filed",
+                    ["filed earlier as %s" % earlier.get("identifier")], filed=True,
+                    prerequisite=earlier.get("identifier"))
+    today = prerequisites_filed_today(kids, now)
+    if today >= MAX_PREREQUISITES_PER_DAY:
+        return refused("cap", "%d prerequisites were filed under %s in the last day, the most "
+                              "filed without the owner" % (today, approved["ticket"]))
+    try:
+        landing = client.team_backlog(team["id"])
+    except ExecutorError as exc:
+        return failed("tracker", "the team's states could not be read: %s" % exc)
+    if not landing:
+        return failed("config", "the team %s has no backlog state" % team.get("key"))
+    try:
+        made = _made(client.create_issue(
+            team["id"], prerequisite_title(piece.get("identifier"), request["needs"]),
+            prerequisite_description(approved["ticket"], piece.get("identifier"), request,
+                                     receipt),
+            landing[0], [prov[0]], parent_id=epic["id"],
+            project_id=(epic.get("project") or {}).get("id") or None), "prerequisite")
+    except ExecutorError as exc:
+        # The answer never confirmed it, so it may have landed: `unconfirmed`, as a plan's is.
+        return failed("unconfirmed", "the prerequisite's create was never confirmed, so it may "
+                                     "or may not be filed: %s" % exc)
+    RUN["created"] = [made["identifier"]]
+    try:
+        client.create_relation(made["id"], piece["id"])
+    except ExecutorError as exc:
+        return failed("partial", "%s was filed, but its edge to %s could not be made: %s"
+                      % (made["identifier"], piece.get("identifier"), exc),
+                      made=made["identifier"])
+    print("::notice:: filed %s under %s, in the backlog with provenance:agent, blocking %s."
+          % (made["identifier"], approved["ticket"], piece.get("identifier")))
+    return _end(EXIT_OK, "filed", "created",
+                ["filed %s under %s, blocking %s" % (made["identifier"], approved["ticket"],
+                                                    piece.get("identifier"))],
+                filed=True, prerequisite=made["identifier"])
 
 
 # --------------------------------------------------------------------------- #
@@ -2245,6 +2633,36 @@ class FakeLinear:
         if getattr(self, "bodies_raise", None):
             raise self.bodies_raise
         return [b for i, b in self.comments if i == issue_id]
+
+    # KIT-611: the prerequisite mode's two reads. A ticket this fake created under the epic is
+    # one of its children on the next read, with the edges it holds, as the tracker answers.
+    def prerequisite_epic(self, epic_id):
+        self.epic_reads = getattr(self, "epic_reads", []) + [epic_id]
+        if getattr(self, "fail_epic", False):
+            raise ExecutorError("simulated tracker failure on the epic read")
+        node = json.loads(json.dumps((getattr(self, "prereq_epics", {}) or {}).get(epic_id)))
+        if not node:
+            return node
+        names = dict((x["id"], x["name"]) for x in node["labels"]["nodes"])
+        for i in self.issues:
+            if i["parent_id"] == epic_id:
+                kid_labels = (getattr(self, "kid_labels", {}) or {}).get(i["id"])
+                node["children"]["nodes"].append({
+                    "id": i["id"], "identifier": i["identifier"],
+                    "createdAt": getattr(self, "created_at", None),
+                    "description": i["description"],
+                    "state": {"type": (getattr(self, "kid_states", {}) or {}).get(
+                        i["id"], "backlog")},
+                    "labels": {"nodes": [{"name": x} for x in kid_labels] if kid_labels
+                               is not None else [{"name": names.get(x, x)}
+                                                 for x in i["label_ids"]]},
+                    "relations": {"nodes": [{"type": "blocks", "relatedIssue": {"id": b}}
+                                            for a, b in self.relations if a == i["id"]]}})
+        return node
+
+    def team_backlog(self, team_id):
+        self.backlog_reads = getattr(self, "backlog_reads", []) + [team_id]
+        return getattr(self, "backlog", ("state-backlog", "Backlog"))
 
 
 _GOOD_CHILD_BODY = """## Context
@@ -4447,6 +4865,348 @@ def selftest():
         check("a-line-with-no-credential-is-kept (KIT-387)",
               withheld("child 0 has no Test plan"), "child 0 has no Test plan")
 
+    # ── KIT-611: THE PREREQUISITE MODE ─────────────────────────────────────────────────────
+    import inspect
+    # Rule 1 relaxed for one path the bridge gates: one ticket under an approved epic, the epic
+    # and the piece taken from the bridge's own approval record. Rules 2 to 5 pinned on it.
+    import time as _time
+    with tempfile.TemporaryDirectory() as tmp611:
+        day, clock = 86400, 1794000000.0
+
+        def at(t):
+            return _time.strftime("%Y-%m-%dT%H:%M:%S.000Z", _time.gmtime(t))
+
+        def approvals(epics=None, schema=APPROVAL_RECORD_SCHEMA, where=tmp611, mode=0o600):
+            os.makedirs(where, exist_ok=True)
+            path = os.path.join(where, "bridge-state.json")
+            if os.path.lexists(path):
+                os.unlink(path)
+            with open(path, "w") as fh:
+                json.dump({"schema": schema, "handled": {}, "threads": {}, "questions": {},
+                           "asked_at": [], "epics": {
+                               "uuid-50": {"ticket": "PROD-50", "team": "PROD",
+                                           "approved": {"uuid-51": "fp1", "uuid-52": "fp2"}},
+                               "uuid-40": {"ticket": "PROD-40", "team": "PROD",
+                                           "approved": {"uuid-41": "fp3"}}}
+                           if epics is None else epics}, fh)
+            os.chmod(path, mode)
+            return path
+
+        def request(**over):
+            path = os.path.join(tmp611, "request.json")
+            with open(path, "w") as fh:
+                json.dump(dict({"schema": PREREQUISITE_SCHEMA, "epic": "uuid-50",
+                                "piece": "uuid-51", "needs": "A login page for the reports",
+                                "reason": "PROD-51 shows reports to signed-in users only."},
+                               **over), fh)
+            return path
+
+        def kid(n, created, labels=("provenance:epic",), description="A piece."):
+            return {"id": "uuid-%d" % n, "identifier": "PROD-%d" % n, "createdAt": created,
+                    "description": description,
+                    "labels": {"nodes": [{"name": x} for x in labels]},
+                    "relations": {"nodes": []}}
+
+        def epic611(extra=(), **over):
+            node = {"id": "uuid-50", "identifier": "PROD-50",
+                    "team": {"id": "team-prod", "key": "PROD"}, "project": {"id": "proj-50"},
+                    "labels": {"nodes": [{"id": "lbl-prov-agent", "name": "provenance:agent"}]},
+                    "children": {"pageInfo": {"hasNextPage": False},
+                                 "nodes": [kid(51, at(clock - 5 * day)),
+                                           kid(52, at(clock - 5 * day))] + list(extra)}}
+            node.update(over)
+            return node
+
+        def world611(**over):
+            fake = FakeLinear()
+            fake.prereq_epics = {"uuid-50": epic611(**over)}
+            fake.created_at = at(clock)
+            return fake
+
+        def file611(fake=None, req=None, record=None, now=clock):
+            args = argparse.Namespace(prerequisite=req or request(),
+                                      approvals=record or approvals(),
+                                      key_env="KIT611_SELFTEST_UNSET")
+            return file_prerequisite(args, client=fake, now=now)
+
+        def said611():
+            v = RUN.get("verdict") or {}
+            return (v.get("exit"), v.get("class"), v.get("kind"), v.get("filed"))
+
+        def untouched(fake):
+            return (fake.issues, fake.relations, fake.comments)
+
+        # 1. Filed: one ticket, exactly the forced fields, one blocks edge to the piece.
+        fake = world611()
+        code = file611(fake)
+        made = fake.issues[0] if fake.issues else {}
+        check("prerequisite: filed under the approved epic, exit 0 (KIT-611)",
+              (code, said611()), (EXIT_OK, (EXIT_OK, "filed", "created", True)))
+        check("prerequisite: exactly one ticket and one blocks edge, from it to the piece",
+              (len(fake.issues), fake.relations), (1, [(made.get("id"), "uuid-51")]))
+        check("prerequisite: its parent is the epic from the approval record, in the epic's "
+              "team and project", (made.get("parent_id"), made.get("team_id"),
+                                   made.get("project_id")), ("uuid-50", "team-prod", "proj-50"))
+        check("prerequisite rule 2: it lands in the team's backlog with provenance:agent, and "
+              "nothing else is set: no other label, no subscriber, no assignee",
+              (made.get("state_id"), made.get("label_ids"), made.get("subscriber_ids"),
+               made.get("assignee_id")), ("state-backlog", ["lbl-prov-agent"], [], None))
+        check("prerequisite: the verdict names the ticket it filed, and no comment is posted "
+              "(the bridge says it)", (RUN["verdict"].get("prerequisite"), fake.comments),
+              (made.get("identifier"), []))
+        check("prerequisite: the title names the piece and what it needs; the description "
+              "quotes the note as data and carries the receipt",
+              (made.get("title"),
+               (made.get("description") or "").startswith("> **Prerequisite for PROD-51"),
+               "\n> A login page for the reports\n" in (made.get("description") or ""),
+               "\n> PROD-51 shows reports to signed-in users only." in (made.get("description")
+                                                                       or ""),
+               PREREQUISITE_RECEIPT_PREFIX + "uuid-51/" in (made.get("description") or "")),
+              ("Prerequisite for PROD-51: A login page for the reports", True, True, True,
+               True))
+
+        # 2. AN EPIC ID TAKEN FROM A SESSION'S TEXT IS REFUSED. The parent comes from the
+        #    bridge's approval record alone: an identifier a note names, an epic the record
+        #    does not hold, or another approved epic whose pieces do not include this one.
+        for name, over, kind in (
+                ("an identifier from a note's text", dict(epic="PROD-40"), "request"),
+                ("an epic not in the approval record", dict(epic="uuid-99"), "not-approved"),
+                ("another approved epic, not the piece's own", dict(epic="uuid-40"),
+                 "not-approved"),
+                ("a piece the record does not hold under the epic", dict(piece="uuid-53"),
+                 "not-approved")):
+            fake = world611()
+            code = file611(fake, req=request(**over))
+            check("prerequisite: an epic id taken from a session's text is refused: %s; "
+                  "nothing is filed and the tracker is not asked (KIT-611)" % name,
+                  (code, said611(), untouched(fake), getattr(fake, "epic_reads", [])),
+                  (EXIT_REJECTED, (EXIT_REJECTED, "refused", kind, False), ([], [], []), []))
+        fake = world611()
+        fake.prereq_epics["uuid-50"]["children"]["nodes"] = [kid(52, at(clock - day))]
+        code = file611(fake)
+        check("prerequisite: an approved piece the tracker no longer lists under the epic is "
+              "refused, and nothing is filed",
+              (code, said611()[2], untouched(fake)), (EXIT_REJECTED, "not-a-piece",
+                                                      ([], [], [])))
+        for name, over, kind in (
+                ("moved to another team", dict(team={"id": "team-web", "key": "WEB"}), "team"),
+                ("lost provenance:agent", dict(labels={"nodes": [{"id": "lbl-track",
+                                                                 "name": "track:meta"}]}),
+                 "not-the-gates"),
+                ("another ticket under the id", dict(identifier="PROD-77"), "not-approved")):
+            fake = world611(**over)
+            code = file611(fake)
+            check("prerequisite: an epic that has %s is refused, and nothing is filed" % name,
+                  (code, said611()[2], untouched(fake)), (EXIT_REJECTED, kind, ([], [], [])))
+        fake = world611()
+        fake.prereq_epics = {}
+        code = file611(fake)
+        check("prerequisite: an epic the tracker does not hold is refused",
+              (code, said611()[2], untouched(fake)), (EXIT_REJECTED, "epic-gone", ([], [], [])))
+
+        # 3. THE RUNAWAY CAP: 15 per epic per day (the owner, 12 Nov 2026). The epic's
+        #    provenance:agent pieces made in the last day count; the plan's own do not.
+        check("prerequisite cap: 15 per epic per day", MAX_PREREQUISITES_PER_DAY, 15)
+
+        def filed_before(n, when, labels=("provenance:agent",)):
+            return [kid(600 + i, when, labels) for i in range(n)]
+        fake = world611(extra=filed_before(14, at(clock - 3600)))
+        check("prerequisite cap: with 14 filed in the last day, the 15th is filed",
+              (file611(fake), len(fake.issues)), (EXIT_OK, 1))
+        fake = world611(extra=filed_before(15, at(clock - 3600)))
+        code = file611(fake)
+        check("prerequisite cap: with 15 filed in the last day, the 16th is refused, and "
+              "nothing is filed (KIT-611)", (code, said611(), untouched(fake)),
+              (EXIT_REJECTED, (EXIT_REJECTED, "refused", "cap", False), ([], [], [])))
+        fake = world611(extra=filed_before(15, at(clock - day - 60)))
+        check("prerequisite cap: one filed more than a day ago does not count",
+              (file611(fake), len(fake.issues)), (EXIT_OK, 1))
+        fake = world611(extra=filed_before(15, None))
+        check("prerequisite cap: one whose time cannot be read counts",
+              (file611(fake), said611()[2]), (EXIT_REJECTED, "cap"))
+        fake = world611(extra=filed_before(18, at(clock - 60), ("provenance:epic",)))
+        check("prerequisite cap: the plan's own pieces do not count",
+              (file611(fake), len(fake.issues)), (EXIT_OK, 1))
+        fake = world611()
+        fake.prereq_epics["uuid-50"]["children"]["pageInfo"]["hasNextPage"] = True
+        code = file611(fake)
+        check("prerequisite cap: an epic whose pieces cannot all be read is a failure, never "
+              "a count of what was read", (code, said611()[1:3], untouched(fake)),
+              (EXIT_ERRORED, ("errored", "tracker"), ([], [], [])))
+
+        # 4. RULE 3: nothing is made until the whole request is checked; a failure after the
+        #    create is a partial filing, said, and a retry makes only what is missing.
+        fake = world611()
+        fake.fail_relation = True
+        code = file611(fake)
+        named = fake.issues[0]["identifier"] if fake.issues else None
+        check("prerequisite rule 3: an edge that fails after the create is a partial filing, "
+              "named in the verdict", (code, said611(), RUN["verdict"].get("prerequisite"),
+                                       ("created: %s" % named) in RUN["verdict"]["reasons"]),
+              (EXIT_ERRORED, (EXIT_ERRORED, "errored", "partial", True), named, True))
+        fake.fail_relation = False
+        code = file611(fake)
+        check("prerequisite rule 3: a retry finds the receipt and makes only the missing edge",
+              (code, said611()[2], len(fake.issues), fake.relations,
+               RUN["verdict"].get("prerequisite")),
+              (EXIT_OK, "already-filed", 1, [(fake.issues[0]["id"], "uuid-51")], named))
+        code = file611(fake)
+        check("prerequisite rule 3: a third run files nothing and makes no edge twice",
+              (code, said611()[2], len(fake.issues), len(fake.relations)),
+              (EXIT_OK, "already-filed", 1, 1))
+        # Stage E on #552: an earlier filing a person undid is never touched again.
+        for name, undo, want in (
+                ("cancelled", dict(kid_states="canceled"), (EXIT_REJECTED, "undone")),
+                ("stripped of provenance:agent", dict(kid_labels=["track:meta"]),
+                 (EXIT_REJECTED, "undone")),
+                ("completed", dict(kid_states="completed"), (EXIT_OK, "already-filed"))):
+            fake = world611()
+            file611(fake)
+            made_id = fake.issues[0]["id"] if fake.issues else None
+            fake.relations = []                       # the person removed the edge too
+            for attr, value in undo.items():
+                setattr(fake, attr, {made_id: value})
+            code = file611(fake)
+            check("prerequisite rule 3: a retry over an earlier filing a person %s makes no "
+                  "edge and files nothing" % name,
+                  ((code, said611()[2]), len(fake.issues), fake.relations), (want, 1, []))
+        fake = world611()
+        fake.fail_on_create = 1
+        code = file611(fake)
+        check("prerequisite rule 3: a create the tracker never confirms is a failure named "
+              "unconfirmed, since it may have landed, and nothing more is made",
+              (code, said611()[1:], fake.relations),
+              (EXIT_ERRORED, ("errored", "unconfirmed", False), []))
+
+        # 5. RULE 4: a refusal (3) is never a failure (2), and neither is ever 0.
+        fake = world611()
+        fake.fail_epic = True
+        check("prerequisite rule 4: a read that fails is a failure, never a refusal",
+              (file611(fake), said611()[1:3], untouched(fake)),
+              (EXIT_ERRORED, ("errored", "tracker"), ([], [], [])))
+        fake = world611()
+        fake.backlog = None
+        check("prerequisite rule 4: a team with no backlog state is a failure of config",
+              (file611(fake), said611()[1:3], untouched(fake)),
+              (EXIT_ERRORED, ("errored", "config"), ([], [], [])))
+        os.environ.pop("KIT611_SELFTEST_UNSET", None)
+        check("prerequisite rule 4: no tracker key is a failure of config, after the request "
+              "and the record are checked", (file611(None), said611()[1:3]),
+              (EXIT_ERRORED, ("errored", "config")))
+        check("prerequisite rule 4: …and a request refused needs no key at all",
+              (file611(None, req=request(epic="uuid-99")), said611()[1:3]),
+              (EXIT_REJECTED, ("refused", "not-approved")))
+
+        # 6. RULE 5: an approval record a session could have written is no record.
+        open_dir = os.path.join(tmp611, "a-folder-anyone-writes")
+        repo = os.path.join(tmp611, "a-worktree")
+        os.makedirs(os.path.join(repo, ".git"), exist_ok=True)
+        link = os.path.join(tmp611, "linked-state.json")
+        os.symlink(approvals(), link)
+        for name, record in (
+                ("inside a git working tree", lambda: approvals(where=repo)),
+                ("a link", lambda: link),
+                ("one others may write", lambda: approvals(mode=0o666)),
+                ("not the bridge's state", lambda: approvals(schema="pipeline-bridge-state/0")),
+                ("in a folder others may write", lambda: (os.makedirs(open_dir, exist_ok=True),
+                                                          os.chmod(open_dir, 0o777),
+                                                          approvals(where=open_dir))[2]),
+                ("absent", lambda: os.path.join(tmp611, "no-such-state.json"))):
+            fake = world611()
+            code = file611(fake, record=record())
+            check("prerequisite rule 5: an approval record %s is refused as config, and "
+                  "nothing is read or filed" % name,
+                  (code, said611()[1:3], untouched(fake), getattr(fake, "epic_reads", [])),
+                  (EXIT_ERRORED, ("errored", "config"), ([], [], []), []))
+        os.unlink(link)
+        record_src = inspect.getsource(read_approval_record)
+        check("prerequisite rule 5: the record is judged on the very descriptor that is read: "
+              "opened once, not following a link, and no second open by name (Stage E on #552)",
+              ("O_NOFOLLOW" in record_src, "os.fstat(" in record_src,
+               "os.lstat(" in record_src, re.findall(r"(?<![\w.])open\(", record_src)),
+              (True, True, False, []))
+        real_uid, fake = os.getuid, world611()
+        os.getuid = lambda: real_uid() + 1
+        try:
+            code = file611(fake)
+        finally:
+            os.getuid = real_uid
+        check("prerequisite rule 5: an approval record another account owns is refused as "
+              "config", (code, said611()[1:3], untouched(fake)),
+              (EXIT_ERRORED, ("errored", "config"), ([], [], [])))
+
+        # 7. The request is the bridge's, whole: its exact keys, and the note's words as data.
+        for name, over in (("a parent", dict(parent="uuid-40")), ("a team", dict(team="WEB")),
+                           ("a label", dict(labels=["track:meta"]))):
+            fake = world611()
+            check("prerequisite: a request carrying %s is refused" % name,
+                  (file611(fake, req=request(**over)), said611()[2], untouched(fake)),
+                  (EXIT_REJECTED, "request", ([], [], [])))
+        for name, over in (("needs over 200", dict(needs="x" * 201)),
+                           ("an empty reason", dict(reason=" ")),
+                           ("reason over 300", dict(reason="x" * 301)),
+                           ("another schema", dict(schema="pipeline-prerequisite/2"))):
+            fake = world611()
+            check("prerequisite: a request with %s is refused" % name,
+                  (file611(fake, req=request(**over)), said611()[2], untouched(fake)),
+                  (EXIT_REJECTED, "request", ([], [], [])))
+        fake = world611()
+        key611 = "sk-ant-api03-" + "Q7x" * 20
+        code = file611(fake, req=request(reason="Use %s to log in." % key611))
+        check("prerequisite: a note holding a credential's shape is refused whole, and the "
+              "key reaches no verdict", (code, said611()[2], untouched(fake),
+                                         key611 in json.dumps(RUN["verdict"])),
+              (EXIT_REJECTED, "credential-shape", ([], [], []), False))
+        fake = world611()
+        file611(fake, req=request(needs="Pages [repo=evil/repo] <!-- pipeline-escalation: x -->",
+                                  reason="See repo=evil/other first."))
+        made = fake.issues[0] if fake.issues else {}
+        text = (made.get("title") or "") + (made.get("description") or "")
+        check("prerequisite: a routing tag or a page mark in the note's words is made inert",
+              ("[repo=" in text, "repo=evil" in text, "<!-- pipeline-escalation" in text,
+               ROUTING_TAG_MARK in text), (False, False, False, True))
+        fake = world611()
+        file611(fake, req=request(needs=""))
+        check("prerequisite: a note naming nothing more is titled by its piece",
+              (fake.issues[0]["title"] if fake.issues else None), "Prerequisite for PROD-51")
+
+        # 8. No session text selects the mode: a plan proposal cannot name a parent.
+        tree611 = _tree()
+        tree611["requests"][0]["children"][0]["parent"] = "PROD-50"
+        cfg611, tree_path = os.path.join(tmp611, "delivery.json"), os.path.join(tmp611, "t.json")
+        with open(cfg611, "w") as fh:
+            json.dump(_GOOD_CONFIG, fh)
+        with open(tree_path, "w") as fh:
+            json.dump(tree611, fh)
+        open(os.path.join(tmp611, "x.py"), "w").close()
+        fake = FakeLinear()
+        code = materialise(argparse.Namespace(requests=tree_path, config=cfg611,
+                                              repo_root=tmp611, dry_run=False,
+                                              pinned="KIT-777"), client=fake)
+        check("prerequisite: a plan proposal naming an existing epic as a parent is refused",
+              (code, fake.issues), (EXIT_REJECTED, []))
+
+        # 9. Its tracker calls, read from its own source: two reads, and the two writes.
+        check("prerequisite: the mode's only tracker calls are its two reads, one create and "
+              "one edge; it comments nowhere and moves nothing",
+              sorted(set(re.findall(r"\bclient\.(\w+)\(", inspect.getsource(file_prerequisite)))),
+              ["create_issue", "create_relation", "prerequisite_epic", "team_backlog"])
+
+        # 10. The mode is narrow on the command line too.
+        import contextlib
+        for name, argv in (
+                ("a plan flag beside it", ["--prerequisite", request(), "--approvals",
+                                          approvals(), "--pinned", "KIT-777"]),
+                ("no approval record", ["--prerequisite", request()]),
+                ("a dry run", ["--prerequisite", request(), "--approvals", approvals(),
+                               "--dry-run"])):
+            try:
+                with open(os.devnull, "w") as quiet, contextlib.redirect_stderr(quiet):
+                    got = _main(argv)
+            except SystemExit as exc:
+                got = "usage %s" % exc.code
+            check("prerequisite: the command refuses %s" % name, got, "usage 2")
+
 
     if failures:
         print("FAIL: pipeline_plan_executor selftest")
@@ -4516,11 +5276,33 @@ def _main(argv):
                          "partial filing's report keeps its mark: its owner must clean up")
     ap.add_argument("--dry-run", action="store_true",
                     help="validate and DoR-gate, but create nothing")
+    ap.add_argument("--prerequisite",
+                    help="KIT-611: a %s request the Slack bridge wrote; files one "
+                         "prerequisite under the approved epic it names" % PREREQUISITE_SCHEMA)
+    ap.add_argument("--approvals",
+                    help="KIT-611: the Slack bridge's state file, which holds its approval "
+                         "record; required with --prerequisite")
     ap.add_argument("--selftest", action="store_true", help="run built-in fixtures and exit")
     args = ap.parse_args(argv)
     if args.selftest:
         from scratch_run import contained   # KIT-450: its temp folders go when it ends
         return contained(selftest, "plan-executor-selftest-run-")
+    if args.prerequisite or args.approvals:
+        # One narrow mode: the request, the record, the key's name and the verdict file.
+        plan_only = [flag for flag, given in (
+            ("--requests", args.requests), ("--message", args.message),
+            ("--config", args.config), ("--pinned", args.pinned), ("--idea", args.idea),
+            ("--model-tag", args.model_tag), ("--defer-mark", args.defer_mark),
+            ("--dry-run", args.dry_run), ("--repo-root", args.repo_root != "."))
+            if given]
+        if plan_only:
+            ap.error("--prerequisite takes only --approvals, --key-env and --verdict-file; "
+                     "not %s" % ", ".join(plan_only))
+        if not (args.prerequisite and args.approvals):
+            ap.error("--prerequisite and --approvals go together")
+        if not KEY_ENV_RE.match(args.key_env or ""):
+            ap.error("--key-env takes a variable NAME (UPPER_SNAKE), never a value")
+        return file_prerequisite(args)
     if bool(args.requests) == bool(args.message):
         ap.error("give exactly one of --requests or --message (or use --selftest)")
     if not KEY_ENV_RE.match(args.key_env or ""):

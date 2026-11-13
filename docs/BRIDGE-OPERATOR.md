@@ -575,29 +575,47 @@ tool records a judgment, and changes nothing. Then code, not the model, decides:
   waits for another approved piece that is not done. Both must be as you approved them, and
   neither may be a ticket your idea names. The wait lives in the bridge's own record, so nothing
   in Linear moves. The queue, when it is on, holds that piece too.
-- **Anything else asks you one question**, where you approved the plan. That covers a missing
-  prerequisite, a ticket you named, a piece already started, a loop, a piece changed since your
-  approval, and the 16th change in a plan in a day. The question gives the piece's reason and
-  the tech lead's take, made inert like any tech lead words, and your options.
+- **A missing prerequisite is filed without you (KIT-611).** The tech lead must name the piece
+  whose note asked. That piece must be an approved piece of the plan and not a ticket your idea
+  names, the idea must be readable, and the plan must have had fewer than 15 changes without
+  you in the last day. The plan executor's prerequisite mode then files one ticket under the
+  plan, in its team and project, in the backlog with `provenance:agent`, and marks the piece as
+  blocked by it. The piece is already at work, so that stops nothing: its session carries on,
+  or escalates. The plan and the piece come from the bridge's own approval record, never from
+  the note. The bridge does not start it: hand it to the agent when you want it.
+- **Anything else asks you one question**, where you approved the plan. That covers a ticket
+  you named, a piece already started, a loop, a piece changed since your approval, a
+  prerequisite for any other piece, and the 16th change in a plan in a day. The question
+  gives the piece's reason and the tech lead's take, made inert like any tech lead words,
+  and your options.
 
-A missing prerequisite always asks for now: the bridge cannot file into an approved plan
-(KIT-611 is that change). Reply under the question and the tech lead takes it from there.
+A prerequisite also asks you when its note holds a credential's shape, or when the filing is
+refused or fails: the question says which, in fixed words, and the log has the executor's own
+reason. When the filing never said how it ended, the question says it may already be filed:
+look under the plan before you file one. Reply under the question and the tech lead takes it
+from there. A ticket filed whose blocks link could not be made is said once instead: link the
+two yourself, or cancel the ticket.
 
 **What is recorded.** Each change made without you is:
 
 - a row in the `plan_changes` ledger in the bridge's state;
-- one comment on the plan, *Changed without the owner, inside the plan they approved*;
+- one comment on the plan: *Changed without the owner, inside the plan they approved* for a
+  reorder, *Filed without the owner, under the plan they approved* for a prerequisite;
 - one line in the next stand-up, under *Changed without you, inside plans you approved*.
   With the stand-up off, that line comes in the plan's thread instead. A change the stand-up
   never said because you switched it off is said there on the next pass.
 
 All three are built from ticket ids, never from the note's words. To start a piece sooner,
-hand it to the agent yourself.
+hand it to the agent yourself. To undo a prerequisite, cancel the ticket it filed.
 
 Good: the stand-up says *PROD-52 now waits for PROD-53 before it starts, in PROD-50. PROD-51
 asked for it, and it stays inside the plan you approved.*
+Good: the stand-up says *I filed PROD-61 under PROD-50: PROD-51 needs it first, and no piece
+of the plan covered it.* PROD-61 waits in the backlog until you hand it over.
 Not that: a change you never heard about. Look for its ledger row and its comment on the plan.
 Not that: a piece reordered after you named it in your idea. That always asks you; tell the build.
+Not that: a prerequisite the bridge handed over by itself, or one filed under another plan.
+Neither can happen by design; tell the build.
 
 ### When a plan finishes
 

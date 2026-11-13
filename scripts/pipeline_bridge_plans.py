@@ -31,6 +31,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 from datetime import datetime
 
@@ -41,6 +42,9 @@ if HERE not in sys.path:
 import pipeline_hold as watcher_hold  # noqa: E402  (KIT-528: the watcher's hold)
 import pipeline_notify_local as notify  # noqa: E402
 import pipeline_plan_poller as poller  # noqa: E402
+# KIT-611: the plan executor's prerequisite mode, run as a process of its own; its request's
+# schema, its verdict's and its credential test are read from it, never copied.
+import pipeline_plan_executor as executor  # noqa: E402
 # The queue (MVP 2, KIT-454): what may start now, and the ledger row before each start.
 import pipeline_queue_start as starter  # noqa: E402
 import pipeline_routing_tags as routing  # noqa: E402  (KIT-405: the follow-up's directive pin)
@@ -52,7 +56,7 @@ from pipeline_bridge_transport import BridgeError  # noqa: E402
 from pipeline_bridge_config import (ASK_AGAIN_BIND, DONE, EXIT_USAGE, EXPIRED,  # noqa: E402
                                     OPEN, REFUSED, SLACK_USER_RE, _TICKET_WORD_RE,
                                     credit_terms, epoch, iso, key_of, label_names, plan_run,
-                                    run_idea, ticket_number, ts_float)
+                                    run_idea, state_path, ticket_number, ts_float)
 
 # KIT-305: how many passes a plan's close keeps trying to close its idea when the tracker would
 # not read or move it. A cause that retrying cannot mend is said once and never retried.
@@ -264,7 +268,8 @@ def children_of(epic):
 # only from an approved piece of a plan it follows, once that piece has been started, and only
 # from the agent's own comment, and it is data. The tech lead judges it in a turn of its own;
 # code decides what the judgment comes to (plan_change_verdict). A reorder inside the owner's
-# spec is made without them, and anything else asks them.
+# spec is made without them, a missing prerequisite is filed under the plan by the plan
+# executor's prerequisite mode (KIT-611), and anything else asks them.
 PLAN_NOTE_SCHEMA = "plan-needs-change/1"
 PLAN_NOTE_KINDS = ("missing-prerequisite", "reorder", "scope", "other")
 PLAN_NOTE_KEYS = ("kind", "prerequisite", "reason", "schema")
@@ -277,8 +282,38 @@ PLAN_CHANGES_KEPT = 200             # rows of the plan_changes ledger kept
 # day. One more is asked of them instead.
 PLAN_CHANGES_PER_DAY = 15
 _NOTE_FENCE_RE = re.compile(r"^[ \t]*```json[ \t]*\n(.*?)\n[ \t]*```[ \t]*$", re.S | re.M)
-PLAN_PREREQUISITE_WHY = ("work the plan does not hold is yours to approve, and I can't file "
-                         "it into an approved plan myself")
+# KIT-611: a missing prerequisite the rules let through is filed without the owner, by the plan
+# executor's prerequisite mode, run as a process of its own. It gets what is left of the pass
+# less a few seconds to say what happened, at most PREREQUISITE_SECONDS, and is not started
+# with fewer than PREREQUISITE_MIN_SECONDS.
+PREREQUISITE_SECONDS = 60
+PREREQUISITE_MIN_SECONDS = 10
+PREREQUISITE_SAY_SECONDS = 5
+# The comment on the plan for a prerequisite filed without the owner, every word from the
+# ledger's fields: the ticket filed and the piece it blocks.
+PLAN_PREREQUISITE_COMMENT = (
+    "**Filed without the owner, under the plan they approved.** %(filed)s is a prerequisite of "
+    "%(piece)s: %(piece)s's note said it needs work no piece of the plan covers, the tech lead "
+    "judged the note, and the plan executor filed it in the backlog with `provenance:agent`, "
+    "blocking %(piece)s. Nothing starts it by itself: hand it to the agent to start it, or "
+    "cancel it to undo this. It is recorded in the bridge's plan_changes ledger.")
+# Why a prerequisite the rules let through is asked of the owner after all, in fixed words by
+# the executor's verdict. Its own reasons go to the log, never into the conversation.
+PREREQUISITE_WHYS = {
+    "cap": "I've filed as many in this plan today as I file without asking",
+    "refused": "it no longer matched the plan you approved when I went to file it",
+    "errored": "my filing of it failed before it finished",
+    # A run with no verdict, or a create never confirmed, may have filed it (Stage E on #552).
+    "unsure": ("my filing of it never said how it ended, so it may already be under %(plan)s; "
+               "look there before you file one"),
+    "key": "its words looked like a credential, so I didn't write them anywhere",
+}
+# A prerequisite filed whose blocks link could not be made: said once in the plan's
+# conversation, from fields.
+PLAN_PREREQUISITE_PARTIAL = (
+    "%(piece)s, a piece of %(plan)s, needs work that no piece of the plan covers. I filed "
+    "%(filed)s for it, but couldn't mark %(piece)s as blocked by it. Link them yourself, or "
+    "cancel %(filed)s to undo it.")
 # The comment on the plan for a change made without the owner, every word from the ledger's
 # fields: the piece that waits, the piece it waits for, the piece whose note asked, and again
 # the piece that waits.
@@ -365,23 +400,25 @@ def waits_on(rec, kids, start, target):
     return False
 
 
-def plan_change_verdict(entries, kids, rec, named, made_today, untouched):
+def plan_change_verdict(entries, kids, rec, named, made_today, untouched, asker=None):
     """("make", piece, after) when the tech lead's one recorded change is a reorder inside the
-    owner's spec, made without them; otherwise ("ask", why), why in fixed words and ticket ids.
-    `kids` are the plan's approved pieces, `named` the tickets the owner named in the idea (None
-    when it could not be read), `made_today` the changes made in this plan without them in the
-    last day, and `untouched(k)` whether nobody has started piece k. The default is to ask. A
-    reorder is inside the spec only when every rule holds: it makes one approved piece, still
-    as approved and started by nobody, wait for another approved piece of the same plan, still
-    as approved and not finished. It removes, cancels and edits nothing, so no acceptance
-    criterion, repo or piece of the plan changes."""
+    owner's spec, made without them; ("file", piece) when it is a missing prerequisite filed
+    without them (KIT-611, prerequisite_verdict); otherwise ("ask", why), why in fixed words
+    and ticket ids. `kids` are the plan's approved pieces, `named` the tickets the owner named
+    in the idea (None when it could not be read), `made_today` the changes made in this plan
+    without them in the last day, `untouched(k)` whether nobody has started piece k, and
+    `asker` the piece whose note this is. The default is to ask. A reorder is inside the spec
+    only when every rule holds: it makes one approved piece, still as approved and started by
+    nobody, wait for another approved piece of the same plan, still as approved and not
+    finished. It removes, cancels and edits nothing, so no acceptance criterion, repo or piece
+    of the plan changes."""
     changes = [e for e in entries if e.get("verb") == "plan_change"]
     if len(changes) != 1:
         return ("ask", "the tech lead recorded %s" % ("no change" if not changes
                                                      else "more than one change"))
     e = changes[0]
     if e.get("kind") == "add_prerequisite":
-        return ("ask", PLAN_PREREQUISITE_WHY)
+        return prerequisite_verdict(e, kids, named, made_today, asker)
     if e.get("kind") != "reorder":
         return ("ask", "the tech lead left it to you")
     by = dict((k.get("identifier"), k) for k in kids)
@@ -412,6 +449,31 @@ def plan_change_verdict(entries, kids, rec, named, made_today, untouched):
     return ("make", piece, after)
 
 
+def prerequisite_verdict(e, kids, named, made_today, asker):
+    """KIT-611: ("file", piece) when the tech lead's add_prerequisite names the very piece whose
+    note asked, an approved piece of this plan that is no ticket the owner named in the idea,
+    with the idea read and fewer than PLAN_CHANGES_PER_DAY changes made in this plan without
+    them in the last day. The plan executor then files the prerequisite under this plan, from
+    the bridge's own record, and checks that record and its own cap again. Otherwise ("ask",
+    why). The piece is started already (a note comes only from a started piece), so a filing
+    only makes it wait; it changes no criterion, repo or approved piece."""
+    by = dict((k.get("identifier"), k) for k in kids)
+    piece = by.get(e.get("ticket"))
+    if piece is None:
+        return ("ask", "it names a ticket that is not an approved piece of this plan")
+    if asker is None or piece.get("id") != asker.get("id"):
+        return ("ask", "it names a piece other than the one whose note asked")
+    if named is None:
+        return ("ask", "I could not read the idea the plan came from, to see which tickets "
+                       "you named")
+    if e["ticket"] in named:
+        return ("ask", "it adds work before a ticket you named")
+    if made_today >= PLAN_CHANGES_PER_DAY:
+        return ("ask", "%d changes were made to this plan without you today, the most I make "
+                       "without asking" % made_today)
+    return ("file", piece)
+
+
 def kept_changes(rows):
     """The ledger cut to PLAN_CHANGES_KEPT rows, the oldest said rows dropped first, so a row
     nothing has said yet is kept while there is one to drop instead (Stage E on #543)."""
@@ -424,7 +486,12 @@ def kept_changes(rows):
 
 
 def plan_change_line(row):
-    """The one line a change made without the owner gets (KIT-320), from the ledger's fields."""
+    """The one line a change made without the owner gets (KIT-320), from the ledger's fields: a
+    reorder, or a prerequisite filed (KIT-611)."""
+    if row.get("kind") == "add_prerequisite":
+        return ("I filed %s under %s: %s needs it first, and no piece of the plan covered it. It "
+                "waits for you to hand it to the agent, and cancelling it undoes this."
+                % (row["after"], row["epic"], row["ticket"]))
     return ("%s now waits for %s before it starts, in %s. %s asked for it, and it stays inside "
             "the plan you approved." % (row["ticket"], row["after"], row["epic"], row["piece"]))
 
@@ -1807,7 +1874,10 @@ class PlansMixin(object):
             self.note(rec, "atwork:" + k["id"], "%s is at work but was not in the plan you "
                       "approved. It counts toward the limit of %d."
                       % (k.get("identifier") or "?", self.cfg["epic_wip"]))
-        fresh = [k for k in extras if k not in running and "added:" + k["id"] not in rec["noted"]]
+        # A prerequisite the bridge filed itself (KIT-611) was said when it was filed.
+        mine = set(f for f in rec.get("filed") or [] if isinstance(f, str))
+        fresh = [k for k in extras if k not in running and "added:" + k["id"] not in rec["noted"]
+                 and k.get("identifier") not in mine]
         if fresh:
             self.note(rec, "added:" + fresh[0]["id"], "%s %s added after the approval, so I "
                       "won't hand %s over. Hand %s over yourself if %s yours."
@@ -1965,9 +2035,10 @@ class PlansMixin(object):
     def judge_plan_note(self, epic_id, rec, kids, piece, note, key):
         """One note, judged once. It goes to the tech lead as a turn over its tools, and what
         the turn's plan_change tool recorded is checked by code, never taken on the model's
-        word: a reorder inside the owner's spec is made without them, and anything else asks
-        them one question. False, with nothing done, when no turn can start this pass (too
-        little time left, or the hourly limit on the tech lead's turns): it is read again."""
+        word: a reorder inside the owner's spec is made without them, a missing prerequisite
+        is filed under the plan (KIT-611), and anything else asks them one question. False,
+        with nothing done, when no turn can start this pass (too little time left, or the
+        hourly limit on the tech lead's turns): it is read again."""
         taken = self.plan_note_take(rec, piece, note, kids)
         if taken is None:
             return False
@@ -1989,9 +2060,12 @@ class PlansMixin(object):
         def untouched(k):
             return (k.get("identifier") not in rec["started"] and not self.handed_over(k)
                     and (k.get("state") or {}).get("type") in ("backlog", "triage", "unstarted"))
-        verdict = plan_change_verdict(entries, kids, rec, named, made_today, untouched)
+        verdict = plan_change_verdict(entries, kids, rec, named, made_today, untouched,
+                                      asker=piece)
         if verdict[0] == "make":
             self.make_plan_change(epic_id, rec, piece, verdict[1], verdict[2])
+        elif verdict[0] == "file":
+            self.file_prerequisite(epic_id, rec, verdict[1], note, entries, take, idea, key)
         else:
             self.ask_plan_change(rec, piece, note, entries, verdict[1], take, idea, key)
         self.save()
@@ -2000,18 +2074,25 @@ class PlansMixin(object):
     def make_plan_change(self, epic_id, rec, piece, waiting, after):
         """A reorder inside the owner's spec, made without them (KIT-320): `waiting` is not
         handed over until `after` is done. It lives in the bridge's own record of the plan, so
-        nothing in the tracker moves and nothing the owner approved is edited. It is recorded in
-        the plan_changes ledger, named in one comment on the plan, and said once: in the next
-        stand-up, or, with the stand-up off, in the plan's own conversation. Every word comes
-        from fields, never from the note."""
+        nothing in the tracker moves and nothing the owner approved is edited. It is recorded as
+        every change made without them is (record_plan_change)."""
         rec.setdefault("waits", {})[waiting["id"]] = sorted(
             set(plan_waits(rec, waiting["id"]) + [after["id"]]))
         row = {"at": iso(self.now), "epic": rec["ticket"], "piece": piece["identifier"],
                "kind": "reorder", "ticket": waiting["identifier"], "after": after["identifier"],
                "reported": False}
+        self.record_plan_change(epic_id, rec, row, PLAN_CHANGE_COMMENT % (
+            row["ticket"], row["after"], row["piece"], row["ticket"]))
+        self.say("  changed %s without the owner: %s now waits for %s, as %s's note asked"
+                 % (rec["ticket"], row["ticket"], row["after"], row["piece"]))
+
+    def record_plan_change(self, epic_id, rec, row, body):
+        """A change made without the owner (KIT-320, KIT-611), recorded in the plan_changes
+        ledger, named in one comment on the plan, `body`, and said once: in the next stand-up,
+        or, with the stand-up off, in the plan's own conversation. Every word comes from
+        fields, never from the note."""
         self.state["plan_changes"] = kept_changes(self.state["plan_changes"] + [row])
         self.save()
-        body = PLAN_CHANGE_COMMENT % (row["ticket"], row["after"], row["piece"], row["ticket"])
         try:
             self.tracker.comment(epic_id, body)
         except BridgeError as exc:
@@ -2021,8 +2102,107 @@ class PlansMixin(object):
             self.owe(epic_id, rec["ticket"], body)
         self.say_unsaid_changes(rec)
         self.counts["acted"] += 1
-        self.say("  changed %s without the owner: %s now waits for %s, as %s's note asked"
-                 % (rec["ticket"], row["ticket"], row["after"], row["piece"]))
+
+    def file_prerequisite(self, epic_id, rec, piece, note, entries, take, idea, key):
+        """KIT-611: a missing prerequisite the rules let through, filed without the owner by the
+        plan executor's prerequisite mode: one ticket under this plan, in its team and project,
+        in the backlog with `provenance:agent`, blocking the piece whose note asked. The plan and
+        the piece go to it as the ids this record keys them by, never from the note's text, and
+        it checks them against this record, saved first. It is recorded as a reorder is, and it
+        waits for the owner to hand it over: the bridge starts only what they approved. A note
+        holding a credential's shape is never written to a request; a filing that does not
+        happen asks the owner, in fixed words, and the executor's own words go to the log."""
+        plan, ident = rec["ticket"], piece["identifier"]
+        if executor.credential_shaped(note["prerequisite"]) \
+                or executor.credential_shaped(note["reason"]):
+            self.ask_plan_change(rec, piece, note, entries, PREREQUISITE_WHYS["key"], take, idea,
+                                 key)
+            return
+        if self.dry:
+            self.say("  [dry-run] would file a prerequisite for %s under %s" % (ident, plan))
+            return
+        self.save()                 # the executor reads this record from the saved state
+        verdict = self.run_prerequisite({
+            "schema": executor.PREREQUISITE_SCHEMA, "epic": epic_id, "piece": piece["id"],
+            "needs": note["prerequisite"], "reason": note["reason"]})
+        verdict = verdict if isinstance(verdict, dict) else {}
+        filed = verdict.get("prerequisite")
+        filed = filed if isinstance(filed, str) and executor.EPIC_ID_RE.match(filed) else None
+        if filed:
+            rec["filed"] = [f for f in rec.get("filed") or [] if f != filed][-199:] + [filed]
+        if verdict.get("class") == "filed" and filed:
+            row = {"at": iso(self.now), "epic": plan, "piece": ident, "kind": "add_prerequisite",
+                   "ticket": ident, "after": filed, "reported": False}
+            self.record_plan_change(epic_id, rec, row, PLAN_PREREQUISITE_COMMENT % {
+                "filed": filed, "piece": ident})
+            self.say("  filed %s under %s without the owner: %s is marked as blocked by it, as "
+                     "its note asked" % (filed, plan, ident))
+            return
+        if filed:
+            self.note(rec, "planpartial:" + key, PLAN_PREREQUISITE_PARTIAL % {
+                "piece": ident, "plan": plan, "filed": filed})
+            self.say("  filed %s under %s, but %s is not marked as blocked by it"
+                     % (filed, plan, ident))
+            return
+        if verdict.get("class") == "refused":
+            why = PREREQUISITE_WHYS["cap" if verdict.get("kind") == "cap" else "refused"]
+        elif not verdict or verdict.get("kind") == "unconfirmed" or verdict.get("filed"):
+            why = PREREQUISITE_WHYS["unsure"] % {"plan": plan}
+        else:
+            why = PREREQUISITE_WHYS["errored"]
+        self.ask_plan_change(rec, piece, note, entries, why, take, idea, key)
+
+    def run_prerequisite(self, request):
+        """The plan executor's prerequisite mode as a process of its own (KIT-611), given what
+        is left of this pass and an environment holding the tracker key and nothing else of the
+        bridge's; its verdict read back, and both files removed. What it wrote to stderr goes to
+        the log. {} when it gave no verdict. A case stands in for it."""
+        folder = self.cfg["state_dir"]
+        ask_path = os.path.join(folder, "prerequisite-request.json")
+        out_path = os.path.join(folder, "prerequisite-verdict.json")
+        seconds = PREREQUISITE_SECONDS
+        if self.deadline is not None:
+            seconds = min(seconds, int(self.deadline - self.clock()) - PREREQUISITE_SAY_SECONDS)
+        if seconds < PREREQUISITE_MIN_SECONDS:
+            self.say("  too little of this pass is left to file a prerequisite")
+            return {}
+        key_env = self.cfg["linear_key_env"]
+        env = dict((k, os.environ[k]) for k in ("HOME", "PATH", "LANG", "LC_ALL", key_env)
+                   if k in os.environ)
+        try:
+            for path in (ask_path, out_path):
+                if os.path.lexists(path):
+                    os.unlink(path)
+            old = os.umask(0o077)
+            try:
+                with open(ask_path, "w", encoding="utf-8") as fh:
+                    json.dump(request, fh)
+            finally:
+                os.umask(old)
+            proc = subprocess.run(
+                [sys.executable, os.path.join(HERE, "pipeline_plan_executor.py"),
+                 "--prerequisite", ask_path, "--approvals", state_path(self.cfg),
+                 "--key-env", key_env, "--verdict-file", out_path],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=seconds)
+            for line in proc.stderr.decode("utf-8", "replace").splitlines()[-5:]:
+                self.say("  the plan executor said: %s" % line[:300])
+            with open(out_path, encoding="utf-8") as fh:
+                doc = json.load(fh)
+            return doc if isinstance(doc, dict) and doc.get("schema") == \
+                executor.VERDICT_SCHEMA else {}
+        except subprocess.TimeoutExpired:
+            self.say("  the plan executor did not finish within %d seconds" % seconds)
+            return {}
+        except (OSError, ValueError) as exc:
+            self.say("  the plan executor's run could not be read back: %s"
+                     % type(exc).__name__)
+            return {}
+        finally:
+            for path in (ask_path, out_path):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
 
     def ask_plan_change(self, rec, piece, note, entries, why, take, idea, key):
         """One question in the plan's conversation, the owner's DM, about a note whose change is
@@ -2038,7 +2218,9 @@ class PlansMixin(object):
         said = (" It says: %s" % reason if reason else "") + (
             " The tech lead's take: %s" % take if take else "")
         reorder = [e for e in entries if e.get("kind") == "reorder"]
-        if note["kind"] == "missing-prerequisite" or why == PLAN_PREREQUISITE_WHY:
+        if note["kind"] == "missing-prerequisite" or [
+                e.get("kind") for e in entries if e.get("verb") == "plan_change"] == [
+                "add_prerequisite"]:
             text = PLAN_ASK_PREREQUISITE % {
                 "piece": ident, "plan": plan, "said": said, "why": why,
                 "needs": ": %s" % needs if needs else "",
@@ -6606,7 +6788,7 @@ def cases_plan_changes(kit):
     code judges what the turn recorded. A reorder inside the owner's spec is made without them
     and recorded three ways; anything else asks them one question; a note anywhere else, or by
     anyone but the agent, is ignored."""
-    from pipeline_bridge import ALICE, BOB, OWNER, Pass, run_text, state_path
+    from pipeline_bridge import ALICE, BOB, OWNER, STATE_SCHEMA, Pass, run_text, state_path
     import pipeline_tech_lead_tools as tool_server
     with kit as tmp:
         check, now, posted = kit.take("check", "now", "posted")
@@ -6652,16 +6834,55 @@ def cases_plan_changes(kit):
                 return {"text": self.text, "why": "", "session_id": None, "resumed": False,
                         "cost": None, "turns": None}
 
-        def judged(c, s, t, entries, at=None, text=None):
-            """One pass with the turn standing in, its plan_change having recorded `entries`."""
+        class Filer(object):
+            """Stands in for the plan executor's prerequisite mode (KIT-611): records each
+            request and answers `verdict`. A filing adds the ticket to the world, under the plan
+            and blocking the piece, as the real one does."""
+
+            def __init__(self, t=None, verdict=None, calls=None, record=None, create=False):
+                self.t, self.requests = t, ([] if calls is None else calls)
+                self.create = create        # files the ticket whatever its verdict says
+                self.record, self.seen = record, None
+                self.verdict = verdict if verdict is not None else {
+                    "schema": executor.VERDICT_SCHEMA, "class": "filed", "kind": "created",
+                    "filed": True, "reasons": ["filed PROD-61"], "prerequisite": "PROD-61"}
+
+            def __call__(self, request):
+                self.requests.append(dict(request))
+                if self.record:
+                    # What the saved state holds as the run starts: the note already judged.
+                    self.seen = json.load(open(self.record))["epics"]["uuid-50"].get(
+                        "notes_seen")
+                if self.t is not None and (self.create or self.verdict.get("class") == "filed"):
+                    t_ = self.t
+                    t_.issues["PROD-61"] = dict(
+                        t_.issues["PROD-53"], id="uuid-61", identifier="PROD-61",
+                        title="Prerequisite for PROD-51", labels=["provenance:agent"],
+                        blocked_by=[], delegate=None,
+                        state={"id": "st-backlog", "name": "Backlog", "type": "backlog"})
+                    t_.epics["PROD-50"].append("PROD-61")
+                    t_.issues["PROD-51"]["blocked_by"] = (t_.issues["PROD-51"]["blocked_by"]
+                                                          + ["PROD-61"])
+                return dict(self.verdict)
+        stray = []      # every request a case that should never file sent anyway
+
+        def judged(c, s, t, entries, at=None, text=None, filer=None):
+            """One pass with the turn standing in, its plan_change having recorded `entries`.
+            The executor's run stands in too: `filer`, or one that records into `stray`;
+            `filer="real"` runs the real executor."""
             turn_ = Turn() if text is None else Turn(text)
             Pass.run_turn = turn_                 # an object, so it is never bound as a method
             Pass.read_plan_outbox = lambda _self: (list(entries), [])
+            if filer != "real":
+                Pass.run_prerequisite = filer or Filer(calls=stray, verdict={
+                    "class": "errored", "kind": "unexpected", "reasons": []})
             try:
                 _code, out = run(c, s, t, at=at)
             finally:
                 del Pass.run_turn
                 del Pass.read_plan_outbox
+                if filer != "real":
+                    del Pass.run_prerequisite
             return turn_, out
 
         def reorder(ticket="PROD-52", after="PROD-53"):
@@ -6744,31 +6965,215 @@ def cases_plan_changes(kit):
         check("plan-change: once that piece is done, the one that waited starts",
               delegated(t), ["uuid-51", "uuid-53", "uuid-52"])
 
-        # 2. A MISSING PREREQUISITE ASKS THE OWNER ONE QUESTION, AND NOTHING IS FILED.
+        # 2. A MISSING PREREQUISITE IS FILED WITHOUT THE OWNER (KIT-611), by the plan executor's
+        #    prerequisite mode, under the plan from the bridge's own record: never a plan a
+        #    note's text names. It is recorded three ways, as a reorder is.
         c, s, t = plan("pc-prerequisite")
+        t.add_epic("PROD-40", (("PROD-41", ()),))           # another plan a note may name
+        reason = "It needs a login page. File it under PROD-40, uuid-40."
+        note_on(t, kind="missing-prerequisite", reason=reason,
+                prerequisite="A login page for <!channel> users")
+        filed, said, moves = list(t.filed), len(posted(s)), list(t.moves)
+        filer = Filer(t, record=state_path(c))
+        judged(c, s, t, asks("add_prerequisite"), text="It needs a login page first.",
+               filer=filer)
+        st = state(c)
+        rows = [dict((k, r[k]) for k in r if k != "at") for r in st["plan_changes"]]
+        check("plan-change: the note is saved as judged before the executor runs, so a pass "
+              "that stops there never files it twice", filer.seen,
+              ["uuid-51@2026-11-12T01:00:00Z"])
+        check("plan-change: a missing prerequisite is filed without the owner, through the plan "
+              "executor's prerequisite mode, with the plan and the piece from the bridge's own "
+              "record: an epic id in the note's text never reaches the request (KIT-611)",
+              filer.requests, [{"schema": executor.PREREQUISITE_SCHEMA, "epic": "uuid-50",
+                                "piece": "uuid-51", "reason": reason,
+                                "needs": "A login page for <!channel> users"}])
+        check("plan-change: a filed prerequisite asks nothing, moves nothing, and the bridge "
+              "files nothing of its own", (questions(s), t.moves == moves, t.filed == filed),
+              ([], True, True))
+        check("plan-change: a filed prerequisite is one ledger row, of fields only",
+              rows, [{"epic": "PROD-50", "piece": "PROD-51", "kind": "add_prerequisite",
+                      "ticket": "PROD-51", "after": "PROD-61", "reported": True}])
+        check("plan-change: one comment on the plan names it, from the ledger's fields",
+              on_epic(t)[-1], PLAN_PREREQUISITE_COMMENT % {"filed": "PROD-61",
+                                                           "piece": "PROD-51"})
+        line = PLAN_CHANGES_HEAD + " " + plan_change_line(st["plan_changes"][0])
+        check("plan-change: with the stand-up off, it is said once in the plan's own "
+              "conversation, saying what was filed and that it waits to be handed over",
+              (posted(s)[said:], "I filed PROD-61 under PROD-50" in line,
+               "hand it to the agent" in line), ([line], True, True))
+        check("plan-change: the note's words reach no comment, ledger row or line",
+              [x for x in [on_epic(t)[-1], json.dumps(st["plan_changes"]), line]
+               if "login" in x or "PROD-40" in x], [])
+        said = len(posted(s))
+        judged(c, s, t, asks("add_prerequisite"), at=now + PLAN_NOTE_READ_SECONDS + 1,
+               filer=filer)
+        check("plan-change: the filed prerequisite is never handed over by the bridge, and gets "
+              "no 'added after the approval' note; the note is judged once",
+              ("uuid-61" in delegated(t), [p for p in posted(s)[said:] if "PROD-61" in p],
+               len(filer.requests)), (False, [], 1))
+        check("plan-change: the executor reads the bridge's own state schema (KIT-611)",
+              executor.APPROVAL_RECORD_SCHEMA, STATE_SCHEMA)
+
+        # 2b. A note holding a credential's shape is never written to a request: it asks.
+        c, s, t = plan("pc-prereq-key")
         note_on(t, kind="missing-prerequisite", reason="It needs a login page. %s" % key,
                 prerequisite="A login page for <!channel> users")
-        filed, said = list(t.filed), len(posted(s))
-        judged(c, s, t, asks("add_prerequisite"), text="It needs a login page first.")
+        said = len(posted(s))
+        filer = Filer(t)
+        judged(c, s, t, asks("add_prerequisite"), text="It needs a login page first.",
+               filer=filer)
         st = state(c)
         q = posted(s)[said:]
-        check("plan-change: a missing prerequisite asks one question, naming it, the piece that "
-              "waits and the options",
-              (len(q), q[0].startswith("PROD-51, a piece of PROD-50, needs work that no piece "
-                                       "of the plan covers: A login page for"),
-               "Should it be added?" in q[0], "file it under PROD-50 in Linear" in q[0],
-               "`replan PROD-6`" in q[0], "The tech lead's take: It needs a login page first."
-               in q[0]), (1, True, True, True, True, True))
+        check("plan-change: a note holding a credential's shape files nothing and asks one "
+              "question, naming it, the piece that waits and the options",
+              (filer.requests, len(q), (q or [""])[0].startswith(
+                  "PROD-51, a piece of PROD-50, needs work that no piece of the plan covers: "
+                  "A login page for"), "Should it be added?" in (q or [""])[0],
+               "file it under PROD-50 in Linear" in (q or [""])[0],
+               "`replan PROD-6`" in (q or [""])[0],
+               "The tech lead's take: It needs a login page first." in (q or [""])[0]),
+              ([], 1, True, True, True, True, True))
         check("plan-change: a reason holding a credential's shape is not passed on, and no "
-              "mention is live", (key in q[0], "<!channel>" in q[0], "It says:" in q[0]),
-              (False, False, False))
-        check("plan-change: nothing a session writes files work by itself or changes the plan",
-              (t.filed == filed, st["plan_changes"], st["epics"]["uuid-50"].get("waits")),
-              (True, [], None))
+              "mention is live", (key in (q or [""])[0], "<!channel>" in (q or [""])[0],
+                                  "It says:" in (q or [""])[0]), (False, False, False))
+        check("plan-change: what is asked changes nothing in the plan",
+              (st["plan_changes"], st["epics"]["uuid-50"].get("waits")), ([], None))
         check("plan-change: the question is recorded as the tech lead's words, so a reply under "
               "it goes to the tech lead and a bare yes acts on no ticket it names",
               [sorted(v["ids"]) for v in st["relayed_posts"].values()],
               [["PROD-50", "PROD-51", "PROD-6"]])
+
+        # 2c. A filing the executor refuses or cannot finish asks the owner, in fixed words.
+        for name, verdict, why in (
+                ("refused at the cap", {"class": "refused", "kind": "cap", "filed": False,
+                                        "reasons": ["15 prerequisites were filed"]},
+                 PREREQUISITE_WHYS["cap"]),
+                ("refused for another reason", {"class": "refused", "kind": "not-a-piece",
+                                                "filed": False, "reasons": ["no"]},
+                 PREREQUISITE_WHYS["refused"]),
+                ("failed before its create", {"class": "errored", "kind": "tracker",
+                                              "filed": False,
+                                              "reasons": ["Linear API HTTP 500"]},
+                 PREREQUISITE_WHYS["errored"]),
+                ("whose create was never confirmed", {"class": "errored",
+                                                      "kind": "unconfirmed", "filed": False,
+                                                      "reasons": ["Linear API timed out"]},
+                 PREREQUISITE_WHYS["unsure"] % {"plan": "PROD-50"}),
+                # Stage E on #552: a run that ends with no verdict may have filed it already.
+                ("that filed it and gave no verdict", {},
+                 PREREQUISITE_WHYS["unsure"] % {"plan": "PROD-50"})):
+            c, s, t = plan("pc-prereq-" + name.replace(" ", "-"))
+            note_on(t, kind="missing-prerequisite", reason="It needs a login page.",
+                    prerequisite="A login page")
+            filer = Filer(t if not verdict else None, verdict=verdict, create=not verdict)
+            judged(c, s, t, asks("add_prerequisite"), filer=filer)
+            got = questions(s)
+            check("plan-change: a prerequisite %s asks the owner one question, saying why in "
+                  "fixed words, and records nothing (KIT-611)" % name,
+                  (len(filer.requests), len(got), why in (got or [""])[0],
+                   "API" in (got or [""])[0], state(c)["plan_changes"]),
+                  (1, 1, True, False, []))
+        c, s, t = plan("pc-prereq-partial")
+        note_on(t, kind="missing-prerequisite", reason="It needs a login page.",
+                prerequisite="A login page")
+        said = len(posted(s))
+        judged(c, s, t, asks("add_prerequisite"), filer=Filer(verdict={
+            "class": "errored", "kind": "partial", "filed": True, "prerequisite": "PROD-61",
+            "reasons": ["created: PROD-61"]}))
+        check("plan-change: a prerequisite filed without its wait is said once, from fields, "
+              "and asks nothing (KIT-611)",
+              (posted(s)[said:], questions(s), state(c)["epics"]["uuid-50"].get("filed")),
+              ([PLAN_PREREQUISITE_PARTIAL % {"piece": "PROD-51", "plan": "PROD-50",
+                                             "filed": "PROD-61"}], [], ["PROD-61"]))
+
+        # 2d. The real executor, from the bridge's own state: the request, the record and the
+        #     verdict file meet. With no key it fails and asks; an epic the record does not hold
+        #     is refused before anything else.
+        os.environ.pop("KIT611_BRIDGE_SELFTEST_UNSET", None)
+        c, s, t = plan("pc-prereq-real", linear_key_env="KIT611_BRIDGE_SELFTEST_UNSET")
+        note_on(t, kind="missing-prerequisite", reason="It needs a login page.",
+                prerequisite="A login page")
+        _turn, out = judged(c, s, t, asks("add_prerequisite"), filer="real")
+        check("plan-change: the real executor reads the bridge's request and record, and its "
+              "verdict comes back: no key is a failure, said in the log, and the owner is asked",
+              ("KIT611_BRIDGE_SELFTEST_UNSET is unset" in out, len(questions(s)),
+               PREREQUISITE_WHYS["errored"] in (questions(s) or [""])[0],
+               state(c)["plan_changes"],
+               sorted(f for f in os.listdir(c["state_dir"]) if "prerequisite" in f)),
+              (True, 1, True, [], []))
+        req611, verdict611 = (os.path.join(tmp, "req-611.json"),
+                              os.path.join(tmp, "verdict-611.json"))
+        with open(req611, "w") as fh:
+            json.dump({"schema": executor.PREREQUISITE_SCHEMA, "epic": "uuid-40",
+                       "piece": "uuid-51", "needs": "x", "reason": "y"}, fh)
+        proc = subprocess.run(
+            [sys.executable, executor.__file__, "--prerequisite", req611, "--approvals",
+             state_path(c), "--key-env", "KIT611_BRIDGE_SELFTEST_UNSET", "--verdict-file",
+             verdict611], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+        check("plan-change: the real executor, reading the bridge's own record, refuses an epic "
+              "the record does not hold (KIT-611)",
+              (proc.returncode, json.load(open(verdict611)).get("kind")), (3, "not-approved"))
+
+        # 2d'. Stage E on #552: a run killed by its time limit, maybe after its create, asks
+        #      in words that say it may be filed already, and records nothing.
+        c, s, t = plan("pc-prereq-timeout")
+        note_on(t, kind="missing-prerequisite", reason="It needs a login page.",
+                prerequisite="A login page")
+        real_run = subprocess.run
+
+        def slow_run(argv, **kw):
+            raise subprocess.TimeoutExpired(argv, kw.get("timeout") or 1)
+        subprocess.run = slow_run
+        try:
+            _turn, out = judged(c, s, t, asks("add_prerequisite"), filer="real")
+        finally:
+            subprocess.run = real_run
+        check("plan-change: an executor run cut off by its time limit asks the owner, saying the "
+              "prerequisite may already be filed under the plan, and records nothing",
+              (len(questions(s)), (PREREQUISITE_WHYS["unsure"] % {"plan": "PROD-50"})
+               in (questions(s) or [""])[0], "did not finish within" in out,
+               state(c)["plan_changes"]), (1, True, True, []))
+
+        # 2e. The run itself: its command line, an environment holding the tracker key and
+        #     nothing else of the bridge's, the request it reads, and nothing left behind.
+        c, s, t = plan("pc-prereq-argv", linear_key_env="KIT611_BRIDGE_SELFTEST_KEY")
+        note_on(t, kind="missing-prerequisite", reason="It needs a login page.",
+                prerequisite="A login page")
+        seen611, real_run = {}, subprocess.run
+
+        def fake_run(argv, **kw):
+            with open(argv[argv.index("--prerequisite") + 1]) as fh:
+                seen611.update(argv=list(argv), env=dict(kw.get("env") or {}),
+                               timeout=kw.get("timeout"), request=json.load(fh))
+            with open(argv[argv.index("--verdict-file") + 1], "w") as fh:
+                json.dump({"schema": executor.VERDICT_SCHEMA, "class": "filed",
+                           "kind": "created", "filed": True, "reasons": [],
+                           "prerequisite": "PROD-61"}, fh)
+            return subprocess.CompletedProcess(argv, 0, b"", b"")
+        os.environ["KIT611_BRIDGE_SELFTEST_KEY"] = "unused"
+        subprocess.run = fake_run
+        try:
+            judged(c, s, t, asks("add_prerequisite"), filer="real")
+        finally:
+            subprocess.run = real_run
+            os.environ.pop("KIT611_BRIDGE_SELFTEST_KEY", None)
+        folder = c["state_dir"]
+        check("plan-change: the executor runs as a process of its own with exactly its "
+              "arguments, the bridge's own state as the record, the tracker key and no other "
+              "secret in its environment, and its two files gone after (KIT-611)",
+              (seen611.get("argv"), seen611.get("request"),
+               sorted(set(seen611.get("env") or {}) - {"HOME", "PATH", "LANG", "LC_ALL"}),
+               seen611.get("timeout"),
+               sorted(f for f in os.listdir(folder) if "prerequisite" in f),
+               [r["after"] for r in state(c)["plan_changes"]]),
+              ([sys.executable, os.path.join(HERE, "pipeline_plan_executor.py"),
+                "--prerequisite", os.path.join(folder, "prerequisite-request.json"),
+                "--approvals", state_path(c), "--key-env", "KIT611_BRIDGE_SELFTEST_KEY",
+                "--verdict-file", os.path.join(folder, "prerequisite-verdict.json")],
+               {"schema": executor.PREREQUISITE_SCHEMA, "epic": "uuid-50", "piece": "uuid-51",
+                "needs": "A login page", "reason": "It needs a login page."},
+               ["KIT611_BRIDGE_SELFTEST_KEY"], PREREQUISITE_SECONDS, [], ["PROD-61"]))
 
         # 3. ANYTHING OUTSIDE THE SPEC ASKS: each rule's case, one plan each.
         def asked(name, entries, idea="Make the reports faster.", setup=None, receipt=True):
@@ -6818,13 +7223,27 @@ def cases_plan_changes(kit):
                 ("started", [reorder("PROD-51", "PROD-53")], "PROD-51 has already been started",
                  {}),
                 ("no-idea", [reorder()], "I could not read the idea", dict(receipt=False)),
-                ("cap", [reorder()], "the most I make without asking", dict(setup=full))):
+                ("cap", [reorder()], "the most I make without asking", dict(setup=full)),
+                # KIT-611: a prerequisite is filed only for the piece whose note asked, an
+                # approved piece, not a ticket the idea names, the idea read, under the cap.
+                ("prerequisite-other-piece", [dict(asks("add_prerequisite")[0],
+                                                   ticket="PROD-52")],
+                 "a piece other than the one whose note asked", {}),
+                ("prerequisite-outside", [dict(asks("add_prerequisite")[0], ticket="PROD-99")],
+                 "it names a ticket that is not an approved piece of this plan", {}),
+                ("prerequisite-named", asks("add_prerequisite"),
+                 "it adds work before a ticket you named", dict(idea="Ship PROD-51 first.")),
+                ("prerequisite-no-idea", asks("add_prerequisite"), "I could not read the idea",
+                 dict(receipt=False)),
+                ("prerequisite-cap", asks("add_prerequisite"), "the most I make without asking",
+                 dict(setup=full))):
             got_q, got_w, got_rows = asked("pc-ask-" + name, entries, **more)
             check("plan-change: %s asks the owner one question, saying why, and changes nothing"
                   % name, (len(got_q), why in (got_q or [""])[0], got_w,
-                           len(got_rows) if name == "cap" else got_rows),
+                           len(got_rows) if name.endswith("cap") else got_rows),
                   (1, True, {"uuid-52": ["uuid-53"]} if name == "already" else None,
-                   PLAN_CHANGES_PER_DAY if name == "cap" else []))
+                   PLAN_CHANGES_PER_DAY if name.endswith("cap") else []))
+        check("plan-change: no rule that asks runs the plan executor (KIT-611)", stray, [])
 
         # 4. A NOTE ANYWHERE ELSE, OR BY ANYONE BUT THE AGENT, IS IGNORED.
         c, s, t = plan("pc-forged")

@@ -302,8 +302,9 @@ first, work no piece covers is missing, or the criteria cannot all hold (KIT-320
 200 characters. Nothing else in that comment is read, and only one note a comment.
 
 Where the project runs the bridge with the tech lead on, the tech lead reads the note. A
-reorder that stays inside the approved plan is then made without the owner. Anything else is
-asked of them. The note changes nothing itself, so still escalate as in 1 if you cannot go on.
+reorder that stays inside the approved plan is then made without the owner, and a missing
+prerequisite is filed under the plan for them to hand over. Anything else is asked of them.
+The note changes nothing itself, so still escalate as in 1 if you cannot go on.
 
 ---
 

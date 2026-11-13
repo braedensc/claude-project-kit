@@ -19,6 +19,10 @@ python3 scripts/pipeline_install.py
 
 It checks first and changes only what is behind. Running it again when nothing changed is safe, and the check is quick. If the pull has moved the code, it starts itself again on the new code.
 
+| I want | Type |
+| --- | --- |
+| To only look | `python3 scripts/pipeline_install.py --check`. It changes nothing, asks nothing and needs no terminal. It prints one line per part, then what waits on you. Exit 0: every part is up to date or off. Exit 10: something waits on you. Exit 4: something could not be measured. |
+
 ---
 
 ## What it covers
@@ -40,6 +44,8 @@ A part with its own settings file and installer, such as the work queue or the w
 | It asks | Answer |
 | --- | --- |
 | How should this run go? | `1` for Automatic ("things just work"), `2` for Manual ("show me each change and ask"). Enter keeps the default: the way you chose last time, or Automatic. |
+| What do you want to call your tech lead? | A name, or Enter for `Tech lead`. Asked only when `bridge.conf` is there and names none; with no `bridge.conf` it says so in one line and asks nothing. It is written to `bridge.conf` after you agree on the consent page, and read back. |
+| The end date of a key | `YYYY-MM-DD`, like `2027-03-15`. For a key that lasts a year, `made YYYY-MM-DD` also works. Enter skips it, or keeps the date on record. Asked for a key with no date, and for one inside its warning (30 days by default) or past. With no `update.conf` it says so in one line and asks nothing. Written to `update.conf` after you agree, and read back. |
 | The consent page: "Type yes to agree" | Read it, then type `yes`. Anything else changes nothing and the command stops with exit 10. It is asked the first time. After that it is asked again only when the mode, a setting or the page's words differ from what you agreed to. |
 | Your Mac password | Type it. Asked once for the whole run, right after you agree, to save the record of your consent where only the administrator can write. |
 | Replace the skills in your home folder? | `y`. |
@@ -76,7 +82,7 @@ To bring the idea gate level and skip the review jobs, add `--skip-stage-e`. A r
 
 ## What is not proven
 
-- **The one command has no look-only mode.** Each installer it runs has its own check, and the command itself changes things (no ticket yet).
+- **`--check` has only been run against made-up machines.** A later workflow is meant to run it on a clean hosted Mac.
 - **It has not been run start to finish on a fresh Mac** with every part present (no ticket yet).
 - **Parts with an installer of their own are not moved by it.** `docs/PARTS.md` lists them, and no page yet says when each needs a re-run (no ticket yet).
 - **The review jobs' move onto work teams, and the sweep's first load,** are separate steps that this page does not walk (no ticket yet).

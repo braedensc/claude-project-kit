@@ -14,11 +14,8 @@ The formats it reads and writes: `docs/PIPELINE-CONTRACT.md` section 28, and sec
 - **Nothing installs it yet.** Its installer comes with the first lane that moves.
 - **No real session goes through it yet.** Its selftest runs it against a stand-in program.
 
-Two pieces come before any lane moves:
-
-- Limits on time, memory and disk for every run (KIT-643).
-- Each kind of session as measured data, the kit's guard from a root-owned copy, and a live probe of
-  the walls as the role account (KIT-704).
+One piece comes before any lane moves: each kind of session as measured data, the kit's guard
+from a root-owned copy, and a live probe of the walls as the role account (KIT-704).
 
 ## What it does
 
@@ -60,6 +57,37 @@ of that ticket finds none.
 The session's budget comes from the project's committed `delivery.json`: `budgets.perEffort` for the
 ticket's effort label.
 
+## Its limits
+
+Every run is held to three limits, and the machine to a floor. Each sits far above any real run: a
+limit hit in normal use is a defect.
+
+| Limit | What it measures | Default |
+| --- | --- | --- |
+| Time | The run's time since it started, checked every pass. | 360 minutes |
+| Memory | Its whole process tree's resident memory: its group, and every descendant by parent. | 8192 MB |
+| Disk | Its own folders: its workspace, its run folder and its temp folder. | 20480 MB |
+| The floor | The queue's own three lines: memory pressure, free disk and swap in use. | 25 GB free, pressure under critical, swap under 4 GB |
+
+- **Past a limit,** the run's whole tree gets SIGTERM, then SIGKILL after the grace. Its record says
+  `stopped`, with the limit as its reason (`limit:time`, `limit:memory` or `limit:disk`).
+- **Its whole tree, even what leaves it.** Each process the runner sees in a run's tree is kept,
+  with its start time, in the run's folder. When the run ends, any of them still alive is killed.
+  The start time tells it from a later process that reused its number.
+- **A tree of more than 512 processes** counts as past its memory limit, however little each holds.
+- **Below the floor,** no new session starts and requests wait. Running sessions finish.
+- **It measures only its own:** its runs' trees, by process group and parent, its runs' folders, and
+  three numbers about the whole machine. It reads nothing about any other app.
+- **Each incident is told once,** in plain words, in `<store_dir>/incidents.json`: a run stopped at a
+  limit, a run it could not measure, or the floor holding starts. A floor incident ends when there is
+  room again.
+
+Good: a session's tree passes 8 GB. It is stopped, its record says `limit:memory`, and one line is told.
+Not: the same session is told about again on every pass.
+
+The health watch does not page from the incidents file yet. It learns the runner with the runner's
+installer, when the first lane moves.
+
 ## What a session is given
 
 - **Nothing from its workspace.** No settings, hooks, tool servers or `CLAUDE.md` load from it.
@@ -90,6 +118,7 @@ One JSON file. The example is `runner.example.json`. `~/` means the account's ow
 | `stop_grace_seconds` | After a stop, how long before the session is killed. | `30` |
 | `max_starts_per_ticket` | A runaway's limit on starts of one ticket and kind. | `20` |
 | `hold` | The watcher's hold file (contract section 20). Set, nothing starts. | none |
+| `limits` | `wall_minutes`, `memory_mb`, `disk_mb`, `check_seconds` (how often trees and folders are measured) and `room` (the floor). See "Its limits". | above |
 | `projects` | Each project: `repo` (the runner's own clone), `base`, `approval_states` per kind, `allowed_hosts`. | required |
 
 The four folders must not sit inside one another.
@@ -120,6 +149,7 @@ Each refusal says why, in the request's answer (`<store_dir>/taken/<id>.json`).
 | the project has no committed delivery.json | The project is not set up for the pipeline. |
 | `<name>` is not set | The sign-in token's variable is missing from the job's environment. |
 | the tracker could not be read | Nothing to do: the request waits, and the next pass tries again. |
+| the machine is below its floor | Free disk or memory. The request waits; it starts when there is room. |
 
 The runner refuses to start from inside a Claude session, or as root.
 
