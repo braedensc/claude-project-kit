@@ -316,7 +316,16 @@ What it does, in order:
      Two more questions come only when a list was not measured. If a list came back but
      could not be read, it asks about that list alone. It asks the same when a list names
      a tool server or a rule, like `mcp__linear__*`, only in a sentence. The sentence may
-     say the session holds those tools or that it does not, so you read it. If no helper
+     say the session holds those tools or that it does not, so you read it.
+
+     A line that may name a tool is never passed over in silence, however many clean lines
+     sit beside it (KIT-734). That covers a note such as `Read (and Bash)`, a sentence such
+     as `I also hold Bash and Write`, and a name wrapped in punctuation, such as `**Bash**`.
+     The probe shows you the line and asks the same question. An exact `mcp__` tool name
+     still stops the probe, wrapped in underscores or not. A line with no capital letter and
+     no `mcp__` in it, such as a code fence or `sorted by name`, names no tool and is
+     ignored. So is a lower-case sentence that uses `read` or `write` as a verb. A lower-case
+     `bash`, `webfetch` or `notebookedit` is not ignored: no English word looks like them. If no helper
      list came back, it says the helper was not measured and asks whether to sign anyway.
      If a helper list came back but the log shows no helper started, that list is **not
      counted**, even as prose. It says so and asks the same question. The record says
@@ -593,6 +602,11 @@ else happened (`created`, `already-filed`, `asked`, `no-proposal`, `no-message`,
   this happens on a live session is not yet seen. If the log shows no helper started, a
   helper list in the answer is not counted, and the record says so. A fenced tool named
   in it still stops the probe (KIT-261).
+- **A helper's list is the session's own words.** The probe asks about every line that may
+  name a tool (KIT-734). It cannot catch a paraphrase that names none, such as "a shell",
+  or a lower-case `read`, `write` or `edit`, which are also ordinary verbs. Only a helper
+  whose tools the runner records closes that. The dispatcher's log records the session's
+  tools, never a helper's.
 - **The duplicate check compares titles, not intent.**
 - **The heartbeat monitor watches the job, once the Stage E installer has run.** It reads
   `~/.stage-a/state/heartbeat.json` as its seventh job (`docs/HEARTBEAT-MONITOR.md`): a stale
