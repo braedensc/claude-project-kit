@@ -273,6 +273,7 @@ Code that is fine on a newer Python can break there, so one job runs on it.
 | Temp-leak sweeps | `ubuntu-24.04` | the runner's own, 3.12 |
 | CI on the newest image | `ubuntu-latest` | the newest 3.x |
 | Kit checks (Python 3.9, the Mac's) | `macos-15` | `/usr/bin/python3`, 3.9.x |
+| Install proof (a clean Mac) | `macos-15` | `/usr/bin/python3`, 3.9.x |
 | The Mac | the owner's | `/usr/bin/python3`, 3.9.6 |
 
 The Python 3.9 job (`.github/workflows/ci-mac-python.yml`) puts a `python3` link to
@@ -306,6 +307,42 @@ a choice made in a PR:
    own Kit checks, now on the new image, are the proof.
 3. `python3 scripts/check_runner_pin.py` fails any `-latest` runner outside the newest-image
    workflow, so a new workflow cannot quietly bring the problem back.
+
+## The one command on a clean Mac (KIT-745)
+
+The job **Install proof (a clean Mac)** (`.github/workflows/install-proof.yml`) runs
+`scripts/pipeline_install.py --check` on a hosted `macos-15` machine that has never seen the kit,
+with `HOME` set to a new empty folder. It runs by hand and on a pull request that touches the
+install script, `pipeline_ask.py`, the parts list, its schema or the workflow itself. It is **not a
+required context** until the owner adds it, so a failure turns the PR red without blocking the merge.
+It holds and uses no secret.
+
+**What it proves.**
+
+- Each run records the image (`sw_vers`, `/usr/bin/python3 -V`, `xcode-select -p`), so the log says what "clean" meant.
+- The look exits 10 (a Mac with no host has things waiting on a person), prints one line for every
+  part in `pipeline-parts.json` or names it on the "No check of their own" line, and reads no part
+  that is not set up as "up to date".
+- The look changes nothing. The empty home, `/Library/LaunchDaemons`, `/Library/LaunchAgents` and
+  `/etc/claude-pipeline` are listed with sha256 hashes before and after and must be identical, and
+  `git status --porcelain --ignored` stays empty. The job then plants a file and shows that the
+  comparison fails, so a green run is never a comparison that compared nothing.
+- The three refusals hold: an agent marker exits 3, root exits 2, and no terminal exits 2, each
+  printing only its refusal. Nothing the job printed has a token shape.
+
+**What it does not prove.** A host: the account, session runner and public address do not exist on
+a runner. Real services: no tracker, code host or chat product, and no key for any of them. Real
+passwords: it only looks, and a hosted runner's `sudo` asks for none. A person at a terminal: the
+first screen, the consent page and the questions never run. And a Mac without the developer tools,
+since the image has them.
+
+**Moving its image pin.** In one PR, change `runs-on: macos-15` in `install-proof.yml` and in
+`ci-mac-python.yml` (the two are meant to share an image) to the new image name.
+`python3 scripts/check_runner_pin.py` fails any `-latest` label. The PR's own run on the new
+image is the proof: read the first step's macOS version, `/usr/bin/python3 -V` and developer-tools
+line, and say in the PR if any of them changed, since that Python is the one the owner's Mac runs.
+If the counts or the listings then fail, that is a finding about the image or the command; do not
+loosen the check to pass.
 
 ## Standard library only
 
