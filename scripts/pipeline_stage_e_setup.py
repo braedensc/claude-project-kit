@@ -6301,11 +6301,17 @@ def heartbeat_probe(stage_home, pairs):
 
 
 def _daemon_floors(ctx, labels):
-    """{label: the second this installer loaded it, or None where it has no record}."""
+    """{label: the first whole second a heartbeat may count from, or None where this installer
+    has no record of loading the daemon}.
+
+    THE SECOND AFTER THE LOAD, not the load's own. Both sides are whole seconds, so a heartbeat
+    the old job wrote just before it exited cannot be told from one the new job wrote, if the
+    load fell in the same second. The floor takes the safe side: a new pass quicker than that
+    waits one more pass, and an old heartbeat never passes as proof of the new load."""
     loads = (ctx.state.data.get("notes") or {}).get(DAEMON_LOADS_NOTE)
     loads = loads if isinstance(loads, dict) else {}
-    return dict((l, loads[l] if isinstance(loads.get(l), int) and not isinstance(loads.get(l), bool)
-                 else None) for l in labels)
+    return dict((l, loads[l] + 1 if isinstance(loads.get(l), int)
+                 and not isinstance(loads.get(l), bool) else None) for l in labels)
 
 
 def _record_load(ctx, label, when):
@@ -9100,6 +9106,30 @@ def _selftest_body():
                isinstance(rowT, Unknown) and "1 of 3" in rowT.what
                and labels_e[2].rsplit(".", 1)[1] in rowT.what,
                "a heartbeat newer than another daemon's load counted for this one: %r" % (rowT,))
+
+        # THE LOAD'S OWN SECOND (Stage E's review). In whole seconds a heartbeat the old job wrote
+        # just before it exited cannot be told from one the new job wrote in the second of the
+        # load, so the first second that counts is the one after. A new pass quicker than that
+        # waits one more pass; an old heartbeat never passes as proof of the new load.
+        def _beat_at(offset):
+            def _set(runX):
+                loads = (runX.ctx_ref.state.data.get("notes") or {}).get(DAEMON_LOADS_NOTE) or {}
+                if len(loads) == 3 and not getattr(runX, "_set", False):
+                    runX._set = True
+                    for lb in labels_e:
+                        runX.beat(lb, loads[lb] + offset)
+            return _set
+        ctxSS, runSS = _enable_world("same-second", clock=_beat_at(0))
+        rowSS, _pSS = _enable(ctxSS)
+        ctxNS, runNS = _enable_world("next-second", clock=_beat_at(1))
+        rowNS, _pNS = _enable(ctxNS)
+        expect("KIT-702 a heartbeat from the load's own second is not proof",
+               isinstance(rowSS, Unknown) and "3 of 3" in rowSS.what
+               and "from before the load" in rowSS.what,
+               "a heartbeat written in the second of the load passed as proof: %r" % (rowSS,))
+        expect("KIT-702 a heartbeat from the second after the load is proof",
+               isinstance(rowNS, tuple) and rowNS[0] is False and "after its load" in rowNS[1],
+               "a heartbeat written the second after the load did not pass: %r" % (rowNS,))
 
         # `verify` reads the same ledger and says the same thing in the same words.
         def _loaded_ctx(tag, beats_at, recorded=True):

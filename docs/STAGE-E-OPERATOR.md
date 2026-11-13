@@ -201,7 +201,9 @@ heartbeat left from before the load came from the old code. It says nothing abou
 just loaded. The installer records the second it loads each daemon, and holds each heartbeat
 to its own daemon's load. That covers the load in `enable`, the one the `code` step makes as
 soon as the clone has moved, and the one a stopped run makes on its way out. A daemon is
-proven when its heartbeat is newer than that.
+proven when its heartbeat was written in a later second than its load. One written in the
+load's own second cannot be told from one the old job left just before it exited, so it waits
+for the next pass.
 
 If a daemon is not proven within 90 seconds, the step ends `UNKNOWN`, never done. It names
 each daemon with `no heartbeat` or `its heartbeat is from before the load`. `verify` reads the
