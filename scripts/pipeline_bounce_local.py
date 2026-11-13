@@ -121,11 +121,12 @@ WHAT HAPPENS WHEN A PULL REQUEST GOES CONFLICTING (the dispatched lane)
 
   `main` moves after a sibling merges, and a dispatcher's pull request goes CONFLICTING
   with its session idle. The conflict monitor (scripts/pr_conflict.py, in Actions) posts
-  a fix `request` on the PR and keeps the clock and the three-per-PR budget. A LOCAL
-  waker must not take that request: it would start a fresh session outside the sandbox,
-  over a branch a sandboxed session wrote. This driver answers it instead, the way it
-  answers everything — a reply in the original session's own thread, so the dispatcher
-  resumes that session in its own worktree and sandbox.
+  a fix `request` on the PR and keeps the clock and the per-PR budget (three, or the limit
+  the repository sets, which each request states). A LOCAL waker must not take that
+  request: it would start a fresh session outside the sandbox, over a branch a sandboxed
+  session wrote. This driver answers it instead, the way it answers everything — a reply
+  in the original session's own thread, so the dispatcher resumes that session in its own
+  worktree and sandbox.
 
   The trigger is GitHub's `mergeable == CONFLICTING` AND an open, unclaimed request from
   the Actions bot (read with the monitor's own marker rules). Ledger row first
@@ -443,7 +444,7 @@ sys.path.insert(0, HERE)
 import gh_fallback  # noqa: E402  (resolve_repo; pr-comment is the ONE GitHub write, via prl)
 import pipeline_review_local as prl  # noqa: E402  (resolve_ticket, post_comment, SEVERITY_RANK)
 # The conflict loop's marker grammar has ONE owner. Only its pure readers and writers are
-# used here (episode_state, marker, BRANCH_RE, MAX_FIX_REQUESTS); --selftest asserts this
+# used here (episode_state, marker, BRANCH_RE, fix_limit); --selftest asserts this
 # file never reaches for the waker half, which is the one that starts sessions.
 import pr_conflict as prc  # noqa: E402
 import pipeline_routing_tags as routing  # noqa: E402  (what a routing directive is — KIT-381)
@@ -1140,7 +1141,7 @@ def render_reprompt(*, bounce_no, max_bounces, threshold, branch, pr_number, pr_
     ])
 
 
-def render_conflict_reprompt(*, conflict_no, episode, branch, base, pr_number, pr_url, owner_repo):
+def render_conflict_reprompt(*, conflict_no, limit, episode, branch, base, pr_number, pr_url, owner_repo):
     """The fixed conflict-fix re-prompt, sent as a THREAD reply so the dispatcher resumes the
     session that owns the branch — in its own worktree and its own sandbox. Nothing in it is
     copied from a reviewer or a ticket: the branch and base are GitHub's, both checked
@@ -1150,8 +1151,7 @@ def render_conflict_reprompt(*, conflict_no, episode, branch, base, pr_number, p
     return "\n".join([
         "**Stage E conflict fix %d of %d** — an automated re-prompt from the bounce driver for "
         "PR #%d (%s). Nobody is watching this thread live: reply here, never to a person, and "
-        "never try to ask an interactive user anything." % (conflict_no, prc.MAX_FIX_REQUESTS,
-                                                            pr_number, pr_url),
+        "never try to ask an interactive user anything." % (conflict_no, limit, pr_number, pr_url),
         "",
         "`%s` moved after this pull request went green, and GitHub now reports it CONFLICTING, "
         "so its required checks are not running. Resolve it in this worktree, on branch %s:"
@@ -1172,12 +1172,11 @@ def render_conflict_reprompt(*, conflict_no, episode, branch, base, pr_number, p
         "_%s %s#%d episode=%d k=%d — conflict fix %d of %d, sent by the Stage E bounce driver in "
         "answer to the conflict monitor's request. The driver's ledger and the monitor's request "
         "count are the budget; this line is their visible record._"
-        % (CONFLICT_MARKER, owner_repo, pr_number, episode, conflict_no, conflict_no,
-           prc.MAX_FIX_REQUESTS),
+        % (CONFLICT_MARKER, owner_repo, pr_number, episode, conflict_no, conflict_no, limit),
     ])
 
 
-def render_conflict_ack(episode, conflict_no):
+def render_conflict_ack(episode, conflict_no, limit):
     """The PR comment that claims the conflict monitor's request. Its FIRST LINE is the
     monitor's own `ack` marker, so the monitor holds off its page — which counts only when
     the token this driver posts with belongs to a writer on the repository. When it does
@@ -1186,7 +1185,7 @@ def render_conflict_ack(episode, conflict_no):
         prc.marker("ack", episode),
         "Stage E bounce driver: this conflict was sent back to the session that opened the PR, "
         "in its tracker thread (conflict fix %d of %d). The fix runs in that session's own "
-        "worktree and sandbox. Nothing here merges or approves." % (conflict_no, prc.MAX_FIX_REQUESTS),
+        "worktree and sandbox. Nothing here merges or approves." % (conflict_no, limit),
     ])
 
 
@@ -1811,8 +1810,10 @@ def conflict_view(mergeable, episode, rows, head_sha):
 
     THE MONITOR KEEPS THE CLOCK AND THE BUDGET; THIS DRIVER ONLY ANSWERS IT. A conflict is
     sent back to the session only in answer to an open, unclaimed fix `request`, so the
-    monitor's three-per-PR lifetime budget bounds it — and the ledger caps it again at the
-    same number, so a forged or reset request can never buy a fourth. States:
+    monitor's per-PR lifetime budget bounds it — and the ledger caps it again at the same
+    number, so a forged or reset request can never buy one more. The number is the one the
+    request itself states (`prc.fix_limit`: three unless the repository set another, read only
+    from a request the Actions bot wrote), never a constant of this file's. States:
 
       request   an open request nobody has claimed, budget left — send the fix (action
                 `conflict`)
@@ -1834,7 +1835,8 @@ def conflict_view(mergeable, episode, rows, head_sha):
     n = episode.get("episode") or 0
     sent = [r for r in (rows or []) if r.get("outcome") == "conflict"]
     mine = [r for r in sent if r.get("episode") == n]
-    view = {"episode": n, "spent": len(sent), "head_moved": False}
+    limit = prc.fix_limit(latest)       # the monitor's limit, as the request states it (KIT-670)
+    view = {"episode": n, "spent": len(sent), "head_moved": False, "limit": limit}
     if latest is None:
         return dict(view, state="none", reason="GitHub reports this PR CONFLICTING and the conflict "
                                                "monitor has posted no fix request for it (not deployed "
@@ -1854,10 +1856,15 @@ def conflict_view(mergeable, episode, rows, head_sha):
     if episode.get("ack") or episode.get("result"):
         return dict(view, state="claimed", reason="episode %d's fix request was claimed by another "
                                                   "waker" % n)
-    if len(sent) >= prc.MAX_FIX_REQUESTS:
+    if len(sent) >= limit:
+        if not limit:
+            return dict(view, state="spent", reason="GitHub reports this PR CONFLICTING and the conflict "
+                                                    "monitor's limit for it is 0 fixes — none is sent; "
+                                                    "the monitor pages")
         return dict(view, state="spent", reason="GitHub reports this PR CONFLICTING and this driver has "
-                                                "already sent %d conflict fixes for it — no more are "
-                                                "sent; the monitor pages" % len(sent))
+                                                "already sent %d conflict fixes for it (the monitor's "
+                                                "limit is %d) — no more are sent; the monitor pages"
+                                                % (len(sent), limit))
     return dict(view, state="request", conflict_no=len(sent) + 1,
                 reason="GitHub reports this PR CONFLICTING and the conflict monitor asked for a fix "
                        "(episode %d)" % n)
@@ -1983,9 +1990,9 @@ def decide(*, pr_open, is_draft, is_fork, ticket_terminal, ticket_state, trigger
     state = (conflict or {}).get("state")
     if state == "request":
         return {"action": "conflict", "bounce_no": None, "episode": conflict["episode"],
-                "conflict_no": conflict["conflict_no"],
+                "conflict_no": conflict["conflict_no"], "limit": conflict["limit"],
                 "reason": "%s — sending conflict fix %d of %d to the session's thread"
-                          % (conflict["reason"], conflict["conflict_no"], prc.MAX_FIX_REQUESTS)}
+                          % (conflict["reason"], conflict["conflict_no"], conflict["limit"])}
     if state == "ours":
         if conflict["head_moved"]:
             return {"action": "conflict-result", "bounce_no": None, "episode": conflict["episode"],
@@ -3298,7 +3305,7 @@ def describe(sit, verdict):
         head = "BLOCKED (no push since bounce %d)" % (verdict.get("bounce_no") or 0)
     elif action == "conflict":
         head = "CONFLICT FIX %d of %d (episode %d)" % (verdict.get("conflict_no") or 0,
-                                                       prc.MAX_FIX_REQUESTS, verdict.get("episode") or 0)
+                                                       verdict.get("limit") or 0, verdict.get("episode") or 0)
     elif action == "conflict-result":
         head = "CONFLICT UNRESOLVED (episode %d)" % (verdict.get("episode") or 0)
     elif action == "unknown":
@@ -3887,11 +3894,11 @@ def perform_conflict(sit, verdict, cfg, state_dir, dry_run):
     if not (prc.BRANCH_RE.match(sit["branch"]) and prc.BRANCH_RE.match(base)):
         raise Decline("the branch or base name has characters the driver will not put in a prompt; "
                       "no conflict fix was sent and the conflict monitor pages the owner", sit)
-    episode, conflict_no = verdict["episode"], verdict["conflict_no"]
-    body = render_conflict_reprompt(conflict_no=conflict_no, episode=episode, branch=sit["branch"],
-                                    base=base, pr_number=sit["pr"], pr_url=sit.get("pr_url") or "",
-                                    owner_repo=sit["repo"])
-    ack = render_conflict_ack(episode, conflict_no)
+    episode, conflict_no, limit = verdict["episode"], verdict["conflict_no"], verdict["limit"]
+    body = render_conflict_reprompt(conflict_no=conflict_no, limit=limit, episode=episode,
+                                    branch=sit["branch"], base=base, pr_number=sit["pr"],
+                                    pr_url=sit.get("pr_url") or "", owner_repo=sit["repo"])
+    ack = render_conflict_ack(episode, conflict_no, limit)
     hits = secret_hits("\n".join((body, ack)))
     if hits:
         raise Decline("%s (%s); no conflict fix was sent" % (SECRET_DECLINE_REASON, ", ".join(hits)), sit)
@@ -3915,7 +3922,7 @@ def perform_conflict(sit, verdict, cfg, state_dir, dry_run):
         announce_could_not(sit, "Stage E conflict fix %d of %d was counted but could not be delivered "
                                 "to the session's thread (%s); nothing claimed the fix request, so the "
                                 "conflict monitor pages the owner"
-                           % (conflict_no, prc.MAX_FIX_REQUESTS, exc.public or exc), state_dir, False)
+                           % (conflict_no, limit, exc.public or exc), state_dir, False)
         return EXIT_USAGE
     append_row(lpath, repo=sit["repo"], pr=sit["pr"], outcome="conflict-delivered",
                episode=episode, conflict_no=conflict_no, ref=ref)
@@ -7451,7 +7458,7 @@ def selftest():
             check("the conflict fix goes to the session's ROOT comment", (reply_call[1], reply_call[2]),
                   ("iss-uuid", "root-c"))
             reply_body = reply_call[3]
-            for must in ("conflict fix 1 of %d" % prc.MAX_FIX_REQUESTS, "git merge origin/main",
+            for must in ("conflict fix 1 of %d" % prc.fix_limit(None), "git merge origin/main",
                          "never rebase", "SAME branch feat/eng-41-x", "never --force",
                          "Never merge or approve", CONFLICT_MARKER):
                 check("the conflict fix says %r" % must, must in reply_body, True)
@@ -7504,6 +7511,35 @@ def selftest():
             check("the ledger caps conflict fixes at the monitor's budget, whatever GitHub shows",
                   (rc, calls, "no more are sent" in out), (EXIT_OK, [], True))
 
+        # KIT-670: a request that states another limit is answered up to THAT limit, and says it
+        # in the words the session reads — "conflict fix 4 of 5" — on the thread reply, on its
+        # record line and on the PR's ack. Past it, nothing is sent; at a stated 0, nothing ever is.
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(err):
+            for n in (1, 2, 3):
+                append_row(ledger_path(tmp), repo="o/r", pr=41, outcome="conflict", episode=n,
+                           conflict_no=n, head_sha="old")
+            world["pr_comments"] = [gh_comment(prc.marker("request", 4, limit="five"), bot=True)]
+            rc, out = pass_(tmp)
+            reply4 = ([c[3] for c in calls if c[0] == "reply"] or [""])[0]
+            ack4 = ([c[2] for c in calls if c[0] == "prComment"] or [""])[0]
+            check("KIT-670 a request that states a limit of 5 gets a 4th fix, and says '4 of 5' to the "
+                  "session, on the record line and on the PR",
+                  (rc, kinds(), "Stage E conflict fix 4 of 5" in reply4, "conflict fix 4 of 5, sent by" in reply4,
+                   "(conflict fix 4 of 5)" in ack4, "CONFLICT FIX 4 of 5 (episode 4)" in out),
+                  (EXIT_OK, ["reply", "prComment"], True, True, True, True))
+            append_row(ledger_path(tmp), repo="o/r", pr=41, outcome="conflict", episode=5,
+                       conflict_no=5, head_sha="old")
+            world["pr_comments"] = [gh_comment(prc.marker("request", 6, limit="five"), bot=True)]
+            rc, out = pass_(tmp)
+            check("KIT-670 …and a sixth, past the stated 5, is not sent",
+                  (rc, calls, "no more are sent" in out), (EXIT_OK, [], True))
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(err):
+            world["pr_comments"] = [gh_comment(prc.marker("request", 1, limit="zero"), bot=True)]
+            rc, out = pass_(tmp)
+            check("KIT-670 a request that states a limit of 0 is answered not at all, and says why",
+                  (rc, calls, os.path.exists(ledger_path(tmp)), "limit for it is 0" in out),
+                  (EXIT_OK, [], False, True))
+
         with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(err):
             world.update(pr=conflicted, pr_comments=[request1],
                          issue=dict(live_issue, comments={"nodes": []}))
@@ -7544,6 +7580,83 @@ def selftest():
         world["pr"] = open_pr
     finally:
         globals().update(saved)
+
+    # 10r. ONE LIMIT (KIT-670). A repository can change how many fixes the conflict monitor asks
+    #      for (`monitor --max-fix-requests N`). This driver stopped at a constant 3 whatever the
+    #      monitor was told, so at 5 the monitor kept waiting on fixes 4 and 5 that never came.
+    #      The REAL monitor writes the comments below, on the monitor selftest's own stand-in for
+    #      GitHub (`prc.FakeGh`), and the REAL driver reads them: both must stop at the same count.
+    def both_stop_at(limits):
+        """(requests the monitor made, fixes the driver sent, pages the monitor posted) for one
+        pull request that goes CONFLICTING once per entry of `limits` — the limit the monitor runs
+        under that time — each fixed once the driver answered."""
+        gh = prc.FakeGh([prc._pr(41)])
+        rows, sent = [], 0
+        for limit in limits:
+            mute = dict(sleep=lambda *_: None, summary=lambda *_: None, max_fix_requests=limit)
+            gh.prs[0]["mergeable"] = "CONFLICTING"
+            with contextlib.redirect_stdout(io.StringIO()):
+                prc.monitor(gh, prc.NOW, **mute)
+            view = conflict_view("CONFLICTING", prc.episode_state(gh.comments(41)), rows, "h1")
+            if view and view["state"] == "request":
+                sent += 1
+                rows.append({"outcome": "conflict", "episode": view["episode"],
+                             "conflict_no": view["conflict_no"]})
+                gh.comment(41, prc.marker("ack", view["episode"]))      # the driver claims it
+            gh.prs[0]["mergeable"] = "MERGEABLE"                        # the session fixed it
+            with contextlib.redirect_stdout(io.StringIO()):
+                prc.monitor(gh, prc.NOW, **mute)                        # the episode ends
+        pages = sum(1 for c in gh.comments(41) if c["body"].startswith("<!-- pr-conflict:page"))
+        return prc.episode_state(gh.comments(41))["requests"], sent, pages
+
+    for monitor_limit in (5, 0, 3, 1, 20):
+        check("KIT-670 at a monitor limit of %d the monitor asks and this driver sends the same count, "
+              "and every conflict after it is paged" % monitor_limit,
+              both_stop_at([monitor_limit] * (monitor_limit + 2)), (monitor_limit, monitor_limit, 2))
+    # A repository can change its limit while a pull request lives: each request states the one in
+    # force when it was written, and the driver follows the request in front of it.
+    check("KIT-670 raised from 3 to 5 after a page, the pull request gets two more fixes — five in all, "
+          "with the monitor",
+          both_stop_at([3] * 4 + [5] * 4), (5, 5, 3))
+    check("KIT-670 lowered from 5 to 2 after three fixes, no more are asked for or sent",
+          both_stop_at([5] * 3 + [2] * 2), (3, 3, 2))
+
+    # …and the limit is read from the request the Actions bot wrote, nowhere else. A request is
+    # episode `sent + 1` here, after `sent` fixes this driver already sent for earlier episodes.
+    def stands(comments, sent):
+        """(state, limit) this driver gives a CONFLICTING PR with these comments and `sent` fixes sent."""
+        rows = [{"outcome": "conflict", "episode": n, "conflict_no": n} for n in range(1, sent + 1)]
+        try:
+            view = conflict_view("CONFLICTING", prc.episode_state(comments), rows, "h1")
+        except Exception as exc:     # the point of some cases: a bad limit must never raise
+            return "raised", repr(exc)
+        return view["state"], view["limit"]
+
+    def ask(n, **attrs):
+        return prc._bot(prc.marker("request", n, **attrs), 5)
+
+    def forged_ask(n, **attrs):
+        return prc._human(prc.marker("request", n, **attrs), 1)
+
+    check("KIT-670 a request that states no limit means 3: the third fix is sent, a fourth is not",
+          (stands([ask(3)], 2), stands([ask(4)], 3)), (("request", 3), ("spent", 3)))
+    check("KIT-670 a request that states 5 is answered up to 5, and one that states 0 is answered not at "
+          "all — 0 is not read as the default",
+          (stands([ask(5, limit="five")], 4), stands([ask(6, limit="five")], 5),
+           stands([ask(1, limit="zero")], 0)),
+          (("request", 5), ("spent", 5), ("spent", 0)))
+    check("KIT-670 a limit that is no whole number from 0 to 20 is the default, never an exception: "
+          "words the grammar takes mean 3, and text it refuses is no request at all",
+          ([stands([ask(4, limit=w)], 3) for w in ("banana", "twenty-one", "minus-one", "-")],
+           [stands([prc._bot("<!-- pr-conflict:request episode=4 limit=%s -->" % w, 5)], 3)
+            for w in ("5", "25", "-1", "Five", "")]),
+          ([("spent", 3)] * 4, [("none", 3)] * 5))
+    check("KIT-670 a request anyone but the Actions bot wrote states nothing: it can neither raise the "
+          "limit nor lower it",
+          (stands([ask(4), forged_ask(5, limit="twenty")], 3),
+           stands([ask(6, limit="five"), forged_ask(7, limit="twenty")], 5),
+           stands([ask(4, limit="five"), forged_ask(5, limit="one")], 3)),
+          (("spent", 3), ("spent", 5), ("request", 5)))
 
     # 10o. C1: the one-shot pass the LaunchDaemon invokes. It leaves a heartbeat on every
     #      path — the §13 distinction applied to the daemon itself, since "ran, nothing to
@@ -7895,6 +8008,12 @@ def selftest():
           [name for name in ("wake", "wake_pass", "run", "FIX_PROMPT", "refuse_waker", "Gh")
            if ("prc." + name + "(") in src or ("prc." + name + ")") in src
            or ("prc." + name + ",") in src or ("prc." + name + "\n") in src], [])
+    # KIT-670: ONE source for the fix limit. This file holds no number of its own and never reads
+    # the module's default directly: every limit it counts against or prints comes from the
+    # request, through the one reader. (The cases at 10r prove it by behaviour; this one is the
+    # tripwire for the next edit. Needles built from parts so no check counts itself.)
+    check("KIT-670 the driver reads the fix limit through prc.fix_limit and never the default constant",
+          (("prc." + "MAX_FIX_REQUESTS") in src, ("prc." + "fix_limit(") in src), (False, True))
 
     if failures:
         print("FAIL pipeline_bounce_local selftest:")

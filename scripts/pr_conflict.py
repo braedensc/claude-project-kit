@@ -115,11 +115,17 @@ MARKERS (the whole producer/consumer contract)
 
   The FIRST LINE of a comment, exactly:
 
-    <!-- pr-conflict:request episode=N -->                      github-actions[bot]
+    <!-- pr-conflict:request episode=N [limit=five] -->         github-actions[bot]
     <!-- pr-conflict:page episode=N reason=budget|fork|stacked -->  github-actions[bot]
     <!-- pr-conflict:escalated episode=N -->                    github-actions[bot]
     <!-- pr-conflict:ack episode=N -->                          OWNER/MEMBER/COLLABORATOR
     <!-- pr-conflict:result episode=N outcome=O -->             OWNER/MEMBER/COLLABORATOR
+
+  A request states its fix limit when that is not the default of 3: `limit=` and the number,
+  0 to 20, spelled in letters. The bounce driver cannot read the monitor's argument, so it
+  reads the limit here (`fix_limit`) and a request that states none means 3. Letters, because
+  an older copy of this grammar takes none but letters in a value and would drop a request
+  with a digit in it. Anything else in the attribute is the default.
 
   Bot markers count only from the Actions bot, so the budget cannot be reset by a
   comment. Waker markers count only from a writer, and only when posted after the
@@ -173,6 +179,20 @@ MAX_FIX_REQUESTS = 3          # automated attempts per PR, lifetime; the 4th con
 # means NOTHING HERE ANSWERS: page a person at detection rather than ask for a fix nobody
 # can do (KIT-175). The budget is the whole difference between the two first-conflict
 # paths, so it is the only knob that needs to exist for that.
+# ONE SOURCE (KIT-670). The monitor reads the limit once, from its argument. Each request it
+# writes STATES a limit that is not the default (`limit=five`), and the bounce driver reads the
+# limit from that request through `fix_limit`: it holds no number of its own, so the two cannot
+# stop at different counts. A request that states none means MAX_FIX_REQUESTS.
+# The number is spelled in letters on purpose. `MARKER_RE` takes only lowercase letters and
+# hyphens in a value, and every copy of this file already deployed (a monitor in another
+# repository, a waker, the role account's clone) runs that grammar until it is updated: `limit=5`
+# would read to one of them as no marker at all, and a request nobody can read is a request
+# nobody answers. `limit=five` they read and ignore. A reader ships before its writer.
+LIMIT_WORDS = ("zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+               "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen",
+               "seventeen", "eighteen", "nineteen", "twenty")
+FIX_LIMIT_MAX = len(LIMIT_WORDS) - 1     # 20: the most either half counts, or takes as an argument
+LIMIT_BY_WORD = {word: n for n, word in enumerate(LIMIT_WORDS)}
 ACK_DEADLINE_MIN = 15
 RESULT_DEADLINE_MIN = 120     # a pass may queue several sessions of up to --timeout-min each
 SETTLE_ATTEMPTS = 5           # bounded re-query while GitHub computes `mergeable` lazily
@@ -227,6 +247,30 @@ class Refusal(Exception):
 def marker(kind, episode, **attrs):
     extra = "".join(f" {k}={v}" for k, v in attrs.items())
     return f"<!-- pr-conflict:{kind} episode={episode}{extra} -->"
+
+
+def limit_attrs(limit):
+    """The attributes a request marker carries to state `limit` (KIT-670): none for the default,
+    which a marker without the attribute already means, so a repository on the default writes the
+    bytes it always wrote. Raises ValueError for a limit no request could state."""
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 0 <= limit <= FIX_LIMIT_MAX:
+        raise ValueError(f"a fix limit is a whole number from 0 to {FIX_LIMIT_MAX}, not {limit!r}")
+    return {} if limit == MAX_FIX_REQUESTS else {"limit": LIMIT_WORDS[limit]}
+
+
+def fix_limit(mark):
+    """The fix limit a parsed request marker states, else MAX_FIX_REQUESTS (KIT-670). THE ONE
+    PLACE A LIMIT IS READ: the bounce driver counts against this and nothing else.
+
+    Only a request marker states one, and `parse_marker` has already refused a request from
+    anyone but the Actions bot, so a marker anybody else writes states nothing. The same
+    attribute on any other kind is not read. A value that is missing, misspelled, outside 0 to
+    FIX_LIMIT_MAX or not text is the default, never an exception, and never more than the ceiling."""
+    if not isinstance(mark, dict) or mark.get("kind") != "request":
+        return MAX_FIX_REQUESTS
+    attrs = mark.get("attrs")
+    word = attrs.get("limit") if isinstance(attrs, dict) else None
+    return LIMIT_BY_WORD.get(word, MAX_FIX_REQUESTS) if isinstance(word, str) else MAX_FIX_REQUESTS
 
 
 def _ts(value):
@@ -494,7 +538,7 @@ def _headline(pr, base):
 def request_body(pr, episode, attempt, base, budget=None):
     budget = MAX_FIX_REQUESTS if budget is None else budget
     return "\n".join([
-        marker("request", episode), _headline(pr, base), "",
+        marker("request", episode, **limit_attrs(budget)), _headline(pr, base), "",
         f"**A fix has been requested** (automated attempt {attempt} of {budget} on this PR). "
         "It is acknowledged here by whichever owns this branch's session: the conflict waker on the "
         "machine where a local session worked in its worktree, or — for a dispatcher's PR — the "
@@ -570,6 +614,7 @@ def settle(fetch, sleep, attempts=SETTLE_ATTEMPTS, delay=SETTLE_DELAY_S):
 def monitor(gh, now, sleep=time.sleep, dry_run=False, summary=print, page_to=(),
             max_fix_requests=None):
     budget = MAX_FIX_REQUESTS if max_fix_requests is None else int(max_fix_requests)
+    limit_attrs(budget)   # a limit no request could state is refused before anything is read or written
     act = (lambda *a, **k: None) if dry_run else None
     add_label = act or gh.add_label
     remove_label = act or gh.remove_label
@@ -1084,6 +1129,16 @@ def _pr(n, mergeable="CONFLICTING", labels=(), draft=False, fork=False, branch=N
 
 
 def selftest():
+    import contextlib
+    import io
+    # THE WORD TABLE IS THE SPEC (KIT-670): a fix limit is a whole number from 0 to 20, spelled as one
+    # of 21 distinct runs of letters, the one thing the grammar already deployed reads. Every limit
+    # case below leans on it, so a table that is wrong stops the battery here, said, not part-way.
+    if not (FIX_LIMIT_MAX == 20 and len(LIMIT_WORDS) == 21 and len(set(LIMIT_WORDS)) == 21
+            and all(re.fullmatch(r"[a-z-]+", w) for w in LIMIT_WORDS)):
+        print("pr_conflict selftest: FAIL\n  - the 21 limit words must be distinct runs of letters, "
+              "0 to 20, the one thing the deployed grammar reads")
+        return 1
     failures = []
     not_checked = []   # cases that cannot run in this checkout, said by name (KIT-166)
 
@@ -1219,11 +1274,155 @@ def selftest():
     gh = FakeGh([_pr(22)], {22: [_bot(marker("request", i), 500 - i) for i in (1, 2, 3)]})
     run_monitor(gh, max_fix_requests=5)
     body5 = [w for w in gh.writes if w[0] == "comment"][0][2]
-    expect(body5.startswith(marker("request", 4)) and "attempt 4 of 5" in body5,
+    expect(body5.startswith(marker("request", 4, limit="five")) and "attempt 4 of 5" in body5,
            f"a raised budget must keep asking, and say the budget it is counting: {body5[:200]}")
     expect(main(["monitor", "--repo", "acme/widgets", "--max-fix-requests", "-1",
                  "--dry-run"]) == 2,
            "a negative budget must be a usage error, never a silent default")
+
+    # 2c. ONE LIMIT, the monitor's half (KIT-670). The bounce driver cannot read the monitor's
+    #     argument, so each request STATES the limit it was written under, and the driver counts
+    #     against that one number. A request on the default states nothing and is the bytes it
+    #     always was. The driver's half is in pipeline_bounce_local.py's selftest (10r).
+    def conflicts_at(limit, conflicts):
+        """(requests, pages) the monitor leaves on one PR that goes CONFLICTING `conflicts` times,
+        each fixed before the next, run under `limit`."""
+        g = FakeGh([_pr(23)])
+        with contextlib.redirect_stdout(io.StringIO()):
+            for _ in range(conflicts):
+                for merge_state in ("CONFLICTING", "MERGEABLE"):
+                    g.prs[0]["mergeable"] = merge_state
+                    run_monitor(g, max_fix_requests=limit)
+        marks = [parse_marker(c) for c in g.comments(23)]
+        return (sum(1 for m in marks if m and m["kind"] == "request"),
+                sum(1 for m in marks if m and m["kind"] == "page"))
+    for limit, conflicts, want in ((5, 7, (5, 2)), (0, 2, (0, 2)), (None, 5, (3, 2)), (1, 3, (1, 2)),
+                                   (20, 22, (20, 2))):
+        got = conflicts_at(limit, conflicts)
+        expect(got == want, f"limit {limit}: (requests, pages) after {conflicts} conflicts: got {got}, want {want}")
+    gh = FakeGh([_pr(23)], {23: [_bot(marker("request", i), 500 - i) for i in (1, 2, 3)]})
+    run_monitor(gh, max_fix_requests=5)
+    req5 = [w for w in gh.writes if w[0] == "comment"][0][2]
+    expect(req5.split("\n", 1)[0] == marker("request", 4, limit="five") and "attempt 4 of 5" in req5
+           and fix_limit(parse_marker(_bot(req5, 0))) == 5,
+           f"a request written under a limit of 5 must state it, as the count it prints: {req5[:120]}")
+    gh = FakeGh([_pr(24)])
+    run_monitor(gh)
+    req3 = [w for w in gh.writes if w[0] == "comment"][0][2]
+    expect(req3.split("\n", 1)[0] == marker("request", 1) and fix_limit(parse_marker(_bot(req3, 0))) == 3,
+           f"a request on the default limit states nothing: {req3[:120]}")
+    expect(all(fix_limit({"kind": "request", "attrs": limit_attrs(n)}) == n for n in range(21)),
+           "every limit from 0 to 20 must read back as itself, 0 included")
+    # The monitor's OWN limit is its argument: what earlier markers say moves nothing.
+    gh = FakeGh([_pr(26)], {26: [_bot(marker("request", i, limit="twenty"), 500 - i) for i in (1, 2, 3)]})
+    run_monitor(gh)
+    expect([w[2] for w in gh.writes if w[0] == "comment"][0].startswith(marker("page", 4, reason="budget")),
+           f"three requests on a monitor left at the default must page, whatever they state: {gh.writes}")
+
+    # 2d. A MISSING OR BAD ATTRIBUTE IS THE DEFAULT, never an exception (KIT-670).
+    expect(fix_limit(parse_marker(_bot(marker("request", 1), 5))) == 3 == MAX_FIX_REQUESTS
+           and fix_limit(episode_state([_bot(marker("request", 1), 5)])["latest"]) == 3,
+           "a request that states no limit — an older monitor's — must mean 3")
+    def stated_by(c):
+        """(was it a marker, the limit it states) for a comment; an exception is returned, not raised."""
+        try:
+            m = parse_marker(c)
+            return m is not None, fix_limit(m)
+        except Exception as exc:       # noqa: BLE001  (the point: nothing may raise)
+            return exc
+    for word in ("banana", "twenty-one", "minus-one", "-", "zero-zero"):    # the grammar takes these
+        got = stated_by(_bot(marker("request", 1, limit=word), 5))
+        expect(got == (True, 3), f"limit={word} names no limit, and must read as the default: {got!r}")
+    for word in ("5", "25", "-1", "3.5", "Five", ""):                       # the grammar refuses these
+        got = stated_by(_bot(marker("request", 1, limit=word), 5))
+        expect(got == (False, 3), f"limit={word!r} is no marker at all, so it states no limit: {got!r}")
+    for odd in (None, [], "request", 3, {}, {"kind": "request"}, {"kind": "request", "attrs": None},
+                {"kind": "request", "attrs": "limit=five"}, {"kind": "request", "attrs": {"limit": 5}},
+                {"kind": "request", "attrs": {"limit": None}}, {"kind": "request", "attrs": {"limit": ["five"]}},
+                {"kind": "request", "attrs": {"limit": b"five"}}, {"kind": "request", "attrs": {"limit": ""}},
+                {"kind": "request", "attrs": {"limit": "5"}}, {"kind": "request", "attrs": {"limit": "21"}},
+                {"kind": "request", "attrs": {"limit": "-1"}}, {"kind": "request", "attrs": {"limit": "FIVE"}},
+                {"kind": "request", "attrs": {"limit": " five"}}):
+        try:
+            got = fix_limit(odd)
+        except Exception as exc:       # noqa: BLE001  (the point: nothing may raise)
+            got = exc
+        expect(got == 3, f"fix_limit({odd!r}) must be the default, never an exception: {got!r}")
+
+    # 2e. A FORGED OR MISPLACED LIMIT RAISES NOTHING (KIT-670). Only a request the Actions bot wrote
+    #     is a request, and only a request states a limit.
+    imposters = [_human(marker("request", 2, limit="twenty"), 10, assoc=a)
+                 for a in ("OWNER", "MEMBER", "COLLABORATOR", "CONTRIBUTOR", "NONE")]
+    imposters += [dict(_bot(marker("request", 2, limit="twenty"), 10), user=u)
+                  for u in ({"login": "other-app[bot]", "type": "Bot"}, {"login": BOT_LOGIN, "type": "User"})]
+    st = episode_state([_bot(marker("request", 1), 30)] + imposters)
+    expect(st["requests"] == 1 and st["episode"] == 1 and fix_limit(st["latest"]) == 3,
+           f"a request anyone but the Actions bot wrote must state nothing: {st['latest']}")
+    for kind_, who in (("ack", _human), ("result", _human), ("page", _bot), ("escalated", _bot)):
+        m = parse_marker(who(marker(kind_, 1, limit="twenty"), 5))
+        expect(m is not None and fix_limit(m) == 3, f"a {kind_} marker states no limit, whatever it carries")
+
+    # 2f. A READER SHIPS BEFORE ITS WRITER (KIT-670). Copies of this file already deployed — a monitor
+    #     in another repository, a waker, the role account's clone — read markers with the code below.
+    #     It is MARKER_RE and parse_marker exactly as `git show 6f8e9ded7a32:scripts/pr_conflict.py`
+    #     has them, unchanged since the markers began, and frozen here. Whatever the monitor writes
+    #     now, they must still read it.
+    old_marker_re = re.compile(
+        r"^<!-- pr-conflict:(request|page|escalated|ack|result) episode=(\d+)"
+        r"((?: [a-z]+=[a-z-]+)*) -->$")
+
+    def old_parse_marker(comment):
+        first = (comment.get("body") or "").split("\n", 1)[0].strip()
+        m = old_marker_re.match(first)
+        if not m:
+            return None
+        kind, episode = m.group(1), int(m.group(2))
+        user = comment.get("user") or {}
+        if kind in {"request", "page", "escalated"}:
+            if user.get("login") != "github-actions[bot]" or user.get("type") != "Bot":
+                return None
+        elif comment.get("author_association") not in {"OWNER", "MEMBER", "COLLABORATOR"}:
+            return None
+        attrs = dict(p.split("=", 1) for p in m.group(3).split())
+        return {"kind": kind, "episode": episode, "attrs": attrs,
+                "at": dt.datetime.fromisoformat(comment["created_at"].replace("Z", "+00:00"))}
+
+    pr_ = _pr(27)
+    who_ = (["dev"], "the PR's author")
+    written = ([request_body(pr_, 2, 1, "main", n) for n in range(21)]
+               + [page_body(pr_, 4, reason, "main", who_, n, default="main")
+                  for reason in ("budget", "fork", "stacked") for n in (0, 3, 5)]
+               + [escalation_body(pr_, 2, "a fix did not land", "main", who_),
+                  marker("ack", 2), marker("result", 2, outcome="resolved")])
+    for body in written:
+        head = old_marker_re.match(body.split("\n", 1)[0])
+        c = (_bot if head and head.group(1) in ("request", "page", "escalated") else _human)(body, 0)
+        expect(head is not None and old_parse_marker(c) is not None and old_parse_marker(c) == parse_marker(c),
+               f"a copy deployed before this change must read what the monitor writes now: {body[:80]!r}")
+    expect(old_parse_marker(_bot("<!-- pr-conflict:request episode=2 limit=5 -->", 0)) is None,
+           "the control: the deployed grammar refuses a digit, which is why the limit is spelled in letters")
+
+    # 2g. A limit no request could state is refused before anything is written, and from the command
+    #     line as a usage error — never read as the default, which would put the two halves apart.
+    try:
+        got = main(["monitor", "--repo", "acme/widgets", "--max-fix-requests", "21", "--dry-run"])
+    except Exception as exc:       # noqa: BLE001  (a named failure, not a crash of the battery)
+        got = exc
+    expect(got == 2, f"a limit of 21 must be a usage error: {got!r}")
+    gh = FakeGh([_pr(28)])
+    try:
+        run_monitor(gh, max_fix_requests=21)
+        expect(False, "the monitor must refuse a limit of 21")
+    except ValueError:
+        expect(gh.writes == [], f"…before it writes anything: {gh.writes}")
+    for bad in (-1, 21, True, 3.0, "5", None):
+        try:
+            limit_attrs(bad)
+            expect(False, f"limit_attrs({bad!r}) must refuse it")
+        except ValueError:
+            pass
+        except Exception as exc:   # noqa: BLE001
+            expect(False, f"limit_attrs({bad!r}) must refuse it with a ValueError, not {exc!r}")
 
     # 3. a fork is paged, never requested.
     gh = FakeGh([_pr(3, fork=True)])
@@ -1693,9 +1892,11 @@ def main(argv=None):
     m.add_argument("--dry-run", action="store_true")
     m.add_argument("--max-fix-requests", type=int,
                    default=os.environ.get("PR_CONFLICT_MAX_FIX_REQUESTS") or MAX_FIX_REQUESTS,
-                   help="automated fix attempts per PR before a person is paged (default %d). "
-                        "0 means nothing in this repository answers one: page at the first "
-                        "conflict instead of asking" % MAX_FIX_REQUESTS)
+                   help="automated fix attempts per PR before a person is paged (default %d, at "
+                        "most %d). 0 means nothing in this repository answers one: page at the "
+                        "first conflict instead of asking. Each request states a limit that is "
+                        "not the default, and the bounce driver stops at that one"
+                        % (MAX_FIX_REQUESTS, FIX_LIMIT_MAX))
     m.add_argument("--page-to", default=os.environ.get("PR_CONFLICT_PAGE_TO", ""),
                    help="logins (or org/team) a page @mentions, comma- or space-separated; default "
                         "PR_CONFLICT_PAGE_TO, else the PR's author, else a person who owns the repo")
@@ -1721,9 +1922,9 @@ def main(argv=None):
             if not args.repo or "/" not in args.repo:
                 print("monitor needs --repo owner/name (or GITHUB_REPOSITORY)", file=sys.stderr)
                 return 2
-            if args.max_fix_requests < 0:
-                print("monitor: --max-fix-requests cannot be negative (0 means page at the "
-                      "first conflict)", file=sys.stderr)
+            if not 0 <= args.max_fix_requests <= FIX_LIMIT_MAX:
+                print("monitor: --max-fix-requests must be a whole number from 0 to %d (0 means "
+                      "page at the first conflict)" % FIX_LIMIT_MAX, file=sys.stderr)
                 return 2
             page_to, bad = parse_page_to(args.page_to)
             if bad:

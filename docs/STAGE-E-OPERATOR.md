@@ -2450,7 +2450,9 @@ pass with a declined PR and a broken one exits `2`. The heartbeat's `result` say
 
 A pull request that goes `CONFLICTING` after its session stopped skips its required checks.
 It can sit there looking green. The conflict monitor sees it and posts a **fix request** on
-the pull request. It allows three per pull request, ever. Then something must answer.
+the pull request. It allows three per pull request, ever, or the number the repository sets with
+`--max-fix-requests`. The bounce driver stops at the same number, so update the role account's clone
+before you raise it. Then something must answer.
 
 **Who answers depends on who owns the session. Never both.**
 
