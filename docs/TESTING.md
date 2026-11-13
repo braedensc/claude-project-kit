@@ -324,14 +324,30 @@ them would hold that PR forever. It holds and uses no secret.
 - The look exits 10 (a Mac with no host has things waiting on a person), prints one line for every
   part in `pipeline-parts.json` or names it on the "No check of their own" line, reads no part
   that is not set up as "up to date", and ends with a list that names every part still waiting.
-- The look changes nothing. The empty home, `/Library/LaunchDaemons`, `/Library/LaunchAgents` and
-  `/etc/claude-pipeline` are listed with sha256 hashes before and after and must be identical, and
-  `git status --porcelain --ignored` stays empty. The job then plants a file and shows that the
-  comparison fails, so a green run is never a comparison that compared nothing. The checks that
-  read text get the same proof: four broken copies of the look's output, a refusal with one line
-  too many and a planted token shape must each be refused, for the right reason.
+- The look changes nothing. Six places are listed with sha256 hashes before and after and must be
+  identical, and `git status --porcelain --ignored` must stay empty: the empty home,
+  `/Library/LaunchDaemons`, `/Library/LaunchAgents`, `/etc/claude-pipeline`, and the runner's real
+  `~/Library/LaunchAgents` and `~/.claude`. The empty home covers a command that obeys `HOME`; the
+  two real places cover one that reaches the real home by another route, and are where a per-user
+  background job and the user-scope skills would land. The rest of a runner's real home changes by
+  itself, so listing it would be noise.
 - The three refusals hold: an agent marker exits 3, root exits 2, and no terminal exits 2, each
-  printing only its refusal. Nothing the job printed has a token shape.
+  printing only its refusal.
+- Nothing the job's commands printed has a token shape. Every `run` step tees its stdout and
+  stderr into one folder, and the last step scans it for GitHub, Slack, Anthropic and AWS key
+  prefixes and a PEM header (the exact list is `scan_tokens` in the workflow). That is a subset of
+  the repo's secret scan, applied to what the job printed; the runner's own lines (the echoed
+  scripts, the checkout action's log) are not in it.
+- Each check is shown to fail. The job plants a file in the empty home, in the real `~/.claude`
+  and in the checkout, and a token of every shape the scan knows; and the checks that read text
+  must refuse four broken copies of the look's output and a refusal with one line too many, for
+  the right reason. A green run is never a check that compared nothing.
+
+**The "Only you can do these" list.** A clean Mac never prints it: every part with a check is off,
+so no waiting part's own output names a card, and the command prints that list only for a card.
+The job accepts what is printed instead, one "`<name>` is waiting on you" line for each part that
+waits, and requires it to name every one of them; the `host` part has no check or card, so it does
+not appear there at all (a separate ticket).
 
 First measured 13 Nov 2026: macOS 15.8.2 (image `macos-15-arm64` 20261104.0514.1), `/usr/bin/python3`
 3.9.6, the developer tools of Xcode 16.4, passwordless `sudo`. The job ran in 14 seconds, after
@@ -348,8 +364,9 @@ since the image has them.
 **Moving its image pin.** In one PR, change `runs-on: macos-15` in `install-proof.yml` and in
 `ci-mac-python.yml` (the two are meant to share an image) to the new image name.
 `python3 scripts/check_runner_pin.py` fails any `-latest` label. The PR's own run on the new
-image is the proof: read the first step's macOS version, `/usr/bin/python3 -V` and developer-tools
-line, and say in the PR if any of them changed, since that Python is the one the owner's Mac runs.
+image is the proof: read the macOS version, `/usr/bin/python3 -V` and developer-tools lines of its
+"What clean means" step, and say in the PR if any of them changed, since that Python is the one the
+owner's Mac runs.
 If the counts or the listings then fail, that is a finding about the image or the command; do not
 loosen the check to pass.
 

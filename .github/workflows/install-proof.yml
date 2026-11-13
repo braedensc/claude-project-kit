@@ -6,16 +6,20 @@ name: Install proof
 #
 # In order:
 #   1. Print what "clean" means on this image: the macOS version, /usr/bin/python3, the developer tools.
-#   2. List four places, with hashes: a NEW EMPTY folder used as HOME (a runner's own home is full
-#      of files that change), /Library/LaunchDaemons, /Library/LaunchAgents and /etc/claude-pipeline.
-#      A place that is not there lists nothing. The checkout must be clean as well.
+#   2. List six places, with hashes: a NEW EMPTY folder used as HOME (a runner's own home is full
+#      of files that change), /Library/LaunchDaemons, /Library/LaunchAgents and /etc/claude-pipeline,
+#      and two places in the runner's REAL home, ~/Library/LaunchAgents and ~/.claude, which a
+#      command that reaches the real home some way other than $HOME would write to. A place that is
+#      not there lists nothing. The checkout must be clean as well.
 #   3. Run `pipeline_install.py --check` with HOME set to the empty folder. A Mac with no host has
 #      things waiting on a person, so the exit must be 10. Its lines are counted against pipeline-parts.json.
-#   4. List the four places again: nothing may differ. Then plant a file and show that the
-#      comparison does fail, so a green run cannot be a comparison that compares nothing.
+#   4. List the six places again: nothing may differ. Then plant a file in the empty home, in the
+#      real ~/.claude and in the checkout, and show that each comparison does fail, so a green run
+#      cannot be a comparison that compares nothing.
 #   5. Try the three refusals: an agent marker (exit 3), root (exit 2) and no terminal (exit 2).
 #      Each must print its refusal and nothing else.
-#   6. Look for token shapes in everything the job printed.
+#   6. Look for token shapes in everything the job's commands printed: every step tees its stdout and
+#      stderr into one folder, and that folder is scanned.
 #
 # It holds and uses no secret; its token is read-only. It is a NEW workflow with its own job name on
 # purpose: "Kit checks" is a required status context. This job is NOT a required check, and must not
@@ -57,27 +61,36 @@ jobs:
         with:
           persist-credentials: false
 
+      # From here on, every step runs its commands as `{ ... } 2>&1 | tee -a printed.txt`: what the
+      # job prints is also a file, so the last step can scan all of it. (A pipeline, not a
+      # redirection of the whole step, so the step cannot end before the file is written.)
       - name: A new empty home folder, and the helpers
         run: |
           proof="$RUNNER_TEMP/install-proof"
           mkdir -p "$proof"
+          {
           home="$(mktemp -d "$RUNNER_TEMP/clean-home.XXXXXX")"
           if [ -n "$(ls -A "$home")" ]; then
             echo "::error::the new home folder is not empty"
             exit 1
           fi
-          { echo "PROOF_DIR=$proof"; echo "PROOF_HOME=$home"; } >> "$GITHUB_ENV"
+          # PROOF_REAL_HOME is the runner's own home, saved before anything sets HOME to another.
+          { echo "PROOF_DIR=$proof"; echo "PROOF_HOME=$home"; echo "PROOF_REAL_HOME=$HOME"; } >> "$GITHUB_ENV"
           cat > "$proof/lib.sh" <<'LIB'
           # Helpers for the install proof; each later step sources this file.
 
-          # The four places the command must leave as it found them, by short name.
-          PLACES="home daemons agents etc"
+          # The six places the command must leave as it found them, by short name. The first four
+          # are the new empty home and the machine's; the last two are in the runner's REAL home
+          # (PROOF_REAL_HOME), for a command that finds the home some other way than $HOME.
+          PLACES="home daemons agents etc realagents realclaude"
           place_of() {
             case "$1" in
               home) echo "$PROOF_HOME" ;;
               daemons) echo /Library/LaunchDaemons ;;
               agents) echo /Library/LaunchAgents ;;
               etc) echo /etc/claude-pipeline ;;
+              realagents) echo "$PROOF_REAL_HOME/Library/LaunchAgents" ;;
+              realclaude) echo "$PROOF_REAL_HOME/.claude" ;;
             esac
           }
 
@@ -102,7 +115,7 @@ jobs:
             done
           }
 
-          # take LABEL: list the four places into $PROOF_DIR/LABEL-<name>.txt
+          # take LABEL: list the places into $PROOF_DIR/LABEL-<name>.txt
           take() {
             local n
             for n in $PLACES; do
@@ -110,7 +123,7 @@ jobs:
             done
           }
 
-          # show LABEL: print those four listings, for the record
+          # show LABEL: print those listings, for the record
           show() {
             local n
             for n in $PLACES; do
@@ -119,7 +132,7 @@ jobs:
             done
           }
 
-          # same A B: the four listings taken as A and as B must not differ; says which one does
+          # same A B: the listings taken as A and as B must not differ; says which one does
           same() {
             local n bad=0
             for n in $PLACES; do
@@ -129,7 +142,7 @@ jobs:
               fi
             done
             if [ "$bad" = 0 ]; then
-              echo "identical: the four places listed '$1' and '$2' do not differ"
+              echo "identical: the $(echo $PLACES | wc -w | tr -d ' ') places listed '$1' and '$2' do not differ"
             fi
             return "$bad"
           }
@@ -175,10 +188,13 @@ jobs:
           }
 
           # scan_tokens DIR: names every file of DIR that holds a token shape, with the line
-          # numbers and never the line; returns 1 if there is one. Each shape is written with a
-          # bracket in it, so that this file (and the job's log, which echoes it) holds none.
+          # numbers and never the line; returns 1 if there is one. The shapes are a subset of what
+          # the repo's secret scan looks for: GitHub's token prefixes (five kinds, and the
+          # fine-grained one), Slack's (the bot, user and app kinds), Anthropic's, AWS's two key
+          # prefixes and a PEM header. Each is written with a bracket in it, so that this file (and
+          # the job's log, which echoes it) holds none.
           scan_tokens() {
-            local shapes='gh[p]_|github_pa[t]_|xo[x]|sk-an[t]-|AKI[A]|-----BEGI[N]' f found=0
+            local shapes='gh[pousr]_|github_pa[t]_|xo[x]|xap[p]-|sk-an[t]-|A[KS]I[A]|-----BEGI[N]' f found=0
             for f in "$1"/*; do
               if [ -f "$f" ] && grep -qE -e "$shapes" "$f"; then
                 echo "::error::a token shape in $(basename "$f"), on line(s): $(grep -nE -e "$shapes" "$f" | cut -d: -f1 | tr '\n' ' ')"
@@ -188,37 +204,41 @@ jobs:
             return "$found"
           }
           LIB
+          } 2>&1 | tee -a "$proof/printed.txt"
 
       - name: What "clean" means on this image
         if: ${{ !cancelled() }}
         run: |
           {
-            echo "--- sw_vers"
-            sw_vers
-            echo "--- /usr/bin/python3 -V"
-            /usr/bin/python3 -V
-            echo "--- developer tools (xcode-select -p)"
-            if tools="$(xcode-select -p 2>&1)"; then
-              echo "present: $tools"
-            else
-              echo "NOT present: $tools"
-            fi
-            echo "--- machine"
-            uname -m
-            echo "ImageOS=${ImageOS:-unset} ImageVersion=${ImageVersion:-unset}"
-          } 2>&1 | tee "$PROOF_DIR/image.txt"
+          echo "--- sw_vers"
+          sw_vers
+          echo "--- /usr/bin/python3 -V"
+          /usr/bin/python3 -V
+          echo "--- developer tools (xcode-select -p)"
+          if tools="$(xcode-select -p 2>&1)"; then
+            echo "present: $tools"
+          else
+            echo "NOT present: $tools"
+          fi
+          echo "--- machine"
+          uname -m
+          echo "ImageOS=${ImageOS:-unset} ImageVersion=${ImageVersion:-unset}"
+          } 2>&1 | tee -a "$PROOF_DIR/printed.txt"
 
-      - name: Before - list the four places, and check the checkout is clean
+      - name: Before - list the places, and check the checkout is clean
         if: ${{ !cancelled() }}
         run: |
+          {
           . "$PROOF_DIR/lib.sh"
           take before
           show before
           clean_checkout
+          } 2>&1 | tee -a "$PROOF_DIR/printed.txt"
 
       - name: "Look: the one command with --check, with HOME set to the empty folder"
         if: ${{ !cancelled() }}
         run: |
+          {
           # The command refuses to run where an agent marker is set; a clean Mac has none.
           if env | grep -E '^(CLAUDECODE|CLAUDE_CODE_ENTRYPOINT|CLAUDE_PROJECT_DIR|AI_AGENT)=' > /dev/null; then
             echo "::error::an agent marker is set on this runner, so the look would refuse"
@@ -229,18 +249,30 @@ jobs:
           echo "$rc" > "$PROOF_DIR/look.out.code"
           cat "$PROOF_DIR/look.out"
           echo "(exit code $rc)"
+          } 2>&1 | tee -a "$PROOF_DIR/printed.txt"
 
-      - name: After the look - the four places and the checkout are as they were
+      - name: After the look - the places and the checkout are as they were
         if: ${{ !cancelled() }}
         run: |
+          {
           . "$PROOF_DIR/lib.sh"
           take afterlook
           same before afterlook
           clean_checkout
+          } 2>&1 | tee -a "$PROOF_DIR/printed.txt"
 
       - name: The look exits 10, with one line for every part, and none set up that is not
         if: ${{ !cancelled() }}
         run: |
+          # "Only you can do these:" is NOT printed on a clean Mac, and this step does not expect it.
+          # Every part with a check is off here (its settings file is absent), so no waiting part's
+          # own output names a card, and the command prints that list only for a card. What it prints
+          # is the other form of the same short list: one "<name> is waiting on you; its own lines
+          # above say what for." line for each part that waits (here the skills and the kit
+          # checkout). So this step requires that form, requires it to name every waiting part, and
+          # fails on "Nothing is waiting on you.". The `host` part has no check and no card, so it is
+          # not in the list at all; showing it there is a change to the command, a separate ticket.
+          {
           # The checks are a file, so a later step can run them on broken copies of the output.
           cat > "$PROOF_DIR/assert_look.py" <<'PY'
           import json
@@ -365,10 +397,12 @@ jobs:
                   if got != ["off on this Mac"]:
                       bad("%s: its settings file %s is not in the checkout, so it must read 'off on this Mac', not %r" % (p["id"], f, got))
 
-          # 6. The short list at the end names every part that waits. It is the cards a waiting part's
-          #    own output names ("Only you can do these:", "Sign-offs still asked for:"), or, for a
-          #    part that names none, one "<name> is waiting on you; ..." line. Nothing waiting would
-          #    be "Nothing is waiting on you.", which a Mac with no host cannot say.
+          # 6. The short list at the end names every part that waits. On a Mac where every part is
+          #    off it is the "<name> is waiting on you; ..." form, one line for each part that waits,
+          #    because no waiting part's own output names a card (see the comment above this step).
+          #    The card lists ("Only you can do these:", "Sign-offs still asked for:") are accepted if
+          #    a card is ever named. Nothing waiting would be "Nothing is waiting on you.", which a
+          #    Mac with no host cannot say.
           waiting = [p for p in parts if [w for w, _ in row_of.get(p["id"], [])] == ["waiting on you"]]
           text = "\n".join(tail)
           cards = "Only you can do these:" in tail
@@ -387,8 +421,13 @@ jobs:
           print("outcome lines: %d (%s)" % (len(rows), ", ".join("%d %s" % (count(w), w) for w in WORDS)))
           print("named on the 'No check of their own' line: %d" % len(bare))
           print("waiting on you: %s" % ("; ".join(p["id"] for p in waiting) or "none"))
-          print("short list: 'Only you can do these:' %s; 'Sign-offs still asked for:' %s; %d '<name> is waiting on you' line(s)"
-                % ("printed" if cards else "not printed", "printed" if signs else "not printed", len(lone)))
+          if cards or signs:
+              form = "a card list is printed ('Only you can do these:' %s, 'Sign-offs still asked for:' %s)" % (
+                  "yes" if cards else "no", "yes" if signs else "no")
+          else:
+              form = ("'Only you can do these:' is not printed, as expected on a Mac where every part is off: "
+                      "no waiting part's own output names a card")
+          print("short list: %s; %d '<name> is waiting on you' line(s)" % (form, len(lone)))
           if problems:
               for why in problems:
                   print("::error::" + why)
@@ -396,19 +435,23 @@ jobs:
           print("ok: exit %d; %d parts, each with its one line or its name on the closing line; none set up that is not" % (code, len(parts)))
           PY
           /usr/bin/python3 "$PROOF_DIR/assert_look.py" "$PROOF_DIR/look.out" "$PROOF_DIR/look.out.code"
+          } 2>&1 | tee -a "$PROOF_DIR/printed.txt"
 
       - name: Refusal - an agent marker is set (exit 3, only the refusal)
         if: ${{ !cancelled() }}
         run: |
+          {
           . "$PROOF_DIR/lib.sh"
           rc=0
           CLAUDECODE=1 PYTHONDONTWRITEBYTECODE=1 HOME="$PROOF_HOME" /usr/bin/python3 scripts/pipeline_install.py --check > "$PROOF_DIR/marker.out" 2>&1 < /dev/null || rc=$?
           echo "$rc" > "$PROOF_DIR/marker.out.code"
           refused "an agent marker" "$PROOF_DIR/marker.out" 3 "this shell belongs to a Claude session (CLAUDECODE is set)"
+          } 2>&1 | tee -a "$PROOF_DIR/printed.txt"
 
       - name: Refusal - run as root (exit 2, only the refusal)
         if: ${{ !cancelled() }}
         run: |
+          {
           . "$PROOF_DIR/lib.sh"
           # A hosted runner's sudo asks for no password. If it ever does, this fails: a refusal
           # that could not be tried is not one that was shown.
@@ -420,27 +463,33 @@ jobs:
           sudo -n -E env PYTHONDONTWRITEBYTECODE=1 HOME="$PROOF_HOME" /usr/bin/python3 scripts/pipeline_install.py --check > "$PROOF_DIR/root.out" 2>&1 < /dev/null || rc=$?
           echo "$rc" > "$PROOF_DIR/root.out.code"
           refused "root" "$PROOF_DIR/root.out" 2 "do not run this with sudo"
+          } 2>&1 | tee -a "$PROOF_DIR/printed.txt"
 
       - name: Refusal - no terminal and no --check (exit 2, only the refusal)
         if: ${{ !cancelled() }}
         run: |
+          {
           . "$PROOF_DIR/lib.sh"
           rc=0
           PYTHONDONTWRITEBYTECODE=1 HOME="$PROOF_HOME" /usr/bin/python3 scripts/pipeline_install.py > "$PROOF_DIR/bare.out" 2>&1 < /dev/null || rc=$?
           echo "$rc" > "$PROOF_DIR/bare.out.code"
           refused "no terminal" "$PROOF_DIR/bare.out" 2 "this needs a person at a terminal"
+          } 2>&1 | tee -a "$PROOF_DIR/printed.txt"
 
       - name: After the look and the three refusals - nothing changed
         if: ${{ !cancelled() }}
         run: |
+          {
           . "$PROOF_DIR/lib.sh"
           take end
           same before end
           clean_checkout
+          } 2>&1 | tee -a "$PROOF_DIR/printed.txt"
 
       - name: The comparison can fail - plant a file, expect a difference, remove it
         if: ${{ !cancelled() }}
         run: |
+          {
           . "$PROOF_DIR/lib.sh"
           planted="$PROOF_HOME/planted-by-the-proof"
           printf 'planted\n' > "$planted"
@@ -454,6 +503,28 @@ jobs:
           fi
           cat "$PROOF_DIR/planted-home.diff"
           echo "ok: the comparison saw the planted file, which is now removed"
+          # The same for the runner's real ~/.claude, which the empty home would not show: a command
+          # that found the real home some other way than $HOME would write there.
+          real="$PROOF_REAL_HOME/.claude"
+          made=0
+          if [ ! -e "$real" ]; then
+            mkdir "$real"
+            made=1
+          fi
+          printf 'planted\n' > "$real/planted-by-the-proof"
+          listing "$real" > "$PROOF_DIR/planted-realclaude.txt"
+          rc=0
+          diff -u "$PROOF_DIR/before-realclaude.txt" "$PROOF_DIR/planted-realclaude.txt" > "$PROOF_DIR/planted-realclaude.diff" || rc=$?
+          rm -f "$real/planted-by-the-proof"
+          if [ "$made" = 1 ]; then
+            rmdir "$real"
+          fi
+          if [ "$rc" != 1 ]; then
+            echo "::error::the listing comparison did not see a file planted in the real ~/.claude (diff exit $rc), so it proves nothing"
+            exit 1
+          fi
+          cat "$PROOF_DIR/planted-realclaude.diff"
+          echo "ok: the comparison saw the file planted in the real ~/.claude, which is now removed"
           # The same for the checkout's own check.
           touch planted-by-the-proof
           dirty="$(git status --porcelain --ignored)"
@@ -465,14 +536,16 @@ jobs:
           echo "$dirty"
           echo "ok: the checkout check saw the planted file, which is now removed"
           clean_checkout
+          } 2>&1 | tee -a "$PROOF_DIR/printed.txt"
 
       # The checks that read text can pass by matching nothing, so each is shown to fail on a broken
       # input: four broken copies of the real output, a refusal that prints one line too many, and a
-      # planted token shape. (The complaints they provoke go to files: printed as they are, they
-      # would show up on the run as errors.)
-      - name: The text checks can fail too - broken copies, a broken refusal, a planted token shape
+      # planted token of every shape the scan knows. (The complaints they provoke go to files:
+      # printed as they are, they would show up on the run as errors.)
+      - name: The text checks can fail too - broken copies, a broken refusal, planted tokens
         if: ${{ !cancelled() }}
         run: |
+          {
           . "$PROOF_DIR/lib.sh"
           # mutate SLUG EXPECT AWK [CODE]: a broken copy of the real output must be refused, and
           # for the reason EXPECT.
@@ -515,22 +588,44 @@ jobs:
           fi
           echo "ok: refused a refusal that printed one line more than itself"
 
-          # The token scan, on a shape put together here from two pieces and kept out of the log.
+          # The token scan, on a token of every shape it knows, one a line. Each is put together
+          # here from two pieces and written to a folder of its own, which is never printed.
           dir="$(mktemp -d "$RUNNER_TEMP/planted-token.XXXXXX")"
-          printf '%s%s\n' 'gh' 'p_0123456789abcdefghijklmnopqrstuvwxyz' > "$dir/planted.txt"
+          {
+            printf '%s%s\n' 'gh' 'p_0123456789abcdefghijklmnopqrstuvwxyz'
+            printf '%s%s\n' 'gh' 'o_0123456789abcdefghijklmnopqrstuvwxyz'
+            printf '%s%s\n' 'gh' 'u_0123456789abcdefghijklmnopqrstuvwxyz'
+            printf '%s%s\n' 'gh' 's_0123456789abcdefghijklmnopqrstuvwxyz'
+            printf '%s%s\n' 'gh' 'r_0123456789abcdefghijklmnopqrstuvwxyz'
+            printf '%s%s\n' 'github_pa' 't_0123456789ABCDEFGHIJKL_0123456789abcdefghijklmnopqrstuvwxyz0123456789ABCDEF'
+            printf '%s%s\n' 'xo' 'xb-0123456789-0123456789012-abcdefghijklmnopqrstuvwx'
+            printf '%s%s\n' 'xap' 'p-1-A0123456789-0123456789012-0123456789abcdef0123456789abcdef'
+            printf '%s%s\n' 'sk-an' 't-api03-0123456789abcdefghijklmnopqrstuvwxyz'
+            printf '%s%s\n' 'AKI' 'A0123456789ABCDEF'
+            printf '%s%s\n' 'ASI' 'A0123456789ABCDEF'
+            printf '%s%s\n' '-----BEGI' 'N PRIVATE KEY-----'
+          } > "$dir/planted.txt"
           found=0
           scan_tokens "$dir" > "$PROOF_DIR/planted-token.log" 2>&1 || found=1
           rm -f "$dir/planted.txt"
           rmdir "$dir"
-          if [ "$found" != 1 ]; then
-            echo "::error::the token scan did not see a planted token shape, so it proves nothing"
+          if [ "$found" != 1 ] || ! grep -qF "on line(s): 1 2 3 4 5 6 7 8 9 10 11 12 " "$PROOF_DIR/planted-token.log"; then
+            echo "::error::the token scan did not name every one of the 12 planted token shapes, so a pattern in it proves nothing"
             exit 1
           fi
-          echo "ok: the token scan saw a planted token shape: $(sed 's/^::error:://' "$PROOF_DIR/planted-token.log")"
+          echo "ok: the token scan saw all 12 planted shapes: $(sed 's/^::error:://' "$PROOF_DIR/planted-token.log")"
+          } 2>&1 | tee -a "$PROOF_DIR/printed.txt"
 
       - name: No token shape in anything the job printed
         if: ${{ !cancelled() }}
         run: |
+          {
           . "$PROOF_DIR/lib.sh"
+          # The scan is only as good as the capture: printed.txt must hold what the look step printed.
+          if ! grep -q '^(exit code ' "$PROOF_DIR/printed.txt"; then
+            echo "::error::what the job printed was not captured in printed.txt, so the scan would prove nothing"
+            exit 1
+          fi
           scan_tokens "$PROOF_DIR"
-          echo "ok: no token shape in the $(ls "$PROOF_DIR" | wc -l | tr -d ' ') files of output"
+          echo "ok: no token shape in the $(ls "$PROOF_DIR" | wc -l | tr -d ' ') files of output, printed.txt ($(wc -l < "$PROOF_DIR/printed.txt" | tr -d ' ') lines) among them"
+          } 2>&1 | tee -a "$PROOF_DIR/printed.txt"
