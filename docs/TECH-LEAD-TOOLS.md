@@ -116,8 +116,9 @@ is offered.
 fields only: the piece, a kind (`reorder`, `add_prerequisite` or `ask_owner`) and, for a
 reorder, the piece to wait for. It changes nothing either. The bridge reads it only after a plan
 note's turn, and leaves it out of any other turn. Its own code then makes a reorder inside your
-approved plan without you, and asks you about anything else (`docs/BRIDGE-OPERATOR.md`, "When a
-piece says the plan needs changing").
+approved plan without you, files a missing prerequisite under it for you to hand over (KIT-611),
+and asks you about anything else (`docs/BRIDGE-OPERATOR.md`, "When a piece says the plan needs
+changing").
 
 ## Changing a queue setting (KIT-700)
 

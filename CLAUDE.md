@@ -221,7 +221,8 @@ npm run test:approve    # auto-approval gate selftest (§5, §11)
 npm run test:merge      # auto-merge tier selftest (§11)
 npm run test:graders    # grader-path gate: gated set + who may apply the label
 npm run test:safe-outputs    # safe-outputs absence-vs-failure selftest (§13, §8)
-npm run test:plan-executor   # idea-gate executor: tree validate, DoR-gate, forced fields (§8, §13)
+npm run test:plan-executor   # idea-gate executor: tree validate, DoR-gate, forced fields (§8, §13);
+                             #   its prerequisite mode: the parent from the bridge's record, cap 15 (KIT-611)
 npm run test:plan-poller     # the planner job: the owner's move on a work team is the
                              #   trigger, the delegated ticket is a clean copy, its routing
                              #   is checked (a miss stops planning), the plan read back

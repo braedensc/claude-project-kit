@@ -223,6 +223,37 @@ enough for those skips: each only spares work.
 - Lists children whose titles look like recent tickets, leaving out the idea and every
   planning ticket.
 
+**The executor's prerequisite mode (KIT-611)**
+
+A started piece of an approved plan may say work no piece covers is missing. When the
+Slack bridge decides to file it, it runs the executor with `--prerequisite`, its request,
+and `--approvals`, its own state file. Nothing else runs this mode, and no session can
+select it. It:
+- Files one ticket: under the epic, in its team and project, in the team's first backlog
+  state, with `provenance:agent` and no other label. One `blocks` edge runs to the piece.
+- Takes the parent from the bridge's approval record alone. It refuses an epic the record
+  does not hold, a piece the record does not approve under it, and an identifier. It also
+  refuses an epic now on another team, and a piece the tracker no longer lists under it.
+- Refuses a record a session could have written: a link, another account's file, a file
+  or folder others may write, or one inside a git working tree.
+- Files at most 15 under one plan in a day, counted from the tracker. The 16th is refused.
+- Files a request once: the ticket carries a `Prerequisite id:` receipt. A retry makes
+  only an edge that is missing, and never touches a ticket a person cancelled or took the
+  label off.
+- Posts no comment, moves nothing, and runs no readiness gate: no approval releases a
+  `provenance:agent` ticket. It waits for a person to hand it over.
+
+Exit codes are the executor's own: 0 filed, 3 refused, 2 failed. A partial filing, the
+ticket made but not its edge, is 2, and its verdict names the ticket.
+
+Good: `filed PROD-61 under PROD-50, in the backlog with provenance:agent, blocking PROD-51.`
+Good: a refusal at the cap, `15 prerequisites were filed under PROD-50 in the last day`, and
+the bridge asks you instead.
+Not that: `the epic is not a plan the bridge's approval record holds`. The request named an
+epic the bridge never approved; report it as a bug. Nothing was filed.
+Not that: `the approval record is inside a git working tree`. The bridge's `state_dir` must
+sit outside every checkout; fix the config, never the check.
+
 **Other jobs on the same team** skip planning tickets. The finding poller skips one by its
 label or its opening tag. The review poller's discovery and the criteria snapshot also need
 the dispatcher's own routing note to confirm it: a coding session can write the label or
