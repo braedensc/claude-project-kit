@@ -175,6 +175,20 @@ jobs:
             fi
             echo "ok: $name exits $want and prints only its refusal"
           }
+
+          # scan_tokens DIR: names every file of DIR that holds a token shape, with the line
+          # numbers and never the line; returns 1 if there is one. Each shape is written with a
+          # bracket in it, so that this file (and the job's log, which echoes it) holds none.
+          scan_tokens() {
+            local shapes='gh[p]_|github_pa[t]_|xo[x]|sk-an[t]-|AKI[A]|-----BEGI[N]' f found=0
+            for f in "$1"/*; do
+              if [ -f "$f" ] && grep -qE -e "$shapes" "$f"; then
+                echo "::error::a token shape in $(basename "$f"), on line(s): $(grep -nE -e "$shapes" "$f" | cut -d: -f1 | tr '\n' ' ')"
+                found=1
+              fi
+            done
+            return "$found"
+          }
           LIB
 
       - name: What "clean" means on this image
@@ -229,7 +243,8 @@ jobs:
       - name: The look exits 10, with one line for every part, and none set up that is not
         if: ${{ !cancelled() }}
         run: |
-          /usr/bin/python3 - "$PROOF_DIR/look.out" "$PROOF_DIR/look.out.code" <<'PY'
+          # The checks are a file, so a later step can run them on broken copies of the output.
+          cat > "$PROOF_DIR/assert_look.py" <<'PY'
           import json
           import os
           import re
@@ -382,6 +397,7 @@ jobs:
               sys.exit(1)
           print("ok: exit %d; %d parts, each with its one line or its name on the closing line; none set up that is not" % (code, len(parts)))
           PY
+          /usr/bin/python3 "$PROOF_DIR/assert_look.py" "$PROOF_DIR/look.out" "$PROOF_DIR/look.out.code"
 
       - name: Refusal - an agent marker is set (exit 3, only the refusal)
         if: ${{ !cancelled() }}
@@ -452,19 +468,71 @@ jobs:
           echo "ok: the checkout check saw the planted file, which is now removed"
           clean_checkout
 
+      # The checks that read text can pass by matching nothing, so each is shown to fail on a broken
+      # input: four broken copies of the real output, a refusal that prints one line too many, and a
+      # planted token shape. (The complaints they provoke go to files: printed as they are, they
+      # would show up on the run as errors.)
+      - name: The text checks can fail too - broken copies, a broken refusal, a planted token shape
+        if: ${{ !cancelled() }}
+        run: |
+          . "$PROOF_DIR/lib.sh"
+          # mutate SLUG EXPECT AWK [CODE]: a broken copy of the real output must be refused, and
+          # for the reason EXPECT.
+          mutate() {
+            local slug="$1" expect="$2" prog="$3" code="${4:-}" out="$PROOF_DIR/broken-$1.out"
+            awk "$prog" "$PROOF_DIR/look.out" > "$out"
+            if [ -n "$code" ]; then
+              echo "$code" > "$out.code"
+            else
+              cp "$PROOF_DIR/look.out.code" "$out.code"
+              if cmp -s "$out" "$PROOF_DIR/look.out"; then
+                echo "::error::the broken copy '$slug' is the same as the real output"
+                return 1
+              fi
+            fi
+            if /usr/bin/python3 "$PROOF_DIR/assert_look.py" "$out" "$out.code" > "$out.log" 2>&1; then
+              echo "::error::the checks on the look accepted a broken copy of its output: $slug"
+              return 1
+            fi
+            if ! grep -qF -e "$expect" "$out.log"; then
+              echo "::error::the broken copy '$slug' was refused, but not for the reason expected: $expect"
+              return 1
+            fi
+            echo "ok: refused the broken copy '$slug', complaining: $expect"
+          }
+          mutate gone "wanted one outcome line" '/^  off on this Mac/ && !d {d=1; next} {print}'
+          mutate uptodate "reads 'up to date'" '/^  off on this Mac/ && !d {d=1; sub(/^  off on this Mac/, "  up to date")} {print}'
+          mutate exit0 "exit 0" '{print}' 0
+          mutate nolist "short list is missing" '!/is waiting on you; its own lines above say what for\.$/'
+
+          printf '\n== 0. Where this is running\n\nStopped: this needs a person at a terminal: x\nand one line more\n' > "$PROOF_DIR/broken-refusal.out"
+          echo 2 > "$PROOF_DIR/broken-refusal.out.code"
+          if refused "a refusal that printed more" "$PROOF_DIR/broken-refusal.out" 2 "this needs a person at a terminal" > "$PROOF_DIR/broken-refusal.log" 2>&1; then
+            echo "::error::the refusal check accepted output that printed more than the refusal"
+            exit 1
+          fi
+          if ! grep -qF "found 3" "$PROOF_DIR/broken-refusal.log"; then
+            echo "::error::the refusal check refused the broken output, but not for printing one line too many"
+            exit 1
+          fi
+          echo "ok: refused a refusal that printed one line more than itself"
+
+          # The token scan, on a shape put together here from two pieces and kept out of the log.
+          dir="$(mktemp -d "$RUNNER_TEMP/planted-token.XXXXXX")"
+          printf '%s%s\n' 'gh' 'p_0123456789abcdefghijklmnopqrstuvwxyz' > "$dir/planted.txt"
+          found=0
+          scan_tokens "$dir" > "$PROOF_DIR/planted-token.log" 2>&1 || found=1
+          rm -f "$dir/planted.txt"
+          rmdir "$dir"
+          if [ "$found" != 1 ]; then
+            echo "::error::the token scan did not see a planted token shape, so it proves nothing"
+            exit 1
+          fi
+          echo "ok: the token scan saw a planted token shape: $(sed 's/^::error:://' "$PROOF_DIR/planted-token.log")"
+
       - name: No token shape in anything the job printed
         if: ${{ !cancelled() }}
         run: |
-          # Written with a bracket in each so that this file does not itself contain one.
-          shapes='gh[p]_|github_pa[t]_|xo[x]|sk-an[t]-|AKI[A]|-----BEGI[N]'
-          found=0
-          for f in "$PROOF_DIR"/*; do
-            if grep -qE -e "$shapes" "$f"; then
-              echo "::error::a token shape in $(basename "$f"), on line(s): $(grep -nE -e "$shapes" "$f" | cut -d: -f1 | tr '\n' ' ')"
-              found=1
-            fi
-          done
-          if [ "$found" != 0 ]; then
-            exit 1
-          fi
-          echo "ok: no token shape in $(ls "$PROOF_DIR" | wc -l | tr -d ' ') files of output"
+          . "$PROOF_DIR/lib.sh"
+          scan_tokens "$PROOF_DIR"
+          echo "ok: no token shape in the $(ls "$PROOF_DIR" | wc -l | tr -d ' ') files of output"

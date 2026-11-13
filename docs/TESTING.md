@@ -321,14 +321,20 @@ It holds and uses no secret.
 
 - Each run records the image (`sw_vers`, `/usr/bin/python3 -V`, `xcode-select -p`), so the log says what "clean" meant.
 - The look exits 10 (a Mac with no host has things waiting on a person), prints one line for every
-  part in `pipeline-parts.json` or names it on the "No check of their own" line, and reads no part
-  that is not set up as "up to date".
+  part in `pipeline-parts.json` or names it on the "No check of their own" line, reads no part
+  that is not set up as "up to date", and ends with a list that names every part still waiting.
 - The look changes nothing. The empty home, `/Library/LaunchDaemons`, `/Library/LaunchAgents` and
   `/etc/claude-pipeline` are listed with sha256 hashes before and after and must be identical, and
   `git status --porcelain --ignored` stays empty. The job then plants a file and shows that the
-  comparison fails, so a green run is never a comparison that compared nothing.
+  comparison fails, so a green run is never a comparison that compared nothing. The checks that
+  read text get the same proof: four broken copies of the look's output, a refusal with one line
+  too many and a planted token shape must each be refused, for the right reason.
 - The three refusals hold: an agent marker exits 3, root exits 2, and no terminal exits 2, each
   printing only its refusal. Nothing the job printed has a token shape.
+
+First measured 13 Nov 2026: macOS 15.8.2 (image `macos-15-arm64` 20261104.0514.1), `/usr/bin/python3`
+3.9.6, the developer tools of Xcode 16.4, passwordless `sudo`. The job ran in 14 seconds, after
+waiting 10 minutes for a macOS runner; the wait does not count against `timeout-minutes`.
 
 **What it does not prove.** A host: the account, session runner and public address do not exist on
 a runner. Real services: no tracker, code host or chat product, and no key for any of them. Real
