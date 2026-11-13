@@ -196,6 +196,28 @@ poller runs.
 Good: `THE JOBS THIS RUN STOPPED ARE LOADED AGAIN`, after the card. Clear the card, run again.
 Not: `NOT DONE: 2 STAGE E JOBS ARE OFF`. Run the lines under it, then run again.
 
+**`enable` counts a heartbeat only if it was written after that daemon's load** (KIT-702). A
+heartbeat left from before the load came from the old code. It says nothing about the code
+just loaded. The installer records the second it loads each daemon, and holds each heartbeat
+to its own daemon's load. That covers the load in `enable`, the one the `code` step makes as
+soon as the clone has moved, and the one a stopped run makes on its way out. A daemon is
+proven when its heartbeat was written in a later second than its load. One written in the
+load's own second cannot be told from one the old job left just before it exited, so it waits
+for the next pass.
+
+If a daemon is not proven within 90 seconds, the step ends `UNKNOWN`, never done. It names
+each daemon with `no heartbeat` or `its heartbeat is from before the load`. `verify` reads the
+same record and says the same sentence. Read the logs it points to under the role account's
+`~/.stage-e/`, then run the same command again.
+
+A daemon an older installer loaded, or you loaded by hand, has no recorded load. `verify` then
+says its heartbeat is present and that none is tied to a load. The next run that loads the
+daemon records one.
+
+Good: `all 3 daemons loaded; each wrote a heartbeat after its load`.
+Not that: `UNKNOWN` at `enable`, read as a pass. A daemon may not be running the new code.
+Read its log first.
+
 **`verify` reads `behind` only when a file the jobs run changed.** Those files are every
 script the five jobs load, their imports included, and `schemas/`, which a review and a
 telemetry row are judged against. They include the notifier's and the Slack bridge's files
