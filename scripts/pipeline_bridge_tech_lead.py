@@ -1437,12 +1437,28 @@ def cases_tech_lead(kit):
         # turn_thread; with push_mode off it answers at the top, as before. Either way the session
         # is the DM's one: a later top-level message resumes it too.
         POST_WORDS = "Stand-up: PROD-6 waits on a review."
+        FIXTURE_SECRET = "harmlessfixturevalue"        # a plain value, shaped like no real key
+
+        def make_poster(state, thread):
+            """The real tech_lead_posted, on a stand-in holding what it reads: the state, the
+            thread the post goes in, and a clean() that really redacts one fixed value."""
+            class Poster(object):
+                now = 5.0
+                reply_thread = thread
+
+                def clean(self, words):
+                    return notify.redact(words, [FIXTURE_SECRET])
+                tech_lead_posted = TechLeadMixin.tech_lead_posted
+            poster = Poster()
+            poster.state = state
+            return poster
 
         def case_reply_under_post(push):
             c, s, t = tlworld("turn-under-post-%s" % push, push_mode=push, **turn_on)
             root = relayed(c, s, POST_WORDS)
             st = json.load(open(state_path(c)))
-            st["relayed_posts"][key_of(DM, root)]["words"] = POST_WORDS
+            st["relayed_posts"].pop(key_of(DM, root))
+            make_poster(st, None).tech_lead_posted(DM, root, POST_WORDS)   # as a stand-up is posted
             save_state(c, st)
             fake = FakeTurn({"text": "Nobody picked it up.", "session_id": t_sid},
                             {"text": "Still nobody.", "session_id": t_sid, "resumed": True},
@@ -1470,22 +1486,18 @@ def cases_tech_lead(kit):
                    [None, t_sid, t_sid], True, False, [True, True]))
 
         def case_posted_words(top):
-            class Poster(object):
-                state = {"relayed_posts": {}}
-                now = 5.0
-                reply_thread = None if top else "1.5"
-
-                def clean(self, words):
-                    return words
-                tech_lead_posted = TechLeadMixin.tech_lead_posted
-            poster = Poster()
-            poster.tech_lead_posted(DM, "100.1", "PROD-6 " + "x" * (TECH_LEAD_MAX_CHARS + 50))
+            poster = make_poster({"relayed_posts": {}}, None if top else "1.5")
+            poster.tech_lead_posted(DM, "100.1", "PROD-6 %s %s" % (
+                FIXTURE_SECRET, "x" * (TECH_LEAD_MAX_CHARS + 50)))
             return poster.state["relayed_posts"][key_of(DM, "100.1")]
         top_rec, thread_rec = outcome(lambda: case_posted_words(True)), \
             outcome(lambda: case_posted_words(False))
+        top_rec = top_rec if isinstance(top_rec, dict) else {"words": str(top_rec), "ids": []}
+        thread_rec = thread_rec if isinstance(thread_rec, dict) else {"words": "raised"}
         check("turn-a-top-level-post-keeps-its-words-cut-to-the-limit-and-one-in-a-thread-keeps-none",
-              (len(top_rec["words"]), top_rec["words"].startswith("PROD-6 x"), top_rec["ids"],
-               "words" in thread_rec), (TECH_LEAD_MAX_CHARS, True, ["PROD-6"], False))
+              (len(top_rec.get("words", "")), top_rec.get("words", "").startswith("PROD-6 «redacted» x"),
+               FIXTURE_SECRET in top_rec.get("words", ""), top_rec["ids"], "words" in thread_rec),
+              (TECH_LEAD_MAX_CHARS, True, False, ["PROD-6"], False))
 
         def case_turn_config():
             base = dict(EXAMPLE_CONFIG, channel_ids=[CHAN], owner_user_id=OWNER,
