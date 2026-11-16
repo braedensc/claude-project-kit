@@ -23,8 +23,8 @@ WHAT IT DOES FOR ONE EVENT
      the message to `Pass.handle_once`: a command, a bare yes or no and the tech lead's turn all
      go the way a pass sends them, and code decides them exactly as there. The turn's reply goes in
      a thread under the owner's message; the bridge's own yes/no questions stay top-level, where a
-     yes is looked for. A reply inside that thread continues its conversation; a new top-level
-     message starts a new one.
+     yes is looked for. There is one conversation per DM: a reply inside that thread and a new
+     top-level message both continue it (KIT-751).
   5. A message already `handled` (by a pass, or by an earlier delivery) is never answered again. The
      state is read under the lock, so a message both this job and a pass see is answered once.
 
@@ -809,19 +809,20 @@ def selftest_body():
           (("status", DM, "1760000001.000100", ""), []))
     st = json.load(open(bridge.state_path(cfg)))
     check("reply: the message is recorded as handled, so a pass leaves it, and the turn's "
-          "session is the thread's",
+          "session is the DM's",
           ("%s:1760000001.000100" % DM in st["handled"],
            sorted(st["turn_sessions"]), turn.calls[0]["session"]),
-          (True, ["%s:1760000001.000100" % DM], None))
-    # the owner replies inside that thread: the same conversation. A new top-level message: a new one.
+          (True, [DM], None))
+    # the owner replies inside that thread: the same conversation. A new top-level message: the same
+    # one too (KIT-751): one conversation per DM; the thread decides only where the answer is posted.
     turn.answers += [{"text": "Still ready.", "session_id": SID, "resumed": True},
                      {"text": "A new topic.", "session_id": SID2}]
     job.handle(event("1760000002.000100", text="and the plan?", thread="1760000001.000100"))
     job.handle(event("1760000003.000100", text="something else"))
-    check("thread: a reply inside the thread resumes its session; a new message starts another",
+    check("thread: a reply inside the thread and a new top-level message both resume the DM's one session",
           ([c["session"] and c["session"]["id"] for c in turn.calls],
            sorted(json.load(open(bridge.state_path(cfg)))["turn_sessions"])),
-          ([None, SID, None], sorted(["%s:1760000001.000100" % DM, "%s:1760000003.000100" % DM])))
+          ([None, SID, SID], [DM]))
     check("thread: every reply is under its own conversation's root",
           [c[2] for c in slack.calls if c[0] == "post"],
           ["1760000001.000100", "1760000001.000100", "1760000003.000100"])
@@ -1280,7 +1281,7 @@ def selftest_body():
           "remembers the thread as the conversation",
           ([(c, t, x) for c, t, x in slack.posts if x == "Caught up."], sorted(st["turn_threads"]),
            sorted(st["turn_sessions"])), ([(DM, top, "Caught up.")], ["%s:%s" % (DM, top)],
-                                          ["%s:%s" % (DM, top)]))
+                                          [DM]))
     reply = slack.add(ALICE, "and the plan?", thread=top, channel=DM, at=NOW - 20)
     turn = FakeTurn({"text": "Same thread.", "session_id": SID, "resumed": True})
     pass_run(cfg, slack, tracker, turn)

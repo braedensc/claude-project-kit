@@ -523,7 +523,12 @@ class RequestsMixin(object):
         under = self.state["relayed_posts"].get(key_of(channel, thread)) if dm and reply else None
         if under is not None:
             if self.cfg["tech_lead_turn"]:
-                self.forward(channel, msg, note=reply_note(under))
+                if self.cfg["push_mode"]:
+                    # KIT-751: answered in that thread, never at the top of the DM.
+                    self.reply_channel, self.reply_thread = channel, thread
+                words = under.get("words")
+                self.forward(channel, msg, note=reply_note(under),
+                             earlier=words if isinstance(words, str) else "")
             else:
                 self.stray(channel, msg)
             return

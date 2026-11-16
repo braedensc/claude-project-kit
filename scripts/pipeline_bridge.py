@@ -1786,7 +1786,7 @@ class Kit(object):
             def __call__(self, cfg, text, session, now, **kw):
                 self.calls.append({"text": text, "session": session,
                                    "seconds": cfg["turn_timeout_seconds"],
-                                   "note": kw.get("note", "")})
+                                   "note": kw.get("note", ""), "earlier": kw.get("earlier", "")})
                 a = self.answers.pop(0) if self.answers else {}
                 return dict({"text": None, "why": "", "session_id": None, "resumed": False,
                              "cost": None, "turns": None}, **a)

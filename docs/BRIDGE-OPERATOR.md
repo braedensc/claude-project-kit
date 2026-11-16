@@ -1371,8 +1371,10 @@ the answers come one after the other.
 - If Slack refuses the status line, the thread gets one short *On it.* instead. The answer
   replaces it. If the turn fails or times out, or anything else goes wrong in it, the status
   clears and the thread says so in plain words.
-- Write inside that thread and it continues the same conversation. Write a new message in the DM
-  and it starts a new one.
+- There is one conversation per DM, as with a person. A message in a thread and a new message in
+  the DM both carry on the same one. The thread only decides where the answer is posted.
+- Reply in the thread under one of the tech lead's own posts, such as a stand-up, and it sees that
+  post's words. The answer goes in that thread.
 - A yes, a no or a command goes the way it always did, decided by code. The bridge's own questions
   stay in the DM itself, not in a thread, where your yes is looked for.
 
