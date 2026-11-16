@@ -97,7 +97,7 @@ DEFAULTS = {
     "turn_timeout_seconds": 90,
     "turn_max_turns": 8,
     "turn_max_budget_usd": 0.5,
-    "turn_session_hours": 12,
+    "turn_session_hours": 168,         # a week, the most it allows (KIT-759)
     "turn_tools_config": "",
 }
 CONFIG_KEYS = {
@@ -116,7 +116,8 @@ CONFIG_KEYS = {
     "turn_max_turns": "the most tool-and-answer rounds in one turn (default 8, at most 30)",
     "turn_max_budget_usd": "the spend cap for one turn (default 0.5, at most 5)",
     "turn_session_hours": "a DM's conversation is resumed within this many hours of its last "
-                          "turn, and begun again after (default 12, at most 168)",
+                          "turn, and begun again after (default 168, a week, which is also the "
+                          "most)",
     "turn_tools_config": "the full path of the tool server's config file "
                          "(docs/TECH-LEAD-TOOLS.md); required while the turn is on",
 }
@@ -1096,8 +1097,17 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
     expect("session: one inside the window is resumed",
            (r.calls[0]["cmd"][6:8], res["resumed"], res["session_id"]),
            (["--resume", SID], True, SID))
+    # KIT-759: the default window is a week, so a quiet night or a long weekend keeps it.
+    expect("session: turn_session_hours defaults to 168 hours, a week",
+           settings({})[0]["turn_session_hours"], 168)
+    for name, gap in (("about 13 hours", 13 * 3600), ("about 6 days", 6 * 24 * 3600)):
+        r = Runner(ok(sid=SID))
+        res = turn(r, session={"id": SID, "last_at": 900.0}, now=900.0 + gap, ids_=[SID2])
+        expect("session: one %s after its last turn is resumed, by default" % name,
+               (r.calls[0]["cmd"][6:8], res["resumed"], res["session_id"]),
+               (["--resume", SID], True, SID))
     r = Runner(ok(sid=SID2))
-    res = turn(r, session={"id": SID, "last_at": 900.0}, now=900.0 + 12 * 3600 + 1,
+    res = turn(r, session={"id": SID, "last_at": 900.0}, now=900.0 + 168 * 3600 + 1,
                ids_=[SID2])
     expect("session: one past turn_session_hours is begun again, as a new id",
            (r.calls[0]["cmd"][6:8], res["resumed"], res["session_id"]),
