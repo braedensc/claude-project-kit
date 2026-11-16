@@ -1241,7 +1241,7 @@ closed. Reply in the thread under its message in Linear, or ask the tech lead wh
 | `turn_bin` | The `claude` CLI's full path, as `command -v claude` prints it. |
 | `turn_tools_config` | The full path of the tool server's config file. |
 | `turn_token_env` | The name of the env var holding the token. Default: `CLAUDE_WRITER_OAUTH_TOKEN`, the name the writer used, so a token stored before the cutover still serves. |
-| `turn_model`, `turn_timeout_seconds`, `turn_max_turns`, `turn_max_budget_usd`, `turn_session_hours` | Optional limits. Defaults: `sonnet`, 90, 8, 0.5, 168 (a week). |
+| `turn_model`, `turn_timeout_seconds`, `turn_max_turns`, `turn_max_budget_usd`, `turn_session_hours` | Optional limits. Defaults: `sonnet`, 90, 8, 0.5. `turn_session_hours` is no longer used: a number there is ignored. |
 
 A pass must keep time to say a turn failed: `turn_timeout_seconds` is at most
 `run_timeout_seconds` less 25.
@@ -1261,11 +1261,13 @@ A pass must keep time to say a turn failed: `turn_timeout_seconds` is at most
 busy or restarting. Ask again in a bit.* The log says why, in fixed words: a usage limit, a
 refused token, a turn that ran out of rounds. The message is not asked again.
 
-**Each DM is one conversation, and it lasts a week.** A message within `turn_session_hours` of
-the last one resumes it, so the tech lead remembers what you said, overnight too. The default is
-168 hours (7 days), the most it allows. After a week with no message, it starts a new one. The
-limit is there because each turn reads the whole conversation again, so a longer one costs more.
-Claude Code shortens a long conversation by itself, by summarising its older part.
+**Each DM is one conversation, and it is kept.** Every message resumes it, however long ago the
+last one was, so the tech lead remembers what you said. Claude Code shortens a long conversation
+by itself, by summarising its older part. The first reply after a long quiet gap costs more: the
+whole conversation is read again, with nothing left in the cache. Each turn's line in the
+bridge's log says what it cost and how much of its input came from the cache. A new conversation
+starts only when the saved one cannot be resumed, and the log says why. A `turn_session_hours`
+left in an old config is ignored, and the log says that too.
 
 **What it costs.** Each message is one turn on your Claude subscription. It counts toward
 your plan's limits. It never uses an API key, and `writer-token` refuses one.

@@ -374,6 +374,19 @@ def setting_refusal(owner, msg, text, setting, value):
     return None
 
 
+def turn_cost(res):
+    """KIT-759: what one turn cost and the share of its input read from the cache, for the log
+    line ("" when the CLI said neither). A reply after a long quiet gap reads the whole
+    conversation afresh, so this is where that shows."""
+    parts = []
+    cost, share = res.get("cost"), res.get("cache_share")
+    if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+        parts.append("cost $%.4f" % cost)
+    if isinstance(share, (int, float)) and not isinstance(share, bool):
+        parts.append("%d%% of its input read from the cache" % round(share * 100))
+    return ("; " + ", ".join(parts)) if parts else ""
+
+
 class TechLeadMixin(object):
     """Pass's questions to the tech lead, and its answers back (KIT-312)."""
 
@@ -561,6 +574,10 @@ class TechLeadMixin(object):
             self.say("  left a DM message for the next pass: %d seconds are too few for a turn"
                      % max(seconds, 0))
             return
+        hours = turn.settings(self.cfg)[0].get("turn_session_hours")
+        if hours:
+            self.say("  turn_session_hours (%g) is no longer used, so it is ignored: a DM's "
+                     "conversation is kept however long ago its last turn was" % hours)
         sessions = self.state["turn_sessions"]
         # KIT-751: one conversation per DM, as a person keeps one: every turn in it resumes the
         # same session (within turn_session_hours), wherever the message sits. Under push mode
@@ -581,6 +598,9 @@ class TechLeadMixin(object):
         try:
             res = self.run_turn(dict(self.cfg, turn_timeout_seconds=seconds), text,
                                 sessions.get(skey), self.now, **more)
+            if res.get("began_again"):
+                # KIT-759: the one way a DM's conversation begins again, said in the log.
+                self.say("  the tech lead's conversation began again: %s" % res["began_again"])
             # Read once, whatever the turn did: a turn that failed after the tools ran leaves no
             # action waiting. What it recorded is asked about only after its reply is posted.
             acts, left_out = self.read_outbox()
@@ -643,8 +663,9 @@ class TechLeadMixin(object):
                 self.post(channel, None, TURN_LEFT_OUT % "; ".join(left_out), in_thread=True)
             self.mark(channel, msg, "answered by a turn")
             self.counts["turned"] = self.counts.get("turned", 0) + 1
-            self.say("  answered a DM message from %s with a turn%s" % (
-                msg["user"], " (the conversation resumed)" if res["resumed"] else ""))
+            self.say("  answered a DM message from %s with a turn%s%s" % (
+                msg["user"], " (the conversation resumed)" if res["resumed"] else "",
+                turn_cost(res)))
         else:
             self.post(channel, None, FORWARD_NO_ANSWER_SAYS, kind="forward-no-answer",
                       bind=FORWARD_NO_ANSWER_BIND, join=" ", in_thread=True)
@@ -652,7 +673,8 @@ class TechLeadMixin(object):
                                      else "it had no words")
             self.mark(channel, msg, "turn failed: %s" % nothing)
             self.counts["refused"] += 1
-            self.say("  a turn for a DM message from %s gave no answer: %s" % (msg["user"], nothing))
+            self.say("  a turn for a DM message from %s gave no answer: %s%s"
+                     % (msg["user"], nothing, turn_cost(res)))
             if removed and not res["why"] and acts:
                 # Only its words told him what to type; what it recorded is still asked about, as
                 # the bridge's own question (Stage E on #426).
@@ -1498,6 +1520,45 @@ def cases_tech_lead(kit):
               (len(top_rec.get("words", "")), top_rec.get("words", "").startswith("PROD-6 «redacted» x"),
                FIXTURE_SECRET in top_rec.get("words", ""), top_rec["ids"], "words" in thread_rec),
               (TECH_LEAD_MAX_CHARS, True, False, ["PROD-6"], False))
+
+        # KIT-759: the conversation is kept; the log says what each turn cost and why one began again.
+        check("turn-cost-says-the-cost-and-the-cache-share-and-nothing-when-neither-is-known",
+              [turn_cost(r) for r in (
+                  {"cost": 0.0123, "cache_share": 0.9}, {"cost": 0.5}, {"cache_share": 0.25},
+                  {}, {"cost": None, "cache_share": None}, {"cost": True, "cache_share": "9"})],
+              ["; cost $0.0123, 90% of its input read from the cache", "; cost $0.5000",
+               "; 25% of its input read from the cache", "", "", ""])
+
+        log_worlds = []
+
+        def case_turn_log(answer, **over):
+            log_worlds.append(0)
+            c, s, t = tlworld("turn-log-%d" % len(log_worlds), **dict(turn_on, **over))
+            s.add(ALICE, "what is blocked?", channel=DM)
+            fake = FakeTurn(dict({"text": "PROD-6 waits.", "session_id": t_sid}, **answer))
+            lines = with_turn(fake, lambda: run(c, s, t, at=now + 60))[1].splitlines()
+            return [ln for ln in lines if ln.startswith("  ") and "DM message" in ln
+                    or "began again" in ln or "turn_session_hours" in ln]
+        check("turn-the-log-says-the-cost-and-cache-share-on-an-answered-turn",
+              outcome(lambda: case_turn_log({"cost": 0.0123, "cache_share": 0.9, "resumed": True})),
+              ["  answered a DM message from %s with a turn (the conversation resumed); cost "
+               "$0.0123, 90%% of its input read from the cache" % ALICE])
+        check("turn-the-log-says-the-cost-on-a-turn-that-gave-no-answer-too",
+              outcome(lambda: case_turn_log({"text": None, "why": "a usage limit was reached",
+                                             "cost": 0.01, "cache_share": 0.5})),
+              ["  a turn for a DM message from %s gave no answer: a usage limit was reached; "
+               "cost $0.0100, 50%% of its input read from the cache" % ALICE])
+        check("turn-the-log-says-why-a-conversation-began-again",
+              outcome(lambda: case_turn_log({"began_again": "the saved conversation could not be "
+                                                            "found"})),
+              ["  the tech lead's conversation began again: the saved conversation could not be "
+               "found",
+               "  answered a DM message from %s with a turn" % ALICE])
+        check("turn-the-log-names-an-ignored-turn_session_hours-and-only-when-it-is-above-zero",
+              [outcome(lambda: [ln for ln in case_turn_log({}, **over) if "turn_session_hours" in ln])
+               for over in ({"turn_session_hours": 12}, {"turn_session_hours": 0}, {})],
+              [["  turn_session_hours (12) is no longer used, so it is ignored: a DM's "
+                "conversation is kept however long ago its last turn was"], [], []])
 
         def case_turn_config():
             base = dict(EXAMPLE_CONFIG, channel_ids=[CHAN], owner_user_id=OWNER,

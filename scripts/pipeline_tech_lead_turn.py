@@ -97,7 +97,7 @@ DEFAULTS = {
     "turn_timeout_seconds": 90,
     "turn_max_turns": 8,
     "turn_max_budget_usd": 0.5,
-    "turn_session_hours": 168,         # a week, the most it allows (KIT-759)
+    "turn_session_hours": 0,           # no longer used: a DM's conversation is kept (KIT-759)
     "turn_tools_config": "",
 }
 CONFIG_KEYS = {
@@ -115,20 +115,23 @@ CONFIG_KEYS = {
     "turn_timeout_seconds": "how long one turn may take (default 90, at most 600)",
     "turn_max_turns": "the most tool-and-answer rounds in one turn (default 8, at most 30)",
     "turn_max_budget_usd": "the spend cap for one turn (default 0.5, at most 5)",
-    "turn_session_hours": "a DM's conversation is resumed within this many hours of its last "
-                          "turn, and begun again after (default 168, a week, which is also the "
-                          "most)",
+    "turn_session_hours": "no longer used (KIT-759): a DM's conversation is resumed however long "
+                          "ago its last turn was, and begun again only when it cannot be resumed. "
+                          "A number left here is ignored, and the bridge's log says so",
     "turn_tools_config": "the full path of the tool server's config file "
                          "(docs/TECH-LEAD-TOOLS.md); required while the turn is on",
 }
-LIMITS = {"turn_timeout_seconds": 600, "turn_max_turns": 30, "turn_max_budget_usd": 5,
-          "turn_session_hours": 168}
+LIMITS = {"turn_timeout_seconds": 600, "turn_max_turns": 30, "turn_max_budget_usd": 5}
 # The bridge keeps this long to post, and starts no turn with less than the minimum left.
 TURN_MIN_SECONDS = 20
 CONFIG_NOTE_KEYS = tuple(k for k in DEFAULTS if k != "tech_lead_turn")
 
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
 _NO_SESSION_RE = re.compile(r"no conversation found|session.{0,40}not found", re.IGNORECASE)
+# KIT-759: with no time limit, a conversation too long to send even after Claude Code's own
+# compaction would fail every turn, so that too begins it again.
+_TOO_LONG_RE = re.compile(r"prompt is too long|context (?:window|length)|too many tokens",
+                          re.IGNORECASE)
 RESULT_MAX_CHARS = 20000                  # what is read of the model's text, before the bridge cuts
 OUTBOX_READ_MAX = 20                      # entries looked at in one read of the outbox
 ENTRY_KEYS = ("at", "schema", "ticket", "verb")
@@ -220,6 +223,11 @@ def settings(cfg):
     for key in LIMITS:
         if not _within(s[key], key):
             return s, key
+    # KIT-759: no longer used, so any number an old config names still loads; it is ignored.
+    hours = s["turn_session_hours"]
+    if not (isinstance(hours, (int, float)) and not isinstance(hours, bool)
+            and 0 <= hours < float("inf")):
+        return s, "turn_session_hours"
     if not isinstance(s["turn_max_turns"], int):
         return s, "turn_max_turns"
     if not isinstance(s["turn_tools_config"], str) or "\0" in s["turn_tools_config"] or (
@@ -472,9 +480,23 @@ def _write(path, text):
 
 
 def _result(text=None, why="", session_id=None, resumed=False, cost=None, turns=None,
-            denials=0):
+            denials=0, cache_share=None):
+    """`cache_share` (KIT-759) is the share of the turn's input read from the prompt cache;
+    `began_again` is why a resumed conversation had to begin again, in fixed words, or ""."""
     return {"text": text, "why": why, "session_id": session_id, "resumed": resumed,
-            "cost": cost, "turns": turns, "denials": denials}
+            "cost": cost, "turns": turns, "denials": denials, "cache_share": cache_share,
+            "began_again": ""}
+
+
+def _cache_share(doc):
+    """The share of the input read from the cache, from the result's own `usage`, or None."""
+    usage = doc.get("usage") if isinstance(doc.get("usage"), dict) else {}
+    nums = [usage.get(k, 0) for k in ("input_tokens", "cache_read_input_tokens",
+                                      "cache_creation_input_tokens")]
+    if not all(isinstance(n, int) and not isinstance(n, bool) and n >= 0 for n in nums) \
+            or not sum(nums):
+        return None
+    return round(nums[1] / float(sum(nums)), 3)
 
 
 def read_result(proc, session_id, resumed):
@@ -500,7 +522,8 @@ def read_result(proc, session_id, resumed):
     sid = got if isinstance(got, str) and _UUID_RE.match(got) else session_id
     denied = doc.get("permission_denials")
     base = dict(session_id=sid, resumed=resumed, cost=cost, turns=turns,
-                denials=len(denied) if isinstance(denied, list) else 0)
+                denials=len(denied) if isinstance(denied, list) else 0,
+                cache_share=_cache_share(doc))
     if erred:
         status = doc.get("api_error_status") if isinstance(doc.get("api_error_status"), int) \
             else None
@@ -570,9 +593,9 @@ def run_turn(cfg, text, session, now, runner=None, new_id=None, environ=None, no
     except OSError as exc:
         return _result(why="I could not write the turn's files: %s" % (exc.strerror or "error"))
     prompt = build_prompt(text, note, earlier)
+    # KIT-759: resumed however long ago its last turn was; Claude Code compacts a long one itself.
     resumed = bool(session and isinstance(session.get("id"), str)
-                   and _UUID_RE.match(session["id"])
-                   and now - session.get("last_at", 0) <= s["turn_session_hours"] * 3600)
+                   and _UUID_RE.match(session["id"]))
     sid = session["id"] if resumed else new_id()
     def on_event(event):
         piece = text_delta(event)
@@ -581,6 +604,7 @@ def run_turn(cfg, text, session, now, runner=None, new_id=None, environ=None, no
                 on_text(piece)
             except Exception:                                  # noqa: BLE001
                 pass
+    began = ""
     for _ in (1, 2):
         argv = build_argv(s, tcfg, mcp_path, rules_path, sid, resumed, stream=bool(on_text))
         try:
@@ -596,10 +620,17 @@ def run_turn(cfg, text, session, now, runner=None, new_id=None, environ=None, no
         except subprocess.SubprocessError as exc:
             return _result(why="the turn failed (%s)" % type(exc).__name__)
         res, said = read_result(proc, sid, resumed)
-        if res["text"] is None and resumed and _NO_SESSION_RE.search(said):
-            sid, resumed = new_id(), False        # the CLI no longer has it: begin again, once
+        lost = ""
+        if res["text"] is None and resumed:
+            lost = ("the saved conversation could not be found" if _NO_SESSION_RE.search(said)
+                    else "the saved conversation was too long to resume"
+                    if _TOO_LONG_RE.search(said) else "")
+        if lost:
+            sid, resumed, began = new_id(), False, lost    # it cannot be resumed: begin again, once
             continue
+        res["began_again"] = began
         return res
+    res["began_again"] = began
     return res
 
 
@@ -948,7 +979,8 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
            [])
     expect("result: the reply, the session to keep, the cost and the rounds",
            res, {"text": "Two plans are open.", "why": "", "session_id": SID, "resumed": False,
-                 "cost": 0.02, "turns": 3, "denials": 0})
+                 "cost": 0.02, "turns": 3, "denials": 0, "cache_share": None,
+                 "began_again": ""})
     expect("a turn runs in its own empty working folder, with a timeout",
            (c["cwd"], c["timeout"], os.listdir(c["cwd"])), (fld["work"], 90, []))
 
@@ -1097,21 +1129,29 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
     expect("session: one inside the window is resumed",
            (r.calls[0]["cmd"][6:8], res["resumed"], res["session_id"]),
            (["--resume", SID], True, SID))
-    # KIT-759: the default window is a week, so a quiet night or a long weekend keeps it.
-    expect("session: turn_session_hours defaults to 168 hours, a week",
-           settings({})[0]["turn_session_hours"], 168)
-    for name, gap in (("about 13 hours", 13 * 3600), ("about 6 days", 6 * 24 * 3600)):
+    # KIT-759: no time-based reset. The setting defaults to 0 and is ignored; any age resumes.
+    expect("session: turn_session_hours defaults to 0, and is not used",
+           settings({})[0]["turn_session_hours"], 0)
+    for name, gap in (("about 13 hours", 13 * 3600), ("about 30 days", 30 * 24 * 3600)):
         r = Runner(ok(sid=SID))
         res = turn(r, session={"id": SID, "last_at": 900.0}, now=900.0 + gap, ids_=[SID2])
         expect("session: one %s after its last turn is resumed, by default" % name,
-               (r.calls[0]["cmd"][6:8], res["resumed"], res["session_id"]),
-               (["--resume", SID], True, SID))
-    r = Runner(ok(sid=SID2))
-    res = turn(r, session={"id": SID, "last_at": 900.0}, now=900.0 + 168 * 3600 + 1,
-               ids_=[SID2])
-    expect("session: one past turn_session_hours is begun again, as a new id",
-           (r.calls[0]["cmd"][6:8], res["resumed"], res["session_id"]),
-           (["--session-id", SID2], False, SID2))
+               (r.calls[0]["cmd"][6:8], res["resumed"], res["session_id"], res["began_again"]),
+               (["--resume", SID], True, SID, ""))
+    for hours in (12, 500):
+        r = Runner(ok(sid=SID))
+        res = turn(r, session={"id": SID, "last_at": 900.0}, now=900.0 + 13 * 3600,
+                   config=dict(cfg, turn_session_hours=hours), ids_=[SID2])
+        expect("session: an old config naming turn_session_hours %d loads and still resumes" % hours,
+               (res["why"], r.calls[0]["cmd"][6:8], res["resumed"]), ("", ["--resume", SID], True))
+    r = Runner(Proc({"type": "result", "subtype": "error_during_execution", "is_error": True,
+                     "result": "Prompt is too long"}), ok(sid=SID2))
+    res = turn(r, session={"id": SID, "last_at": 900.0}, ids_=[SID2])
+    expect("session: a resumed turn whose prompt is too long begins again, once, and says why",
+           (len(r.calls), [c["cmd"][6:8] for c in r.calls[1:]], res["text"], res["resumed"],
+            res["began_again"]),
+           (2, [["--session-id", SID2]], "Two plans are open.", False,
+            "the saved conversation was too long to resume"))
     r = Runner(ok(sid=SID2))
     res = turn(r, session={"id": "../../etc", "last_at": 900.0}, ids_=[SID2])
     expect("session: a record whose id is not a UUID is never passed to the CLI",
@@ -1120,9 +1160,10 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
     r = Runner(Proc({"type": "result", "subtype": "error_during_execution", "is_error": True,
                      "result": "No conversation found with session ID: %s" % SID}), ok(sid=SID2))
     res = turn(r, session={"id": SID, "last_at": 900.0}, ids_=[SID2])
-    expect("session: one the CLI no longer has is begun again, once",
-           (len(r.calls), r.calls[1]["cmd"][6:8], res["text"], res["resumed"]),
-           (2, ["--session-id", SID2], "Two plans are open.", False))
+    expect("session: one the CLI no longer has is begun again, once, and says why",
+           (len(r.calls), r.calls[1]["cmd"][6:8], res["text"], res["resumed"], res["began_again"]),
+           (2, ["--session-id", SID2], "Two plans are open.", False,
+            "the saved conversation could not be found"))
     r = Runner(Proc({"type": "result", "subtype": "error_during_execution", "is_error": True,
                      "result": "No conversation found"}),
                Proc({"type": "result", "subtype": "error_during_execution", "is_error": True,
@@ -1134,7 +1175,18 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                      "result": "You've hit your session limit"}), ok())
     res = turn(r, session={"id": SID, "last_at": 900.0}, ids_=[SID2])
     expect("session: a resumed turn that fails for another reason is never asked again",
-           (len(r.calls), res["text"], res["why"]), (1, None, "a usage limit was reached"))
+           (len(r.calls), res["text"], res["why"], res["began_again"]),
+           (1, None, "a usage limit was reached", ""))
+    for name, usage, want in (
+            ("10/90/0", {"input_tokens": 10, "cache_read_input_tokens": 90,
+                         "cache_creation_input_tokens": 0}, 0.9),
+            ("none given", None, None),
+            ("a non-int field", {"input_tokens": 10, "cache_read_input_tokens": "90",
+                                 "cache_creation_input_tokens": 0}, None),
+            ("a bool field", {"input_tokens": 10, "cache_read_input_tokens": True,
+                              "cache_creation_input_tokens": 0}, None)):
+        r = Runner(ok(**({"usage": usage} if usage is not None else {})))
+        expect("cache share: usage %s" % name, turn(r)["cache_share"], want)
 
     # ── failures say why in fixed words, never the CLI's own ─────────────────────────────────
     import subprocess as sp
@@ -1172,7 +1224,9 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                        ("turn_model", "--bare"), ("turn_token_env", "lower"),
                        ("turn_timeout_seconds", 9999), ("turn_max_turns", 0),
                        ("turn_max_turns", 2.5), ("turn_max_budget_usd", 50),
-                       ("turn_session_hours", float("nan")), ("turn_tools_config", "rel.json")):
+                       ("turn_session_hours", float("nan")), ("turn_session_hours", -1),
+                       ("turn_session_hours", float("inf")), ("turn_session_hours", True),
+                       ("turn_session_hours", "168"), ("turn_tools_config", "rel.json")):
         r = Runner(ok())
         res = turn(r, config=dict(cfg, **{key: value}))
         expect("settings: %s=%r is refused before anything starts" % (key, value),
