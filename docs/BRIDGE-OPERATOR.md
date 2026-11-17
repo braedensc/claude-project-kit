@@ -1241,7 +1241,7 @@ closed. Reply in the thread under its message in Linear, or ask the tech lead wh
 | `turn_bin` | The `claude` CLI's full path, as `command -v claude` prints it. |
 | `turn_tools_config` | The full path of the tool server's config file. |
 | `turn_token_env` | The name of the env var holding the token. Default: `CLAUDE_WRITER_OAUTH_TOKEN`, the name the writer used, so a token stored before the cutover still serves. |
-| `turn_model`, `turn_timeout_seconds`, `turn_max_turns`, `turn_max_budget_usd`, `turn_session_hours` | Optional limits. Defaults: `sonnet`, 90, 8, 0.5. `turn_session_hours` is no longer used: a number there is ignored. |
+| `turn_model`, `turn_timeout_seconds`, `turn_max_turns`, `turn_max_budget_usd`, `turn_session_hours` | Optional limits. Defaults: `sonnet`, 90, 20, 2. The rounds and the spend cap stop a runaway, never a normal request: a request of several steps can take more than 8 rounds, and the first reply after a quiet gap in a long conversation can cost more than $0.50. `turn_session_hours` is no longer used: a number there is ignored. |
 
 A pass must keep time to say a turn failed: `turn_timeout_seconds` is at most
 `run_timeout_seconds` less 25.
@@ -1268,6 +1268,21 @@ whole conversation is read again, with nothing left in the cache. Each turn's li
 bridge's log says what it cost and how much of its input came from the cache. A new conversation
 starts only when the saved one cannot be resumed, and the log says why. A `turn_session_hours`
 left in an old config is ignored, and the log says that too.
+
+**A new conversation never starts blank (KIT-751).** The first conversation in a DM, and one that
+had to begin again, is given the DM's recent messages: yours, the tech lead's own and the
+pipeline's, oldest first. The tech lead reads them as a record of what was said, not as requests.
+
+- It reads the newest 30 messages before yours, and the threads among them, where the tech lead
+  answers. That is at most 8,000 characters, the oldest dropped first, with no time limit.
+- A message shaped like a key is left out, and the block says how many were.
+- If Slack cannot be read, or is slow, the turn still answers with what was read, and the log
+  says so. It reads no thread after 10 seconds.
+- The tech lead never says it has no memory. If you mention something it does not have, it asks.
+
+Good: `the tech lead's new conversation was given 12 of the DM's recent messages`, right after
+`the tech lead's conversation began again: …`.
+Not that: an answer that says it cannot see your earlier messages. Look for that log line first.
 
 **What it costs.** Each message is one turn on your Claude subscription. It counts toward
 your plan's limits. It never uses an API key, and `writer-token` refuses one.

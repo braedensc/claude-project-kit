@@ -1778,18 +1778,25 @@ class Kit(object):
         t_sid = "11111111-1111-4111-8111-111111111111"
 
         class FakeTurn(object):
-            """Stands in for run_turn: records each call, answers from the list it was given."""
+            """Stands in for run_turn: records each call, answers from the list it was given.
+            With `seeds` (KIT-751) it asks the turn's seed as run_turn does, once, when the
+            answer it gives starts a new conversation (not resumed), and records the lines."""
 
-            def __init__(self, *answers):
+            def __init__(self, *answers, **opts):
                 self.answers, self.calls = list(answers), []
+                self.seeds = opts.get("seeds", False)
 
             def __call__(self, cfg, text, session, now, **kw):
+                a = self.answers.pop(0) if self.answers else {}
+                seed = kw.get("seed")
+                lines = seed() if self.seeds and seed and not a.get("resumed") else None
                 self.calls.append({"text": text, "session": session,
                                    "seconds": cfg["turn_timeout_seconds"],
-                                   "note": kw.get("note", ""), "earlier": kw.get("earlier", "")})
-                a = self.answers.pop(0) if self.answers else {}
+                                   "note": kw.get("note", ""), "earlier": kw.get("earlier", ""),
+                                   "seed": lines})
                 return dict({"text": None, "why": "", "session_id": None, "resumed": False,
-                             "cost": None, "turns": None}, **a)
+                             "cost": None, "turns": None,
+                             "seeded": None if lines is None else len(lines)}, **a)
 
         def with_turn(fake, fn, outbox=None):
             """`fn`, with `fake` standing in for the turn and, when given, `outbox` for what the
