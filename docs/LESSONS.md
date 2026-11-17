@@ -346,7 +346,7 @@ commit and proves it is the base.
 A prod deploy failed in the Actions tab for hours with nothing surfacing it
 (2026-07-09): every PR check was green, the `workflow_run` deploy after merge was not.
 Fix: a `workflow_run`-triggered alert that opens/comments ONE deduped, stable-titled
-issue when a watched workflow fails on main (`templates/workflows/pipeline-failure-alert.yml`;
+issue when a watched workflow fails, times out or is cancelled on the default branch, unless a newer run replaced a cancelled one (`templates/workflows/pipeline-failure-alert.yml`;
 the stable title IS the dedupe key). And **detection without delivery is still
 silence**: an auto-opened issue a solo owner doesn't watch is a dead-end — @mention +
 assign the owner on create AND on every comment, so the notification reason becomes
