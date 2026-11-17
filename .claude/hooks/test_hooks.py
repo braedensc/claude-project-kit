@@ -3787,7 +3787,7 @@ def main():
     # read as a person's session, so the three numbers must agree.
     def _product_const(path, name):
         with open(path, encoding="utf-8") as fh:
-            m = re.search(r"^%s = ([0-9][0-9 *]*)$" % name, fh.read(), re.M)
+            m = re.search(r"^%s = ([0-9][0-9 *]*?)\s*(?:#.*)?$" % name, fh.read(), re.M)
         if not m:
             return None
         n = 1
