@@ -2164,7 +2164,7 @@ def post_dm(bridge_cfg, text, client=None):
     client. Returns (channel, ts). The token stays in the env var the bridge config names."""
     users = bridge_cfg.get("dm_user_ids") or []
     if not users:
-        raise StandupError("the bridge's config names no DM member (dm_user_ids)")
+        raise StandupError("the tech lead's config names no DM member (dm_user_ids)")
     if client is None:
         client = transport.SlackClient(bridge_cfg,
                                        bridge_config.credential(bridge_cfg, "slack_token_env"))
@@ -2212,7 +2212,7 @@ def run(settings, dry_run=False, now=None, client=None, bridge_cfg=None, out=Non
         if bridge_cfg is None:
             bridge_cfg = bridge_config.load_config(os.path.expanduser(settings["bridge_config"]))
     except (transport.BridgeError, OSError, ValueError) as exc:
-        out.write("COULD NOT SEND the %s rundown: the bridge's config: %s\n" % (kind, exc))
+        out.write("COULD NOT SEND the %s rundown: the tech lead's config: %s\n" % (kind, exc))
         return EXIT_FAILED
     secrets = bridge_config.live_secrets(bridge_cfg)
     composed = compose(kind, now, settings, record, teams=bridge_cfg.get("team_keys"))
@@ -2273,7 +2273,7 @@ def preview(settings, kind, now=None, out=None, full=False):
         teams = bridge_config.load_config(os.path.expanduser(settings["bridge_config"]))[
             "team_keys"]
     except (transport.BridgeError, OSError, ValueError) as exc:
-        out.write("note: the bridge's config could not be read (%s), so this preview covers "
+        out.write("note: the tech lead's config could not be read (%s), so this preview covers "
                   "every project in the status file.\n" % exc)
         teams = None
     composed = compose(kind, now, settings, record, teams=teams)
@@ -4554,7 +4554,7 @@ def _selftest():
     # KIT-718: preview prints what code would post, the short version; --full prints the full
     # list, which is never posted.
     check("preview-prints-and-changes-nothing", (rc_preview, rc_full) == (EXIT_OK, EXIT_OK)
-          and shown.startswith("note: the bridge's config could not be read")
+          and shown.startswith("note: the tech lead's config could not be read")
           and "every project in the status file.\nGood morning. " in shown
           and "Plan KIT-420, Faster reviews, waits for your "
           "approval." in shown and "approve KIT-420" not in shown

@@ -660,7 +660,7 @@ def step_stage_e(io, conf, skip, rep):
         io.say("Stage E is not up to date: the check above names what is outstanding.")
         io.say("Updating it can restart the dispatcher, which cuts off any session it is "
                "running.")
-        io.say("If it moves the clone, it also stops the notifier and the Slack bridge, where "
+        io.say("If it moves the clone, it also stops the notifier and the tech lead, where "
                "this Mac runs them, for a few seconds, and loads them again.")
         io.say("Check Linear first: nothing the dispatcher works on should be In Progress.")
         if not io.ask("Update Stage E now?"):
@@ -706,7 +706,7 @@ def step_stage_e(io, conf, skip, rep):
                                                 "(exit %d). The lines above say where." % code)
                     + " It loads the review jobs it unloaded again on its way out. Any it says "
                       "NOT DONE for stays off until it is loaded: it prints the line. A notifier "
-                      "or Slack bridge job it names as off stays off until it is loaded. Clear "
+                      "or tech lead job it names as off stays off until it is loaded. Clear "
                       "what it names, then run this command again.",
                     code)
     # ONLY A CARD IS LEFT, and Stage E's code is current. The idea gate needs Stage E's
@@ -2239,9 +2239,9 @@ def selftest():
           < io.ran.index("pipeline_stage_a_setup.py run"), True)
     check("stage-e-warns-about-the-restart",
           any("restart the dispatcher" in line for line in io.lines), True)
-    check("stage-e-warns-the-notifier-and-bridge-stop-for-the-move",
-          any("notifier" in line and "bridge" in line and "few seconds" in line
-              for line in io.lines), True)
+    check("stage-e-warns-the-notifier-and-tech-lead-stop-for-the-move",
+          any("notifier" in line and "tech lead" in line and "few seconds" in line
+              and "bridge" not in line for line in io.lines), True)
     code, io = go(codes={"pipeline_stage_e_setup.py verify": 10}, answers=[False])
     check("stage-e-declined-stops-before-the-idea-gate",
           (code, "pipeline_stage_e_setup.py run" in io.ran,
@@ -2305,8 +2305,8 @@ def selftest():
     check("stage-e-run-that-stopped-part-way-stops",
           (code, "pipeline_stage_a_setup.py run" in io.ran,
            any("unloaded" in line for line in io.lines)), (10, False, True))
-    check("stage-e-run-that-stopped-part-way-names-the-notifier-and-bridge",
-          any("notifier or Slack bridge job it names as off" in line for line in io.lines), True)
+    check("stage-e-run-that-stopped-part-way-names-the-notifier-and-tech-lead",
+          any("notifier or tech lead job it names as off" in line for line in io.lines), True)
     for rc in (1, 4):
         code, io = go(codes={"pipeline_stage_e_setup.py verify": 10,
                              "pipeline_stage_e_setup.py run": rc}, answers=[True],
