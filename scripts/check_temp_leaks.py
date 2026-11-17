@@ -28,7 +28,7 @@ Neither shows what a SIGTERM does: Python's default handler ends the process wit
 running them, and a session's Bash timeout is what left thousands of folders on 4 Nov. With
 `--sigterm`, each battery still running after SECONDS gets SIGTERM, to its whole process
 group, and nothing else; whatever it leaves is a leak. A battery that does not end within
-15 s of it fails too. Its own exit code is not judged: it was stopped on purpose.
+30 s of it fails too. Its own exit code is not judged: it was stopped on purpose.
 
 THE CHECK REMOVES WHAT IT FINDS. Every folder it made is removed in a `finally`, leftovers
 included, so running it never adds to the pile it measures. A leftover is reported, then
@@ -58,7 +58,11 @@ import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TIMEOUT = 900
-TERM_GRACE = 15                       # seconds a battery has to end after its SIGTERM
+# Seconds a battery has to end after its SIGTERM (KIT-755). Measured: 0.1 to 0.2 s for the
+# slowest battery on a Mac, at five signal times (1, 2, 4, 8, 12 s in); once 15.1 s on a busy
+# hosted runner. 30 s is twice the worst seen; a battery that never ends still fails.
+TERM_GRACE = 30
+TERM_GRACE_CEILING = 60               # the selftest pins the limit finite and under this
 # The random tail tempfile (8 of [a-z0-9_]) or mktemp (6+ alphanumerics) adds after a
 # prefix's separator, or after tempfile's own default prefix `tmp`.
 RANDOM_TAIL = re.compile(r"(?:(?<=[._-])|(?<=^tmp))[A-Za-z0-9_]{6,}$")
@@ -479,6 +483,8 @@ def selftest():
                            term_grace=1)
         expect("--sigterm: a battery that does not end on its SIGTERM fails, and is killed",
                (code, "NO-END" in text, "did not end" in text), (1, True, True))
+        expect("--sigterm: the limit is finite (a mutant that lifts it to infinity is red)",
+               0 < TERM_GRACE <= TERM_GRACE_CEILING and TERM_GRACE >= 15, True)
         code, text = check([("test:quick", "true")], term_after=5)
         expect("--sigterm: a battery that ends before the signal is judged as it ended",
                (code, "stopped by SIGTERM" in text), (0, False))
