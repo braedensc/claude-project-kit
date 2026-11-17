@@ -6287,7 +6287,10 @@ CATCHUP_HEARTBEAT_WAIT_SECONDS = 180
 # One left from before the load was written by the old code, and passing it showed nothing
 # about the code just loaded. This installer records the second it loads each daemon, by
 # label, on its ledger; `enable` and `verify` both compare each heartbeat with its own daemon's.
-DAEMON_LOADS_NOTE = "daemon-loads"
+# "-v2" (KIT-762): the second recorded is now taken at the top of a fresh second, so a heartbeat in
+# it is the new job's. An entry an older installer wrote under the old name could share its second
+# with the old job's last heartbeat, so it is not read: that daemon reads as "no load recorded".
+DAEMON_LOADS_NOTE = "daemon-loads-v2"
 HEARTBEAT_STATES = ("ok", "older", "missing")
 
 # The role account's shell: one line per heartbeat, `<file> ok`, `<file> older` or `<file>
@@ -9170,7 +9173,7 @@ def _selftest_body():
         # KIT-762: EACH DAEMON GETS ONE WHOLE PASS OF ITS OWN. A fake clock the waits advance, and
         # a heartbeat each job writes once its own delay has passed after its load. The bounce
         # driver's pass can run for minutes; 90 s for every daemon stopped a healthy install.
-        def _with_clock(tag, delays):
+        def _with_clock(tag, delays, via_clone=False):
             now = [time.time()]
             def _sleep(s):
                 now[0] += s
@@ -9184,6 +9187,9 @@ def _selftest_body():
             time.time, globals()["_pause"] = (lambda: now[0]), _sleep
             try:
                 ctxW, runW = _enable_world(tag, old_beats=labels_e, clock=_beat_when)
+                if via_clone:             # an update: the code step moved the clone and reloaded
+                    runW.present = True
+                    _load_clone_jobs(ctxW, list(labels_e))
                 started = now[0]
                 rowW, _pW = _enable(ctxW)
                 return rowW, now[0] - started
@@ -9195,12 +9201,22 @@ def _selftest_body():
             rowL1, _s1 = _with_clock("slow-pass", (100, 800, 250))
             rowL2b, _s2 = _with_clock("slow-finding", (100, 800, 1000))
             rowL3, spent3 = _with_clock("never", (None, None, None))
+            rowL4, _s4 = _with_clock("update-slow", (100, 800, 250), via_clone=True)
         finally:
             globals()["HEARTBEAT_WAIT_SECONDS"] = saved_grace
             globals()["DAEMON_PASS_SECONDS"] = (0, 0, 0)
         expect("KIT-762 a pass of several minutes is waited for, each daemon by its own pass",
                isinstance(rowL1, tuple) and rowL1[0] is False and "after its load" in rowL1[1],
                "a heartbeat written 800 s after the load was not waited for: %r" % (rowL1,))
+        ctxOld, _rOld = _enable_world("old-ledger")
+        ctxOld.state.data.setdefault("notes", {})["daemon-loads"] = dict((l, 1) for l in labels_e)
+        expect("KIT-762 a load an older installer recorded is not read as proof's floor",
+               all(f is None for f in _daemon_floors(ctxOld, labels_e).values()),
+               "a load second the old installer wrote was still used as a floor")
+        expect("KIT-762 an update that moves the clone waits a slow pass out too",
+               isinstance(rowL4, tuple) and rowL4[0] is False and "after its load" in rowL4[1],
+               "a bounce driver beating 800 s after the clone-move reload was not waited for: %r"
+               % (rowL4,))
         expect("KIT-762 a daemon is waited for no longer than its own pass",
                isinstance(rowL2b, Unknown) and "1 of 3" in rowL2b.what
                and labels_e[2].rsplit(".", 1)[1] in rowL2b.what
