@@ -241,6 +241,11 @@ it. The row names the file and why. `no heartbeat yet` means the file is not the
 **The first pass answers nothing.** It records every message already in the channel as seen,
 so an old request is never answered late.
 
+**A lost state file stops the job.** The state holds your approved plans and open questions.
+If it is gone after the job has written one, the pass says `state missing` and stops, and the
+heartbeat says so. Restore the file from a backup. To start clean on purpose, run the job once
+with `run --init-state`.
+
 ---
 
 ## Step 7 — Try it

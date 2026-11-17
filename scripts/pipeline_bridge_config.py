@@ -623,6 +623,24 @@ def heartbeat_path(cfg):
     return os.path.join(cfg["state_dir"], "bridge-heartbeat.json")
 
 
+def seen_path(cfg):
+    """KIT-677: the record that a state file was once written here. It is what tells a lost
+    state file from a first pass; it is never deleted by the job."""
+    return os.path.join(cfg["state_dir"], "bridge-state.seen")
+
+
+def _mark_seen(cfg):
+    path = seen_path(cfg)
+    if os.path.exists(path):
+        return
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("a bridge state file was written here; if it is gone, the pass refuses "
+                     "until the owner runs `run --init-state` on purpose\n")
+    except OSError:
+        pass                      # the state itself is what matters; the mark is the second line
+
+
 def new_state():
     # asked_at: when each tracker lookup for a request was made (the hourly limit).
     # limit_said: per channel, when the bridge last said that limit was reached.
@@ -652,7 +670,17 @@ def load_state(cfg):
     are what bind a yes to a ticket, and a fresh start would forget them silently."""
     path = state_path(cfg)
     if not os.path.exists(path):
+        # KIT-677: absent is a first pass only when nothing says a state was ever written.
+        # A mark of an earlier one means the file was LOST, and a fresh start would forget
+        # every approved plan and open question without a word.
+        if os.path.exists(seen_path(cfg)) and not cfg.get("init_state"):
+            raise BridgeError("state missing: %s is gone, but this job wrote one before. "
+                              "Nothing was done, because a fresh start would forget every "
+                              "approved plan and open question. Restore the file from a "
+                              "backup, or start clean on purpose with `run --init-state`"
+                              % path)
         return new_state(), True
+    _mark_seen(cfg)
     try:
         with open(path, "r", encoding="utf-8") as fh:
             doc = json.load(fh)
@@ -774,6 +802,7 @@ def save_state(cfg, state):
         notify._atomic_write_json(state_path(cfg), state)
     finally:
         os.umask(old)
+    _mark_seen(cfg)
 
 
 def _awake_clock():
