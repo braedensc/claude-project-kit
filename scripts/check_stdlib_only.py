@@ -173,7 +173,7 @@ def tracked_python(root):
     return [p for p in out.stdout.splitlines() if p]
 
 
-def verdict(root):
+def verdict(root, import_path=None):
     """(exit code, lines). No files, or no git, is its own answer, never a pass."""
     try:
         files = tracked_python(root)
@@ -191,7 +191,7 @@ def verdict(root):
         except (OSError, UnicodeDecodeError) as exc:
             return 2, [f"COULD NOT CHECK: {rel} unreadable ({exc}); this is not a pass"]
     problems, outside = judge(sources)
-    problems += unused_import_paths(sources)
+    problems += unused_import_paths(sources, import_path)
     if problems:
         return 1, ["FAIL: " + p for p in problems]
     return 0, [f"OK: {len(files)} Python file(s), {len(outside)} allowed outside import(s), "
@@ -223,7 +223,7 @@ def selftest():
     expect(unused_import_paths(fake, pair) == [], "a used IMPORT_PATH pair flagged")
     expect(len(unused_import_paths({".claude/hooks/t.py": "import os\n", "scripts/b.py": ""}, pair)) == 1,
            "an unused IMPORT_PATH pair must fail")
-    expect(len(unused_import_paths({".claude/hooks/t.py": "import t2\n", ".claude/hooks/t2.py": "", "scripts/b.py": ""}, pair)) == 1,
+    expect(len(unused_import_paths({".claude/hooks/t.py": "import t2\n", ".claude/hooks/t2.py": "", "scripts/t2.py": ""}, pair)) == 1,
            "a module found in the file's own folder does not use the pair")
     expect(not bad("from . import x\nfrom .y import z\n"), "a relative import flagged")
     for src in ("import yaml\n", "import yaml.nodes\n", "from yaml import safe_load\n",
@@ -261,6 +261,13 @@ def selftest():
         git("add", "a.py")
         code, lines = verdict(tmp)
         expect(code == 1 and "a.py:2" in lines[0] and "yaml" in lines[0], f"git tree with outside import: {code} {lines}")
+        with open(os.path.join(tmp, "a.py"), "w", encoding="utf-8") as fh:
+            fh.write("import os\n")
+        git("add", "a.py")
+        code, lines = verdict(tmp, {})
+        expect("IMPORT_PATH entry" not in "\n".join(lines), f"no IMPORT_PATH pair, none reported: {code} {lines}")
+        code, lines = verdict(tmp, {"scripts": ("docs",)})
+        expect(code == 1 and "IMPORT_PATH entry" in "\n".join(lines), f"a stale pair in a real run fails: {code} {lines}")
     if failures:
         print("check_stdlib_only selftest: FAIL")
         for f in failures:
