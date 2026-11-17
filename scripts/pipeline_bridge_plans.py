@@ -70,6 +70,8 @@ HOLD_CLEAR_BIND = "To clear it, in a terminal: python3 scripts/pipeline_hold.py 
 # directory, beside its heartbeat.
 ROOM_SCHEMA = "pipeline-queue-room/1"
 ROOM_FILE = "queue-room.json"
+QUEUE_BEAT_SCHEMA = "pipeline-queue-heartbeat/1"
+QUEUE_BEAT_FILE = "queue-heartbeat.json"
 
 # The bind sentences of a plan's two questions (KIT-342): what a yes does and how long the
 # question stays open; the approval says that merging stays the member's, and the follow-up,
@@ -1783,7 +1785,10 @@ class PlansMixin(object):
         if self.state["epics"]:
             agent_id, why = self.tracker.agent_user(self.cfg["agent_user_name"])
         if queue:
+            asked_before, errors_before = self.state.get("queue_at"), len(self.release_errors)
             self.queue_pass(agent_id, why)
+            self.queue_beat(self.state.get("queue_at") != asked_before,
+                            len(self.release_errors) > errors_before)
             self.save()
         for epic_id in sorted(self.state["epics"]):
             rec = self.state["epics"][epic_id]
@@ -2552,6 +2557,21 @@ class PlansMixin(object):
         except OSError as exc:
             self.release_errors.append("the queue's room record could not be written (%s)"
                                        % type(exc).__name__)
+    def queue_beat(self, asked, failed):
+        """KIT-689: a small file each time the queue was asked (whatever it found: a closed window,
+        a hold or a stop is a queue that ran), beside the bridge's heartbeat, so the health watch can
+        tell a queue that stopped from one that is off. `exit` is 1 when this ask ended the pass
+        loud. No file in a dry run, or in a pass the queue was not due in. A failed write ends the
+        pass loud like the room record's."""
+        if self.dry or not asked:
+            return
+        doc = {"schema": QUEUE_BEAT_SCHEMA, "at": iso(self.now), "exit": 1 if failed else 0}
+        try:
+            notify._atomic_write_json(os.path.join(self.cfg["state_dir"], QUEUE_BEAT_FILE), doc)
+        except OSError as exc:
+            self.release_errors.append("the queue's heartbeat could not be written (%s)"
+                                       % type(exc).__name__)
+
     def hold_gate(self):
         """(blocked, why, how to clear it) for the watcher's hold (KIT-528, contract section 20),
         which the bridge finds through the queue's config, the one place a hold file is named. With
@@ -4609,6 +4629,30 @@ def cases_approve(kit):
             def room_record(c_):
                 path = os.path.join(c_["state_dir"], ROOM_FILE)
                 return json.load(open(path)) if os.path.exists(path) else None
+
+            # KIT-689: each ask of the queue leaves a heartbeat for the health watch, exit 1 when
+            # that ask ended the pass loud, and none in a dry run.
+            def queue_beat(c_):
+                path = os.path.join(c_["state_dir"], QUEUE_BEAT_FILE)
+                return json.load(open(path)) if os.path.exists(path) else None
+            c, s, t, out, ledger = queued("q-beat-ok", decided())
+            beat_ok = queue_beat(c)
+            c, s, t, out, ledger = queued("q-beat-loud", short("disk"))
+            beat_loud = queue_beat(c)
+            check("the-queue-leaves-a-heartbeat-each-ask-and-exit-1-when-the-ask-ended-loud",
+                  (beat_ok and (beat_ok["schema"], beat_ok["exit"]),
+                   beat_loud and (beat_loud["schema"], beat_loud["exit"], beat_loud["at"])),
+                  (("pipeline-queue-heartbeat/1", 0),
+                   ("pipeline-queue-heartbeat/1", 1, iso(now + 1000))))
+            conf_b, ledger_b = queue_at("q-beat-dry")
+            answer["v"] = {"state": "closed", "why": "before-start", "decision": None}
+            c, s, t, root = approved("q-beat-dry", wip=2, queue_config=conf_b,
+                                     kids=(("PROD-51", ()), ("PROD-52", ())))
+            before_dry = queue_beat(c)
+            active[0], answer["v"] = t, decided()
+            run(c, s, t, dry=True, at=now + 5000)
+            check("a-dry-pass-leaves-the-queue-heartbeat-as-it-found-it",
+                  queue_beat(c), before_dry)
 
             def room_story2(name):
                 c_, s_, t_, out_, ledger_ = queued(name, short("disk"))

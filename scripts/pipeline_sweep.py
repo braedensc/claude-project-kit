@@ -125,6 +125,8 @@ CONFIG_KEYS = {
     "log_keep": "older copies kept of a trimmed log, log.1 to log.N (default %d)" % DEFAULT_LOG_KEEP,
     "look_record_dir": "the look tool's record folder (its record_dir), absolute: a plan's folder of "
                        "records and kept screenshots goes on the worktree's rule. Empty sweeps none",
+    "heartbeat_file": "a file, absolute, the sweep writes after each real pass so the health watch can "
+                      "tell it stopped (KIT-689). Empty: no heartbeat, and the watch reads it as off",
 }
 
 EXAMPLE_CONFIG = {
@@ -266,6 +268,7 @@ def load_config(path):
         "log_max_mb": _count(raw, "log_max_mb", DEFAULT_LOG_MAX_MB, 1, 10240),
         "log_keep": _count(raw, "log_keep", DEFAULT_LOG_KEEP, 1, 20),
         "look_record_dir": _folder(raw, "look_record_dir", required=False),
+        "heartbeat_file": _folder(raw, "heartbeat_file", required=False),
     }
     if cfg["workspace_dir"] == cfg["dispatcher_home"]:
         raise ConfigError("config 'workspace_dir' and 'dispatcher_home' must be two folders")
@@ -860,6 +863,28 @@ def finish(p):
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
+HEARTBEAT_SCHEMA = "pipeline-sweep-heartbeat/1"
+
+
+def write_heartbeat(cfg, code, now, dry_run=False):
+    """KIT-689: one small file after each real pass, whatever its exit, so the health watch can
+    tell a sweep that stopped from one that is off. Not written without `heartbeat_file`, nor in a
+    dry run. A failed write is said, and never changes the pass's own exit."""
+    path = cfg.get("heartbeat_file")
+    if not path or dry_run:
+        return
+    doc = {"schema": HEARTBEAT_SCHEMA, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+           "exit": code}
+    tmp = path + ".tmp"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh)
+        os.replace(tmp, path)
+    except OSError as exc:
+        log("COULD NOT write the heartbeat %s: %s" % (path, type(exc).__name__))
+
+
 def account_name(uid):
     try:
         return pwd.getpwuid(uid).pw_name
@@ -910,13 +935,16 @@ def main(argv=None, environ=None, world_for=None):
         code, lines = run_pass(world, cfg, dry_run=args.dry_run)
     except ConfigError as exc:
         log("CONFIG: %s" % exc)
+        write_heartbeat(cfg, EXIT_USAGE, time.time(), args.dry_run)
         return EXIT_USAGE
     except SweepError as exc:
         log("FAILED: the pass could not complete: %s" % exc)
+        write_heartbeat(cfg, EXIT_FAILED, time.time(), args.dry_run)
         return EXIT_FAILED
     for line in lines:
         print("sweep: " + line)
     sys.stdout.flush()
+    write_heartbeat(cfg, code, world.now(), args.dry_run)
     return code
 
 
@@ -1433,6 +1461,19 @@ def _cases(top, check):
 
     check("the example config is one this script reads",
           conf_error(**dict(EXAMPLE_CONFIG)), None)
+    # -- KIT-689: the heartbeat the health watch reads --------------------------------------
+    beat = os.path.join(top, "beat", "sweep-heartbeat.json")
+    write_heartbeat(dict(cfg2, heartbeat_file=beat), 0, 1794000000, dry_run=True)
+    after_dry = os.path.exists(beat)
+    write_heartbeat(dict(cfg2, heartbeat_file=""), 0, 1794000000)
+    after_off = os.path.exists(beat)
+    write_heartbeat(dict(cfg2, heartbeat_file=beat), 1, 1794000000)
+    doc = json.load(open(beat)) if os.path.exists(beat) else None
+    check("the sweep's heartbeat: none in a dry run or with no file named, else schema, time, exit",
+          (after_dry, after_off, doc), (False, False, {
+              "schema": "pipeline-sweep-heartbeat/1", "at": "2026-11-06T21:20:00Z", "exit": 1}))
+    check("a heartbeat_file that is not absolute is a config error",
+          conf_error(heartbeat_file="rel/beat.json"), "config 'heartbeat_file' must be an absolute path")
     check("each config fault is named", [conf_error(**bad) for bad in (
         {"workspace_dir": "relative/worktrees"}, {"dispatcher_home": "/"},
         {"workspace_dir": "/opt"}, {"teams": []}, {"teams": ["eng"]},

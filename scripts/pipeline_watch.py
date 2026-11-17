@@ -63,6 +63,11 @@ WHAT IT CHECKS, one KIND each (a kind is what an alert is about):
               this account can read: an hour old, unreadable or missing, two passes running
               (KIT-286). Each opens a GitHub issue, since Slack is what a dead notifier cannot
               reach, and a dead monitor cannot page about the others.
+  queue, morning, sweep  the queue's pass in the bridge, the morning job and the sweep (KIT-689), where
+              QUEUE_HEARTBEAT_FILE, MORNING_HEARTBEAT_FILE and SWEEP_HEARTBEAT_FILE name the small
+              file each writes after a pass: older than an hour (three for the sweep), unreadable, in
+              another shape or missing, two passes running. Empty: that job is off here, not
+              watched, and every pass says so. Slack only, through the status file.
 A last kind, `watch-job` — this job itself stopped — cannot be reported by the job. The
 heartbeat monitor watches the status file this job writes and pages when it goes stale.
 
@@ -128,12 +133,13 @@ STATUS_SCHEMA = "pipeline-health-status/1"
 STATE_SCHEMA = "pipeline-health-watch-state/1"
 KINDS = ("hooks", "updates", "release", "dispatcher", "front-door", "disk", "temp",
          "conflict-waker", "watcher-page", "push-connection", "notifier", "monitor", "credentials",
-         "memory", "burn")
+         "memory", "burn", "queue", "morning", "sweep")
 # Read here for the heartbeat monitor, which cannot (KIT-339): the conflict waker is the
 # owner's LaunchAgent, and its heartbeat sits in the owner's home. It reaches Slack through
 # the status file alone. It opens no GitHub issue: the alert workflow knows a fixed list of
 # kinds, and a deployed copy that does not know this one would fail every send.
-SLACK_ONLY_KINDS = ("conflict-waker", "watcher-page", "push-connection", "memory", "burn")
+SLACK_ONLY_KINDS = ("conflict-waker", "watcher-page", "push-connection", "memory", "burn",
+                    "queue", "morning", "sweep")
 WAKER_SCHEMA = "pr-conflict-waker-heartbeat/1"
 # The watcher's page job (KIT-519) writes this beat. A page that could not be sent shows in it as
 # `could-not-page` and the routes that failed, and nothing else reads it (KIT-549). The route names
@@ -159,6 +165,18 @@ CLERKS = {
                 "heartbeat monitor", "Nothing is watching the daemons' heartbeats."),
 }
 CLERK_STALE_SECONDS = 3600
+# The queue, the morning job and the sweep (KIT-689): each writes a small heartbeat after a pass,
+# and the watch says one stopped, in fixed words. A job off by design has no file named here, and
+# reads as "not watched". Slack only through the status file. Alive and current is all that is
+# judged: what a pass found is that job's own to page. (conf key, schema, label, effect, stale).
+JOB_BEATS = {
+    "queue": ("QUEUE_HEARTBEAT_FILE", "pipeline-queue-heartbeat/1", "queue",
+              "No new work is started by itself.", 3600),
+    "morning": ("MORNING_HEARTBEAT_FILE", "pipeline-morning-heartbeat/1", "morning job",
+                "The day is not planned.", 3600),
+    "sweep": ("SWEEP_HEARTBEAT_FILE", "pipeline-sweep-heartbeat/1", "sweep",
+              "Finished runs' leftovers are not cleared, so the disk fills.", 3 * 3600),
+}
 # Upkeep, not outage. These open and close their GitHub issue like any kind, but never make
 # the status file a problem, so the heartbeat monitor never pages Slack about them: a Slack
 # ping must mean something is broken (owner decision 2026-10-27, KIT-264). The status file
@@ -830,7 +848,7 @@ def check_push_connection(env, conf, state):
     return finding("push-connection", UNKNOWN, "%s this pass; one more and it fires" % problem)
 
 
-def _clerk_problem(label, path, schema, now):
+def _clerk_problem(label, path, schema, now, stale=CLERK_STALE_SECONDS):
     """What is wrong with a clerk's heartbeat at `path`, or None when it is checking in. Only
     that it is alive and current is judged here: its results are the monitor's to page."""
     try:
@@ -845,9 +863,27 @@ def _clerk_problem(label, path, schema, now):
     stamp = _parse_iso(beat.get("at"))
     if stamp is None:
         return "the %s's heartbeat %s has no time on it" % (label, path)
-    if now - stamp > CLERK_STALE_SECONDS:
+    if now - stamp > stale:
         return "the %s has not checked in since %s" % (label, _iso(stamp))
     return None
+
+
+def check_job_beat(env, conf, state, kind):
+    """The queue, the morning job or the sweep (KIT-689), where its heartbeat file is named, and
+    said off where it is not. Debounced like the clerks: on a wake from sleep this hourly pass can
+    run before the job's first."""
+    key, schema, label, effect, stale = JOB_BEATS[kind]
+    path = conf.get(key)
+    if not path:
+        return finding(kind, OK, "%s is not set: the %s is off here, not watched" % (key, label))
+    problem = _clerk_problem(label, path, schema, _now(env), stale)
+    if problem is None:
+        _debounced(state, kind, False)
+        return finding(kind, OK, "checking in")
+    if _debounced(state, kind, True):
+        return finding(kind, FIRING, "%s, for %d passes running. %s" % (
+            problem[0].upper() + problem[1:], DEBOUNCE, effect))
+    return finding(kind, UNKNOWN, "%s this pass; one more and it fires" % problem)
 
 
 def check_clerk(env, conf, state, kind):
@@ -984,6 +1020,7 @@ def run_pass(env, conf, dry_run=False):
                 check_push_connection(env, conf, state), check_credentials(env, conf),
                 check_memory(env, conf, state), check_burn(env, conf)]
     findings += [check_clerk(env, conf, state, kind) for kind in CLERKS]
+    findings += [check_job_beat(env, conf, state, kind) for kind in JOB_BEATS]
     failed, notes, claimed = [], [], set()
     github_on = bool(conf.get("ALERT_REPO"))
     for f in findings:
@@ -2177,6 +2214,64 @@ def selftest():
                 if "PUSH_HEARTBEAT_FILE" in e] != [],
                [e for e in pu.validate_conf(dict(base_c, PUSH_HEARTBEAT_FILE="/srv/push.json"))[1]
                 if "PUSH_HEARTBEAT_FILE" in e]), (True, []))
+
+        # -- the queue, the morning job and the sweep (KIT-689): each off unless its heartbeat file
+        #    is named; a stale, foreign, timeless or missing one is unknown once and fires on the
+        #    second pass; Slack only, never a GitHub issue ------------------------------------------
+        jb_dir = os.path.join(home, "jobbeats")
+        os.makedirs(jb_dir)
+        jb_paths = dict((k, os.path.join(jb_dir, k + ".json")) for k in JOB_BEATS)
+
+        def job_beat(kind, age=60, schema=None, at=True):
+            doc = {"schema": schema or JOB_BEATS[kind][1], "exit": 0}
+            if at:
+                doc["at"] = _iso(T - age)
+            with open(jb_paths[kind], "w") as fh:
+                json.dump(doc, fh)
+        env = make_env(home)
+        for kind in JOB_BEATS:
+            key = JOB_BEATS[kind][0]
+            jc = conf(**{key: jb_paths[kind]})
+            check("%s is said off, not stopped, where %s is not set" % (kind, key),
+                  (check_job_beat(env, conf(), {}, kind)["state"],
+                   "off here, not watched" in check_job_beat(env, conf(), {}, kind)["summary"]),
+                  (OK, True))
+            job_beat(kind)
+            check("%s checking in is ok" % kind, check_job_beat(env, jc, {}, kind)["state"], OK)
+            stale_age = JOB_BEATS[kind][4] + 600
+            seen = []
+            for name, make in (("stale", lambda: job_beat(kind, age=stale_age)),
+                               ("another shape", lambda: job_beat(kind, schema="x/1")),
+                               ("no time", lambda: job_beat(kind, at=False)),
+                               ("never written", lambda: os.remove(jb_paths[kind]))):
+                make()
+                st_j = {}
+                two = [check_job_beat(env, jc, st_j, kind)["state"] for _ in range(2)]
+                seen.append((name, two[0], two[1]))
+            check("a stopped %s is unknown on one pass and fires on two" % kind, seen,
+                  [(n, UNKNOWN, FIRING) for n in ("stale", "another shape", "no time",
+                                                  "never written")])
+        job_beat("sweep", age=JOB_BEATS["queue"][4] + 600)
+        check("the sweep, which runs hourly, is not stale at two hours; the queue is",
+              (check_job_beat(env, conf(SWEEP_HEARTBEAT_FILE=jb_paths["sweep"]), {}, "sweep")["state"],
+               _clerk_problem("queue", jb_paths["sweep"], JOB_BEATS["sweep"][1], T,
+                              JOB_BEATS["queue"][4]) is not None),
+              (OK, True))
+        for kind in JOB_BEATS:
+            job_beat(kind, age=JOB_BEATS[kind][4] + 600)
+        jb_home = os.path.join(home, "jobbeats-pass")
+        os.makedirs(jb_home)
+        jb_status = os.path.join(home, "jobbeats-status.json")
+        env = make_env(jb_home, gh=gh_ok(T))
+        for _ in range(2):
+            run_pass(env, conf(HEALTH_STATUS_FILE=jb_status, KIT_CHECKOUT=kit,
+                               **dict((JOB_BEATS[k][0], jb_paths[k]) for k in JOB_BEATS)))
+        check("...each reaches the status file the monitor reads, and no GitHub issue",
+              (sorted(json.load(open(jb_status))["firing"]), env.runner.writes),
+              (["morning", "queue", "sweep"], []))
+        check("a relative heartbeat file for any of the three is refused by name",
+              [bool([e for e in pu.validate_conf(dict(base_c, **{JOB_BEATS[k][0]: "x.json"}))[1]
+                     if JOB_BEATS[k][0] in e]) for k in sorted(JOB_BEATS)], [True] * 3)
 
         # -- the yearly credentials (KIT-579): the owner writes each date down; the kind
         #    warns CREDENTIAL_WARN_DAYS ahead and after, names only, and is upkeep -------------
