@@ -128,6 +128,7 @@ A review, a plan and an acceptance check get none: each returns one checked bloc
   @mentions are made inert.
 - **Its caps are contract section 8's:** 20 comments a run, the last kept for `report_done`; three
   findings; one question; bodies of 16 000 characters. Each write is counted before it is sent.
+  Reads stop at 100 a run, which only a runaway meets.
 
 Good: a session calls `file_finding` with a title and a body. The finding filer files it in the
 backlog and replies on the ticket.

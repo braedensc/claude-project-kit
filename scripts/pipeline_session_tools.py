@@ -47,7 +47,8 @@ receipt, or a credential's shape. What is left is made inert, never refused: a r
 ITS CAPS (contract section 8).  20 comments a run, one of them kept for report_done; three
 findings; one question; one report_done; bodies of 16 000 characters, titles of 200. Each write
 is recorded in the run's counts before it is sent: a server that dies mid-write still counts it.
-A write the tracker did not confirm is recorded as failed, and does not count.
+A write the tracker did not confirm is recorded as failed, and does not count. Reads are capped
+too, at 100 a server: far above any real run, so only a runaway meets it.
 
 WHAT IT NEVER DOES (asserted in --selftest).  Sends a request anywhere but the tracker's fixed
 address, or any document but its four fixed ones. Writes to any ticket but its run's. Shows the
@@ -111,6 +112,7 @@ WRITES_MAX = 20            # comments a run posts; the last is kept for report_d
 FINDINGS_MAX = 3
 QUESTIONS_MAX = 1
 TRIES_MAX = 40             # every write tried, the failed ones too
+READS_MAX = 100            # reads of the ticket a server makes: a runaway's, never a real run's
 BODY_MAX = 16000
 TITLE_MAX = 200
 SUMMARY_MAX = 12000        # report_done's comment also holds the telemetry block
@@ -579,6 +581,7 @@ class Server(object):
         self.clock = clock
         self.writer_ok = False
         self.issue_id = None
+        self.reads = 0
 
     # -- the tracker ------------------------------------------------------------------- #
     def send(self, document, variables):
@@ -681,6 +684,10 @@ class Server(object):
                     "reported" if live(writes, "report_done") else "not reported"))
 
     def do_read_ticket(self, _args):
+        if self.reads >= READS_MAX:
+            raise ToolError("this run has read its ticket %d times, its limit. Work from what you "
+                            "have read" % READS_MAX)
+        self.reads += 1
         node = self.ticket(Q_TICKET)
         try:
             writes = read_state(self.dfd, self.run["run"])["writes"]
@@ -1621,6 +1628,15 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
         expect("a run that keeps failing stops at its tries",
                call(tries, "comment", {"body": "x"}),
                ("this run has tried %d writes, its limit, so nothing more is written" % TRIES_MAX, True))
+        expect("…and sends nothing more", len(sent), n)
+        reset()
+        reader = server(44)
+        for _ in range(READS_MAX):
+            call(reader, "read_ticket")
+        n = len(sent)
+        expect("a run that keeps reading stops at its reads", call(reader, "read_ticket"),
+               ("this run has read its ticket %d times, its limit. Work from what you have read"
+                % READS_MAX, True))
         expect("…and sends nothing more", len(sent), n)
 
         # ── the run's counts: what cannot be read is never "nothing yet" ─────────────────
