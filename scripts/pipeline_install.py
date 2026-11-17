@@ -790,19 +790,11 @@ def step_sweep(io, conf, rep):
     return stop(io, "the sweep's installer stopped with exit %d. The lines above say why." % code, code)
 
 
-# What an installer that prints the Stage E step table says: a row whose outcome is WOULD-CHANGE
-# is work its `run` would do; a row that is only a card is work for a person, which running it
-# again cannot clear. The notifier installer prints this table; this file's selftest pins the
-# word against the installer's own constant.
-STEP_TABLE = "-- steps --"
-WOULD_CHANGE_ROW = re.compile(r"^\s+\S+\s+WOULD-CHANGE(\s|$)", re.M)
-
-
-def would_change(text):
-    """True when the dry run's step table has work its `run` would do. A dry run that printed
-    no table says nothing about what it found, so that counts as work too: it is asked about,
-    and never read as up to date."""
-    return STEP_TABLE not in (text or "") or bool(WOULD_CHANGE_ROW.search(text or ""))
+# What an installer's compare says when it would write something, as opposed to a block only a person
+# can clear (which running it again cannot). The selftest pins the line against the installer's source.
+def has_work(text, line):
+    """True when the compare printed `line`, the installer's own words for "I would write"."""
+    return line in (text or "")
 
 
 # The steps that run an optional job's installer when its settings file is on this Mac: look
@@ -812,8 +804,10 @@ JOB_STEPS = (
     {"key": "bridge", "number": "3d", "title": "The Slack bridge and the stand-up",
      "noun": "The bridge", "conf": "bridge.conf", "script": BRIDGE_SETUP,
      # `install` without --apply compares the job's config, its plist and the stand-up's settings
-     # file with what bridge.conf composes, and exits 10 when it would write one. It prints no
-     # step table, which would_change() reads as work. `verify` is read afterwards for what only a person can do.
+     # file with what bridge.conf composes. It exits 10 for two different things: it would write
+     # something (and prints `work_line`), or a block only a person can clear, before any write.
+     # `verify` is read afterwards for what only a person can do.
+     "work_line": "DRY RUN: nothing was written",
      "look": ["install"], "apply": ["install", "--apply"], "then": ["verify"],
      "note": "It writes the bridge's config, its job file and the stand-up's settings file as the "
              "role account; it never loads the job."},
@@ -868,7 +862,7 @@ def step_job(io, spec, files, rep):
         rep.note_code(key, code, "its check")
         return stop(io, "%s's check stopped with exit %d. The lines above say why."
                     % (noun, code), code)
-    if not would_change(out):
+    if not has_work(out, spec["work_line"]):
         io.say("")
         io.say("%s has nothing to change; what is left is for you, named above." % noun)
         rep.note(key, OUT_WAITING, "a card is still yours", card_only=True)
@@ -2596,8 +2590,14 @@ def selftest():
           ("standup_needs_writing(conf, facts)" in install_source, "write_standup(conf, runner)" in install_source),
           (True, True))
 
-    def bridge(codes=None, answers=(), interrupt=(), **kw):
+    check("bridge-pin-the-work-line-is-the-installers-own",
+          spec["work_line"] in install_source, True)
+    would = "To write: config.\n" + spec["work_line"] + ". Run it again with --apply.\n"
+    blocked = "BLOCKED: the env file holds no tracker key under X. Run `token` first.\n"
+
+    def bridge(codes=None, answers=(), interrupt=(), seen=None, **kw):
         io = FakeIo(codes=dict(healthy, **(codes or {})), answers=answers, **kw)
+        io.seen_out = {look: would} if seen is None else dict(seen)
         io.interrupt_on = set(interrupt or ())
         return main(base + ["--bridge-conf", bridge_conf], io=io), io
 
@@ -2618,6 +2618,13 @@ def selftest():
     check("bridge-would-write-asked-then-applied-then-verified-updated",
           (code, [k for k in io.ran if "bridge" in k or "stage_a" in k], len(io.asked), bout(io)),
           (EX_OK, [look, apply_, verify, "pipeline_stage_a_setup.py run"], 1, [(OUT_UPDATED, "")]))
+    code, io = bridge({look: 10}, seen={look: blocked})
+    check("bridge-a-blocked-compare-asks-nothing-is-waiting-and-carries-on",
+          (code, io.asked, apply_ in io.ran, "pipeline_stage_a_setup.py run" in io.ran, bout(io)),
+          (EX_BLOCKED, [], False, True, [(OUT_WAITING, "a card is still yours")]))
+    code, io = bridge({look: 10}, seen={look: ""})
+    check("bridge-a-compare-that-printed-nothing-is-never-up-to-date-and-asks-nothing",
+          (code, io.asked, bout(io)), (EX_BLOCKED, [], [(OUT_WAITING, "a card is still yours")]))
     code, io = bridge({look: 10}, answers=[False])
     check("bridge-declined-is-waiting-and-writes-nothing",
           (code, io.ran.count(apply_), "pipeline_stage_a_setup.py run" in io.ran, bout(io)),
