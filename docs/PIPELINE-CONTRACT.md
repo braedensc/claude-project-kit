@@ -462,7 +462,7 @@ the session starts**.
 
 ```
 <pinsRoot>/<pin_key>.json
-<pinsRoot>/ledger.jsonl        # append-only, one row per pin ever written
+<pinsRoot>/ledger.jsonl        # append-only: one row per pin written, one per release
 <pinsRoot>/dispatched-lane/<OS account>   # the OLDER lane marker (below); still counts
 /etc/claude-pipeline/dispatched-lane/<OS account>   # the lane marker (below); root's
 
@@ -606,9 +606,12 @@ empty rather than handed something invented.
 1. Create the worktree and branch.
 2. Write the pin to a temp file in `pinsRoot`, `fsync`, `chmod 0444`, then **atomically
    `rename()`** into `<pin_key>.json` — a reader never sees a half-written pin.
-3. Append one row to `ledger.jsonl`.
+3. Append one row to `ledger.jsonl`: `dispatch_id`, `ticket`, `worktree`, `pinned_at`.
 4. Spawn the session with cwd = worktree.
-5. On session end, the **dispatcher** deletes the pin. The agent never does.
+5. On session end, the **dispatcher** deletes the pin and appends a release row (the same
+   fields, with `released_at` in place of `pinned_at`). The agent never does either. The
+   hand-run dispatcher's `--release` and the runner write that row; the GitHub Actions
+   backend's runner is ephemeral, so its whole pins root, ledger included, ends with the job.
 
 ### Read protocol (hooks, validators)
 
@@ -621,6 +624,13 @@ empty rather than handed something invented.
    *broken* and fails closed. With no pin and no marker, checks that would *withhold*
    something fail open (a human's ad-hoc session in a configured repo must not be
    bricked) and checks that would *grant* extra autonomy fail closed.
+6. **A pin that is gone is not one that never was (KIT-674).** Before reading an absent
+   pin as a person's session, read `ledger.jsonl`. When its last row for this worktree is
+   a pin row under a day old (no kit dispatcher lets a pin live longer), or one whose age
+   cannot be read, the pin was deleted or moved: *missing*, and broken in every mode,
+   because the row does not carry the mode. A pin row more than a day old, and a release
+   row, expect nothing. A pin or ledger that cannot be read (anything but "no such file")
+   is broken too: could not check is not absent (§13).
 
 > **Tamper-evident, not tamper-proof.** The session's shell runs as the same user, so
 > `0444` and a path outside the repo raise the cost of tampering — they do not make it

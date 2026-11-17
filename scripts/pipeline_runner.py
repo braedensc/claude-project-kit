@@ -577,19 +577,32 @@ def write_pin(root, pin):
 
 
 def remove_pin(path, run_id):
-    """Remove the run's own pin, and no other run's."""
+    """Remove the run's own pin, and no other run's, and record the release in the ledger
+    beside it. Without that row the guard reads the workspace's next session, for up to a
+    day, as one whose pin was taken away (contract section 3, KIT-674)."""
     if not path:
         return
     try:
         with open(path, encoding="utf-8") as fh:
-            mine = json.load(fh).get("dispatch_id") == run_id
+            pin = json.load(fh)
+        mine = pin.get("dispatch_id") == run_id
     except (OSError, ValueError, AttributeError):
         return
-    if mine:
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
+    if not mine:
+        return
+    try:
+        os.unlink(path)
+    except OSError:
+        return
+    ticket = pin.get("ticket")
+    try:
+        with open(os.path.join(os.path.dirname(path), "ledger.jsonl"), "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"dispatch_id": run_id,
+                                 "ticket": ticket.get("id") if isinstance(ticket, dict) else None,
+                                 "worktree": pin.get("worktree"), "released_at": iso(time.time()),
+                                 "stage": "runner"}) + "\n")
+    except OSError:
+        pass                           # best effort, as the pin's own row is
 
 
 # --------------------------------------------------------------------------- #
@@ -1670,6 +1683,8 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                 isinstance(rec["seconds"], float), rec["ended_at"] is not None),
                ("ended", 0, "ended", 0.0125, 3, True, True))
         expect("its pin is removed when it ends", os.path.exists(ppath), False)
+        expect("…and its release is in the ledger, so the guard's mirror reads it unbound, "
+               "never missing", tier0.read_pin(ppath, os.path.realpath(ws1))[1], "absent")
         first = _calls(calls)[0]
         expect("the program saw its pin before it ran", first["pin_seen"], True)
         expect("the program ran in the workspace", first["cwd"], ws1)
