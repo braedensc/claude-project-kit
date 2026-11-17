@@ -1521,7 +1521,7 @@ def main(argv=None, io=None):
                     EX_REFUSED)
     import pipeline_root_guard as rg      # KIT-693: the one refusal every installer shares
     if rg.refusal(io.uid()):
-        return stop(io, rg.refusal(io.uid()), EX_USAGE)
+        return stop(io, rg.BODY, EX_USAGE)
     if args.check:                   # KIT-736: it only looks, so it needs no terminal
         return look_only(io, args)
     if not io.is_tty():

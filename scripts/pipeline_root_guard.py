@@ -20,10 +20,11 @@ Standard library only. Run it bare for its own selftest: `python3 scripts/pipeli
 import os
 import sys
 
-MESSAGE = ("REFUSED: do not run this as root or with sudo. Run it as yourself, in your own terminal: "
+BODY = ("do not run this with sudo or as root. Run it as yourself, in your own terminal: "
            "it asks for your Mac password only when a step needs it. Run as root it would write "
            "files that belong to root in your folders, which the later passes cannot read or "
            "replace. Nothing was changed.")
+MESSAGE = "REFUSED: " + BODY
 
 
 def _uid():
