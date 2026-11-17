@@ -1768,6 +1768,15 @@ refused by name. The example below is the work-team shape the installer writes:
   resets to the default. It is a **different question** from `in_flight_hours` — one is
   "how soon may I re-prompt", the other is "when has waiting become silence" — so the two
   are separate keys and neither implies the other.
+- `validator_ledger_file` is optional, and off when empty (KIT-542). Set it to the
+  validator's ledger, as an absolute path this account can read, and a `sent-back` row for a
+  pull request at its current head re-prompts that pull request's session: one more trigger on
+  the same budget, with the validator's agent's reason as one marked line inside the fence. A
+  path that is not absolute is refused when the config loads. A ledger the driver cannot read
+  is *CANNOT EVALUATE* on each pull request where nothing else triggers, never a quiet
+  nothing. The validator's own `Validator` check is always set aside, like a check in
+  `human_pending_checks`, whatever that list says: its verdict is never bounced as red CI.
+  See `docs/VALIDATOR-OPERATOR.md`, section 7.
 - `needs_human_label_id` is optional; without it the driver reads the label ids from
   `delivery.json`. Unset in **both** ⇒ exhaustion and the no-push signal still post their
   comments and still hand the pull request to a person, say once that the id is missing,
