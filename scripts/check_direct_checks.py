@@ -27,7 +27,7 @@ ROOT = os.path.dirname(HERE)
 CI = ".github/workflows/ci.yml"
 JOB = "kit-checks"
 
-# The direct checks: script path, relative to the repository root.
+# The direct checks: a script path from the repository root, then its arguments (if any).
 DIRECT = (
     "scripts/check_runner_pin.py",
     "scripts/check_agent_trigger_author.py",
@@ -38,20 +38,26 @@ DIRECT = (
     "scripts/check_schemas.py",
     "scripts/check_delivery_config.py",
     "scripts/check_alert_pages.py",
+    "scripts/pipeline_parts.py check",
 )
 
-# Direct steps in Kit checks that are deliberately not in DIRECT: path -> reason.
+# Direct steps in Kit checks that are deliberately not in DIRECT: command -> reason.
 EXCLUDED = {
     ".claude/hooks/test_hooks.py": "a battery: the 3.9 job runs it as test:hooks",
     ".claude/hooks/test_guard_bypass.py": "a battery: the 3.9 job runs it as test:bypass",
 }
 
-STEP = re.compile(r"python3\s+([\w./-]+\.py)\s*$")
+# One command of a step: `python3 [flags] path.py [arguments]`. A step that runs the script with
+# --selftest is a battery, not a direct check. This file's own steps (--verify, --json-yaml) are
+# the machinery, not a check.
+STEP = re.compile(r"python3\s+(?:-\w+\s+)*([\w./-]+\.py)((?:\s+[^\s&;|]+)*)\s*$")
+SELF = "scripts/check_direct_checks.py"
 HEADER = re.compile(r"^  ([A-Za-z0-9_-]+):\s*$")
 
 
 def kit_checks_direct_steps(ci_text):
-    """The script paths Kit checks runs with no argument, in order (comments skipped)."""
+    """The direct commands Kit checks runs (path and arguments), in order; comments skipped, a
+    `--selftest` run is not one, and each `&&` part of a line is read on its own."""
     found, inside, in_jobs = [], False, False
     for line in ci_text.splitlines():
         if line.startswith("jobs:"):
@@ -61,9 +67,10 @@ def kit_checks_direct_steps(ci_text):
             inside = m.group(1) == JOB
         if not inside or line.lstrip().startswith("#"):
             continue
-        m = STEP.search(line.split("run:", 1)[-1].strip())
-        if m:
-            found.append(m.group(1))
+        for part in re.split(r"\s*&&\s*", line.split("run:", 1)[-1].strip()):
+            m = STEP.match(part.strip())
+            if m and m.group(1) != SELF and "--selftest" not in m.group(2).split():
+                found.append((m.group(1) + m.group(2)).strip())
     return found
 
 
@@ -118,20 +125,21 @@ def cmd_json_yaml():
     return 1 if bad else 0
 
 
-def cmd_run():
+def cmd_run(root=ROOT, direct=DIRECT, json_yaml_too=True):
     print("python: %s" % sys.version.split()[0])
     failed = []
-    for path in DIRECT:
-        if not os.path.isfile(os.path.join(ROOT, path)):
-            print("COULD NOT RUN %s: file missing" % path, file=sys.stderr)
+    for command in direct:
+        argv = command.split()
+        if not os.path.isfile(os.path.join(root, argv[0])):
+            print("COULD NOT RUN %s: file missing" % argv[0], file=sys.stderr)
             return 2
-        print("::group::%s" % path)
-        code = subprocess.run([sys.executable, path], cwd=ROOT).returncode
+        print("::group::%s" % command)
+        code = subprocess.run([sys.executable] + argv, cwd=root).returncode
         print("::endgroup::")
-        print("%s %s" % ("ok  " if code == 0 else "FAIL", path))
+        print("%s %s" % ("ok  " if code == 0 else "FAIL", command))
         if code:
-            failed.append(path)
-    if cmd_json_yaml():
+            failed.append(command)
+    if json_yaml_too and cmd_json_yaml():
         failed.append("tracked JSON/YAML parse")
     if failed:
         print("FAILED: %s" % ", ".join(failed))
@@ -184,7 +192,47 @@ def selftest():
            len(differences(ci, ("scripts/a.py", "scripts/c.py", ".claude/hooks/t.py"), ex)), 1)
     expect("DIRECT holds no duplicate", len(set(DIRECT)), len(DIRECT))
     expect("every EXCLUDED has a reason", all(v.strip() for v in EXCLUDED.values()), True)
-    expect("every listed script exists", all(os.path.isfile(os.path.join(ROOT, p)) for p in DIRECT), True)
+    expect("every listed script exists", all(os.path.isfile(os.path.join(ROOT, c.split()[0])) for c in DIRECT), True)
+    # a step that takes an argument is read as a direct check, with its argument (review of KIT-659)
+    ci2 = ci.replace("python3 scripts/c.py\n", "python3 scripts/c.py check && python3 -I scripts/e.py --strict\n")
+    expect("an argument is part of the command; && parts and interpreter flags are read",
+           kit_checks_direct_steps(ci2), ["scripts/a.py", "scripts/c.py check", "scripts/e.py --strict", ".claude/hooks/t.py"])
+    expect("this file's own steps are not direct checks",
+           kit_checks_direct_steps(ci + "      - run: python3 scripts/check_direct_checks.py --verify\n"),
+           ["scripts/a.py", "scripts/c.py", ".claude/hooks/t.py"])
+    expect("a listed bare command does not cover its argument form",
+           len(differences(ci2, ("scripts/a.py", "scripts/c.py", "scripts/e.py --strict"), ex)), 2)
+    # --json-yaml and --run, against a throwaway tree
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="direct-checks-") as tmp:
+        def vc(*a):
+            return subprocess.run(["git", "-C", tmp, *a], capture_output=True, text=True)
+        vc("init", "-q")
+        with open(os.path.join(tmp, "good.json"), "w") as fh:
+            fh.write('{"a": 1}')
+        with open(os.path.join(tmp, "ok.py"), "w") as fh:
+            fh.write("raise SystemExit(0)\n")
+        with open(os.path.join(tmp, "bad.py"), "w") as fh:
+            fh.write("raise SystemExit(1)\n")
+        vc("add", ".")
+        bad, n = json_yaml(tmp)
+        expect("json-yaml: a tree of good files reports none", (bad, n >= 1), ([], True))
+        with open(os.path.join(tmp, "broken.json"), "w") as fh:
+            fh.write("{nope")
+        vc("add", ".")
+        bad, _n = json_yaml(tmp)
+        expect("json-yaml: a malformed file is named", [b.split(":")[0] for b in (bad or [])], ["broken.json"])
+        quiet = open(os.devnull, "w")
+        old_out, old_err = sys.stdout, sys.stderr
+        sys.stdout = sys.stderr = quiet
+        try:
+            rc_ok = cmd_run(tmp, ("ok.py",), json_yaml_too=False)
+            rc_bad = cmd_run(tmp, ("ok.py", "bad.py"), json_yaml_too=False)
+            rc_gone = cmd_run(tmp, ("ok.py", "gone.py"), json_yaml_too=False)
+        finally:
+            sys.stdout, sys.stderr = old_out, old_err
+            quiet.close()
+        expect("run: all pass is 0, one failure is 1, a missing file is 2", (rc_ok, rc_bad, rc_gone), (0, 1, 2))
     if failures:
         print("%d FAILED" % len(failures))
         return 1
@@ -195,7 +243,9 @@ def selftest():
 if __name__ == "__main__":
     args = sys.argv[1:]
     if "--selftest" in args:
-        sys.exit(selftest())
+        sys.path.insert(0, HERE)
+        from scratch_run import contained       # its temp folders go when it ends
+        sys.exit(contained(selftest, "direct-checks-selftest-run-"))
     if "--run" in args:
         sys.exit(cmd_run())
     if "--json-yaml" in args:
