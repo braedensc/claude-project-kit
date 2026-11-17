@@ -1775,6 +1775,14 @@ def main():
         pl_acct, os.path.join(pl_acct_root, "home"), "in-repo")
     acct_launch["none"] = make_account_launcher(pl_acct, None, "none")
     nopin_noacct = make_account_launcher(pl_nopin, None, "none")
+    # KIT-674: a configured project whose delivery.json names no pins root reads the default,
+    # ~/.claude/pipeline/pins under the account's home. With no ledger there, nothing expects
+    # a pin, so a person's session stays allowed: the ledger check changes nothing for it.
+    pl_defroot_root, pl_defroot, pl_defroot_pins = make_pipeline_sandbox(
+        pin=None, cfg_over={"dispatch": {"pinsRoot": None}})
+    defroot_home = os.path.realpath(tempfile.mkdtemp(prefix="hook-battery-acct-"))
+    defroot_launch = make_account_launcher(pl_defroot, defroot_home, "defroot")
+    _PL_TMP.extend([pl_defroot_root, pl_defroot_pins, defroot_home])
     lane_home_env = {**os.environ, "CLAUDE_PROJECT_DIR": pl_acct_root, "HOME": lane_fakehome}
     # The marker's SYSTEM path, /etc/claude-pipeline/dispatched-lane/<account> (CK-10):
     # folders root owns all the way down, so the role account cannot rename it away the
@@ -2910,6 +2918,11 @@ def main():
          read(os.path.join(pl_gone_root, "delivery.json")), ALLOW, pl_gone),
         ("no pin and no ledger: a person's session stays allowed (KIT-674)",
          mcp("save_issue", id="ENG-456", stateId=PL_RAW), ALLOW, pl_nopin),
+        ("no pins root named, no ledger at the default: a person's session stays allowed "
+         "(KIT-674)",
+         mcp("save_issue", id="ENG-456", stateId=PL_RAW), ALLOW, defroot_launch),
+        ("…and an edit there stays allowed too (KIT-674)",
+         edit(os.path.join(pl_defroot_root, "src/app.ts"), "x"), ALLOW, defroot_launch),
         ("released pin: the worktree is a person's again (KIT-674)",
          mcp("save_issue", id="ENG-456", stateId=PL_RAW), ALLOW, pl_freed),
         ("a ledger row for ANOTHER worktree expects no pin here (KIT-674)",
