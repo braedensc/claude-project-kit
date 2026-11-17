@@ -296,8 +296,8 @@ class Io(object):
         return os.path.exists(path)
 
     def places(self, path):
-        """{settings file name: where this Mac keeps it} (KIT-752); {} when it says nothing."""
-        return load_places(path)[0]
+        """({settings file name: where this Mac keeps it}, why it was ignored) (KIT-752)."""
+        return load_places(path)
 
     def parts(self):
         """The pipeline's parts, in the list's order. Raises OSError or ValueError."""
@@ -477,6 +477,8 @@ def missing(path):
     here = os.path.dirname(os.path.abspath(path))
     where = "the kit folder" if here == KIT else here
     name = os.path.basename(path)
+    if PLACES_WHY[0]:
+        where += " (the places file at %s was not used: %s)" % (DEFAULT_PLACES, PLACES_WHY[0])
     if name in PLACES and os.path.abspath(PLACES[name]) != os.path.abspath(path):
         where += " (or at %s, where this Mac says it is kept)" % PLACES[name]
     return "no %s in %s" % (name, where)
@@ -1187,6 +1189,7 @@ def step_of(part):
 # values. The kit folder stays the default: a file found there wins.
 DEFAULT_PLACES = "/Library/Application Support/claude-pipeline/settings-places.json"
 PLACES = {}
+PLACES_WHY = [""]          # why the places file, or part of it, was ignored; "" when it was not
 
 
 def load_places(path, lstat=os.lstat, realpath=os.path.realpath, read=_read_small):
@@ -1207,13 +1210,17 @@ def load_places(path, lstat=os.lstat, realpath=os.path.realpath, read=_read_smal
         return {}, "it could not be read (%s)" % exc
     if not isinstance(data, dict):
         return {}, "it is not a map of file names to paths"
-    out = {}
+    out, dropped = {}, []
     for name, where in data.items():
         if (isinstance(name, str) and isinstance(where, str) and name == os.path.basename(name)
                 and name.endswith((".conf", ".json")) and os.path.isabs(where)
                 and os.path.basename(where) == name):
             out[name] = where
-    return out, ""
+        else:
+            dropped.append(str(name)[:40])
+    return out, ("ignored %d entr%s that are not a file name with its own full path (%s)"
+                 % (len(dropped), "y" if len(dropped) == 1 else "ies", ", ".join(dropped))
+                 if dropped else "")
 
 
 def conf_path(name, files):
@@ -1560,10 +1567,6 @@ def main(argv=None, io=None):
         from scratch_run import contained   # KIT-450: its temp folders go when it ends
         return contained(selftest, "install-selftest-run-")
 
-    PLACES.clear()
-    PLACES.update(io.places(args.settings_places))
-    if args.bridge_conf is None:
-        args.bridge_conf = conf_path("bridge.conf", {})
     heading(io, "0. Where this is running")
     found = [m for m in AGENT_ENV_MARKERS if m in io.env()]
     if found:
@@ -1575,6 +1578,13 @@ def main(argv=None, io=None):
     if io.uid() == 0:
         return stop(io, "do not run this with sudo. Run it as yourself; it asks for your Mac "
                         "password when it needs it.", EX_USAGE)
+    # KIT-752: the one place that says where a settings file is kept, read only now, past the two
+    # refusals. A file that was ignored says why on the lines of the parts it would have found.
+    found_places, PLACES_WHY[0] = io.places(args.settings_places)
+    PLACES.clear()
+    PLACES.update(found_places)
+    if args.bridge_conf is None:
+        args.bridge_conf = conf_path("bridge.conf", {})
     if args.check:                   # KIT-736: it only looks, so it needs no terminal
         return look_only(io, args)
     if not io.is_tty():
@@ -1662,7 +1672,8 @@ class FakeIo(Io):
     program this case did not script is a failure of the case, never a silent pass."""
 
     def __init__(self, codes=None, answers=(), env=None, uid=501, tty=True, git_state=None,
-                 steps=None, typed=None, record=None, conf=None, places=None):
+                 steps=None, typed=None, record=None, conf=None, places=None,
+                 places_why=""):
         # The first screen and the consent read lines from `typed` (default: Manual, then
         # yes), so the cases written before them keep their meaning. `record` is what the
         # consent record reads as: (state, data, why). Everything the new seams do is logged.
@@ -1673,6 +1684,7 @@ class FakeIo(Io):
         self.conf = dict(conf or {})
         self.conf_reads = []
         self.placed = dict(places or {})
+        self.places_why = places_why
         self.places_reads = []
         # The ask (KIT-735) finds nothing unless a case scripts it, so a machine's own settings
         # files can never reach a case written before it. Its battery (pipeline_ask.py) puts the
@@ -1759,7 +1771,7 @@ class FakeIo(Io):
 
     def places(self, path):
         self.places_reads.append(path)
-        return dict(self.placed)
+        return dict(self.placed), self.places_why
 
     def parts(self):
         if isinstance(self.parts_list, Exception):
@@ -2540,6 +2552,17 @@ def selftest():
     bridge_id = "tech-lead"
     code, io = go(argv=["--settings-places", "/x/places.json"], places={"bridge.conf": placed})
     check("kit752-the-one-place-is-read", io.places_reads, ["/x/places.json"])
+    code, io2 = go()
+    check("kit752-a-plain-run-reads-the-default-place", io2.places_reads, [DEFAULT_PLACES])
+    code, io2 = go(env={AGENT_ENV_MARKERS[0]: ""})
+    check("kit752-nothing-is-read-before-the-refusals", io2.places_reads, [])
+    code, io2 = go(uid=0)
+    check("kit752-nothing-is-read-as-root", io2.places_reads, [])
+    code, io2 = go(argv=["--settings-places", "/x/places.json"], places_why="it is a link")
+    got = dict((r["id"], r) for r in io2.records)
+    check("kit752-an-ignored-places-file-says-why-on-the-line",
+          ("the places file at" in got["tech-lead"]["detail"], "it is a link" in got["tech-lead"]["detail"]),
+          (True, True))
     got = dict((r["id"], r) for r in io.records)
     check("kit752-a-placed-file-is-not-off",
           (got[bridge_id]["outcome"] != OUT_OFF, "pipeline_bridge_setup.py verify" in io.measured),
