@@ -3242,7 +3242,7 @@ class ChatClient:
             if error == "missing_scope":
                 raise ChatDMScopeError(
                     "I could not open a direct message with %s: the chat token is missing a "
-                    "scope (needed: %s; provided: %s). The Slack bridge's app needs im:write "
+                    "scope (needed: %s; provided: %s). The tech lead's Slack app needs im:write "
                     "to page a person directly. Add it to that app and reinstall the app. No "
                     "page reached that person"
                     % (user_id, doc.get("needed") or "im:write",
