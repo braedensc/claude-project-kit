@@ -42,7 +42,8 @@ in blocks of 8 KB. The once-a-minute pass exits every time, which flushes; this 
 so its lines stayed in memory and the log read 0 bytes while it answered messages (measured 16 Nov).
 `run` therefore line-buffers stdout first, and every line the job prints, its own and each Pass's,
 reaches the file as it is written. It prints one line when it starts, so a log that shows it is a
-log that works.
+log that works. If stdout cannot be made line-buffered, it says so on stderr first, so a log
+that may stay empty says why.
 """
 import json
 import os
@@ -99,16 +100,23 @@ def status_text(phrase):
     return "is %s…" % phrase
 
 
+NOT_LINE_BUFFERED = ("could not make its output line-buffered (%s), so its log may stay empty "
+                     "while it runs")
+
+
 def line_buffered_output():
     """KIT-761: make stdout write each line as it is printed. Under launchd stdout is a file, and
     Python holds a file's output until 8 KB are waiting or the process ends. This job never ends,
     so its log stayed empty. Both ways it prints (its own `say` and each Pass's `out`) write whole
-    lines to sys.stdout, so one setting covers them. A stdout that cannot be changed, such as a
-    test's stand-in, is left as it is."""
+    lines to sys.stdout, so one setting covers them. Returns "" once it is set. A stdout that
+    cannot be changed, such as a test's stand-in, is left as it is, never an error, and the
+    reason comes back in fixed words, so run can say why its log may stay empty (Stage E on
+    #563, contract §13)."""
     try:
         sys.stdout.reconfigure(line_buffering=True)
-    except (AttributeError, ValueError, OSError):
-        pass
+    except (AttributeError, ValueError, OSError) as exc:
+        return NOT_LINE_BUFFERED % type(exc).__name__
+    return ""
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════
@@ -602,7 +610,14 @@ def main(argv=None):
         sys.stderr.write("usage: pipeline_bridge_push.py run --config PATH | probe --config PATH"
                          " | --selftest\n")
         return EXIT_USAGE
-    line_buffered_output()                # before anything can print: KIT-761
+    why = line_buffered_output()          # before anything can print: KIT-761
+    if why:
+        # Said on stderr, which Python line-buffers since 3.9, so the log says why it may stay
+        # empty instead of staying empty with no sign (Stage E on #563).
+        try:
+            sys.stderr.write("push job: %s\n" % why)
+        except (AttributeError, ValueError, OSError):
+            pass                          # no stream left to say it on
     try:
         cfg = bridge.load_config(argv[2])
         if cfg["push_mode"] is not True:
@@ -1663,16 +1678,35 @@ def selftest_body():
     quiet.run = lambda: None
     check("log: the job's first line says it started, so a log that works shows it",
           (run_job(quiet), lines), (EXIT_OK, [START_LINE]))
-    real_out, sys.stdout = sys.stdout, io.StringIO()
+    # Stage E on #563: a stdout that cannot be made line-buffered is never an error, and never
+    # silent either (contract §13): the log could stay empty again, so run says why, on stderr.
+    not_set = "could not make its output line-buffered (AttributeError), so its log may stay " \
+              "empty while it runs"
+    real_out, real_err = sys.stdout, sys.stderr
+    sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
     try:
-        line_buffered_output()
-        left_alone = True
-    except Exception:                                   # noqa: BLE001
-        left_alone = False
+        why = line_buffered_output()
+        main(["run", "--config", no_config])
+        err = sys.stderr.getvalue()
+    except Exception as exc:                            # noqa: BLE001
+        why, err = "raised %s" % type(exc).__name__, ""
     finally:
-        sys.stdout = real_out
-    check("log: a stdout that cannot be changed is left as it is, never an error",
-          left_alone, True)
+        sys.stdout, sys.stderr = real_out, real_err
+    check("log: a stdout that cannot be changed is left as it is, never an error, and the setter "
+          "says why in fixed words", why, not_set)
+    check("log: and run says it on stderr before anything else, so a log that may stay empty "
+          "says why", err.splitlines()[:1], ["push job: " + not_set])
+    with open(os.path.join(ROOTDIR, "real-out.txt"), "wb") as raw:
+        wrapped = io.TextIOWrapper(raw, encoding="utf-8")
+        real_out, sys.stdout = sys.stdout, wrapped
+        try:
+            why = line_buffered_output()
+            got = (why, wrapped.line_buffering)
+        finally:
+            sys.stdout = real_out
+            wrapped.detach()
+    check("log: a stdout that is a file is made line-buffered, and the setter says nothing",
+          got, ("", True))
 
     if failures:
         print("FAIL: pipeline_bridge_push selftest (%d of %d cases failed)" % (len(failures),

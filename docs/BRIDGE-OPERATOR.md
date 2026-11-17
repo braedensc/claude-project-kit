@@ -1409,7 +1409,9 @@ heard, how many events it handled, and how many times it reconnected.
 | The push job, always on | `bridge-push.log` | `push job: started, opening Slack's connection` each time the job starts. Then one line for each message it answers, such as `answered a DM message from U… with a turn (the conversation resumed); cost $0.0123, 90% of its input read from the cache`. While it is idle, nothing. |
 
 A problem is a line too: `could not open the connection (…); trying again in 4s`, or `message … could
-not be handled yet`.
+not be handled yet`. If the job cannot make its own output reach the file line by line, its first
+line says so: `push job: could not make its output line-buffered (…), so its log may stay empty
+while it runs`.
 
 Good: you send a DM, and within a second of the answer a new line shows in `bridge-push.log`.
 Not that: `bridge-push.log` at 0 bytes while the job answers messages. Before 16 Nov this was the
