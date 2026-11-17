@@ -1147,8 +1147,9 @@ def selftest():
             _c, e = validate_conf(dict(values, KIT_CHECKOUT=REPO, **over), "alice")
             check("conf: %s is refused, by key" % label, any(needle in x for x in e), True)
         import pipeline_watcher_local as _watcher_mod
-        c_v, e_v = validate_conf(dict(values, KIT_CHECKOUT=REPO, VALIDATOR_LEDGER="/Users/Shared/v/ledger.json",
-                                      OWNER_LOGINS="the-owner", LIMIT_DAY_APPROVALS="20"), "alice")
+        system = {"KIT_CHECKOUT": REPO, "INSTALL_DIR": "/opt/watch/inst", "STATE_DIR": "/opt/watch/state"}
+        c_v, e_v = validate_conf(dict(values, VALIDATOR_LEDGER="/Users/Shared/v/ledger.json",
+                                      OWNER_LOGINS="the-owner", LIMIT_DAY_APPROVALS="20", **system), "alice")
         rules_v = json.loads(compose_rules(c_v, _watcher_mod).decode("utf-8")) if not e_v else {}
         check("KIT-546: the validator's ledger, the owner's logins and the day's approvals reach the rules, "
               "and the watcher's own loader takes them",
@@ -1156,7 +1157,7 @@ def selftest():
                (rules_v.get("limits") or {}).get("day_approvals"),
                _watcher_mod.which_on(_watcher_mod.validate_config(rules_v))["approval-rate"] if rules_v else "x"),
               ([], "/Users/Shared/v/ledger.json", ["the-owner"], 20, None))
-        c_n, _e = validate_conf(dict(values, KIT_CHECKOUT=REPO), "alice")
+        c_n, _e = validate_conf(dict(values, **system), "alice")
         check("...and with none of them, approval-rate stays off", "validator_ledger" in json.loads(
             compose_rules(c_n, _watcher_mod).decode("utf-8")), False)
         with open(os.path.join(REPO, "watcher.conf.example"), encoding="utf-8") as fh:
