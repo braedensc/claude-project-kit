@@ -872,6 +872,11 @@ def main(argv=None):
     if args.selftest:
         from scratch_run import contained
         return contained(selftest, "watcher-setup-selftest-run-")
+    import pipeline_root_guard as _rg   # KIT-693: the one refusal every installer shares
+    _root = _rg.refusal()
+    if _root:
+        say(_root)
+        return EX_REFUSED
     if args.example_conf:
         sys.stdout.write(EXAMPLE_CONF)
         return EX_OK

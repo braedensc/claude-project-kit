@@ -416,7 +416,8 @@ def step_preflight(ctx, apply_it):
     if unsupported:
         raise Unsupported(unsupported)
     r, problems = ctx.runner, []
-    if ctx.uid == 0:
+    import pipeline_root_guard as rg      # KIT-693: the one rule every installer shares
+    if rg.refusal(ctx.uid):
         problems.append("this is root. The waker runs as the person whose local sessions it wakes; "
                         "run the installer as that person, without sudo")
     role_env = os.path.join(ctx.home, prc.DISPATCHER_ENV_FILE[2:])

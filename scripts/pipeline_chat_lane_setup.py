@@ -5564,6 +5564,11 @@ def main(argv=None, runner=None, sudo=None):
     if args.selftest:
         from scratch_run import contained   # KIT-450: its temp folders go when it ends
         return contained(selftest, "chat-lane-setup-selftest-run-")
+    import pipeline_root_guard as _rg   # KIT-693: the one refusal every installer shares
+    _root = _rg.refusal()
+    if _root:
+        say(_root)
+        return EX_REFUSED
     if not args.command:
         build_parser().print_usage()
         return EX_USAGE

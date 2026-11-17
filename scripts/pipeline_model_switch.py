@@ -558,9 +558,9 @@ def main(argv=None, io=None):
             "dispatcher's model from one would let a session choose its own model. Open the "
             "Terminal app, or this app's Terminal tab, and run it there." % ", ".join(found))
         return EX_REFUSED
-    if io.uid() == 0:
-        say("REFUSED: do not run this with sudo. Run it as yourself; it asks for your Mac "
-            "password when it needs it.")
+    import pipeline_root_guard as rg      # KIT-693: the one refusal every installer shares
+    if rg.refusal(io.uid()):
+        say(rg.refusal(io.uid()))
         return EX_REFUSED
     if not io.is_tty():
         say("This asks you one question before it changes anything, so it runs only in a "

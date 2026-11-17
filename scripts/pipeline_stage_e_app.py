@@ -755,9 +755,9 @@ def cmd_run(io, args):
                "never do that. Run it in your own terminal. (An agent's environment was found: "
                "%s.)" % ", ".join(found))
         return EX_REFUSED
-    if io.uid() == 0:
-        io.say("REFUSED: run this as yourself, not as root. Its ledger lives under YOUR home, "
-               "where the installer reads it.")
+    import pipeline_root_guard as rg      # KIT-693: the one refusal every installer shares
+    if rg.refusal(io.uid()):
+        io.say(rg.refusal(io.uid()))
         return EX_REFUSED
     conf, code = load_conf(io, args.conf)
     if conf is None:

@@ -379,6 +379,19 @@ fails too. Its standard-library list is one constant, so Python 3.9 and 3.12 agr
 fails when the running Python knows a module the constant lacks (add it). `npm run
 test:stdlib-only` runs the selftest, `npm run lint:stdlib-only` the real check.
 
+## Installers refuse to run as root (KIT-693)
+
+An installer run as root writes files owned by root in the owner's or the role account's folders,
+and later passes cannot read or replace them. Every installer refuses at its entry, before it reads
+its conf, with the one message in `scripts/pipeline_root_guard.py` and exit 3 (the installer that
+already used another exit code for this keeps it). A step that needs root asks for it itself,
+once, with a reason; none starts as root. `npm run test:root-guard` runs each installer as root
+(the uid stubbed) from an empty folder and checks it refuses and leaves the folder empty. A new
+installer calls `refusal()` and is added to the list there.
+
+Good: you run the installer in your own terminal and it asks for your password when a step needs it.
+Not: you run it with `sudo` and find root-owned files in your home later.
+
 ## What CI never does
 
 - Never runs the DB-backed suite.

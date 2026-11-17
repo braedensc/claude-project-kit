@@ -18110,6 +18110,11 @@ def main(argv=None):
     if args.selftest:
         from scratch_run import contained   # KIT-450: its temp folders go when it ends
         return contained(selftest, "stage-e-setup-selftest-")
+    import pipeline_root_guard as _rg   # KIT-693: the one refusal every installer shares
+    _root = _rg.refusal()
+    if _root:
+        say(_root)
+        return EX_REFUSED
     try:
         # BEFORE the conf is read, before the state directory is touched, and
         # long before any prompt: a session must not get as far as discovering

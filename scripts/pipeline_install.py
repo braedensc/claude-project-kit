@@ -1519,9 +1519,9 @@ def main(argv=None, io=None):
                         "could run them could install its own supervisor. Open the Terminal "
                         "app, or this app's Terminal tab, and run it there." % ", ".join(found),
                     EX_REFUSED)
-    if io.uid() == 0:
-        return stop(io, "do not run this with sudo. Run it as yourself; it asks for your Mac "
-                        "password when it needs it.", EX_USAGE)
+    import pipeline_root_guard as rg      # KIT-693: the one refusal every installer shares
+    if rg.refusal(io.uid()):
+        return stop(io, rg.refusal(io.uid()), EX_USAGE)
     if args.check:                   # KIT-736: it only looks, so it needs no terminal
         return look_only(io, args)
     if not io.is_tty():

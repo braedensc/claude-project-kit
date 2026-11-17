@@ -10037,6 +10037,11 @@ def main(argv=None):
     if args.selftest:
         from scratch_run import contained   # KIT-450: its temp folders go when it ends
         return contained(selftest, "stage-a-setup-selftest-")
+    import pipeline_root_guard as _rg   # KIT-693: the one refusal every installer shares
+    _root = _rg.refusal()
+    if _root:
+        print(_root, file=sys.stderr)
+        return EX_REFUSED
 
     # Refuse a mutating command in an agent environment BEFORE any read.
     if (args.command in ("run", "drill") and not args.dry_run) or args.command == "attest":
