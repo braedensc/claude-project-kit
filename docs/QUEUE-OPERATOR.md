@@ -78,9 +78,10 @@ Not that: starts going on while the disk fills. Free some space; the next pass s
 
 The queue has stops for a runaway: the plan near or at its limit, a day over its hard stop, a piece over its cost stop,
 too many running or started, a usage file that is missing or stale, or a run signed in with an API key. Each holds every
-start. A stop ends the bridge's pass loud for as long as it stands, so the heartbeat monitor pages you once, naming the stop
-(`QUEUE: a runaway stop holds every start (day-hard-stop (61.5 against 60))`), and says it is recovered on the first pass
-after the stop lifts, with `queue: the runaway stop is lifted: starts resume` in the log.
+start. A stop ends the bridge's pass loud for as long as it stands, so the heartbeat monitor pages you once that the bridge is failing, and says it is recovered on the first pass
+after the stop lifts. The page does not carry the stop's name: the bridge's log and its heartbeat summary do
+(`QUEUE: a runaway stop holds every start (day-hard-stop (61.5 against 60))`), and the log says
+`queue: the runaway stop is lifted: starts resume` when it clears.
 Good: one page when `day-hard-stop` trips, one when it clears.
 Not that: starts held for hours with no page. Look at the stop the page names.
 

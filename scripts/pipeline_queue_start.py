@@ -300,8 +300,8 @@ def read_usage(path):
 def stop_words(decision):
     """KIT-695: the runaway stops a decision names, as fixed words and numbers only, sorted: the
     stop's code, the ref (a window name, a ticket id or a repository) and its value against its
-    limit. [] for a decision with none, or no decision. The bridge ends its pass loud on a
-    change in this list, so a stop that holds every start reaches the owner as a page."""
+    limit. [] for a decision with none, or no decision. The bridge ends its pass loud for as long as
+    this list is not empty, so a stop that holds every start reaches the owner as a page."""
     out = []
     for item in (decision or {}).get("stops") or []:
         if not isinstance(item, dict) or not isinstance(item.get("stop"), str):
