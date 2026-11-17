@@ -92,7 +92,14 @@ DISPATCH_STATES = ["firing", "ok"]
 SUMMARY_CAP = 4000
 ISSUE_WRITES = ("issues.create", "issues.createComment", "issues.update", "issues.addAssignees")
 PAYLOAD = {"workflow_run": {"name": "Deploy (prod)", "run_number": 12, "id": 1, "head_branch": "main",
-                            "head_sha": "0123456789abcdef", "html_url": "https://example.invalid/runs/1"}}
+                            "head_sha": "0123456789abcdef", "html_url": "https://example.invalid/runs/1",
+                            "conclusion": "failure", "event": "push", "workflow_id": 9,
+                            "created_at": "2026-11-17T10:00:00Z"},
+           "repository": {"default_branch": "main"}}
+# The failure alert, which reacts to a finished run: its own scenarios (KIT-685).
+FAILURE_ALERTS = ("pipeline-failure-alert.yml",)
+# The drift monitor: its detection step and its issue step (KIT-685).
+DRIFT_ALERTS = ("migration-drift.yml",)
 
 # Runs one github-script body the way actions/github-script does (an async function
 # over github, context, core), with every API it may call mocked and recorded.
@@ -106,6 +113,7 @@ const rec = (name, result) => async (args) => {
 }
 const github = { rest: {
   repos: { get: rec('repos.get', { data: { owner: { login: input.owner, type: input.ownerType } } }) },
+  actions: { listWorkflowRuns: rec('actions.listWorkflowRuns', { data: { workflow_runs: input.runs || [] } }) },
   issues: {
     listForRepo: rec('issues.listForRepo', { data: input.existingTitle ? [{ number: 7, title: input.existingTitle }] : [] }),
     create: rec('issues.create', { data: { number: 42 } }),
@@ -127,12 +135,13 @@ new AsyncFunction('github', 'context', 'core', 'process', input.script)(github, 
 """
 
 
-def run_script(script, owner_type, page_to=None, existing_title=None, throws=(), env_extra=None):
+def run_script(script, owner_type, page_to=None, existing_title=None, throws=(), env_extra=None,
+               payload=None, runs=None):
     env = dict(ENV, **(env_extra or {}))
     if page_to is not None:
         env["ALERT_PAGE_TO"] = page_to
-    payload = {"script": script, "owner": OWNER, "ownerType": owner_type, "env": env, "payload": PAYLOAD,
-               "existingTitle": existing_title, "throws": list(throws)}
+    payload = {"script": script, "owner": OWNER, "ownerType": owner_type, "env": env, "payload": payload or PAYLOAD,
+               "existingTitle": existing_title, "throws": list(throws), "runs": runs or []}
     proc = subprocess.run(["node", "-e", HARNESS], input=json.dumps(payload), capture_output=True,
                           text=True, timeout=30)
     if proc.returncode != 0 or not proc.stdout:
@@ -212,6 +221,101 @@ def scenarios(script):
     out.append(("assignment refused → warns only: the @mention is the page",
                 not r.get("error") and f"cc @{OWNER}" in args.get("body", "")
                 and r["warnings"] and not r["failed"]))
+    return out
+
+
+def failure_payload(conclusion="failure", branch="main", event="push", default="main"):
+    run = dict(PAYLOAD["workflow_run"], conclusion=conclusion, head_branch=branch, event=event)
+    return {"workflow_run": run, "repository": {"default_branch": default}}
+
+
+def failure_alert_scenarios(script, doc):
+    """(label, ok) for the failure alert: which finished runs alert, and which do not."""
+    def go(**kw):
+        runs = kw.pop("runs", None)
+        throws = kw.pop("throws", ())
+        return run_script(script, "User", payload=failure_payload(**kw), runs=runs, throws=throws)
+
+    def alerts(r):
+        return not r.get("error") and posted(r)[0] == "issues.create" and not r["failed"]
+
+    job = next(iter(((doc or {}).get("jobs") or {}).values()), {})
+    cond = str(job.get("if", ""))
+    newer = [{"id": 2, "run_number": 13, "created_at": "2026-11-17T10:05:00Z"}]
+    older = [{"id": 3, "run_number": 11, "created_at": "2026-11-17T09:00:00Z"}]
+    out = [("the job runs for a failed, a timed-out and a cancelled run",
+            all(w in cond for w in ("failure", "timed_out", "cancelled")))]
+    r = go()
+    out.append(("a failed run on main alerts, naming the conclusion",
+                alerts(r) and "`failure`" in posted(r)[1].get("body", "")))
+    r = go(conclusion="timed_out")
+    out.append(("a timed_out run on main alerts, naming the conclusion",
+                alerts(r) and "`timed_out`" in posted(r)[1].get("body", "")))
+    r = go(conclusion="cancelled")
+    out.append(("a cancelled run nothing replaced alerts", alerts(r) and "`cancelled`" in posted(r)[1].get("body", "")))
+    r = go(conclusion="cancelled", runs=older)
+    out.append(("a cancelled run with only OLDER runs beside it still alerts", alerts(r)))
+    r = go(conclusion="cancelled", runs=newer)
+    out.append(("a cancelled run a newer run replaced does not page, and says why",
+                not r.get("error") and not writes(r) and not r["failed"]
+                and any("replaced by run #13" in m for m in r["infos"])))
+    r = go(conclusion="cancelled", runs=newer, throws=("actions.listWorkflowRuns",))
+    out.append(("a failed lookup for a newer run alerts anyway, with a warning",
+                alerts(r) and bool(r["warnings"])))
+    r = go(conclusion="timed_out", runs=newer)
+    out.append(("a newer run never silences a timed_out run", alerts(r)))
+    r = go(branch="nightly", event="schedule")
+    out.append(("a failed scheduled run on a branch that is not main alerts", alerts(r)))
+    r = go(branch="develop", default="develop")
+    out.append(("the default branch is read from the repository, not assumed to be main", alerts(r)))
+    r = go(branch="feature-x")
+    out.append(("a failed push run on a feature branch does not alert",
+                not r.get("error") and not writes(r) and not r["failed"]))
+    return out
+
+
+def drift_scenarios(script, doc):
+    """(label, ok) for the drift monitor: the detection step run for real against a stub CLI,
+    and the issue step for an unchecked run."""
+    import tempfile
+    out = []
+    steps = [s for j in ((doc or {}).get("jobs") or {}).values() for s in (j.get("steps") or [])]
+    detect = next((s for s in steps if s.get("id") == "drift"), None)
+    if detect is None:
+        return [("the detection step (id: drift) exists", False)]
+    cases = [
+        ("a dry run that fails to run reads \"could not check\", not \"no drift\"", 1, "connection refused", "unchecked=true", "drift=false"),
+        ("a dry run that prints nothing it recognises reads \"could not check\"", 0, "something new", "unchecked=true", "drift=false"),
+        ("a dry run that finds pending migrations reads drift", 0,
+         "Would push these migrations:\n 20260101000000_init.sql", "drift=true", "unchecked"),
+        ("a dry run that says up to date reads clean", 0, "Remote database is up to date.", "drift=false", "unchecked"),
+    ]
+    for label, code, text, want, not_want in cases:
+        with tempfile.TemporaryDirectory(prefix="alert-pages-") as tmp:
+            stub = os.path.join(tmp, "supabase")
+            with open(stub, "w", encoding="utf-8") as fh:
+                fh.write('#!/bin/sh\nprintf \'%b\\n\' "$STUB_OUT"\nexit "$STUB_CODE"\n')
+            os.chmod(stub, 0o755)
+            gh_out = os.path.join(tmp, "out")
+            open(gh_out, "w").close()
+            env = dict(os.environ, PATH=tmp + os.pathsep + os.environ.get("PATH", ""), SUPABASE_DB_URL="x",
+                       GITHUB_OUTPUT=gh_out, STUB_OUT=text, STUB_CODE=str(code))
+            proc = subprocess.run(["bash", "-c", detect.get("run", "")], env=env, capture_output=True, text=True)
+            with open(gh_out, encoding="utf-8") as fh:
+                got = fh.read()
+        out.append((label, proc.returncode == 0 and want in got and not_want not in got))
+    for unchecked in (True, False):
+        r = run_script(script, "User", env_extra={"UNCHECKED": "true" if unchecked else "false"})
+        api, args = posted(r)
+        body, title = args.get("body", ""), args.get("title", "")
+        if unchecked:
+            ok = (not r.get("error") and api == "issues.create" and "could not be checked" in title
+                  and "**could not check**" in body and "behind" not in title
+                  and any("COULD NOT CHECK" in f for f in r["failed"]))
+            out.append(("an unchecked run files its own issue, pages, and FAILS the run", ok))
+        else:
+            ok = (not r.get("error") and "behind" in title and "could not check" not in body and not r["failed"])
+            out.append(("a drift run still files the behind issue and passes", ok))
     return out
 
 
@@ -352,7 +456,7 @@ def main():
         print("COULD NOT RUN: node is not on PATH, so no alert script was executed")
         return 1
 
-    fails, blocks, steps_checked, dispatched = [], {}, 0, set()
+    fails, blocks, steps_checked, dispatched, seen = [], {}, 0, set(), set()
     for path in workflow_files():
         with open(path, encoding="utf-8") as fh:
             text = fh.read()
@@ -384,6 +488,13 @@ def main():
                 print(f"  {'ok  ' if ok else 'FAIL'} {path}: {name}")
                 if not ok:
                     fails.append(f"{label}: {name}")
+            for names, fn in ((FAILURE_ALERTS, failure_alert_scenarios), (DRIFT_ALERTS, drift_scenarios)):
+                if base in names:
+                    seen.add(base)
+                    for name, ok in fn(script, doc):
+                        print(f"  {'ok  ' if ok else 'FAIL'} {path}: {name}")
+                        if not ok:
+                            fails.append(f"{label}: {name}")
             if base in DISPATCHED:
                 dispatched.add(base)
                 for why in dispatch_contract(doc, step):
@@ -402,6 +513,9 @@ def main():
     for base in sorted(set(DISPATCHED) - dispatched):
         fails.append(f"DISPATCHED names {base}, but no alert step in {' or '.join(SCAN_DIRS)} has that name, "
                      f"so its open/close scenarios never ran — remove it, or restore the file")
+    for base in sorted((set(FAILURE_ALERTS) | set(DRIFT_ALERTS)) - seen):
+        fails.append(f"{base} is named for its own scenarios but no alert step in {' or '.join(SCAN_DIRS)} "
+                     f"has that name, so they never ran — remove it, or restore the file")
     if len(blocks) > 1:
         fails.append("the WHO THIS ALERT PAGES block differs between copies: "
                      + "; ".join(f"variant {i + 1} in {', '.join(where)}" for i, where in enumerate(blocks.values())))
@@ -421,4 +535,6 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from scratch_run import contained       # the detection scenarios' temp folders go when it ends
+    sys.exit(contained(main, "alert-pages-run-"))

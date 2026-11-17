@@ -5,9 +5,13 @@ name: Pipeline failure alert
 # deploy-failure-alert.yml, born from the 2026-07-09 incident: a PR's CI going
 # green is SEPARATE from the post-merge prod deploy, and the deploy failed in
 # the Actions tab for hours with nothing surfacing it. This reacts to a watched
-# workflow finishing with `failure` on main and opens (or comments on) ONE
-# deduplicated GitHub issue, @mentioning and assigning a person so the alert
-# actually reaches a human.
+# workflow finishing with `failure`, `timed_out` or `cancelled` on the default
+# branch (or any scheduled run) and opens (or comments on) ONE deduplicated
+# GitHub issue, @mentioning and assigning a person so the alert actually reaches
+# a human. A deploy that hangs past its limit ends `timed_out`, and a lost runner
+# ends `cancelled`: both leave a half-deploy, so both alert. A cancelled run is
+# NOT an alert when a newer run of the same workflow on the same branch exists
+# (concurrency cancels the older one on purpose).
 #
 # WHO is paged: the ALERT_PAGE_TO repository variable (logins or org/team,
 # comma-separated) when set; else the repository owner when that is a person.
@@ -29,7 +33,7 @@ name: Pipeline failure alert
 #     "Read and write permissions".
 #
 # Interaction with the deploy template's preflights: this fires only on a
-# FAILED conclusion — a preflight that skips-green produces no failure event,
+# failed, timed-out or cancelled conclusion — a preflight that skips-green produces no failure event,
 # so after your first successful deploy, flip deploy-on-green.yml's preflights
 # to their fail-loud variants or this alert is blind to half-deploys.
 # ══════════════════════════════════════════════════════════════════════════════
@@ -52,11 +56,11 @@ permissions:
 jobs:
   alert:
     name: Open an issue on pipeline failure
-    # Only failures on main alert — a red run on a feature branch is the PR
-    # author's normal feedback loop, not an outage.
-    if: >-
-      github.event.workflow_run.conclusion == 'failure' &&
-      github.event.workflow_run.head_branch == 'main'
+    # Failed, timed-out and cancelled runs reach the script, which decides (scripts/
+    # check_alert_pages.py runs it): only the default branch, or a scheduled run on any
+    # branch, alerts. A red run on a feature branch is the PR author's normal feedback
+    # loop, not an outage; a cancelled run that a newer run replaced is not an outage.
+    if: contains(fromJSON('["failure","timed_out","cancelled"]'), github.event.workflow_run.conclusion)
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -68,6 +72,27 @@ jobs:
             const run = context.payload.workflow_run
             const owner = context.repo.owner
             const repo = context.repo.repo
+            // ── WHICH RUNS ALERT ── the default branch, or a scheduled run on any branch.
+            const defaultBranch = (context.payload.repository && context.payload.repository.default_branch) || 'main'
+            if (run.head_branch !== defaultBranch && run.event !== 'schedule') {
+              core.info(`${run.name} ended ${run.conclusion} on ${run.head_branch}, which is not ${defaultBranch}: no alert`)
+              return
+            }
+            // A cancelled run is an outage only when nothing replaced it. A newer run of the same
+            // workflow on the same branch (any state) means concurrency cancelled it on purpose.
+            // When the lookup fails the alert goes out: a page nobody needed beats one never sent.
+            if (run.conclusion === 'cancelled') {
+              try {
+                const runs = await github.rest.actions.listWorkflowRuns({ owner, repo, workflow_id: run.workflow_id, branch: run.head_branch, per_page: 20 })
+                const newer = (runs.data.workflow_runs || []).filter((r) => r.id !== run.id && Date.parse(r.created_at) > Date.parse(run.created_at))
+                if (newer.length) {
+                  core.info(`${run.name} run #${run.run_number} was cancelled and replaced by run #${newer[0].run_number}: no alert`)
+                  return
+                }
+              } catch (e) {
+                core.warning(`could not look for a newer run, so the cancelled run alerts: ${e.message}`)
+              }
+            }
             // ── WHO THIS ALERT PAGES ── identical in every alert template (scripts/check_alert_pages.py
             // runs each copy). An @mention of an ORGANIZATION notifies nobody and an organization
             // cannot be assigned, so the repository owner is never paged blindly. In order: the
@@ -116,10 +141,10 @@ jobs:
             // The stable title IS the dedupe key — change it and you fork a second
             // issue instead of commenting on the existing one. One issue per watched
             // workflow (run.name), regardless of how many runs fail.
-            const title = `🚨 ${run.name} is failing on main`
+            const title = `🚨 ${run.name} is failing on ${run.head_branch}`
             const recipients = await alertRecipients()
             const body = [
-              `**${run.name}** run [#${run.run_number}](${run.html_url}) finished with \`failure\` on \`${run.head_branch}\` (commit \`${run.head_sha.slice(0, 7)}\`).`,
+              `**${run.name}** run [#${run.run_number}](${run.html_url}) finished with \`${run.conclusion}\` on \`${run.head_branch}\` (commit \`${run.head_sha.slice(0, 7)}\`).`,
               '',
               'Whatever this workflow deploys, backs up, or safeguards did **not** happen.',
               '',
