@@ -25,6 +25,9 @@ Each pass, every few seconds:
    removed. Anything left of its process group is killed first. A run that left no result and no
    exit is *interrupted*, and is resumed once. A lock only the wrapper holds says a run is alive;
    the session never gets it, so it cannot fake its own end.
+   A resume whose session the program no longer has is started afresh once: a new session in the
+   same workspace, given the ticket and the same request's text. Its record says `started_for:
+   session-gone` and names the lost session in `gone_session`.
 2. **Answers each waiting request, oldest first.** It starts, resumes or stops a session, or refuses
    with a reason. A request it cannot judge now waits for a later pass.
 
@@ -157,5 +160,8 @@ The runner refuses to start from inside a Claude session, or as root.
 
 - That a session outlives a restart of the runner under launchd. The selftest proves it for a runner
   killed with its whole process group. One live check is owed.
+- That the program says a lost session in the words the runner looks for: "No conversation found",
+  as an error result or as the last line of its errors. The tech lead's turn relies on the same
+  words. The selftest's stand-in prints them. One live check is owed.
 - That one sign-in serves the runner and the tech lead together (KIT-629).
 - That sandboxed Bash may write the session's temp folder. Each kind's walls are measured in KIT-704.

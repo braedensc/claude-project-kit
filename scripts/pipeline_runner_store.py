@@ -77,12 +77,19 @@ USAGE_KINDS = {"code": "coding", "fix": "bounce_fix", "conflict": "conflict_fix"
 RUNNING, STOPPING = "running", "stopping"
 STATES = (RUNNING, STOPPING, "ended", "stopped", "interrupted", "failed")
 LIVE = (RUNNING, STOPPING)
-# Why a run ended. The runner's limits add their own (KIT-643).
-REASONS = ("ended", "stopped", "interrupted", "could-not-start")
+# Why a run ended. The runner's limits add their own (KIT-643). `session-gone`: a resume whose
+# session the program no longer has (KIT-764).
+REASONS = ("ended", "stopped", "interrupted", "could-not-start", "session-gone")
 LIMIT_REASONS = ("limit:time", "limit:memory", "limit:disk")
-STARTED_FOR = ("request", "interrupted")
+# Why the runner itself started a run: a request, its one resume after an interruption, or its
+# one fresh start after a resume found its session gone (KIT-764).
+STARTED_FOR = ("request", "interrupted", "session-gone")
+RUNNERS_OWN = ("interrupted", "session-gone")
 AUTO_RESUME = ("pending", "started", "refused")
-HOW = ("move", "creation", "resumed-run")
+# How a run was let start: the owner's move or creation, a resume of a run of the same session,
+# or a fresh session in the workspace of a run whose session was gone.
+HOW = ("move", "creation", "resumed-run", "fresh-session")
+FOLLOWS = ("resumed-run", "fresh-session")              # a run that carries on another run
 
 TICKET_RE = re.compile(r"^[A-Z][A-Z0-9]{0,15}-[0-9]{1,9}\Z")
 PROJECT_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}\Z")
@@ -100,7 +107,8 @@ REQUEST_KEYS = ("schema", "id", "at", "caller", "action", "kind", "project", "ti
 RUN_KEYS = ("schema", "run", "request", "caller", "kind", "project", "ticket", "resumes",
             "started_for", "approved_by", "approved_at", "how", "session_id", "workspace",
             "branch", "pin", "pid", "state", "started_at", "ended_at", "seconds", "exit",
-            "reason", "why", "cost_usd", "turns", "stop_asked_at", "auto_resume", "resumed_by")
+            "reason", "why", "cost_usd", "turns", "stop_asked_at", "auto_resume", "resumed_by",
+            "gone_session")
 
 
 class StoreError(Exception):
@@ -190,7 +198,7 @@ def run_problems(doc):
         ("run", isinstance(doc["run"], str) and bool(RUN_RE.match(doc["run"]))),
         ("request", _opt(doc, "request", lambda v: isinstance(v, str) and bool(REQUEST_RE.match(v)))),
         ("caller", isinstance(doc["caller"], str) and (doc["caller"] in CALLERS or (
-            doc["caller"] == "runner" and doc["started_for"] == "interrupted"))),
+            doc["caller"] == "runner" and doc["started_for"] in RUNNERS_OWN))),
         ("kind", doc["kind"] in KINDS),
         ("project", isinstance(doc["project"], str) and bool(PROJECT_RE.match(doc["project"]))),
         ("ticket", isinstance(doc["ticket"], str) and bool(TICKET_RE.match(doc["ticket"]))),
@@ -216,6 +224,8 @@ def run_problems(doc):
         ("stop_asked_at", _opt(doc, "stop_asked_at", t)),
         ("auto_resume", _opt(doc, "auto_resume", lambda v: v in AUTO_RESUME)),
         ("resumed_by", _opt(doc, "resumed_by", lambda v: isinstance(v, str) and bool(RUN_RE.match(v)))),
+        ("gone_session", _opt(doc, "gone_session",
+                              lambda v: isinstance(v, str) and bool(UUID_RE.match(v)))),
     )
     bad = ["the record's %s is not valid" % name for name, ok in checks if not ok]
     if not bad:
@@ -224,8 +234,11 @@ def run_problems(doc):
         if live != (doc["ended_at"] is None) or (live and doc["reason"] is not None and not at_limit) \
                 or (not live and doc["reason"] is None):
             bad.append("a live run has no end, and an ended one has its end and reason")
-        if (doc["resumes"] is None) != (doc["how"] != "resumed-run"):
+        if (doc["resumes"] is None) != (doc["how"] not in FOLLOWS):
             bad.append("a resumed run names the run it resumed, and only it")
+        fresh = doc["how"] == "fresh-session"
+        if fresh != (doc["gone_session"] is not None) or fresh != (doc["started_for"] == "session-gone"):
+            bad.append("a fresh start names the session it could not resume, and only it")
     return bad
 
 
@@ -375,6 +388,22 @@ def settle(store, request_id, doc, ok, run, why, now):
         os.unlink(os.path.join(store, "requests", request_id + ".json"))
     except FileNotFoundError:
         pass
+
+
+def taken_request(store, request_id):
+    """A request the runner acted on, as it was asked (KIT-764: a fresh start reads its words back
+    from here). None when it is not there, cannot be read, or is not a well-formed request."""
+    if not (isinstance(request_id, str) and REQUEST_RE.match(request_id)):
+        return None
+    try:
+        doc = read_json(os.path.join(store, "taken", request_id + ".json"))
+    except StoreError:
+        return None
+    req = doc.get("request") if isinstance(doc, dict) else None
+    try:
+        return req if isinstance(req, dict) and not request_problems(req) else None
+    except (TypeError, ValueError, AttributeError):
+        return None
 
 
 def answer(store, request_id):
@@ -563,6 +592,13 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
     expect("a settled request leaves the waiting ones", rid in [i[0] for i in pending(store)], False)
     expect("its answer is kept", answer(store, rid),
            {"at": "2023-11-14T22:13:21Z", "ok": True, "run": "run-" + "d" * 32, "why": "started"})
+    expect("…and the request as it was asked, for a fresh start to read back (KIT-764)",
+           (taken_request(store, rid), taken_request(store, "rq-" + "0" * 32), taken_request(store, "../x")),
+           (doc, None, None))
+    write_json(os.path.join(store, "taken", "rq-" + "9" * 32 + ".json"),
+               {"request": dict(doc, caller="session"), "answer": {}})
+    expect("…never one that is not a request a caller may make",
+           taken_request(store, "rq-" + "9" * 32), None)
 
     # Run records.
     rec = dict((k, None) for k in RUN_KEYS)
@@ -582,6 +618,21 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
     expect("the runner's own resume after an interruption names it",
            run_problems(dict(rec, caller="runner", started_for="interrupted", how="resumed-run",
                              resumes="run-" + "f" * 32)), [])
+    fresh = dict(rec, caller="runner", started_for="session-gone", how="fresh-session",
+                 resumes="run-" + "f" * 32, gone_session="0b0e5e2c-1111-4222-8333-944445555777")
+    expect("its fresh start after a resume found its session gone names that session (KIT-764)",
+           run_problems(fresh), [])
+    fresh_rule = ["a fresh start names the session it could not resume, and only it"]
+    expect("…and a fresh start that names no gone session is not a record",
+           run_problems(dict(fresh, gone_session=None)), fresh_rule)
+    expect("…nor is any other run that names one",
+           run_problems(dict(rec, gone_session=fresh["gone_session"])), fresh_rule)
+    expect("…nor a gone session that is not a session id",
+           run_problems(dict(fresh, gone_session="../x")), ["the record's gone_session is not valid"])
+    expect("a resume whose session was gone ends with that reason",
+           run_problems(dict(rec, state="ended", ended_at="2023-11-14T22:20:00Z",
+                             reason="session-gone", why="gone", how="resumed-run",
+                             resumes="run-" + "f" * 32, auto_resume="pending")), [])
     stopping = dict(rec, state=STOPPING, stop_asked_at="2023-11-14T22:20:00Z")
     live_rule = ["a live run has no end, and an ended one has its end and reason"]
     expect("a run being stopped at a limit carries that limit",

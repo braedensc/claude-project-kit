@@ -14,7 +14,8 @@ yet, and no job loads it: each lane moves later, on the owner's yes. Docs: docs/
 WHAT A PASS DOES.  Each pass, every `poll_seconds`:
   1. Each live run: is its process still there? If not, its record is finished from what the
      session left, and its pin is removed. A run that left no result and no exit is interrupted,
-     and is resumed once.
+     and is resumed once. A resume whose session the program no longer has is started afresh
+     once, in the same workspace, with the ticket and the same request's text (KIT-764).
   2. Each waiting request (scripts/pipeline_runner_store.py), oldest first: checked, then started,
      resumed or stopped, or refused with a reason. A request the runner cannot judge now (the
      tracker did not answer, the watcher's hold) waits for a later pass.
@@ -137,6 +138,14 @@ KIND_LEAD = {
 }
 INTERRUPTED_TEXT = ("This session was interrupted before it ended. Carry on from where it "
                     "stopped.")
+# KIT-764. What a fresh start after a lost session is told first, before the ticket and the request.
+FRESH_TEXT = ("The session that did this work could not be resumed: the program no longer has its "
+              "conversation. This workspace and branch hold that work. Read the ticket, look at "
+              "what is already here, then do what the request asks.")
+# The program's own words for a session it no longer has, read as the tech lead's turn reads them
+# (scripts/pipeline_tech_lead_turn.py): in an error result's text, or the last line of its errors.
+NO_SESSION_RE = re.compile(r"no conversation found|session.{0,40}not found", re.IGNORECASE)
+ERR_SCAN = 4096
 DEFAULTS = {
     "enabled": False,
     "store_dir": None,
@@ -602,15 +611,21 @@ def fence(tag, lead, payload):
         tag, lead, body, tag)
 
 
-def build_prompt(kind, ticket, run_id, node=None, text=None):
+def build_prompt(kind, ticket, run_id, node=None, text=None, fresh=False):
+    """The prompt on stdin. A fresh start after a lost session (KIT-764) is told so first, then
+    gets the ticket and the request's text, each fenced: a new session knows neither."""
     note = "<pipeline-note>\nkind: %s; ticket: %s; run: %s\n</pipeline-note>\n" % (kind, ticket, run_id)
     lead = INTERRUPTED_TEXT if text == INTERRUPTED_TEXT else KIND_LEAD[kind]
-    if text is not None:
-        return note + lead + "\n" + fence("untrusted-request-data", "The request's text.", {"text": text})
+    request = fence("untrusted-request-data", "The request's text.", {"text": text})
+    if text is not None and not fresh:
+        return note + lead + "\n" + request
     snap = {"id": node.get("identifier"), "title": node.get("title"),
             "description": node.get("description") or ""}
     snap.update(pin_fields(snap["description"]))
-    return note + lead + "\n" + fence("untrusted-ticket-data", "The ticket, as it was read.", snap)
+    ticket_data = fence("untrusted-ticket-data", "The ticket, as it was read.", snap)
+    if fresh:
+        return note + FRESH_TEXT + "\n" + ticket_data + lead + "\n" + request
+    return note + lead + "\n" + ticket_data
 
 
 def build_rules(kind, ticket, instructions):
@@ -756,11 +771,29 @@ def read_result(rdir):
             num = lambda v: v if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0 else None  # noqa: E731
             turns = doc.get("num_turns")
             sub = doc.get("subtype")
+            said = doc.get("result")
             return {"is_error": doc.get("is_error") is not False,
                     "subtype": sub if isinstance(sub, str) and SUBTYPE_RE.match(sub) else "",
                     "cost_usd": num(doc.get("total_cost_usd")),
-                    "turns": turns if isinstance(turns, int) and not isinstance(turns, bool) and turns >= 0 else None}
+                    "turns": turns if isinstance(turns, int) and not isinstance(turns, bool) and turns >= 0 else None,
+                    # The program's own words, for session_gone() alone: never in a record.
+                    "said": said[:ERR_SCAN] if isinstance(said, str) else ""}
     return None
+
+
+def session_gone(rdir, result):
+    """True when the program said the session it was asked to resume is not there (KIT-764): an
+    error result, after no turn, whose text says so, or no result and the last line of its error
+    log saying so. The program's own words, as the tech lead's turn reads them."""
+    if result is not None:
+        return bool(result["is_error"] and not result["turns"] and NO_SESSION_RE.search(result["said"]))
+    try:
+        with open(os.path.join(rdir, "err.log"), "rb") as fh:
+            fh.seek(max(0, os.fstat(fh.fileno()).st_size - ERR_SCAN))
+            lines = [ln for ln in fh.read().decode("utf-8", "replace").splitlines() if ln.strip()]
+    except OSError:
+        return False
+    return bool(lines) and bool(NO_SESSION_RE.search(lines[-1]))
 
 
 def session_main(rdir, fd):
@@ -860,7 +893,8 @@ class Runner(object):
                 if done:
                     out["ended"].append(done)
         for rec in self.runs() or []:
-            if cfg["enabled"] and rec["state"] == "interrupted" and rec["auto_resume"] == "pending":
+            if cfg["enabled"] and rec["auto_resume"] == "pending" and (
+                    rec["state"] == "interrupted" or rec["reason"] == "session-gone"):
                 self.auto_resume(rec, out)
         if not cfg["enabled"]:
             out.update(state="off", why="the runner is off: no request is taken")
@@ -917,6 +951,12 @@ class Runner(object):
         elif exit_doc is None and result is None:
             state, reason = "interrupted", "interrupted"
             why = "the session left no result and no exit: it was interrupted"
+        elif rec["how"] == "resumed-run" and session_gone(rdir, result):
+            # KIT-764. Only a resume can find its session gone, so a fresh start never leads to
+            # another: the runner starts this one afresh once, with the same text and the ticket.
+            state, reason = "ended", "session-gone"
+            why = "the session it resumed is gone: the program no longer has its conversation"
+            rec["auto_resume"] = "pending"
         else:
             state, reason = "ended", "ended"
             if result and result["is_error"]:
@@ -1019,10 +1059,23 @@ class Runner(object):
             pass
 
     def auto_resume(self, rec, out):
-        """A run that died is resumed once, by the runner itself, with fixed words."""
-        verdict, run_id, why = self.start(rec["project"], rec["kind"], rec["ticket"], "runner",
-                                          None, resumes=rec, text=INTERRUPTED_TEXT,
-                                          started_for="interrupted")
+        """A run that died is resumed once, by the runner itself, with fixed words. A resume that
+        found its session gone is started afresh once, in the same workspace, with the same text
+        and the ticket (KIT-764)."""
+        if rec["reason"] == "session-gone":
+            text, why = INTERRUPTED_TEXT, ""
+            if rec["request"] is not None:      # else it was the runner's own resume, in fixed words
+                asked = store.taken_request(self.store_dir(), rec["request"])
+                text = asked["text"] if asked else None
+                why = "" if asked else "the request's text could not be read back, so it was not started afresh"
+            started_for, done = "session-gone", "started afresh once, its session gone"
+        else:
+            text, why = INTERRUPTED_TEXT, ""
+            started_for, done = "interrupted", "resumed once after an interruption"
+        verdict, run_id = "refused", None
+        if text is not None:
+            verdict, run_id, why = self.start(rec["project"], rec["kind"], rec["ticket"], "runner",
+                                              None, resumes=rec, text=text, started_for=started_for)
         if verdict == "held":
             out["waiting"].append(rec["run"])
             return
@@ -1031,7 +1084,7 @@ class Runner(object):
         rec["resumed_by"] = run_id
         store.write_run(self.store_dir(), rec)
         (out["started"] if verdict == "started" else out["refused"]).append(run_id or rec["run"])
-        self.say("runner: %s resumed once after an interruption: %s" % (rec["run"], why or run_id))
+        self.say("runner: %s %s: %s" % (rec["run"], done, why or run_id))
 
     # -- a request -------------------------------------------------------- #
     def take(self, item, out):
@@ -1157,9 +1210,11 @@ class Runner(object):
         if pins is None:
             return "refused", None, why
         run_id, made = "run-" + uuid.uuid4().hex, None
+        fresh = started_for == "session-gone" and resumes is not None   # KIT-764: a new session
         if resumes is not None:
             workspace, branch = resumes["workspace"], resumes["branch"]
-            session_id, attempt = resumes["session_id"], len(starts) or 1
+            session_id = str(uuid.uuid4()) if fresh else resumes["session_id"]
+            attempt = len(starts) or 1
         else:
             branch = branch_name(kind, ticket, node.get("title"))
             if not store.BRANCH_RE.match(branch):
@@ -1191,8 +1246,9 @@ class Runner(object):
             _write_text(os.path.join(rdir, "rules.md"),
                         build_rules(kind, ticket, instructions[:INSTRUCTIONS_MAX]))
             _write_text(os.path.join(rdir, "prompt.txt"),
-                        build_prompt(kind, ticket, run_id, node=node, text=text))
-            argv = build_argv(cfg, kind, workspace, rdir, session_id, resumes is not None, pin["budget"])
+                        build_prompt(kind, ticket, run_id, node=node, text=text, fresh=fresh))
+            argv = build_argv(cfg, kind, workspace, rdir, session_id,
+                              resumes is not None and not fresh, pin["budget"])
             store.write_json(os.path.join(rdir, "launch.json"), {"argv": argv, "cwd": workspace})
         except OSError as exc:
             remove_pin(ppath, run_id)
@@ -1203,7 +1259,8 @@ class Runner(object):
                    kind=kind, project=project_key, ticket=ticket,
                    resumes=resumes["run"] if resumes else None, started_for=started_for,
                    approved_by=ok["by"], approved_at=ok["at"],
-                   how="resumed-run" if resumes else ok["how"], session_id=session_id,
+                   how="fresh-session" if fresh else "resumed-run" if resumes else ok["how"],
+                   session_id=session_id, gone_session=resumes["session_id"] if fresh else None,
                    workspace=workspace, branch=branch, pin=ppath, state=store.RUNNING,
                    started_at=iso(now))
         store.write_run(self.store_dir(), rec)
@@ -1356,7 +1413,18 @@ with open(os.path.join(HERE, "calls.jsonl"), "a") as fh:
                          "pid": os.getpid(), "tmpdir": os.environ.get("TMPDIR"),
                          "tmp_ready": os.path.isdir(os.environ.get("TMPDIR") or "/nonexistent"),
                          "pin_seen": os.path.exists(os.path.join(%(pins)r, key + ".json"))}) + "\n")
+known = os.path.join(HERE, "sessions", sid)  # the conversations it has, as the program keeps its own
+if "--resume" in argv and not os.path.exists(known):
+    sys.stderr.write("No conversation found with session ID: %%s\n" %% sid)
+    sys.exit(1)
+os.makedirs(os.path.dirname(known), exist_ok=True)
+open(known, "a").close()
 m = re.search(r"STANDIN:([a-z]+)(?:=([0-9]+))?", prompt)
+if m and m.group(1) == "gonejson":  # says it has no such conversation, as an error result
+    print(json.dumps({"type": "result", "subtype": "error_during_execution", "is_error": True,
+                      "result": "No conversation found with session ID: %%s" %% sid, "num_turns": 0,
+                      "session_id": sid, "total_cost_usd": 0}))
+    sys.exit(1)
 mode, n = (m.group(1), int(m.group(2) or 0)) if m else ("quick", 0)
 if "was interrupted before it ended" in prompt:
     mode, n = "sleep", 30           # the runner's own resume: it runs until the selftest ends it
@@ -1532,6 +1600,9 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
     ticket("ENG-13", "Criteria come later", [move("owner-1", "st-ready")])
     nodes["ENG-13"]["description"] = "Context only, no sections yet."
     ticket("ENG-14", "A pin is in the way", [move("owner-1", "st-ready")])
+    ticket("ENG-31", "Its session is lost", [move("owner-1", "st-ready")])
+    ticket("ENG-32", "Its session is lost for good", [move("owner-1", "st-ready")])
+    ticket("ENG-33", "Its resume fails another way", [move("owner-1", "st-ready")])
     ticket("ENG-17", "Grow without bound STANDIN:grow", [move("owner-1", "st-ready")])
     ticket("ENG-18", "Starts when there is room", [move("owner-1", "st-ready")])
 
@@ -1757,6 +1828,61 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                second["argv"][second["argv"].index("--resume") + 1], rec["session_id"])
         expect("the resume's text reached it fenced, and could not close its fence",
                second["prompt"].count("</untrusted-request-data>"), 1)
+
+        # ---- a resume whose session is gone starts afresh, once (KIT-764) -------- #
+        def ended_code_run(ident):
+            store.ask(sdir, "queue", "start", "code", "app", ident)
+            runner.pass_once()
+            r = [x for x in runner.runs() if x["ticket"] == ident and x["kind"] == "code"][0]
+            _wait(lambda: runner.pass_once() and store.read_run(sdir, r["run"])["state"] == "ended", 15)
+            return store.read_run(sdir, r["run"])
+
+        def resume_until_settled(ident, run, text):
+            """Ask the fix driver's resume, then pass until it and anything it led to has ended."""
+            rq = store.ask(sdir, "fix-driver", "resume", "fix", "app", ident, run=run, text=text)
+            _wait(lambda: runner.pass_once() is not None and store.answer(sdir, rq) is not None and
+                  not [x for x in runner.runs() if x["ticket"] == ident and x["state"] in store.LIVE] and
+                  not [x for x in runner.runs() if x["ticket"] == ident and x["auto_resume"] == "pending"],
+                  20)
+            return store.read_run(sdir, store.answer(sdir, rq)["run"])
+
+        lost = ended_code_run("ENG-31")
+        os.unlink(os.path.join(bindir, "sessions", lost["session_id"]))   # the program lost it
+        tried = resume_until_settled("ENG-31", lost["run"], "Fix finding A STANDIN:quick")
+        expect("a resume whose session the program no longer has ends with that reason, in its words",
+               (tried["state"], tried["reason"], tried["why"], tried["session_id"], tried["auto_resume"]),
+               ("ended", "session-gone", "the session it resumed is gone: the program no longer has "
+                "its conversation", lost["session_id"], "started"))
+        anew = store.read_run(sdir, tried["resumed_by"])
+        expect("…and is started afresh once, in the same workspace, and its record says so",
+               (anew["started_for"], anew["how"], anew["caller"], anew["request"], anew["resumes"],
+                anew["gone_session"], anew["workspace"], anew["branch"], anew["kind"], anew["state"],
+                anew["session_id"] in (lost["session_id"], None)),
+               ("session-gone", "fresh-session", "runner", None, tried["run"], lost["session_id"],
+                lost["workspace"], lost["branch"], "fix", "ended", False))
+        fresh_call = [c for c in _calls(calls) if c.get("argv") and anew["session_id"] in c["argv"]][0]
+        expect("…as a new session, never a resume of the lost one",
+               (fresh_call["argv"][fresh_call["argv"].index("--session-id") + 1], "--resume" in fresh_call["argv"]),
+               (anew["session_id"], False))
+        expect("…told so first, then given the ticket and the same request's text, each fenced",
+               (fresh_call["prompt"].index(FRESH_TEXT) < fresh_call["prompt"].index("<untrusted-ticket-data>")
+                < fresh_call["prompt"].index("<untrusted-request-data>"),
+                "Its session is lost" in fresh_call["prompt"], "Fix finding A" in fresh_call["prompt"]),
+               (True, True, True))
+        gone = ended_code_run("ENG-32")
+        tried = resume_until_settled("ENG-32", gone["run"], "Fix finding B STANDIN:gonejson")
+        anew = store.read_run(sdir, tried["resumed_by"]) if tried["resumed_by"] else {}
+        expect("the program's error result saying so counts too, and a fresh start that hears it "
+               "again is never started afresh again",
+               (tried["reason"], tried["auto_resume"], anew.get("how"), anew.get("reason"),
+                anew.get("auto_resume"), len([x for x in runner.runs() if x["ticket"] == "ENG-32"])),
+               ("session-gone", "started", "fresh-session", "ended", None, 3))
+        other = ended_code_run("ENG-33")
+        tried = resume_until_settled("ENG-33", other["run"], "Fix finding C STANDIN:fail")
+        expect("a resume that fails any other way ends with its own reason, and is not started afresh",
+               (tried["reason"], tried["why"], tried["auto_resume"], tried["resumed_by"],
+                len([x for x in runner.runs() if x["ticket"] == "ENG-33"])),
+               ("ended", "the program reported an error (error_during_execution)", None, None, 2))
 
         # ---- a stop -------------------------------------------------------- #
         store.ask(sdir, "queue", "start", "code", "app", "ENG-2")
