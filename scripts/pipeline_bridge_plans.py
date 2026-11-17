@@ -2640,6 +2640,17 @@ class PlansMixin(object):
             return self.queue_failed("the tracker could not be read (%s)" % result["why"])
         if self.state.pop("queue_room", None) is not None:
             self.say("  queue: room again: starts resume")
+        # KIT-695: a runaway stop holds every start, so it reaches the owner the way a short
+        # machine does: the pass ends loud while it stands (the heartbeat monitor pages once
+        # per incident, not once per pass, and says so when it clears), and the log says when
+        # it lifts. The words are the starter's: codes, ids and numbers only.
+        stops = starter.stop_words(result.get("decision"))
+        if stops:
+            self.state["queue_stops"] = ",".join(stops)
+            self.queue_failed("a runaway stop holds every start (%s)"
+                              % self.clean("; ".join(stops))[:300])
+        elif self.state.pop("queue_stops", None) is not None:
+            self.say("  queue: the runaway stop is lifted: starts resume")
         stopped = self.resume_stopped(cfg, ledger, agent_id, why)
         if stopped is None:
             return
@@ -4609,6 +4620,25 @@ def cases_approve(kit):
             def room_record(c_):
                 path = os.path.join(c_["state_dir"], ROOM_FILE)
                 return json.load(open(path)) if os.path.exists(path) else None
+
+            # KIT-695: a runaway stop holds every start and ends the pass loud while it stands, so
+            # the heartbeat monitor pages it once; the pass after it lifts is clean.
+            def stopped(*stops):
+                return {"state": "decided", "why": None, "window": {}, "inputs": None,
+                        "decision": {"start": [], "held": [], "stops": list(stops)}}
+            day_stop = {"stop": "day-hard-stop", "ref": None, "value": 61.5, "limit": 60}
+            c, s, t, out, ledger = queued("q-stop", stopped(day_stop))
+            check("a-runaway-stop-ends-the-pass-loud-and-names-the-stop",
+                  (out[0] != EXIT_OK, "a runaway stop holds every start (day-hard-stop (61.5 "
+                   "against 60))" in out[1], delegated(t)), (True, True, []))
+            answer["v"] = stopped(day_stop)
+            again = run(c, s, t, at=now + 2000)
+            check("…and stays loud while it stands, so the page is not cleared early",
+                  (again[0] != EXIT_OK, "day-hard-stop" in again[1]), (True, True))
+            answer["v"] = decided()
+            lifted = run(c, s, t, at=now + 3000)
+            check("…and the first pass after it lifts is clean and says so",
+                  (lifted[0], "the runaway stop is lifted" in lifted[1]), (EXIT_OK, True))
 
             def room_story2(name):
                 c_, s_, t_, out_, ledger_ = queued(name, short("disk"))
