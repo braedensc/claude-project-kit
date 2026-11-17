@@ -119,6 +119,14 @@ CAN_DO = {
     "shape-system-tag": "Read that text. The pipeline ignored it.",
     "shape-secret-ask": "Read that text. The pipeline ignored it.",
     "shape-hidden-char": "Read that text. It holds characters a reader cannot see.",
+    "merge-without-approval": "A pull request merged with no approval from the validator, and not by you. "
+                              "Look at who merged it. Nothing new starts until you clear the hold.",
+    "approval-without-merge": "The validator approved that pull request a day ago and it has not merged. "
+                              "Look at its checks and its auto-merge.",
+    "approval-rate": "The validator approved more than your daily limit. Look at what it approved. "
+                     "Nothing new starts until you clear the hold.",
+    "urgent-escalation": "The validator believes a dev session may be compromised. Look at that change "
+                         "before anything else.",
 }
 CLEAR_HOLD = "To let new starts begin again, clear the hold in your terminal: scripts/pipeline_hold.py clear."
 

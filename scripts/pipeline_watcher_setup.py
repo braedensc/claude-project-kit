@@ -66,7 +66,8 @@ MANIFEST_SCHEMA = "pipeline-watcher-manifest/1"
 RULES_NAME, MANIFEST_NAME, COPIER_RULES_NAME = "etc/watcher.json", "manifest.json", "etc/copier.json"
 # The files the watcher runs from: its import closure, derived by the selftest with `ast`, and its schema.
 WATCHER_FILES = ("scripts/pipeline_watcher_local.py", "scripts/pipeline_watcher_tracker.py",
-                 "scripts/pipeline_hold.py", "scripts/check_schemas.py", "scripts/jsonschema_mini.py",
+                 "scripts/pipeline_hold.py", "scripts/pipeline_validator_ledger.py",
+                 "scripts/check_schemas.py", "scripts/jsonschema_mini.py",
                  "schemas/pipeline-watcher.schema.json")
 COPIER_FILES = ("scripts/pipeline_watcher_copy.py",)       # the root copier: stdlib only, run with -I
 INSTALLED_FILES = WATCHER_FILES + COPIER_FILES
@@ -83,6 +84,8 @@ CONF_DEFAULTS = {
     "PYTHON": "/usr/bin/python3", "GITHUB_TOKEN_ENV": "WATCHER_GITHUB_TOKEN", "INTERVAL_SECONDS": "900",
     "LINEAR_KEY_ENV": "", "TRACKER_TEAMS": "", "TRACKER_TRUSTED_USERS": "", "USAGE_FILE": "",
     "LIMIT_DAY_USD": "", "LIMIT_PIECE_USD": "", "LIMIT_DAY_RUNS": "", "LIMIT_PIECE_RUNS": "",
+    # KIT-546: the validator's ledger, the owner's own GitHub logins, and the day's approvals limit.
+    "VALIDATOR_LEDGER": "", "OWNER_LOGINS": "", "LIMIT_DAY_APPROVALS": "",
 }
 CONF_KEYS = set(CONF_REQUIRED) | set(CONF_DEFAULTS)
 ACCOUNT_RE = re.compile(r"^_?[a-z][a-z0-9_-]{1,30}\Z")
@@ -91,6 +94,7 @@ ENV_RE = re.compile(r"^[A-Z][A-Z0-9_]*\Z")
 PATH_LIMIT = 1000      # the system allows 1024 characters in a path; the character set is what keeps a value safe, not a short limit
 PATH_RE = re.compile(r"^/[A-Za-z0-9_./-]{1,%d}\Z" % PATH_LIMIT)
 REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+\Z")
+LOGIN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,38}\Z")
 CRED_RE = re.compile(r"(ghp_|gho_|ghs_|github_pat_|lin_api_|xox[bpas]-|sk-ant-|-----BEGIN)")
 
 
@@ -186,6 +190,12 @@ def validate_conf(values, user=None):
     for k in ("LIMIT_DAY_USD", "LIMIT_PIECE_USD", "LIMIT_DAY_RUNS", "LIMIT_PIECE_RUNS"):
         v = c.get(k, "")
         need(v == "" or re.match(r"^[0-9]+(\.[0-9]+)?\Z", v) and float(v) > 0, "%s must be a positive number, or empty" % k)
+    need(c.get("VALIDATOR_LEDGER", "") == "" or PATH_RE.match(c.get("VALIDATOR_LEDGER", "")),
+         "VALIDATOR_LEDGER must be the validator ledger's absolute path, or empty")
+    need(all(LOGIN_RE.match(x) for x in split_list(c.get("OWNER_LOGINS"))),
+         "OWNER_LOGINS must list GitHub logins, or be empty")
+    v = c.get("LIMIT_DAY_APPROVALS", "")
+    need(v == "" or (v.isdigit() and int(v) > 0), "LIMIT_DAY_APPROVALS must be a whole number above 0, or empty")
     return c, e
 
 
@@ -238,8 +248,15 @@ def compose_rules(c, watcher):
                       ("LIMIT_DAY_RUNS", "day_runs"), ("LIMIT_PIECE_RUNS", "piece_runs")):
         if c[key]:
             limits[name] = int(c[key]) if name.endswith("runs") else float(c[key])
+    if c["LIMIT_DAY_APPROVALS"]:
+        limits["day_approvals"] = int(c["LIMIT_DAY_APPROVALS"])
     if limits:
         doc["limits"] = limits
+    if c["VALIDATOR_LEDGER"]:
+        # KIT-546: approval-rate, every merge against the validator's ledger, which this account reads.
+        doc["validator_ledger"] = c["VALIDATOR_LEDGER"]
+    if split_list(c["OWNER_LOGINS"]):
+        doc["owner_logins"] = split_list(c["OWNER_LOGINS"])
     if c["LINEAR_KEY_ENV"]:
         doc.update(linear_key_env=c["LINEAR_KEY_ENV"], tracker_teams=split_list(c["TRACKER_TEAMS"]),
                    tracker_trusted_users=split_list(c["TRACKER_TRUSTED_USERS"]))
@@ -857,6 +874,14 @@ LIMIT_DAY_USD=
 LIMIT_PIECE_USD=
 LIMIT_DAY_RUNS=
 LIMIT_PIECE_RUNS=
+
+# Optional: the validator's ledger (docs/WATCHER.md, approval-rate).  With it, every merge into a watched
+# repository is checked against the validator's approvals.  This account must be able to read the file.
+# OWNER_LOGINS: your own GitHub logins, comma-separated: your own merges need no approval.  Leave yours out,
+# and each of your merges holds new starts.  LIMIT_DAY_APPROVALS: the most approvals in 24 hours, a runaway's.
+VALIDATOR_LEDGER=
+OWNER_LOGINS=
+LIMIT_DAY_APPROVALS=
 """
 
 
@@ -1113,9 +1138,27 @@ def selftest():
                 ("a half tracker", {"LINEAR_KEY_ENV": "WATCHER_LINEAR_KEY"}, "go together"),
                 ("a bad limit", {"LIMIT_DAY_USD": "-3"}, "LIMIT_DAY_USD"),
                 ("a path that climbs", {"INSTALL_DIR": "/opt/../etc"}, "INSTALL_DIR"),
-                ("no repos", {"WATCH_REPOS": ""}, "WATCH_REPOS")):
+                ("no repos", {"WATCH_REPOS": ""}, "WATCH_REPOS"),
+                ("a ledger path that is not absolute", {"VALIDATOR_LEDGER": "ledger.json"},
+                 "VALIDATOR_LEDGER"),
+                ("an owner login that is not one", {"OWNER_LOGINS": "not a login"}, "OWNER_LOGINS"),
+                ("a day's approvals that is not whole", {"LIMIT_DAY_APPROVALS": "2.5"},
+                 "LIMIT_DAY_APPROVALS")):
             _c, e = validate_conf(dict(values, KIT_CHECKOUT=REPO, **over), "alice")
             check("conf: %s is refused, by key" % label, any(needle in x for x in e), True)
+        import pipeline_watcher_local as _watcher_mod
+        c_v, e_v = validate_conf(dict(values, KIT_CHECKOUT=REPO, VALIDATOR_LEDGER="/Users/Shared/v/ledger.json",
+                                      OWNER_LOGINS="the-owner", LIMIT_DAY_APPROVALS="20"), "alice")
+        rules_v = json.loads(compose_rules(c_v, _watcher_mod).decode("utf-8")) if not e_v else {}
+        check("KIT-546: the validator's ledger, the owner's logins and the day's approvals reach the rules, "
+              "and the watcher's own loader takes them",
+              (e_v, rules_v.get("validator_ledger"), rules_v.get("owner_logins"),
+               (rules_v.get("limits") or {}).get("day_approvals"),
+               _watcher_mod.which_on(_watcher_mod.validate_config(rules_v))["approval-rate"] if rules_v else "x"),
+              ([], "/Users/Shared/v/ledger.json", ["the-owner"], 20, None))
+        c_n, _e = validate_conf(dict(values, KIT_CHECKOUT=REPO), "alice")
+        check("...and with none of them, approval-rate stays off", "validator_ledger" in json.loads(
+            compose_rules(c_n, _watcher_mod).decode("utf-8")), False)
         with open(os.path.join(REPO, "watcher.conf.example"), encoding="utf-8") as fh:
             example_file = fh.read()
         check("the shipped watcher.conf.example is the one the code prints, and names every key but the checkout (it defaults)",

@@ -125,8 +125,8 @@ are built, nothing is approved for you.
 ## 2. The ledger
 
 Every decision the validator makes is one row in its ledger: what it decided, about what, and
-why. Only the validator writes it. The stand-up, the weekly recap and the watcher will read it,
-and the watcher will check every merge against it. Nothing writes rows yet: the pieces that
+why. Only the validator writes it. The stand-up and the weekly recap will read it. The watcher
+checks every merge against it (`docs/WATCHER.md`, the `approval-rate` monitor). Nothing writes rows yet: the pieces that
 decide come next. The format is contract §24; the code is `scripts/pipeline_validator_ledger.py`.
 
 | A row says | For example |

@@ -20,10 +20,42 @@ its job are KIT-517. The way it pauses the system is KIT-515, and its urgent pag
 | `injection` | Shapes that try to steer an AI reading the text: closing the kit's fence, "ignore the previous instructions", a system-role tag, a request to print a secret, and characters a reader can't see. | GitHub's comments and pull requests |
 
 | `tracker-text` | The same shapes in ticket and comment text, and a pipeline marker on a comment's first line from an author who is not trusted. The tracker's newest 100 tickets and 100 comments. | The tracker, by one fixed read-only query |
+| `approval-rate` | Every merge against the validator's approvals: a merge with no approval that you did not make, an approval still unmerged a day later, too many approvals in a day, and the validator's urgent escalations. | GitHub's merges and the validator's ledger |
 
-Four more are listed as `off`, each with its reason, until something writes their signal: guard blocks,
-egress refusals, work outside a ticket's files, and the validator's approval rate (KIT-518). The file
-always says how many monitors are on.
+Three more are listed as `off`, each with its reason, until something writes their signal: guard blocks,
+egress refusals, and work outside a ticket's files (KIT-518). The file always says how many monitors
+are on.
+
+### The validator's monitor: `approval-rate`
+
+The validator approves merges in your place (`docs/VALIDATOR-OPERATOR.md`). This monitor checks every
+merge against its record, so a merge the validator did not make is noticed (KIT-546). It reads the
+validator's ledger through the ledger's own reader, and GitHub's merges with its own read-only token.
+
+| It finds | Level | What it means |
+|---|---|---|
+| `merge-without-approval` | `pause` | A pull request merged into a watched repository's default branch with no `approved` row for its head, and not by you. New starts are held. |
+| `approval-rate` | `pause` | More approvals in 24 hours than your `day_approvals`. New starts are held. |
+| `approval-without-merge` | `page` | The validator approved a pull request a day ago, and it is still open, with nothing newer about it. |
+| `urgent-escalation` | `page` | The validator believes a dev session may be compromised. This is how its urgent escalation reaches you. |
+
+**Who merged it** comes from GitHub's own record of the merge, never from the pull request. Your own
+merges need no approval: list your GitHub logins in `owner_logins`. A merge whose merger GitHub will not
+say is still a `pause`, and the gap is said.
+
+**It is off until your rules name the ledger.** It needs `validator_ledger` and `repos`. With either
+missing it is `off`, with the reason, and it reads nothing. The watcher's account must be able to read
+the ledger: the validator's install puts it where it can.
+
+**A ledger or a merge list it cannot read is `blind`, never `clear`.** So is a ledger a session could
+have written: one in a git working tree, a link, or writable by group or other. An absent ledger is
+an empty one: nothing approved, so every merge that is not yours is a finding.
+
+Good: `clear`, with `read 12 ledger row(s) and 3 merge(s) ... 2 approved, 1 the owner's, 0 without an
+approval`. Not that: `clear` while the ledger could not be read. That is `blind`, with the reason.
+
+Good: your login in `owner_logins`, and your own hand merge passes. Not that: leaving it out. Then each
+merge you make by hand holds new starts until you clear the hold.
 
 **Where the judge's cost shows (KIT-569).** The usage file counts the watcher judge's model calls as runs of
 kind `judge`: they are in each day's and the week's `usd` and `runs`, and in `by_kind.judge`. So `spend` counts
@@ -84,7 +116,9 @@ problem at once.
 | `hold_file` | Where the hold is written when a monitor flags something at level `pause`. Empty: the watcher only reports. |
 | `usage_copy_status` | The status file of the read-only copier (KIT-573) that makes `usage_file`. With it, the usage file counts only if that status is fresh, says the copy was made and carries the copy's hash. The installer sets it when you name a `USAGE_FILE`. Empty: the usage file is read as it is. |
 | `install_manifest` | The manifest of its own installed files (KIT-517). Every pass checks them against it; a mismatch makes every monitor blind. Empty: its files are not checked. The installer sets it. |
-| `limits` | `day_usd`, `piece_usd`, `day_runs`, `piece_runs`. A monitor with none of its limits is off: the limits are the owner's decision. |
+| `limits` | `day_usd`, `piece_usd`, `day_runs`, `piece_runs`, and `day_approvals`: the validator's approvals in 24 hours, set as a runaway's limit, not a normal day's. A monitor with none of its limits is off: the limits are the owner's decision. `approval-rate` is the exception: without `day_approvals` it still checks every merge, and says the rate is not judged. |
+| `validator_ledger` | The validator's ledger, an absolute path this account can read. With `repos`, it turns `approval-rate` on. Empty: `approval-rate` is off. The installer's `VALIDATOR_LEDGER` sets it. |
+| `owner_logins` | Your own GitHub logins. A merge by one of them needs no validator approval. The installer's `OWNER_LOGINS` sets it. |
 | `trusted_actors` | GitHub logins that may apply or remove a protected label. |
 | `trusted_associations` | Author associations a marker or text is trusted from. Default: owner, member, collaborator. |
 | `github_token_env` | The name of the environment variable that holds the token, never the token. |

@@ -1956,7 +1956,7 @@
       "id": "watcher",
       "name": "An independent auditor that can pause new work",
       "internal_name": "the watcher, its copier and the hold",
-      "does": "Plain code under its own account flags spend over a limit, too many runs, or labels added by the wrong login. Its one power is to write a reason into the hold file, which pauses new starts.",
+      "does": "Plain code under its own account flags spend over a limit, too many runs, labels added by the wrong login, or a merge the validator did not approve. Its one power is to write a reason into the hold file, which pauses new starts.",
       "scope": "machine",
       "state": "built-off",
       "needs": [
