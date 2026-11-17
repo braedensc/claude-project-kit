@@ -1189,6 +1189,12 @@ def settings_path(part, files):
     return conf_path(name, files) if name.endswith((".conf", ".json")) else None
 
 
+# KIT-696: said the same way on the part's line and in the line under the list, and always as
+# "not measured", so it can never be read as a pass.
+PASSWORD_WHY = ("not measured: it needs your Mac password, which a check run without a "
+                "terminal cannot ask for; this is not a pass")
+
+
 def outcome_of_check(code, out):
     """A part's own read-only check, read the one way for every part: 0 is up to date, 10 is
     waiting on you, and anything else, a child that did not finish included, is a thing that
@@ -1199,8 +1205,7 @@ def outcome_of_check(code, out):
         return OUT_WAITING, "its check found something outstanding"
     if code == 5 or (code is not None and re.search(r"password", out or "", re.I)
                      and re.search(r"need|requir|ask|enter|type", out or "", re.I)):
-        return OUT_UNMEASURED, ("it needs your Mac password, which a check run without a "
-                                "terminal cannot ask for")
+        return OUT_UNMEASURED, (PASSWORD_WHY)
     if code is None:
         return OUT_UNMEASURED, "its check did not finish (%s)" % (out or "no reason given")[:120]
     return OUT_UNMEASURED, "its check stopped with exit %d" % code
@@ -1339,6 +1344,11 @@ def finish(io, parts, rep, files, reached, stop_code, stopped, unreadable=None):
         io.say("")
         io.say("%d part(s) could not be measured and %d were not reached, so this run is not "
                "a pass (exit %d)." % (counts[OUT_UNMEASURED], counts[OUT_NOT_REACHED], code))
+    no_password = [r["name"] for r in records
+                   if r["outcome"] == OUT_UNMEASURED and r["detail"] == PASSWORD_WHY]
+    if no_password:
+        io.say("Not measured, and so not a pass: %s. Each needs your Mac password to be "
+               "checked, and this run's checks cannot ask for it." % "; ".join(no_password))
     mine, signs, lone = short_list(parts, records, texts)
     io.say("")
     if not (mine or signs or lone):
@@ -2557,7 +2567,11 @@ def selftest():
         main(base, io=io)
         check("lines-password-%s-detail" % name,
               [r["detail"] for r in io.records if r["id"] == "paging"],
-              ["it needs your Mac password, which a check run without a terminal cannot ask for"])
+              [PASSWORD_WHY])
+        check("lines-password-%s-says-not-measured-and-not-a-pass" % name,
+              (PASSWORD_WHY.startswith("not measured: "), PASSWORD_WHY.endswith("not a pass"),
+               any(ln.startswith("Not measured, and so not a pass: ") and "Mac password" in ln
+                   for ln in io.lines)), (True, True, True))
     code, io = go(argv=["--no-pull"])
     check("lines-own-no-pull-is-unmeasured",
           ([(r["outcome"], r["detail"]) for r in io.records if r["id"] == "one-command"], code),
