@@ -116,6 +116,14 @@ jobs:
           python3 -m pip install --quiet pyyaml
           python3 scripts/check_agent_trigger_author.py --selftest
           python3 scripts/check_agent_trigger_author.py
+      # KIT-668. The label gate runs the default branch's workflow and code, never the PR's.
+      - name: Label gate check (the gate runs from the default branch)
+        run: |
+          python3 -m pip install --quiet pyyaml
+          python3 scripts/check_label_gate.py --selftest
+          python3 scripts/check_label_gate.py
+      - name: Label gate policy selftest (the owner's allow for pull_request_target)
+        run: python3 scripts/pipeline_gate_policy.py --selftest
 
       # KIT-652. The kit's Python imports only the standard library, bar a short named list,
       # because its jobs and hooks run on a Python with nothing added to it.
