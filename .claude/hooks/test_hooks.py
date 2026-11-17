@@ -3626,6 +3626,39 @@ def main():
           f"nothing, once per session (KIT-214)")
     failures += 0 if ok else 1
 
+    # KIT-683: the pipeline's own credentials, from the one list the scanner's selftest
+    # checks the real secretlint rules against (scripts/secret_shapes.py). The hook refuses
+    # each sample in a Write and in an Edit, naming it, and lets each near miss through. A
+    # list that lost a shape would pass vacuously, so the shapes the ticket names must be on it.
+    from secret_shapes import SHAPES as _SHAPES
+    seq_ran += 1
+    _want = {"Linear API key", "Slack bot token", "Slack user token", "Slack app-level token",
+             "GitHub fine-grained token"}
+    ok = _want <= {_s[0] for _s in _SHAPES}
+    print(f"[{'PASS' if ok else 'FAIL'}] pipeline credentials (KIT-683): the shared list holds "
+          f"every shape the pipeline holds"
+          + ("" if ok else f"  (missing: {sorted(_want - {_s[0] for _s in _SHAPES})})"))
+    failures += 0 if ok else 1
+    for _name, _label, _rule, _sample, _near in _SHAPES:
+        for _how, _payload, _named in (
+                ("in a Write is refused, by name", write("/x/notes.md", "TOKEN=" + _sample),
+                 _label),
+                ("in an Edit is refused, by name", edit("/x/client.py", "token = '%s'" % _sample),
+                 _label),
+                ("near miss is allowed", write("/x/notes.md", "TOKEN=" + _near), None)):
+            _cn = f"pipeline credential (KIT-683): {_name} {_how}"
+            seq_ran += 1
+            _starting(_cn)
+            _r = run_hook_proc(_payload)
+            if _named:
+                ok = (_r.returncode == 2 and
+                      f"Secret value pattern detected in file content ({_named}" in _r.stderr)
+            else:
+                ok = _r.returncode == 0
+            print(f"[{'PASS' if ok else 'FAIL'}] {_cn}"
+                  + ("" if ok else f"  (exit {_r.returncode}: {_r.stderr[-200:]!r})"))
+            failures += 0 if ok else 1
+
     # KIT-214: session-start.py (advisory; self-protected since KIT-463) describes the session's
     # own worktree, and WARNS THE PERSON (systemMessage) when the guards are about to
     # judge the session as a different checkout than the one it started in. The
