@@ -533,8 +533,13 @@ def ask_name(conf_path, values, reader=None, tty=None, err=None):
     try:
         write_conf_name(conf_path, name)
     except NameWriteError as exc:
-        err.write("Could not write the name into %s: %s. Nothing was written.\n"
-                  % (conf_path, exc.detail or exc.kind))
+        if exc.kind in ("readback", "mismatch"):    # the file was swapped in: it was written
+            err.write("The name was written to %s but %s. Check it by hand.\n"
+                      % (conf_path, "reads back differently" if exc.kind == "mismatch"
+                         else "could not be read back (%s)" % exc.detail))
+        else:
+            err.write("Could not write the name into %s: %s. Nothing was written.\n"
+                      % (conf_path, exc.detail or exc.kind))
         return EX_FAILED, values
     err.write("Saved: your tech lead is called %r (APP_NAME in %s). To rename it later, change "
               "that line and paste the manifest again.\n" % (name, conf_path))
@@ -3863,6 +3868,34 @@ def selftest():
                 check("kit747-name-writer-keeps-every-other-byte-" + klabel, got, expected)
                 check("kit747-set-conf-line-keeps-every-other-byte-" + klabel,
                       set_conf_line(before, "APP_NAME", "Rex"), expected)
+        # The file was swapped in before a read-back or a mismatch is found, so those two say
+        # "written", not "nothing was written"; a failed swap says nothing was written.
+        with tempfile.TemporaryDirectory() as mtmp:
+            mpath = os.path.join(mtmp, "bridge.conf")
+            with open(mpath, "w", encoding="utf-8") as fh:
+                fh.write(bare)
+            said = {}
+            real_write = globals()["write_conf_name"]
+            try:
+                for kind in ("mismatch", "readback", "write"):
+                    def boom(path, name, guard=None, _k=kind):
+                        raise NameWriteError(_k, "OSError" if _k != "mismatch" else "")
+                    globals()["write_conf_name"] = boom
+                    m_err = io.StringIO()
+                    m_rc = ask_name(mpath, {}, reader=lambda _q: "Rex", tty=True, err=m_err)[0]
+                    said[kind] = (m_rc, m_err.getvalue())
+            finally:
+                globals()["write_conf_name"] = real_write
+        check("kit747-a-name-found-wrong-after-the-swap-says-it-was-written",
+              (said["mismatch"][0], "was written to" in said["mismatch"][1],
+               "reads back differently" in said["mismatch"][1],
+               "Nothing was written" in said["mismatch"][1]), (EX_FAILED, True, True, False))
+        check("kit747-a-name-that-cannot-be-read-back-says-it-was-written",
+              ("was written to" in said["readback"][1], "Nothing was written" in said["readback"][1]),
+              (True, False))
+        check("kit747-a-swap-that-fails-says-nothing-was-written",
+              ("Nothing was written" in said["write"][1], "was written to" in said["write"][1]),
+              (True, False))
         check("name-saved-line-says-the-name-and-how-to-rename",
               (r_asked[4].startswith("Saved: your tech lead is called 'babyclaw' (APP_NAME in "),
                "change that line and paste the manifest again" in r_asked[4]), (True, True))

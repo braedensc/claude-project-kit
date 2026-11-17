@@ -872,15 +872,33 @@ def run_cases(check):
     # C. WRITING (point 3): written, then read back; a failure names the file and leaves the old one.
     #    The name goes in by a writer of its own: only the active APP_NAME line changes, byte for byte.
     def named(text):
-        return bs.set_conf_line(text, "APP_NAME", "Rex")
-    for label_, text in (("no-name-line", "# c\nACT=no\n"),
-                         ("an-empty-name-line", "# c\nAPP_NAME=\nACT=no\n"),
-                         ("an-indented-empty-name-line", "ACT=no\n  APP_NAME = \nINTERVAL_SECONDS=60\n"),
-                         ("empty-quotes", 'ACT=no\nAPP_NAME=""\nINTERVAL_SECONDS=60\n'),
-                         ("a-commented-example-only", "#APP_NAME=Tech lead\nACT=no\n"),
-                         ("an-export-line-is-not-active", "export APP_NAME=\nACT=no\n")):
-        check("kit735-on-an-ordinary-file-the-two-writers-agree:%s" % label_,
-              named(text), bs.set_conf_line(text, "APP_NAME", "Rex"))
+        """The file the one writer leaves: `text` written to a real file, the name set through
+        write_conf_name (the path the one command takes), and the bytes read back."""
+        path = os.path.join(tmp, "named.conf")
+        with open(path, "wb") as fh:
+            fh.write(text.encode("utf-8"))
+        try:
+            bs.write_conf_name(path, "Rex")
+        except bs.NameWriteError as exc:
+            if exc.kind not in ("readback", "mismatch"):    # swapped in, but not a valid conf
+                return "failed: %s" % exc.kind              # (a case that is not): read it as it is
+        with open(path, "rb") as fh:
+            back = fh.read().decode("utf-8")
+        os.remove(path)
+        return back
+    for label_, text, want in (
+            ("no-name-line", "# c\nACT=no\n", "# c\nACT=no\nAPP_NAME=Rex\n"),
+            ("an-empty-name-line", "# c\nAPP_NAME=\nACT=no\n", "# c\nAPP_NAME=Rex\nACT=no\n"),
+            ("an-indented-empty-name-line", "ACT=no\n  APP_NAME = \nINTERVAL_SECONDS=60\n",
+             "ACT=no\nAPP_NAME=Rex\nINTERVAL_SECONDS=60\n"),
+            ("empty-quotes", 'ACT=no\nAPP_NAME=""\nINTERVAL_SECONDS=60\n',
+             "ACT=no\nAPP_NAME=Rex\nINTERVAL_SECONDS=60\n"),
+            ("a-commented-example-only", "#APP_NAME=Tech lead\nACT=no\n",
+             "#APP_NAME=Tech lead\nACT=no\nAPP_NAME=Rex\n"),
+            ("an-export-line-is-not-active", "export APP_NAME=\nACT=no\n",
+             "export APP_NAME=\nACT=no\nAPP_NAME=Rex\n")):
+        check("kit735-on-an-ordinary-file-the-name-goes-in-as-expected:%s" % label_,
+              named(text), want)
     check("kit735-a-crlf-file-keeps-its-endings-when-the-line-is-added",
           named("# c\r\nACT=no\r\n"), "# c\r\nACT=no\r\nAPP_NAME=Rex\r\n")
     check("kit735-a-crlf-file-has-its-active-line-replaced-in-place-with-its-own-ending",
@@ -932,7 +950,8 @@ def run_cases(check):
     check("kit735-after-the-write-a-second-run-asks-nothing", list(ask()), [])
     # an APP_NAME line that is empty is set in place
     put_bridge("APP_NAME=\nDM_USER_IDS=\n")
-    expected = bs.set_conf_line(get(bridge_conf).decode(), "APP_NAME", "Rex").encode()
+    expected = (b"# the tech lead\nACT=no\nINTERVAL_SECONDS=60\nAPP_NAME=Rex\nDM_USER_IDS=\n"
+                b"# end of file\n")
     check("kit735-an-empty-name-line-is-set-in-place",
           (write_answers(pi.FakeIo(), [name], kit), get(bridge_conf)), (None, expected))
     check("kit735-nothing-to-write-is-nothing-written", write_answers(pi.FakeIo(), [], kit), None)
