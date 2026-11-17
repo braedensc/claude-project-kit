@@ -116,6 +116,8 @@
     "test:runner-pin": "python3 scripts/check_runner_pin.py --selftest && python3 scripts/check_runner_pin.py",
     "test:stdlib-only": "python3 scripts/check_stdlib_only.py --selftest",
     "lint:stdlib-only": "python3 scripts/check_stdlib_only.py",
+    "test:ci-covers": "python3 scripts/check_ci_covers_tests.py --selftest",
+    "lint:ci-covers": "python3 scripts/check_ci_covers_tests.py",
     "test:alert-pages": "python3 scripts/check_alert_pages.py",
     "test:secret-scan": "python3 scripts/check_secret_scan.py --selftest",
     "lint:secrets": "python3 scripts/check_secret_scan.py --scan",
