@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """The direct checks: scripts Kit checks runs over the real tree, not as a selftest (KIT-659).
 
-    python3 scripts/direct_checks.py --run        # run every direct check, report each, exit 1 on any failure
-    python3 scripts/direct_checks.py --json-yaml  # parse every tracked JSON and YAML file
-    python3 scripts/direct_checks.py --verify     # the list below and ci.yml's Kit checks agree
-    python3 scripts/direct_checks.py --selftest   # the battery CI runs
+    python3 scripts/check_direct_checks.py --run        # run every direct check, report each, exit 1 on any failure
+    python3 scripts/check_direct_checks.py --json-yaml  # parse every tracked JSON and YAML file
+    python3 scripts/check_direct_checks.py --verify     # the list below and ci.yml's Kit checks agree
+    python3 scripts/check_direct_checks.py --selftest   # the battery CI runs
 
 WHY. The CI job on Python 3.9 (the Mac's own) used to run only the `test:*` batteries. Kit checks
 also runs several scripts directly over the real tree, and those paths never ran on 3.9.
@@ -88,7 +88,10 @@ def differences(ci_text, direct=DIRECT, excluded=EXCLUDED):
 
 def json_yaml(root=ROOT):
     """(bad, count): the tracked JSON and YAML files that do not parse."""
-    import yaml
+    try:
+        import yaml
+    except ImportError:                  # the CI jobs install PyYAML; without it this is could-not-check
+        return None, 0
     out = subprocess.run(["git", "-C", root, "ls-files", "*.json", "*.yml", "*.yaml"],
                          capture_output=True, text=True)
     if out.returncode:
@@ -109,7 +112,7 @@ def json_yaml(root=ROOT):
 def cmd_json_yaml():
     bad, n = json_yaml()
     if bad is None:
-        print("COULD NOT CHECK: git ls-files failed", file=sys.stderr)
+        print("COULD NOT CHECK: git ls-files failed, or PyYAML is not installed", file=sys.stderr)
         return 2
     print("\n".join(bad) if bad else "all %d tracked JSON/YAML files parse OK" % n)
     return 1 if bad else 0

@@ -128,15 +128,15 @@ jobs:
       - name: Validate all tracked JSON/YAML
         run: |
           python3 -m pip install --quiet pyyaml
-          python3 scripts/direct_checks.py --json-yaml
+          python3 scripts/check_direct_checks.py --json-yaml
 
       # KIT-659. The Python 3.9 job runs the direct checks above (the ones run bare, not as a
-      # selftest) from the list in scripts/direct_checks.py. This fails when that list and the
+      # selftest) from the list in scripts/check_direct_checks.py. This fails when that list and the
       # direct steps in this job differ, so a new direct check cannot reach one job and miss the other.
       - name: Direct-check list matches this job's direct steps
         run: |
-          python3 scripts/direct_checks.py --selftest
-          python3 scripts/direct_checks.py --verify
+          python3 scripts/check_direct_checks.py --selftest
+          python3 scripts/check_direct_checks.py --verify
 
       # Parsing proves a workflow is well-formed, not that it can START. A job
       # doing `uses: ./…` whose permissions are narrower than the callee declares

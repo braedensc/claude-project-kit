@@ -32,6 +32,7 @@ ROOT = os.path.dirname(HERE)
 # (file, module, reason). Every outside import the kit makes today, and why.
 ALLOWED = (
     ("scripts/check_alert_pages.py", "yaml", "parses the alert workflow templates as YAML; CI installs PyYAML"),
+    ("scripts/check_direct_checks.py", "yaml", "parses the tracked YAML for --json-yaml; CI installs PyYAML, and an ImportError is reported as could-not-check"),
     ("scripts/check_runner_pin.py", "yaml", "parses workflows as YAML, not by pattern; says COULD NOT CHECK without it"),
     ("scripts/check_workflow_calls.py", "yaml", "parses workflows as YAML; CI installs PyYAML"),
     ("scripts/check_agent_trigger_author.py", "yaml", "parses workflows as YAML; CI installs PyYAML"),

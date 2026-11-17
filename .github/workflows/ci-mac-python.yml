@@ -68,11 +68,11 @@ jobs:
 
       # KIT-659. The scripts Kit checks runs bare over the real tree (runner pin, workflow calls,
       # schemas, placeholders, delivery config and the others) and the JSON and YAML parse. The
-      # list is scripts/direct_checks.py; Kit checks fails when its own steps and that list differ.
+      # list is scripts/check_direct_checks.py; Kit checks fails when its own steps and that list differ.
       - name: Direct checks over the real tree
         run: |
           python3 -V
-          python3 scripts/direct_checks.py --run
+          python3 scripts/check_direct_checks.py --run
 
       # Includes the hook battery (test:hooks), then every other test:* battery, one at a time.
       - name: Every selftest battery, one at a time
