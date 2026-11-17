@@ -2263,7 +2263,8 @@
       "scripts": [
         "scripts/pipeline_runner.py",
         "scripts/pipeline_runner_store.py",
-        "scripts/pipeline_runner_limits.py"
+        "scripts/pipeline_runner_limits.py",
+        "scripts/pipeline_session_tools.py"
       ],
       "installer": null,
       "check": null,
@@ -2294,6 +2295,12 @@
           "key": "linear_key_file",
           "default_name": null,
           "what": "A file of the account's own that holds the tracker key, to read each ticket and its history.",
+          "ends": "never"
+        },
+        {
+          "key": "session_tools",
+          "default_name": null,
+          "what": "A file of the account's own that holds the session writer's tracker key, which a session's own tools comment with. Never the owner's key.",
           "ends": "never"
         }
       ],

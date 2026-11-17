@@ -778,6 +778,7 @@ jobs:
           python3 scripts/pipeline_ws_client.py --selftest
           python3 scripts/pipeline_bridge_handover.py --selftest
           python3 scripts/pipeline_tech_lead_tools.py --selftest
+          python3 scripts/pipeline_session_tools.py --selftest
           python3 scripts/pipeline_tech_lead_turn.py --selftest
           python3 scripts/pipeline_sprint.py --selftest
           python3 scripts/pipeline_acceptance_poller.py --selftest

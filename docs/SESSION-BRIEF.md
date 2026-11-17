@@ -70,6 +70,17 @@ You can read and edit files in your worktree, run the project's commands, and co
 can push to your branch, open **one** pull request, comment on your ticket, and read the
 tracker.
 
+**If you have the `ticket` tools, they are your only way to the tracker.** A session the runner
+started holds no tracker sign-in. It has five tools tied to its own ticket instead:
+`read_ticket`, `comment`, `ask_question`, `file_finding` and `report_done`. Use them for every
+read and every write. They know your ticket, so you never name one. Each one writes the part a
+machine reads for you: `ask_question` the escalation mark, `file_finding` the finding block, and
+`report_done` the telemetry block (§7, §8). Never type those into a `comment`: it refuses them.
+
+Good: "Criterion 3 conflicts with criterion 1." You call `ask_question`, then `report_done` with
+outcome `blocked`, and end.
+Not: posting the escalation mark by hand in a `comment`, or looking for another way to the tracker.
+
 **If your ticket has a parent, read the plan before you plan.** A child of a planned epic
 opens with a short block naming its epic, its place in the plan, and the tickets it depends
 on. Before you plan your change:
@@ -252,7 +263,8 @@ Not: "Criterion 3 probably meant X, so I implemented X."
 ### The three things a machine reads in your comments
 
 A person reads your comments, but a machine reads these three exactly. Copy them; never
-reword them.
+reword them. With the `ticket` tools (§3), the first two are tool calls, and the tool writes the
+exact form: 1 is `ask_question`, and 2 is `file_finding`. A plan note still goes in a `comment`.
 
 **1. The escalation mark: the first line of the comment, on its own.** Where the project runs
 a notifier, it pages the owner on this line and applies the label for you. You never apply
@@ -319,7 +331,7 @@ The note changes nothing itself, so still escalate as in 1 if you cannot go on.
   it keeps its copies in `$SCRATCH_RUN_DIR`. Either way the folder goes when the command
   ends, however it ends.
 - Emit the telemetry block on every ending, including an escalation. It is reporting
-  only; it buys nothing.
+  only; it buys nothing. With the `ticket` tools, `report_done` writes it: call it once, last.
 
 ---
 

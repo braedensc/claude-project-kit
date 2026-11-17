@@ -40,11 +40,18 @@ nothing loaded from the workspace (KIT-630, rows r1 and r1c):
   -p --model <model> --output-format json --session-id <id> | --resume <id>
   --setting-sources "" --strict-mcp-config --mcp-config <run>/mcp.json --settings <run>/settings.json
   --tools <the kind's tools> --allowedTools <each by the workspace's path, never by bare name (r4a)>
+      <and, for a code, fix or conflict run with `session_tools` set, its five tracker tools by name>
   --permission-mode dontAsk --permission-prompts none
   --append-system-prompt-file <run>/rules.md --max-turns <pin> --max-budget-usd <pin>
 The prompt goes on stdin: the ticket's snapshot, or a resume's text, fenced as data. A kind with
 Bash gets the built-in sandbox with a deny-read list (r3, r3b). Its environment is exactly PATH,
 HOME, TMPDIR, LANG, the sign-in token under the one name the program reads, and two switches.
+
+NO TRACKER SIGN-IN (KIT-706, scripts/pipeline_session_tools.py).  No session holds a tracker key:
+none is in its environment, its mcp.json lists no tracker server, and every tracker key file is
+walled from its file tools and from Bash. With `session_tools` set, a code, fix or conflict run
+gets one tool server of its own, tied to its run: read its ticket, comment, ask one question,
+file a finding, report done. The runner writes that server's run file in the run's folder.
 
 ITS PROCESS.  Each session runs under a small wrapper, this file's `session` command, in its own
 process group and session, writing its output and its exit to the run's folder. The runner holds
@@ -97,6 +104,7 @@ try:
     import pipeline_voice as voice
     import pipeline_hold as hold
     import pipeline_runner_limits as limits
+    import pipeline_session_tools as session_tools
     from pipeline_dispatch_local import AGENT_ENV_MARKERS, pin_key, slug
     from pipeline_labels import resolve_label_keys
     from check_ticket_dor import pin_fields
@@ -153,6 +161,7 @@ DEFAULTS = {
     "max_starts_per_ticket": 20,
     "hold": None,
     "limits": None,
+    "session_tools": None,
     "projects": None,
 }
 PROJECT_DEFAULTS = {"repo": None, "base": "main", "approval_states": None,
@@ -245,6 +254,11 @@ def load_config(raw):
     lim, problems = limits.load(cfg["limits"])
     bad += problems
     cfg["limits"] = lim
+    # KIT-706: the session's own tracker tools. Absent is off.
+    tools, problems = session_tools.setting(cfg["session_tools"], cfg["owner_user_ids"],
+                                            (cfg["work_dir"], cfg["session_home"]))
+    bad += problems
+    cfg["session_tools"] = tools
     projects, cfg["projects"] = cfg["projects"], {}
     if not (isinstance(projects, dict) and projects):
         bad.append("projects: needs at least one project")
@@ -640,23 +654,28 @@ def settings_doc(cfg, kind, proj, pins):
     built-in sandbox with a deny-read list (KIT-630, rows r3 and r3b). KIT-704 adds the rest."""
     walls = [cfg["store_dir"], pins, cfg["session_home"]]
     deny = ["%s(/%s/**)" % (tool, p) for p in walls for tool in ("Read", "Edit", "Write")]
+    # KIT-706: no tracker sign-in reaches a session, so every tracker key file is walled off.
+    keys = [cfg["linear_key_file"]] + session_tools.key_files(cfg.get("session_tools"))
+    deny += ["%s(/%s)" % (tool, k) for k in keys for tool in ("Read", "Edit", "Write")]
     doc = {"permissions": {"deny": deny}}
     if KIND_DATA[kind]["bash"]:
         doc["sandbox"] = {"enabled": True, "failIfUnavailable": True,
                           "allowUnsandboxedCommands": False,
                           "network": {"allowedDomains": list(proj["allowed_hosts"])},
-                          "filesystem": {"denyRead": walls}}
+                          "filesystem": {"denyRead": walls + keys}}
     return doc
 
 
-def build_argv(cfg, kind, workspace, rdir, session_id, resume, budget):
-    """The one command line. The prompt is not in it: that goes on stdin."""
+def build_argv(cfg, kind, workspace, rdir, session_id, resume, budget, extra_allowed=()):
+    """The one command line. The prompt is not in it: that goes on stdin. `extra_allowed` is
+    the exact names of the run's own tracker tools (KIT-706), empty for a run that has none."""
     return ([cfg["claude_bin"], "-p", "--model", cfg["model"], "--output-format", "json",
              "--resume" if resume else "--session-id", session_id,
              "--setting-sources", "", "--strict-mcp-config",
              "--mcp-config", os.path.join(rdir, "mcp.json"),
              "--settings", os.path.join(rdir, "settings.json"),
              "--tools", kind_tools(kind), "--allowedTools"] + allowed_rules(kind, workspace)
+            + list(extra_allowed)
             + ["--permission-mode", "dontAsk", "--permission-prompts", "none",
                "--append-system-prompt-file", os.path.join(rdir, "rules.md"),
                "--max-turns", str(budget["maxTurns"]),
@@ -1187,12 +1206,15 @@ class Runner(object):
             os.makedirs(tmpdir, mode=0o700)
             instructions = committed_file(self.git, proj["repo"], proj["base"], "CLAUDE.md") or ""
             store.write_json(os.path.join(rdir, "settings.json"), settings_doc(cfg, kind, proj, pins))
-            store.write_json(os.path.join(rdir, "mcp.json"), {"mcpServers": {}})
+            # KIT-706: the run's mcp.json, and its own tracker tools' run file when it gets them.
+            tools = session_tools.prepare(cfg["session_tools"], rdir, kind, pin, cfg["model"],
+                                          cfg["owner_user_ids"])
             _write_text(os.path.join(rdir, "rules.md"),
                         build_rules(kind, ticket, instructions[:INSTRUCTIONS_MAX]))
             _write_text(os.path.join(rdir, "prompt.txt"),
                         build_prompt(kind, ticket, run_id, node=node, text=text))
-            argv = build_argv(cfg, kind, workspace, rdir, session_id, resumes is not None, pin["budget"])
+            argv = build_argv(cfg, kind, workspace, rdir, session_id, resumes is not None, pin["budget"],
+                              tools)
             store.write_json(os.path.join(rdir, "launch.json"), {"argv": argv, "cwd": workspace})
         except OSError as exc:
             remove_pin(ppath, run_id)
@@ -1656,7 +1678,12 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
         expect("a kind with Bash gets the built-in sandbox, with a deny-read list",
                (settings["sandbox"]["enabled"], settings["sandbox"]["allowUnsandboxedCommands"],
                 settings["sandbox"]["filesystem"]["denyRead"]),
-               (True, False, [sdir, pins, cfg["session_home"]]))
+               (True, False, [sdir, pins, cfg["session_home"], cfg["linear_key_file"]]))
+        expect("the runner's tracker key file is walled from the file tools too",
+               ["%s(/%s)" % (t, cfg["linear_key_file"]) in settings["permissions"]["deny"]
+                for t in ("Read", "Edit", "Write")], [True, True, True])
+        expect("with session_tools off, the run lists no tool server",
+               _load(os.path.join(rdir1, "mcp.json")), {"mcpServers": {}})
         expect("no file tool is allowed by bare name",
                [a for a in _load(os.path.join(rdir1, "launch.json"))["argv"]
                 if a in ("Read", "Edit", "Write")], [])
@@ -1757,6 +1784,49 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                second["argv"][second["argv"].index("--resume") + 1], rec["session_id"])
         expect("the resume's text reached it fenced, and could not close its fence",
                second["prompt"].count("</untrusted-request-data>"), 1)
+
+        # ---- the session's own tracker tools (KIT-706) --------------------- #
+        writer_key = os.path.join(tmp, "writer.key")
+        bad_st = load_config(dict(raw, session_tools={"key_file": writer_key,
+                                                      "writer_user_id": "owner-1"}))[1]
+        expect("session_tools: a writer who is the owner is refused", bad_st,
+               ["session_tools.writer_user_id: is an owner's id. A session must never write as "
+                "the owner"])
+        cfg_st, bad_st = load_config(dict(raw, session_tools={"key_file": writer_key,
+                                                              "writer_user_id": "writer-1"}))
+        expect("session_tools: the setting loads", bad_st, [])
+        tooled = Runner(cfg_st, tracker, environ=environ, git_env=genv, say=said.append, room=roomy)
+        rq = store.ask(sdir, "fix-driver", "resume", "fix", "app", "ENG-1", run=run2,
+                       text="One more look STANDIN:quick")
+        tooled.pass_once()
+        run_t = store.answer(sdir, rq)["run"]
+        rdir_t = store.run_dir(sdir, run_t)
+        _wait(lambda: tooled.pass_once() and store.read_run(sdir, run_t)["state"] == "ended", 15)
+        run_file = os.path.join(rdir_t, session_tools.RUN_FILE)
+        expect("session_tools: the run's mcp.json lists its own server, and no other",
+               _load(os.path.join(rdir_t, "mcp.json")), session_tools.mcp_doc(run_file))
+        expect("session_tools: its run file, in the run's own folder, names the run and its ticket",
+               dict((k, v) for k, v in _load(run_file).items()
+                    if k in ("run", "kind", "ticket", "key_file", "writer_user_id")),
+               {"run": run_t, "kind": "fix", "ticket": "ENG-1", "key_file": writer_key,
+                "writer_user_id": "writer-1"})
+        expect("session_tools: the run file is outside the workspace", _inside(run_file, ws1), False)
+        targv = _load(os.path.join(rdir_t, "launch.json"))["argv"]
+        expect("session_tools: its five tools are allowed by exact name, after the file rules",
+               targv[targv.index("--allowedTools") + 1:targv.index("--permission-mode")],
+               ["Bash", "Read(/%s/**)" % ws1, "Edit(/%s/**)" % ws1, "Write(/%s/**)" % ws1]
+               + list(session_tools.ALLOWED))
+        tsettings = _load(os.path.join(rdir_t, "settings.json"))
+        expect("session_tools: both tracker key files are walled from the file tools and Bash",
+               (["Read(/%s)" % k in tsettings["permissions"]["deny"]
+                 for k in (cfg["linear_key_file"], writer_key)],
+                tsettings["sandbox"]["filesystem"]["denyRead"][-2:]),
+               ([True, True], [cfg["linear_key_file"], writer_key]))
+        expect("session_tools: the session's environment holds no tracker key or token",
+               [k for k in _calls(calls)[-1]["env"] if k not in ("__CF_USER_TEXT_ENCODING", "PWD",
+                                                                 "SHLVL", "_")],
+               sorted(["PATH", "HOME", "TMPDIR", "LANG", "CLAUDE_CODE_OAUTH_TOKEN",
+                       "DISABLE_AUTOUPDATER", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"]))
 
         # ---- a stop -------------------------------------------------------- #
         store.ask(sdir, "queue", "start", "code", "app", "ENG-2")
