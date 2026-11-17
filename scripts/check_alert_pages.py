@@ -243,7 +243,10 @@ def failure_alert_scenarios(script, doc):
     cond = str(job.get("if", ""))
     newer = [{"id": 2, "run_number": 13, "created_at": "2026-11-17T10:05:00Z"}]
     older = [{"id": 3, "run_number": 11, "created_at": "2026-11-17T09:00:00Z"}]
-    out = [("the job runs for a failed, a timed-out and a cancelled run",
+    perms = (doc or {}).get("permissions") or {}
+    out = [("the lookup for a newer run has the permission it needs: actions: read",
+            "github.rest.actions." not in script or perms.get("actions") == "read"),
+           ("the job runs for a failed, a timed-out and a cancelled run",
             all(w in cond for w in ("failure", "timed_out", "cancelled")))]
     r = go()
     out.append(("a failed run on main alerts, naming the conclusion",
@@ -300,7 +303,7 @@ def drift_scenarios(script, doc):
             open(gh_out, "w").close()
             env = dict(os.environ, PATH=tmp + os.pathsep + os.environ.get("PATH", ""), SUPABASE_DB_URL="x",
                        GITHUB_OUTPUT=gh_out, STUB_OUT=text, STUB_CODE=str(code))
-            proc = subprocess.run(["bash", "-c", detect.get("run", "")], env=env, capture_output=True, text=True)
+            proc = subprocess.run(["bash", "-eo", "pipefail", "-c", detect.get("run", "")], env=env, capture_output=True, text=True)
             with open(gh_out, encoding="utf-8") as fh:
                 got = fh.read()
         out.append((label, proc.returncode == 0 and want in got and not_want not in got))

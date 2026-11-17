@@ -52,6 +52,7 @@ on:
 permissions:
   contents: read
   issues: write
+  actions: read # the cancelled-run check lists the workflow's runs; without it a private repo refuses and every replaced run pages
 
 jobs:
   alert:
