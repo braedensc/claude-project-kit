@@ -4516,9 +4516,21 @@ def _is_planning_entry(entry):
                for key in ("id", "name"))
 
 
+# The acceptance check's installer adds `acceptance-<repo>` entries that carry the repository's
+# clone too (KIT-622), so they are skipped the same way. The prefix is the one that installer
+# gives them (pipeline_acceptance_run.ENTRY_PREFIX); this module cannot import it, so the
+# acceptance installer's selftest holds the two equal.
+ACCEPTANCE_ENTRY_PREFIX = "acceptance-"
+
+
+def _is_acceptance_entry(entry):
+    return any(str(entry.get(key) or "").startswith(ACCEPTANCE_ENTRY_PREFIX)
+               for key in ("id", "name"))
+
+
 def _entries_by_repo(ctx):
     """{OWNER/NAME lower-cased: the dispatcher entry that manages that repository}, over
-    the entries this installer does NOT own, and never a Planning entry.
+    the entries this installer does NOT own, and never a Planning or an acceptance entry.
 
     IDENTITY IS THE CLONE'S `origin` REMOTE, with the entry's own `githubUrl` as a second
     authority — both of which NAME the repository. The matcher this replaces compared a
@@ -4528,7 +4540,8 @@ def _entries_by_repo(ctx):
     so either is a correct place to read it."""
     out = {}
     for entry in ctx.dispatcher.get("entries", []) or []:
-        if _owns_review_entry(entry) or _is_planning_entry(entry):
+        if (_owns_review_entry(entry) or _is_planning_entry(entry)
+                or _is_acceptance_entry(entry)):
             continue
         slug = (_origin_slug(ctx, entry.get("repositoryPath"))
                 or _repo_slug(entry.get("githubUrl")))
@@ -10355,6 +10368,24 @@ def _selftest_body():
            % (by_repo.get("example-org/kit") or {}).get("id"))
     ctx14.dispatcher["entries"] = [e for e in ctx14.dispatcher["entries"]
                                    if not _is_planning_entry(e)]
+    ctx14.origin_slugs.clear()
+
+    # -- 14b-iii. an ACCEPTANCE entry carries the clone too, and is never the answer - #
+    # The acceptance installer adds `acceptance-<repo>` entries that point at a clone of the
+    # repository, with their own fence and MCP config. Put one FIRST, where file order would
+    # have made it win: the review entry must still be copied from the coding entry (KIT-622).
+    cases += 1
+    acceptance = {"id": ACCEPTANCE_ENTRY_PREFIX + "kit", "name": ACCEPTANCE_ENTRY_PREFIX + "kit",
+                  "repositoryPath": "/x/kit", "baseBranch": "main"}
+    ctx14.dispatcher["entries"] = [acceptance] + list(ctx14.dispatcher["entries"])
+    ctx14.origin_slugs.clear()
+    by_repo = _entries_by_repo(ctx14)
+    expect("acceptance-entry-skipped",
+           (by_repo.get("example-org/kit") or {}).get("id") == "kit",
+           "example-org/kit resolved to %r, not the coding entry that manages it"
+           % (by_repo.get("example-org/kit") or {}).get("id"))
+    ctx14.dispatcher["entries"] = [e for e in ctx14.dispatcher["entries"]
+                                   if e is not acceptance]
     ctx14.origin_slugs.clear()
 
     # -- 14c. the tag names the REVIEW entry, and nothing else answers to it - #
