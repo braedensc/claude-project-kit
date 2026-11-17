@@ -373,7 +373,9 @@ loosen the check to pass.
 ## Standard library only
 
 `python3 scripts/check_stdlib_only.py` reads every tracked `.py` file and fails on an import that
-is neither the standard library nor a kit module, naming the file, line and module. The few
+is neither the standard library nor a kit module it can really import (a tracked file in its own
+folder, or one in a folder named in `IMPORT_PATH`; a same-named file elsewhere does not count),
+naming the file, line and module. The few
 exceptions are the `ALLOWED` list in the script, each with a reason; an entry matching no import
 fails too. Its standard-library list is one constant, so Python 3.9 and 3.12 agree; the selftest
 fails when the running Python knows a module the constant lacks (add it). `npm run
