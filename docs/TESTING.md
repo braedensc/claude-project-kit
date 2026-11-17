@@ -379,6 +379,25 @@ fails too. Its standard-library list is one constant, so Python 3.9 and 3.12 agr
 fails when the running Python knows a module the constant lacks (add it). `npm run
 test:stdlib-only` runs the selftest, `npm run lint:stdlib-only` the real check.
 
+## The repository has the labels and variables its workflows rely on (KIT-692)
+
+Some workflows assume state that lives in GitHub, not in the tree: the `hooks-change` label has to
+exist before a guarded PR can pass, and the alert workflows page `ALERT_PAGE_TO`. A repository
+without them looks configured until the first guarded PR or the first alert.
+
+`npm run check:repo-setup` reads the repository (GET calls through `gh api`, creating nothing)
+and names each missing label and each missing page-recipient variable, with the command for you
+to run. A page variable counts as missing only when the repository owner is an organization;
+for a person it says "fine" and why. Reading Actions variables needs admin rights on the
+repository: without them it says COULD NOT CHECK and exits 2, never a pass. CI cannot run it
+(the job's token cannot read variables), so the owner runs it after setting up a repository, a
+copy of the kit included. The tables of names are at the top of `scripts/check_repo_setup.py`;
+its selftest (`npm run test:repo-setup`) uses a stub GitHub and checks that each name is still
+used by the file that relies on it.
+
+Good: you run `npm run check:repo-setup` on a new copy and create what it lists.
+Not: you find the missing label when the first guarded PR will not go green.
+
 ## What CI never does
 
 - Never runs the DB-backed suite.
