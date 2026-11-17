@@ -813,8 +813,8 @@ JOB_STEPS = (
      "noun": "The bridge", "conf": "bridge.conf", "script": BRIDGE_SETUP,
      # `install` without --apply compares the job's config, its plist and the stand-up's settings
      # file with what bridge.conf composes, and exits 10 when it would write one. It prints no
-     # step table, so a 10 is always work. `verify` is read afterwards for what only a person can do.
-     "look": ["install"], "apply": ["install", "--apply"], "then": ["verify"], "table": False,
+     # step table, which would_change() reads as work. `verify` is read afterwards for what only a person can do.
+     "look": ["install"], "apply": ["install", "--apply"], "then": ["verify"],
      "note": "It writes the bridge's config, its job file and the stand-up's settings file as the "
              "role account; it never loads the job."},
 )
@@ -868,7 +868,7 @@ def step_job(io, spec, files, rep):
         rep.note_code(key, code, "its check")
         return stop(io, "%s's check stopped with exit %d. The lines above say why."
                     % (noun, code), code)
-    if spec.get("table", True) and not would_change(out):
+    if not would_change(out):
         io.say("")
         io.say("%s has nothing to change; what is left is for you, named above." % noun)
         rep.note(key, OUT_WAITING, "a card is still yours", card_only=True)
