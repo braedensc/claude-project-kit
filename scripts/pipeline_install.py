@@ -54,6 +54,22 @@ WHAT IT DOES, IN ORDER
   3b. The sweep (`scripts/pipeline_sweep_setup.py run`), when this Mac has a `sweep.conf`:
      it installs the job that removes what finished dispatcher runs left, and never loads
      it. Its card (CK-S1) is yours and does not hold the idea gate back.
+  3e. The usage job and the queue's morning job (`scripts/pipeline_queue_setup.py`), when this Mac
+     has a `queue.conf` (`--queue-conf` names another). It runs the installer's own
+     `run --dry-run`, shown as it runs. Exit 0 is "up to date". A step table with a WOULD-CHANGE
+     row is work: it asks, then runs `run` on a yes ("updated"); that writes the queue's settings
+     and both job files as the role account, and loads nothing. Only a card left (loading the
+     jobs is yours) reads "waiting on you" and asks nothing. A dry run that printed no table, or
+     ended with any other code, is never "up to date". A `run` that ends on a card stops the
+     command in Manual and is carried past in Automatic. With no `queue.conf` the part is "off
+     on this Mac" and nothing runs.
+  3f. The hourly health check (`scripts/pipeline_watch.py install`), when this Mac has an
+     `update.conf`. It reads, and never changes, whether the LaunchAgent is there, names this
+     kit, this settings file and this interval, and is held by launchd. Level is "up to date".
+     Missing or behind asks, then runs the installer, which shows a dry pass and asks for its own
+     typed yes; the job is looked at again afterwards, and one not seen loaded is "could not be
+     measured", never "updated". A declined or untyped yes is "waiting on you"; a job that could
+     not be looked at is "could not be measured". With no `update.conf` it is "off on this Mac".
   4. The idea gate (`scripts/pipeline_stage_a_setup.py run`). On a first run it writes
      its own settings from what the review installer's settings already say. Then it
      works through its steps, asking before each one that changes something a person
@@ -123,7 +139,7 @@ TO ONLY LOOK: --check (KIT-736)
 
 Usage:
     pipeline_install.py [--conf stage-a.conf] [--stage-e-conf stage-e.conf]
-                        [--no-pull] [--skip-stage-e]
+                        [--no-pull] [--skip-stage-e] [--queue-conf queue.conf]
     pipeline_install.py --check [--conf stage-a.conf] [--stage-e-conf stage-e.conf]
                         [--sweep-conf sweep.conf] [--skip-stage-e]
     pipeline_install.py --selftest
@@ -172,6 +188,8 @@ SKILLS = os.path.join(HERE, "sync_user_skills.py")
 STAGE_E = os.path.join(HERE, "pipeline_stage_e_setup.py")
 STAGE_A = os.path.join(HERE, "pipeline_stage_a_setup.py")
 SWEEP_SETUP = os.path.join(HERE, "pipeline_sweep_setup.py")
+QUEUE_SETUP = os.path.join(HERE, "pipeline_queue_setup.py")
+WATCH = os.path.join(HERE, "pipeline_watch.py")
 
 # What each installer's exit code means, in a sentence a person can act on. The codes are
 # the installers' own (their docstrings); an unknown one is passed through as it is.
@@ -255,6 +273,32 @@ class Io(object):
         except (OSError, subprocess.SubprocessError) as exc:
             return 127, str(exc)
 
+    def run_seen(self, argv):
+        """(exit code, output): the installer's lines go to the person as they come, and are
+        also kept, so this command can read what the installer found. Standard input stays
+        the person's terminal, so a password prompt still works. Ctrl-C belongs to the
+        installer, as in `run`."""
+        import signal
+        kept = []
+        try:
+            previous = signal.signal(signal.SIGINT,
+                                     lambda _s, _f: setattr(self, "interrupted", True))
+            try:
+                child = subprocess.Popen(argv, cwd=KIT, stdout=subprocess.PIPE,
+                                         stderr=subprocess.STDOUT,
+                                         preexec_fn=lambda: signal.signal(signal.SIGINT,
+                                                                          signal.SIG_DFL))
+                for raw in iter(child.stdout.readline, b""):
+                    text = raw.decode("utf-8", "replace")
+                    kept.append(text)
+                    sys.stdout.write(text)
+                    sys.stdout.flush()
+                return child.wait(), "".join(kept)
+            finally:
+                signal.signal(signal.SIGINT, previous)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return 127, str(exc)
+
     def measure(self, argv, timeout=CHECK_TIMEOUT):
         """(exit code, output) of one read-only check, or (None, why) when it did not finish.
 
@@ -292,6 +336,10 @@ class Io(object):
 
     def exists(self, path):
         return os.path.exists(path)
+
+    def watch_level(self, conf_path):
+        """(state, why) of the hourly health check's job: see watch_level. Reads only."""
+        return watch_level(conf_path, os.path.expanduser("~"), os.getuid(), self.measure)
 
     def parts(self):
         """The pipeline's parts, in the list's order. Raises OSError or ValueError."""
@@ -751,6 +799,169 @@ def step_sweep(io, conf, rep):
     return stop(io, "the sweep's installer stopped with exit %d. The lines above say why." % code, code)
 
 
+# What an installer that prints the Stage E step table says: a row whose outcome is WOULD-CHANGE
+# is work its `run` would do; a row that is only a card is work for a person, which running it
+# again cannot clear. The notifier installer prints this table; this file's selftest pins the
+# word against the installer's own constant.
+STEP_TABLE = "-- steps --"
+WOULD_CHANGE_ROW = re.compile(r"^\s+\S+\s+WOULD-CHANGE(\s|$)", re.M)
+
+
+def would_change(text):
+    """True when the dry run's step table has work its `run` would do. A dry run that printed
+    no table says nothing about what it found, so that counts as work too: it is asked about,
+    and never read as up to date."""
+    return STEP_TABLE not in (text or "") or bool(WOULD_CHANGE_ROW.search(text or ""))
+
+
+# The steps that run an optional job's installer when its settings file is on this Mac: look
+# first with the installer's own read-only pass, ask only when there is work, run it on a yes.
+# `note` is said before the question, for what a run of it may do.
+JOB_STEPS = (
+    {"key": "queue", "number": "3e", "title": "The usage job and the queue's morning job",
+     "noun": "The usage job and the queue", "conf": "queue.conf", "script": QUEUE_SETUP,
+     "look": ["run", "--dry-run"], "apply": ["run"],
+     "note": "It writes the queue's settings and its two job files (the usage reader and the morning "
+             "job) as the role account; it never loads them."},
+)
+
+
+def step_job(io, spec, files, rep):
+    """None to carry on, or an exit code. See JOB_STEPS."""
+    key, noun = spec["key"], spec["noun"]
+    heading(io, "%s. %s" % (spec["number"], spec["title"]))
+    conf = files[spec["conf"]]
+    if not io.exists(conf):
+        rep.note(key, OUT_OFF, missing(conf))
+        io.say("No %s, so %s is not set up on this Mac. Copy %s.example to switch it on."
+               % (os.path.relpath(conf, KIT), noun.lower(), spec["conf"]))
+        return None
+    base = [sys.executable, spec["script"]]
+    code, out = io.run_seen(base + spec["look"] + ["--conf", conf])
+    if io.interrupted:
+        rep.note(key, OUT_UNMEASURED, "interrupted during its check")
+        return stop(io, INTERRUPTED % (noun + "'s check"), code or EX_BLOCKED)
+    if code == 0:
+        io.say("")
+        io.say("%s is up to date. Nothing to do." % noun)
+        rep.note(key, OUT_OK)
+        return None
+    if code != EX_BLOCKED:
+        rep.note_code(key, code, "its check")
+        return stop(io, "%s's check stopped with exit %d. The lines above say why."
+                    % (noun, code), code)
+    if not would_change(out):
+        io.say("")
+        io.say("%s has nothing to change; what is left is for you, named above." % noun)
+        rep.note(key, OUT_WAITING, "a card is still yours", card_only=True)
+        return None
+    io.say("")
+    io.say("%s is not up to date: the check above names what would change." % noun)
+    io.say(spec["note"])
+    if not io.ask("Update %s now?" % noun.lower()):
+        rep.note(key, OUT_WAITING, "behind; you did not update it")
+        return None
+    code, _out = io.run(base + spec["apply"] + ["--conf", conf])
+    if io.interrupted:
+        rep.note(key, OUT_UNMEASURED, "interrupted during its installer")
+        return stop(io, INTERRUPTED % (noun + "'s installer"), code or EX_BLOCKED)
+    io.say("")
+    if code == 0:
+        io.say("%s is up to date." % noun)
+        rep.note(key, OUT_UPDATED)
+        rep.asked.add(key)
+        return None
+    rep.note_code(key, code, "its installer")
+    if code == EX_BLOCKED and io.auto:
+        io.say("%s waits for you at the card above. Carrying on; come back to it." % noun)
+        return None
+    return stop(io, "%s's installer stopped with exit %d. The lines above say why; do what "
+                    "they say, then run this command again." % (noun, code), code)
+
+
+def watch_level(conf_path, home, uid, measure):
+    """(state, why) of the hourly health check's job, read and never changed: "current" (its job
+    file names this kit, this settings file and this interval, and launchd holds it), "missing"
+    (no job file, or launchd does not hold it), "behind" (a job file for another kit, settings
+    file or interval) or "unmeasured" (a file or a launchctl answer that could not be read)."""
+    import plistlib
+    try:
+        import pipeline_update as pu
+        conf = pu.load_conf(conf_path)
+        label = conf["WATCH_LABEL"]
+        want = [WATCH, "--conf", conf["__source__"], "run"]
+        every = int(conf["WATCH_INTERVAL_SECONDS"])
+    except Exception as exc:                                    # noqa: BLE001  (any failure is unmeasured)
+        return "unmeasured", "its settings could not be read (%s)" % (
+            str(exc).strip().splitlines() or [type(exc).__name__])[0][:100]
+    plist = os.path.join(home, "Library", "LaunchAgents", label + ".plist")
+    if not os.path.exists(plist):
+        return "missing", "no job file for %s" % label
+    try:
+        with open(plist, "rb") as fh:
+            doc = plistlib.load(fh)
+        args, interval = list(doc.get("ProgramArguments") or []), doc.get("StartInterval")
+    except Exception as exc:                                    # noqa: BLE001
+        return "unmeasured", "its job file could not be read (%s)" % type(exc).__name__
+    if args[1:] != want or interval != every:
+        return "behind", "its job file names another kit, settings file or interval"
+    code, out = measure(["launchctl", "print", "gui/%d/%s" % (uid, label)])
+    if code is None:
+        return "unmeasured", "launchctl did not answer (%s)" % (out or "no reason given")[:80]
+    if code != 0:
+        return "missing", "its job file is there, but launchd does not hold the job"
+    return "current", ""
+
+
+def step_watch(io, conf, rep):
+    """The hourly health check's job, when `update.conf` exists. It is a LaunchAgent that runs as
+    you; its own installer shows a dry pass and asks for a typed yes before it loads anything."""
+    key = "watch"
+    heading(io, "3f. The hourly health check")
+    if not io.exists(conf):
+        rep.note(key, OUT_OFF, missing(conf))
+        io.say("No %s, so the health check is not set up on this Mac. Copy update.conf.example to "
+               "switch it on." % os.path.relpath(conf, KIT))
+        return None
+    state, why = io.watch_level(conf)
+    if state == "current":
+        io.say("The hourly health check is installed and loaded, from this kit.")
+        rep.note(key, OUT_OK)
+        return None
+    if state == "unmeasured":
+        io.say("The hourly health check could not be looked at: %s." % why)
+        rep.note(key, OUT_UNMEASURED, why)
+        return None
+    io.say("The hourly health check is %s: %s." % ("behind" if state == "behind" else "not running", why))
+    io.say("Installing it writes one LaunchAgent in your own home and loads it. It runs as you and "
+           "changes nothing it reports on. It shows a dry pass first and asks for a typed yes.")
+    if not io.ask("Install the hourly health check now?"):
+        rep.note(key, OUT_WAITING, "%s; you did not install it" % why)
+        return None
+    code, _out = io.run([sys.executable, WATCH, "--conf", conf, "install"])
+    if io.interrupted:
+        rep.note(key, OUT_UNMEASURED, "interrupted during its installer")
+        return stop(io, INTERRUPTED % "The health check's installer", code or EX_BLOCKED)
+    io.say("")
+    if code == EX_BLOCKED:
+        io.say("Nothing was installed: its own yes was not typed. Run this command again when you are ready.")
+        rep.note(key, OUT_WAITING, "its own yes was not typed")
+        return None
+    if code != 0:
+        rep.note_code(key, code, "its installer")
+        return stop(io, "the health check's installer stopped with exit %d. The lines above say why."
+                    % code, code)
+    # Read it again: an installer that said done is not a job that was seen loaded.
+    state, why = io.watch_level(conf)
+    if state != "current":
+        io.say("It said it was installed, but looking again: %s." % why)
+        rep.note(key, OUT_UNMEASURED, "installed, but not seen loaded: %s" % why)
+        return None
+    io.say("The hourly health check is installed and loaded.")
+    rep.note(key, OUT_UPDATED)
+    return None
+
+
 def step_stage_a(io, conf, stage_e_conf, rep):
     heading(io, "4. The idea gate")
     before = look_first(io, rep, "stage_a")
@@ -1156,7 +1367,8 @@ def step_write_settings(io, writes):
 # The step of this command that acts on a part is found from the part's own installer or
 # check script, never from a list of part ids, so a new part is picked up from the list.
 STEP_OF_SCRIPT = {"sync_user_skills.py": "skills", "pipeline_stage_e_setup.py": "stage_e",
-                  "pipeline_sweep_setup.py": "sweep", "pipeline_stage_a_setup.py": "stage_a"}
+                  "pipeline_sweep_setup.py": "sweep", "pipeline_stage_a_setup.py": "stage_a",
+                  "pipeline_queue_setup.py": "queue", "pipeline_watch.py": "watch"}
 
 
 def step_of(part):
@@ -1420,6 +1632,11 @@ def look_steps(io, parts, files, skip_stage_e, rep):
             rep.note(key, OUT_UNMEASURED, "skipped (--skip-stage-e), so not checked")
         elif path and not io.exists(path):
             rep.note(key, OUT_OFF, missing(path))
+        elif key == "watch":
+            # The step's own question is whether the job is installed, not what a pass finds.
+            state, why = io.watch_level(path)
+            rep.note(key, *{"current": (OUT_OK, ""), "unmeasured": (OUT_UNMEASURED, why)}.get(
+                state, (OUT_WAITING, why)))
         else:
             argv = check_argv(part, files)
             answer = io.measure(argv)
@@ -1443,7 +1660,9 @@ def look_only(io, args):
     io.say(ONLY_LOOKED)
     files = {"stage-a.conf": os.path.abspath(args.conf),
              "stage-e.conf": os.path.abspath(args.stage_e_conf),
-             "sweep.conf": os.path.abspath(args.sweep_conf)}
+             "sweep.conf": os.path.abspath(args.sweep_conf),
+             "queue.conf": os.path.abspath(args.queue_conf),
+             "update.conf": os.path.abspath(args.update_conf)}
     rep, parts, unreadable = Report(), [], None
     try:
         parts = io.parts()
@@ -1494,6 +1713,9 @@ def main(argv=None, io=None):
                         help="use this checkout as it is, without pulling")
     parser.add_argument("--sweep-conf", default=os.path.join(KIT, "sweep.conf"),
                         help="the sweep's settings (default: sweep.conf in the kit; absent skips it)")
+    parser.add_argument("--queue-conf", default=os.path.join(KIT, "queue.conf"),
+                        help="the usage job and the queue's settings (default: queue.conf in the kit; "
+                             "absent skips it)")
     parser.add_argument("--skip-stage-e", action="store_true",
                         help="do not check or update the review jobs")
     parser.add_argument("--check", action="store_true", help="only look: change nothing, ask nothing, no terminal needed")
@@ -1534,7 +1756,9 @@ def main(argv=None, io=None):
     # the end says so, in words.
     files = {"stage-a.conf": os.path.abspath(args.conf),
              "stage-e.conf": os.path.abspath(args.stage_e_conf),
-             "sweep.conf": os.path.abspath(args.sweep_conf)}
+             "sweep.conf": os.path.abspath(args.sweep_conf),
+             "queue.conf": os.path.abspath(args.queue_conf),
+             "update.conf": os.path.abspath(args.update_conf)}
     rep = Report()
     parts, unreadable = [], None
     try:
@@ -1584,8 +1808,10 @@ def main(argv=None, io=None):
              lambda: step_checkout(io, argv, args.no_pull, rep, args.pulled_from, mode),
              lambda: step_skills(io, rep),
              lambda: step_stage_e(io, files["stage-e.conf"], args.skip_stage_e, rep),
-             lambda: step_sweep(io, files["sweep.conf"], rep),
-             lambda: step_stage_a(io, files["stage-a.conf"], files["stage-e.conf"], rep))
+             lambda: step_sweep(io, files["sweep.conf"], rep)) \
+        + tuple((lambda spec=spec: step_job(io, spec, files, rep)) for spec in JOB_STEPS) \
+        + (lambda: step_watch(io, files["update.conf"], rep),) \
+        + (lambda: step_stage_a(io, files["stage-a.conf"], files["stage-e.conf"], rep),)
     code, reached, stopped = None, True, False
     try:
         for n, step in enumerate(steps):
@@ -1673,8 +1899,21 @@ class FakeIo(Io):
         script = os.path.basename(argv[1])
         return " ".join([script] + [a for a in argv[2:3] if not a.startswith("/")])
 
+    seen_out = {}                          # program key -> the lines run_seen returns for it
+
+    def run_seen(self, argv):
+        """Scripted like `run`; the lines it returns are `seen_out[key]`."""
+        code, _out = self.run(argv)
+        return code, self.seen_out.get(self.ran[-1], "")
+
     def run(self, argv, capture=False):
         k = self.key(argv)
+        if argv[0] != "git":
+            # A flag after the subcommand tells a look from the real thing: `run --dry-run`
+            # from `run`, `install` from `install --apply`.
+            for flag in ("--dry-run", "--apply"):
+                if flag in argv[3:] and not k.endswith(flag):
+                    k += " " + flag
         self.ran.append(k)
         self.argvs.append(list(argv))
         if argv[0] == "git":
@@ -1701,6 +1940,14 @@ class FakeIo(Io):
         if path.startswith(KIT + os.sep):
             return path in self.present
         return os.path.exists(path)
+
+    levels = ("current", "")                # what watch_level answers; a list is answered in turn
+    level_asked = 0
+
+    def watch_level(self, conf_path):
+        self.level_asked += 1
+        got = self.levels
+        return got.pop(0) if isinstance(got, list) and len(got) > 1 else (got[0] if isinstance(got, list) else got)
 
     def parts(self):
         if isinstance(self.parts_list, Exception):
@@ -2173,7 +2420,8 @@ def selftest():
     sweep_conf = os.path.join(tmp, "sweep.conf")                  # absent: the sweep is skipped
     base = ["--conf", a_conf, "--stage-e-conf", se_conf, "--sweep-conf", sweep_conf]
     healthy = {"sync_user_skills.py": 0, "pipeline_stage_e_setup.py verify": 0,
-               "pipeline_stage_a_setup.py run": 0}
+               "pipeline_stage_a_setup.py run": 0,
+               "pipeline_queue_setup.py run --dry-run": 0}        # asked only where queue.conf is present
 
     def go(codes=None, answers=(), argv=None, **kw):
         io = FakeIo(codes=dict(healthy, **(codes or {})), answers=answers, **kw)
@@ -2411,6 +2659,183 @@ def selftest():
               (code, "pipeline_stage_a_setup.py run" in io.ran), (rc, False))
     os.unlink(sweep_conf)
 
+    # 6e. THE USAGE JOB AND THE QUEUE (KIT-585): the installer's dry run first, a question only when a step would
+    #     change something, its `run` on a yes. Unmeasured is never up to date.
+    import inspect
+    import pipeline_queue_setup as queue_setup
+    queue_conf = os.path.join(tmp, "queue.conf")                  # absent: the queue is off
+    look, apply_ = "pipeline_queue_setup.py run --dry-run", "pipeline_queue_setup.py run"
+
+    def table(*rows):
+        """The queue installer's step table, in the shape its run_steps prints (pinned below)."""
+        return "\n-- steps --\n" + "".join("  %-10s %-17s %s\n" % row for row in rows)
+
+    work = table(("configs", queue_setup.WOULD_CHANGE, "not written"),
+                 ("enable", queue_setup.BLOCKED, "CK-Q2: you load them"))
+    cards = table(("configs", queue_setup.ALREADY_DONE, "written"),
+                  ("enable", queue_setup.BLOCKED, "CK-Q2: you load them"))
+    check("queue-pin-would-change-word", (queue_setup.WOULD_CHANGE, would_change(work), would_change(cards)),
+          ("WOULD-CHANGE", True, False))
+    # The real installer's own table code, not a copy: its summary is built from rows of this shape.
+    src = inspect.getsource(queue_setup.run_steps)
+    check("queue-installer-prints-the-table-this-reads",
+          ('say("\\n-- steps --")' in src, '"  %-10s %-17s %s"' in src), (True, True))
+
+    def queue(codes=None, seen=None, answers=(), interrupt=(), **kw):
+        io = FakeIo(codes=dict(healthy, **(codes or {})), answers=answers, **kw)
+        io.seen_out = dict(seen or {})
+        io.interrupt_on = set(interrupt or ())
+        return main(base + ["--queue-conf", queue_conf], io=io), io
+
+    def qout(io):
+        return [(r["outcome"], r["detail"]) for r in io.records if r["id"] == "work-queue"]
+
+    code, io = queue()
+    check("queue-no-conf-is-off-and-not-run",
+          (code, [k for k in io.ran if "queue" in k], qout(io)),
+          (EX_OK, [], [(OUT_OFF, "no queue.conf in %s" % tmp)]))
+    with open(queue_conf, "w") as fh:
+        fh.write("ROLE_ACCOUNT=_x\n")
+    code, io = queue()
+    check("queue-current-is-up-to-date-and-asks-nothing",
+          (code, io.ran.count(apply_), io.asked, qout(io)), (EX_OK, 0, [], [(OUT_OK, "")]))
+    code, io = queue({look: 10, apply_: 0}, {look: work}, answers=[True])
+    check("queue-work-asked-then-run-then-updated",
+          (code, [k for k in io.ran if "queue" in k or "stage_a" in k], len(io.asked), qout(io)),
+          (EX_OK, [look, apply_, "pipeline_stage_a_setup.py run"], 1, [(OUT_UPDATED, "")]))
+    code, io = queue({look: 10}, {look: work}, answers=[False])
+    check("queue-declined-is-waiting-and-changes-nothing",
+          (code, io.ran.count(apply_), qout(io)),
+          (EX_BLOCKED, 0, [(OUT_WAITING, "behind; you did not update it")]))
+    code, io = queue({look: 10}, {look: cards})
+    check("queue-cards-only-asks-nothing-is-waiting",
+          (code, io.asked, io.ran.count(apply_), "pipeline_stage_a_setup.py run" in io.ran, qout(io)),
+          (EX_BLOCKED, [], 0, True, [(OUT_WAITING, "a card is still yours")]))
+    code, io = queue({look: 10, apply_: 0}, {look: "no table"}, answers=[True])
+    check("queue-a-dry-run-with-no-table-is-asked-about-never-current",
+          (code, len(io.asked), qout(io)), (EX_OK, 1, [(OUT_UPDATED, "")]))
+    code, io = queue({look: 10, apply_: 10}, {look: work}, answers=[True])
+    check("queue-a-run-ending-on-a-card-stops-in-manual",
+          (code, "pipeline_stage_a_setup.py run" in io.ran, [o for o, _d in qout(io)]),
+          (EX_BLOCKED, False, [OUT_WAITING]))
+    code, io = queue({look: 10, apply_: 10}, {look: work}, answers=[True], typed=["1", "yes"])
+    check("queue-a-run-ending-on-a-card-is-carried-past-in-automatic",
+          (code, "pipeline_stage_a_setup.py run" in io.ran), (EX_BLOCKED, True))
+    for rc in (1, 2, 3, 4, 5, 77):
+        code, io = queue({look: rc})
+        check("queue-check-exit-%d-stops-never-current" % rc,
+              (code, "pipeline_stage_a_setup.py run" in io.ran, qout(io)[0][0] != OUT_OK), (rc, False, True))
+    for rc in (1, 4):
+        code, io = queue({look: 10, apply_: rc}, {look: work}, answers=[True])
+        check("queue-installer-exit-%d-stops-unmeasured" % rc,
+              (code, [o for o, _d in qout(io)]), (rc, [OUT_UNMEASURED]))
+    code, io = queue({}, interrupt={look})
+    check("queue-ctrl-c-stops-the-run", (code, "pipeline_stage_a_setup.py run" in io.ran), (EX_BLOCKED, False))
+    os.unlink(queue_conf)
+
+    # 6f. THE HOURLY HEALTH CHECK (KIT-585): read whether its job is level, ask, install, look again.
+    update_conf = os.path.join(tmp, "update.conf")                # absent: the health check is off
+    watch_run = "pipeline_watch.py --conf"
+
+    def watch(levels=("current", ""), codes=None, answers=(), interrupt=(), **kw):
+        io = FakeIo(codes=dict(healthy, **(codes or {})), answers=answers, **kw)
+        io.levels = levels
+        io.interrupt_on = set(interrupt or ())
+        return main(base + ["--update-conf", update_conf], io=io), io
+
+    def wout(io):
+        return [(r["outcome"], r["detail"]) for r in io.records if r["id"] == "health-check"]
+
+    code, io = watch()
+    check("watch-no-conf-is-off-and-never-looked-at",
+          (code, io.level_asked, wout(io)), (EX_OK, 0, [(OUT_OFF, "no update.conf in %s" % tmp)]))
+    with open(update_conf, "w") as fh:
+        fh.write("DISPATCHER_VERSION=1\n")
+    code, io = watch()
+    check("watch-level-is-up-to-date-and-asks-nothing",
+          (code, io.asked, watch_run in io.ran, wout(io)), (EX_OK, [], False, [(OUT_OK, "")]))
+    code, io = watch([("missing", "no job file for x"), ("current", "")], {watch_run: 0}, answers=[True])
+    check("watch-missing-asked-installed-looked-at-again-updated",
+          (code, len(io.asked), io.ran.count(watch_run), io.level_asked, wout(io)),
+          (EX_OK, 1, 1, 2, [(OUT_UPDATED, "")]))
+    check("watch-installer-argv-is-the-parts-list-apply",
+          [a for a in io.argvs if a[1].endswith("pipeline_watch.py")][0][2:],
+          ["--conf", update_conf, "install"])
+    code, io = watch([("behind", "another kit"), ("current", "")], {watch_run: 0}, answers=[True])
+    check("watch-behind-is-asked-and-installed", (code, wout(io)), (EX_OK, [(OUT_UPDATED, "")]))
+    code, io = watch(("missing", "no job file for x"), answers=[False])
+    check("watch-declined-is-waiting-and-installs-nothing",
+          (code, watch_run in io.ran, wout(io)),
+          (EX_BLOCKED, False, [(OUT_WAITING, "no job file for x; you did not install it")]))
+    code, io = watch(("unmeasured", "launchctl did not answer"))
+    check("watch-unread-is-never-up-to-date-and-asks-nothing",
+          (code, io.asked, wout(io)), (EX_UNMEASURED, [], [(OUT_UNMEASURED, "launchctl did not answer")]))
+    code, io = watch([("missing", "x"), ("missing", "its job file is there, but launchd does not hold the job")],
+                     {watch_run: 0}, answers=[True])
+    check("watch-installed-but-not-seen-loaded-is-not-updated",
+          (code, [o for o, _d in wout(io)]), (EX_UNMEASURED, [OUT_UNMEASURED]))
+    code, io = watch(("missing", "x"), {watch_run: 10}, answers=[True])
+    check("watch-its-own-yes-not-typed-is-waiting-and-carries-on",
+          (code, "pipeline_stage_a_setup.py run" in io.ran, [o for o, _d in wout(io)]),
+          (EX_BLOCKED, True, [OUT_WAITING]))
+    for rc in (1, 3, 4):
+        code, io = watch(("missing", "x"), {watch_run: rc}, answers=[True])
+        check("watch-installer-exit-%d-stops" % rc,
+              (code, "pipeline_stage_a_setup.py run" in io.ran), (rc, False))
+    code, io = watch(("missing", "x"), {watch_run: 0}, answers=[True], interrupt={watch_run})
+    check("watch-ctrl-c-in-its-installer-stops-the-run",
+          (code, "pipeline_stage_a_setup.py run" in io.ran), (EX_BLOCKED, False))
+
+    # watch_level itself, against a made-up home and a made-up launchctl: it reads and changes nothing.
+    import plistlib
+    import pipeline_update as update_module
+    home = os.path.join(tmp, "home")
+    agents = os.path.join(home, "Library", "LaunchAgents")
+    os.makedirs(agents)
+    with open(os.path.join(KIT, "update.conf.example")) as fh:
+        example = fh.read()
+    with open(update_conf, "w") as fh:         # the example, with its three placeholder values edited
+        fh.write(example.replace("com.example.dispatcher", "com.test.dispatcher")
+                 .replace("_exdispatch", "_testdispatch")
+                 .replace("/opt/example-dispatcher/.env", "/opt/test-dispatcher/.env"))
+    conf =update_module.load_conf(update_conf)
+    job_file = os.path.join(agents, conf["WATCH_LABEL"] + ".plist")
+    asked = []
+
+    def launchctl(code):
+        def measure(argv):
+            asked.append(argv)
+            return code, ""
+        return measure
+
+    level = lambda code=0: watch_level(update_conf, home, 501, launchctl(code))       # noqa: E731
+    check("watch-level-no-job-file-is-missing", level()[0], "missing")
+    good = {"Label": conf["WATCH_LABEL"], "StartInterval": int(conf["WATCH_INTERVAL_SECONDS"]),
+            "ProgramArguments": [sys.executable, WATCH, "--conf", conf["__source__"], "run"]}
+    with open(job_file, "wb") as fh:
+        plistlib.dump(good, fh)
+    check("watch-level-matching-file-and-loaded-is-current", (level()[0], asked[-1][:2]),
+          ("current", ["launchctl", "print"]))
+    check("watch-level-matching-file-not-loaded-is-missing", level(113)[0], "missing")
+    check("watch-level-launchctl-that-did-not-answer-is-unmeasured",
+          watch_level(update_conf, home, 501, lambda argv: (None, "timed out"))[0], "unmeasured")
+    for what, doc in (("another-interval", dict(good, StartInterval=1)),
+                      ("another-kit", dict(good, ProgramArguments=[sys.executable, "/old/pipeline_watch.py",
+                                                                  "--conf", conf["__source__"], "run"])),
+                      ("another-conf", dict(good, ProgramArguments=[sys.executable, WATCH, "--conf",
+                                                                   "/elsewhere/update.conf", "run"]))):
+        with open(job_file, "wb") as fh:
+            plistlib.dump(doc, fh)
+        before = len(asked)
+        check("watch-level-%s-is-behind-and-launchd-not-asked" % what, (level()[0], len(asked)),
+              ("behind", before))
+    with open(job_file, "wb") as fh:
+        fh.write(b"not a plist")
+    check("watch-level-an-unreadable-job-file-is-unmeasured", level()[0], "unmeasured")
+    check("watch-level-unreadable-settings-are-unmeasured",
+          watch_level(os.path.join(tmp, "nope.conf"), home, 501, launchctl(0))[0], "unmeasured")
+    os.unlink(update_conf)
+
     # 7. CTRL-C REACHES THE INSTALLER AND ITS CLEAN-UP RUNS TO THE END. Real processes:
     #    a terminal's Ctrl-C goes to the whole process group, and a wrapper that did not
     #    step aside would kill the installer a quarter of a second in.
@@ -2587,6 +3012,7 @@ def selftest():
     io = FakeIo(codes=dict(healthy))
     io.present = {paging_conf, kit_file("update.conf")}
     io.measure_codes = {"pipeline_notifier_setup.py run": 10, "pipeline_watch.py --conf": 1}
+    io.levels = ("unmeasured", "its job could not be looked at")
     code = main(base, io=io)
     check("lines-unmeasured-outranks-waiting", code, EX_UNMEASURED)
     code, io = go(codes={"pipeline_stage_a_setup.py run": 10})
@@ -2656,7 +3082,7 @@ def selftest():
     check("lines-steps-are-found-from-the-list",
           (keys["one-command"], keys["skills"], keys["cleanup"], keys["idea-gate"],
            set(k for k in keys.values() if k) == set(["checkout", "skills", "stage_e",
-                                                      "sweep", "stage_a"]),
+                                                      "sweep", "stage_a", "queue", "watch"]),
            all(keys[pt["id"]] == "stage_e" for pt in real
                if pt["check"] and pt["check"]["script"].endswith("pipeline_stage_e_setup.py"))),
           ("checkout", "skills", "sweep", "stage_a", True, True))
