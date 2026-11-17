@@ -134,10 +134,10 @@ WHAT HAPPENS WHEN A PULL REQUEST GOES CONFLICTING (the dispatched lane)
   `ack` marker on the PR so it holds its page. A later push that leaves the PR
   CONFLICTING is reported once as `result outcome=unresolved`, and the monitor escalates.
   It spends NO bounce, writes no re-review request and no label, and files no ticket (a
-  second session on a branch the first may hold). It is capped on the ledger at the limit
-  the latest request states (three unless the repository set another, never above 20).
-  That limit is the bot's own word, so see `conflict_view` for what the cap does and does
-  not guard. No thread, or no request, sends nothing and the monitor pages. On a CONCLUDED
+  second session on a branch the first may hold). It is capped on the ledger at the lowest
+  limit any request on the PR states (three unless the repository set another, never above
+  20), so a later request can lower it but never raise it (KIT-749). See `conflict_view` for
+  what the cap does and does not guard. No thread, or no request, sends nothing and the monitor pages. On a CONCLUDED
   pull request a conflict is a notice, like any other change. The ack counts on GitHub only
   when the token this driver posts with belongs to a writer; if it does not, the monitor
   pages while the session works — loud, never silent.
@@ -446,7 +446,7 @@ sys.path.insert(0, HERE)
 import gh_fallback  # noqa: E402  (resolve_repo; pr-comment is the ONE GitHub write, via prl)
 import pipeline_review_local as prl  # noqa: E402  (resolve_ticket, post_comment, SEVERITY_RANK)
 # The conflict loop's marker grammar has ONE owner. Only its pure readers and writers are
-# used here (episode_state, marker, BRANCH_RE, fix_limit); --selftest asserts this
+# used here (episode_state, marker, BRANCH_RE, fix_cap); --selftest asserts this
 # file never reaches for the waker half, which is the one that starts sessions.
 import pr_conflict as prc  # noqa: E402
 import pipeline_routing_tags as routing  # noqa: E402  (what a routing directive is — KIT-381)
@@ -1813,18 +1813,19 @@ def conflict_view(mergeable, episode, rows, head_sha):
     THE MONITOR KEEPS THE CLOCK AND THE BUDGET; THIS DRIVER ONLY ANSWERS IT. A conflict is
     sent back to the session only in answer to an open, unclaimed fix `request`, so the
     monitor's per-PR lifetime budget bounds it. The ledger counts the fixes this driver has
-    sent and caps them at the limit the LATEST request states (`prc.fix_limit`: three unless
-    the repository set another), never above the hard ceiling `prc.FIX_LIMIT_MAX` (20), and
-    never a constant of this file's.
+    sent and caps them at the LOWEST limit any request on the PR has stated, in any episode
+    (`prc.fix_cap`: three unless the repository set another), never above the hard ceiling
+    `prc.FIX_LIMIT_MAX` (20), and never a constant of this file's.
 
-    WHAT THAT CAP GUARDS, AND WHAT IT DOES NOT. It is read from the very request it
-    second-guesses, so it is not independent of it. A request written by anyone but the
-    Actions bot is refused by the parser and states nothing. A forged request from the bot
-    account itself is not refused: it can state a limit above the repository's own, and so
-    raise this cap, at most to the ceiling. The independent second layer is the ceiling and
-    the reset protection: the count is this driver's own ledger, which no comment can lower,
-    so deleting or renumbering the monitor's comments cannot reset it. Tightening the rest
-    is KIT-749. States:
+    WHAT THAT CAP GUARDS, AND WHAT IT DOES NOT. A request written by anyone but the Actions
+    bot is refused by the parser and states nothing. A forged request from the bot account
+    itself is not refused, but it can only LOWER this cap, never raise it (KIT-749): the cap is
+    no higher than the lowest limit the monitor's own requests state, and the monitor reads its
+    limit from the default branch's workflow. The count is this driver's own ledger, which no
+    comment can lower, so deleting or renumbering the monitor's comments cannot reset it. The
+    price: a limit the repository raises while this PR is in flight does not reach it. The
+    driver stops at the lowest limit already stated, the monitor's next request goes
+    unanswered, and the monitor pages a person at its ack deadline. States:
 
       request   an open request nobody has claimed, budget left — send the fix (action
                 `conflict`)
@@ -1846,7 +1847,7 @@ def conflict_view(mergeable, episode, rows, head_sha):
     n = episode.get("episode") or 0
     sent = [r for r in (rows or []) if r.get("outcome") == "conflict"]
     mine = [r for r in sent if r.get("episode") == n]
-    limit = prc.fix_limit(latest)       # the monitor's limit, as the request states it (KIT-670)
+    limit = prc.fix_cap(episode)        # the lowest limit any request on the PR stated (KIT-749)
     view = {"episode": n, "spent": len(sent), "head_moved": False, "limit": limit}
     if latest is None:
         return dict(view, state="none", reason="GitHub reports this PR CONFLICTING and the conflict "
@@ -7519,8 +7520,8 @@ def selftest():
                            conflict_no=n, head_sha="old")
             world["pr_comments"] = [gh_comment(prc.marker("request", 4), bot=True)]
             rc, out = pass_(tmp)
-            # The request states no limit, so the cap here is the default 3. A request the bot wrote
-            # that stated more would raise it, to 20 at most (conflict_view's docstring; KIT-749).
+            # The request states no limit, so the cap here is the default 3. A later request the bot
+            # wrote that stated more could not raise it: the cap is the lowest stated (KIT-749, 10r).
             check("the ledger caps conflict fixes at the monitor's budget, whatever GitHub shows",
                   (rc, calls, "no more are sent" in out), (EXIT_OK, [], True))
 
@@ -7599,10 +7600,12 @@ def selftest():
     #      monitor was told, so at 5 the monitor kept waiting on fixes 4 and 5 that never came.
     #      The REAL monitor writes the comments below, on the monitor selftest's own stand-in for
     #      GitHub (`prc.FakeGh`), and the REAL driver reads them: both must stop at the same count.
-    def both_stop_at(limits):
+    def both_stop_at(limits, escalated=None):
         """(requests the monitor made, fixes the driver sent, pages the monitor posted) for one
         pull request that goes CONFLICTING once per entry of `limits` — the limit the monitor runs
-        under that time — each fixed once the driver answered."""
+        under that time — each fixed once the driver answered. When the driver leaves an open
+        request unanswered, the monitor runs again past its ack deadline, as it would on its next
+        tick, and the escalations it posts are appended to `escalated` (KIT-749)."""
         gh = prc.FakeGh([prc._pr(41)])
         rows, sent = [], 0
         for limit in limits:
@@ -7616,10 +7619,17 @@ def selftest():
                 rows.append({"outcome": "conflict", "episode": view["episode"],
                              "conflict_no": view["conflict_no"]})
                 gh.comment(41, prc.marker("ack", view["episode"]))      # the driver claims it
+            elif view and view["state"] == "spent" and escalated is not None:
+                late = prc.NOW + timedelta(minutes=prc.ACK_DEADLINE_MIN + 1)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    prc.monitor(gh, late, **mute)                       # nobody answered in time
             gh.prs[0]["mergeable"] = "MERGEABLE"                        # the session fixed it
             with contextlib.redirect_stdout(io.StringIO()):
                 prc.monitor(gh, prc.NOW, **mute)                        # the episode ends
         pages = sum(1 for c in gh.comments(41) if c["body"].startswith("<!-- pr-conflict:page"))
+        if escalated is not None:
+            escalated.extend(int(c["body"].split("episode=", 1)[1].split(" ", 1)[0])
+                             for c in gh.comments(41) if c["body"].startswith("<!-- pr-conflict:escalated"))
         return prc.episode_state(gh.comments(41))["requests"], sent, pages
 
     for monitor_limit in (5, 0, 3, 1, 20):
@@ -7627,10 +7637,14 @@ def selftest():
               "and every conflict after it is paged" % monitor_limit,
               both_stop_at([monitor_limit] * (monitor_limit + 2)), (monitor_limit, monitor_limit, 2))
     # A repository can change its limit while a pull request lives: each request states the one in
-    # force when it was written, and the driver follows the request in front of it.
-    check("KIT-670 raised from 3 to 5 after a page, the pull request gets two more fixes — five in all, "
-          "with the monitor",
-          both_stop_at([3] * 4 + [5] * 4), (5, 5, 3))
+    # force when it was written, and the driver keeps the LOWEST any of them stated (KIT-749).
+    # A RAISE does not reach a pull request already in flight. The monitor asks for fixes 4 and 5
+    # under its new limit; the driver has sent the 3 the earlier requests allowed and sends no more;
+    # nobody acknowledges; and at its deadline the monitor pages a person, once per request.
+    escalations = []
+    check("KIT-749 raised from 3 to 5 while the pull request is in flight, the driver stops at 3 and "
+          "the monitor pages a person at its deadline for each request past it",
+          (both_stop_at([3] * 4 + [5] * 4, escalated=escalations), escalations), ((5, 3, 3), [5, 6]))
     check("KIT-670 lowered from 5 to 2 after three fixes, no more are asked for or sent",
           both_stop_at([5] * 3 + [2] * 2), (3, 3, 2))
 
@@ -7670,6 +7684,21 @@ def selftest():
            stands([ask(6, limit="five"), forged_ask(7, limit="twenty")], 5),
            stands([ask(4, limit="five"), forged_ask(5, limit="one")], 3)),
           (("spent", 3), ("spent", 5), ("request", 5)))
+    # KIT-749: the cap is the LOWEST limit any request the Actions bot wrote on the pull request has
+    # stated, in any episode. A later request can lower it and never raise it, so a request the bot
+    # account itself forged (any workflow with a write token can post one) buys no fix an earlier
+    # request did not allow.
+    check("KIT-749 a later request the Actions bot itself wrote cannot raise the cap: twenty after none "
+          "stops at 3, and twenty after five stops at 5",
+          (stands([ask(3), ask(4, limit="twenty")], 3), stands([ask(5, limit="five"), ask(6, limit="twenty")], 5)),
+          (("spent", 3), ("spent", 5)))
+    check("KIT-749 a later request can lower the cap: five, then two, stops at 2",
+          stands([ask(1, limit="five"), ask(3, limit="two")], 2), ("spent", 2))
+    check("KIT-749 a forged FIRST request is held to the lowest a later one states: twenty, then none, "
+          "stops at 3",
+          stands([ask(1, limit="twenty"), ask(4)], 3), ("spent", 3))
+    check("KIT-749 a stated zero anywhere on the pull request holds: zero, then five, sends nothing",
+          stands([ask(1, limit="zero"), ask(2, limit="five")], 0), ("spent", 0))
 
     # 10o. C1: the one-shot pass the LaunchDaemon invokes. It leaves a heartbeat on every
     #      path — the §13 distinction applied to the daemon itself, since "ran, nothing to
@@ -8023,10 +8052,15 @@ def selftest():
            or ("prc." + name + ",") in src or ("prc." + name + "\n") in src], [])
     # KIT-670: ONE source for the fix limit. This file holds no number of its own and never reads
     # the module's default directly: every limit it counts against or prints comes from the
-    # request, through the one reader. (The cases at 10r prove it by behaviour; this one is the
-    # tripwire for the next edit. Needles built from parts so no check counts itself.)
-    check("KIT-670 the driver reads the fix limit through prc.fix_limit and never the default constant",
-          (("prc." + "MAX_FIX_REQUESTS") in src, ("prc." + "fix_limit(") in src), (False, True))
+    # requests, through the one reader. KIT-749: that reader is `fix_cap`, the lowest limit the
+    # PR's requests stated; the driver's own code never reads one request's limit (`fix_limit`),
+    # which is how a later request raised the cap. (The cases at 10r prove it by behaviour; this
+    # is the tripwire for the next edit. Needles built from parts so no check counts itself.)
+    code = src.split("\ndef " + "selftest():", 1)[0]
+    check("KIT-749 the driver counts against prc.fix_cap, never one request's prc.fix_limit, and never "
+          "the default constant",
+          (("prc." + "MAX_FIX_REQUESTS") in src, ("prc." + "fix_cap(") in code, ("prc." + "fix_limit(") in code),
+          (False, True, False))
 
     if failures:
         print("FAIL pipeline_bounce_local selftest:")
