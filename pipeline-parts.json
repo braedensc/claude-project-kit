@@ -1097,7 +1097,9 @@
               "<claude>",
               "--repo-dir",
               "<REPO_DIRS>",
-              "--claude-arg=<CLAUDE_ARGS>"
+              "--check-command=<CHECK_COMMANDS>",
+              "--model",
+              "<MODEL>"
             ]
           },
           "schedule": "interval",

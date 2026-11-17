@@ -29,6 +29,13 @@
 # FORMAT.  `KEY=value`, one per line; `#` starts a comment only at the start of
 # a line.  Parsed, never sourced.  A duplicate key is an error.  No value here
 # ever holds a credential — the waker uses your own `claude` and `gh` logins.
+#
+# CLAUDE_ARGS is gone (KIT-676): a conf that still sets it is refused by name.
+# Move your local gate to CHECK_COMMANDS and a model to MODEL.
+#
+# Each REPO_DIRS checkout needs an HTTPS origin.  A fix session's git runs in
+# Claude Code's sandbox, where SSH cannot connect on macOS, so the installer
+# refuses an SSH origin and prints the command that changes it.
 # ---------------------------------------------------------------------------
 
 # The checkouts whose worktrees your sessions run in — the directory you start
@@ -65,15 +72,21 @@ MAX_SESSIONS_PER_PASS=2
 # `fresh` starts a new one.
 RESUME_MODE=from-pr
 
-# Extra arguments for `claude`, space-separated.  A headless session gets only
-# the tools your settings and these allow, and it cannot ask for more.  The fix
-# prompt needs three kinds: git (merge, commit, push), gh (watch CI), and every
-# runner your local gate uses — the prompt tells it to run the checks your
-# CLAUDE.md names before pushing.  Without git or gh it ends `failed` and the
-# monitor pages you; without the gate's runners it pushes an untested merge or
-# ends `failed`.  In this kit the gate is `npm run test:hooks` and
-# `python3 scripts/check_placeholders.py`, so its line is:
-#   --permission-mode acceptEdits --allowedTools Bash(git:*) Bash(gh:*) Bash(npm:*) Bash(python3:*)
-# Swap the last two for your own gate's runners.  Each one you allow is a whole
-# interpreter the session may run (under the repo's hooks), so allow only those.
-CLAUDE_ARGS=
+# Your local gate: the checks a fix session runs before it pushes, each by its
+# exact words, comma-separated (so a check cannot hold a comma).  A fix session
+# may run only these and the git and gh steps of its prompt.  It loads none of
+# your settings and none of the worktree's.  Its file tools reach only its
+# worktree, and its commands run in Claude Code's sandbox (KIT-676).
+# A check left out here is never run, and the fix is pushed with only CI to
+# test it.  The installer finds each check's program on your PATH now and puts
+# its folder on the job's PATH.  In this kit the gate is:
+#   CHECK_COMMANDS=npm run test:hooks, python3 scripts/check_placeholders.py
+# RULE: one plain command each.  No `*`, and no `;` `&` `|` `<` `>` `$` or
+# backquote: the session is allowed each check by its exact words, and nothing
+# that would turn one into a pattern or two commands is accepted.
+CHECK_COMMANDS=
+
+# The fix session's model, e.g. `sonnet`.  Empty means Claude Code's default.
+# Your own settings no longer reach the session, so a model set there does not
+# apply to it.
+MODEL=

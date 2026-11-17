@@ -1904,8 +1904,8 @@ CARDS = {
                 "Once loaded, each pass starts a paid session per unclaimed fix request, up to "
                 "its session cap. The count, and whether the fix session gets the tools it "
                 "needs, are yours to judge. Its sign-off lives in the waker's own ledger."),
-        "do": ["Read the conflict waker's dry run printed above (`would wake [...]`), and its",
-               "card, which says what to check in CLAUDE_ARGS:",
+        "do": ["Read the conflict waker's dry run printed above (`would wake [...]` and its",
+               "`fix session:` lines), and its card, which says what to check in CHECK_COMMANDS:",
                "    python3 scripts/pipeline_conflict_waker_setup.py card CK-W1",
                "Then sign the count off there and re-run this installer:",
                "    python3 scripts/pipeline_conflict_waker_setup.py attest A-WAKE-DRY-RUN "
