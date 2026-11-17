@@ -1485,7 +1485,7 @@ def _selftest_body():
     nvm_npm = "/Users/you/.nvm/versions/node/v22.23.0/bin/npm"
     c, f = _fake_ctx(GOOD_CONF + "CHECK_COMMANDS=npm run test:hooks, ./scripts/check.sh, nosuchtool --x\n")
     f.answers = [("command -v npm", 0, nvm_npm + "\n"),
-                 ("src/kit remote get-url origin", 0, "git@github.com:example-org/kit.git\n")] + _settled_answers(c)
+                 ("src/kit remote get-url origin", 0, "git@example.invalid:example-org/kit.git\n")] + _settled_answers(c)
     rows, _ = quiet(lambda: measure(c, apply_it=False))
     detail = rows[0][2] if rows else ""
     expect("preflight-checks-and-ssh", rows and rows[0][1] == FAILED
@@ -1498,8 +1498,9 @@ def _selftest_body():
     expect("preflight-check-found", rows and rows[0][1] == ALREADY_DONE and c.check_dirs == [os.path.dirname(nvm_npm)]
            and os.path.dirname(nvm_npm) in plistlib.loads(render_plist(c).encode())["EnvironmentVariables"]["PATH"],
            "%s %s" % (rows[:1], c.check_dirs))
-    for url, want in (("git@github.com:o/n.git", True), ("ssh://git@github.com/o/n", True),
-                      ("https://github.com/o/n.git", False), ("https://user@github.com/o/n", False)):
+    # Every host here is example.invalid: the provenance scan reads a real host after a user as an email.
+    for url, want in (("git@example.invalid:o/n.git", True), ("ssh://git@example.invalid/o/n", True),
+                      ("https://example.invalid/o/n.git", False), ("https://user@example.invalid/o/n", False)):
         expect("ssh-url-%s" % url, ssh_url(url) is want, url)
 
     # 14. the clone is `behind` only when a script the job runs changed: a merge elsewhere leaves
