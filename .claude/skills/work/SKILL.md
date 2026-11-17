@@ -37,9 +37,10 @@ when a detail here is not enough; do not invent a second shape for anything it d
 > `mcp__ticket__file_finding` and `mcp__ticket__report_done`. They take no ticket id: they
 > know your run's (`docs/RUNNER.md`, *The session's own tracker tools*). When you have them,
 > they are your only way to the tracker, and they replace the safe-outputs file. Read the
-> ticket with `read_ticket` (step 2). Post the plan and the summary with `comment` (step 5).
-> Escalate with `ask_question` (step 5). Request a finding with `file_finding` (step 5). End
-> with `report_done` (step 9), which builds the telemetry block from your run's own facts.
+> ticket with `read_ticket` (step 2). Post the plan with `comment` (step 5). Escalate with
+> `ask_question` (step 5). Request a finding with `file_finding` (step 5). End with
+> `report_done` (step 9): it posts your summary, with the telemetry block it builds from your
+> run's own facts.
 > Then write no safe-outputs file. Never type a mark or a block into a `comment`: it is
 > refused, because each one has its own tool.
 
