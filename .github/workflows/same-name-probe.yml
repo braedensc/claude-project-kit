@@ -1,0 +1,24 @@
+name: Same-name probe
+
+# A THROWAWAY EXPERIMENT. Its pull request is closed unmerged once it has been read.
+# It measures one rule GitHub does not document: when two check runs on one commit carry
+# a required check's name, the earlier one red and the later one green, does branch
+# protection still block the merge? This job takes the label gate's name and passes four
+# minutes after the real gate has failed on this same pull request.
+
+on:
+  pull_request:
+    types: [opened]
+
+permissions: {}
+
+jobs:
+  probe:
+    name: Hooks change guard
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Pass well after the real gate has finished
+        run: |
+          sleep 240
+          echo "probe: a later green run under the gate's name"
