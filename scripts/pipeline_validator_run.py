@@ -258,7 +258,9 @@ def run_agent(cfg, brief, environ=None, runner=None):
     """THE ONE CALL: one run of the claude CLI with `brief` (build_brief's answer) on stdin.
     Returns {"text", "hold", "why", "cost"}: the model's raw text and no hold, or no text and a
     closed word from HOLDS with fixed words. It starts at most one process, once, and never
-    raises for a failed run. `runner` stands in for the CLI in a selftest."""
+    raises for a failed run. `runner` stands in for the CLI in a selftest. `environ` is read for
+    the token and the agent markers only: the child's PATH and LANG are this job's own, as the
+    writer's are (pipeline_voice.child_env)."""
     environ = os.environ if environ is None else environ
     s, bad = settings(cfg)
     if bad:
@@ -390,6 +392,9 @@ def selftest():
     check("its token is the setup token, under the name the CLI reads",
           (env[voice.CHILD_TOKEN_VAR], env["DISABLE_AUTOUPDATER"],
            env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"]), (TOKEN, "1", "1"))
+    check("its PATH and LANG are this job's own, as the writer's are, not the environ it was given",
+          (env["PATH"], env["LANG"]), (os.environ.get("PATH") or voice.DEFAULT_PATH,
+                                       os.environ.get("LANG") or voice.DEFAULT_LANG))
     check("no GitHub token, no tracker key and no token in the command line",
           [v for v in ENV.values() if v.startswith(("gho_", "lin_api_")) and (
               v in env.values() or any(v in a for a in call["argv"]))]
