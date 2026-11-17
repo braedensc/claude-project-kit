@@ -43,6 +43,10 @@ ONE PASS, IN ORDER
      the place of the earlier check's ledger row once that check is over and its ticket is closed. The same ledger,
      row first; never while one of its checks runs. A request is acted on once its check starts or its start fails;
      one that has to wait is acted on at a later pass.
+     A plan whose pieces all merged also gets a record of whether the head its last pull request merged at was checked,
+     in `<ledger>.coverage.json` (KIT-763): covered by a check at that head or one started after the merge, or not
+     covered, in which case one check of the default branch starts when nothing of the plan runs. A lookup it cannot
+     read leaves no record and is said.
 
 THE SECOND PASS (contract section 27, KIT-608). A result that lists a problem is not concluded at once: the pass replies
 in the session's own thread, the bounce driver's route, naming each problem and its screenshot, and asks for one
@@ -127,6 +131,9 @@ MAX_CHILDREN = 50
 MAX_LINKS = 20
 MAX_CHECK_BLOCKS = 20
 MAX_CHECK_RUNS = 100
+MAX_MERGED_PRS = 20                  # the merged pull requests one plan's coverage reads
+COVERAGE_SCHEMA = "pipeline-acceptance-coverage/1"
+COVERAGE_SUFFIX = ".coverage.json"   # next to the ledger: <ledger>.coverage.json
 DONE_STATES = ("completed",)
 # The review poller's own window for finding a ticket's agent session, and its query shapes. Copied, not imported:
 # that file stops when its publisher is missing. The selftest pins each copy to it.
@@ -813,7 +820,7 @@ def gather_facts(cfg, linear, github, problems, out, authors=()):
             problems.append("%s has more than %d pieces, so whether all but one are done cannot be told" % (ticket,
                                                                                                          MAX_CHILDREN))
             continue
-        pieces, open_kids, repos, cut = [], [], set(), False
+        pieces, open_kids, repos, cut, merged_prs = [], [], set(), False, []
         for k in kids.get("nodes") or []:
             kind = ((k or {}).get("state") or {}).get("type")
             if kind == "canceled" or not TICKET_RE.match(str((k or {}).get("identifier") or "")):
@@ -823,6 +830,7 @@ def gather_facts(cfg, linear, github, problems, out, authors=()):
             prs, complete = linked_prs(k)
             cut = cut or not complete
             repos.update(p["repo"].lower() for p in prs)
+            merged_prs += [p for p in prs if p["status"] == "merged"]
             if not done:
                 open_kids.append((k, prs))
         if cut:
@@ -849,7 +857,7 @@ def gather_facts(cfg, linear, github, problems, out, authors=()):
             continue
         plan = {"plan": ticket, "repo": repo, "acceptance": acceptance_of[repo], "pieces": pieces}
         info[ticket] = {"epic_id": epic_id, "repo": repo, "epic": epic,
-                        "requested_at": newest_request(epic, ticket, authors)}
+                        "requested_at": newest_request(epic, ticket, authors), "merged_prs": merged_prs}
         if plan["acceptance"] and len(open_kids) == 1:
             kid, prs = open_kids[0]
             live = [p for p in prs if p["status"] not in ("merged", "closed")]
@@ -1151,6 +1159,99 @@ class Pass:
         finally:
             lock.close()
 
+    # ---- after the merge: was the merged head checked (KIT-763)
+    def last_merge(self, info):
+        """(head, merged_at, number) of the plan's last merged pull request, as GitHub names them: the head it merged at
+        and when. Raises RunError when it cannot be told: no merged pull request is linked, too many are, or GitHub's
+        answer names no full head or no merge time. Never a guess."""
+        merged = info.get("merged_prs") or []
+        if not merged:
+            raise RunError("no merged pull request is linked to its pieces")
+        if len(merged) > MAX_MERGED_PRS:
+            raise RunError("%d merged pull requests are linked, past the %d it reads" % (len(merged), MAX_MERGED_PRS))
+        best = None
+        for pr in merged:
+            doc = self.github.pr(pr["repo"], pr["number"])
+            head = ((doc or {}).get("head") or {}).get("sha") if isinstance(doc, dict) else None
+            at = _epoch(doc.get("merged_at")) if isinstance(doc, dict) and isinstance(doc.get("merged_at"), str) else None
+            if not SHA_RE.match(str(head or "")) or at is None:
+                raise RunError("GitHub names no merge time or full head for %s#%d" % (pr["repo"], pr["number"]))
+            if best is None or at > best[1]:
+                best = (head, at, pr["number"])
+        return best
+
+    def coverage_path(self):
+        return self.cfg["ledger"] + COVERAGE_SUFFIX
+
+    def write_coverage(self, plan, entry):
+        """Set (or, with None, remove) one plan's record in the coverage file next to the ledger, atomically. A file that
+        is not this schema is replaced and said: the records it held are rewritten by the next pass."""
+        path = self.coverage_path()
+        plans = {}
+        try:
+            with open(path, encoding="utf-8") as fh:
+                doc = json.load(fh)
+            if not isinstance(doc, dict) or doc.get("schema") != COVERAGE_SCHEMA or not isinstance(doc.get("plans"), dict):
+                raise ValueError("not a %s document" % COVERAGE_SCHEMA)
+            plans = doc["plans"]
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as exc:
+            self.problems.append("%s: the coverage records could not be read (%s), so they were written again"
+                                 % (plan, exc))
+        if entry is None:
+            if plan not in plans:
+                return
+            del plans[plan]
+        else:
+            plans[plan] = entry
+        _atomic_write_json(path, {"schema": COVERAGE_SCHEMA, "plans": plans})
+
+    def settle_merged(self, plan, info, running):
+        """A plan whose pieces all merged: was the head its last pull request merged at checked? Covered when the ledger
+        holds a check at that head, or one started after the merge (a check of the default branch); a failed start
+        covers nothing. Not covered, with nothing of the plan's running: one check of the default branch starts (the
+        same ledger rule as every start, so never a second for one head). The record, one per plan next to the ledger,
+        is written after that decision and says covered or not, with the merged head. When the ledger or the merge
+        cannot be read, no record is left for the plan (so the bridge holds it) and the pass says what it could not
+        read; a plan that never had a check still gets its first one."""
+        if self.dry:
+            if not any(pl == plan for pl, _h in poller.load_ledger(self.cfg["ledger"])):
+                self.start_default(plan, info, "its pieces merged before a check ran")
+            return
+        try:
+            rows = poller.load_ledger(self.cfg["ledger"])
+        except poller.LedgerError as exc:
+            self.problems.append("%s: the ledger could not be read (%s), so whether its merged head was checked is not "
+                                 "known" % (plan, exc))
+            self.write_coverage(plan, None)
+            return
+        mine = [r for (pl, _h), r in rows.items() if pl == plan]
+        try:
+            head, merged_at, number = self.last_merge(info)
+        except (RunError, NotFound) as exc:
+            self.problems.append("%s: its last merged pull request could not be read (%s), so whether its merged head "
+                                 "was checked is not known" % (plan, exc))
+            self.write_coverage(plan, None)
+            if not mine:
+                self.start_default(plan, info, "its pieces merged before a check ran")
+            return
+        by = None
+        for row in mine:
+            if row["status"] == "failed":
+                continue
+            if row["head"] == head or (_epoch(row["at"]) or 0) >= merged_at:
+                by = row["head"]
+                break
+        covered = by is not None
+        if not covered and not running:
+            self.start_default(plan, info, "its pieces merged before a check ran" if not mine else
+                               "its last piece merged at %s, a head no check covered" % head[:12])
+        self.write_coverage(plan, {"merged_head": head, "merged_pr": number, "merged_at": _iso(merged_at),
+                                   "covered": covered, "by": by, "looked_at": _iso(self.now)})
+        self.say("%-10s merged head %s: %s" % (plan, head[:12], "covered by a check at %s" % by[:12] if covered
+                                             else "not covered by any check"))
+
     def start_asked(self, facts, info):
         """The check the owner asked for (contract section 26). After the merge, of the default branch; before it, of
         the last piece's pull-request head, once the usual rule has checked that head (a head it has not checked yet
@@ -1424,14 +1525,16 @@ def run_once(cfg, linear, github, now, out, dry_run=False):
         if not plan["acceptance"] or name not in info:
             continue
         mine = [r for (pl, _h), r in rows_now.items() if pl == name]
-        if any(r["status"] in ("starting", "started") and r.get("verdict") is None for r in mine):
-            continue
+        running = any(r["status"] in ("starting", "started") and r.get("verdict") is None for r in mine)
         asked = info[name].get("requested_at")
-        if asked is not None and asked > max([_epoch(r["at"]) or 0 for r in mine] + [asked_before.get(name, 0)]):
+        if not running and asked is not None and asked > max([_epoch(r["at"]) or 0 for r in mine]
+                                                              + [asked_before.get(name, 0)]):
             if p.start_asked(plan, info[name]):
                 asked_before[name] = asked
-        elif not mine and poller.decide_plan(plan)[0] == "all-done":
-            p.start_default(name, info[name], "its pieces merged before a check ran")
+        elif poller.decide_plan(plan)[0] == "all-done":
+            # Every pass says whether the head the last piece merged at was checked, and starts a check of the default
+            # branch when it was not and nothing of the plan runs (KIT-763).
+            p.settle_merged(name, info[name], running)
     for (plan, head), row in sorted(poller.load_ledger(cfg["ledger"]).items()):
         if row["status"] == "started" and row.get("verdict") is None:
             p.collect(plan, head)
@@ -2210,12 +2313,118 @@ def selftest():
         lin.epics["e-TOD-100"]["children"]["nodes"][1]["state"]["type"] = "completed"
         lin.epics["e-TOD-100"]["children"]["nodes"][1]["attachments"]["nodes"][0]["metadata"]["status"] = "merged"
         lin.epics["e-TOD-100"]["comments"] = {"nodes": []}
+        # What GitHub says of the two merged pull requests: #7 merged last, at head H1, an hour and a bit before NOW.
+        gh.prs[("acme/app", 5)] = {"state": "closed", "head": {"sha": H3}, "merged_at": _iso(NOW - 5000)}
+        gh.prs[("acme/app", 7)] = {"state": "closed", "head": {"sha": H1}, "merged_at": _iso(NOW - 1000)}
         return lin, gh
 
     def ask(lin, at, author="owner-1", plan="TOD-100", first=None):
         lin.epics["e-TOD-100"]["comments"]["nodes"].insert(0, {
             "body": (first or CHECK_REQUEST_MARK % plan) + "\nAsked by the owner, in the DM.",
             "createdAt": _iso(at).replace("Z", ".000Z"), "user": {"id": author}})
+    coverage_file = cfg["ledger"] + COVERAGE_SUFFIX
+
+    def coverage(plan="TOD-100"):
+        try:
+            with open(coverage_file, encoding="utf-8") as fh:
+                doc = json.load(fh)
+        except (OSError, ValueError):
+            return None
+        return doc["plans"].get(plan) if doc.get("schema") == COVERAGE_SCHEMA else "bad schema"
+
+    def seed(rows):
+        poller.write_ledger(cfg["ledger"], {(r["plan"], r["head"]): r for r in rows})
+
+    def row(head, at, verdict=True, status="started"):
+        doc = {"plan": "TOD-100", "head": head, "status": status, "at": _iso(at)}
+        if verdict:
+            doc["verdict"] = {"word": "passed", "status": "written", "at": _iso(at + 60)}
+        return doc
+
+    # 11a. KIT-763: after the merge, was the head the last piece merged at checked?
+    # (1) a check ran at that very head before the merge: covered, by that head, and no second check starts.
+    clean()
+    lin, gh = merged_world()
+    seed([row(H1, NOW - 3000)])
+    code, out = go(lin, gh)
+    expect(code == EXIT_OK and not lin.calls and (coverage() or {}).get("covered") is True
+           and coverage()["by"] == H1 and coverage()["merged_head"] == H1,
+           "a plan merged at a checked head is covered by it, and nothing starts: %s %r %r" % (out, lin.calls, coverage()))
+    # (2) the only check ran at an older head, before the merge: not covered, the head named, one check of main starts,
+    #     and the next pass sees that check, started after the merge, and never starts another.
+    clean()
+    lin, gh = merged_world()
+    seed([row(H2, NOW - 3000)])
+    code, out = go(lin, gh)
+    D = "d" * 40
+    rec = coverage() or {}
+    expect(code == EXIT_OK and rec.get("covered") is False and rec.get("merged_head") == H1 and rec.get("by") is None
+           and lin.kinds() == ["create", "delegate"] and ("TOD-100", D) in poller.load_ledger(cfg["ledger"]),
+           "a plan merged at a head no check ran on is recorded not covered, with that head, and one check of main "
+           "starts: %s %r %r" % (out, lin.calls, rec))
+    code, out = go(lin, gh, now=NOW + 60)
+    rec = coverage() or {}
+    expect(rec.get("covered") is True and rec.get("by") == D and lin.kinds() == ["create", "delegate"],
+           "the next pass finds the check started after the merge and starts no second one: %s %r" % (out, rec))
+    # (3) a check of the older head is still running: not covered, and nothing starts until it is over.
+    clean()
+    lin, gh = merged_world()
+    seed([row(H2, NOW - 3000, verdict=False)])
+    code, out = go(lin, gh)
+    expect(not lin.calls and (coverage() or {}).get("covered") is False,
+           "nothing starts while a check of the plan runs, and the record says not covered: %s %r" % (out, lin.calls))
+    # (4) a start that failed covers nothing.
+    clean()
+    lin, gh = merged_world()
+    seed([row(H1, NOW - 3000, verdict=False, status="failed")])
+    code, out = go(lin, gh)
+    expect((coverage() or {}).get("covered") is False and lin.kinds() == ["create", "delegate"],
+           "a failed start covers nothing: %s %r" % (out, coverage()))
+    # (5) the merge lookup cannot be read: no record is left (an old "covered" one is removed), it is said, and a plan
+    #     with no check at all still gets its first one.
+    clean()
+    lin, gh = merged_world()
+    seed([row(H1, NOW - 3000)])
+    go(lin, gh)
+    expect((coverage() or {}).get("covered") is True, "the record is there before the lookup fails")
+    gh.fail.add("pr")
+    code, out = go(lin, gh, now=NOW + 60)
+    expect(coverage() is None and "NOT DONE: TOD-100: its last merged pull request could not be read" in out
+           and code == EXIT_DECLINED and not lin.calls,
+           "an unreadable merge lookup leaves no record, and is said: %s %r" % (out, coverage()))
+    clean()
+    lin, gh = merged_world()
+    gh.fail.add("pr")
+    code, out = go(lin, gh)
+    expect(coverage() is None and lin.kinds() == ["create", "delegate"] and "could not be read" in out,
+           "a plan never checked still gets its first check when the lookup fails, with no record: %s" % out)
+    # (6) the ledger cannot be read: no record is written and the pass says it.
+    clean()
+    lin, gh = merged_world()
+    seed([row(H1, NOW - 3000)])
+    go(lin, gh)
+    with open(cfg["ledger"], "w") as fh:
+        fh.write("not json")
+    pass_ = Pass(cfg, lin, gh, NOW + 60, io.StringIO())
+    pass_.settle_merged("TOD-100", {"repo": "acme/app", "merged_prs": [{"repo": "acme/app", "number": 7}]}, False)
+    expect(coverage() is None and any("the ledger could not be read" in x for x in pass_.problems),
+           "an unreadable ledger leaves no record and is said: %r %r" % (coverage(), pass_.problems))
+    # (7) a dry run writes no record.
+    clean()
+    lin, gh = merged_world()
+    seed([row(H1, NOW - 3000)])
+    go(lin, gh, dry=True)
+    expect(not os.path.exists(coverage_file), "a dry run writes no coverage record")
+    # (8) the record's shape: the schema, and one entry per plan.
+    clean()
+    lin, gh = merged_world()
+    seed([row(H1, NOW - 3000)])
+    go(lin, gh)
+    rec = coverage() or {}
+    expect(sorted(rec) == ["by", "covered", "looked_at", "merged_at", "merged_head", "merged_pr"]
+           and rec["merged_at"] == _iso(NOW - 1000) and rec["merged_pr"] == 7,
+           "the record names the merged head, pull request and time, and what covers it: %r" % rec)
+
     clean()
     lin, gh = merged_world()
     code, out = go(lin, gh, dry=True)

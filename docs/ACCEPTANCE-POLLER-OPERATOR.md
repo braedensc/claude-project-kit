@@ -180,6 +180,23 @@ one holds the plan. Look at the ticket's thread: the session may not have taken 
 the head the default branch is at then. The bridge waits for a verdict before it closes a plan, so one must come. No
 step from you.
 
+**After the merge, was the merged head checked? The coverage record.** A check that ran before the last piece merged
+may have run on an older head: a fix was pushed after it, and merged. So each pass, for every plan whose pieces all
+merged, the pass reads the plan's last merged pull request from GitHub (its head, and when it merged) and compares them
+with the ledger. The plan is **covered** when the ledger holds a check at that head, or a check that started after the
+merge. A check whose start failed covers nothing. When it is not covered and nothing of the plan is running, the pass
+starts one check of the default branch, once per head.
+
+The pass writes its answer, one entry per plan, to a file next to the ledger: `<ledger>.coverage.json`
+(`pipeline-acceptance-coverage/1`). An entry holds `merged_head`, `merged_pr`, `merged_at`, `covered` (true or false),
+`by` (the head of the check that covers it, or null) and `looked_at`. The entry is written after the decision, so on
+the pass that starts the check it says not covered, and on the next it says covered, by that check.
+**Good:** `TOD-100    merged head aaaaaaaaaaaa: covered by a check at aaaaaaaaaaaa`.
+**Not:** `NOT DONE: TOD-100: its last merged pull request could not be read`. The pass could not tell, so it leaves no
+entry for the plan, and removes an older one. No entry means "not looked at", never "covered". A plan with no check at
+all still gets its first one. A ledger that cannot be read is said the same way.
+Nothing reads this file yet: the bridge holding a finished plan on it is its own piece.
+
 **When you ask: `check <epic>`.** The Slack bridge posts a request on the epic (contract §26) when you send `check
 <epic>` and say yes. The next pass runs the plan's check again, even at a head it checked before:
 
