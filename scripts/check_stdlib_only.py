@@ -97,6 +97,33 @@ def own_modules(files, rel):
     return {os.path.splitext(os.path.basename(f))[0] for f in files if os.path.dirname(f) in folders}
 
 
+def unused_import_paths(sources, import_path=None):
+    """[message] for each IMPORT_PATH (folder, added folder) pair that no import of a file in
+    `folder` needs: a module of the added folder that the file's own folder lacks. Like an ALLOWED
+    entry that matches nothing, a stale pair would keep exempting names for no reason."""
+    import_path = IMPORT_PATH if import_path is None else import_path
+    used = set()
+    for rel in sources:
+        here = os.path.dirname(rel)
+        extras = import_path.get(here, ())
+        if not extras:
+            continue
+        try:
+            found = imports(sources[rel])
+        except SyntaxError:
+            continue
+        mine = {os.path.splitext(os.path.basename(f))[0] for f in sources if os.path.dirname(f) == here}
+        for _line, mod in found:
+            if mod in STDLIB or mod in mine:
+                continue
+            for extra in extras:
+                if any(os.path.dirname(f) == extra and os.path.splitext(os.path.basename(f))[0] == mod
+                       for f in sources):
+                    used.add((here, extra))
+    return [f"IMPORT_PATH entry ({folder}, {extra}) is used by no import: remove it"
+            for folder, extras in sorted(import_path.items()) for extra in extras if (folder, extra) not in used]
+
+
 def imports(source):
     """[(line, top-level module)] for every absolute import at any depth. Relative imports
     (`from . import x`) are the kit's own and are skipped. Raises SyntaxError on bad source."""
@@ -164,6 +191,7 @@ def verdict(root):
         except (OSError, UnicodeDecodeError) as exc:
             return 2, [f"COULD NOT CHECK: {rel} unreadable ({exc}); this is not a pass"]
     problems, outside = judge(sources)
+    problems += unused_import_paths(sources)
     if problems:
         return 1, ["FAIL: " + p for p in problems]
     return 0, [f"OK: {len(files)} Python file(s), {len(outside)} allowed outside import(s), "
@@ -189,6 +217,14 @@ def selftest():
     expect(bad("import yaml\n", extra={".claude/hooks/yaml.py": ""}), "a hooks file exempted yaml for a script")
     expect(not judge({".claude/hooks/t.py": "import b\n", "scripts/b.py": ""}, ())[0], "hooks' import path flagged")
     expect(judge({"docs/t.py": "import b\n", "scripts/b.py": ""}, ())[0], "an unrelated folder reached scripts")
+    # an IMPORT_PATH pair that nothing uses is stale, like an ALLOWED entry that matches nothing
+    pair = {".claude/hooks": ("scripts",)}
+    fake = {".claude/hooks/t.py": "import b\n", "scripts/b.py": ""}
+    expect(unused_import_paths(fake, pair) == [], "a used IMPORT_PATH pair flagged")
+    expect(len(unused_import_paths({".claude/hooks/t.py": "import os\n", "scripts/b.py": ""}, pair)) == 1,
+           "an unused IMPORT_PATH pair must fail")
+    expect(len(unused_import_paths({".claude/hooks/t.py": "import t2\n", ".claude/hooks/t2.py": "", "scripts/b.py": ""}, pair)) == 1,
+           "a module found in the file's own folder does not use the pair")
     expect(not bad("from . import x\nfrom .y import z\n"), "a relative import flagged")
     for src in ("import yaml\n", "import yaml.nodes\n", "from yaml import safe_load\n",
                 "def f():\n    import yaml\n", "try:\n    import yaml\nexcept ImportError:\n    pass\n",
