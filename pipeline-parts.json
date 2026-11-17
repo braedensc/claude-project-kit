@@ -529,7 +529,8 @@
           "interval_key": "POLL_INTERVAL_SECONDS",
           "log": "<role home>/.stage-e/poller.log",
           "switch": null,
-          "switch_reason": "No settings key turns it off; it runs while launchd holds it."
+          "switch_reason": "No settings key turns it off; it runs while launchd holds it.",
+          "watched_by": "heartbeat-monitor"
         },
         {
           "label": "<prefix>.stage-e-bounce",
@@ -547,7 +548,8 @@
           "interval_key": "BOUNCE_INTERVAL_SECONDS",
           "log": "<role home>/.stage-e/bounce.log",
           "switch": null,
-          "switch_reason": "No settings key turns it off; it runs while launchd holds it."
+          "switch_reason": "No settings key turns it off; it runs while launchd holds it.",
+          "watched_by": "heartbeat-monitor"
         }
       ],
       "person_steps": [
@@ -669,7 +671,8 @@
           "interval_key": "FINDING_INTERVAL_SECONDS",
           "log": "<role home>/.stage-e/finding/poller.log",
           "switch": null,
-          "switch_reason": "No settings key turns it off; it runs while launchd holds it."
+          "switch_reason": "No settings key turns it off; it runs while launchd holds it.",
+          "watched_by": "heartbeat-monitor"
         }
       ],
       "person_steps": [],
@@ -755,7 +758,8 @@
             "key": "CATCHUP_INTERVAL_SECONDS",
             "example": "stage-e.conf.example"
           },
-          "switch_reason": null
+          "switch_reason": null,
+          "watched_by": "heartbeat-monitor"
         }
       ],
       "person_steps": [
@@ -848,7 +852,8 @@
             "key": "STATUS_INTERVAL_SECONDS",
             "example": "stage-e.conf.example"
           },
-          "switch_reason": null
+          "switch_reason": null,
+          "watched_by": "heartbeat-monitor"
         }
       ],
       "person_steps": [
@@ -945,7 +950,8 @@
             "key": "HEARTBEAT_MONITOR_TICKET",
             "example": "stage-e.conf.example"
           },
-          "switch_reason": null
+          "switch_reason": null,
+          "watched_by": "health-watch"
         }
       ],
       "person_steps": [
@@ -1107,7 +1113,8 @@
             "key": "CONFLICT_WAKER_CONF",
             "example": "stage-e.conf.example"
           },
-          "switch_reason": null
+          "switch_reason": null,
+          "watched_by": "health-watch"
         }
       ],
       "person_steps": [
@@ -1213,7 +1220,8 @@
           "interval_key": "POLL_INTERVAL_SECONDS",
           "log": "<role home>/.stage-a/poller.log",
           "switch": null,
-          "switch_reason": "No settings key turns it off; it runs while launchd holds it."
+          "switch_reason": "No settings key turns it off; it runs while launchd holds it.",
+          "watched_by": "heartbeat-monitor"
         }
       ],
       "person_steps": [
@@ -1354,7 +1362,8 @@
           "interval_key": "INTERVAL_SECONDS",
           "log": "<dir of BRIDGE_CONFIG>/bridge.log",
           "switch": null,
-          "switch_reason": "No settings key turns it off; card CK-B3 turns it off."
+          "switch_reason": "No settings key turns it off; card CK-B3 turns it off.",
+          "watched_by": "heartbeat-monitor"
         }
       ],
       "person_steps": [
@@ -1463,7 +1472,8 @@
             "key": "PUSH_MODE",
             "example": "bridge.conf.example"
           },
-          "switch_reason": null
+          "switch_reason": null,
+          "watched_by": "health-watch"
         }
       ],
       "person_steps": [
@@ -1572,7 +1582,8 @@
           "interval_key": "INTERVAL_SECONDS",
           "log": "<dir of NOTIFIER_CONFIG>/notifier.log",
           "switch": null,
-          "switch_reason": "No settings key turns it off; card CK-N5 says how to pause it."
+          "switch_reason": "No settings key turns it off; card CK-N5 says how to pause it.",
+          "watched_by": "heartbeat-monitor"
         }
       ],
       "person_steps": [
@@ -1689,7 +1700,8 @@
           "interval_key": null,
           "log": "/var/log/pipeline-dispatcher-port.log",
           "switch": null,
-          "switch_reason": "No settings key; a person loads or unloads it as root."
+          "switch_reason": "No settings key; a person loads or unloads it as root.",
+          "watched_by": "not-watched"
         }
       ],
       "person_steps": [
@@ -1795,7 +1807,8 @@
           "interval_key": "SWEEP_INTERVAL_SECONDS",
           "log": "<dir of SWEEP_CONFIG>/sweep.log",
           "switch": null,
-          "switch_reason": "No settings key; the installer never loads it, and a person loads or unloads it."
+          "switch_reason": "No settings key; the installer never loads it, and a person loads or unloads it.",
+          "watched_by": "health-watch"
         }
       ],
       "person_steps": [
@@ -1903,7 +1916,8 @@
           "interval_key": "USAGE_INTERVAL_SECONDS",
           "log": "<dir of USAGE_CONFIG>/usage.log",
           "switch": null,
-          "switch_reason": "No settings key; the installer never loads it, and a person loads or unloads it."
+          "switch_reason": "No settings key; the installer never loads it, and a person loads or unloads it.",
+          "watched_by": "not-watched"
         },
         {
           "label": "com.example.queue-morning",
@@ -1921,7 +1935,8 @@
           "interval_key": "MORNING_INTERVAL_SECONDS",
           "log": "<dir of QUEUE_CONFIG>/morning.log",
           "switch": null,
-          "switch_reason": "No settings key; the installer never loads it, and a person loads or unloads it."
+          "switch_reason": "No settings key; the installer never loads it, and a person loads or unloads it.",
+          "watched_by": "health-watch"
         }
       ],
       "person_steps": [
@@ -2036,7 +2051,8 @@
           "interval_key": "INTERVAL_SECONDS",
           "log": "<STATE_DIR>/watcher.log",
           "switch": null,
-          "switch_reason": "No settings key; the watcher installer loads it after one typed yes."
+          "switch_reason": "No settings key; the watcher installer loads it after one typed yes.",
+          "watched_by": "not-watched"
         },
         {
           "label": "<JOB_LABEL>.copier",
@@ -2060,7 +2076,8 @@
             "key": "USAGE_FILE",
             "example": "watcher.conf.example"
           },
-          "switch_reason": null
+          "switch_reason": null,
+          "watched_by": "not-watched"
         }
       ],
       "person_steps": [
@@ -2171,7 +2188,8 @@
           "interval_key": "ACCEPTANCE_INTERVAL_SECONDS",
           "log": "<dir of ACCEPTANCE_CONFIG>/acceptance.log",
           "switch": null,
-          "switch_reason": "No settings key; the installer never loads it, and a person loads or unloads it."
+          "switch_reason": "No settings key; the installer never loads it, and a person loads or unloads it.",
+          "watched_by": "not-watched"
         }
       ],
       "person_steps": [
@@ -2319,7 +2337,8 @@
             "key": "enabled",
             "example": "runner.example.json"
           },
-          "switch_reason": null
+          "switch_reason": null,
+          "watched_by": "not-watched"
         }
       ],
       "person_steps": [],
@@ -2492,7 +2511,8 @@
           "interval_key": "WATCH_INTERVAL_SECONDS",
           "log": "<owner home>/.pipeline-update/watch.log",
           "switch": null,
-          "switch_reason": "No settings key; `pipeline_watch.py uninstall` removes it."
+          "switch_reason": "No settings key; `pipeline_watch.py uninstall` removes it.",
+          "watched_by": "heartbeat-monitor"
         }
       ],
       "person_steps": [

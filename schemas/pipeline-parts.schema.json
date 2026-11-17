@@ -78,7 +78,7 @@
           "items": {
             "type": "object",
             "required": ["label", "from_key", "account", "loaded_by", "command", "schedule", "interval_key",
-                         "log", "switch", "switch_reason"],
+                         "log", "switch", "switch_reason", "watched_by"],
             "additionalProperties": false,
             "description": "One job, as data, for the supervisor that will read the list: what runs, when, as whom, where it logs, and what switches it. A <KEY> in a value is that settings key's value; <dir of KEY> is its folder.",
             "properties": {
@@ -99,6 +99,7 @@
               "schedule": {"enum": ["interval", "always-on", "at-boot"], "description": "Every interval_key seconds, kept alive, or once at boot."},
               "interval_key": {"oneOf": [{"$ref": "#/$defs/keyName"}, {"type": "null"}], "description": "The settings key that sets the interval; null unless schedule is interval."},
               "log": {"type": "string", "minLength": 1, "maxLength": 200, "description": "The log path's shape."},
+              "watched_by": {"enum": ["heartbeat-monitor", "health-watch", "not-watched"], "description": "Which watcher says when the job stops: the heartbeat monitor, the hourly health watch, or neither (KIT-689)."},
               "switch": {
                 "type": ["object", "null"],
                 "required": ["key", "example"],
