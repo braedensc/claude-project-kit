@@ -13,6 +13,9 @@ move into it; until then this is the whole store.
     <store>/taken/<id>.json        a request the runner acted on, with its answer
     <store>/runs/<run>/run.json    one record per run: the runner's alone to write
     <store>/runs/<run>/...         that run's own files: its command's inputs and its output
+    <store>/trees/<run>.json       the processes the runner remembered of a run, to kill what is
+                                   left when it ends: the runner's alone, never in the run's own
+                                   folder, which the run's processes write (KIT-739)
 
 WHO MAY ASK.  Five jobs, each for its own kinds of session (CALLERS):
 
@@ -264,10 +267,12 @@ def walls(path):
     return []
 
 
+FOLDERS = ("requests", "taken", "runs", "trees")
+
+
 def prepare(store):
-    """Make the store and its three folders, mode 0700, and check every one. Returns problems."""
-    for path in (store, os.path.join(store, "requests"), os.path.join(store, "taken"),
-                 os.path.join(store, "runs")):
+    """Make the store and its four folders, mode 0700, and check every one. Returns problems."""
+    for path in (store,) + tuple(os.path.join(store, name) for name in FOLDERS):
         if not os.path.lexists(path):
             try:
                 os.makedirs(path, mode=0o700)
@@ -399,6 +404,15 @@ def run_dir(store, run_id):
     return os.path.join(store, "runs", run_id)
 
 
+def tree_path(store, run_id):
+    """Where the runner keeps the processes it remembered of a run (KIT-739): in its own folder,
+    never the run's, whose files the run's own processes write. What it holds is the limits
+    module's record (scripts/pipeline_runner_limits.py)."""
+    if not (isinstance(run_id, str) and RUN_RE.match(run_id)):
+        raise ValueError("not a run id")
+    return os.path.join(store, "trees", run_id + ".json")
+
+
 def write_run(store, rec):
     """The runner's one way to write a record. ValueError when it is not well formed."""
     bad = run_problems(rec)
@@ -474,7 +488,12 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
     expect("a missing store is said", walls(store), ["the store does not exist"])
     expect("prepare makes the store and its folders", prepare(store), [])
     expect("each folder is mode 0700", sorted({stat.S_IMODE(os.stat(os.path.join(store, d)).st_mode)
-                                                for d in ("", "requests", "taken", "runs")}), [0o700])
+                                                for d in ("",) + FOLDERS}), [0o700])
+    expect("a run's remembered tree is in the runner's own folder, not the run's",
+           (tree_path(store, "run-" + "a" * 32), tree_path(store, "run-" + "a" * 32).startswith(
+               run_dir(store, "run-" + "a" * 32))),
+           (os.path.join(store, "trees", "run-" + "a" * 32 + ".json"), False))
+    expect("a tree path is only ever a run's", refused(lambda: tree_path(store, "../x")), "not a run id")
 
     # The walls: a git working tree, a link, a folder others can write.
     git_tree = os.path.join(root, "repo")

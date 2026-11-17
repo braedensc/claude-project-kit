@@ -50,9 +50,16 @@ ITS PROCESS.  Each session runs under a small wrapper, this file's `session` com
 process group and session, writing its output and its exit to the run's folder. The runner holds
 no pipe to it. A lock only the wrapper holds says whether the run is alive: the program never gets
 it, so a session cannot release it. So a restart of the runner ends no session: the next pass finds
-each one again. A run whose wrapper is gone without its exit is finished only once nothing of its
-process group is left: the runner kills what is, first. Off, the runner takes no request and
-resumes nothing; it still finishes runs already started.
+each one again. Off, the runner takes no request and resumes nothing; it still finishes runs
+already started.
+
+WHAT IS LEFT OF A RUN (KIT-739).  A run is finished only once nothing of it is left: its lock is
+free, its process group is empty, and no process it remembered is alive. The runner kills what is,
+and again, since one kill can miss a process the group's leader is forking at that instant. What it
+remembers of a run, each process with its start time, is in its own store (<store>/trees/<run>.json),
+never in the run's folder, whose files the run's own processes write. So a session cannot name a
+process for the runner to kill. The wrapper's start time is noted when it starts, so a group number
+a later process reused is never signalled.
 
 ITS LIMITS (KIT-643, scripts/pipeline_runner_limits.py).  Each live run is held to a wall-clock
 limit, a memory limit for its whole process tree and a disk limit for its own folders, from the
@@ -165,6 +172,7 @@ STATE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}\Z")
 SUBTYPE_RE = re.compile(r"^[a-z_]{1,40}\Z")
 _PATTERN_CHARS = re.compile(r"[*?\[\]{}!\\]")       # a permission rule would match more than it
 GIT_TIMEOUT = 300
+CLEAR_TRIES, CLEAR_PAUSE = 20, 0.05                 # an ending run is killed again until clear
 INSTRUCTIONS_MAX = 200 << 10                        # the project's CLAUDE.md, read from its base
 RESULT_SCAN = 1 << 20
 PIN_EXTRA_MINUTES = 30                              # as the hand-run pin writer does
@@ -878,13 +886,13 @@ class Runner(object):
     def check(self, rec):
         """Finish a run whose process is gone. Returns its id when it finished."""
         rdir, now = self.rdir(rec["run"]), self.clock()
-        pid = rec["pid"] or _wrapper_pid(rdir)
+        pid = rec["pid"] or self.leader_pid(rec["run"])
         exit_doc = _read_exit(rdir)
         alive = lock_held(rdir)
         if alive and exit_doc is None:
             if rec["state"] == store.STOPPING:
                 pids = limits.tree(pid) or []
-                self.remember(rdir, pids)
+                self.remember(rec, pids)
                 if rec["stop_asked_at"] and \
                         now >= pool.epoch(rec["stop_asked_at"]) + self.cfg["stop_grace_seconds"]:
                     limits.signal_tree(pid, pids, signal.SIGKILL)
@@ -893,15 +901,10 @@ class Runner(object):
             if over:
                 self.stop_at_limit(rec, rdir, pid, now, *over)
             return None
-        if alive:
-            signal_group(pid, signal.SIGKILL)      # the program ended; nothing of it may stay
-        if exit_doc is None:
-            # The wrapper is gone without its exit. Whatever is left of the run's group goes
-            # first: a run is never finished, or resumed, while any of it still runs.
-            signal_group(pid, signal.SIGKILL)
-            self.reap()
-            if group_alive(pid):
-                return None
+        # The program ended, or its wrapper is gone without its exit. Whatever is left of the
+        # run goes first: a run is never finished, or resumed, while any of it still runs.
+        if not self.clear_run(rec, rdir, pid):
+            return None
         result = read_result(rdir)
         started_up = os.path.lexists(os.path.join(rdir, "wrapper.json"))
         stopping = rec["state"] == store.STOPPING
@@ -931,7 +934,6 @@ class Runner(object):
                    cost_usd=(result or {}).get("cost_usd"), turns=(result or {}).get("turns"))
         if state == "interrupted" and rec["started_for"] != "interrupted":
             rec["auto_resume"] = "pending"
-        self.kill_left(rdir)                     # whatever of its tree outlived it, by start time
         remove_pin(rec["pin"], rec["run"])
         shutil.rmtree(run_tmp(self.cfg, rec["run"]), ignore_errors=True)
         store.write_run(self.store_dir(), rec)
@@ -949,11 +951,11 @@ class Runner(object):
         self.measured[rec["run"]] = now
         got = limits.check_run(lim, pid, started,
                                [rec["workspace"], rdir, run_tmp(self.cfg, rec["run"])], now)
-        self.remember(rdir, got["pids"])
+        capped = self.remember(rec, got["pids"])
         if got["unmeasured"]:
             self.tell("%s:unmeasured" % rec["run"], "Run %s (%s, %s): %s, so its limits could "
                       "not be checked." % (rec["run"], rec["kind"], rec["ticket"], got["unmeasured"]))
-        return got["over"]
+        return got["over"] or capped
 
     def stop_at_limit(self, rec, rdir, pid, now, reason, words):
         """Stop a run past a limit: its whole tree gets SIGTERM now, SIGKILL past the grace, and
@@ -962,34 +964,91 @@ class Runner(object):
                    why="stopped at its limit: %s" % words)
         store.write_run(self.store_dir(), rec)
         pids = limits.tree(pid) or []
-        self.remember(rdir, pids)
+        self.remember(rec, pids)
         limits.signal_tree(pid, pids, signal.SIGTERM)
         self.tell("%s:%s" % (rec["run"], reason), "Run %s (%s, %s) was stopped: %s." % (
             rec["run"], rec["kind"], rec["ticket"], words))
 
-    def remember(self, rdir, pids):
-        """Keep each process of the run's tree, with its start time, in the run's folder: a
-        process that leaves the tree, or outlives its parent, is still killed when the run ends."""
-        path = os.path.join(rdir, "tree.json")
+    # -- what it remembers of a run (KIT-739) ---------------------------- #
+    def read_tree(self, run_id):
+        """The run's remembered tree, from the runner's own store: None when there is none. A
+        record that cannot be read, or is not one, is said once and read as none."""
+        path = store.tree_path(self.store_dir(), run_id)
+        if not os.path.lexists(path):
+            return None
         try:
-            known = store.read_json(path) if os.path.lexists(path) else {}
-        except store.StoreError:
-            known = {}
-        known = known if isinstance(known, dict) else {}
-        fresh = limits.snapshot([p for p in pids if str(p) not in known])
-        if fresh and len(known) + len(fresh) <= limits.REMEMBER_MAX:
-            known.update(fresh)
-            try:
-                store.write_json(path, known)
-            except OSError:
-                pass
+            doc = store.read_json(path)
+        except store.StoreError as exc:
+            doc, why = None, str(exc)
+        else:
+            problems = limits.record_problems(doc)
+            why = problems[0] if problems else ""
+        if why:
+            self.tell("%s:tree-unread" % run_id, "Run %s: the record of its processes could not "
+                      "be read (%s), so what it leaves behind may not be found." % (run_id, why))
+            return None
+        return doc
 
-    def kill_left(self, rdir):
+    def write_tree(self, run_id, record):
         try:
-            known = store.read_json(os.path.join(rdir, "tree.json"))
-        except store.StoreError:
-            return
-        limits.kill_remembered(known)
+            store.write_json(store.tree_path(self.store_dir(), run_id), record)
+        except OSError as exc:
+            self.tell("%s:tree-unwritten" % run_id, "Run %s: the record of its processes could not "
+                      "be written (%s), so what it leaves behind may not be found." % (
+                          run_id, type(exc).__name__))
+
+    def note_leader(self, run_id, pid):
+        """Record the run's wrapper, whose number is its process group's, with its start time:
+        the runner's own note of which group is the run's, made before anything else is."""
+        record = limits.new_record()
+        got = limits.start_times([pid], record["method"]) or {}
+        if got.get(str(pid)):
+            record["leader"] = [str(pid), got[str(pid)]]
+            record["procs"] = [list(record["leader"])]
+        self.write_tree(run_id, record)
+
+    def leader_pid(self, run_id):
+        """The run's group number from the runner's own record, for a run whose record lacks its
+        pid. Never from the run's folder, which the run's own processes write."""
+        leader = (self.read_tree(run_id) or {}).get("leader")
+        return int(leader[0]) if leader else None
+
+    def remember(self, rec, pids):
+        """Keep each process of the run's tree, with its start time, in the runner's own store:
+        a process that leaves the tree, or outlives its parent, is still killed when the run
+        ends. Returns (limit:memory, words) when more of its processes are alive at once than
+        are remembered: then the newest are kept, and the run is past its memory limit."""
+        record, over, unread = limits.remember(self.read_tree(rec["run"]), pids)
+        if unread:
+            self.tell("%s:unremembered" % rec["run"], "Run %s (%s, %s): its processes' start times "
+                      "could not be read, so what it leaves behind may not be found." % (
+                          rec["run"], rec["kind"], rec["ticket"]))
+            return None
+        self.write_tree(rec["run"], record)
+        return over
+
+    def clear_run(self, rec, rdir, pid):
+        """Kill what is left of an ending run, and again, until nothing is: its process group,
+        while that number is still the run's, and each process it remembered. One kill is never
+        taken as the end, since it can miss a process the group's leader is forking at that
+        instant (measured on CI, 12 Nov). True once the run's lock is free, its group is empty
+        and none of its remembered processes is alive. False when something is still there after
+        CLEAR_TRIES: the next pass tries again, and the run is not finished while any of it runs."""
+        record = self.read_tree(rec["run"])
+        ours = limits.leader_is_gone_or_same(record, pid)
+        for attempt in range(CLEAR_TRIES + 1):
+            self.reap()
+            left = limits.remembered_alive(record) if record else []
+            if not lock_held(rdir) and not (ours and group_alive(pid)) and not left:
+                return True
+            if attempt == CLEAR_TRIES:
+                return False
+            if ours:
+                signal_group(pid, signal.SIGKILL)
+            if record:
+                limits.kill_remembered(record)
+            time.sleep(CLEAR_PAUSE)
+        return False
 
     def floor(self):
         """The lines the machine is under, as words: [] when a new session may start."""
@@ -1087,7 +1146,7 @@ class Runner(object):
         if rec["state"] == store.RUNNING:
             rec.update(state=store.STOPPING, stop_asked_at=iso(self.clock()))
             store.write_run(self.store_dir(), rec)
-            signal_group(rec["pid"] or _wrapper_pid(self.rdir(rec["run"])), signal.SIGTERM)
+            signal_group(rec["pid"] or self.leader_pid(rec["run"]), signal.SIGTERM)
         return True, rec["run"], "stopping"
 
     def start(self, project_key, kind, ticket, caller, request_id, resumes=None, text=None,
@@ -1217,6 +1276,7 @@ class Runner(object):
             store.write_run(self.store_dir(), rec)
             return "refused", run_id, rec["why"]
         self.children[proc.pid] = proc
+        self.note_leader(run_id, proc.pid)       # the runner's own note of which group is the run's
         rec["pid"] = proc.pid
         store.write_run(self.store_dir(), rec)
         self.say("runner: %s %s %s started for %s" % (run_id, kind, ticket, caller))
@@ -1235,14 +1295,6 @@ def _read_exit(rdir):
     except store.StoreError:
         return None
     return doc if isinstance(doc, dict) else None
-
-
-def _wrapper_pid(rdir):
-    try:
-        pid = store.read_json(os.path.join(rdir, "wrapper.json")).get("pid")
-    except (store.StoreError, AttributeError):
-        return None
-    return pid if isinstance(pid, int) and not isinstance(pid, bool) and pid > 1 else None
 
 
 # --------------------------------------------------------------------------- #
@@ -1388,6 +1440,18 @@ if mode == "grow":                  # grow without bound, as a runaway would; a 
         held.append(bytearray(os.urandom(64)) * 65536)
         time.sleep(0.05)
     mode, n = "sleep", 30
+if mode in ("orphans", "spawn"):    # three children that stay in its group, made after a first look:
+    time.sleep(0.5)                 # orphans then ends at once, spawn runs on
+    kids = []
+    for _ in range(3):
+        kid = os.fork()
+        if kid == 0:
+            time.sleep(60)
+            os._exit(0)
+        kids.append(kid)
+    with open(os.path.join(HERE, "calls.jsonl"), "a") as fh:
+        fh.write(json.dumps({"cwd": cwd, "kids": kids}) + "\n")
+    mode, n = ("quick", 0) if mode == "orphans" else ("sleep", 30)
 if mode == "sleep":
     end = time.time() + n
     while time.time() < end:
@@ -1430,7 +1494,7 @@ def selftest():
 
 def _selftest():  # noqa: C901  (one battery, read top to bottom)
     import tempfile
-    failures, cleanup, counted = [], [], [0]
+    failures, cleanup, counted, victims = [], [], [0], []
 
     def expect(name, got, want):
         counted[0] += 1
@@ -1534,6 +1598,9 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
     ticket("ENG-14", "A pin is in the way", [move("owner-1", "st-ready")])
     ticket("ENG-17", "Grow without bound STANDIN:grow", [move("owner-1", "st-ready")])
     ticket("ENG-18", "Starts when there is room", [move("owner-1", "st-ready")])
+    ticket("ENG-19", "A forged record beside it STANDIN:sleep=2", [move("owner-1", "st-ready")])
+    ticket("ENG-20", "Leave children behind STANDIN:orphans", [move("owner-1", "st-ready")])
+    ticket("ENG-21", "Keep many alive STANDIN:spawn", [move("owner-1", "st-ready")])
 
     class Tracker(object):
         down = False
@@ -1947,6 +2014,61 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                (store.answer(sdir, rq)["ok"], "floor" in _load(os.path.join(sdir, "incidents.json"))["open"]),
                (True, False))
 
+        # ---- what it remembers of a run, and kills when it ends (KIT-739) -------- #
+        tree9 = _load(store.tree_path(sdir, rec9["run"]))
+        expect("the remembered tree is in the runner's own store, never the run's folder",
+               (limits.record_problems(tree9), tree9["leader"][0],
+                os.path.exists(os.path.join(store.run_dir(sdir, rec9["run"]), "tree.json"))),
+               ([], str(rec9["pid"]), False))
+        expect("…and names the resolution its start times were read at",
+               (tree9["method"], tree9["resolution"]),
+               (limits.start_method(), limits.RESOLUTION[limits.start_method()]))
+        victim = subprocess.Popen([sys.executable, "-I", "-c", "import time; time.sleep(60)"],
+                                  start_new_session=True, stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        victims.append(victim)
+        store.ask(sdir, "queue", "start", "code", "app", "ENG-19")
+        runner.pass_once()
+        rec19 = [r for r in runner.runs() if r["ticket"] == "ENG-19"][0]
+        forged = limits.start_times([victim.pid], "ps")     # the shape the old record held
+        store.write_json(os.path.join(store.run_dir(sdir, rec19["run"]), "tree.json"), forged)
+        _wait(lambda: runner.pass_once() and store.read_run(sdir, rec19["run"])["state"] == "ended", 20)
+        expect("a forged entry in the run's folder is ignored: the process it names lives on",
+               (store.read_run(sdir, rec19["run"])["state"], bool(forged), victim.poll()),
+               ("ended", True, None))
+        store.ask(sdir, "queue", "start", "code", "app", "ENG-20")
+        runner.pass_once()
+        rec20 = [r for r in runner.runs() if r["ticket"] == "ENG-20"][0]
+        _wait(lambda: runner.pass_once() and store.read_run(sdir, rec20["run"])["state"] == "ended", 20)
+        kids20 = [k for c in _calls(calls) if c.get("kids") and c["cwd"].endswith("/ENG-20")
+                  for k in c["kids"]]
+        expect("a run that ends with children left in its group is finished only once none is left",
+               (store.read_run(sdir, rec20["run"])["state"], len(kids20),
+                [k for k in kids20 if _pid_alive(k)], group_alive(rec20["pid"])),
+               ("ended", 3, [], False))
+        capped = Runner(dict(cfg, limits=dict(cfg["limits"], check_seconds=0)), tracker,
+                        environ=environ, git_env=genv, say=said.append, room=roomy)
+        real_max, limits.REMEMBER_MAX = limits.REMEMBER_MAX, 3
+        try:
+            store.ask(sdir, "queue", "start", "code", "app", "ENG-21")
+            capped.pass_once()
+            rec21 = [r for r in capped.runs() if r["ticket"] == "ENG-21"][0]
+            _wait(lambda: capped.pass_once() and store.read_run(sdir, rec21["run"])["state"] == "stopped", 30)
+            tree21 = _load(store.tree_path(sdir, rec21["run"]))
+        finally:
+            limits.REMEMBER_MAX = real_max
+        rec21 = store.read_run(sdir, rec21["run"])
+        kids21 = [k for c in _calls(calls) if c.get("kids") and c["cwd"].endswith("/ENG-21")
+                  for k in c["kids"]]
+        expect("more of a run alive at once than it remembers: stopped at its memory limit, in "
+               "words that name the cap", (rec21["state"], rec21["reason"], rec21["why"]),
+               ("stopped", "limit:memory", "stopped at its limit: more than 3 of its processes "
+                "were alive at once, past its limit"))
+        expect("…the newest are kept and the rest counted, and nothing of it is left",
+               (len(tree21["procs"]) <= 3, tree21["dropped"] > 0, len(kids21),
+                [k for k in kids21 if _pid_alive(k)], group_alive(rec21["pid"])),
+               (True, True, 3, [], False))
+
         # ---- what the usage job reads ---------------------------------------- #
         got = store.read_runs(sdir)
         expect("every run is in the store, each a full record",
@@ -1958,21 +2080,26 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
             """Kill every run still alive, again on each look: a kill can miss a fork."""
             left = False
             for c in (_calls(calls) if os.path.exists(calls) else []):
-                if c.get("child_pid") and _pid_alive(c["child_pid"]):
-                    left = True
-                    try:
-                        os.kill(c["child_pid"], signal.SIGKILL)
-                    except OSError:
-                        pass
+                for kid in [c.get("child_pid")] + list(c.get("kids") or []):
+                    if kid and _pid_alive(kid):
+                        left = True
+                        try:
+                            os.kill(kid, signal.SIGKILL)
+                        except OSError:
+                            pass
             for r in (store.read_runs(sdir)["runs"] or []) if os.path.isdir(sdir) else []:
                 rd = store.run_dir(sdir, r["run"])
-                if lock_held(rd):
+                if lock_held(rd) or group_alive(r["pid"]):
                     left = True
-                    signal_group(r["pid"] or _wrapper_pid(rd), signal.SIGKILL)
+                    signal_group(r["pid"], signal.SIGKILL)
             return not left
-        for proc in runner.children.values():
+        for proc in list(runner.children.values()) + victims:
             if proc.poll() is None:
                 proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
         _wait(all_gone, 10)
     if failures:
         print("FAIL: pipeline_runner selftest")

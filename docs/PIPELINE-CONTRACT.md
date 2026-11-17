@@ -3183,6 +3183,7 @@ session nobody approved.
 <store>/requests/<id>.json     a request that waits
 <store>/taken/<id>.json        a request the runner acted on, with its answer
 <store>/runs/<run>/run.json    the run's record
+<store>/trees/<run>.json       the processes the runner remembered of the run (KIT-739)
 ```
 
 ### A request
@@ -3270,6 +3271,17 @@ process tree and a disk limit for its own folders, from the runner's `limits` se
 its tree is stopped and the record says `stopped` with that `limit:` reason. Below the machine's floor
 no new session starts. Each incident is recorded once, in plain words, in `<store>/incidents.json`
 (`{"schema": "pipeline-runner-incidents/1", "open", "told"}`), which the runner alone writes.
+
+**What is left of a run (KIT-739).** A run is finished only once its lock is free, its process group
+is empty and no process it remembered is alive. The runner kills what is left, and again until
+nothing is. It remembers each process it saw in the run's tree, with its start time, in
+`<store>/trees/<run>.json`: `{"schema": "pipeline-runner-tree/1", "method", "resolution", "leader",
+"procs", "dropped"}`. The runner alone writes it, and never reads a process from the run's folder.
+`leader` is the wrapper, noted when it starts, so a group number a later process took is never
+signalled. `procs` holds `[pid, start]` pairs, first seen first. Each look drops the ones that are
+gone. `method` is how start times were read: `sysctl` to the microsecond on macOS, `proc` in clock
+ticks on Linux, or `ps` to the second, and `resolution` says which. More than 4096 alive at once
+keeps the newest, counts the rest in `dropped`, and stops the run at `limit:memory`.
 
 **How to read it.** `read_runs()` gives every record, oldest first, and says `read`, `partly-read`
 (a record it could not read is named) or `could-not-read`. Then the runs are `None`, never an empty
