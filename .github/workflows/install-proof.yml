@@ -394,7 +394,8 @@ jobs:
           host_got = [w for w, _ in row_of.get("host", [])]
           if host_got != ["waiting on you"]:
               bad("host: a Mac that has never seen the kit has no host, so it must read 'waiting on you', not %r" % host_got)
-          if not any(ln.startswith("Build this first") for ln in tail):
+          first = [ln for ln in tail if ln.strip()]
+          if not first or not first[0].startswith("Build this first"):
               bad("the short list does not open with 'Build this first.' for the host")
           elif not any("docs/HOST.md" in ln for ln in tail):
               bad("the host item does not name docs/HOST.md")

@@ -2537,6 +2537,7 @@ def selftest():
     check("kit756-a-mac-with-a-host-reads-up-to-date-and-is-not-on-the-list",
           (by_id(go()[1])["host"], any("Build this first" in ln for ln in go()[1].lines)),
           (OUT_OK, False))
+    HOST_NAME = [p["name"] for p in Io().parts() if p["id"] == "host"][0]
     code, io = go(host=("none", HOST_NONE + ": test"))
     lines = io.lines
     at = [i for i, ln in enumerate(lines) if ln.startswith("Build this first")]
@@ -2552,7 +2553,7 @@ def selftest():
     check("kit756-the-host-comes-before-every-other-list-item",
           all(at[0] < i for i in others), True)
     check("kit756-the-host-is-not-named-a-second-time",
-          sum(1 for ln in lines if "host" in ln.lower() and ln.endswith("is waiting on you; its own lines above say what for.")), 0)
+          sum(1 for ln in lines if ln.startswith(HOST_NAME) and ln.endswith("is waiting on you; its own lines above say what for.")), 0)
     code, io = go(host=("unknown", "the lane marker folder could not be read (x)"))
     check("kit756-an-unreadable-host-is-not-measured-never-has-one",
           (by_id(io)["host"], code, [r["detail"] for r in io.records if r["id"] == "host"][0][:13]),
@@ -2560,7 +2561,7 @@ def selftest():
     code, io = go(host=("none", HOST_NONE))
     check("kit756-the-host-is-no-longer-on-the-no-check-line",
           any("The always-on machine" in ln and ln.startswith("No check of their own") for ln in io.lines), False)
-    Pw = type("Pw", (), {"pw_dir": "/home/x"})
+    Pw = type("Pw", (), {"pw_dir": "/srv/acct"})
     check("kit756-host-state-no-folder-is-none",
           host_state(listdir=lambda p: (_ for _ in ()).throw(FileNotFoundError()))[0], "none")
     check("kit756-host-state-unreadable-is-unknown",
