@@ -2337,16 +2337,47 @@ def _selftest(identity=(True,) * 5, reached=()):
         check("a-first-pass-leaves-a-state-and-the-mark-that-one-was-written",
               (os.path.exists(state_path(cfg7)), os.path.exists(seen_path(cfg7))), (True, True))
         os.remove(state_path(cfg7))
+        lost_out = io.StringIO()
+        lost_code = run_command(cfg7, False, 30, slack=slack7, tracker=tracker7, out=lost_out)
+        lost_beat = json.load(open(heartbeat_path(cfg7)))
+        check("a-lost-state-file-ends-the-job-non-zero-and-its-heartbeat-says-state-missing",
+              (lost_code != EXIT_OK, lost_beat["exit"] != EXIT_OK, "state missing" in lost_beat["summary"]),
+              (True, True, True))
         code7, out7 = run(cfg7, slack7, tracker7)
         check("a-lost-state-file-stops-the-pass-and-says-so",
               (code7 != EXIT_OK, "state missing" in out7, os.path.exists(state_path(cfg7))),
               (True, True, False))
+        init_cfg = os.path.join(os.path.dirname(state_path(cfg7)), "init.json")
+        with open(init_cfg, "w", encoding="utf-8") as fh:
+            json.dump(dict(EXAMPLE_CONFIG, state_dir=cfg7["state_dir"]), fh)
+        seen_flag = []
+        real_run_command = globals()["run_command"]
+        globals()["run_command"] = lambda c, d, t, **k: seen_flag.append(c.get("init_state")) or 0
+        try:
+            main(["run", "--config", init_cfg, "--init-state"])
+            main(["run", "--config", init_cfg])
+        finally:
+            globals()["run_command"] = real_run_command
+        check("the---init-state-flag-reaches-the-pass-through-main-and-only-then",
+              seen_flag, [True, None])
         code7, out7 = run(dict(cfg7, init_state=True), slack7, tracker7)
         check("init-state-starts-a-clean-state-on-purpose",
               (code7, os.path.exists(state_path(cfg7)), "first pass" in out7),
               (EXIT_OK, True, True))
         code7, out7 = run(cfg7, slack7, tracker7)
         check("…and the pass after it needs no flag", code7, EXIT_OK)
+        # A mark that cannot be written is said, never swallowed: a broken link stands where it goes.
+        cfg8 = world("lost-state-unmarked")[0]
+        os.makedirs(cfg8["state_dir"], exist_ok=True)
+        os.symlink(os.path.join(cfg8["state_dir"], "no-such-folder", "mark"), seen_path(cfg8))
+        stderr_was, sys.stderr = sys.stderr, io.StringIO()
+        try:
+            save_state(cfg8, new_state())
+            noted = sys.stderr.getvalue()
+        finally:
+            sys.stderr = stderr_was
+        check("a-mark-that-cannot-be-written-is-said-and-the-state-still-lands",
+              ("lost-state mark" in noted, os.path.exists(state_path(cfg8))), (True, True))
         # KIT-291: the first pass checks each HANDOFF_STATES name on each team, in the log
         # alone. A name a team lacks is said once, and the pass still does its work.
         check("first-pass-finds-every-handoff-lane-and-says-nothing-of-it",

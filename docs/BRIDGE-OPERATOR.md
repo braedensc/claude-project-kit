@@ -244,7 +244,9 @@ so an old request is never answered late.
 **A lost state file stops the job.** The state holds your approved plans and open questions.
 If it is gone after the job has written one, the pass says `state missing` and stops, and the
 heartbeat says so. Restore the file from a backup. To start clean on purpose, run the job once
-with `run --init-state`.
+with `run --init-state`. This covers a lost file, not a lost folder: the job's mark of an earlier
+state sits beside the state, so wiping the whole state folder reads as a first pass. If the mark
+itself cannot be written, the job says so in its log, and until it exists a lost file reads as a first pass.
 
 ---
 

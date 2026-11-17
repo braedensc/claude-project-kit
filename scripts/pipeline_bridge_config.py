@@ -637,8 +637,10 @@ def _mark_seen(cfg):
         with open(path, "w", encoding="utf-8") as fh:
             fh.write("a bridge state file was written here; if it is gone, the pass refuses "
                      "until the owner runs `run --init-state` on purpose\n")
-    except OSError:
-        pass                      # the state itself is what matters; the mark is the second line
+    except OSError as exc:
+        # The state itself is what matters, so the pass goes on, but it says the guard is off.
+        sys.stderr.write("NOTE: could not write the lost-state mark %s (%s): until it exists, a "
+                         "lost state file reads as a first pass\n" % (path, type(exc).__name__))
 
 
 def new_state():
@@ -680,7 +682,6 @@ def load_state(cfg):
                               "backup, or start clean on purpose with `run --init-state`"
                               % path)
         return new_state(), True
-    _mark_seen(cfg)
     try:
         with open(path, "r", encoding="utf-8") as fh:
             doc = json.load(fh)
