@@ -545,6 +545,12 @@ python3 scripts/pipeline_notifier_setup.py run             # the only command th
 do, it prints a numbered card and exits 10. Do that one thing. Run the same command again.
 It checks your work and carries on.
 
+**The one command runs this for you** (`python3 scripts/pipeline_install.py`, step 3c) when this
+Mac has a `notifier.conf`. It runs `run --dry-run` and shows it. If a step would change something
+it asks, then runs `run` on a yes: that is how a new setting reaches the job after a merge. If
+only a card is left, it asks nothing and the end list says "waiting on you". With no
+`notifier.conf` the notifier reads "off on this Mac".
+
 | Command | What it is |
 |---|---|
 | `run` | do everything possible; stop at the first card |
