@@ -1532,6 +1532,17 @@ def _cases(top, check):
     check("a real run as the named account removes what is due, with the key from its env var",
           (_quietly(main, ["run", "--config", conf], key, fake_world), there(old_tmp), made[-1]),
           (EXIT_OK, [False], "k"))
+    mbeat = os.path.join(tmp, "main-beat", "sweep-heartbeat.json")
+    with open(conf, "w") as fh:
+        json.dump(dict(cfg2, heartbeat_file=mbeat), fh)
+    _quietly(main, ["run", "--config", conf, "--dry-run"], key, fake_world)
+    after_dry_main = os.path.exists(mbeat)
+    _quietly(main, ["run", "--config", conf], key, fake_world)
+    check("KIT-689: main leaves the heartbeat after a real pass, and none after a dry run",
+          (after_dry_main, json.load(open(mbeat))["exit"] if os.path.exists(mbeat) else None),
+          (False, EXIT_OK))
+    with open(conf, "w") as fh:
+        json.dump(cfg2, fh)
     os.makedirs(os.path.join(home, "KIT-77"))
     age(os.path.join(home, "KIT-77"), OLD)
     check("a key the tracker refuses is a credential fault, exit 2, and nothing goes",
