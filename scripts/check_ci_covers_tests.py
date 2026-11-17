@@ -9,12 +9,12 @@ sweeps. When the sweeps became their own job, nothing else ran those ten, and th
 stopped blocking merges with no red check to say so. A battery nobody runs is the silent
 nothing contract 13 warns about, so this fails the PR that adds a `test:*` script without a step.
 
-THE RULE. A `test:*` script is covered when every Python file its command names (a
-`scripts/...py` or `.claude/...py` path) appears in a step of a job in
-`.github/workflows/ci.yml` other than the leak sweeps, or when the workflow writes the
-script as `npm run <script>`. A `for m in a b; do python3 x_$m.py; done` loop is read once
-per word, so a step has to name each file the loop reaches. The leak sweeps do not count:
-that job runs every battery, which is what hid the gap.
+THE RULE. A `test:*` script is covered when each `python3 ... .py ...` command it runs, with its
+arguments, is run by a step of a job in `.github/workflows/ci.yml` other than the leak sweeps (the
+same words, then the end of the line, `&&`, `;` or `||`), or when the workflow writes the script as
+`npm run <script>`. A path in `git show` or `cp`, or the same script with other arguments, is not a
+run of it. A `for m in a b; do python3 x_$m.py; done` loop is read once per word. The leak sweeps
+do not count: that job runs every battery, which is what hid the gap.
 
 THE ALLOW LIST is data: a script left out on purpose, with its reason. An entry for a script
 that is covered anyway, or that is not in package.json, fails too, so the list cannot go stale.
@@ -56,18 +56,36 @@ def ci_text_without_sweeps(text):
     return "\n".join(out)
 
 
-def needed_paths(command):
-    """The Python file paths a script's command reaches; a loop is expanded word by word."""
-    paths = []
+def needed_commands(command):
+    """The `python3 ... .py ...` commands a script's command runs, each as one whitespace-normalised
+    string: a loop is expanded word by word, `&&` and `;` split it, a trailing `|| exit 1` goes."""
+    out = []
 
     def expand(m):
         var, words, body = m.group(1), m.group(2).split(), m.group(3)
         for w in words:
-            paths.extend(PY.findall(body.replace("$" + var, w)))
-        return " "
+            out.extend(split_commands(body.replace("$" + var, w)))
+        return " ; "
     rest = LOOP.sub(expand, command)
-    paths.extend(PY.findall(rest))
-    return paths
+    out.extend(split_commands(rest))
+    return out
+
+
+def split_commands(text):
+    found = []
+    for part in re.split(r"\s*(?:&&|;)\s*", text):
+        part = re.sub(r"\s*\|\|.*$", "", part).strip()
+        if part.startswith("python3") and PY.search(part):
+            found.append(" ".join(part.split()))
+    return found
+
+
+def runs(command, text):
+    """True when `text` has a line that runs exactly `command`: the same arguments, and nothing
+    after them but the end of the line, `&&`, `;` or `||`. A path in `git show` or `cp`, or the
+    same script with other arguments, is not a run of it."""
+    pattern = r"(?<![\w/.$-])" + r"\s+".join(re.escape(w) for w in command.split()) + r"\s*(?:$|&&|;|\|\|)"
+    return re.search(pattern, text, re.M) is not None
 
 
 def uncovered(scripts, ci_text, allowed=None):
@@ -81,8 +99,8 @@ def uncovered(scripts, ci_text, allowed=None):
         if re.search(r"npm run (?:--silent )?%s(?![\w:-])" % re.escape(name), text):
             covered = True
         else:
-            paths = needed_paths(command)
-            covered = bool(paths) and all(p in text for p in paths)
+            needed = needed_commands(command)
+            covered = bool(needed) and all(runs(c, text) for c in needed)
         if name in allowed:
             if covered:
                 problems.append((name, "is in the allow list but has a CI step: remove the entry"))
@@ -143,14 +161,27 @@ def selftest():
     expect("the job after the sweeps counts", uncovered({"test:d": "python3 scripts/d.py"}, ci, {}), [])
     loop = {"test:m": "for m in x y; do python3 scripts/p_$m.py --selftest || exit 1; done"}
     expect("a loop needs every word named",
-           [n for n, _ in uncovered(loop, ci + "      - run: python3 scripts/p_x.py\n", {})], ["test:m"])
+           [n for n, _ in uncovered(loop, ci + "      - run: python3 scripts/p_x.py --selftest\n", {})], ["test:m"])
     expect("a loop is covered when each is named",
-           uncovered(loop, ci + "      - run: python3 scripts/p_x.py\n      - run: python3 scripts/p_y.py\n", {}), [])
+           uncovered(loop, ci + "      - run: python3 scripts/p_x.py --selftest\n      - run: python3 scripts/p_y.py --selftest\n", {}), [])
     expect("a command naming no Python file is not covered",
            [n for n, _ in uncovered({"test:n": "node x.mjs"}, ci, {})], ["test:n"])
     expect("a comment naming the script is not a step",
            [n for n, _ in uncovered({"test:q": "python3 scripts/q.py"}, ci + "      # python3 scripts/q.py\n", {})],
            ["test:q"])
+    # the review of KIT-620: a path alone is not a run of the battery
+    sec = {"test:sec": "python3 scripts/sec.py --selftest"}
+    only_other_args = ci + "      - run: python3 scripts/sec.py\n"
+    expect("the same script with other arguments does not cover it",
+           [n for n, _ in uncovered(sec, only_other_args, {})], ["test:sec"])
+    mention = ci + "      - run: git show \"$t:scripts/sec.py\" > x && cp scripts/sec.py y\n"
+    expect("a path in git show or cp does not cover it", [n for n, _ in uncovered(sec, mention, {})], ["test:sec"])
+    expect("the exact command covers it", uncovered(sec, ci + "      - run: python3 scripts/sec.py --selftest\n", {}), [])
+    both = {"test:two": "python3 scripts/t.py --selftest && python3 scripts/t.py"}
+    expect("each part of an && command needs its own run",
+           [n for n, _ in uncovered(both, ci + "      - run: python3 scripts/t.py --selftest\n", {})], ["test:two"])
+    expect("a command followed by && or || still counts",
+           uncovered(sec, ci + "      - run: python3 scripts/sec.py --selftest && echo ok\n", {}), [])
     expect("the allow list holds only reasons", all(isinstance(v, str) and v for v in ALLOWED.values()), True)
     if failures:
         print("%d FAILED" % len(failures))
