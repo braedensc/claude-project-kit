@@ -180,6 +180,8 @@ def selftest():
     both = {"test:two": "python3 scripts/t.py --selftest && python3 scripts/t.py"}
     expect("each part of an && command needs its own run",
            [n for n, _ in uncovered(both, ci + "      - run: python3 scripts/t.py --selftest\n", {})], ["test:two"])
+    expect("both parts run on their own lines: covered",
+           uncovered(both, ci + "      - run: python3 scripts/t.py --selftest\n      - run: python3 scripts/t.py\n", {}), [])
     expect("a command followed by && or || still counts",
            uncovered(sec, ci + "      - run: python3 scripts/sec.py --selftest && echo ok\n", {}), [])
     expect("the allow list holds only reasons", all(isinstance(v, str) and v for v in ALLOWED.values()), True)
