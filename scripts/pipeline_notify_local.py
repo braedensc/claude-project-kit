@@ -5853,11 +5853,15 @@ def selftest():
            (_GqlStub.asked[:1], read_t))
 
         # KIT-680: 60 tickets in a team are all read, over two pages.
+        def _ago(seconds):
+            # relative to the real clock, which the read's window is judged against
+            return time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(time.time() - seconds))
+
         class _PagedStub(TrackerClient):
             def __init__(self, *a, total=60, stamp=None, **k):
                 TrackerClient.__init__(self, *a, **k)
                 self.total, self.calls = total, []
-                self.stamp = stamp or (lambda i: "2026-11-16T12:00:00.000Z")
+                self.stamp = stamp or (lambda i: _ago(3600))
 
             def _gql(self, query, variables):
                 self.calls.append(variables.get("a"))
@@ -5873,8 +5877,7 @@ def selftest():
         got = paged.recent_tickets("KIT", 20)
         ok("KIT-680: a team with 60 tickets is read whole, over two pages",
            (len(got), paged.calls) == (60, [None, "50"]), (len(got), paged.calls))
-        old_after = lambda i: ("2026-11-16T12:00:00.000Z" if i < 55
-                               else "2020-01-01T00:00:00.000Z")
+        old_after = lambda i: _ago(3600) if i < 55 else _ago(30 * 86400)
         paged_old = _PagedStub(cfg, "not-a-real-key", total=5000, stamp=old_after)
         got = paged_old.recent_tickets("KIT", 20)
         ok("KIT-680: the read stops at the first page that reaches past the window",
