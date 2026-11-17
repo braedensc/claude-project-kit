@@ -140,8 +140,11 @@ from `stage-e.conf`:
 | `CATCHUP_MAX_PAGES` | `10` | Pages of 50 sessions read per pass; raise it only when the job says its read was cut short |
 | `HOLD_FILE` | empty | The watcher's hold file, shared with the bounce driver. While it exists, nothing is re-prompted |
 
-The teams are the installer's `MANAGED_TEAM_KEYS`. The review team is never caught up: the
-review poller times its own sessions out. It uses the tracker key Stage E already stores, so
+The teams are the installer's `MANAGED_TEAM_KEYS`, less any team in `RUNNER_LANE_REPOS`. Work
+on those teams goes through our own runner, which keeps its own requests, so no hand-off can be
+lost there. With no team left the job is not installed, as with `CATCHUP_INTERVAL_SECONDS=off`
+(docs/STAGE-E-OPERATOR.md, step 5a). The review team is never caught up: the review poller times
+its own sessions out. It uses the tracker key Stage E already stores, so
 it needs no new credential. `--example-config` prints every key of its own config file.
 
 **When the watcher holds new starts.** With `HOLD_FILE` set (`docs/WATCHER.md`), a pass that finds the

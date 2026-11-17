@@ -723,7 +723,7 @@ check catches it, and nothing is collected from it, but the session ran.
 | Finding poller | The same account, a third system LaunchDaemon | Same env file, same clone, **its own** state directory and config. Reads one tracker key. Creates backlog tickets, links each to its source, posts receipts and cap notes on the source ticket, and comments the finding-filed mark on the new ticket — nothing else. Not a session. |
 | Reviewer | The same account, sandboxed, the Reviews entry | Reads files and its ticket body, and nothing else. No shell, edits, fetch, scheduling or messaging tools, and none of the dispatcher's MCP servers: the fence names the four it injects and every one its platform MCP configs add (KIT-132). |
 | Coding session | The same account, sandboxed, the managed-repo entry | Unchanged. Receives bounces, and conflict fixes, as thread comments. |
-| Catch-up poller | The same account, a fourth system LaunchDaemon, installed only once you sign its first count (`CK-11`), unless `CATCHUP_INTERVAL_SECONDS=off` | Same env file, same clone, **its own** state directory and config. Reads one tracker key and the dispatcher's local status. Its only tracker write is one reply under a delegation the dispatcher never answered (`docs/CATCH-UP.md`). Not a session. |
+| Catch-up poller | The same account, a fourth system LaunchDaemon, installed only once you sign its first count (`CK-11`), unless `CATCHUP_INTERVAL_SECONDS=off` or every team is on the runner lane (step 5a) | Same env file, same clone, **its own** state directory and config. Reads one tracker key and the dispatcher's local status. Its only tracker write is one reply under a delegation the dispatcher never answered (`docs/CATCH-UP.md`). Not a session. |
 | Heartbeat monitor | The same account, a fifth system LaunchDaemon, unless `HEARTBEAT_MONITOR_TICKET=off` | Reads the daemons' heartbeats (the catch-up poller's once it is installed) — and the notifier's, when `NOTIFIER_JOB_LABEL` names it, and the health watch's status file, when `HEALTH_STATUS_FILE` names it — and one tracker key. Posts one comment per incident on one ticket, and nothing else. Its comments carry a mark the notifier pings on; its code reads no chat token. Not a session. |
 | Conflict waker | **You**, a user LaunchAgent, only while you are logged in | Uses your own `claude` and `gh` logins. Starts fix sessions **outside** any sandbox, so it takes only worktrees your own Claude Code worked in, and refuses to run as the role account. |
 | State | `<role-account home>/.stage-e/state`, `…/.stage-e/finding` for the finding poller, and `…/.stage-e/catchup` for the catch-up poller | The sandbox denies sessions every read under that home. Same uid, so the sandbox is the whole boundary — see *Accepted risks*. |
@@ -1911,7 +1911,7 @@ The last three rows have their own installer steps, after `enable` loads the fir
 - **The catch-up poller** is installed only once you sign its first count (card `CK-11`).
   Until then it has no plist at all, so no reboot can start it, and every run says so.
   Nothing else waits on it. `CATCHUP_INTERVAL_SECONDS=off` declines it by name, and removes
-  one an earlier run installed.
+  one an earlier run installed. So does a `RUNNER_LANE_REPOS` that covers every team (step 5a).
 - **The status job** writes one file of where every plan stands, which the Slack tech lead
   reads instead of GitHub (contract §16). Its dry run must read the tracker before it is
   installed (card `CK-12`). It writes that file and one small count of how long the tracker and
@@ -2495,6 +2495,38 @@ pass with a declined PR and a broken one exits `2`. The heartbeat's `result` say
 - **The re-prompt never names the review ticket.** The session writes the pull request's
   text, and a review ticket's id there could link the two. The ledger and the outcome file
   keep the id.
+
+### 5a. Fixes by resume, through the runner — one setting per repository
+
+Our own runner (`docs/RUNNER.md`) can resume a pull request's own coding session directly.
+For a repository named in `RUNNER_LANE_REPOS`, the driver sends each fix that way, as a resume
+request to the runner, not as a reply in the tracker thread. It is off while the key is empty.
+
+```
+RUNNER_LANE_REPOS=example-org/app:APP:app
+RUNNER_STORE_DIR=~/.pipeline-runner/store
+```
+
+Each entry is `OWNER/NAME:TEAM:PROJECT`. The repository is one you review, the team is its
+tracker team, and the project is its key in the runner's settings. Remove the entry and run
+the installer again to switch it back.
+
+- **What stays the same.** The ledger rows, the fix budget, the re-review request, exhaustion
+  and the page when a fix is never pushed. The visible record line goes on the ticket as one
+  top-level comment.
+- **What the driver needs.** The runner's record of the pull request's coding run, matched by
+  project, ticket and branch. With none, nothing is sent, no bounce is spent, and the pull
+  request says a person is needed. While that run is still going, the fix waits for it to end
+  and spends nothing.
+- **The catch-up poller** leaves that repository's team out. With every team on this lane it
+  is not installed, as with `CATCHUP_INTERVAL_SECONDS=off`.
+- **A conflict** still goes by the thread. That move comes later.
+- **Name a repository only once its coding sessions run through the runner too.** Until then
+  every fix finds no run there, and says so on the pull request.
+
+Good: `delivered via runner (rq-…)` in the driver's log, one request in the runner's store,
+and one "sent to its coding session" comment on the ticket.
+Not that: a reply in the ticket's agent-session thread for a repository on this lane.
 
 ---
 

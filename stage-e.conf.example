@@ -271,6 +271,23 @@ CATCHUP_DISPATCHER_URL=http://127.0.0.1:3456
 CATCHUP_FRONT_DOOR_URL=
 CATCHUP_WEBHOOK_ID=
 
+# Fixes by resume, through our own runner (docs/RUNNER.md).  OFF while EMPTY.
+# For each repository named here, the bounce driver sends a fix to the pull
+# request's own coding session as a resume request to the runner, not as a
+# reply in the tracker thread.  The ledger, the fix budget and the page when a
+# fix is never pushed stay the same.  That repository's team leaves the
+# catch-up poller, which is not installed at all once no team is left.
+# Name a repository only once its coding sessions run through the runner too:
+# until then a fix finds no session there, and the driver says so on the PR.
+# RULE: comma-separated OWNER/NAME:TEAM:PROJECT entries.  OWNER/NAME is one of
+# REVIEW_REPOS, TEAM one of MANAGED_TEAM_KEYS, and PROJECT that repository's
+# key in the runner's settings.  To switch one back, remove its entry and run
+# the installer again.  RUNNER_STORE_DIR is the runner's store_dir, an
+# absolute path or one under ~/, needed while any repository is named.
+# Example: RUNNER_LANE_REPOS=example-org/app:APP:app
+RUNNER_LANE_REPOS=
+RUNNER_STORE_DIR=
+
 # The watcher's hold file (docs/WATCHER.md).  While this file exists, the bounce
 # driver sends no re-prompt and the catch-up job re-prompts nothing; each says so
 # on every pass.  Only you clear it, with scripts/pipeline_hold.py.
