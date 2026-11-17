@@ -34,6 +34,7 @@ import pipeline_stage_e_setup as se  # noqa: E402
 import pipeline_notifier_setup as ns  # noqa: E402  (its shell fragments, path rules and scrub are not its alone)
 import pipeline_morning as morning  # noqa: E402  (the jobs: their own loaders judge what this file composes)
 import pipeline_queue_read as reader  # noqa: E402
+import pipeline_queue_settings as queue_settings  # noqa: E402  (KIT-700: the installed copy of queue.conf, and the carry)
 import pipeline_queue_start as starter  # noqa: E402
 import pipeline_usage_local as usage_job  # noqa: E402
 import pipeline_window as window  # noqa: E402
@@ -47,7 +48,7 @@ MORNING_SCRIPT = "pipeline_morning.py"
 READER_SCRIPT = "pipeline_queue_read.py"
 SELFTESTS = ("pipeline_usage_local.py", "pipeline_queue_read.py", "pipeline_morning.py", "pipeline_queue_start.py",
              "pipeline_queue_pool.py", "pipeline_queue_order.py", "pipeline_day_planner.py", "pipeline_day_plan.py",
-             "pipeline_window.py")
+             "pipeline_window.py", "pipeline_queue_settings.py")
 DRY_OK = (0, 3)                 # the jobs' own: 0 ran, 3 ran and says a source was not read whole
 LABEL_KEYS = ("USAGE_JOB_LABEL", "MORNING_JOB_LABEL")
 INTERVAL_KEYS = ("USAGE_INTERVAL_SECONDS", "MORNING_INTERVAL_SECONDS")
@@ -73,12 +74,15 @@ def runtime_closure(roots):
 REQUIRED_SCRIPTS = runtime_closure((USAGE_SCRIPT, MORNING_SCRIPT, READER_SCRIPT))
 
 # ── the conf: parsed, never sourced; every fault at once, by key and never by value ───────────────────────────
-CONF_REQUIRED = ("ROLE_ACCOUNT", "OWNER_USER_IDS", "DISPATCHER_USER_IDS", "TEAM_KEYS", "REVIEWS_TEAM_KEY",
+CONF_REQUIRED = ("ROLE_ACCOUNT", "OWNER_USER_IDS", "DISPATCHER_USER_IDS", "TEAM_KEYS",
                  "REPO_BY_TEAM") + LABEL_KEYS
 CONF_DEFAULTS = {
     "ROLE_KIT_CLONE": se.ROLE_KIT_CLONE_PATH, "ENV_FILE": "~/.stage-e/env", "OWNER_SLACK_USER_IDS": "",
+    # KIT-596: optional. Review tickets on the work teams are told by their marks; this names
+    # only an old Reviews team, whose tickets stay never work.
+    "REVIEWS_TEAM_KEY": "",
     "REPO_BY_LABEL": "", "BACKLOG": "no", "AGENT_FILED": "off", "PLANNED_LOAD": "40", "DAY_STOP": "60",
-    "PACE_TO_RESET": "no", "WEEKLY_BUDGET_USD": "",
+    "PACE_TO_RESET": "no", "WEEKLY_BUDGET_USD": "", "SPRINT_PLAN_FILE": "",
     "LANES_PER_REPO": "1", "WINDOW_TIME_ZONE": "", "WINDOW_DAYS": "mon-sat 09:00 6, sun off", "GRACE_MINUTES": "60",
     "PLANNER": "yes", "PLANNER_BIN": "", "PLANNER_TOKEN_ENV": morning.DEFAULTS["planner_token_env"],
     "LINEAR_KEY_ENV": reader.DEFAULTS["linear_key_env"], "BRIDGE_CONFIG": "~/.stage-e/bridge.json",
@@ -190,6 +194,10 @@ def validate_conf(values, invoking_user=None):
     need(c.get("PACE_TO_RESET") in ("yes", "no"), "PACE_TO_RESET must be yes or no")
     need(not c.get("WEEKLY_BUDGET_USD") or num(c.get("WEEKLY_BUDGET_USD")), "WEEKLY_BUDGET_USD must be empty or a number above 0")
     need(c.get("PACE_TO_RESET") != "yes" or c.get("WEEKLY_BUDGET_USD"), "WEEKLY_BUDGET_USD is required with PACE_TO_RESET=yes")
+    need(not c.get("SPRINT_PLAN_FILE") or re.match(r"^[~/][A-Za-z0-9_./~-]{1,200}\Z", c["SPRINT_PLAN_FILE"]),
+         "SPRINT_PLAN_FILE must be a path, or empty")
+    need(not c.get("SPRINT_PLAN_FILE") or c.get("WEEKLY_BUDGET_USD"),
+         "WEEKLY_BUDGET_USD is required with SPRINT_PLAN_FILE: a week cannot be sized without a budget")
     for k in ("LANES_PER_REPO", "GRACE_MINUTES"):
         need(whole(c.get(k)) is not None, "%s must be a whole number" % k)
     days, bad_days = parse_window_days(c.get("WINDOW_DAYS"))
@@ -222,14 +230,16 @@ def path_problems(c, home, skip=()):
 
 
 def load_conf(path, user=None):
+    """(conf, errors, the file's text): the text is what the installed copy of queue.conf is made from (KIT-700)."""
     try:
         with open(path, encoding="utf-8") as fh:
-            values, errors = parse_conf(fh.read(), os.path.basename(path))
+            text = fh.read()
     except OSError as exc:
         raise SetupError("could not read %s (%s): cp queue.conf.example queue.conf && chmod 600 queue.conf"
                          % (path, exc.strerror))
+    values, errors = parse_conf(text, os.path.basename(path))
     conf, more = validate_conf(values, user)
-    return conf, errors + more
+    return conf, errors + more, text
 
 
 # ── what it composes: two documents, each judged by the jobs' own loaders ─────────────────────────────────────
@@ -243,7 +253,8 @@ def compose(c):
                  "reviews_team_key": c["REVIEWS_TEAM_KEY"], "backlog": c["BACKLOG"] == "yes", "agent_filed": c["AGENT_FILED"]},
         "order": dict({"lanes_per_repo": lanes, "planned_load": load, "day_stop": num(c["DAY_STOP"])},
                       **({"pace_to_reset": True, "weekly_budget_usd": num(c["WEEKLY_BUDGET_USD"])}
-                         if c["PACE_TO_RESET"] == "yes" else {})),
+                         if c["PACE_TO_RESET"] == "yes" else
+                         {"weekly_budget_usd": num(c["WEEKLY_BUDGET_USD"])} if c["SPRINT_PLAN_FILE"] else {})),
         "planner": {"lanes_per_repo": lanes, "planned_load": load},
         "window": {"time_zone": c["WINDOW_TIME_ZONE"] or None, "days": parse_window_days(c["WINDOW_DAYS"])[0],
                    "grace_minutes": whole(c["GRACE_MINUTES"])},
@@ -253,7 +264,8 @@ def compose(c):
                    "inputs_file": reader.DEFAULTS["inputs_file"]},
         "morning": dict({"planner": c["PLANNER"] == "yes", "planner_token_env": c["PLANNER_TOKEN_ENV"],
                          "usage_file": c["USAGE_FILE"], "day_plan_file": morning.DEFAULTS["day_plan_file"]},
-                        **({"planner_bin": c["PLANNER_BIN"]} if c["PLANNER_BIN"] else {})),
+                        **({"planner_bin": c["PLANNER_BIN"]} if c["PLANNER_BIN"] else {}),
+                        **({"sprint_plan_file": c["SPRINT_PLAN_FILE"]} if c["SPRINT_PLAN_FILE"] else {})),
     }
     return queue, {"reviews_team_key": c["REVIEWS_TEAM_KEY"], "out": c["USAGE_FILE"]}
 
@@ -408,8 +420,9 @@ def acquire_privilege(ctx, dry_run):
 
 
 class Ctx(object):
-    def __init__(self, conf, runner, env=None, sudo=None):
+    def __init__(self, conf, runner, env=None, sudo=None, conf_path=None, conf_text=None):
         self.conf, self.runner = conf, runner
+        self.conf_path, self.conf_text = conf_path, conf_text      # the owner's queue.conf (KIT-700)
         self.env = os.environ if env is None else env
         self.agent, self.sudo = agent_markers(self.env), sudo or se.SudoSession()
         self.role_home = self.loaded = None
@@ -513,18 +526,50 @@ def read_role_file(ctx, path):
 
 
 def step_config(ctx, apply_it):
-    c = ctx.conf
+    """The two configs, and beside the queue's the installed copy of queue.conf (KIT-700). The tech lead changes that
+    copy (pipeline_queue_settings.change); a setting it changed since the last install is carried into your queue.conf
+    first, unless you changed that setting too: then yours stays, and it is said."""
+    c, text = ctx.conf, ctx.conf_text
+    if text is None or not ctx.conf_path:
+        raise SetupError("the queue.conf this install reads is not known, so its installed copy cannot be written")
+    copy_path = queue_settings.paths_for(c["QUEUE_CONFIG"])[0]
+    have_copy, copy_mode = read_role_file(ctx, copy_path)
+    carried, kept, why = queue_settings.carry(text, have_copy)
+    notes = ["%s: your queue.conf says %s and the tech lead set %s since the last install; yours stays" % k for k in kept]
+    if why:
+        notes.append("%s, so nothing is carried from it" % why)
+    for key, _mine, theirs in carried:
+        text = queue_settings.set_line(text, key, theirs)
+    if carried:
+        values, errors = parse_conf(text, os.path.basename(ctx.conf_path))
+        c, more = validate_conf(values, ns.invoking_user())
+        bad = errors + more + ["%s: not a form queue.conf takes" % k for k, _m, t in carried
+                               if queue_settings.value_problem(k, t)]
+        if bad:
+            raise SetupError("the tech lead's changes would make your queue.conf refused, so nothing was written:\n  "
+                             + "\n  ".join(bad))
+    carry_said = ", ".join("%s %s -> %s" % k for k in carried)
     bodies, stale = validate_composed(*compose(c), ctx.role_home), []
-    for path, body in ((c["QUEUE_CONFIG"], bodies[0]), (c["USAGE_CONFIG"], bodies[1])):
-        have, mode = read_role_file(ctx, path)
+    for path, body in ((c["QUEUE_CONFIG"], bodies[0]), (c["USAGE_CONFIG"], bodies[1]),
+                       (copy_path, queue_settings.installed_copy(text))):
+        have, mode = (have_copy, copy_mode) if path == copy_path else read_role_file(ctx, path)
         if have != body or mode != "600":
             stale.append((path, body, "absent" if have is None else "differs" if have != body else "mode " + mode))
-    if not stale:
+    if not stale and not carried:
         ctx.config_current = True
-        return True, "both configs are current, mode 600, and accepted by the jobs' own loaders", []
+        return True, ("both configs and the installed copy of queue.conf are current, mode 600, and accepted by the "
+                      "jobs' own loaders"), notes
     named = ", ".join("%s (%s)" % (p, why) for p, _b, why in stale)
     if not apply_it:
-        return False, "would write %s; the jobs' own loaders accept it" % named, []
+        return False, ("would carry %s (the tech lead's change) into your queue.conf; " % carry_said if carried else ""
+                       ) + "would write %s; the jobs' own loaders accept it" % named, notes
+    if carried:
+        try:
+            queue_settings.carry_into(ctx.conf_path, carried)
+        except (OSError, ValueError, UnicodeDecodeError) as exc:
+            raise SetupError("could not carry the tech lead's changes into %s (%s), so nothing was written"
+                             % (ctx.conf_path, type(exc).__name__))
+        ctx.conf, ctx.conf_text = c, text
     for path, body, _why in stale:
         res = ctx.as_role(ns.CONFIG_WRITE_SH.replace("@F@", ns._q(path)), what="writing " + path, stdin=body,
                           why="write %s (mode 600)" % path)
@@ -533,7 +578,8 @@ def step_config(ctx, apply_it):
             raise SetupError("could not write %s as %s, or reading it back does not match (exit %d, mode %s)"
                              % (path, ctx.account, res.rc, mode))
     ctx.config_current = True
-    return False, "wrote %s, mode 600" % named, []
+    return False, ("carried %s (the tech lead's change) into your queue.conf; " % carry_said if carried else ""
+                   ) + "wrote %s, mode 600" % named, notes
 
 
 def step_jobs(ctx, apply_it):
@@ -747,12 +793,12 @@ def main(argv=None):
     try:
         if not args.dry_run:        # BEFORE the conf is read: a session must not discover what it would have installed
             refuse_if_agent("run")
-        conf, errors = load_conf(args.conf, ns.invoking_user())
+        conf, errors, text = load_conf(args.conf, ns.invoking_user())
         if errors:
             say("Your conf has %d problem(s), all of them:\n  - %s\n\nFix them, then run the same command again."
                 % (len(errors), "\n  - ".join(errors)))
             return EX_USAGE
-        ctx = Ctx(conf, se.Runner(dry_run=args.dry_run))
+        ctx = Ctx(conf, se.Runner(dry_run=args.dry_run), conf_path=args.conf, conf_text=text)
         ctx.flags = " --conf " + shlex.quote(args.conf) if args.conf != DEFAULT_CONF else ""
         acquire_privilege(ctx, args.dry_run)
         return cmd_run(ctx, args.dry_run)
@@ -904,11 +950,15 @@ def _cases(check, tmp):
     def world(**over):
         conf, errs = parse(text(**over))
         assert not errs, errs
-        return FakeMachine(tempfile.mkdtemp(dir=tmp), conf, key, token), conf
+        fake = FakeMachine(tempfile.mkdtemp(dir=tmp), conf, key, token)
+        fake.conf_path = fake.root + "/queue.conf"              # the owner's queue.conf (KIT-700)
+        _put(fake.conf_path, text(**over), 0o600)
+        return fake, conf
 
     def ctx(fake, conf, env=None, role=False, dry=False):
         fake.dry_run = dry
-        c = Ctx(conf, fake, {} if env is None else env, NoSudo())
+        c = Ctx(conf, fake, {} if env is None else env, NoSudo(), conf_path=fake.conf_path,
+                conf_text=open(fake.conf_path).read())
         c.checkout_scripts, c.role_home = fake.scripts, fake.home if role else None
         return c
 
@@ -923,7 +973,7 @@ def _cases(check, tmp):
             undo = []
             for dotted, value in patches.items():
                 where, _dot, attr = dotted.rpartition(".")
-                obj = {"se": se, "ns": ns}.get(where, me)
+                obj = {"se": se, "ns": ns, "qs": queue_settings}.get(where, me)
                 undo.append((obj, attr, getattr(obj, attr)))
                 setattr(obj, attr, value)
             try:
@@ -978,6 +1028,18 @@ def _cases(check, tmp):
          ("the usage job writes another file than the one the queue reads", {"compose": lambda conf: (lambda q, u: (q, dict(
              u, out="~/.stage-e/usage/other.json")))(*o["compose"](conf))}))
 
+    # KIT-596: review tickets on the work teams are told by their marks, so the Reviews team's key may be left out
+    def no_reviews_team():
+        conf, errs = parse(text(REVIEWS_TEAM_KEY=None))
+        if errs:
+            return errs
+        queue, usage = compose(conf)
+        validate_composed(queue, usage, None)
+        return queue["pool"]["reviews_team_key"], usage["reviews_team_key"]
+    case("KIT-596 conf: REVIEWS_TEAM_KEY may be left out, and both configs still pass the jobs' own loaders",
+         no_reviews_team, ("", ""),
+         ("REVIEWS_TEAM_KEY required again", {"CONF_REQUIRED": CONF_REQUIRED + ("REVIEWS_TEAM_KEY",)}))
+
     def paced_conf(**over):
         conf, bad_ = parse(text(**over))
         return (bad_, compose(conf)[0]["order"]) if not bad_ else (bad_, None)
@@ -993,6 +1055,23 @@ def _cases(check, tmp):
                                                       dict(PACE_TO_RESET="yes"))],
           [["PACE_TO_RESET must be yes or no"], ["WEEKLY_BUDGET_USD must be empty or a number above 0"],
            ["WEEKLY_BUDGET_USD is required with PACE_TO_RESET=yes"]])
+
+    def sprint_conf(**over):
+        conf, bad_ = parse(text(**over))
+        return (bad_, compose(conf)[0]) if not bad_ else (bad_, None)
+    ok_s = sprint_conf(WEEKLY_BUDGET_USD="90", SPRINT_PLAN_FILE="~/.stage-e/queue/sprint-plan.json")
+    check("sprint planning (KIT-575): off by default adds nothing; on writes the file name and the budget, and the jobs' own loaders accept it",
+          (sprint_conf()[1]["morning"].get("sprint_plan_file"), "weekly_budget_usd" in sprint_conf()[1]["order"],
+           ok_s[0], ok_s[1]["morning"]["sprint_plan_file"], ok_s[1]["order"]["weekly_budget_usd"],
+           ok_s[1]["order"].get("pace_to_reset"),
+           validate_composed(ok_s[1], compose(parse(text())[0])[1], None)),
+          (None, False, [], "~/.stage-e/queue/sprint-plan.json", 90, None,
+           validate_composed(ok_s[1], compose(parse(text())[0])[1], None)))
+    check("sprint planning: a plan file with no budget, and a file name that is not a path, are each refused by key",
+          [sprint_conf(**kw)[0] for kw in (dict(SPRINT_PLAN_FILE="~/p.json"),
+                                          dict(WEEKLY_BUDGET_USD="90", SPRINT_PLAN_FILE="bad name; echo hi"))],
+          [["WEEKLY_BUDGET_USD is required with SPRINT_PLAN_FILE: a week cannot be sized without a budget"],
+           ["SPRINT_PLAN_FILE must be a path, or empty"]])
 
     def loaders_refuse():
         fake, conf = world()
@@ -1010,6 +1089,40 @@ def _cases(check, tmp):
                                                                                               "usage/usage-config.json")]
     case("config: written as the role account at mode 600, read back, and then current", config_writes,
          (False, True, ["0o600", "0o600"]), ("a config left readable by anyone", {"ns.CONFIG_WRITE_SH": ns.CONFIG_WRITE_SH.replace("chmod 600", "chmod 644")}))
+
+    # KIT-700: the installed copy of queue.conf beside the queue's settings, and the tech lead's changes to it
+    # carried into the owner's queue.conf by the next install, unless he changed that setting too.
+    def carry_case(tl=None, his=None, dry=False):
+        fake, conf = world()
+        copy_path = fake.home + "/.stage-e/queue/queue.conf"
+        step_config(ctx(fake, conf, role=True), True)
+        first = open(copy_path).read()
+        if tl:
+            _put(copy_path, queue_settings.set_line(first, "PLANNED_LOAD", tl), 0o600)
+        if his:
+            _put(fake.conf_path, queue_settings.set_line(open(fake.conf_path).read(), "PLANNED_LOAD", his), 0o600)
+        ok, detail, notes = step_config(ctx(fake, parse(open(fake.conf_path).read())[0], role=True, dry=dry), not dry)
+        live = json.load(open(fake.home + "/.stage-e/queue/queue.json"))
+        return (first == queue_settings.installed_copy(text()), ok,
+                queue_settings.effective(open(fake.conf_path).read(), "PLANNED_LOAD"),
+                (live["order"]["planned_load"], live["planner"]["planned_load"]),
+                queue_settings.read_base(open(copy_path).read())["PLANNED_LOAD"], detail.split(";")[0], notes)
+    case("config: a first install writes the installed copy of queue.conf, base line first, and is then current",
+         carry_case, (True, True, "40", (40, 40), "40", "both configs and the installed copy of queue.conf are current, "
+                      "mode 600, and accepted by the jobs' own loaders", []))
+    case("config: a setting the tech lead changed in the copy is carried into your queue.conf, composed and installed",
+         lambda: carry_case(tl="30"), (True, False, "30", (30, 30), "30",
+                                      "carried PLANNED_LOAD 40 -> 30 (the tech lead's change) into your queue.conf", []),
+         ("an install that carries nothing", {"qs.carry": lambda a, b: ([], [], None)}))
+    case("config: one you changed too stays yours, and the install says so",
+         lambda: carry_case(tl="30", his="50"), (True, False, "50", (50, 50), "50", "wrote ~/.stage-e/queue/queue.json "
+                                                "(differs), ~/.stage-e/queue/queue.conf (differs), mode 600",
+                                                ["PLANNED_LOAD: your queue.conf says 50 and the tech lead set 30 since "
+                                                 "the last install; yours stays"]))
+    case("config: a dry run carries nothing and writes nothing, and says what it would carry",
+         lambda: carry_case(tl="30", dry=True), (True, False, "40", (40, 40), "40",
+                                                 "would carry PLANNED_LOAD 40 -> 30 (the tech lead's change) into your "
+                                                 "queue.conf", []))
 
     # the plists
     def plists():

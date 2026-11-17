@@ -122,10 +122,29 @@ _ENV_ROOT = os.environ.get("CLAUDE_PROJECT_DIR") or _FILE_ROOT
 
 
 def _cwd_git_toplevel():
-    """Git toplevel of the hook process's cwd, or None when not in a repo."""
+    """Git toplevel of the hook process's cwd, or None when not in a repo. Only the
+    fallback for a subagent whose payload carries no `cwd` (KIT-242): the desktop app
+    starts every hook process in the main checkout."""
     try:
         r = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            env=_child_env(),
+            text=True,
+            timeout=3,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            return os.path.realpath(r.stdout.strip())
+    except Exception:
+        pass
+    return None
+
+
+def _dir_git_toplevel(d: str):
+    """Git toplevel of directory `d`, or None when it is not in a repo (KIT-242)."""
+    try:
+        r = subprocess.run(
+            ["git", "-C", d, "rev-parse", "--show-toplevel"],
             capture_output=True,
             env=_child_env(),
             text=True,
@@ -240,7 +259,9 @@ def _resolve_root(data) -> str:
          Claude Code 2.1.286. The model cannot move it.
       2. the cwd, ONLY for a subagent: the payload carries `agent_id` (the CLI sets
          it only for a subagent) AND the cwd's git toplevel shares a
-         --git-common-dir with the anchor.
+         --git-common-dir with the anchor. That cwd is the payload's `cwd` (KIT-242);
+         the hook process's own cwd only when the payload has none, because the
+         desktop app starts every hook in the main checkout.
     Anything else falls back. This is deliberate: the hook is spawned with the
     CURRENT session cwd, which a persisted `cd` moves — so a cwd-derived root for a
     main session would let `cd ~/other-checkout` switch OFF the branch,
@@ -257,7 +278,12 @@ def _resolve_root(data) -> str:
     _SESSION_ROOT = session_root
     if not data.get("agent_id"):
         return session_root  # main session → its launch worktree, never the cwd
-    top = _cwd_git_toplevel()
+    # KIT-242: the payload's `cwd` names where the subagent works. The process cwd is
+    # only the fallback for a harness that sends none: the desktop app starts every
+    # hook in the main checkout, so that cwd named it for every subagent (measured).
+    _cwd = data.get("cwd")
+    top = (_dir_git_toplevel(_cwd) if isinstance(_cwd, str) and os.path.isabs(_cwd)
+           else _cwd_git_toplevel())
     if not top:
         return session_root
     common = _git_common_dir(top)
@@ -487,21 +513,57 @@ _PROTECTED_REL = (
     # KIT-460: the SessionEnd cleanup runs after the session could edit it, as a hook
     # process outside the Bash sandbox, so an editable copy would run a session's own code.
     ("hooks", "session-end.py"),
+    # KIT-463: SessionStart runs on resume as well as startup, after the session could
+    # edit it, as a hook process outside the Bash sandbox, from $CLAUDE_PROJECT_DIR (on
+    # the dispatcher's lane, the session's own worktree). Same reason as session-end.py.
+    ("hooks", "session-start.py"),
     ("settings.json",),
     ("settings.local.json",),
 )
+# KIT-603: every file a hook command in the settings runs is protected as well. Each runs
+# as a hook process outside the Bash sandbox, from $CLAUDE_PROJECT_DIR (on the dispatcher's
+# lane, the session's own worktree), so an editable copy would run a session's own code the
+# next time the hook fires. That holds for a hook a project wires itself, such as the
+# provisioning template, and for any file its command names (that template's wiring names
+# the provisioning script it runs). Only regular files count, so a folder a formatter hook
+# names is never frozen. The settings files are in the fixed set above, so the list read
+# here is one a session cannot change through this hook.
+_WIRED_PATH_RE = re.compile(r"""\$\{?CLAUDE_PROJECT_DIR\}?["']?/([^\s"'`;|&<>()]+)""")
+
+
+def _wired_hook_files():
+    """Paths, relative to the anchor, of every regular file that a hook command in
+    .claude/settings.json or settings.local.json names through $CLAUDE_PROJECT_DIR.
+    Settings that cannot be read add nothing: the fixed set above still holds."""
+    anchor = os.path.realpath(_ENV_ROOT)
+    found = []
+    for name in ("settings.json", "settings.local.json"):
+        try:
+            with open(os.path.join(anchor, ".claude", name), encoding="utf-8") as fh:
+                events = (json.load(fh).get("hooks") or {}).values()
+            commands = [h.get("command") for entries in events for e in entries
+                        for h in (e.get("hooks") or [])]
+        except Exception:
+            continue
+        for cmd in commands:
+            for rel in _WIRED_PATH_RE.findall(cmd) if isinstance(cmd, str) else ():
+                rel = os.path.normpath(rel)
+                if (rel not in found and not rel.startswith("..") and not os.path.isabs(rel)
+                        and os.path.isfile(os.path.join(anchor, rel))):
+                    found.append(rel)
+    return tuple(found)
+
+
+_WIRED_REL = _wired_hook_files()
+
+
 def _self_protected_paths() -> set:
     """Recomputed whenever PROJECT_ROOT is resolved, so a subagent's own worktree
-    copies are protected too — never only the anchor's."""
-    return {
-        os.path.join(_root, ".claude", *_rel)
-        for _root in {
-            PROJECT_ROOT,
-            os.path.realpath(_ENV_ROOT),
-            os.path.realpath(_FILE_ROOT),
-        }
-        for _rel in _PROTECTED_REL
-    }
+    copies are protected too — never only the anchor's. Holds the fixed set and every
+    file a hook command in the settings runs (KIT-603)."""
+    roots = {PROJECT_ROOT, os.path.realpath(_ENV_ROOT), os.path.realpath(_FILE_ROOT)}
+    return ({os.path.join(_root, ".claude", *_rel) for _root in roots for _rel in _PROTECTED_REL}
+            | {os.path.join(_root, _rel) for _root in roots for _rel in _WIRED_REL})
 
 
 SELF_PROTECTED = _self_protected_paths()
@@ -516,12 +578,14 @@ SELF_PROTECT_HELP = (
 )
 SELF_PROTECT_BASH_HELP = (
     "🔒 That command would modify a protected hook file (one of: pre-tool-use.py, "
-    "audit.py, stop-pr-check.py, session-end.py, .claude/settings.json, "
-    ".claude/settings.local.json). "
+    "audit.py, stop-pr-check.py, session-start.py, session-end.py, "
+    ".claude/settings.json, .claude/settings.local.json). "
     "These are HUMAN-ONLY — Claude cannot edit or overwrite the guards that constrain "
     "it. Print the change as a terminal command for the human to run themselves "
     "instead; it lands via a reviewed PR. (Reading them — cat/less/grep — is fine.)"
 )
+SELF_PROTECT_BASH_HELP += (" Any other file a hook command in .claude/settings.json runs is "
+                           "protected the same way (KIT-603).")
 
 
 def _is_self_protected(path: str) -> bool:
@@ -542,7 +606,7 @@ def _is_self_protected(path: str) -> bool:
 # python/node/ruby invocation NAMING a protected file is blocked (an interpreter can
 # rewrite the file no matter which flags it was launched with) — so validate hook
 # DRAFTS in a scratch dir under a different filename, not against the live path.
-_SELF_PROT = r"(?:pre-tool-use\.py|stop-pr-check\.py|session-end\.py|audit\.py|\.claude[/\\]settings(?:\.local)?\.json)"
+_SELF_PROT = r"(?:pre-tool-use\.py|stop-pr-check\.py|session-start\.py|session-end\.py|audit\.py|\.claude[/\\]settings(?:\.local)?\.json)"
 def _mutate_re(path_re: str):
     """The write/mutation operator scaffold, aimed at whatever path shape is
     passed in. Factored out (behavior-identical for self-protection) so the
@@ -559,6 +623,9 @@ def _mutate_re(path_re: str):
 
 
 _SELF_MUTATE_RE = _mutate_re(_SELF_PROT)
+if _WIRED_REL:  # KIT-603: and every file a hook command in the settings runs
+    _SELF_MUTATE_RE = _mutate_re("(?:%s|%s)" % (_SELF_PROT, "|".join(
+        re.escape(os.path.basename(_w)) for _w in _WIRED_REL)))
 
 
 # ── Protected-label guard: an acknowledgement is the HUMAN's to give ────────────
@@ -1196,6 +1263,137 @@ def _command_word_index(texts):
             continue
         return k
     return None
+
+
+# ── Marker-scrub guard (KIT-107) ──────────────────────────────────────────────
+# The kit's installers, its local dispatch tool and the jobs' setup scripts refuse to
+# run where Claude Code's agent markers are set (scripts/pipeline_dispatch_local.py
+# owns the tuple; presence, not truthiness). That refusal is what keeps a session from
+# placing its own dispatch pin, installing or changing the pipeline, or reading the
+# owner's stored credentials. A shell that REMOVES the markers looks exactly like the
+# owner's own terminal to anything reading os.environ, so no script can see that
+# tamper. This hook can, because it reads the command before the shell runs it.
+#
+# Blocked: a Bash command that RUNS a gated kit script — scripts/pipeline_*.py,
+# scripts/pr_conflict.py or scripts/sync_user_skills.py, as the command word or as the
+# script a Python interpreter is given — while the same line removes or blanks a
+# marker: `env -u M` / `env --unset[=]M` / `env -i` (every marker at once), `unset M`,
+# `export -n M`, or an empty `M=` / `M=''`. A grep or cat that only NAMES a script
+# runs nothing and passes. The battery checks in lockstep that every script with an
+# agent refusal is matched, so a new installer cannot land outside this net unseen.
+#
+# Advisory, like every Bash pattern guard (docs/SECURITY.md): a marker name held in a
+# variable, an interpreter that edits its own environment, or a script reached by a
+# path this matcher does not read all get past it. It makes the attempt visible and
+# dearer. The boundaries that hold are the role account's mode-600 files and the
+# sandbox's deny-read of that home.
+_AGENT_MARKERS = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_PROJECT_DIR", "AI_AGENT")
+_GATED_SCRIPT_RE = re.compile(
+    r"(?:^|/)scripts/(?:pipeline_[A-Za-z0-9_]+|pr_conflict|sync_user_skills)\.py$")
+_PYTHON_WORD_RE = re.compile(r"^(?:python(?:\d+(?:\.\d+)*)?|pypy\d*)$")
+_WRAPPER_ARG_FLAGS = frozenset({"-u", "-g", "-C", "-S", "-P", "--unset", "--chdir",
+                                "--split-string", "--user", "--group"})
+_EVERY_MARKER = "every agent marker (env -i clears the whole environment)"
+MARKER_SCRUB_HELP = (
+    "🔒 Blocked: this command removes or blanks {marker} and runs `{script}`. That "
+    "script refuses to run where Claude Code's agent markers are set, so that a "
+    "session cannot place its own dispatch pin, install or change the pipeline, or "
+    "read the owner's stored credentials. Removing a marker is the way around that "
+    "refusal. Stop and report what you were trying to do; do not respell the command. "
+    "If the step is needed, it is the owner's, run in their own terminal."
+)
+
+
+def _marker_scrubbed(texts):
+    """The agent marker this simple command removes or blanks, or None."""
+    for t in texts:
+        name, eq, val = t.partition("=")
+        if eq and not val and name in _AGENT_MARKERS:      # M= / M='' / env M=
+            return name
+    for i, t in enumerate(texts):
+        word = t.rsplit("/", 1)[-1]
+        if word == "unset" or (word == "export" and "-n" in texts[i + 1:]):
+            hit = next((a for a in texts[i + 1:] if a in _AGENT_MARKERS), None)
+            if hit:
+                return hit
+        if word != "env":
+            continue
+        j = i + 1
+        while j < len(texts) and texts[j].startswith("-"):
+            a = texts[j]
+            if a in ("-", "--ignore-environment"):
+                return _EVERY_MARKER
+            if a.startswith("--"):
+                name = a.partition("=")[2] if a.startswith("--unset=") else (
+                    texts[j + 1] if a == "--unset" and j + 1 < len(texts) else "")
+                if name in _AGENT_MARKERS:
+                    return name
+                j += 2 if a in _WRAPPER_ARG_FLAGS else 1
+                continue
+            cluster = a[1:]
+            if "i" in cluster.split("u", 1)[0]:             # -i, -vi, -iu M: all of it
+                return _EVERY_MARKER
+            if "u" in cluster:                               # -u M, -uM, -vu M
+                rest = cluster.split("u", 1)[1]
+                name = rest or (texts[j + 1] if j + 1 < len(texts) else "")
+                if name in _AGENT_MARKERS:
+                    return name
+                j += 1 if rest else 2
+                continue
+            j += 2 if a in _WRAPPER_ARG_FLAGS else 1
+    return None
+
+
+def _run_word_index(texts):
+    """Index of the word a simple command runs: past `VAR=x` assignments and wrapper
+    words, including a wrapper named by its path (`/usr/bin/env`) and the flags that
+    take an argument (`env --unset M`). None when there is no such word."""
+    k = 0
+    while k < len(texts):
+        t = texts[k]
+        if _ASSIGNMENT_RE.match(t):
+            k += 1
+            continue
+        if t.rsplit("/", 1)[-1] in _PREFIX_WORDS:
+            k += 1
+            while k < len(texts) and texts[k].startswith("-"):
+                k += 2 if texts[k] in _WRAPPER_ARG_FLAGS else 1
+            continue
+        return k
+    return None
+
+
+def _gated_script_run(texts):
+    """The gated kit script this simple command RUNS, or None: its command word, or
+    the script a Python interpreter is given (inline code and modules are not)."""
+    k = _run_word_index(texts)
+    if k is None:
+        return None
+    if _GATED_SCRIPT_RE.search(texts[k]):
+        return texts[k]
+    if not _PYTHON_WORD_RE.match(texts[k].rsplit("/", 1)[-1]):
+        return None
+    m = k + 1
+    while m < len(texts) and texts[m].startswith("-") and texts[m] != "-":
+        a = texts[m]
+        if not a.startswith("--") and ("c" in a[1:] or "m" in a[1:]):
+            return None                                       # -c code / -m module
+        m += 2 if a in ("-W", "-X") else 1
+    if m < len(texts) and _GATED_SCRIPT_RE.search(texts[m]):
+        return texts[m]
+    return None
+
+
+def _marker_scrub_block(cmd):
+    """(marker, script) when a command line runs a gated kit script while it removes
+    or blanks an agent marker, else None. Reads the RAW command through the shell
+    lexer, so quoted text (a grep pattern, a message) is one word, never a command."""
+    commands = [[w[0] for w in words] for words in _shell_commands(cmd)]
+    script = next((s for s in map(_gated_script_run, commands) if s), None)
+    if not script:
+        return None
+    marker = next((m for m in map(_marker_scrubbed, commands) if m), None)
+    return (marker, script) if marker else None
 
 
 # ── reading git, cheaply and never raising ────────────────────────────────────
@@ -3044,6 +3242,100 @@ def _pipeline_guards(tool, inp) -> None:
 
 
 # ── Bash prose-stripping ──────────────────────────────────────────────────────
+# ── Commit-checkout guard (KIT-237): a commit is judged where it lands ───────────
+# The branch guard above judges the SESSION ROOT's branch. A commit can land in another
+# checkout: through a persisted `cd` (the payload's `cwd`), a `cd`/`pushd` earlier on the
+# same line, or `git -C <dir> commit`, which the root check's `git commit` pattern never
+# even saw. When that checkout is a worktree of this repository, it is judged the same
+# way: on `main`/`master`, or on a badly named branch, the commit is blocked. A detached
+# HEAD is not judged (its commit lands on no branch), and another repository never is:
+# the ops repo commits on its own main by design.
+#
+# Only ever TIGHTER. These values are model-movable, so they can add a block and never
+# lift the root's check. The hook PROCESS's cwd is never read: the desktop app starts
+# every hook in the main checkout, so judging it would block every desktop commit (a
+# battery case pins this). Not read, so they get past it: `--git-dir`, a `$VAR` or
+# `~user` path, and anything the shell lexer cannot follow. Advisory, like every Bash
+# guard; branch protection on GitHub stays the durable layer.
+COMMIT_CHECKOUT_HELP = (
+    "This commit would land in `{checkout}`, {why}. Only your own worktree's branch "
+    "takes commits (docs/COLLABORATION.md). Commit there instead:\n"
+    "  git -C {root} commit -F <message-file>\n"
+    "The usual cause is a persisted `cd` into another checkout, or `git -C` aimed at "
+    "one. Prefer absolute paths to your own worktree over `cd`."
+)
+_GIT_ARG_OPTS = frozenset({"-c", "--git-dir", "--work-tree", "--namespace",
+                           "--config-env", "--super-prefix", "--exec-path"})
+
+
+def _expand_path(text, base):
+    """A literal shell path made absolute: `~` and `~/x` from the account database
+    (never $HOME), a relative one from `base`. None when it cannot be known."""
+    if text == "~" or text.startswith("~/"):
+        home = _account()[1]
+        if not home:
+            return None
+        text = home + text[1:]
+    elif text.startswith("~"):
+        return None
+    if not os.path.isabs(text):
+        if not base:
+            return None
+        text = os.path.join(base, text)
+    return os.path.normpath(text)
+
+
+def _commit_checkouts(cmd, cwd):
+    """Each directory a `git … commit` on this line runs in. It starts at the payload's
+    `cwd`, follows each literal `cd`/`pushd` on the line in order, then the commit's own
+    `-C` options. A word the hook cannot know (a `$VAR`, a substitution) drops that
+    commit, which is then not judged here."""
+    here = cwd if isinstance(cwd, str) and os.path.isabs(cwd) else None
+    found = []
+    for words in _shell_commands(cmd):
+        texts = [w[0] for w in words]
+        k = _command_word_index(texts)
+        if k is None:
+            continue
+        head = texts[k].rsplit("/", 1)[-1]
+        if head in ("cd", "pushd"):
+            arg = next((w for w in words[k + 1:] if not w[0].startswith("-")), None)
+            here = None if arg is None or arg[1] else _expand_path(arg[0], here)
+            continue
+        if head != "git":
+            continue
+        d, j = here, k + 1
+        while j < len(words) and words[j][0].startswith("-"):
+            opt = words[j][0]
+            if opt == "-C" and j + 1 < len(words):
+                d = None if words[j + 1][1] else _expand_path(words[j + 1][0], d)
+                j += 2
+                continue
+            j += 2 if opt in _GIT_ARG_OPTS else 1
+        if d and j < len(words) and words[j][0] == "commit":
+            found.append(d)
+    return found
+
+
+def _checkout_block(d):
+    """The block message for a commit landing in checkout `d`, or "" when it may."""
+    top = _git_in(d, "rev-parse", "--show-toplevel")
+    if not top:
+        return ""
+    top = os.path.realpath(top)
+    common = _git_common_dir(top)
+    if not common or common != _git_common_dir(PROJECT_ROOT):
+        return ""                                   # another repository: never judged
+    branch = _git_in(top, "rev-parse", "--abbrev-ref", "HEAD") or ""
+    if branch in PROTECTED_BRANCHES:
+        why = "which is on `%s`, where commits are blocked" % branch
+    elif branch and branch != "HEAD" and not BRANCH_NAME_RE.match(branch):
+        why = "whose branch `%s` does not match `<type>/<short-kebab-desc>`" % branch
+    else:
+        return ""
+    return COMMIT_CHECKOUT_HELP.format(checkout=top, why=why, root=PROJECT_ROOT)
+
+
 def _strip_prose(c: str) -> str:
     """v2 (2026-07-03 retro): guards must match OPERATIONS, not PROSE.
 
@@ -3121,6 +3413,14 @@ def _dispatch(data) -> None:
             if merged:
                 block(MERGED_PR_HELP.format(branch=branch, number=merged["number"]))
 
+    # Commit-checkout guard (KIT-237): judge the checkout each commit on the line lands
+    # in, from the payload's cwd, any `cd`/`pushd` and the commit's own `git -C`.
+    if tool == "Bash" and "commit" in str(inp.get("command", "")):
+        for _d in _commit_checkouts(inp.get("command", ""), data.get("cwd")):
+            _why = _checkout_block(_d)
+            if _why:
+                block(_why)
+
     # ── Bash ──────────────────────────────────────────────────────────────────
     if tool == "Bash":
         cmd = inp.get("command", "")
@@ -3130,6 +3430,12 @@ def _dispatch(data) -> None:
         # guard in the Bash block so its message wins.
         if _SELF_MUTATE_RE.search(scan):
             block(SELF_PROTECT_BASH_HELP)
+
+        # Marker-scrub (KIT-107): a gated kit script run while the line removes or
+        # blanks an agent marker. Reads the RAW command through the shell lexer.
+        _scrub = _marker_scrub_block(cmd)
+        if _scrub:
+            block(MARKER_SCRUB_HELP.format(marker=_scrub[0], script=_scrub[1]))
 
         # Config anchor: writing a protected ref, repointing `origin`, or mutating
         # `.git/**` is human-only (see CONFIG_ANCHOR_HELP). `git config --get

@@ -851,6 +851,20 @@ def selftest():
 
     # ── Totals and spend ────────────────────────────────────────────────────
     check("period is 7 days", s["period"]["days"] == 7, str(s["period"]))
+    t0 = datetime(2026, 11, 17, 12, tzinfo=timezone.utc)
+    check("an exact period is the one given (a sprint's), and none is the last N days",
+          (parse_period("2026-11-10T18:00:00Z", "2026-11-17T18:00:00Z", 7, t0),
+           parse_period(None, None, 3, t0)),
+          ((datetime(2026, 11, 10, 18, tzinfo=timezone.utc), datetime(2026, 11, 17, 18, tzinfo=timezone.utc)),
+           (t0 - timedelta(days=3), t0)))
+    for bad_args in (("2026-11-10T18:00:00Z", None), (None, "2026-11-17T18:00:00Z"), ("yesterday", "today"),
+                     ("2026-11-17T18:00:00Z", "2026-11-10T18:00:00Z")):
+        try:
+            parse_period(bad_args[0], bad_args[1], 7, t0)
+            refused = False
+        except ValueError:
+            refused = True
+        check("a bad period %r is refused" % (bad_args,), refused, True)
     check("spend sums every run", s["metrics"]["spend"]["value"] == 9.65,
           str(s["metrics"]["spend"]["value"]))
     check("budget is dailyUsd x days", s["metrics"]["spend"]["budget"] == 70.0)
@@ -1204,10 +1218,30 @@ def selftest():
     return 0
 
 
+def parse_period(since, until, days, now):
+    """(since, until) as aware UTC datetimes. With --since and --until (UTC times ending in Z) the period is
+    exactly that, as a sprint's is (KIT-576); with neither it is the last `days` days up to `now`. One without the
+    other, a time that is not one, or a period that ends before it begins raises ValueError."""
+    if since is None and until is None:
+        return now - timedelta(days=days), now
+    if since is None or until is None:
+        raise ValueError("--since and --until go together")
+    try:
+        a = datetime.strptime(since, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        b = datetime.strptime(until, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        raise ValueError("--since and --until must be UTC times like 2026-11-10T18:00:00Z")
+    if not a < b:
+        raise ValueError("--until must be after --since")
+    return a, b
+
+
 def main():
     ap = argparse.ArgumentParser(add_help=True, description=__doc__.splitlines()[0])
     ap.add_argument("--config", help="path to delivery.json")
     ap.add_argument("--days", type=int, default=DEFAULT_DAYS, help="period length (default: 7)")
+    ap.add_argument("--since", help="start of an exact period, a UTC time like 2026-11-10T18:00:00Z (with --until)")
+    ap.add_argument("--until", help="end of an exact period (with --since); replaces --days")
     ap.add_argument("--from-json", help="read rows from a JSON file instead of the store")
     ap.add_argument("--exclude", nargs="*", default=[], help="ticket IDs to leave out (e.g. `meta`)")
     ap.add_argument("--out", help="write the HTML page here")
@@ -1233,8 +1267,11 @@ def main():
                   % (config_path, config.get("version"), SUPPORTED_VERSION), file=sys.stderr)
             return 2
 
-    until = datetime.now(timezone.utc)
-    since = until - timedelta(days=args.days)
+    try:
+        since, until = parse_period(args.since, args.until, args.days, datetime.now(timezone.utc))
+    except ValueError as e:
+        print("FAIL: %s" % e, file=sys.stderr)
+        return 2
 
     if args.from_json:
         try:

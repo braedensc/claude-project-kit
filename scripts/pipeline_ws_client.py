@@ -142,6 +142,7 @@ class WebSocket(object):
         self.buf = bytearray(leftover)
         self.closed = False
         self.sent_close = False
+        self.frame_count = 0                 # every frame the server sent, a ping and a pong too (KIT-561)
         self._open = None               # (opcode, chunks) of a message still arriving
 
     def __repr__(self):
@@ -206,6 +207,7 @@ class WebSocket(object):
                 continue
             (fin, opcode, payload), used = got
             del self.buf[:used]
+            self.frame_count += 1
             if opcode == OP_PING:
                 self._send(encode_frame(OP_PONG, payload))
             elif opcode == OP_PONG:
@@ -525,6 +527,19 @@ def _selftest():
           ((OP_CLOSE, 1001), True, "the connection is closed", "the connection is closed"))
     check("the server's thread ended", ended, True)
     ws.close()
+
+    # -- every frame is counted, a ping included: how a quiet connection is told from a dead one (KIT-561)
+    import socket as _socket
+    near, far = _socket.socketpair()
+    counted = WebSocket(near, "pair")
+    far.sendall(encode_frame(OP_PING, b"p", mask=False) + encode_frame(OP_TEXT, b"t", mask=False))
+    before = counted.frame_count
+    first_read = counted.recv(timeout=2)
+    check("frame_count: a ping and the text after it are both counted, and the ping is answered",
+          (before, first_read, counted.frame_count, far.recv(64)[:2] == bytes([0x8A, 0x81])),
+          (0, ("text", "t"), 2, True))
+    near.close()
+    far.close()
 
     # -- a read that times out leaves the connection good ----------------------------------------
     def late(conn, request, rest):

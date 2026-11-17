@@ -77,6 +77,7 @@ try:
     import pipeline_queue_pool as pool
     import pipeline_hold as watcher_hold
     import pipeline_queue_read as reader
+    import pipeline_sprint_plan as sprint_plan
     import pipeline_status_local as status_job
     import pipeline_window as window
 except ImportError as exc:  # a packaging accident, never a state to run in
@@ -131,12 +132,18 @@ def load(raw):
             morning, dict) else None, "morning.usage_file")
     except ValueError as exc:
         bad.append(str(exc))
+    plan_file = ""
+    if isinstance(morning, dict) and morning.get("sprint_plan_file"):
+        try:
+            plan_file = reader.resolve_path(morning["sprint_plan_file"], "morning.sprint_plan_file")
+        except ValueError as exc:
+            bad.append(str(exc))
     rcfg, rbad = room_config(raw.get("room", {}))
     bad += ["room: %s" % w for w in rbad]
     hcfg, hbad = hold_config(raw.get("hold", {}))
     bad += ["hold: %s" % w for w in hbad]
-    return (None, bad) if bad else (dict(cfg, window=wcfg, usage_file=usage, room=rcfg,
-                                         hold=hcfg), [])
+    return (None, bad) if bad else (dict(cfg, window=wcfg, usage_file=usage, room=rcfg, hold=hcfg,
+                                         sprint_plan_file=plan_file), [])
 
 
 def hold_config(raw):
@@ -328,6 +335,8 @@ def decide(raw_config, gql, now, clock=time.time, say=None, room=None):
         cfg["window"], now, until))
     for line in why_paced:
         (say or (lambda _line: None))("queue: " + line)
+    # KIT-575: the owner's recorded sprint plan puts its pieces first, as it does in the morning job's day plan.
+    paced = dict(paced, sprint_planned=sprint_plan.planned_for_usage(cfg["sprint_plan_file"], usage))
     decision = order.order(paced, now, with_extras(verdicts, inputs["extras"]),
                            inputs["running"], usage, inputs["ledger"])
     return dict(out, state="decided", decision=decision,
@@ -827,8 +836,50 @@ def _cases(check, tmp, home):
                    say=said.append, room=lambda: FINE)
         return r["decision"]["load"]["planned"], said
 
+    # -- KIT-575: the owner's recorded sprint plan puts its pieces first in the starts, and admits nothing -------
+    SPRINT_START = "2026-11-03T18:00:00Z"
+    sprint_usage = os.path.join(tmp, "sprint-usage.json")
+    with open(sprint_usage, "w", encoding="utf-8") as fh:
+        json.dump({"schema": "pipeline-usage/1", "written_at": pool.iso(NOW - 300), "result": "ok",
+                   "days": [{"date": TODAY, "usd": 6.5}], "pieces": [], "status": {"windows": {}},
+                   "sign_in": {"api_key_runs": []},
+                   "week": {"known": True, "starts_at": SPRINT_START, "resets_at": "2026-11-10T18:00:00Z",
+                            "usd": 20.0, "runs": 5}}, fh)
+
+    def sprint_starts(plan_tickets, sprint=SPRINT_START, name="plan"):
+        """The starts of a pass with two admitted pieces, ENG-2 more urgent than ENG-1, with a sprint plan
+        naming `plan_tickets` ([] and None: a plan file with no yes, and no plan file at all)."""
+        path = os.path.join(tmp, "sprint-%s-%d" % (name, counter[0]), "sprint-plan.json")
+        counter[0] += 1
+        raw = dict(RAW, morning={"usage_file": sprint_usage})
+        if plan_tickets is not None:
+            os.makedirs(os.path.dirname(path))
+            sprint_plan.save({
+                "schema": sprint_plan.SCHEMA, "sprint": sprint, "first_day": "2026-11-04",
+                "resets_at": "2026-11-10T18:00:00Z", "proposed_at": "2026-11-03T20:00:00Z",
+                "announced_at": "2026-11-03T20:01:00Z", "budget_usd": 60, "spent_usd": 10, "planned_usd": 2,
+                "planned": [{"ticket": "ENG-1", "effort": "S", "usd": 2.0, "title": "t"}], "not_planned": [],
+                "plan": {"recorded_at": "2026-11-03T21:00:00Z", "tickets": plan_tickets} if plan_tickets else None}, path)
+            raw["morning"]["sprint_plan_file"] = path
+        doc = inputs(histories={"id-1": [move(OWNER)], "id-2": [move(OWNER)]},
+                     extras={"ENG-1": extra(1, priority=3), "ENG-2": extra(2, repo="acme/web", priority=1)})
+        return run(doc=doc, raw=raw)[3]
+    battery_sprint = [
+        ("sprint plan: with none, the urgent piece starts first, as it always did", sprint_starts(None), ["ENG-2", "ENG-1"]),
+        ("sprint plan: a recorded plan puts its piece before a more urgent one that is not in it",
+         sprint_starts(["ENG-1"]), ["ENG-1", "ENG-2"]),
+        ("sprint plan: a file with no yes, or another sprint's plan, changes nothing",
+         (sprint_starts([]), sprint_starts(["ENG-1"], sprint="2026-10-27T18:00:00Z")), (["ENG-2", "ENG-1"], ["ENG-2", "ENG-1"])),
+        ("sprint plan: a plan that names a piece the pool did not admit starts nothing extra",
+         sprint_starts(["ENG-9", "ENG-3"]), ["ENG-2", "ENG-1"]),
+        ("sprint plan: the starter's config names the same file the morning job does, and refuses a bad one",
+         (load(dict(RAW, morning={"usage_file": usage, "sprint_plan_file": "/p/s.json"}))[0]["sprint_plan_file"],
+          load(dict(RAW))[0]["sprint_plan_file"], bool(load(dict(RAW, morning={"usage_file": usage, "sprint_plan_file": "rel/p.json"}))[1])),
+         ("/p/s.json", "", True)),
+    ]
+
     def battery():
-        return [
+        return battery_sprint + [
             ("config: a good one loads, and every fault is named at once",
              (load(RAW)[1], len(load(dict(RAW, oops=1, window={"days": {"wed": "9"}},
                                           morning={"usage_file": "u.json"}))[1])), ([], 3)),

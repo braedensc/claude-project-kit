@@ -7,6 +7,37 @@ Run it in a terminal, as yourself, from the kit checkout you install from. It do
 everything a machine can do and stops only for what a person must do. Run it again after
 any stop: it picks up where it left off.
 
+THE FIRST SCREEN, THE CONSENT AND THE RECORD (KIT-717; docs/adr/2026-11-11-one-consent-then-no-stops.md)
+  After the three refusals it offers Automatic ("things just work") or Manual ("show me each
+  change and ask"). The default is the mode in the consent record, or Automatic.
+  Then one consent page, drawn from `pipeline-parts.json` for the parts this Mac runs (those
+  whose settings file it finds): the background jobs it installs under a separate account,
+  what may restart, what may be created in the tracker, the code host and the chat product,
+  what it spends (the subscription only), what it never does, and the installers that may
+  still ask their own question or show a card. You agree once by typing `yes`; anything else
+  changes nothing and exits 10. Automatic then answers this command's own questions yes, out
+  loud; Manual asks each one, as before.
+  The consent is written to a record only root can write
+  (/Library/Application Support/claude-pipeline/consent-record.json; `--consent-record` moves
+  it): the mode, the page's words, each part on or off, each job's switch value, each ceiling.
+  A later run trusts it only if the file and every folder above it are root's alone and nobody
+  else can write them. A matching record asks nothing; a difference is shown, old and new, and
+  asked again in either mode. A missing or untrusted record is never a match.
+
+THE VALUES ONLY YOU HAVE (KIT-735; scripts/pipeline_ask.py)
+  Between the first screen and the consent page, in both modes, it asks one plain question for
+  each value that is still missing: the end date of each stored key that ends (`update.conf`'s
+  CREDENTIAL_EXPIRIES; a key already inside its warning, or past, is asked again) and the tech
+  lead's name (`bridge.conf`). Enter skips a date, or keeps the one on record; for the name it
+  takes `Tech lead`. Nothing is written yet. The consent page then lists each answer as a file,
+  a key, the old value and the new one, and your one yes covers them. Right after the yes, and
+  before any installer, they are written and read back. Decline and nothing is written. A write
+  that fails stops the run, naming the file. It does not ask again when it has started itself
+  again on new code, and a second run with nothing missing asks nothing. `--update-conf` and
+  `--bridge-conf` (hidden from the help) name the two files. A file that is not there asks
+  nothing and is said in one line, once, with where it looked (`Not asked: no bridge.conf in the
+  kit folder, so the tech lead's name was not asked.`).
+
 WHAT IT DOES, IN ORDER
   1. The kit checkout. It must be on its default branch with no uncommitted changes to
      tracked files. It fast-forwards it to origin, and when that moved the code it starts
@@ -23,11 +54,6 @@ WHAT IT DOES, IN ORDER
   3b. The sweep (`scripts/pipeline_sweep_setup.py run`), when this Mac has a `sweep.conf`:
      it installs the job that removes what finished dispatcher runs left, and never loads
      it. Its card (CK-S1) is yours and does not hold the idea gate back.
-  3c. The tech lead's rules (`scripts/pipeline_chat_lane_setup.py chat-rules`), when this Mac
-     has a `chat-lane.conf` with `CHAT_RULES=on`. A kit update can change them, and the chat
-     lane's `verify` fails until they are written again. It reads them first (a dry run), says
-     "up to date" or asks before writing, and a "no" stops with the rules named as behind. A
-     Mac with no `chat-lane.conf`, or with the rules off, is named and carried past (KIT-582).
   4. The idea gate (`scripts/pipeline_stage_a_setup.py run`). On a first run it writes
      its own settings from what the review installer's settings already say. Then it
      works through its steps, asking before each one that changes something a person
@@ -44,18 +70,80 @@ WHAT IT NEVER DOES
   Terminal tab (measured 2026-09-24: none of the markers below is set there). The `!`
   prefix inside a Claude Code session does NOT: that shell is the session's own.
 
+WHAT IT PRINTS AT THE END (every exit that gets past the three refusals, a stop part way
+and Ctrl-C included; the refusals read nothing, so they print nothing)
+  One line per part of the pipeline, read from `pipeline-parts.json`, each with exactly one
+  of: up to date · updated · waiting on you · off on this Mac · could not be measured · not
+  reached (the run stopped before that part). The steps above report their own result for
+  the parts they act on. Every other part with a check is looked at once, read-only, with no
+  input and no terminal to prompt on: its settings file absent is "off on this Mac" and its
+  check does not run; exit 0 is up to date, 10 waiting on you, anything else (another code,
+  a killed or timed-out child, a check that wanted to ask) could not be measured. A part
+  with no check and no step is named on one closing line and changes no exit code.
+  Then a short list: the cards (`CK-...`) a waiting part's own output names, split into
+  "Only you can do these" and "Sign-offs still asked for", or "Nothing is waiting on you."
+  The lines are built as data first, one record per part (id, name, outcome, detail).
+  In Automatic, a part whose installer ran with work to do, and that has steps only a person
+  can do, keeps its real outcome and gains the note "its installer still asks its own
+  questions; Automatic cannot answer them yet". The note changes no outcome, no exit code
+  and not the short list.
+
+  Two limits, plainly. "Off on this Mac" means the part's settings file is not in the kit
+  folder (or the folder you named with --conf and its kin); settings kept elsewhere read as
+  off. Checks that need the Mac password read "could not be measured", because they run
+  without a terminal and cannot ask for it.
+
+TO ONLY LOOK: --check (KIT-736)
+  `pipeline_install.py --check` looks at every part and changes nothing. It needs no terminal,
+  so a run with no person at one can use it. The refusals come first and print only themselves:
+  inside a Claude session it exits 3, as root it exits 2. After that it asks nothing: no first
+  screen, no consent page, no password, and the consent record is neither read nor written.
+  It writes no settings file, makes no folder, installs no job and runs no `git fetch`, `pull`
+  or `checkout`. The only commands it runs are each part's own read-only check, run the way the
+  end lines run them (no terminal, stdin closed, a time limit), and two read-only git calls:
+  `git rev-parse HEAD` and `git ls-remote --symref origin HEAD`. (Python itself may write its
+  bytecode cache next to the scripts; PYTHONDONTWRITEBYTECODE=1 stops that too.)
+  The first line says it only looked. Then the same one line per part and the same short list
+  as a real run, each part judged the way the lines at the end judge it:
+    - The kit checkout is judged by its commit alone. The same commit as the tip of origin's
+      default branch is "up to date"; any other is "waiting on you". A read of the tip cannot
+      tell behind from ahead, so it never says behind. An origin that cannot be reached or
+      read is "could not be measured", and the line says which. The branch the checkout is on
+      is not asked, so a detached commit is measured like any other.
+    - Every other part: its settings file absent is "off on this Mac"; otherwise its own check
+      runs once and is read the one way for every part. One exception, because the lines at
+      the end read it so too: the skills check exits 1 for "differ from the kit's", which is
+      "waiting on you". The review jobs share one check, and a look cannot tell a card from
+      work, so each of their parts reads "waiting on you" when it exits 10. A part with no
+      check is named on the closing line.
+  `--skip-stage-e` and the settings-file flags work. `--no-pull`, `--pulled-from`,
+  `--chosen-mode` and `--consent-record` do nothing with it.
+  Exit: 0 every part is up to date or off on this Mac · 10 something waits on you · 4 something
+  could not be measured, or the list of parts could not be read (4 comes before 10).
+
 Usage:
     pipeline_install.py [--conf stage-a.conf] [--stage-e-conf stage-e.conf]
-                        [--chat-lane-conf chat-lane.conf] [--no-pull] [--skip-stage-e]
+                        [--no-pull] [--skip-stage-e]
+    pipeline_install.py --check [--conf stage-a.conf] [--stage-e-conf stage-e.conf]
+                        [--sweep-conf sweep.conf] [--skip-stage-e]
     pipeline_install.py --selftest
 
-Exit: 0 everything is installed and proven · 10 waiting on you (the lines above say
-      what; run it again afterwards) · 2 this checkout or its settings need fixing first
-      · 3 refused (an agent environment) · any other code is the installer's own,
-      passed through with a sentence saying which one stopped.
+Exit: 0 every part is up to date, updated or off · 4 a part could not be measured, or was
+      not reached · 10 waiting on you (the lines above say what; run it again afterwards)
+      · 2 this checkout or its settings need fixing first · 3 refused (an agent
+      environment) · any other code is the installer's own, passed through with a sentence
+      saying which one stopped.
+      4 comes before 10 when both apply (contract section 13, and the installers' own
+      order): a run that could not measure something has not found out what else is left, so
+      "waiting on you" must not read as the whole answer. A stop part way keeps the code of
+      the installer that stopped (10 stays 10; the parts it did not reach are on the
+      lines); a stop that would exit 0 exits 4.
 """
 import argparse
+import json
 import os
+import re
+import stat
 import subprocess
 import sys
 
@@ -67,12 +155,23 @@ sys.path.insert(0, HERE)
 from pipeline_dispatch_local import AGENT_ENV_MARKERS  # noqa: E402
 
 EX_OK, EX_USAGE, EX_REFUSED, EX_BLOCKED = 0, 2, 3, 10
+EX_UNMEASURED = 4
+
+# The six things a part's line can say, and no others.
+OUT_OK = "up to date"
+OUT_UPDATED = "updated"
+OUT_WAITING = "waiting on you"
+OUT_OFF = "off on this Mac"
+OUT_UNMEASURED = "could not be measured"
+OUT_NOT_REACHED = "not reached"
+OUTCOMES = (OUT_OK, OUT_UPDATED, OUT_WAITING, OUT_OFF, OUT_UNMEASURED, OUT_NOT_REACHED)
+# A part's own check gets this long, once. Longer is "could not be measured".
+CHECK_TIMEOUT = 120
 
 SKILLS = os.path.join(HERE, "sync_user_skills.py")
 STAGE_E = os.path.join(HERE, "pipeline_stage_e_setup.py")
 STAGE_A = os.path.join(HERE, "pipeline_stage_a_setup.py")
 SWEEP_SETUP = os.path.join(HERE, "pipeline_sweep_setup.py")
-CHAT_LANE = os.path.join(HERE, "pipeline_chat_lane_setup.py")
 
 # What each installer's exit code means, in a sentence a person can act on. The codes are
 # the installers' own (their docstrings); an unknown one is passed through as it is.
@@ -99,29 +198,6 @@ OPTIONAL_JOB_CARDS = {
 # and nothing after it runs.
 INTERRUPTED = ("interrupted. %s finished its own clean-up and stopped; the lines above say "
                "where. Nothing after it ran. Run this same command again to carry on.")
-# The chat lane installer's exits for `chat-rules`, as a sentence (KIT-582). 10 on the dry run
-# means the rules differ from what this checkout composes (or are missing): the ask follows.
-CHAT_RULES_MEANS = {
-    3: "the chat-lane installer refused: it saw a Claude session. Use the Terminal app.",
-    4: "the tech lead's rules could not be measured: the read-only check as the role account did "
-       "not run. The lines above say why. Nothing was changed, and they are NOT counted as up to "
-       "date.",
-    2: "chat-lane.conf has a problem; every bad value is listed above.",
-    5: "the chat-lane installer needs your Mac password and did not get it. Run this again and "
-       "type it at the prompt.",
-    1: "writing the tech lead's rules failed. The FAILED line above says why.",
-}
-# After --apply the same codes mean something a little different: 3 is the role-account writer
-# refusing (not a Claude session), and 10 or 4 are the read-back still not current or not run.
-CHAT_RULES_APPLY_MEANS = dict(CHAT_RULES_MEANS)
-CHAT_RULES_APPLY_MEANS.update({
-    3: "the chat-lane installer refused to write the rules. The REFUSED or FAILED line above "
-       "says why. Nothing was changed, and the rules are NOT counted as up to date.",
-    10: "the rules were written, and the read-back is still not what this checkout composes. "
-        "The row above says what differs. They are NOT counted as up to date.",
-    4: "the rules were written, and the read-back could not run. The lines above say why. They "
-       "are NOT counted as up to date.",
-})
 STAGE_A_MEANS = {
     0: "The idea gate is installed, running and proven.",
     10: "The idea gate is waiting on you. What for is printed just above. Do it, then run "
@@ -179,6 +255,53 @@ class Io(object):
         except (OSError, subprocess.SubprocessError) as exc:
             return 127, str(exc)
 
+    def measure(self, argv, timeout=CHECK_TIMEOUT):
+        """(exit code, output) of one read-only check, or (None, why) when it did not finish.
+
+        NOTHING IN HERE CAN ASK A PERSON. Standard input is closed, and the child runs in a
+        session of its own, so it has no terminal to open: a password prompt or an input()
+        fails at once, and the caller reads that as "could not be measured". A child that
+        outlives `timeout` is killed with everything it started."""
+        import signal
+        try:
+            proc = subprocess.Popen(argv, cwd=KIT, stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    start_new_session=True)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return None, str(exc)
+
+        def end_it():
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            try:
+                proc.communicate(timeout=5)
+            except (OSError, subprocess.SubprocessError):
+                pass
+        try:
+            out, _ = proc.communicate(timeout=timeout)
+            return proc.returncode, out.decode("utf-8", "replace")
+        except subprocess.TimeoutExpired:
+            end_it()
+            return None, "no answer in %d seconds" % timeout
+        except KeyboardInterrupt:
+            end_it()
+            self.interrupted = True
+            return None, "interrupted"
+
+    def exists(self, path):
+        return os.path.exists(path)
+
+    def parts(self):
+        """The pipeline's parts, in the list's order. Raises OSError or ValueError."""
+        import pipeline_parts
+        doc, _schema = pipeline_parts.load(KIT)
+        return pipeline_parts.parts_of(doc)
+
+    # The records the last run ended with, for whatever prints them another way later.
+    records = None
+
     def stage_e_steps(self, since):
         """{step: outcome} for the steps the review installer's own record says were
         measured at or after `since` — or None when it cannot be read, or when its `code`
@@ -194,11 +317,92 @@ class Io(object):
             return None
         return fresh if "code" in fresh else None
 
+    # Set once the person has agreed in Automatic: this command's OWN questions are then
+    # answered yes, out loud, by the consent. Installers it runs are not touched by this.
+    auto = False
+    auto_answered = ()
+
     def ask(self, question):
+        if self.auto:
+            self.say("%s -> yes (you agreed to this in the consent)" % question)
+            self.auto_answered = tuple(self.auto_answered) + (question,)
+            return True
+        return self.prompt(question)
+
+    def prompt(self, question):
         try:
             return input("%s [y/N] " % question).strip().lower() in ("y", "yes")
         except EOFError:
             return False
+
+    def line(self, prompt):
+        """One typed line for the first screen or the consent, or None at the end of input."""
+        try:
+            return input(prompt)
+        except EOFError:
+            return None
+
+    def read_record(self, path):
+        """(state, data, why) for the consent record: see load_record."""
+        return load_record(path)
+
+    def read_conf(self, path):
+        """{KEY: value} of a settings file, or None when it cannot be read."""
+        try:
+            with open(path, encoding="utf-8") as fh:
+                return parse_conf(fh.read())
+        except (OSError, ValueError):
+            return None
+
+    # The one administrator session of this run, kept so its keep-alive outlives the call.
+    _sudo = None
+
+    def make_sudo(self):
+        """The same once-per-run password session the installers use (never a second way)."""
+        import pipeline_stage_e_setup as se
+        return se.SudoSession()
+
+    def sudo_once(self, why):
+        """True when administrator access is held for the rest of this run."""
+        import pipeline_stage_e_setup as se
+        if self._sudo is None:
+            self._sudo = self.make_sudo()
+        try:
+            return bool(self._sudo.acquire(why, ""))
+        except se.NoPrivilege:
+            return False
+
+    def write_record(self, path, text):
+        """Install `text` at `path` as root:wheel 0644, in a root-owned folder made with sudo
+        when it is missing. None when done, else why not. The text is written to a private
+        temp file first; sudo only copies it."""
+        import shutil
+        import tempfile
+        private = tempfile.mkdtemp(prefix="consent-record-")     # made 0700: only this user
+        tmp = os.path.join(private, "record.json")
+        try:
+            os.chmod(private, 0o700)
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(text)
+            for argv in record_install_argvs(os.path.isdir(os.path.dirname(path)), tmp, path):
+                code, _out = self.run(argv)
+                if code != 0:
+                    return "%s ended with exit %d" % (" ".join(argv[:3]), code)
+            # A program running as this user could have swapped the temp file before sudo
+            # copied it. So the installed, root-owned file is read back and compared byte for
+            # byte with what was meant to be written. Nothing is removed on a mismatch, and
+            # nothing is trusted: the caller stops.
+            with open(path, "rb") as fh:
+                installed = fh.read(RECORD_MAX_BYTES + 1)
+            if installed != text.encode("utf-8"):
+                return ("the installed record does not match what was meant to be written "
+                        "(the temp file may have been swapped), so it is not trusted")
+            return None
+        except OSError as exc:
+            return str(exc)
+        finally:
+            shutil.rmtree(private, ignore_errors=True)
 
     def say(self, line=""):
         print(line, flush=True)
@@ -214,6 +418,27 @@ class Io(object):
 
     def is_tty(self):
         return sys.stdin.isatty()
+
+    # The values only a person has, and writing them (KIT-735). `kit` is the folder whose
+    # parts list and settings files say which stored keys this Mac has.
+    kit = KIT
+
+    def today(self):
+        """Today's date in UTC, from `now`, so a scripted clock moves it."""
+        import datetime
+        return datetime.date.fromisoformat(self.now()[:10])
+
+    def missing_values(self, update_conf, bridge_conf):
+        """The questions for every value still missing: a read of the two settings files that
+        changes nothing (pipeline_ask.missing_values)."""
+        import pipeline_ask
+        return pipeline_ask.missing_values(update_conf, bridge_conf, self.kit, self.today())
+
+    def write_settings(self, changes):
+        """Write what the person typed and the consent page listed, and read it back. None when
+        all of it is written, else why not, naming the file (pipeline_ask.write_answers)."""
+        import pipeline_ask
+        return pipeline_ask.write_answers(self, changes, self.kit)
 
 
 def heading(io, text):
@@ -240,69 +465,169 @@ def default_branch(io):
     return "main"
 
 
-def step_checkout(io, argv, no_pull):
+def missing(path):
+    """Where a settings file was looked for, in words: in the kit folder, or the folder it
+    was named in (--conf and its kin can point elsewhere)."""
+    here = os.path.dirname(os.path.abspath(path))
+    where = "the kit folder" if here == KIT else here
+    return "no %s in %s" % (os.path.basename(path), where)
+
+
+def look_first(io, rep, key):
+    """The exit code of the part's own read-only check, run before a step that can only
+    `run`, so the step can say whether it changed anything. None when the parts list gave
+    no check or it did not finish. Nothing here prints, asks or changes anything."""
+    argv = rep.checks.get(key)
+    if not argv or io.interrupted:
+        return None
+    code, _out = io.measure(argv)
+    return code
+
+
+ASKED_DETAIL = "its installer still asks its own questions; Automatic cannot answer them yet"
+
+
+def note_run_ok(rep, key, before):
+    """The installer's `run` ended at 0: everything holds. Whether it had to change
+    anything is what the check before it said. An installer that had work to do (or whose
+    work was not measured) is taken to have asked its own questions in this run: in Automatic
+    its line says so, as a note only."""
+    if before != 0:
+        rep.asked.add(key)
+    if before == 0:
+        rep.note(key, OUT_OK)
+    elif before is None:
+        rep.note(key, OUT_OK, "installed and proven; whether it changed anything was not measured")
+    else:
+        rep.note(key, OUT_UPDATED)
+
+
+class Report(object):
+    """What each of this command's own steps did, by step key, for the lines at the end:
+    {key: (outcome, detail)}. A step that was never reached has no entry. `checks` holds,
+    by step key, the read-only check of the part the step acts on (from the parts list), so
+    a step that can only `run` can still say whether it changed anything."""
+
+    def __init__(self):
+        self.steps = {}
+        self.checks = {}
+        # Steps that act on several parts and ended waiting on a card alone: their code is
+        # current, so a part of theirs that names no card of its own is not itself behind.
+        self.card_only = set()
+        # Steps whose installer ran with work to do. In Automatic, such a step's parts that
+        # have person steps are named as waiting on you: the installer still asks its own.
+        self.asked = set()
+        # Answers of checks already run, by argv: build_records reuses one rather than run it
+        # twice. Empty in a real run, whose checks run after its steps. --check fills it.
+        self.seen = {}
+
+    def note(self, key, outcome, detail="", card_only=False):
+        self.steps[key] = (outcome, detail)
+        if card_only:
+            self.card_only.add(key)
+
+    def note_code(self, key, code, what):
+        """An installer ended with `code` and the step stops or carries on without success:
+        a card or a missing password is waiting on the person; anything else is a thing
+        that could not be measured or done."""
+        if code == EX_BLOCKED:
+            self.note(key, OUT_WAITING, what)
+        elif code == 5:
+            self.note(key, OUT_WAITING, "%s needs your Mac password" % what)
+        else:
+            self.note(key, OUT_UNMEASURED, "%s stopped with exit %d" % (what, code))
+
+
+def step_checkout(io, argv, no_pull, rep, pulled_from=None, mode=None):
     """None to carry on, or an exit code. May restart this program on the new code."""
     heading(io, "1. The kit checkout")
     io.say("Kit checkout: %s" % KIT)
     if no_pull:
         io.say("Not pulled (--no-pull).")
+        if pulled_from:
+            # The run this command started itself after a pull that moved the code.
+            _code, now = git(io, "rev-parse", "--short", "HEAD")
+            rep.note("checkout", OUT_UPDATED,
+                     "moved from %s to %s" % (pulled_from[:7], now or "the latest"))
+        else:
+            # A person's own --no-pull: nothing compared this checkout with origin.
+            rep.note("checkout", OUT_UNMEASURED, "used as it is, without pulling")
         return None
     want = default_branch(io)
     code, branch = git(io, "rev-parse", "--abbrev-ref", "HEAD")
     if code != 0:
+        rep.note("checkout", OUT_UNMEASURED, "git could not read it")
         return stop(io, "this is not a git checkout git can read (%s)." % branch, EX_USAGE)
     if branch != want:
+        rep.note("checkout", OUT_WAITING, "on '%s', not %s" % (branch, want))
         return stop(io, "the kit checkout is on '%s'. The installers run from %s:\n"
                         "    git -C %s switch %s" % (branch, want, KIT, want), EX_USAGE)
     code, dirty = git(io, "status", "--porcelain", "--untracked-files=no")
     if code != 0 or dirty:
+        rep.note("checkout", OUT_WAITING if code == 0 else OUT_UNMEASURED,
+                 "uncommitted changes" if code == 0 else "git could not read its state")
         return stop(io, "the kit checkout has uncommitted changes. See them with:\n"
                         "    git -C %s status" % KIT, EX_USAGE)
     _code, before = git(io, "rev-parse", "HEAD")
     code, out = git(io, "pull", "--ff-only", "--quiet")
     if code != 0:
+        rep.note("checkout", OUT_UNMEASURED, "git could not fast-forward")
         return stop(io, "git could not fast-forward %s:\n    %s" % (want, out[:300]), 1)
     _code, after = git(io, "rev-parse", "HEAD")
     _code, line = git(io, "log", "--oneline", "-1")
     io.say("Now at: %s" % line)
+    rep.note("checkout", OUT_UPDATED if before != after else OUT_OK,
+             "moved to the latest" if before != after else "already at the latest")
     if before != after:
         io.say("That moved the code, so this command starts again on it.")
-        io.restart([os.path.abspath(__file__)] + list(argv) + ["--no-pull"])
+        io.restart([os.path.abspath(__file__)] + list(argv)
+                   + ["--pulled-from", before, "--no-pull"]
+                   + (["--chosen-mode", mode] if mode else []))
         return EX_OK                 # reached only when `restart` returns (the battery)
     return None
 
 
-def step_skills(io):
+def step_skills(io, rep):
     heading(io, "2. The skills in your home folder")
     code, _out = io.run([sys.executable, SKILLS])
     if io.interrupted:
+        rep.note("skills", OUT_UNMEASURED, "interrupted")
         return stop(io, INTERRUPTED % "The skills check", code or EX_BLOCKED)
     if code == 0:
+        rep.note("skills", OUT_OK)
         return None
     if code == 3:
+        rep.note("skills", OUT_UNMEASURED, "its check refused: it saw a Claude session")
         return stop(io, "the skills check refused: it saw a Claude session.", EX_REFUSED)
     if code != 1:
+        rep.note("skills", OUT_UNMEASURED, "its check failed (exit %d)" % code)
         return stop(io, "the skills check failed (exit %d). The lines above say why." % code,
                     code)
     io.say("Some skills in your home folder differ from the kit's (listed above).")
     io.say("Replacing them overwrites any change you made to those copies by hand.")
     if not io.ask("Replace them with the kit's now?"):
         io.say("Left as they are. Planning sessions may load an older procedure until you do.")
+        rep.note("skills", OUT_WAITING, "differ from the kit's; you left them as they are")
         return None
     code, _out = io.run([sys.executable, SKILLS, "--apply"])
     if io.interrupted:
+        rep.note("skills", OUT_UNMEASURED, "interrupted while replacing them")
         return stop(io, INTERRUPTED % "Replacing the skills", code or EX_BLOCKED)
     if code != 0:
+        rep.note("skills", OUT_UNMEASURED, "they could not all be replaced (exit %d)" % code)
         return stop(io, "the skills could not all be replaced (exit %d)." % code, code)
+    rep.note("skills", OUT_UPDATED, "replaced with the kit's")
     return None
 
 
-def step_stage_e(io, conf, skip):
+def step_stage_e(io, conf, skip, rep):
     heading(io, "3. Stage E, the review jobs")
     if skip:
         io.say("Skipped (--skip-stage-e).")
+        rep.note("stage_e", OUT_UNMEASURED, "skipped (--skip-stage-e), so not checked")
         return None
     if not os.path.exists(conf):
+        rep.note("stage_e", OUT_OFF, missing(conf))
         io.say("Stage E is not set up on this Mac (no %s), so there is nothing to bring up "
                "to date." % os.path.relpath(conf, KIT))
         io.say("The idea gate asks for the dispatcher's details itself.")
@@ -310,12 +635,15 @@ def step_stage_e(io, conf, skip):
     started = io.now()
     code, _out = io.run([sys.executable, STAGE_E, "verify", "--conf", conf])
     if io.interrupted:
+        rep.note("stage_e", OUT_UNMEASURED, "interrupted during its check")
         return stop(io, INTERRUPTED % "Stage E's check", code or EX_BLOCKED)
     if code == 0:
         io.say("")
         io.say("Stage E is up to date. Nothing to do.")
+        rep.note("stage_e", OUT_OK)
         return None
     if code != 10:
+        rep.note_code("stage_e", code, "its check")
         # NOT "WORK OUTSTANDING": a step that FAILED (1), one that could not be measured
         # (4), a settings problem (2), a refusal (3) or no password (5). None of those is a
         # card a person signs, and none is something to carry on past.
@@ -336,16 +664,20 @@ def step_stage_e(io, conf, skip):
                "this Mac runs them, for a few seconds, and loads them again.")
         io.say("Check Linear first: nothing the dispatcher works on should be In Progress.")
         if not io.ask("Update Stage E now?"):
+            rep.note("stage_e", OUT_WAITING, "behind; you did not update it")
             return stop(io, "nothing changed. Stage E comes first, because the same kit change "
                             "teaches its jobs to leave planning tickets alone. Run this again "
                             "when you are ready.", EX_BLOCKED)
         ran_at = io.now()
         code, _out = io.run([sys.executable, STAGE_E, "run", "--conf", conf])
         if io.interrupted:
+            rep.note("stage_e", OUT_UNMEASURED, "interrupted during its installer")
             return stop(io, INTERRUPTED % "Stage E's installer", code or EX_BLOCKED)
         if code == 0:
             io.say("")
             io.say("Stage E is up to date.")
+            rep.note("stage_e", OUT_UPDATED)
+            rep.asked.add("stage_e")
             return None
         # A RUN THAT FINISHED, ENDING ON AN OPTIONAL JOB'S CARD: the catch-up poller's (CK-11)
         # or the status job's (CK-12). Neither card stops `run`: every step ran, through its
@@ -361,16 +693,21 @@ def step_stage_e(io, conf, skip):
                 io.say("Stage E is up to date.")
                 for st in carded:
                     io.say(OPTIONAL_JOB_CARDS[st] + "; that does not block the idea gate.")
+                rep.note("stage_e", OUT_WAITING, "updated; an optional job still waits on a card",
+                         card_only=True)
                 return None
         # A RUN THAT STOPPED PART WAY IS NEVER CARRIED PAST. It may have moved the code and
-        # stopped before reloading the review jobs, so "the code is current" says nothing
-        # about whether they are running. The next pass's check tells the two apart: if
-        # all that is left then is a card, it carries on.
+        # stopped before the steps that set the review jobs up, so "the code is current" says
+        # nothing about whether they are done. It loads the jobs it unloaded again on its way
+        # out, and says NOT DONE for any it could not (KIT-661). The next pass's check tells
+        # the two apart: if all that is left then is a card, it carries on.
+        rep.note_code("stage_e", code, "its installer")
         return stop(io, STAGE_E_MEANS.get(code, "Stage E's installer stopped part way "
                                                 "(exit %d). The lines above say where." % code)
-                    + " If it said its jobs are unloaded, review, bounce, findings and catch-up stay off "
-                      "until it finishes. A notifier or Slack bridge job it names as off stays off "
-                      "until it is loaded. Clear what it names, then run this command again.",
+                    + " It loads the review jobs it unloaded again on its way out. Any it says "
+                      "NOT DONE for stays off until it is loaded: it prints the line. A notifier "
+                      "or Slack bridge job it names as off stays off until it is loaded. Clear "
+                      "what it names, then run this command again.",
                     code)
     # ONLY A CARD IS LEFT, and Stage E's code is current. The idea gate needs Stage E's
     # code (its jobs leave planning tickets alone), not its sign-offs; stopping here on a
@@ -379,104 +716,766 @@ def step_stage_e(io, conf, skip):
         io.say("")
         io.say("Stage E's jobs run the current code. Stage E still has something for you,")
         io.say("named above, which does not block the idea gate. Carrying on; come back to it.")
+        rep.note("stage_e", OUT_WAITING, "its code is current; a card is still yours",
+                 card_only=True)
         return None
+    rep.note_code("stage_e", code, "its check")
     return stop(io, "Stage E's check says its code is not current, and nothing `run` could "
                     "change was named." + STAGE_E_SKIP_HINT, code)
 
 
-def step_sweep(io, conf):
+def step_sweep(io, conf, rep):
     """The sweep's installer, when `sweep.conf` exists. An optional job: its own card waits on a person (it reads the dry
     run, then loads the job), and that never holds back the idea gate."""
     heading(io, "3b. The sweep, what finished runs leave behind")
     if not os.path.exists(conf):
+        rep.note("sweep", OUT_OFF, missing(conf))
         io.say("No %s, so the sweep is not set up on this Mac. Copy sweep.conf.example to switch it on."
                % os.path.relpath(conf, KIT))
         return None
+    before = look_first(io, rep, "sweep")
     code, _out = io.run([sys.executable, SWEEP_SETUP, "run", "--conf", conf])
     if io.interrupted:
+        rep.note("sweep", OUT_UNMEASURED, "interrupted during its installer")
         return stop(io, INTERRUPTED % "The sweep's installer", code or EX_BLOCKED)
     io.say("")
     if code == 0:
         io.say("The sweep is installed, loaded and under its leftover line.")
+        note_run_ok(rep, "sweep", before)
         return None
     if code == 10:
         io.say("The sweep waits for you at the card above; that does not block the idea gate.")
+        rep.note("sweep", OUT_WAITING, "a card is still yours")
         return None
+    rep.note_code("sweep", code, "its installer")
     return stop(io, "the sweep's installer stopped with exit %d. The lines above say why." % code, code)
 
 
-def chat_rules_state(path):
-    """"on", "off" or "unclear": CHAT_RULES as the chat-lane installer's own parse_conf reads a
-    line (blank and # lines skipped, KEY=value split once on "=", both sides stripped, no inline
-    comment or quote removed, the first of a repeated key kept). A value that is neither on nor
-    off, a repeated key, or a file that cannot be read is "unclear": the installer's dry run is
-    then run so IT says what is wrong, instead of this step calling the rules off."""
-    try:
-        with open(path, encoding="utf-8") as fh:
-            lines = fh.read().splitlines()
-    except OSError:
-        return "unclear"
-    values = []
-    for raw in lines:
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, val = [part.strip() for part in line.split("=", 1)]
-        if key == "CHAT_RULES":
-            values.append(val)
-    if len(values) == 1 and values[0] in ("on", "off"):
-        return values[0]
-    return "off" if not values else "unclear"
-
-
-def step_chat_rules(io, conf):
-    """The tech lead's rules (KIT-582): read-only first, asked before writing, and a rule that
-    could not be measured is never called up to date."""
-    heading(io, "3c. The tech lead's rules")
-    if not os.path.exists(conf):
-        io.say("No %s, so the tech lead's rules are not set up on this Mac. Nothing to bring up "
-               "to date." % os.path.relpath(conf, KIT))
-        return None
-    state = chat_rules_state(conf)
-    if state == "off":
-        io.say("The tech lead's rules are off on this Mac (CHAT_RULES is not on in %s). They "
-               "stay off." % os.path.relpath(conf, KIT))
-        return None
-    code, _out = io.run([sys.executable, CHAT_LANE, "chat-rules", "--conf", conf])
-    if io.interrupted:
-        return stop(io, INTERRUPTED % "The chat-lane check", code or EX_BLOCKED)
-    io.say("")
-    if code == 0:
-        io.say("The tech lead's rules are up to date. Nothing to do.")
-        return None
-    if code != 10:
-        return stop(io, CHAT_RULES_MEANS.get(code, "the chat-lane check stopped with exit %d. "
-                                                   "The lines above say why." % code), code)
-    io.say("The tech lead's rules are behind this checkout (the lines above say how).")
-    io.say("Writing them changes one file the role account owns. A chat session reads it when "
-           "it starts; nothing is restarted.")
-    if not io.ask("Write the tech lead's rules now?"):
-        return stop(io, "nothing changed. The tech lead's rules are behind this checkout, and the "
-                        "chat lane's verify fails until they are written. Run this again when "
-                        "you are ready.", EX_BLOCKED)
-    code, _out = io.run([sys.executable, CHAT_LANE, "chat-rules", "--apply", "--conf", conf])
-    if io.interrupted:
-        return stop(io, INTERRUPTED % "The chat-lane installer", code or EX_BLOCKED)
-    io.say("")
-    if code == 0:
-        io.say("The tech lead's rules are written and read back: up to date.")
-        return None
-    return stop(io, CHAT_RULES_APPLY_MEANS.get(code, "the chat-lane installer stopped with exit %d. "
-                                                     "The lines above say why." % code), code)
-
-
-def step_stage_a(io, conf, stage_e_conf):
+def step_stage_a(io, conf, stage_e_conf, rep):
     heading(io, "4. The idea gate")
+    before = look_first(io, rep, "stage_a")
     code, _out = io.run([sys.executable, STAGE_A, "run", "--conf", conf,
                          "--stage-e-conf", stage_e_conf])
+    if io.interrupted:
+        rep.note("stage_a", OUT_UNMEASURED, "interrupted during its installer")
+    elif code == 0:
+        note_run_ok(rep, "stage_a", before)
+    else:
+        rep.note_code("stage_a", code, "its installer")
     io.say("")
     io.say(STAGE_A_MEANS.get(code, "The idea-gate installer stopped with exit %d. The lines "
                                    "above say why." % code))
+    return code
+
+
+# --------------------------------------------------------------------------- #
+# The first screen, the one consent, and the record only root can write (KIT-717)
+# --------------------------------------------------------------------------- #
+MODE_AUTO, MODE_MANUAL = "automatic", "manual"
+MODE_WORDS = {MODE_AUTO: "Automatic", MODE_MANUAL: "Manual"}
+# Where the record lives is itself a setting (--consent-record, hidden from the help).
+DEFAULT_RECORD = "/Library/Application Support/claude-pipeline/consent-record.json"
+RECORD_VERSION = 1
+RECORD_MAX_BYTES = 1000000
+# A switch whose key looks like a secret is recorded as set or unset, never by value.
+SECRET_KEY_NAME = re.compile(r"(^|_)(KEY|TOKEN|SECRET|PASSWORD|CREDENTIALS?)($|_)")
+SPEND_LINE = "It spends your Claude subscription only. Nothing else is charged."
+NEVER_LINE = ("It never merges, approves or labels a pull request, never changes a guard, "
+              "and never reads a key back.")
+
+
+def first_screen(io, default):
+    """Automatic or Manual, asked right after the three refusals. The default is the mode in
+    the trusted consent record, or Automatic. None when no usable answer came."""
+    heading(io, "0b. How should this run go?")
+    io.say("  1  Automatic: things just work. You agree once; after that it asks nothing of its own.")
+    io.say("  2  Manual: show me each change and ask.")
+    for _ in range(3):
+        reply = io.line("Type 1 or 2, or press Enter for %s: " % MODE_WORDS[default])
+        if reply is None:
+            return None
+        word = reply.strip().lower()
+        if word == "":
+            return default
+        if word in ("1", "a", "automatic"):
+            return MODE_AUTO
+        if word in ("2", "m", "manual"):
+            return MODE_MANUAL
+        io.say("Please type 1 or 2.")
+    return None
+
+
+def step_ask(io, update_conf, bridge_conf):
+    """The changes the person typed, as a list; nothing is written yet (KIT-735). One plain question
+    for each value only a person has that is still missing, in both modes. A file it cannot ask
+    about is said in a line. Prints nothing when nothing is missing and nothing could not be asked."""
+    import pipeline_ask
+    found = io.missing_values(update_conf, bridge_conf)
+    notes = list(getattr(found, "notes", ()))
+    if not found and not notes:
+        return []
+    heading(io, "0b2. Values only you have")
+    for note in notes:
+        io.say(note)
+    if not found:
+        return []
+    io.say("I need %d thing%s from you. Nothing is written until you agree on the next page."
+           % (len(found), "" if len(found) == 1 else "s"))
+    changes, _skipped = pipeline_ask.ask_all(io, found)
+    return changes
+
+
+def parse_conf(text):
+    """{KEY: value} from a KEY=value settings file. Comments and anything else are skipped."""
+    out = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+        key, eq, value = line.partition("=")
+        key, value = key.strip(), value.strip()
+        if not eq or not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", key):
+            continue
+        quoted = re.match(r"^([\"'])(.*?)\1(\s+#.*)?$", value)
+        if quoted:
+            value = quoted.group(2)
+        else:
+            value = re.split(r"\s+#", value, maxsplit=1)[0].strip()
+        out[key] = value
+    return out
+
+
+def switch_value(key, conf):
+    """What a job's switch key says in its settings file. None when absent. A key that looks
+    like a secret is said as '(set)', never by value."""
+    if conf is None or key not in conf:
+        return None
+    return "(set)" if SECRET_KEY_NAME.search(key.upper()) else conf[key]
+
+
+def candidates(io, parts, files, skip_stage_e):
+    """[(part, on)] for each part this command acts on or looks at, judged the way the end
+    lines judge it: a step's part by its step, any other part with a check by its settings file
+    being found. Parts with neither are not candidates."""
+    out = []
+    for part in parts:
+        key = step_of(part)
+        if key in ("checkout", "skills", "stage_a"):
+            on = True
+        elif key == "stage_e":
+            on = (not skip_stage_e) and io.exists(files["stage-e.conf"])
+        elif key == "sweep":
+            on = io.exists(files["sweep.conf"])
+        elif part.get("check"):
+            path = settings_path(part, files)
+            on = bool(path) and io.exists(path)
+        else:
+            continue
+        out.append((part, bool(on)))
+    return out
+
+
+def snapshot(io, cands, files):
+    """Each consent-relevant setting: {parts: {id: on}, jobs: {id/label: {key, value}},
+    ceilings: {id: ceiling}}. Plain data, so it can be compared and recorded."""
+    parts_state, jobs_state, ceilings, confs = {}, {}, {}, {}
+    for part, on in cands:
+        parts_state[part["id"]] = on
+        ceilings[part["id"]] = part.get("ceiling")
+        path = settings_path(part, files)
+        for job in part.get("jobs") or []:
+            switch = job.get("switch")
+            value = None
+            if switch and on and path and path.endswith(".conf"):
+                if path not in confs:
+                    confs[path] = io.read_conf(path)
+                value = switch_value(switch["key"], confs[path])
+            jobs_state["%s/%s" % (part["id"], job["label"])] = {
+                "key": switch["key"] if switch else None, "value": value}
+    return {"parts": parts_state, "jobs": jobs_state, "ceilings": ceilings}
+
+
+def consent_lines(cands):
+    """The consent page, as lines, drawn from the parts list for the parts that are on."""
+    on = [part for part, is_on in cands if is_on]
+    lines = ["WHAT YOU ARE AGREEING TO", ""]
+    lines.append("Installed: background jobs, under a separate account of their own.")
+    jobbed = [p for p in on if p.get("jobs")]
+    for part in jobbed:
+        lines.append("  - %s: %d job(s)" % (part["name"], len(part["jobs"])))
+    if not jobbed:
+        lines.append("  - none for the parts on this Mac")
+    lines.append("")
+    lines.append("May be restarted:")
+    restarts = [(p["name"], r) for p in on for r in p.get("restarts") or []]
+    for name, text in restarts:
+        lines.append("  - %s: %s" % (name, text))
+    if not restarts:
+        lines.append("  - nothing")
+    lines.append("")
+    lines.append("May be created or changed in the tracker, the code host, the chat product "
+                 "and this Mac:")
+    made = [(p["name"], c) for p in on for c in p.get("consent") or []]
+    for name, text in made:
+        lines.append("  - %s: %s" % (name, text))
+    if not made:
+        lines.append("  - nothing")
+    lines.append("")
+    lines.append(SPEND_LINE)
+    lines.append(NEVER_LINE)
+    lines.append("")
+    lines.append("These installers may still ask their own question or show a card to sign:")
+    asking = {}
+    for part in on:
+        if part.get("person_steps") and part.get("installer"):
+            names = asking.setdefault(part["installer"], [])
+            if part["name"] not in names:
+                names.append(part["name"])
+    for installer in sorted(asking):
+        lines.append("  - %s, for: %s" % (installer, "; ".join(asking[installer])))
+    if not asking:
+        lines.append("  - none for the parts on this Mac")
+    lines.append("Whatever only a person can do stays on the short list at the end.")
+    return lines
+
+
+def build_record(mode, lines, snap, when):
+    return {"version": RECORD_VERSION, "agreed_at": when, "mode": mode,
+            "consent": list(lines), "settings": snap}
+
+
+def show_value(group, value):
+    if group == "parts":
+        return "on" if value else "off"
+    if group == "jobs":
+        key = (value or {}).get("key")
+        return "no switch" if not key else "%s=%s" % (key, (value or {}).get("value"))
+    return "none" if value is None else str(value)
+
+
+def record_diffs(rec, mode, snap, lines):
+    """What differs from the record, in words, old and new. Empty means a match."""
+    diffs = []
+    if rec["mode"] != mode:
+        diffs.append("mode: was %s, now %s" % (MODE_WORDS[rec["mode"]], MODE_WORDS[mode]))
+    old = rec["settings"]
+    for group, label in (("parts", "part"), ("jobs", "job"), ("ceilings", "ceiling")):
+        was, now = old.get(group) or {}, snap[group]
+        for key in sorted(set(was) | set(now)):
+            if key not in was:
+                diffs.append("%s %s: not in the record, now %s" % (label, key, show_value(group, now[key])))
+            elif key not in now:
+                diffs.append("%s %s: was %s, no longer listed" % (label, key, show_value(group, was[key])))
+            elif was[key] != now[key]:
+                diffs.append("%s %s: was %s, now %s" % (label, key, show_value(group, was[key]),
+                                                       show_value(group, now[key])))
+    if rec["consent"] != list(lines):
+        diffs.append("the words of the consent page changed")
+    return diffs
+
+
+def record_install_argvs(folder_exists, tmp, path):
+    """The commands that put the record in place: the folder (root:wheel 755) when it is
+    missing, then the file (root:wheel 0644) copied from the private temp file."""
+    install = "/usr/bin/install"
+    argvs = []
+    if not folder_exists:
+        argvs.append(["sudo", install, "-d", "-o", "root", "-g", "wheel", "-m", "755",
+                      os.path.dirname(path)])
+    argvs.append(["sudo", install, "-o", "root", "-g", "wheel", "-m", "0644", tmp, path])
+    return argvs
+
+
+def _components(path):
+    found, cur = [], path
+    while True:
+        found.append(cur)
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return list(reversed(found))
+        cur = parent
+
+
+def untrusted_why(path, lstat=os.lstat, realpath=os.path.realpath):
+    """None when the file and every folder above it belong to root and nobody else can
+    write them; else why not. A link is followed only if root owns it and everything it
+    leads through passes too. Raises FileNotFoundError when something is missing."""
+    path = os.path.abspath(path)
+    lstat(path)                       # a missing record is "none", whoever owns the folders above
+    real = realpath(path)
+    for walk in (path,) if real == path else (path, real):
+        for cur in _components(walk):
+            st = lstat(cur)
+            final = cur == walk
+            if st.st_uid != 0:
+                return "%s is not owned by root" % cur
+            if stat.S_ISLNK(st.st_mode):
+                if final and walk == path:
+                    return "%s is a link" % cur
+                continue
+            if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                return "%s can be written by someone other than root" % cur
+            if final and not stat.S_ISREG(st.st_mode):
+                return "%s is not a regular file" % cur
+            if not final and not stat.S_ISDIR(st.st_mode):
+                return "%s is not a folder" % cur
+    return None
+
+
+def _valid_record(data):
+    try:
+        return (data["version"] == RECORD_VERSION and data["mode"] in MODE_WORDS
+                and isinstance(data["agreed_at"], str)
+                and isinstance(data["consent"], list)
+                and all(isinstance(x, str) for x in data["consent"])
+                and all(isinstance(data["settings"].get(g), dict)
+                        for g in ("parts", "jobs", "ceilings")))
+    except (KeyError, TypeError, AttributeError):
+        return False
+
+
+def _read_small(path):
+    with open(path, "rb") as fh:
+        raw = fh.read(RECORD_MAX_BYTES + 1)
+    if len(raw) > RECORD_MAX_BYTES:
+        raise ValueError("larger than %d bytes" % RECORD_MAX_BYTES)
+    return raw.decode("utf-8")
+
+
+def load_record(path, lstat=os.lstat, realpath=os.path.realpath, read=_read_small):
+    """(state, record, why). State is 'none' (no file), 'ok' (a record only root could have
+    written) or 'unreadable' (anything else: never a match, so the consent is asked)."""
+    try:
+        why = untrusted_why(path, lstat, realpath)
+    except FileNotFoundError:
+        return "none", None, "no record yet"
+    except OSError as exc:
+        return "unreadable", None, "it could not be inspected (%s)" % exc
+    if why:
+        return "unreadable", None, why
+    try:
+        data = json.loads(read(path))
+    except (OSError, ValueError) as exc:
+        return "unreadable", None, "it could not be read (%s)" % exc
+    if not _valid_record(data):
+        return "unreadable", None, "it is not a consent record this command wrote"
+    return "ok", data, ""
+
+
+def step_consent(io, record_path, mode, state, rec, why, cands, files, unreadable, writes=()):
+    """None to carry on, or an exit code. Asks the one consent unless the trusted record
+    already matches this mode, these settings and these words; then writes the record.
+
+    `writes` is what the person typed in the ask (KIT-735). The page lists it after its own lines,
+    and the one yes covers it. It is no part of the page the record keeps, so a date or a name
+    never makes the record differ. When the record matches and there is something to write, only
+    that list is shown, and the yes is for it alone."""
+    heading(io, "0c. What this run may do")
+    if unreadable:
+        return stop(io, "the list of parts could not be read, so there is no consent page to "
+                        "agree to. Nothing was changed.", EX_UNMEASURED)
+    lines = consent_lines(cands)
+    snap = snapshot(io, cands, files)
+    record_needed = True
+    if state == "ok":
+        diffs = record_diffs(rec, mode, snap, lines)
+        if not diffs and not writes:
+            io.say("This matches what you agreed to on %s: the same mode, settings and words. "
+                   "Nothing to agree to again." % rec["agreed_at"])
+            return None
+        if not diffs:
+            io.say("This matches what you agreed to on %s: the same mode, settings and words."
+                   % rec["agreed_at"])
+            record_needed = False
+        else:
+            io.say("Since you agreed (%s), this changed:" % rec["agreed_at"])
+            for diff in diffs:
+                io.say("  - %s" % diff)
+    elif state == "unreadable":
+        io.say("The record of your last consent cannot be trusted (%s), so you are asked "
+               "again." % why)
+    else:
+        io.say("There is no record of a consent yet, so you are asked once.")
+    io.say("")
+    if record_needed:
+        for line in lines:
+            io.say(line)
+        io.say("")
+    if writes:
+        import pipeline_ask
+        for line in pipeline_ask.settings_lines(writes) + [""]:
+            io.say(line)
+    if record_needed:
+        io.say("%s: %s" % (MODE_WORDS[mode], "after you agree it answers its own questions yes. "
+                           "Each installer above may still ask its own."
+                           if mode == MODE_AUTO else
+                           "it shows each change and asks, as before."))
+    reply = io.line("Type yes to agree. Anything else changes nothing: " if record_needed else
+                    "Type yes to write these settings. Anything else changes nothing: ")
+    if (reply or "").strip().lower() != "yes":
+        return stop(io, "nothing was agreed to, so nothing was changed. Run this again when "
+                        "you are ready.", EX_BLOCKED)
+    if not record_needed:
+        return None
+    if not io.sudo_once("it saves the record of what you agreed to in a folder only the "
+                        "administrator can write, so a Claude session cannot edit it."):
+        return stop(io, "saving the record needs your Mac password and did not get it. "
+                        "Nothing was changed. Run this again and type it at the prompt.", 5)
+    failed = io.write_record(record_path, json.dumps(
+        build_record(mode, lines, snap, io.now()), indent=2, sort_keys=True) + "\n")
+    if failed:
+        return stop(io, "the record of your consent could not be saved (%s). Nothing else was "
+                        "changed." % failed, 1)
+    state, _rec, why = io.read_record(record_path)
+    if state != "ok":
+        io.say("Saved, but it cannot be trusted yet (%s), so you will be asked again next "
+               "time." % why)
+    return None
+
+
+def step_write_settings(io, writes):
+    """None to carry on, or an exit code. Writes what the person typed and the consent page
+    listed, now that they said yes, and reads it back (KIT-735). It runs before any installer."""
+    if not writes:
+        return None
+    io.say("")
+    io.say("Writing the settings listed above.")
+    failed = io.write_settings(writes)
+    if failed:
+        return stop(io, "your settings were not all written: %s. Nothing after this ran. Fix "
+                        "that, then run this again; it asks again for what is still missing."
+                    % failed, 1)
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# The lines at the end: one record per part, then the short list
+# --------------------------------------------------------------------------- #
+# The step of this command that acts on a part is found from the part's own installer or
+# check script, never from a list of part ids, so a new part is picked up from the list.
+STEP_OF_SCRIPT = {"sync_user_skills.py": "skills", "pipeline_stage_e_setup.py": "stage_e",
+                  "pipeline_sweep_setup.py": "sweep", "pipeline_stage_a_setup.py": "stage_a"}
+
+
+def step_of(part):
+    """The key of this command's step that acts on the part, or None."""
+    if os.path.basename(part.get("installer") or "") == "pipeline_install.py":
+        return "checkout"
+    check = part.get("check")
+    if not check:
+        return None
+    base = os.path.basename(check["script"])
+    if base == "pipeline_stage_e_setup.py" and (check.get("args") or [])[:1] != ["verify"]:
+        return None
+    return STEP_OF_SCRIPT.get(base)
+
+
+def conf_path(name, files):
+    return files.get(name) or os.path.join(KIT, name)
+
+
+def check_argv(part, files):
+    check = part["check"]
+    args = [conf_path(a, files) if a.endswith(".conf") else a for a in check.get("args") or []]
+    return [sys.executable, os.path.join(KIT, check["script"])] + args
+
+
+def settings_path(part, files):
+    """Where the part's settings file lives on this Mac, or None when it has no file a
+    person switches it on with."""
+    name = (part.get("settings") or {}).get("file") or ""
+    return conf_path(name, files) if name.endswith((".conf", ".json")) else None
+
+
+def outcome_of_check(code, out):
+    """A part's own read-only check, read the one way for every part: 0 is up to date, 10 is
+    waiting on you, and anything else, a child that did not finish included, is a thing that
+    could not be measured. Never a pass."""
+    if code == 0:
+        return OUT_OK, ""
+    if code == EX_BLOCKED:
+        return OUT_WAITING, "its check found something outstanding"
+    if code == 5 or (code is not None and re.search(r"password", out or "", re.I)
+                     and re.search(r"need|requir|ask|enter|type", out or "", re.I)):
+        return OUT_UNMEASURED, ("it needs your Mac password, which a check run without a "
+                                "terminal cannot ask for")
+    if code is None:
+        return OUT_UNMEASURED, "its check did not finish (%s)" % (out or "no reason given")[:120]
+    return OUT_UNMEASURED, "its check stopped with exit %d" % code
+
+
+def build_records(io, parts, rep, files, reached):
+    """([record], [names with no check of their own], {part id: its check's output}).
+    A record is {id, name, outcome, detail}. `reached` is False when a step stopped the
+    run: the checks of the other parts are then not run, and say so."""
+    try:
+        import pipeline_parts
+        ordered = pipeline_parts.order(parts)
+    except (ImportError, ValueError):
+        ordered = list(parts)
+    records, nocheck, texts, seen, group = [], [], {}, rep.seen, {}
+    for part in ordered:
+        rec = {"id": part["id"], "name": part["name"], "outcome": OUT_NOT_REACHED,
+               "detail": "the run stopped before this part"}
+        key = step_of(part)
+        if key:
+            if key in rep.steps:
+                rec["outcome"], rec["detail"] = rep.steps[key]
+            if (io.auto and key in rep.asked and part.get("person_steps")
+                    and rec["outcome"] != OUT_NOT_REACHED):
+                # A NOTE, never an outcome: the part keeps what its own result said, so a
+                # clean run exits 0 and the short list holds only what is still left to do.
+                rec["detail"] = "%s; %s" % (rec["detail"], ASKED_DETAIL) if rec["detail"] \
+                    else ASKED_DETAIL
+            if rec["outcome"] == OUT_WAITING and part.get("check") and not io.interrupted:
+                # The step ran its installer uncaptured, so its card ids are read from the
+                # part's own check, once more, read-only.
+                argv = check_argv(part, files)
+                if tuple(argv) not in seen:
+                    seen[tuple(argv)] = io.measure(argv)
+                texts[part["id"]] = seen[tuple(argv)][1] or ""
+                group.setdefault(key, []).append((rec, part))
+        elif part.get("check"):
+            path = settings_path(part, files)
+            if path and not io.exists(path):
+                rec["outcome"] = OUT_OFF
+                rec["detail"] = missing(path)
+            elif reached and not io.interrupted:
+                argv = check_argv(part, files)
+                if tuple(argv) not in seen:
+                    seen[tuple(argv)] = io.measure(argv)
+                code, out = seen[tuple(argv)]
+                rec["outcome"], rec["detail"] = outcome_of_check(code, out)
+                texts[part["id"]] = out or ""
+        else:
+            nocheck.append(part["name"])
+            continue
+        records.append(rec)
+    # A step that ended on a card alone has its code current. Of the parts it acts on, only
+    # those that name a card of their own are still waiting; that is said only when the
+    # check's output names at least one card, so an output that names none keeps them all
+    # waiting rather than calling an unread card a pass.
+    for key in rep.card_only:
+        rows = [(r, pt, any(cards_named(texts.get(r["id"], ""), st["card"])
+                            for st in pt.get("person_steps") or [] if st.get("card")))
+                for r, pt in group.get(key, []) if r["outcome"] == OUT_WAITING]
+        if any(named for _r, _pt, named in rows):
+            for r, _pt, named in rows:
+                if not named:
+                    r["outcome"] = OUT_OK
+                    r["detail"] = "its code is current; no card of its own is waiting"
+    return records, nocheck, texts
+
+
+def end_code(code, records, stopped, unreadable=False):
+    """The exit code. A step that stopped the run keeps its code, 10 included: the parts not
+    reached are on the lines, and the person's next move is the same either way. Only a stop
+    that would exit 0 gives way, to 4. A run that got to the end takes the idea gate's code
+    when it is not 0, 4 or 10; otherwise 4 when a part could not be measured or was not
+    reached, 10 when a part is waiting, 0 only when none is. 4 outranks 10 (contract
+    section 13): never exit 0 with anything unfinished."""
+    kinds = set(r["outcome"] for r in records)
+    unmeasured = unreadable or OUT_UNMEASURED in kinds or OUT_NOT_REACHED in kinds
+    waiting = OUT_WAITING in kinds
+    if stopped:
+        return code if code not in (None, EX_OK) else EX_UNMEASURED
+    if code is None or code in (EX_OK, EX_UNMEASURED, EX_BLOCKED):
+        if unmeasured or code == EX_UNMEASURED:
+            return EX_UNMEASURED
+        if waiting or code == EX_BLOCKED:
+            return EX_BLOCKED
+        return EX_OK
+    return code
+
+
+def cards_named(text, card):
+    """True when the card id stands alone in the text (CK-1 is not found inside CK-11)."""
+    return bool(re.search(r"(?<![A-Za-z0-9-])%s(?![A-Za-z0-9-])" % re.escape(card), text))
+
+
+def short_list(parts, records, texts):
+    """The cards a waiting part's own output names, and the parts that wait without one."""
+    by_id = dict((p["id"], p) for p in parts)
+    mine, signs, lone, done = [], [], [], set()
+    for rec in records:
+        if rec["outcome"] != OUT_WAITING:
+            continue
+        part = by_id[rec["id"]]
+        text = texts.get(rec["id"])
+        found = False
+        for step in part.get("person_steps") or []:
+            card = step.get("card")
+            if card and cards_named(text or "", card) and card not in done:
+                done.add(card)
+                found = True
+                row = "  %-8s %s (%s)" % (card, step["words"], part["name"])
+                (mine if step["kind"] == "only-a-person" else signs).append(row)
+            elif card and card in done:
+                found = True
+        if not found:
+            lone.append(part["name"])
+    return mine, signs, lone
+
+
+def finish(io, parts, rep, files, reached, stop_code, stopped, unreadable=None):
+    """Print the lines and the short list; return the exit code."""
+    heading(io, "Where every part stands")
+    if unreadable:
+        io.say("The list of parts could not be read (%s), so no part was looked at." % unreadable)
+        io.records = []
+        return end_code(stop_code, [], stopped, unreadable=True)
+    records, nocheck, texts = build_records(io, parts, rep, files, reached)
+    io.records = records
+    for rec in records:
+        io.say("  %-22s %s%s" % (rec["outcome"], rec["name"],
+                                 " (%s)" % rec["detail"] if rec["detail"] else ""))
+    if nocheck:
+        io.say("No check of their own: %s." % "; ".join(nocheck))
+    code = end_code(stop_code, records, stopped)
+    counts = dict((o, sum(1 for r in records if r["outcome"] == o)) for o in OUTCOMES)
+    if counts[OUT_UNMEASURED] or counts[OUT_NOT_REACHED]:
+        io.say("")
+        io.say("%d part(s) could not be measured and %d were not reached, so this run is not "
+               "a pass (exit %d)." % (counts[OUT_UNMEASURED], counts[OUT_NOT_REACHED], code))
+    mine, signs, lone = short_list(parts, records, texts)
+    io.say("")
+    if not (mine or signs or lone):
+        if counts[OUT_WAITING] == 0:
+            io.say("Nothing is waiting on you.")
+        return code
+    if mine:
+        io.say("Only you can do these:")
+        for row in mine:
+            io.say(row)
+    if signs:
+        io.say("Sign-offs still asked for:")
+        for row in signs:
+            io.say(row)
+    for name in lone:
+        io.say("%s is waiting on you; its own lines above say what for." % name)
+    return code
+
+
+# --------------------------------------------------------------------------- #
+# --check: look at every part and change nothing (KIT-736)
+# --------------------------------------------------------------------------- #
+ONLY_LOOKED = ("This run only looked and changed nothing (--check). It asked no question and "
+               "needed no terminal.")
+BEHIND_DETAIL = "not at origin's tip; a real run would compare it and move it"
+SKILLS_DIFFER = "differ from the kit's; a real run would ask to replace them"
+COMMIT_ID = r"(?:[0-9a-f]{40}|[0-9a-f]{64})"
+
+
+def git_read(repo, *args):
+    """A read-only git command as the argv a look runs it with. It never goes through a shell."""
+    return ["git", "-C", repo] + list(args)
+
+
+def look_checkout(io, rep, repo=KIT):
+    """The kit checkout's line, from two read-only git calls: this checkout's commit, and the
+    tip of the branch origin calls its default. The same commit is up to date. Any other is
+    waiting on you, and only that: a read of the tip cannot tell behind from ahead. Which branch
+    this checkout is on is never asked, so a detached commit is measured like any other.
+    Whatever cannot be read is could not be measured, and the detail says which. Git's own
+    words are not repeated, because an error can carry the remote's address."""
+    code, out = io.measure(git_read(repo, "rev-parse", "HEAD"))
+    here = (out or "").strip()
+    if code != 0 or not re.fullmatch(COMMIT_ID, here):
+        rep.note("checkout", OUT_UNMEASURED, "git could not read this checkout's commit")
+        return
+    code, out = io.measure(git_read(repo, "ls-remote", "--symref", "origin", "HEAD"))
+    if code != 0:
+        why = ("git exited with %d" % code) if code is not None else (out or "no reason given")[:120]
+        rep.note("checkout", OUT_UNMEASURED, "origin could not be reached (%s)" % why)
+        return
+    tips = re.findall(r"^(%s)[ \t]+HEAD[ \t]*$" % COMMIT_ID, out or "", re.M)
+    if not tips:
+        rep.note("checkout", OUT_UNMEASURED, "origin's answer could not be read")
+    elif tips[0] == here:
+        rep.note("checkout", OUT_OK, "at origin's tip")
+    else:
+        rep.note("checkout", OUT_WAITING, BEHIND_DETAIL)
+
+
+def look_steps(io, parts, files, skip_stage_e, rep):
+    """Give each step of a real run the result it would report, read-only: the kit checkout by
+    git (look_checkout), every other step by its part's own check, run once. The settings file
+    is looked at first: absent is "off on this Mac", and the check does not run. A step with
+    no result reads "not reached" in build_records, so each one is given one. Each check's
+    answer goes in rep.seen, so build_records does not run it again. A Ctrl-C stops the
+    looking, and the steps it did not reach say so."""
+    done = set()
+    for part in parts:
+        key = step_of(part)
+        if not key or key in done or io.interrupted:
+            continue
+        done.add(key)
+        if key == "checkout":
+            look_checkout(io, rep)
+            continue
+        path = settings_path(part, files)
+        if key == "stage_e" and skip_stage_e:
+            rep.note(key, OUT_UNMEASURED, "skipped (--skip-stage-e), so not checked")
+        elif path and not io.exists(path):
+            rep.note(key, OUT_OFF, missing(path))
+        else:
+            argv = check_argv(part, files)
+            answer = io.measure(argv)
+            rep.seen[tuple(argv)] = answer
+            code, out = answer
+            if key == "skills" and code == 1:
+                # The skills check exits 1 for "differ from the kit's", which the lines at the
+                # end of a real run call waiting; read as outcome_of_check does, it would not be.
+                rep.note(key, OUT_WAITING, SKILLS_DIFFER)
+            else:
+                rep.note(key, *outcome_of_check(code, out))
+
+
+def look_only(io, args):
+    """--check, run after the two refusals that apply to it (a Claude session, root). It needs
+    no terminal and asks nothing: no first screen, no consent, no password, and the consent
+    record is neither read nor written. It runs nothing but the checks and the two read-only
+    git calls, all through io.measure, so none can ask a person or outlive its time limit.
+    The first line says it only looked; the rest is finish(), the lines and the short list a
+    real run ends with, and their exit code (0, 10, or 4 before 10)."""
+    io.say(ONLY_LOOKED)
+    files = {"stage-a.conf": os.path.abspath(args.conf),
+             "stage-e.conf": os.path.abspath(args.stage_e_conf),
+             "sweep.conf": os.path.abspath(args.sweep_conf)}
+    rep, parts, unreadable = Report(), [], None
+    try:
+        parts = io.parts()
+        look_steps(io, parts, files, args.skip_stage_e, rep)
+    except (OSError, ValueError, ImportError, KeyError, TypeError) as exc:
+        parts, unreadable = [], "%s: %s" % (type(exc).__name__, exc)
+    except KeyboardInterrupt:
+        io.interrupted = True
+    stopped = io.interrupted
+    if stopped:
+        io.say("Interrupted. Nothing was changed. The parts it did not reach say so below.")
+    return finish(io, parts, rep, files, not stopped, EX_UNMEASURED if stopped else None,
+                  stopped, unreadable)
+
+
+def commit_id(value):
+    """The hidden --pulled-from value: a commit id, nothing else."""
+    if not re.match(r"^[0-9a-f]{7,64}$", value):
+        raise argparse.ArgumentTypeError("not a commit id")
+    return value
+
+
+def step_consent_and_mode(io, record_path, mode, state, rec, why, parts, files, skip_stage_e,
+                          unreadable, writes=()):
+    """The consent, then what the person typed is written (KIT-735), then (in Automatic) this
+    command's own questions are answered by it."""
+    cands = [] if unreadable else candidates(io, parts, files, skip_stage_e)
+    code = step_consent(io, record_path, mode, state, rec, why, cands, files, unreadable, writes)
+    if code is None:
+        code = step_write_settings(io, writes)
+    if code is None:
+        io.auto = mode == MODE_AUTO
     return code
 
 
@@ -495,11 +1494,17 @@ def main(argv=None, io=None):
                         help="use this checkout as it is, without pulling")
     parser.add_argument("--sweep-conf", default=os.path.join(KIT, "sweep.conf"),
                         help="the sweep's settings (default: sweep.conf in the kit; absent skips it)")
-    parser.add_argument("--chat-lane-conf", default=os.path.join(KIT, "chat-lane.conf"),
-                        help="the tech lead's rules settings (default: chat-lane.conf in the kit; "
-                             "absent skips it)")
     parser.add_argument("--skip-stage-e", action="store_true",
                         help="do not check or update the review jobs")
+    parser.add_argument("--check", action="store_true", help="only look: change nothing, ask nothing, no terminal needed")
+    parser.add_argument("--pulled-from", default=None, help=argparse.SUPPRESS, type=commit_id)
+    parser.add_argument("--chosen-mode", default=None, choices=sorted(MODE_WORDS),
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--consent-record", default=DEFAULT_RECORD, help=argparse.SUPPRESS)
+    parser.add_argument("--update-conf", default=os.path.join(KIT, "update.conf"),
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--bridge-conf", default=os.path.join(KIT, "bridge.conf"),
+                        help=argparse.SUPPRESS)
     parser.add_argument("--selftest", action="store_true")
     args = parser.parse_args(argv)
     if args.selftest:
@@ -517,20 +1522,83 @@ def main(argv=None, io=None):
     if io.uid() == 0:
         return stop(io, "do not run this with sudo. Run it as yourself; it asks for your Mac "
                         "password when it needs it.", EX_USAGE)
+    if args.check:                   # KIT-736: it only looks, so it needs no terminal
+        return look_only(io, args)
     if not io.is_tty():
         return stop(io, "this needs a person at a terminal: it asks before every change.",
                     EX_USAGE)
     io.say("A terminal, as yourself. Good.")
 
-    for step in (lambda: step_checkout(io, argv, args.no_pull),
-                 lambda: step_skills(io),
-                 lambda: step_stage_e(io, os.path.abspath(args.stage_e_conf), args.skip_stage_e),
-                 lambda: step_sweep(io, os.path.abspath(args.sweep_conf)),
-                 lambda: step_chat_rules(io, os.path.abspath(args.chat_lane_conf))):
-        code = step()
-        if code is not None:
-            return code
-    return step_stage_a(io, os.path.abspath(args.conf), os.path.abspath(args.stage_e_conf))
+    # Past the three refusals, every exit ends with the lines. The parts list is read once,
+    # up front; if it cannot be read there is no consent page to agree to, so nothing runs and
+    # the end says so, in words.
+    files = {"stage-a.conf": os.path.abspath(args.conf),
+             "stage-e.conf": os.path.abspath(args.stage_e_conf),
+             "sweep.conf": os.path.abspath(args.sweep_conf)}
+    rep = Report()
+    parts, unreadable = [], None
+    try:
+        parts = io.parts()
+        for part in parts:
+            key = step_of(part)
+            if key and part.get("check") and key not in rep.checks:
+                rep.checks[key] = check_argv(part, files)
+    except (OSError, ValueError, ImportError, KeyError, TypeError) as exc:
+        parts, unreadable = [], "%s: %s" % (type(exc).__name__, exc)
+
+    # THE FIRST SCREEN. Only now, past the three refusals, is anything read: first the consent
+    # record (its mode is the default), then the person is asked which way this run goes.
+    record_path = os.path.abspath(args.consent_record)
+    state, rec, why = io.read_record(record_path)
+    default = rec["mode"] if state == "ok" else MODE_AUTO
+    try:
+        if args.pulled_from:
+            # This command started itself again after a pull: the person already chose.
+            mode = args.chosen_mode or default
+            io.say("Carrying on as %s, the way you chose before the pull." % MODE_WORDS[mode])
+        else:
+            mode = first_screen(io, default)
+    except KeyboardInterrupt:
+        mode = None
+    if mode is None:
+        code = stop(io, "no way to run was chosen, so nothing was changed. Run it again and "
+                        "type 1 or 2.", EX_BLOCKED)
+        return finish(io, parts, rep, files, False, code, True, unreadable)
+
+    # THE ASK (KIT-735). Right after the first screen and before the consent, in both modes: one
+    # plain question for each value only a person has that is still missing. Nothing is written
+    # here; what was typed is listed on the consent page and written after the yes. Not after a
+    # restart on new code (the person answered before it), and not when the parts list is unread.
+    writes = []
+    if not args.pulled_from and not unreadable:
+        try:
+            writes = step_ask(io, os.path.abspath(args.update_conf),
+                              os.path.abspath(args.bridge_conf))
+        except KeyboardInterrupt:
+            code = stop(io, "interrupted while asking, so nothing was changed. Run it again when "
+                            "you are ready.", EX_BLOCKED)
+            return finish(io, parts, rep, files, False, code, True, unreadable)
+
+    steps = (lambda: step_consent_and_mode(io, record_path, mode, state, rec, why, parts, files,
+                                           args.skip_stage_e, unreadable, writes),
+             lambda: step_checkout(io, argv, args.no_pull, rep, args.pulled_from, mode),
+             lambda: step_skills(io, rep),
+             lambda: step_stage_e(io, files["stage-e.conf"], args.skip_stage_e, rep),
+             lambda: step_sweep(io, files["sweep.conf"], rep),
+             lambda: step_stage_a(io, files["stage-a.conf"], files["stage-e.conf"], rep))
+    code, reached, stopped = None, True, False
+    try:
+        for n, step in enumerate(steps):
+            code = step()
+            if code is not None:
+                reached = n == len(steps) - 1
+                stopped = not reached
+                break
+    except KeyboardInterrupt:
+        io.interrupted = True
+        reached, stopped = False, True
+        code = stop(io, INTERRUPTED % "The step you interrupted", EX_BLOCKED)
+    return finish(io, parts, rep, files, reached, code, stopped, unreadable)
 
 
 # --------------------------------------------------------------------------- #
@@ -541,7 +1609,28 @@ class FakeIo(Io):
     program this case did not script is a failure of the case, never a silent pass."""
 
     def __init__(self, codes=None, answers=(), env=None, uid=501, tty=True, git_state=None,
-                 steps=None):
+                 steps=None, typed=None, record=None, conf=None):
+        # The first screen and the consent read lines from `typed` (default: Manual, then
+        # yes), so the cases written before them keep their meaning. `record` is what the
+        # consent record reads as: (state, data, why). Everything the new seams do is logged.
+        self.typed = ["2", "yes"] if typed is None else list(typed)
+        self.line_log = []                 # (prompt, programs run so far, record reads so far)
+        self.record = record or ("none", None, "no record yet")
+        self.record_reads = []
+        self.conf = dict(conf or {})
+        self.conf_reads = []
+        # The ask (KIT-735) finds nothing unless a case scripts it, so a machine's own settings
+        # files can never reach a case written before it. Its battery (pipeline_ask.py) puts the
+        # real seams back over files of its own.
+        self.questions = []
+        self.asked_files = []              # (update conf, bridge conf) it was asked to read
+        self.settings_failure = None
+        self.settings_log = []             # the changes it was asked to write
+        self.events = []                   # "sudo", "write" and "settings", in order
+        self.sudo_ok = True
+        self.write_failure = None
+        self.written = []                  # (path, text)
+        self.write_at = None               # programs run when the record was written
         self.steps = {"code": "WOULD-CHANGE"} if steps is None else steps
         self.since = []
         self.interrupt_on = set()          # program keys whose run the person Ctrl-C'd
@@ -552,12 +1641,22 @@ class FakeIo(Io):
         self.argvs = []
         self.lines = []
         self.restarted = None
+        # Each part's own read-only check: {program key: exit code, or a list of them}, with
+        # {program key: output} beside it. A check this case did not script ends at 0, so
+        # the cases written before the lines existed keep their meaning; the new cases
+        # script what they mean. `None` is a check that did not finish.
+        self.measure_codes = {}
+        self.measure_out = {}
+        self.measured = []
+        self.present = set()               # settings files under the kit that "exist"
+        self.parts_list = None             # None: the real list; an Exception: it cannot be read
         self._env = dict(env or {})
         self._uid = uid
         self._tty = tty
         self.git = dict({"symbolic-ref": (0, "refs/remotes/origin/main"),
                          "rev-parse --abbrev-ref": (0, "main"), "status": (0, ""),
                          "rev-parse HEAD": [(0, "aaa"), (0, "aaa")], "pull": (0, ""),
+                         "rev-parse --short": (0, "abc1234"),
                          "log": (0, "aaa the latest")}, **(git_state or {}))
 
     @staticmethod
@@ -568,6 +1667,8 @@ class FakeIo(Io):
                 return "rev-parse --abbrev-ref"
             if rest[:2] == ["rev-parse", "HEAD"]:
                 return "rev-parse HEAD"
+            if rest[:2] == ["rev-parse", "--short"]:
+                return "rev-parse --short"
             return rest[0]
         script = os.path.basename(argv[1])
         return " ".join([script] + [a for a in argv[2:3] if not a.startswith("/")])
@@ -588,6 +1689,24 @@ class FakeIo(Io):
         got = self.codes[k]
         return (got.pop(0) if isinstance(got, list) else got), ""
 
+    def measure(self, argv, timeout=CHECK_TIMEOUT):
+        k = self.key(argv)
+        self.measured.append(k)
+        got = self.measure_codes.get(k, 0)
+        code = got.pop(0) if isinstance(got, list) and len(got) > 1 else (
+            got[0] if isinstance(got, list) else got)
+        return code, self.measure_out.get(k, "" if code in (0, None) else "")
+
+    def exists(self, path):
+        if path.startswith(KIT + os.sep):
+            return path in self.present
+        return os.path.exists(path)
+
+    def parts(self):
+        if isinstance(self.parts_list, Exception):
+            raise self.parts_list
+        return Io.parts(self) if self.parts_list is None else self.parts_list
+
     def stage_e_steps(self, since):
         self.since.append(since)
         got = self.steps
@@ -596,9 +1715,43 @@ class FakeIo(Io):
     def now(self):
         return "2026-10-03T00:00:00Z"
 
-    def ask(self, question):
+    def prompt(self, question):
         self.asked.append(question)
         return self.answers.pop(0) if self.answers else False
+
+    def line(self, prompt):
+        self.line_log.append((prompt, len(self.ran), len(self.record_reads)))
+        return self.typed.pop(0) if self.typed else None
+
+    def read_record(self, path):
+        self.record_reads.append(path)
+        return self.record
+
+    def read_conf(self, path):
+        self.conf_reads.append(path)
+        return self.conf.get(path)
+
+    def missing_values(self, update_conf, bridge_conf):
+        self.asked_files.append((update_conf, bridge_conf))
+        return self.questions
+
+    def write_settings(self, changes):
+        self.events.append("settings")
+        self.settings_log.append(list(changes))
+        return self.settings_failure
+
+    def sudo_once(self, why):
+        self.events.append("sudo")
+        return self.sudo_ok
+
+    def write_record(self, path, text):
+        self.events.append("write")
+        self.write_at = len(self.ran)
+        if self.write_failure:
+            return self.write_failure
+        self.written.append((path, text))
+        self.record = ("ok", json.loads(text), "")
+        return None
 
     def say(self, line=""):
         self.lines.append(line)
@@ -616,6 +1769,393 @@ class FakeIo(Io):
         return self._tty
 
 
+def selftest_look(check, base, se_conf, tmp):
+    """Every case of the look-only mode, --check (KIT-736), and no other case. selftest() calls
+    it with one line. `base` is its settings-file flags; `se_conf` exists and the other two do
+    not; `tmp` is the run's own folder."""
+    import builtins
+    import contextlib
+    import shutil
+    import subprocess as sp
+
+    files = {"stage-a.conf": base[1], "stage-e.conf": base[3], "sweep.conf": base[5]}
+    kit = lambda name: os.path.join(KIT, name)                    # noqa: E731
+    real = Io().parts()
+    here, tip = "a" * 40, "b" * 40
+    answer = lambda sha: "ref: refs/heads/main\tHEAD\n%s\tHEAD\n" % sha        # noqa: E731
+    head_argv = ["git", "-C", KIT, "rev-parse", "HEAD"]
+    tip_argv = ["git", "-C", KIT, "ls-remote", "--symref", "origin", "HEAD"]
+    # A conf path may be any path, so a part's check is known by its argv with those blanked.
+    norm = lambda argv: tuple("<conf>" if a.endswith(".conf") else a for a in argv)  # noqa: E731
+    paging = "pipeline_notifier_setup.py run"
+
+    class Untouchable(FakeIo):
+        """A FakeIo on which everything that asks, writes, installs or restarts raises, and which
+        measures only what a look may: each part's own check and the two read-only git calls."""
+
+        def __init__(self, **kw):
+            FakeIo.__init__(self, **kw)
+            self.parts_reads = 0
+            self.checks = set(norm(check_argv(p, files)) for p in real if p.get("check"))
+
+        def parts(self):
+            self.parts_reads += 1
+            return FakeIo.parts(self)
+
+        def measure(self, argv, timeout=CHECK_TIMEOUT):
+            if list(argv) not in (head_argv, tip_argv) and norm(argv) not in self.checks:
+                raise AssertionError("--check measured %r: neither a part's own check nor "
+                                     "a read-only git call" % (argv,))
+            return FakeIo.measure(self, argv, timeout)
+
+    def refuses(name):
+        def refused(self, *a, **k):
+            raise AssertionError("--check called %s%r" % (name, a[:2]))
+        return refused
+    for name in ("ask", "prompt", "line", "sudo_once", "make_sudo", "read_record",
+                 "write_record", "read_conf", "stage_e_steps", "restart", "run"):
+        setattr(Untouchable, name, refuses(name))
+
+    class Pressed(Untouchable):
+        """Ctrl-C reaches the first check, and Io.measure notes it and returns."""
+        def measure(self, argv, timeout=CHECK_TIMEOUT):
+            Untouchable.measure(self, argv, timeout)
+            self.interrupted = True
+            return None, "interrupted"
+
+    class Raised(Untouchable):
+        """Ctrl-C reaches the look itself, as an exception."""
+        def measure(self, argv, timeout=CHECK_TIMEOUT):
+            raise KeyboardInterrupt
+
+    @contextlib.contextmanager
+    def no_writes():
+        """While it lasts, a file opened for writing, a path made, moved or removed, and a
+        process started outside the Io seam all raise."""
+        real_open, saved = builtins.open, {}
+
+        def guarded_open(file, mode="r", *a, **k):
+            if set(str(mode)) & set("wax+"):
+                raise AssertionError("--check opened %r for writing" % (file,))
+            return real_open(file, mode, *a, **k)
+
+        def blocked(label):
+            def refused(*a, **k):
+                raise AssertionError("--check called %s%r" % (label, a[:1]))
+            return refused
+        for mod, names in ((os, ("makedirs", "mkdir", "rename", "replace", "remove", "unlink",
+                                 "rmdir", "system", "execv")),
+                           (shutil, ("rmtree", "copy", "copyfile", "move")),
+                           (sp, ("Popen", "run", "call", "check_call", "check_output"))):
+            for name in names:
+                saved[(mod, name)] = getattr(mod, name)
+                setattr(mod, name, blocked("%s.%s" % (mod.__name__, name)))
+        builtins.open = guarded_open
+        try:
+            yield
+        finally:
+            builtins.open = real_open
+            for (mod, name), original in saved.items():
+                setattr(mod, name, original)
+
+    def look(argv=(), codes=None, out=None, present=(), cls=None, parts_list=None, **kw):
+        """`--check` on an Untouchable, inside no_writes(): (exit code, io, why it raised)."""
+        kw.setdefault("tty", False)                    # a look needs no terminal
+        io = (cls or Untouchable)(**kw)
+        io.measure_out = dict({"rev-parse HEAD": here + "\n", "ls-remote": answer(here)},
+                              **(out or {}))
+        io.measure_codes = dict(codes or {})
+        io.present = set(present)
+        io.parts_list = parts_list
+        try:
+            with no_writes():
+                code = main(base + ["--check"] + list(argv), io=io)
+        except Exception as exc:                       # a mutant's crash is a named failure too
+            return None, io, (str(exc) if isinstance(exc, AssertionError)
+                              else "%s: %s" % (type(exc).__name__, exc))
+        except KeyboardInterrupt:
+            if cls is not Raised:
+                raise                                  # a person's own Ctrl-C is not swallowed
+            return None, io, "Ctrl-C was not caught by the look"
+        return code, io, None
+
+    class Rows(dict):
+        def __missing__(self, key):
+            return ("no line for %s" % key, "")
+    rec = lambda io: Rows((r["id"], (r["outcome"], r["detail"]))        # noqa: E731
+                          for r in (io.records or []))
+    text = lambda io: "\n".join(io.lines)                          # noqa: E731
+    five = (OUT_OK, OUT_WAITING, OUT_OFF, OUT_UNMEASURED)
+
+    # 1. THE REFUSALS COME FIRST, print only themselves, and nothing is read before them: not
+    #    the parts list, not a check, not the record. A Claude session is 3; root is 2.
+    def plain_run(extra=(), **kw):
+        """The same flags with no --check, on a FakeIo that scripts no program: (code, io). A
+        run that goes past its refusal and starts one is a code naming it, not a crash."""
+        io = FakeIo(**kw)
+        try:
+            return main(base + list(extra), io=io), io
+        except Exception as exc:
+            return "went on: %s" % exc, io
+
+    for label, kw, want in ([("marker:%s" % m, {"env": {m: ""}}, EX_REFUSED)
+                             for m in AGENT_ENV_MARKERS] + [("root", {"uid": 0}, EX_USAGE)]):
+        plain = plain_run(**kw)[1]                     # the same refusal with no --check
+        code, io, err = look(**kw)
+        check("kit736-refusal-first:%s" % label,
+              (code, err, io.lines == plain.lines, ONLY_LOOKED in io.lines, io.parts_reads,
+               io.measured, io.record_reads, io.records),
+              (want, None, True, False, 0, [], [], None))
+
+    # 2. NO TERMINAL IS NEEDED, and every other flow still needs one. And a look changes and
+    #    asks nothing: on an Untouchable, a restart, a record, a question, a password, an
+    #    installer, a pull, a written file or any other command raises, and `err` says which.
+    code, io, err = look()
+    check("kit736-changes-and-asks-nothing", err, None)
+    check("kit736-no-terminal-needed", (code, err, io.is_tty(), io.records is not None),
+          (EX_OK, None, False, True))
+    for extra in ([], ["--skip-stage-e"], ["--no-pull"]):
+        code, plain = plain_run(extra, tty=False)
+        check("kit736-other-flows-still-need-a-terminal:%s" % (" ".join(extra) or "plain"),
+              (code, plain.records, plain.ran, plain.measured), (EX_USAGE, None, [], []))
+
+    # 3. A LEVEL MAC: exit 0; each part judged the way the lines at the end judge it; the
+    #    only commands are each present part's own check (once) and the two git reads.
+    code, io, err = look()
+    got = rec(io)
+    check("kit736-level-mac-exits-0-and-says-nothing-waits",
+          (code, err, "Nothing is waiting on you." in io.lines), (EX_OK, None, True))
+    check("kit736-level-mac-judges-each-part",
+          [got[i] for i in ("one-command", "skills", "review", "findings", "review-identity",
+                            "idea-gate", "cleanup", "paging")],
+          [(OUT_OK, "at origin's tip"), (OUT_OK, ""), (OUT_OK, ""), (OUT_OK, ""), (OUT_OK, ""),
+           (OUT_OFF, "no stage-a.conf in %s" % tmp), (OUT_OFF, "no sweep.conf in %s" % tmp),
+           (OUT_OFF, "no notifier.conf in the kit folder")])
+    check("kit736-runs-only-the-checks-and-the-git-reads-each-once",
+          (sorted(io.measured), io.ran),
+          (sorted(["sync_user_skills.py", "pipeline_stage_e_setup.py verify",
+                   "pipeline_stage_e_app.py verify", "rev-parse HEAD", "ls-remote"]), []))
+    check("kit736-asks-and-writes-nothing",
+          (io.asked, io.line_log, io.events, io.written, io.record_reads, io.conf_reads,
+           io.restarted, io.auto, io.auto_answered), ([], [], [], [], [], [], None, False, ()))
+    check("kit736-the-first-line-says-it-only-looked",
+          (io.lines[:3], "only looked" in ONLY_LOOKED, "changed nothing" in ONLY_LOOKED),
+          (["", "== 0. Where this is running", ONLY_LOOKED], True, True))
+    closing = [ln for ln in io.lines if ln.startswith("No check of their own: ")]
+    bare = [p["name"] for p in real if not step_of(p) and not p.get("check")]
+    line_of = lambda r: "  %-22s %s%s" % (r["outcome"], r["name"],                 # noqa: E731
+                                          " (%s)" % r["detail"] if r["detail"] else "")
+    check("kit736-one-line-per-part-in-the-parts-list",
+          (sum(1 for r in (io.records or []) if io.lines.count(line_of(r)) == 1),
+           len(io.records or []) + len(bare), closing),
+          (len(io.records or []), len(real), ["No check of their own: %s." % "; ".join(bare)]))
+    check("kit736-every-line-carries-one-of-the-four-words-and-none-is-not-reached",
+          bool(io.records) and all(r["outcome"] in five for r in io.records), True)
+
+    # 4. THE CHECKOUT LINE. Only the commit is compared: the same is up to date, any other is
+    #    waiting on you (never "behind"), and what cannot be read says which it was.
+    check("kit736-the-waiting-detail-is-the-tickets-words", BEHIND_DETAIL,
+          "not at origin's tip; a real run would compare it and move it")
+    one = lambda io: rec(io)["one-command"]                       # noqa: E731
+    unreachable = lambda why: (OUT_UNMEASURED, "origin could not be reached (%s)" % why)  # noqa: E731
+    unread = (OUT_UNMEASURED, "origin's answer could not be read")
+    no_commit = (OUT_UNMEASURED, "git could not read this checkout's commit")
+    for name, out, codes, want in (
+            ("same", {}, {}, (OUT_OK, "at origin's tip")),
+            ("different", {"ls-remote": answer(tip)}, {}, (OUT_WAITING, BEHIND_DETAIL)),
+            ("noise-around-the-answer", {"ls-remote": "warning: x\n" + answer(tip) + "\nmore\n"},
+             {}, (OUT_WAITING, BEHIND_DETAIL)),
+            ("origin-refused", {"ls-remote": "fatal: unable to access GITS-OWN-WORDS"},
+             {"ls-remote": 128}, unreachable("git exited with 128")),
+            ("origin-did-not-answer", {"ls-remote": "no answer in 120 seconds"},
+             {"ls-remote": None}, unreachable("no answer in 120 seconds")),
+            ("answer-is-not-a-tip", {"ls-remote": "hello\n"}, {}, unread),
+            ("answer-is-only-the-symref", {"ls-remote": "ref: refs/heads/main\tHEAD\n"}, {}, unread),
+            ("answer-is-a-short-id", {"ls-remote": answer("abc123")}, {}, unread),
+            ("answer-names-another-ref", {"ls-remote": "%s\trefs/heads/main\n" % tip}, {}, unread),
+            ("answer-is-empty", {"ls-remote": ""}, {}, unread),
+            ("this-checkout-cannot-be-read", {"rev-parse HEAD": "fatal: not a git repository"},
+             {"rev-parse HEAD": 128}, no_commit),
+            ("this-checkout-says-no-commit", {"rev-parse HEAD": "HEAD\n"}, {}, no_commit)):
+        code, io, err = look(out=out, codes=codes)
+        check("kit736-checkout-%s" % name, (err, one(io)), (None, want))
+        if name == "origin-refused":
+            check("kit736-checkout-never-repeats-gits-own-words", "GITS-OWN-WORDS" in text(io), False)
+        if name == "this-checkout-cannot-be-read":
+            check("kit736-checkout-unreadable-asks-origin-nothing", "ls-remote" in io.measured, False)
+    # A detached commit or another branch is not a failure to measure, and is never mentioned.
+    for branch in ("HEAD", "feat/x"):
+        for sha, want in ((here, (OUT_OK, "at origin's tip")), (tip, (OUT_WAITING, BEHIND_DETAIL))):
+            code, io, err = look(out={"rev-parse --abbrev-ref": branch, "ls-remote": answer(sha)})
+            check("kit736-checkout-on-%s-with-tip-%s" % (branch, sha[0]),
+                  (err, one(io), [k for k in io.measured if "abbrev" in k or "symbolic" in k],
+                   any(w in one(io)[1] for w in ("detached", "branch", "behind", "ahead", "feat"))),
+                  (None, want, [], False))
+
+    # 5. EXIT CODES. 0 level; 10 waiting; 4 could not be measured; 4 before 10.
+    waits = {paging: 10}
+    cases = (("0-level", {}, {}, (), EX_OK),
+             ("10-not-at-origins-tip", {"ls-remote": answer(tip)}, {}, (), EX_BLOCKED),
+             ("10-skills-differ", {}, {"sync_user_skills.py": 1}, (), EX_BLOCKED),
+             ("10-a-part-check-waits", {}, waits, (kit("notifier.conf"),), EX_BLOCKED),
+             ("10-the-review-check-waits", {}, {"pipeline_stage_e_setup.py verify": 10}, (),
+              EX_BLOCKED),
+             ("4-origin-cannot-be-reached", {}, {"ls-remote": 128}, (), EX_UNMEASURED),
+             ("4-a-check-stopped", {}, {paging: 1}, (kit("notifier.conf"),), EX_UNMEASURED),
+             ("4-a-check-did-not-finish", {}, {paging: None}, (kit("notifier.conf"),),
+              EX_UNMEASURED),
+             ("4-a-check-needs-the-password", {}, {paging: 5}, (kit("notifier.conf"),),
+              EX_UNMEASURED),
+             ("4-a-step-check-stopped", {}, {"pipeline_stage_e_setup.py verify": 4}, (),
+              EX_UNMEASURED),
+             ("4-outranks-10-a-waiting-checkout", {"ls-remote": answer(tip)}, {paging: 1},
+              (kit("notifier.conf"),), EX_UNMEASURED),
+             ("4-outranks-10-a-waiting-part", {}, {"ls-remote": 128, paging: 10},
+              (kit("notifier.conf"),), EX_UNMEASURED))
+    for name, out, codes, present, want in cases:
+        code, io, err = look(out=out, codes=codes, present=present)
+        check("kit736-exit-%s" % name, (code, err), (want, None))
+    code, io, err = look(codes={"sync_user_skills.py": 1})
+    check("kit736-skills-differ-is-waiting-not-unmeasured",
+          (rec(io)["skills"], any(r["outcome"] == OUT_UNMEASURED for r in (io.records or []))),
+          ((OUT_WAITING, SKILLS_DIFFER), False))
+    code, io, err = look(codes={"sync_user_skills.py": 2})
+    check("kit736-another-skills-code-is-unmeasured",
+          (rec(io)["skills"][0], code), (OUT_UNMEASURED, EX_UNMEASURED))
+
+    # 6. THE SHORT LIST comes from the same reader as a real run's, and each check runs once.
+    code, io, err = look(codes=waits, out={paging: "CK-N1 is yours\nthen CK-N3 and CK-N10"},
+                         present=[kit("notifier.conf")])
+    at = lambda s: io.lines.index(s) if s in io.lines else len(io.lines)       # noqa: E731
+    only, signs = at("Only you can do these:"), at("Sign-offs still asked for:")
+    first = lambda lines: [(ln.split() or [""])[0] for ln in lines]            # noqa: E731
+    check("kit736-short-list-splits-by-kind-and-matches-whole-card-ids",
+          (first(io.lines[only + 1:signs]), first(io.lines[signs + 1:signs + 2]), code,
+           io.measured.count(paging)),
+          (["CK-N1"], ["CK-N3"], EX_BLOCKED, 1))
+    code, io, err = look(codes={"pipeline_stage_e_setup.py verify": 10},
+                         out={"pipeline_stage_e_setup.py verify": "CK-11 waits"})
+    check("kit736-a-waiting-step-part-takes-its-cards-from-its-check-run-once",
+          (any(ln.startswith("  CK-11") for ln in io.lines), rec(io)["catch-up"][0],
+           io.measured.count("pipeline_stage_e_setup.py verify"), code),
+          (True, OUT_WAITING, 1, EX_BLOCKED))
+    code, io, err = look(codes={"sync_user_skills.py": 1})
+    check("kit736-a-waiting-part-with-no-card-is-named",
+          (any(ln.endswith("is waiting on you; its own lines above say what for.") for ln in io.lines),
+           io.measured.count("sync_user_skills.py")), (True, 1))
+
+    # 7. THE FLAGS. The hidden four do nothing; --skip-stage-e and the settings flags work.
+    level = look(out={"ls-remote": answer(tip)})
+    for flags in (["--no-pull"], ["--pulled-from", "abcdef1234"], ["--chosen-mode", "manual"],
+                  ["--chosen-mode", "automatic"], ["--consent-record", "/x/y/z.json"],
+                  ["--no-pull", "--pulled-from", "abcdef1234", "--chosen-mode", "manual",
+                   "--consent-record", "/x/y/z.json"]):
+        got = look(flags, out={"ls-remote": answer(tip)})
+        check("kit736-flags-do-nothing:%s" % " ".join(flags),
+              (got[0], got[1].lines, got[1].records, got[2], got[1].record_reads),
+              (level[0], level[1].lines, level[1].records, None, []))
+    code, io, err = look(["--skip-stage-e"])
+    check("kit736-skip-stage-e-is-unmeasured-and-not-checked",
+          ([rec(io)[i] for i in ("review", "findings", "catch-up", "status", "job-health")],
+           code, "pipeline_stage_e_setup.py verify" in io.measured),
+          ([(OUT_UNMEASURED, "skipped (--skip-stage-e), so not checked")] * 5, EX_UNMEASURED, False))
+    absent = os.path.join(tmp, "elsewhere", "stage-e.conf")
+    code, io, err = look(["--stage-e-conf", absent])
+    check("kit736-a-stage-e-conf-that-is-not-there-reads-off",
+          (rec(io)["review"], rec(io)["review-identity"], "pipeline_stage_e_setup.py verify" in io.measured, code),
+          ((OUT_OFF, "no stage-e.conf in %s" % os.path.dirname(absent)),
+           (OUT_OFF, "no stage-e.conf in %s" % os.path.dirname(absent)), False, EX_OK))
+    alt_a, alt_s = os.path.join(tmp, "alt-stage-a.conf"), os.path.join(tmp, "alt-sweep.conf")
+    for path in (alt_a, alt_s):
+        with open(path, "w") as fh:
+            fh.write("X=1\n")
+    code, io, err = look(["--conf", alt_a, "--sweep-conf", alt_s],
+                         codes={"pipeline_stage_a_setup.py run": 10, "pipeline_sweep_setup.py run": 0})
+    check("kit736-the-idea-gate-and-sweep-conf-flags-are-honoured",
+          (rec(io)["idea-gate"], rec(io)["cleanup"], code),
+          ((OUT_WAITING, "its check found something outstanding"), (OUT_OK, ""), EX_BLOCKED))
+    os.unlink(alt_a)
+    os.unlink(alt_s)
+
+    # 8. CTRL-C stops the looking, prints the lines, and is never a pass.
+    for label, cls, skills_line in (("noted-in-a-check", Pressed, OUT_UNMEASURED),
+                                    ("raised", Raised, OUT_NOT_REACHED)):
+        code, io, err = look(cls=cls)
+        check("kit736-ctrl-c-%s" % label,
+              (code, err, len(io.measured) <= 1, rec(io)["skills"][0], rec(io)["one-command"][0],
+               rec(io)["review"][0], any(ln.startswith("Interrupted.") for ln in io.lines),
+               "Where every part stands" in text(io)),
+              (EX_UNMEASURED, None, True, skills_line, OUT_NOT_REACHED, OUT_NOT_REACHED, True, True))
+
+    # 9. THE PARTS LIST cannot be read: said in words, exit 4, and nothing is looked at.
+    for label, broken in (("cannot-be-opened", OSError("no list")),
+                          ("holds-a-check-with-no-script", [{"id": "bad", "name": "Bad",
+                                                            "check": {"args": []}}])):
+        code, io, err = look(parts_list=broken)
+        check("kit736-an-unreadable-parts-list-is-said-and-exits-4:%s" % label,
+              (code, err, io.records, io.measured, any("could not be read" in ln for ln in io.lines)),
+              (EX_UNMEASURED, None, [], [], True))
+
+    # 10. THE TWO GIT READS, against real git and a repository made here.
+    check("kit736-git-is-there", shutil.which("git") is not None, True)
+    home = os.path.join(tmp, "look-git-home")
+    os.makedirs(home)
+    genv = dict(os.environ, HOME=home, XDG_CONFIG_HOME=home, GIT_CONFIG_NOSYSTEM="1",
+                GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull)
+
+    def git(cwd, *args):
+        sp.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"]
+               + list(args), cwd=cwd, env=genv, check=True, stdout=sp.PIPE, stderr=sp.PIPE)
+
+    def commit(repo, name):
+        with open(os.path.join(repo, name), "w") as fh:
+            fh.write(name)
+        git(repo, "add", name)
+        git(repo, "commit", "-m", name)
+
+    root = os.path.join(tmp, "look-git")
+    origin, work, other = (os.path.join(root, d) for d in ("origin.git", "work", "other"))
+    os.makedirs(root)
+    git(root, "init", "--bare", origin)
+    git(origin, "symbolic-ref", "HEAD", "refs/heads/main")
+    git(root, "init", work)
+    commit(work, "one")
+    git(work, "remote", "add", "origin", origin)
+    git(work, "push", "origin", "HEAD:refs/heads/main")
+
+    def seen_by_git(repo=work):
+        rep = Report()
+        look_checkout(Io(), rep, repo)                 # the real Io.measure: no terminal, a limit
+        return rep.steps["checkout"]
+    check("kit736-real-git-same-commit", seen_by_git(), (OUT_OK, "at origin's tip"))
+    pushed = sp.run(["git", "-C", work, "rev-parse", "HEAD"], stdout=sp.PIPE, env=genv,
+                    universal_newlines=True).stdout.strip()
+    git(work, "checkout", "--detach", pushed)
+    check("kit736-real-git-detached-at-the-tip-is-measured", seen_by_git(), (OUT_OK, "at origin's tip"))
+    commit(work, "two")
+    check("kit736-real-git-a-commit-origin-lacks", seen_by_git(), (OUT_WAITING, BEHIND_DETAIL))
+    git(work, "checkout", "-b", "feat/x")
+    check("kit736-real-git-another-branch-is-measured", seen_by_git(), (OUT_WAITING, BEHIND_DETAIL))
+    git(root, "clone", origin, other)
+    commit(other, "three")
+    git(other, "push", "origin", "HEAD:refs/heads/main")
+    git(work, "checkout", "--detach", pushed)
+    check("kit736-real-git-origin-moved-on", seen_by_git(), (OUT_WAITING, BEHIND_DETAIL))
+    git(work, "remote", "set-url", "origin", os.path.join(root, "gone.git"))
+    check("kit736-real-git-origin-gone", seen_by_git(), unreachable("git exited with 128"))
+    git(work, "remote", "remove", "origin")
+    check("kit736-real-git-no-origin", seen_by_git(), unreachable("git exited with 128"))
+    check("kit736-real-git-not-a-checkout",
+          seen_by_git(os.path.join(root, "nothing-here")), no_commit)
+
+    # 11. THE FLAG IS DOCUMENTED where a person looks: the help, and the docstring.
+    helped = sp.run([sys.executable, os.path.abspath(__file__), "--help"], stdout=sp.PIPE,
+                    stderr=sp.PIPE, universal_newlines=True).stdout
+    check("kit736-the-flag-is-in-the-help-and-the-docstring",
+          ("--check" in helped, "pipeline_install.py --check" in (__doc__ or ""),
+           "TO ONLY LOOK" in (__doc__ or "")), (True, True, True))
+
+
 def selftest():
     failures, cases = [], [0]
 
@@ -631,9 +2171,7 @@ def selftest():
         fh.write("ROLE_ACCOUNT=_x\n")
     a_conf = os.path.join(tmp, "stage-a.conf")
     sweep_conf = os.path.join(tmp, "sweep.conf")                  # absent: the sweep is skipped
-    chat_conf = os.path.join(tmp, "chat-lane.conf")                 # absent: the rules are skipped
-    base = ["--conf", a_conf, "--stage-e-conf", se_conf, "--sweep-conf", sweep_conf,
-            "--chat-lane-conf", chat_conf]
+    base = ["--conf", a_conf, "--stage-e-conf", se_conf, "--sweep-conf", sweep_conf]
     healthy = {"sync_user_skills.py": 0, "pipeline_stage_e_setup.py verify": 0,
                "pipeline_stage_a_setup.py run": 0}
 
@@ -671,10 +2209,10 @@ def selftest():
     check("pull-failure-stops", (code, "sync_user_skills.py" in io.ran), (1, False))
     code, io = go(git_state={"rev-parse HEAD": [(0, "aaa"), (0, "bbb")]})
     check("new-code-restarts-itself",
-          (io.restarted is not None and io.restarted[-1] == "--no-pull",
+          (io.restarted is not None and "--no-pull" in io.restarted,
            "sync_user_skills.py" in io.ran), (True, False))
     code, io = go(argv=["--no-pull"])
-    check("no-pull-skips-git", ("pull" in io.ran, code), (False, EX_OK))
+    check("no-pull-skips-git", ("pull" in io.ran, code), (False, EX_UNMEASURED))
     code, io = go(git_state={"symbolic-ref": (1, "")})
     check("default-branch-falls-back-to-main", code, EX_OK)
 
@@ -716,7 +2254,7 @@ def selftest():
                          "pipeline_stage_e_setup.py run": 10}, answers=[True],
                   steps=[{"code": "WOULD-CHANGE"}, finished])
     check("stage-e-run-ending-on-ck11-carries-on",
-          ("pipeline_stage_a_setup.py run" in io.ran, code), (True, EX_OK))
+          ("pipeline_stage_a_setup.py run" in io.ran, code), (True, EX_BLOCKED))
     # …and so does one that finished on the status job's card, alone or with CK-11 (KIT-411).
     for name, cards in (("ck12", {"status": "BLOCKED-ON-HUMAN"}),
                         ("ck11-and-ck12", {"status": "BLOCKED-ON-HUMAN",
@@ -728,7 +2266,7 @@ def selftest():
         check("stage-e-run-ending-on-%s-carries-on" % name,
               ("pipeline_stage_a_setup.py run" in io.ran, code,
                sum("does not block the idea gate" in line for line in io.lines)),
-              (True, EX_OK, len(cards)))
+              (True, EX_BLOCKED, len(cards)))
     # Only the card is exempt: a status row with any other outcome is judged like every other
     # row, so a FAILED one never carries on (a real run with one also exits 1, not 10).
     code, io = go(codes={"pipeline_stage_e_setup.py verify": 10,
@@ -758,7 +2296,7 @@ def selftest():
                   steps={"code": "ALREADY-DONE", "handover": "BLOCKED-ON-HUMAN"})
     check("stage-e-card-only-is-not-rerun-and-does-not-block",
           ("pipeline_stage_e_setup.py run" in io.ran, "pipeline_stage_a_setup.py run" in io.ran,
-           io.asked, code), (False, True, [], EX_OK))
+           io.asked, code), (False, True, [], EX_BLOCKED))
     # A RUN THAT STOPPED PART WAY IS NEVER CARRIED PAST — even with its code moved, it may
     # have stopped before reloading the review jobs (the review round's high finding).
     code, io = go(codes={"pipeline_stage_e_setup.py verify": 10,
@@ -866,7 +2404,7 @@ def selftest():
           (EX_OK, ["pipeline_stage_e_setup.py verify", "pipeline_sweep_setup.py run", "pipeline_stage_a_setup.py run"]))
     code, io = go(codes={"pipeline_sweep_setup.py run": 10})
     check("sweep-card-does-not-hold-the-idea-gate",
-          (code, "pipeline_stage_a_setup.py run" in io.ran), (EX_OK, True))
+          (code, "pipeline_stage_a_setup.py run" in io.ran), (EX_BLOCKED, True))
     for rc in (1, 2, 3, 4, 5):
         code, io = go(codes={"pipeline_sweep_setup.py run": rc})
         check("sweep-exit-%d-stops-before-the-idea-gate" % rc,
@@ -902,97 +2440,695 @@ def selftest():
     check("markers-imported-not-copied",
           "from pipeline_dispatch_local import AGENT_ENV_MARKERS" in src, True)
 
-    # 10. THE TECH LEAD'S RULES (KIT-582): read first, asked before writing, and a rule that could
-    #     not be measured is never "up to date".
-    chat_key = "pipeline_chat_lane_setup.py chat-rules"
+    # 9. THE LINES AT THE END (KIT-586): one record per part, exactly one of six outcomes, and an
+    #    exit code that is 0 only when nothing is unfinished.
+    kit_file = lambda name: os.path.join(KIT, name)           # noqa: E731
 
-    def with_chat(text):
-        with open(chat_conf, "w") as fh:
-            fh.write(text)
+    def by_id(io):
+        return dict((r["id"], r["outcome"]) for r in (io.records or []))
 
-    def without_chat():
-        if os.path.exists(chat_conf):
-            os.unlink(chat_conf)
-    without_chat()
     code, io = go()
-    check("rules-no-conf-is-named-and-nothing-runs",
-          (code, chat_key in io.ran,
-           any("tech lead's rules are not set up on this Mac" in ln for ln in io.lines)),
-          (EX_OK, False, True))
-    for name, text in (("off", "CHAT_RULES=off\n"), ("absent", "ROLE_ACCOUNT=_x\n"),
-                       ("commented", "#CHAT_RULES=on\n"),
-                       ("beside-a-longer-key", "CHAT_RULES_X=on\nCHAT_RULES=off\n")):
-        with_chat(text)
-        code, io = go()
-        check("rules-%s-stay-off-and-are-named" % name,
-              (code, chat_key in io.ran, any("rules are off on this Mac" in ln for ln in io.lines)),
-              (EX_OK, False, True))
-    for name, text in (("an-inline-comment", "CHAT_RULES=on  # step 14\n"),
-                       ("a-quote", 'CHAT_RULES="on"\n'),
-                       ("a-repeat", "CHAT_RULES=off\nCHAT_RULES=on\n")):
-        with_chat(text)
-        code, io = go(codes={chat_key: 2})
-        check("rules-unclear-%s-lets-the-installer-say-so" % name,
-              (code, chat_key in io.ran, any("chat-lane.conf has a problem" in ln for ln in io.lines),
-               any("rules are off" in ln for ln in io.lines)), (2, True, True, False))
-    with_chat("  CHAT_RULES = on \n")
-    code, io = go(codes={chat_key: 0})
-    check("rules-spaces-around-the-equals-are-read-as-the-installer-reads-them",
-          (code, chat_key in io.ran), (EX_OK, True))
-    with_chat("CHAT_RULES=on\n")
-    code, io = go(codes={chat_key: 0})
-    check("rules-up-to-date-asks-nothing-and-carries-on",
-          (code, io.ran.count(chat_key), io.asked, "pipeline_stage_a_setup.py run" in io.ran,
-           any("rules are up to date" in ln for ln in io.lines)), (EX_OK, 1, [], True, True))
-    check("rules-the-check-is-a-dry-run-on-this-conf",
-          [a for a in io.argvs if a[1:2] and a[1].endswith("pipeline_chat_lane_setup.py")],
-          [[sys.executable, CHAT_LANE, "chat-rules", "--conf", chat_conf]])
-    code, io = go(codes={chat_key: [10, 0]}, answers=[True])
-    check("rules-behind-asked-then-written-then-the-idea-gate-runs",
-          (code, io.ran.count(chat_key), len(io.asked),
-           [a for a in io.argvs if "--apply" in a and a[1:2] and a[1].endswith("setup.py")
-            and "chat" in a[1]],
-           io.ran.index(chat_key) < io.ran.index("pipeline_stage_a_setup.py run")),
-          (EX_OK, 2, 1, [[sys.executable, CHAT_LANE, "chat-rules", "--apply", "--conf", chat_conf]],
-           True))
-    code, io = go(codes={chat_key: 10}, answers=[False])
-    check("rules-declined-changes-nothing-and-stops-before-the-idea-gate",
-          (code, io.ran.count(chat_key), "pipeline_stage_a_setup.py run" in io.ran,
-           any("behind this checkout" in ln for ln in io.lines)), (EX_BLOCKED, 1, False, True))
-    code, io = go(codes={chat_key: 4})
-    check("rules-unmeasured-is-never-up-to-date",
-          (code, io.asked, "pipeline_stage_a_setup.py run" in io.ran,
-           any("NOT counted as up to date" in ln for ln in io.lines),
-           any("rules are up to date" in ln for ln in io.lines)), (4, [], False, True, False))
-    for exit_code, word in ((3, "refused"), (2, "chat-lane.conf has a problem"),
-                            (5, "Mac password")):
-        code, io = go(codes={chat_key: exit_code})
-        check("rules-check-exit-%d-stops-with-a-sentence" % exit_code,
-              (code, "pipeline_stage_a_setup.py run" in io.ran,
-               any(word in ln for ln in io.lines)), (exit_code, False, True))
-    code, io = go(codes={chat_key: [10, 1]}, answers=[True])
-    check("rules-a-write-that-failed-stops-and-is-not-up-to-date",
-          (code, "pipeline_stage_a_setup.py run" in io.ran,
-           any("writing the tech lead's rules failed" in ln for ln in io.lines),
-           any("written and read back" in ln for ln in io.lines)), (1, False, True, False))
-    for name, codes_, word in (("refused", [10, 3], "refused to write the rules"),
-                               ("still-behind", [10, 10], "read-back is still not what"),
-                               ("read-back-unmeasured", [10, 4], "read-back could not run")):
-        code, io = go(codes={chat_key: list(codes_)}, answers=[True])
-        check("rules-after-a-write-%s-stops-and-is-not-up-to-date" % name,
-              (code, "pipeline_stage_a_setup.py run" in io.ran,
-               any(word in ln for ln in io.lines),
-               any("written and read back" in ln for ln in io.lines),
-               any("Use the Terminal app" in ln for ln in io.lines)),
-              (codes_[1], False, True, False, False))
-    io = FakeIo(codes=dict(healthy, **{chat_key: 10}), answers=[True])
-    io.interrupt_on = {chat_key}
+    got = by_id(io)
+    check("lines-one-record-per-part-with-a-check-or-a-step",
+          (code, got.get("one-command"), got.get("skills"), got.get("review"),
+           got.get("idea-gate"), got.get("cleanup"), got.get("paging")),
+          (EX_OK, OUT_OK, OUT_OK, OUT_OK, OUT_OK, OUT_OFF, OUT_OFF))
+    check("lines-records-are-data",
+          all(sorted(r) == ["detail", "id", "name", "outcome"] and r["outcome"] in OUTCOMES
+              for r in io.records), True)
+    check("lines-printed-once-per-record",
+          sum(1 for ln in io.lines if ln.startswith("  ") and ln.split("  ")[2:3]
+              and ln.strip().split("  ")[0] in OUTCOMES), len(io.records))
+    check("lines-nothing-waiting-says-so", "Nothing is waiting on you." in io.lines, True)
+    check("lines-name-the-parts-with-no-check",
+          any(ln.startswith("No check of their own: ") for ln in io.lines), True)
+    check("lines-parts-with-no-check-are-not-records",
+          [r for r in io.records if r["id"] == "guards"], [])
+    check("lines-off-detail-says-where-it-looked",
+          [r["detail"] for r in io.records if r["id"] == "paging"], ["no notifier.conf in the kit folder"])
+    check("lines-off-detail-outside-the-kit-names-the-folder",
+          [r["detail"] for r in io.records if r["id"] == "cleanup"], ["no sweep.conf in %s" % tmp])
+    check("lines-a-part-off-never-runs-its-check",
+          "pipeline_notifier_setup.py run" in io.measured, False)
+
+    # up to date vs updated, from the step's own result
+    code, io = go(codes={"sync_user_skills.py --apply": 0, "sync_user_skills.py": [1]},
+                  answers=[True])
+    check("lines-skills-replaced-is-updated", (by_id(io)["skills"], code), (OUT_UPDATED, EX_OK))
+    code, io = go(codes={"pipeline_stage_e_setup.py verify": 10,
+                         "pipeline_stage_e_setup.py run": 0}, answers=[True])
+    check("lines-stage-e-updated-covers-its-parts",
+          (by_id(io)["review"], by_id(io)["job-health"], code), (OUT_UPDATED, OUT_UPDATED, EX_OK))
+    io = FakeIo(codes=dict(healthy))
+    io.measure_codes = {"pipeline_stage_a_setup.py run": 10}
     code = main(base, io=io)
-    check("rules-ctrl-c-stops-what-follows-and-says-so",
-          (code, "pipeline_stage_a_setup.py run" in io.ran, io.asked,
-           any(ln.startswith("Stopped: interrupted. The chat-lane check finished") for ln in io.lines)),
-          (EX_BLOCKED, False, [], True))
-    without_chat()
+    check("lines-idea-gate-installed-after-work-is-updated",
+          (by_id(io)["idea-gate"], code), (OUT_UPDATED, EX_OK))
+
+    # waiting on you, and the short list
+    code, io = go(codes={"sync_user_skills.py": 1}, answers=[False])
+    check("lines-skills-left-differing-is-waiting",
+          (by_id(io)["skills"], code), (OUT_WAITING, EX_BLOCKED))
+    check("lines-waiting-without-a-card-names-the-part",
+          any(ln.startswith("Written procedures a session runs as slash commands is waiting on "
+                            "you; its own lines above") for ln in io.lines), True)
+    check("lines-waiting-says-nothing-is-waiting-never",
+          "Nothing is waiting on you." in io.lines, False)
+    paging_conf = kit_file("notifier.conf")
+    io = FakeIo(codes=dict(healthy))
+    io.present = {paging_conf}
+    io.measure_codes = {"pipeline_notifier_setup.py run": 10}
+    io.measure_out = {"pipeline_notifier_setup.py run": "CK-N1 is yours\nthen CK-N3 and CK-N10"}
+    code = main(base, io=io)
+    check("lines-a-check-at-10-is-waiting",
+          (by_id(io)["paging"], code), (OUT_WAITING, EX_BLOCKED))
+    only = io.lines.index("Only you can do these:")
+    signs = io.lines.index("Sign-offs still asked for:")
+    check("lines-short-list-splits-by-kind-and-matches-whole-card-ids",
+          ([ln.split()[0] for ln in io.lines[only + 1:signs]],
+           [ln.split()[0] for ln in io.lines[signs + 1:signs + 2]],
+           any("CK-N2" in ln or "CK-N4" in ln for ln in io.lines)),
+          (["CK-N1"], ["CK-N3"], False))
+    check("lines-card-id-prefix-is-not-a-match",
+          (cards_named("see CK-N10", "CK-N1"), cards_named("see CK-N1.", "CK-N1")), (False, True))
+    io.measure_out = {"pipeline_notifier_setup.py run": "something is outstanding"}
+    io.lines[:] = []
+    io.typed = ["2", "yes"]
+    main(base, io=io)
+    check("lines-waiting-with-no-card-in-its-output-names-the-part",
+          any(ln.startswith("Messages you when only a person can act is waiting on you")
+              for ln in io.lines), True)
+    code, io = go(codes={"pipeline_stage_a_setup.py run": 10})
+    io2 = FakeIo(codes=dict(healthy, **{"pipeline_stage_a_setup.py run": 10}))
+    io2.measure_out = {"pipeline_stage_a_setup.py run": "waiting at CA-DELIVERY"}
+    main(base, io=io2)
+    check("lines-a-step-part-waiting-takes-its-cards-from-its-check",
+          any(ln.startswith("  CA-DELIVERY") for ln in io2.lines), True)
+    # a step that ended on a card alone: parts naming no card of their own are not waiting,
+    # but only when the output names at least one card at all
+    io = FakeIo(codes=dict(healthy, **{"pipeline_stage_e_setup.py verify": 10}),
+                steps={"code": "ALREADY-DONE", "handover": "BLOCKED-ON-HUMAN"})
+    io.measure_codes = {"pipeline_stage_e_setup.py verify": 10}
+    io.measure_out = {"pipeline_stage_e_setup.py verify": "CK-11 waits"}
+    code = main(base, io=io)
+    check("lines-card-only-stage-e-waits-only-where-a-card-is-named",
+          (by_id(io)["catch-up"], by_id(io)["findings"], code), (OUT_WAITING, OUT_OK, EX_BLOCKED))
+    io = FakeIo(codes=dict(healthy, **{"pipeline_stage_e_setup.py verify": 10}),
+                steps={"code": "ALREADY-DONE", "handover": "BLOCKED-ON-HUMAN"})
+    io.measure_codes = {"pipeline_stage_e_setup.py verify": 10}
+    main(base, io=io)
+    check("lines-card-only-with-no-card-read-keeps-every-part-waiting",
+          (by_id(io)["catch-up"], by_id(io)["findings"]), (OUT_WAITING, OUT_WAITING))
+
+    # could not be measured, and 4 outranks 10
+    for name, measured in (("exit-1", 1), ("exit-4", 4), ("exit-5-no-password", 5),
+                           ("did-not-finish", None)):
+        io = FakeIo(codes=dict(healthy))
+        io.present = {paging_conf}
+        io.measure_codes = {"pipeline_notifier_setup.py run": measured}
+        code = main(base, io=io)
+        check("lines-check-%s-is-unmeasured-and-exits-4" % name,
+              (by_id(io)["paging"], code), (OUT_UNMEASURED, EX_UNMEASURED))
+    for name, rc, words in (("exit-5", 5, ""), ("its-own-words", 1, "Mac password needed to continue")):
+        io = FakeIo(codes=dict(healthy))
+        io.present = {paging_conf}
+        io.measure_codes = {"pipeline_notifier_setup.py run": rc}
+        io.measure_out = {"pipeline_notifier_setup.py run": words}
+        main(base, io=io)
+        check("lines-password-%s-detail" % name,
+              [r["detail"] for r in io.records if r["id"] == "paging"],
+              ["it needs your Mac password, which a check run without a terminal cannot ask for"])
+    code, io = go(argv=["--no-pull"])
+    check("lines-own-no-pull-is-unmeasured",
+          ([(r["outcome"], r["detail"]) for r in io.records if r["id"] == "one-command"], code),
+          ([(OUT_UNMEASURED, "used as it is, without pulling")], EX_UNMEASURED))
+    code, io = go(argv=["--pulled-from", "abcdef1234", "--no-pull"], typed=["yes"])
+    check("lines-restarted-after-a-pull-is-updated",
+          ([(r["outcome"], r["detail"]) for r in io.records if r["id"] == "one-command"], code),
+          ([(OUT_UPDATED, "moved from abcdef1 to abc1234")], EX_OK))
+    code, io = go(git_state={"rev-parse HEAD": [(0, "aaa"), (0, "bbb")]})
+    check("lines-restart-carries-the-old-commit-in-a-hidden-flag",
+          io.restarted[-5:], ["--pulled-from", "aaa", "--no-pull", "--chosen-mode", "manual"])
+    import contextlib
+    import io as io_module
+    with contextlib.redirect_stderr(io_module.StringIO()):
+        try:
+            main(base + ["--pulled-from", "not a sha"], io=FakeIo(codes=healthy))
+            bad = None
+        except SystemExit as exc:
+            bad = exc.code
+    check("lines-hidden-flag-refuses-a-non-commit", bad, 2)
+    check("lines-hidden-flag-is-not-in-the-help", "pulled-from" in subprocess.run(
+        [sys.executable, os.path.abspath(__file__), "--help"],
+        capture_output=True, text=True).stdout, False)
+    code, io = go(argv=["--skip-stage-e"])
+    check("lines-skipped-stage-e-is-unmeasured-not-up-to-date",
+          (by_id(io)["review"], code), (OUT_UNMEASURED, EX_UNMEASURED))
+    io = FakeIo(codes=dict(healthy))
+    io.present = {paging_conf, kit_file("update.conf")}
+    io.measure_codes = {"pipeline_notifier_setup.py run": 10, "pipeline_watch.py --conf": 1}
+    code = main(base, io=io)
+    check("lines-unmeasured-outranks-waiting", code, EX_UNMEASURED)
+    code, io = go(codes={"pipeline_stage_a_setup.py run": 10})
+    check("lines-the-idea-gate-at-10-still-exits-10", code, EX_BLOCKED)
+    io = FakeIo(codes=dict(healthy, **{"pipeline_stage_a_setup.py run": 10}))
+    io.present = {paging_conf}
+    io.measure_codes = {"pipeline_notifier_setup.py run": 1}
+    check("lines-the-idea-gate-at-10-with-an-unmeasured-part-exits-4",
+          main(base, io=io), EX_UNMEASURED)
+    check("lines-another-code-of-the-idea-gate-is-passed-through",
+          go(codes={"pipeline_stage_a_setup.py run": 77})[0], 77)
+    check("lines-end-code-table",
+          [end_code(c, recs, st) for c, recs, st in (
+              (0, [{"outcome": OUT_OK}], False), (0, [{"outcome": OUT_WAITING}], False),
+              (0, [{"outcome": OUT_NOT_REACHED}], False), (0, [], True), (10, [], True),
+              (None, [{"outcome": OUT_UNMEASURED}, {"outcome": OUT_WAITING}], False))],
+          [0, 10, 4, 4, 10, 4])
+    check("lines-an-unreadable-parts-list-is-never-a-pass",
+          end_code(0, [], False, unreadable=True), EX_UNMEASURED)
+
+    # not reached: a stop part way, and Ctrl-C, still print every line
+    code, io = go(git_state={"status": (0, " M scripts/x.py")})
+    got = by_id(io)
+    check("lines-a-stop-prints-the-lines-and-keeps-its-code",
+          (code, got["one-command"], got["skills"], got["review"], got["idea-gate"]),
+          (EX_USAGE, OUT_WAITING, OUT_NOT_REACHED, OUT_NOT_REACHED, OUT_NOT_REACHED))
+    code, io = go(codes={"pipeline_stage_e_setup.py verify": 10}, answers=[False])
+    check("lines-a-stop-at-10-stays-10-and-says-what-was-not-reached",
+          (code, by_id(io)["review"], by_id(io)["idea-gate"]),
+          (EX_BLOCKED, OUT_WAITING, OUT_NOT_REACHED))
+    io = FakeIo(codes=dict(healthy))
+    io.present = {paging_conf}
+    io.interrupt_on.add("sync_user_skills.py")
+    code = main(base, io=io)
+    got = by_id(io)
+    check("lines-ctrl-c-prints-the-lines-and-runs-no-more-checks",
+          (code != EX_OK, got["skills"], got["idea-gate"], got["paging"], io.measured),
+          (True, OUT_UNMEASURED, OUT_NOT_REACHED, OUT_NOT_REACHED, []))
+    io = FakeIo(codes=dict(healthy))
+    io.present = {paging_conf}
+    io.interrupt_on.add("pipeline_stage_a_setup.py run")
+    code = main(base, io=io)
+    check("lines-ctrl-c-in-the-last-step-runs-no-more-checks",
+          (code != EX_OK, by_id(io)["idea-gate"], by_id(io)["paging"], "pipeline_notifier_setup.py run" in io.measured),
+          (True, OUT_UNMEASURED, OUT_NOT_REACHED, False))
+    code, io = go(git_state={"rev-parse HEAD": [(0, "aaa"), (0, "bbb")]})
+    check("lines-a-restart-that-returns-is-not-a-pass", code, EX_UNMEASURED)
+    for marker in AGENT_ENV_MARKERS[:1]:
+        code, io = go(env={marker: ""})
+        check("lines-refusals-print-no-lines",
+              (io.records, any("Where every part stands" in ln for ln in io.lines),
+               io.measured), (None, False, []))
+    code, io = go(uid=0)
+    check("lines-root-prints-no-lines", (io.records, io.measured), (None, []))
+    code, io = go(tty=False)
+    check("lines-no-terminal-prints-no-lines", (io.records, io.measured), (None, []))
+
+    # the parts list: read, never hard-coded; an unreadable one is said, and is not a pass
+    io = FakeIo(codes=dict(healthy))
+    io.parts_list = OSError("no list")
+    code = main(base, io=io)
+    check("lines-unreadable-parts-list-is-said-and-exits-4",
+          (code, io.records, any("could not be read" in ln for ln in io.lines)),
+          (EX_UNMEASURED, [], True))
+    real = Io().parts()
+    keys = dict((pt["id"], step_of(pt)) for pt in real)
+    check("lines-steps-are-found-from-the-list",
+          (keys["one-command"], keys["skills"], keys["cleanup"], keys["idea-gate"],
+           set(k for k in keys.values() if k) == set(["checkout", "skills", "stage_e",
+                                                      "sweep", "stage_a"]),
+           all(keys[pt["id"]] == "stage_e" for pt in real
+               if pt["check"] and pt["check"]["script"].endswith("pipeline_stage_e_setup.py"))),
+          ("checkout", "skills", "sweep", "stage_a", True, True))
+    one = [pt for pt in real if pt["id"] == "review-identity"][0]
+    check("lines-a-check-argv-uses-the-conf-given-on-the-command-line",
+          check_argv(one, {"stage-e.conf": "/x/y.conf"})[-1], "/x/y.conf")
+
+    # a part's check cannot ask: stdin closed, no terminal, and a time limit
+    import subprocess as _sp
+    spied, real_popen = {}, _sp.Popen
+
+    def spy(*a, **k):
+        spied.update(k)
+        return real_popen(*a, **k)
+    _sp.Popen = spy
+    try:
+        got = Io().measure([sys.executable, "-c", "import sys; sys.exit(0 if sys.stdin.read() == '' else 9)"])
+    finally:
+        _sp.Popen = real_popen
+    check("measure-closes-stdin-and-leaves-the-terminal",
+          (got[0], spied.get("stdin") == _sp.DEVNULL, spied.get("start_new_session")),
+          (0, True, True))
+    check("measure-returns-the-code-and-the-output",
+          Io().measure([sys.executable, "-c", "print('hello'); raise SystemExit(10)"]),
+          (10, "hello\n"))
+    got = Io().measure([sys.executable, "-c", "import time; time.sleep(30)"], timeout=1)
+    check("measure-kills-a-check-that-does-not-finish", got[0], None)
+    check("measure-a-program-that-cannot-start-is-not-a-pass",
+          Io().measure(["/no/such/program"])[0], None)
+
+    # 9b. THE LOOK-ONLY MODE, --check (KIT-736): every one of its cases is in selftest_look().
+    selftest_look(check, base, se_conf, tmp)
+
+    # 10. NO CHAT-LANE STEP (KIT-492). The tech lead's rules went with the cutover, so the one
+    #     command runs no chat-lane installer, and its old flag is refused, not ignored.
+    code, io = go()
+    check("kit492-no-chat-lane-step",
+          (code, [r for r in io.ran if "pipeline_chat_lane_setup.py" in r],
+           any("tech lead's rules" in ln for ln in io.lines)), (EX_OK, [], False))
+    import contextlib
+    import io as io_module
+    with contextlib.redirect_stderr(io_module.StringIO()):
+        try:
+            main(base + ["--chat-lane-conf", "chat-lane.conf"], io=FakeIo(codes=healthy))
+            refused = None
+        except SystemExit as exc:
+            refused = exc.code
+    check("kit492-the-old-flag-is-refused", refused, 2)
+
+    # 11. THE FIRST SCREEN, THE ONE CONSENT, AND THE RECORD ONLY ROOT CAN WRITE (KIT-717).
+    import collections
+    import copy
+    real_parts = Io().parts()
+    cmd = lambda io: "\n".join(io.lines)                          # noqa: E731
+    status_job = "status/" + [j for pt in real_parts if pt["id"] == "status"
+                              for j in pt["jobs"]][0]["label"]
+
+    # 11a. The refusals come first and read nothing, the record included (point 5).
+    refusals = [("marker:%s" % m, {"env": {m: ""}}) for m in AGENT_ENV_MARKERS]
+    refusals += [("root", {"uid": 0}), ("no-terminal", {"tty": False})]
+    for label, kw in refusals:
+        code, io = go(**kw)
+        check("kit717-refusal-reads-nothing:%s" % label,
+              (io.record_reads, io.conf_reads, io.line_log, io.events, io.written, io.ran),
+              ([], [], [], [], [], []))
+
+    # 11b. The first screen (point 1): right after the refusals, before any step.
+    code, io = go(typed=["1", "yes"])
+    check("kit717-first-screen-is-before-any-step",
+          (io.line_log[0][0].startswith("Type 1 or 2"), io.line_log[0][1]), (True, 0))
+    check("kit717-first-screen-says-both-ways-in-plain-words",
+          ("Automatic: things just work" in cmd(io), "Manual: show me each change and ask" in cmd(io)),
+          (True, True))
+    code, io = go(typed=["", "yes"])
+    check("kit717-default-is-automatic-with-no-record",
+          (io.auto, json.loads(io.written[0][1])["mode"]), (True, MODE_AUTO))
+    for typed_mode, want in (("1", True), ("a", True), ("automatic", True), ("2", False),
+                             ("m", False), ("Manual", False)):
+        code, io = go(typed=[typed_mode, "yes"])
+        check("kit717-first-screen-takes:%s" % typed_mode, io.auto, want)
+    prior = go(typed=["2", "yes"])[1].written[0][1]
+    saved = json.loads(prior)
+    code, io = go(typed=[""], record=("ok", saved, ""))
+    check("kit717-default-is-the-records-mode", (io.auto, len(io.line_log)), (False, 1))
+    code, io = go(typed=["", "yes"], record=("unreadable", None, "x is not owned by root"))
+    check("kit717-an-untrusted-record-gives-no-default", io.auto, True)
+    for name, typed in (("garbage", ["x", "y", "z"]), ("end-of-input", [])):
+        code, io = go(typed=typed)
+        check("kit717-no-usable-answer-changes-nothing:%s" % name,
+              (code, io.ran, io.written, io.events), (EX_BLOCKED, [], [], []))
+        check("kit717-no-usable-answer-still-prints-the-lines:%s" % name,
+              "Where every part stands" in cmd(io), True)
+
+    # 11c. One consent, typed yes (point 2). Anything else changes nothing and exits 10.
+    for reply in ("y", "no", "", "yes please", "ok", "yes!", " n", None):
+        code, io = go(typed=["1"] + ([reply] if reply is not None else []))
+        check("kit717-consent-%r-changes-nothing" % reply,
+              (code, io.ran, io.written, io.events), (EX_BLOCKED, [], [], []))
+    for reply in ("yes", " YES "):
+        code, io = go(typed=["1", reply])
+        check("kit717-consent-%r-agrees" % reply, (code, len(io.written)), (EX_OK, 1))
+    code, io = go(typed=["1", "yes"])
+    page = cmd(io)
+    review = [pt for pt in real_parts if pt["id"] == "review"][0]
+    paging = [pt for pt in real_parts if pt["id"] == "paging"][0]
+    check("kit717-page-has-each-parts-consent-lines",
+          all(c in page for c in review["consent"]), True)
+    check("kit717-page-has-what-may-restart", all(r in page for r in review["restarts"]), True)
+    check("kit717-page-has-the-jobs-under-a-separate-account",
+          ("background jobs, under a separate account" in page,
+           "%s: %d job(s)" % (review["name"], len(review["jobs"])) in page), (True, True))
+    check("kit717-page-has-the-fixed-lines",
+          (SPEND_LINE in page, NEVER_LINE in page, "subscription only" in page,
+           "never merges, approves or labels" in page), (True, True, True, True))
+    check("kit717-page-names-the-installers-that-still-ask",
+          "scripts/pipeline_stage_e_setup.py, for: " in page, True)
+    check("kit717-page-leaves-out-a-part-that-is-off",
+          any(c in page for c in paging["consent"]), False)
+    io = FakeIo(codes=dict(healthy), typed=["1", "yes"])
+    io.present = {kit_file("notifier.conf")}
+    main(base, io=io)
+    check("kit717-page-adds-a-part-whose-settings-are-found",
+          all(c in cmd(io) for c in paging["consent"]), True)
+    code, io = go(argv=["--skip-stage-e"], typed=["1", "yes"])
+    check("kit717-skipped-stage-e-is-off-in-page-and-record",
+          (any(c in cmd(io) for c in review["consent"]),
+           json.loads(io.written[0][1])["settings"]["parts"]["review"]), (False, False))
+
+    # 11d. Automatic asks none of its own; Manual asks with today's words (points 3, 4).
+    drift = lambda: {"sync_user_skills.py": [1], "sync_user_skills.py --apply": 0,   # noqa: E731
+                     "pipeline_stage_e_setup.py verify": 10, "pipeline_stage_e_setup.py run": 0}
+    code, io = go(codes=drift(), typed=["1", "yes"])
+    check("kit717-automatic-asks-nothing-of-its-own",
+          (io.asked, code, "pipeline_stage_e_setup.py run" in io.ran,
+           "sync_user_skills.py --apply" in io.ran), ([], EX_OK, True, True))
+    # An installer that ran with work to do still asks its own questions. Its part keeps its
+    # real outcome and gains a note; the note moves no outcome, exit code or short list.
+    recs = dict((r["id"], r) for r in io.records)
+    code2, io2 = go(codes=drift(), typed=["2", "yes"], answers=[True, True])
+    recs2 = dict((r["id"], r) for r in io2.records)
+    check("kit717-automatic-notes-a-part-whose-installer-still-asks",
+          (recs["review"]["detail"], recs["skills"]["detail"]), (ASKED_DETAIL, "replaced with the kit's"))
+    check("kit717-automatic-note-is-printed-on-the-part-line",
+          any(ln.strip().startswith(OUT_UPDATED) and ASKED_DETAIL in ln for ln in io.lines), True)
+    check("kit717-the-note-does-not-change-an-outcome",
+          ([(r["id"], r["outcome"]) for r in io.records],
+           recs["review"]["outcome"]),
+          ([(r["id"], r["outcome"]) for r in io2.records], OUT_UPDATED))
+    check("kit717-the-note-does-not-change-the-exit-code", (code, code2), (EX_OK, EX_OK))
+    check("kit717-the-note-does-not-change-the-short-list",
+          ([ln for ln in io.lines if ln.endswith("is waiting on you; its own lines above say what for.")
+            or ln in ("Only you can do these:", "Sign-offs still asked for:")],
+           "Nothing is waiting on you." in io.lines),
+          ([ln for ln in io2.lines if ln.endswith("is waiting on you; its own lines above say what for.")
+            or ln in ("Only you can do these:", "Sign-offs still asked for:")], True))
+    check("kit717-manual-shows-no-note",
+          (any(ASKED_DETAIL in ln for ln in io2.lines), recs2["review"]["detail"]), (False, ""))
+    code3, io3 = go(typed=["1", "yes"])
+    check("kit717-automatic-with-nothing-to-do-notes-nothing",
+          (code3, any(ASKED_DETAIL in ln for ln in io3.lines)), (EX_OK, False))
+    io4 = FakeIo(codes=dict(healthy), typed=["1", "yes"])
+    io4.measure_codes = {"pipeline_stage_a_setup.py run": 10}
+    code4 = main(base, io=io4)
+    check("kit717-automatic-notes-the-idea-gate-when-its-run-had-work-and-it-finished",
+          ({r["id"]: (r["outcome"], r["detail"]) for r in io4.records}["idea-gate"], code4),
+          ((OUT_UPDATED, ASKED_DETAIL), EX_OK))
+    check("kit717-the-note-says-exactly-what-the-ticket-says",
+          ASKED_DETAIL, "its installer still asks its own questions; Automatic cannot answer them yet")
+    io6 = FakeIo(codes=dict(healthy), typed=["1", "yes"])
+    io6.measure_codes = {"pipeline_stage_a_setup.py run": None}
+    code6 = main(base, io=io6)
+    check("kit717-the-note-keeps-the-detail-the-part-already-had",
+          ({r["id"]: r["detail"] for r in io6.records}["idea-gate"], code6),
+          ("installed and proven; whether it changed anything was not measured; " + ASKED_DETAIL,
+           EX_OK))
+    code5, io5 = go(codes={"pipeline_stage_a_setup.py run": 10}, typed=["1", "yes"])
+    check("kit717-automatic-an-installer-that-ends-waiting-is-still-waiting",
+          ({r["id"]: r["outcome"] for r in io5.records}["idea-gate"], code5), (OUT_WAITING, EX_BLOCKED))
+    check("kit717-automatic-answers-yes-out-loud",
+          (io.auto_answered, any("agreed to this in the consent" in ln for ln in io.lines)),
+          (("Replace them with the kit's now?", "Update Stage E now?"), True))
+    code, io = go(codes=drift(), typed=["2", "yes"], answers=[True, True])
+    check("kit717-manual-asks-with-todays-words",
+          (io.asked, io.auto_answered, code),
+          (["Replace them with the kit's now?", "Update Stage E now?"], (), EX_OK))
+    code, io = go(codes=drift(), typed=["2", "yes"], answers=[True, False])
+    check("kit717-manual-no-still-stops",
+          (code, "pipeline_stage_e_setup.py run" in io.ran), (EX_BLOCKED, False))
+    check("kit717-the-words-other-sessions-depend-on-stay",
+          ("Update Stage E now?" in src, "Replace them with the kit's now?" in src), (True, True))
+
+    # 11e. The record (point 6): written after the consent, once, as the settings stand.
+    code, io = go(typed=["1", "yes"], conf={se_conf: {"STATUS_INTERVAL_SECONDS": "900"}})
+    got = json.loads(io.written[0][1])
+    check("kit717-record-is-written-once-after-the-consent-and-before-any-step",
+          (io.events, io.write_at, len(io.written), io.written[0][0]),
+          (["sudo", "write"], 0, 1, os.path.abspath(DEFAULT_RECORD)))
+    check("kit717-record-holds-mode-page-and-settings",
+          (got["version"], got["mode"], got["consent"][0], sorted(got["settings"]),
+           got["agreed_at"]),
+          (RECORD_VERSION, MODE_AUTO, "WHAT YOU ARE AGREEING TO",
+           ["ceilings", "jobs", "parts"], "2026-10-03T00:00:00Z"))
+    check("kit717-record-page-is-the-page-shown",
+          all(ln in io.lines for ln in got["consent"] if ln), True)
+    check("kit717-record-has-each-part-on-or-off",
+          (got["settings"]["parts"]["review"], got["settings"]["parts"]["paging"],
+           got["settings"]["parts"]["idea-gate"]), (True, False, True))
+    check("kit717-record-has-each-jobs-switch-value-from-the-parts-list",
+          (got["settings"]["jobs"][status_job],
+           got["settings"]["jobs"]["review/" + review["jobs"][0]["label"]]),
+          ({"key": "STATUS_INTERVAL_SECONDS", "value": "900"}, {"key": None, "value": None}))
+    check("kit717-record-has-each-ceiling-all-null-today",
+          (set(got["settings"]["ceilings"].values()), "review" in got["settings"]["ceilings"]),
+          ({None}, True))
+    check("kit717-a-switch-that-looks-like-a-secret-is-never-recorded-by-value",
+          (switch_value("LINEAR_API_KEY", {"LINEAR_API_KEY": "abc"}),
+           switch_value("LINEAR_API_KEY", {}), switch_value("STATUS_FILE", {"STATUS_FILE": "x"})),
+          ("(set)", None, "x"))
+    check("kit717-conf-reader",
+          parse_conf("# c\nA=1\nexport B='two words'\nC=\"x\" # k\nD=3 # note\nbad line\n=z\n"),
+          {"A": "1", "B": "two words", "C": "x", "D": "3"})
+    code, io = go(typed=["1", "no"])
+    check("kit717-no-record-without-the-consent", (io.written, io.events), ([], []))
+    io = FakeIo(codes=dict(healthy), typed=["1", "yes"])
+    io.sudo_ok = False
+    code = main(base, io=io)
+    check("kit717-no-password-changes-nothing-and-exits-5",
+          (code, io.written, io.ran, io.events), (5, [], [], ["sudo"]))
+    io = FakeIo(codes=dict(healthy), typed=["1", "yes"])
+    io.write_failure = "disk full"
+    code = main(base, io=io)
+    check("kit717-a-record-that-cannot-be-saved-stops-everything-else",
+          (code, io.ran, any("disk full" in ln for ln in io.lines)), (1, [], True))
+    code, io = go(argv=["--consent-record", "/x/y/z.json"], typed=["1", "yes"])
+    check("kit717-the-record-place-is-a-setting",
+          (io.record_reads[0], io.written[0][0]), ("/x/y/z.json", "/x/y/z.json"))
+    check("kit717-the-record-flag-is-hidden-and-the-default-is-the-library-folder",
+          ("consent-record" in subprocess.run([sys.executable, os.path.abspath(__file__), "--help"],
+                                              capture_output=True, text=True).stdout,
+           DEFAULT_RECORD),
+          (False, "/Library/Application Support/claude-pipeline/consent-record.json"))
+    code, io = go(argv=["--pulled-from", "abcdef1234", "--no-pull", "--chosen-mode", "manual"],
+                  typed=["yes"], record=("unreadable", None, "x"))
+    check("kit717-a-restart-keeps-the-mode-chosen-before-it-when-the-record-is-untrusted",
+          io.auto, False)
+    check("kit717-the-chosen-mode-flag-is-hidden",
+          "chosen-mode" in subprocess.run([sys.executable, os.path.abspath(__file__), "--help"],
+                                          capture_output=True, text=True).stdout, False)
+    code, io = go(argv=["--pulled-from", "abcdef1234", "--no-pull"], typed=["yes"])
+    check("kit717-a-restart-does-not-ask-the-first-screen-again",
+          [p[0].startswith("Type yes") for p in io.line_log], [True])
+
+    # 11f. A later run reads it: a match asks nothing; any difference is shown and asked again,
+    #      in either mode. A missing or untrusted record is never a match.
+    for mode_word, typed_mode in ((MODE_MANUAL, "2"), (MODE_AUTO, "1")):
+        base_rec = json.loads(go(typed=[typed_mode, "yes"])[1].written[0][1])
+        code, io = go(typed=[typed_mode], record=("ok", base_rec, ""))
+        check("kit717-a-matching-record-asks-no-consent:%s" % mode_word,
+              (len(io.line_log), io.events, io.written, code),
+              (1, [], [], EX_OK))
+        check("kit717-a-matching-record-says-so:%s" % mode_word,
+              any(ln.startswith("This matches what you agreed to on ") for ln in io.lines), True)
+
+        def edited(fn):
+            rec = copy.deepcopy(base_rec)
+            fn(rec)
+            return ("ok", rec, "")
+
+        diff_cases = (
+            ("a-part-turned-on", edited(lambda r: r["settings"]["parts"].update(review=False)),
+             "part review: was off, now on", {}, set()),
+            ("a-job-switch", edited(lambda r: r["settings"]["jobs"].update(
+                {status_job: {"key": "STATUS_INTERVAL_SECONDS", "value": "900"}})),
+             "was STATUS_INTERVAL_SECONDS=900, now STATUS_INTERVAL_SECONDS=None", {}, set()),
+            ("a-ceiling", edited(lambda r: r["settings"]["ceilings"].update(review=5)),
+             "ceiling review: was 5, now none", {}, set()),
+            ("the-words", edited(lambda r: r["consent"].append("an extra line")),
+             "the words of the consent page changed", {}, set()),
+            ("a-part-missing-from-the-record",
+             edited(lambda r: r["settings"]["parts"].pop("paging")),
+             "part paging: not in the record, now off", {}, set()),
+            ("a-part-found-now", ("ok", base_rec, ""), "part paging: was off, now on", {},
+             {kit_file("notifier.conf")}),
+            ("a-switch-changed-in-the-settings-file", ("ok", base_rec, ""),
+             "now STATUS_INTERVAL_SECONDS=900", {se_conf: {"STATUS_INTERVAL_SECONDS": "900"}},
+             set()),
+            ("an-untrusted-record", ("unreadable", None, "/x is not owned by root"),
+             "cannot be trusted (/x is not owned by root)", {}, set()),
+            ("no-record", ("none", None, "no record yet"), "no record of a consent yet", {}, set()),
+        )
+        for name, rec, want_line, conf, present in diff_cases:
+            io = FakeIo(codes=dict(healthy), typed=[typed_mode, "yes"], record=rec, conf=conf)
+            io.present = set(present)
+            code = main(base, io=io)
+            check("kit717-%s-asks-the-consent-again:%s" % (name, mode_word),
+                  (any(want_line in ln for ln in io.lines), len(io.line_log), len(io.written)),
+                  (True, 2, 1))
+    code, io = go(typed=["1", "yes"], record=("ok", dict(saved), ""))
+    check("kit717-a-change-of-mode-alone-is-shown-and-asked",
+          (any("mode: was Manual, now Automatic" in ln for ln in io.lines), len(io.line_log)),
+          (True, 2))
+    code, io = go(typed=["1", "no"], record=("ok", dict(saved), ""))
+    check("kit717-a-changed-setting-declined-changes-nothing",
+          (code, io.ran, io.written), (EX_BLOCKED, [], []))
+    io = FakeIo(codes=dict(healthy), typed=["1"])
+    io.parts_list = OSError("no list")
+    code = main(base, io=io)
+    check("kit717-no-parts-list-no-consent-no-run",
+          (code, io.ran, io.written, io.events), (EX_UNMEASURED, [], [], []))
+
+    # 11g. Trust (point 6): only root's own record, in folders only root can write.
+    St = collections.namedtuple("St", "st_uid st_mode")
+    dir_, reg, lnk = stat.S_IFDIR, stat.S_IFREG, stat.S_IFLNK
+    where = DEFAULT_RECORD
+    folders = ["/", "/Library", "/Library/Application Support",
+               "/Library/Application Support/claude-pipeline"]
+    good_text = json.dumps(build_record(MODE_AUTO, ["a"], {"parts": {}, "jobs": {}, "ceilings": {}},
+                                        "2026-11-11T00:00:00Z"))
+
+    def tree(over=None, drop=()):
+        nodes = dict((f, St(0, dir_ | 0o755)) for f in folders)
+        nodes[where] = St(0, reg | 0o644)
+        nodes.update(over or {})
+        for gone in drop:
+            nodes.pop(gone, None)
+
+        def lstat(path):
+            if path not in nodes:
+                raise FileNotFoundError(path)
+            return nodes[path]
+        return lstat
+
+    def judged(over=None, text=good_text, drop=(), realpath=lambda p: p):
+        def read(_p):
+            if isinstance(text, Exception):
+                raise text
+            return text
+        return load_record(where, tree(over, drop), realpath, read)
+
+    check("kit717-trust-root-owned-chain-is-trusted", judged()[0], "ok")
+    check("kit717-trust-the-record-comes-back-whole", judged()[1]["mode"], MODE_AUTO)
+    for name, over in (
+            ("file-owned-by-the-user", {where: St(501, reg | 0o644)}),
+            ("file-group-writable", {where: St(0, reg | 0o664)}),
+            ("file-other-writable", {where: St(0, reg | 0o646)}),
+            ("file-is-a-link", {where: St(0, lnk | 0o755)}),
+            ("file-is-a-folder", {where: St(0, dir_ | 0o755)}),
+            ("own-folder-owned-by-the-user", {folders[3]: St(501, dir_ | 0o755)}),
+            ("own-folder-group-writable", {folders[3]: St(0, dir_ | 0o775)}),
+            ("a-folder-above-owned-by-the-user", {folders[2]: St(501, dir_ | 0o755)}),
+            ("a-folder-above-world-writable-and-sticky", {folders[1]: St(0, dir_ | 0o1777)}),
+            ("the-top-folder-group-writable", {"/": St(0, dir_ | 0o775)}),
+            ("a-folder-above-is-a-link-the-user-made", {folders[2]: St(501, lnk | 0o755)})):
+        check("kit717-trust-%s-is-unreadable" % name, judged(over)[0], "unreadable")
+    check("kit717-trust-a-root-owned-link-above-is-followed-and-the-target-is-judged",
+          judged({folders[2]: St(0, lnk | 0o755), "/priv": St(0, dir_ | 0o755),
+                  "/priv/app": St(0, dir_ | 0o755), "/priv/app/claude-pipeline": St(0, dir_ | 0o755),
+                  "/priv/app/claude-pipeline/consent-record.json": St(0, reg | 0o644)},
+                 realpath=lambda p: "/priv/app/claude-pipeline/consent-record.json")[0], "ok")
+    check("kit717-trust-a-root-owned-link-to-a-folder-the-user-owns-is-unreadable",
+          judged({folders[2]: St(0, lnk | 0o755), "/priv": St(0, dir_ | 0o755),
+                  "/priv/app": St(501, dir_ | 0o755), "/priv/app/claude-pipeline": St(0, dir_ | 0o755),
+                  "/priv/app/claude-pipeline/consent-record.json": St(0, reg | 0o644)},
+                 realpath=lambda p: "/priv/app/claude-pipeline/consent-record.json")[0],
+          "unreadable")
+    check("kit717-trust-no-file-is-none", judged(drop=[where])[0], "none")
+    check("kit717-trust-no-folder-is-none", judged(drop=[where, folders[3]])[0], "none")
+    for name, text in (("not-json", "{"), ("a-list", "[]"),
+                       ("wrong-version", json.dumps(dict(json.loads(good_text), version=2))),
+                       ("wrong-mode", json.dumps(dict(json.loads(good_text), mode="x"))),
+                       ("consent-not-a-list", json.dumps(dict(json.loads(good_text), consent="x"))),
+                       ("no-settings", json.dumps({k: v for k, v in json.loads(good_text).items()
+                                                   if k != "settings"})),
+                       ("too-big", ValueError("larger than a record can be"))):
+        check("kit717-trust-%s-is-unreadable" % name, judged(text=text)[0], "unreadable")
+    check("kit717-trust-an-error-inspecting-it-is-unreadable",
+          load_record(where, lambda p: (_ for _ in ()).throw(PermissionError(p)),
+                      lambda p: p)[0], "unreadable")
+    mine = os.path.join(tmp, "mine.json")
+    with open(mine, "w") as fh:
+        fh.write(good_text)
+    if os.getuid() != 0:
+        check("kit717-trust-a-real-file-this-process-made-is-never-trusted",
+              Io().read_record(mine)[0], "unreadable")
+    check("kit717-trust-a-real-missing-file-is-none",
+          Io().read_record(os.path.join(tmp, "absent", "r.json"))[0], "none")
+
+    # 11h. Writing it: a private temp file, then sudo installs it root:wheel 0644.
+    class Recorder(Io):
+        def __init__(self, fail=None):
+            self.argvs, self.copied, self.mode, self.fail, self.tmp = [], None, None, fail, None
+            self.swap, self.folder_mode, self.corrupt = None, None, None
+
+        def run(self, argv, capture=False):
+            # Stands in for sudo install: -d makes the folder, the other copies the file.
+            self.argvs.append(list(argv))
+            if argv[-1].endswith("/r.json"):
+                self.tmp = argv[-2]
+                self.folder_mode = stat.S_IMODE(os.stat(os.path.dirname(self.tmp)).st_mode)
+                if self.swap is not None:           # a program running as this user swaps it
+                    with open(self.tmp, "w") as fh:
+                        fh.write(self.swap)
+                with open(self.tmp) as fh:
+                    self.copied = fh.read()
+                self.mode = stat.S_IMODE(os.stat(self.tmp).st_mode)
+                if not self.fail:
+                    os.makedirs(os.path.dirname(argv[-1]), exist_ok=True)
+                    with open(argv[-1], "w") as fh:
+                        fh.write(self.copied if self.corrupt is None else self.corrupt)
+            return (self.fail if self.fail and argv[-1].endswith("/r.json") else 0), ""
+
+    target = os.path.join(tmp, "newfolder", "r.json")
+    rec_io = Recorder()
+    check("kit717-write-returns-none-when-done", rec_io.write_record(target, "TEXT\n"), None)
+    check("kit717-write-makes-the-folder-root-wheel-755-then-installs-the-file-root-wheel-0644",
+          ([a[:-1] if a[2] == "-d" else a[:-2] for a in rec_io.argvs],
+           rec_io.argvs[0][-1], rec_io.argvs[1][-1]),
+          ([["sudo", "/usr/bin/install", "-d", "-o", "root", "-g", "wheel", "-m", "755"],
+            ["sudo", "/usr/bin/install", "-o", "root", "-g", "wheel", "-m", "0644"]],
+           os.path.dirname(target), target))
+    check("kit717-write-uses-a-private-temp-file-that-is-removed",
+          (rec_io.copied, rec_io.mode, rec_io.folder_mode, os.path.exists(rec_io.tmp),
+           os.path.exists(os.path.dirname(rec_io.tmp))), ("TEXT\n", 0o600, 0o700, False, False))
+    swapped = Recorder()
+    swapped.swap = "SWAPPED\n"
+    got_why = swapped.write_record(os.path.join(tmp, "swapped", "r.json"), "TEXT\n")
+    check("kit717-write-a-swapped-temp-file-is-a-failure-that-says-so",
+          ("does not match" in (got_why or ""), "not trusted" in (got_why or "")), (True, True))
+    altered = Recorder()
+    altered.corrupt = "NOT WHAT WAS COPIED\n"
+    check("kit717-write-an-installed-file-that-differs-from-the-temp-file-is-a-failure",
+          "does not match" in (altered.write_record(os.path.join(tmp, "altered", "r.json"),
+                                                    "TEXT\n") or ""), True)
+    check("kit717-write-a-swapped-file-removes-nothing",
+          os.path.exists(os.path.join(tmp, "swapped", "r.json")), True)
+    io = FakeIo(codes=dict(healthy), typed=["1", "yes"])
+    io.write_failure = "the installed record does not match what was meant"
+    check("kit717-a-mismatch-stops-the-run-before-anything-runs",
+          (main(base, io=io), io.ran), (1, []))
+    rec_io = Recorder()
+    rec_io.write_record(os.path.join(tmp, "r.json"), "T")
+    check("kit717-write-makes-no-folder-that-exists", len(rec_io.argvs), 1)
+    check("kit717-write-says-why-when-sudo-fails",
+          "exit 1" in (Recorder(fail=1).write_record(target, "T") or ""), True)
+
+    # 11i. One password session, the one the installers use; a refusal is False.
+    import pipeline_stage_e_setup as se_mod
+
+    class Sudoer(Io):
+        def __init__(self, validate):
+            self.validate = validate
+
+        def make_sudo(self):
+            return se_mod.SudoSession(validate=self.validate, refresh=lambda: 0, interval=3600)
+
+        def say(self, line=""):
+            pass
+    ok_io = Sudoer(lambda: 0)
+    with contextlib.redirect_stdout(io_module.StringIO()):
+        held = ok_io.sudo_once("why")
+        again = ok_io.sudo_once("again")
+        declined = Sudoer(lambda: 1).sudo_once("why")
+    check("kit717-sudo-once-held", held, True)
+    check("kit717-sudo-once-is-asked-once", (again, ok_io._sudo.acquisitions), (True, 1))
+    ok_io._sudo.release()
+    check("kit717-sudo-declined-is-false", declined, False)
+
+    # 11j. The parts list: every part the command acts on, or installs a job for, has consent.
+    check("kit717-every-part-acted-on-has-consent-lines",
+          [pt["id"] for pt in real_parts if (step_of(pt) or pt.get("jobs"))
+           and not pt.get("consent")], [])
+    check("kit717-no-hard-coded-python-path", ("/usr/bin/" + "python3") in src, False)
 
     import shutil
     shutil.rmtree(tmp, ignore_errors=True)

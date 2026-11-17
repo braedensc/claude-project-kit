@@ -399,6 +399,18 @@ Run each non-null command from `delivery.json` → `commands` (`lint`, `typechec
 `e2e`/`preview` only if the ticket calls for them). `null` means the project has no such
 step — skip it. An empty string is invalid config, not a no-op: report it.
 
+**End with one line per command.** Your last message is what the dispatcher posts on the
+ticket, and what a person reads. Give every non-null command one line there, in one of
+three forms:
+
+    Gate test: ran, 212 passed, 0 failed.
+    Gate e2e: could not run, the sandbox blocks the browser download.
+    Gate preview: not asked.
+
+A command the ticket asked for that could not run is still owed: say who can run it (CI,
+or a person) and that nobody has yet. Never follow it with "nothing left to do"
+(`docs/SESSION-BRIEF.md` §6).
+
 Local green is **necessary, not sufficient** — CI is the real gate. And never edit
 `commands` to make the gate pass: `delivery.json` is in `riskPaths`, so that change needs
 a human and will be seen.

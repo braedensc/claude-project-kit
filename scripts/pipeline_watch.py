@@ -42,10 +42,22 @@ WHAT IT CHECKS, one KIND each (a kind is what an alert is about):
               page-heartbeat.json: older than WATCHER_PAGE_MAX_AGE_MINUTES, unreadable, in another
               shape, missing, or reporting that a page could not be sent (and by which route), two
               passes running. Slack only, through the status file: it opens no GitHub issue
+  push-connection  the bridge's push-connection job (KIT-561), where PUSH_HEARTBEAT_FILE names its
+              bridge-push-heartbeat.json as a file this account can read: older than ten minutes,
+              unreadable, in another shape, missing, not connected to Slack, or silent for five
+              minutes, two passes running. Slack only, through the status file: it opens no GitHub
+              issue
   credentials the yearly credentials' expiry dates, which the owner writes down in
               CREDENTIAL_EXPIRIES (names and dates, never a token): any date within
               CREDENTIAL_WARN_DAYS, or past, fires. Upkeep: a GitHub issue, never a Slack page
               (KIT-579). Empty: no dates are watched, and every pass says so.
+  memory      the machine's free memory under MEMORY_FREE_FLOOR_PCT, or swap over SWAP_CEILING_GB, two
+              passes running (KIT-609). Read from macOS's own tools, no sudo; unreadable is unknown. A
+              concern, not an outage: advisory in the status file, no GitHub issue, no page. The
+              stand-up says one line about it.
+  burn        the usage job's weekly window projected to its reset (BURN_WEEK_PCT), or its 5-hour window
+              at BURN_FIVE_HOUR_PCT (KIT-609). Reads only BURN_USAGE_FILE; a figure it cannot read is
+              unknown, never zero. Advisory like `memory`. Empty: not watched.
   notifier, monitor  the human-action notifier and the heartbeat monitor, where
               NOTIFIER_HEARTBEAT_FILE and MONITOR_HEARTBEAT_FILE name their heartbeats as files
               this account can read: an hour old, unreadable or missing, two passes running
@@ -63,6 +75,24 @@ WHERE IT SAYS SO.
   * Slack: it writes HEALTH_STATUS_FILE (readable by the dispatcher's role account). The
     heartbeat monitor reads it and pages through the notifier, as it does for the daemons.
   Either one empty means that channel is OFF, and every pass says so.
+
+THE KEYS' END DATES (KIT-667).  Two commands over the same list, names and dates only:
+    pipeline_watch.py --conf update.conf dates
+        A header, then one tab-separated row per stored key the parts list knows (pipeline-parts.json,
+        listed once even when several parts share it, and only when a part that uses it has its settings
+        file in the kit folder): its clock name, what it is, the date on record or `missing`, days left
+        or `-`, and where to read the date. Names in CREDENTIAL_EXPIRIES the list does not know are
+        listed as kept as written. Asks nothing, writes nothing, runs anywhere.
+          0 every date that should be set is set and none is within CREDENTIAL_WARN_DAYS
+          10 a key that ends (`one-year`, `set-when-made`) has no date, or a date is due or past
+             (an `unknown` end is listed and never makes a missing date a failure)
+          4 update.conf or the parts list could not be read
+    pipeline_watch.py --conf update.conf dates --apply   (name:YYYY-MM-DD lines on standard input)
+        Replaces or adds those entries, keeps every other entry, changes only the CREDENTIAL_EXPIRIES
+        line (every other byte stays), writes atomically with the file's mode, reads it back, and prints
+        the rows. A person runs it: it is refused in a Claude session before it reads anything.
+          0 written and read back   2 a bad line (named by number), nothing written
+          1 the write or the read-back failed, or the files could not be read   3 refused
 
 EXIT CODES — contract §13.
   0   every kind is ok, and every change was delivered
@@ -97,18 +127,25 @@ OK, FIRING, UNKNOWN = "ok", "firing", "unknown"
 STATUS_SCHEMA = "pipeline-health-status/1"
 STATE_SCHEMA = "pipeline-health-watch-state/1"
 KINDS = ("hooks", "updates", "release", "dispatcher", "front-door", "disk", "temp",
-         "conflict-waker", "watcher-page", "notifier", "monitor", "credentials")
+         "conflict-waker", "watcher-page", "push-connection", "notifier", "monitor", "credentials",
+         "memory", "burn")
 # Read here for the heartbeat monitor, which cannot (KIT-339): the conflict waker is the
 # owner's LaunchAgent, and its heartbeat sits in the owner's home. It reaches Slack through
 # the status file alone. It opens no GitHub issue: the alert workflow knows a fixed list of
 # kinds, and a deployed copy that does not know this one would fail every send.
-SLACK_ONLY_KINDS = ("conflict-waker", "watcher-page")
+SLACK_ONLY_KINDS = ("conflict-waker", "watcher-page", "push-connection", "memory", "burn")
 WAKER_SCHEMA = "pr-conflict-waker-heartbeat/1"
 # The watcher's page job (KIT-519) writes this beat. A page that could not be sent shows in it as
 # `could-not-page` and the routes that failed, and nothing else reads it (KIT-549). The route names
 # are a closed list, so nothing the file says is repeated but those two words.
 PAGE_SCHEMA = "pipeline-watcher-page-heartbeat/1"
 PAGE_ROUTES = ("slack", "github")
+# The bridge's push-connection job (KIT-561) beats about every 30 seconds while it runs; the job's own
+# fields say whether it is connected and when Slack was last heard from (a ping counts). Fixed words
+# here: nothing the file says is repeated.
+PUSH_SCHEMA = "pipeline-bridge-push-heartbeat/1"
+PUSH_STALE_SECONDS = 600
+PUSH_HEARD_SECONDS = 300
 # The waker runs every 300 s, and a pass can run up to its 40-minute session timeout.
 WAKER_STALE_SECONDS = 3600
 # The notifier and the heartbeat monitor (KIT-286): the two clerks that page about everything
@@ -126,7 +163,7 @@ CLERK_STALE_SECONDS = 3600
 # the status file a problem, so the heartbeat monitor never pages Slack about them: a Slack
 # ping must mean something is broken (owner decision 2026-10-27, KIT-264). The status file
 # still lists them, under `advisory`, for the tech lead and `status`.
-UPKEEP_KINDS = ("updates", "release", "credentials")
+UPKEEP_KINDS = ("updates", "release", "credentials", "memory", "burn")
 UPDATE_REVIEW_EVERY = 20 * 3600       # the registry and Homebrew need not be asked hourly
 DEBOUNCE = 2                          # a liveness kind fires after this many failing passes
 HOOK_EVIDENCE_SECONDS = 24 * 3600
@@ -327,6 +364,160 @@ def check_credentials(env, conf):
     # new one too (it adds a comment and pages once more); the day counts changing do not.
     out["key"] = ",".join(name for _days, name, _when in due)
     return out
+
+
+# The machine and the budget (KIT-609). Concerns, not outages: both are advisory in the status file, open no GitHub
+# issue and page nobody; the stand-up reads them and says one line only when one is firing. Numbers only: the
+# summaries carry percentages, gigabytes and times, nothing a file or a session wrote.
+SWAP_RE = re.compile(r"\bused = ([0-9]+(?:\.[0-9]+)?)([KMGT])\b")
+FREE_RE = re.compile(r"free percentage:\s*([0-9]{1,3})%")
+SWAP_UNIT_GB = {"K": 1 / 1048576.0, "M": 1 / 1024.0, "G": 1.0, "T": 1024.0}
+USAGE_SCHEMA = "pipeline-usage/1"
+USAGE_MAX_AGE_SECONDS = 2 * 3600       # the usage job writes every 15 minutes
+WEEK_SECONDS = 7 * 86400
+BURN_MIN_ELAPSED = 12 * 3600           # earlier in the week a projection is noise
+TREND_DAYS = 14
+
+
+class MemoryUnreadable(Exception):
+    pass
+
+
+def read_memory(env):
+    """(free percentage, swap used in GB) from macOS's own tools, without sudo. MemoryUnreadable, in words, when
+    either cannot be read or does not look as expected: never a guessed number."""
+    got = env.runner.read(["/usr/bin/memory_pressure"], timeout=20)
+    m = FREE_RE.search(got.out) if got.ok else None
+    if not m or not 0 <= int(m.group(1)) <= 100:
+        raise MemoryUnreadable("memory_pressure did not give the free percentage")
+    swap = env.runner.read(["/usr/sbin/sysctl", "vm.swapusage"], timeout=10)
+    s = SWAP_RE.search(swap.out) if swap.ok else None
+    if not s:
+        raise MemoryUnreadable("sysctl vm.swapusage did not give the swap used")
+    return int(m.group(1)), float(s.group(1)) * SWAP_UNIT_GB[s.group(2)]
+
+
+def _trend(state, now, free_pct, swap_gb):
+    """The week's lows, kept day by day for the sprint review: the lowest free percentage and the most swap seen."""
+    days = state.setdefault("memory_trend", {})
+    day = days.setdefault(_iso(now)[:10], {"min_free_pct": free_pct, "max_swap_gb": swap_gb})
+    day["min_free_pct"] = min(day["min_free_pct"], free_pct)
+    day["max_swap_gb"] = round(max(day["max_swap_gb"], swap_gb), 2)
+    for old in sorted(days)[:-TREND_DAYS]:
+        del days[old]
+
+
+def check_memory(env, conf, state):
+    """Memory (KIT-609): the free percentage under MEMORY_FREE_FLOOR_PCT, or swap over SWAP_CEILING_GB, on two passes
+    running; one brief spike says nothing. A reading that cannot be taken is unknown, never fine."""
+    read = getattr(env, "memory_read", None) or (lambda: read_memory(env))
+    try:
+        free_pct, swap_gb = read()
+    except MemoryUnreadable as exc:
+        _debounced(state, "memory", False)       # an unreadable pass breaks the run: two spikes must be consecutive
+        return finding("memory", UNKNOWN, "could not read the machine's memory this pass: %s" % exc)
+    _trend(state, _now(env), free_pct, swap_gb)
+    floor, ceiling = int(conf["MEMORY_FREE_FLOOR_PCT"]), int(conf["SWAP_CEILING_GB"])
+    low, swapping = free_pct < floor, swap_gb > ceiling
+    now_line = "%d%% of memory free, %.1f GB of swap used" % (free_pct, swap_gb)
+    if not _debounced(state, "memory", low or swapping):
+        return finding("memory", OK, now_line + (" (past a limit once; it says so only if the next pass is too)"
+                                                 if low or swapping else ""))
+    parts = []
+    if low:
+        parts.append("only %d%% of memory is free (the floor is %d%%)" % (free_pct, floor))
+    if swapping:
+        parts.append("%.1f GB of swap is in use (the ceiling is %d GB)" % (swap_gb, ceiling))
+    return finding("memory", FIRING, "The machine is short of memory: %s, on two passes in a row. This check only reports it: the "
+                                     "queue's own room check decides whether new work starts, and work already running is "
+                                     "not touched." % " and ".join(parts))
+
+
+def burn_projection(util, resets_at, now):
+    """The weekly window's use at the reset if the week goes on as it has: (projected fraction, elapsed seconds), or
+    None when the week is too young to project. ValueError when the figures cannot be believed."""
+    start = resets_at - WEEK_SECONDS
+    if not isinstance(util, (int, float)) or isinstance(util, bool) or not 0 <= util <= 1.5:
+        raise ValueError("the weekly window's use is not a figure")
+    if not start <= now < resets_at:
+        raise ValueError("the weekly window's reset is not the current week's")
+    elapsed = now - start
+    if elapsed < BURN_MIN_ELAPSED:
+        return None
+    return util * WEEK_SECONDS / elapsed, elapsed
+
+
+def check_burn(env, conf):
+    """The burn rate (KIT-609): the weekly window's use projected to its reset from use so far and time left, firing
+    at BURN_WEEK_PCT, and the 5-hour window when it is at BURN_FIVE_HOUR_PCT. Reads only what the usage job already
+    records. A figure that cannot be read is unknown, never zero."""
+    path = conf.get("BURN_USAGE_FILE") or ""
+    if not path:
+        return finding("burn", OK, "BURN_USAGE_FILE is not set: the burn rate is not watched here")
+    path = os.path.expanduser(path)
+    now = _now(env)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError):
+        return finding("burn", UNKNOWN, "could not read the usage file this pass, so the burn rate is not judged")
+    written = _parse_iso(doc.get("written_at")) if isinstance(doc, dict) else None
+    if not isinstance(doc, dict) or doc.get("schema") != USAGE_SCHEMA or written is None or doc.get("result") == "failed":
+        return finding("burn", UNKNOWN, "the usage file is not one this watch can read, or its last pass failed")
+    if now - written > USAGE_MAX_AGE_SECONDS:
+        return finding("burn", UNKNOWN, "the usage file was last written %d minutes ago, so the burn rate is not judged"
+                       % ((now - written) // 60))
+    windows = ((doc.get("status") or {}).get("windows") or {}) if isinstance(doc.get("status"), dict) else {}
+    lines = []
+    five = windows.get("five_hour") if isinstance(windows.get("five_hour"), dict) else {}
+    line5 = int(conf["BURN_FIVE_HOUR_PCT"])
+    reset5 = _parse_iso(five.get("resets_at"))
+    util5 = five.get("utilization")
+    five_readable = isinstance(util5, (int, float)) and not isinstance(util5, bool) and reset5 is not None
+    if isinstance(five.get("utilization"), (int, float)) and not isinstance(five.get("utilization"), bool) \
+            and reset5 and reset5 > now and five["utilization"] * 100 >= line5:
+        lines.append("The 5-hour window is %d%% used (the line is %d%%)." % (round(five["utilization"] * 100), line5))
+    week = windows.get("seven_day") if isinstance(windows.get("seven_day"), dict) else {}
+    reset7 = _parse_iso(week.get("resets_at"))
+    if reset7 is None:
+        if lines:
+            return _burn_firing(lines)
+        return finding("burn", UNKNOWN, "the usage file has no reset time for the weekly window, so its burn rate is not judged")
+    try:
+        got = burn_projection(week.get("utilization"), reset7, now)
+    except ValueError as exc:
+        if lines:
+            return _burn_firing(lines)
+        return finding("burn", UNKNOWN, "%s, so the burn rate is not judged" % exc)
+    line7 = int(conf["BURN_WEEK_PCT"])
+    if got is None:
+        used = week["utilization"] * 100
+        if used >= line7:
+            lines.append("The weekly window is already %d%% used, only %.0f hours into the week (the line is %d%%)."
+                         % (round(used), (now - (reset7 - WEEK_SECONDS)) / 3600.0, line7))
+        if lines:
+            return _burn_firing(lines)
+        return _burn_ok(five_readable, "%d%% of the weekly window used; it is too early in the week to project" % round(used))
+    projected, elapsed = got
+    if projected * 100 >= line7:
+        lines.append("At this pace the weekly window will be %d%% used at its reset (%d%% used, %.1f days into the week; the line is %d%%)."
+                     % (round(projected * 100), round(week["utilization"] * 100), elapsed / 86400.0, line7))
+    if lines:
+        return _burn_firing(lines)
+    return _burn_ok(five_readable, "%d%% of the weekly window used, %d%% projected at the reset" % (round(week["utilization"] * 100), round(projected * 100)))
+
+
+def _burn_ok(five_readable, said):
+    """Fine on the weekly window; but a 5-hour figure that could not be read is not a clear: unknown, with the weekly
+    reading said (the figure was there to be read, so its absence is news)."""
+    if not five_readable:
+        return finding("burn", UNKNOWN, "the 5-hour window's figure could not be read, so it is not judged (%s)" % said)
+    return finding("burn", OK, said)
+
+
+def _burn_firing(lines):
+    return finding("burn", FIRING, " ".join(lines) + " Nothing is stopped by this: the watcher's own limits and the daily "
+                                                      "pacing (if it is on) apply as before.")
 
 
 def _debounced(state, kind, failing):
@@ -592,6 +783,53 @@ def check_watcher_page(env, conf, state):
     return finding("watcher-page", UNKNOWN, "%s this pass; one more and it fires" % problem)
 
 
+def _push_problem(path, now):
+    """What is wrong with the bridge's push-connection job's heartbeat at `path`, or None when it
+    is checking in, connected, and has heard from Slack lately. Fields only: the words are ours."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            beat = json.load(fh)
+    except FileNotFoundError:
+        return "the push-connection job has never written its heartbeat, %s" % path
+    except (OSError, ValueError) as exc:
+        return "the push-connection job's heartbeat %s cannot be read (%s)" % (path, exc)
+    if not isinstance(beat, dict) or beat.get("schema") != PUSH_SCHEMA:
+        return "the push-connection job's heartbeat %s is not in a shape this watch knows" % path
+    stamp = _parse_iso(beat.get("at"))
+    if stamp is None:
+        return "the push-connection job's heartbeat %s has no time on it" % path
+    if now - stamp > PUSH_STALE_SECONDS:
+        return "the push-connection job has not checked in since %s" % _iso(stamp)
+    if beat.get("connected") is not True:
+        return "the push-connection job is not connected to Slack"
+    heard = _parse_iso(beat.get("last_heard_at"))
+    if heard is None or now - heard > PUSH_HEARD_SECONDS:
+        return "the push-connection job has not heard from Slack since %s" % (
+            _iso(heard) if heard is not None else "it started")
+    return None
+
+
+def check_push_connection(env, conf, state):
+    """The bridge's push-connection job (KIT-561), where PUSH_HEARTBEAT_FILE names its heartbeat,
+    and said off where it does not. Debounced like the waker: on a wake from sleep this hourly pass
+    can run before the job has reconnected. Slack only: the bridge falls back to its once-a-minute
+    pass, so a DM is still answered, only not at once."""
+    path = conf.get("PUSH_HEARTBEAT_FILE")
+    if not path:
+        return finding("push-connection", OK, "PUSH_HEARTBEAT_FILE is not set: the bridge's "
+                                               "push-connection job is not watched here")
+    problem = _push_problem(path, _now(env))
+    if problem is None:
+        _debounced(state, "push-connection", False)
+        return finding("push-connection", OK, "connected, and Slack was heard from lately")
+    if _debounced(state, "push-connection", True):
+        return finding("push-connection", FIRING, (
+            "%s, for %d passes running. DMs are still answered once a minute by the bridge's own "
+            "pass, only not at once. Check: `python3 scripts/pipeline_bridge_setup.py verify "
+            "--conf <its conf>`." % (problem[0].upper() + problem[1:], DEBOUNCE)))
+    return finding("push-connection", UNKNOWN, "%s this pass; one more and it fires" % problem)
+
+
 def _clerk_problem(label, path, schema, now):
     """What is wrong with a clerk's heartbeat at `path`, or None when it is checking in. Only
     that it is alive and current is judged here: its results are the monitor's to page."""
@@ -743,7 +981,8 @@ def run_pass(env, conf, dry_run=False):
                 check_release(env, conf), check_dispatcher(env, conf, state),
                 check_front_door(env, conf, state), check_disk(env, conf), check_temp(env, conf),
                 check_conflict_waker(env, conf, state), check_watcher_page(env, conf, state),
-                check_credentials(env, conf)]
+                check_push_connection(env, conf, state), check_credentials(env, conf),
+                check_memory(env, conf, state), check_burn(env, conf)]
     findings += [check_clerk(env, conf, state, kind) for kind in CLERKS]
     failed, notes, claimed = [], [], set()
     github_on = bool(conf.get("ALERT_REPO"))
@@ -834,12 +1073,20 @@ def _path_env():
     return ":".join(dirs + ["/usr/bin", "/bin", "/usr/sbin", "/sbin"])
 
 
+INSTALL_WHY = ("It loads or removes a job that runs as you every hour; a session\n"
+               "  does not install its own supervision.")
+# Each action's own reason and its read-only command (KIT-667): `dates --apply` writes no job.
+REFUSAL_WORDS = {
+    "dates --apply": ("It writes the end dates the health check warns from; a session\n"
+                      "  does not set its own warnings.", "dates"),
+}
+
+
 def refuse_if_agent(action, environ):
-    """The update script's refusal, naming THIS script's command for the person to run."""
-    pu.refuse_if_agent(action, environ, script="pipeline_watch.py",
-                       why="It loads or removes a job that runs as you every hour; a session\n"
-                           "  does not install its own supervision.",
-                       read_only="run --dry-run")
+    """The update script's refusal, naming THIS script's command for the person to run, with the
+    reason and the read-only command that belong to the action."""
+    why, read_only = REFUSAL_WORDS.get(action, (INSTALL_WHY, "run --dry-run"))
+    pu.refuse_if_agent(action, environ, script="pipeline_watch.py", why=why, read_only=read_only)
 
 
 def _load(env, domain, label, plist):
@@ -920,9 +1167,232 @@ def install(env, conf, uninstall_only=False):
 
 
 # --------------------------------------------------------------------------- #
+# dates: each stored key's end date (KIT-667)
+# --------------------------------------------------------------------------- #
+DATES_HEADER = "clock\twhat\tdate\tdays_left\tdate_from"
+ENDS_NEEDING_A_DATE = ("one-year", "set-when-made")
+KEPT_WHAT = "kept as written; the parts list does not know it"
+APPLY_STDIN_MAX = 65536
+
+
+class PartsUnreadable(Exception):
+    pass
+
+
+def _one_line(text):
+    return " ".join(str(text).split())
+
+
+def listed_keys(kit):
+    """[{clock, what, ends, date_from}] from the parts list: one row per clock, in list order, for each
+    stored key that has a clock and that at least one part with its settings file in `kit` uses. A part
+    whose settings file is not in the kit folder is off on this Mac and lists nothing. Names and words
+    only; it never opens a settings file or an env file. PartsUnreadable, in words, when the list is
+    missing or in a shape this reader does not know."""
+    try:
+        with open(os.path.join(kit, "pipeline-parts.json"), encoding="utf-8") as fh:
+            doc = json.load(fh)
+        rows, seen = [], set()
+        for part in doc["parts"]:
+            name = part["settings"]["file"]
+            on = bool(name) and os.path.isfile(os.path.join(kit, name))
+            for secret in part["secrets"]:
+                ends = secret["ends"]
+                if ends not in ("one-year", "set-when-made", "never", "unknown"):
+                    raise ValueError("a key's end is not one of the four")
+                clock = secret.get("clock")
+                if ends != "never" and not (clock and secret.get("date_from")):
+                    raise ValueError("a key that ends has no clock or no place for its date")
+                if not clock or not on:
+                    continue
+                if not pu.CREDENTIAL_ENTRY_RE.match(clock + ":2000-01-01"):
+                    raise ValueError("a clock is not a valid entry name")
+                if clock in seen:
+                    continue
+                seen.add(clock)
+                rows.append({"clock": clock, "what": _one_line(secret["what"]), "ends": ends,
+                             "date_from": _one_line(secret.get("date_from") or "")})
+        return rows
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        raise PartsUnreadable("pipeline-parts.json could not be read (%s)" % type(exc).__name__)
+
+
+def date_rows(keys, clocks, today, warn):
+    """(rows, exit code) from the listed keys, the dates on record [(name, date)] and today's date.
+    A row is (clock, what, date or None, days left or None, date_from). Exit 10 when a key that ends
+    has no date, or any date is within `warn` days or past; otherwise 0. A key whose end is unknown,
+    or that never ends, is listed and is never made a failure by having no date."""
+    on_record = dict(clocks)
+    rows, bad, known = [], False, set()
+    for key in keys:
+        known.add(key["clock"])
+        when = on_record.get(key["clock"])
+        days = (when - today).days if when else None
+        rows.append((key["clock"], key["what"], when, days, key["date_from"]))
+        if when is None and key["ends"] in ENDS_NEEDING_A_DATE:
+            bad = True
+    for name, when in clocks:
+        if name not in known:
+            rows.append((name, KEPT_WHAT, when, (when - today).days, "-"))
+    if any(r[3] is not None and r[3] <= warn for r in rows):
+        bad = True
+    return rows, (EX_FIRING if bad else EX_OK)
+
+
+def print_date_rows(rows):
+    say(DATES_HEADER)
+    for clock, what, when, days, date_from in rows:
+        say("\t".join((clock, what, when.isoformat() if when else "missing",
+                       "-" if days is None else str(days), date_from)))
+
+
+def _today(env):
+    import datetime
+    return datetime.datetime.fromtimestamp(_now(env), datetime.timezone.utc).date()
+
+
+def parse_apply_lines(text, allowed):
+    """([(name, date)], [problems]) from `name:YYYY-MM-DD` lines. A problem names its line number, never
+    its text: a person may have pasted a token."""
+    import datetime
+    out, problems, seen = [], [], set()
+    for n, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line:
+            continue
+        m = pu.CREDENTIAL_ENTRY_RE.match(line)
+        try:
+            when = datetime.date(int(m.group(2)), int(m.group(3)), int(m.group(4))) if m else None
+        except ValueError:
+            when = None
+        if m is None:
+            problems.append("line %d is not name:YYYY-MM-DD (a short lower-case name, a colon, a date)" % n)
+        elif when is None:
+            problems.append("line %d has a date that does not exist" % n)
+        elif m.group(1) not in allowed:
+            problems.append("line %d names a key that is not listed and not already in CREDENTIAL_EXPIRIES" % n)
+        elif m.group(1) in seen:
+            problems.append("line %d repeats a name from an earlier line" % n)
+        else:
+            seen.add(m.group(1))
+            out.append((m.group(1), when))
+    return out, problems
+
+
+def merged_expiries(existing, new):
+    """(value, entries) for CREDENTIAL_EXPIRIES: every existing entry in place (a new date replaces its old
+    one), then the entries that were not there, in the order given."""
+    changed = dict(new)
+    out = [(name, changed.pop(name, when)) for name, when in existing]
+    out += [(name, when) for name, when in new if name in changed]
+    return ",".join("%s:%s" % (name, when.isoformat()) for name, when in out), out
+
+
+def rewrite_expiries(raw, value):
+    """`raw` (the conf's bytes) with ONLY its CREDENTIAL_EXPIRIES line replaced by `value`, or added at the
+    end when it has none. Every other byte stays, line endings included."""
+    lines = raw.splitlines(keepends=True)
+    new = b"CREDENTIAL_EXPIRIES=" + value.encode("ascii")
+    for i, line in enumerate(lines):
+        body = line.rstrip(b"\r\n")
+        if re.match(rb"^\s*CREDENTIAL_EXPIRIES\s*=", body):
+            lines[i] = new + line[len(body):]
+            return b"".join(lines)
+    if lines and not lines[-1].endswith((b"\n", b"\r")):
+        lines[-1] += b"\n"
+    return b"".join(lines) + new + b"\n"
+
+
+def write_atomic(path, data):
+    """Write `data` beside `path` and rename it over, with the old file's mode. Follows a link to the file
+    it points at. Raises OSError; the temp file is removed on any failure."""
+    import tempfile
+    target = os.path.realpath(path)
+    mode = os.stat(target).st_mode & 0o7777
+    fd, tmp = tempfile.mkstemp(prefix=".update.conf-", dir=os.path.dirname(target))
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, target)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def cmd_dates(env, conf_path, apply, stdin):
+    """`dates` and `dates --apply`. Exit codes in the module doc."""
+    kit = getattr(env, "kit", KIT)
+    could_not = EX_FAILED if apply else EX_UNKNOWN
+    if apply:
+        # Before anything is read: a session does not write its own supervision's dates.
+        try:
+            refuse_if_agent("dates --apply", env.environ)
+        except pu.Refusal as exc:
+            say(str(exc))
+            return EX_REFUSED
+    try:
+        conf = pu.load_conf(conf_path)
+        keys = listed_keys(kit)
+    except (pu.ConfError, PartsUnreadable) as exc:
+        say("CONFIG: %s" % exc)
+        return could_not
+    clocks, problems = pu.credential_clocks(conf.get("CREDENTIAL_EXPIRIES"))
+    if problems:
+        say("CONFIG: CREDENTIAL_EXPIRIES could not be read: " + "; ".join(problems))
+        return could_not
+    warn = int(conf.get("CREDENTIAL_WARN_DAYS") or 30)
+    if not apply:
+        rows, code = date_rows(keys, clocks, _today(env), warn)
+        print_date_rows(rows)
+        return code
+    text = stdin.read(APPLY_STDIN_MAX + 1)
+    if len(text) > APPLY_STDIN_MAX:
+        say("NOT WRITTEN: the input is longer than %d characters." % APPLY_STDIN_MAX)
+        return EX_USAGE
+    allowed = {k["clock"] for k in keys} | {name for name, _ in clocks}
+    new, bad = parse_apply_lines(text, allowed)
+    if not bad and not new:
+        bad = ["no line was given: send name:YYYY-MM-DD lines on standard input"]
+    value, merged = ("", [])
+    if not bad:
+        value, merged = merged_expiries(clocks, new)
+        if len(merged) > pu.CREDENTIAL_ENTRIES_MAX:
+            bad = ["that would make more than %d entries" % pu.CREDENTIAL_ENTRIES_MAX]
+    if bad:
+        say("NOT WRITTEN: %d problem(s); nothing was changed:\n  " % len(bad) + "\n  ".join(bad))
+        return EX_USAGE
+    path = conf["__source__"]
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read()
+        data = rewrite_expiries(raw, value)
+        write_atomic(path, data)
+        with open(path, "rb") as fh:
+            back = fh.read()
+        after = pu.load_conf(path)
+        got, why = pu.credential_clocks(after.get("CREDENTIAL_EXPIRIES"))
+    except (OSError, pu.ConfError) as exc:
+        say("FAILED: update.conf was not written, or could not be read back (%s)." % type(exc).__name__)
+        return EX_FAILED
+    if back != data or why or got != merged:
+        say("FAILED: update.conf was written but reads back differently; check it by hand.")
+        return EX_FAILED
+    rows, _code = date_rows(keys, got, _today(env), warn)
+    say("WRITTEN: %d date(s) in CREDENTIAL_EXPIRIES; every other line is as it was." % len(new))
+    print_date_rows(rows)
+    return EX_OK
+
+
+# --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
-def main(argv=None, env=None):
+def main(argv=None, env=None, stdin=None):
     p = argparse.ArgumentParser(prog="pipeline_watch.py", description=__doc__.split("\n")[0])
     p.add_argument("--conf", default=os.path.join(KIT, "update.conf"))
     p.add_argument("--selftest", action="store_true")
@@ -932,6 +1402,8 @@ def main(argv=None, env=None):
     sub.add_parser("status")
     sub.add_parser("install")
     sub.add_parser("uninstall")
+    dates = sub.add_parser("dates")
+    dates.add_argument("--apply", action="store_true")
     args = p.parse_args(argv)
     if args.selftest:
         from scratch_run import contained   # KIT-450: its temp folders go when it ends
@@ -940,6 +1412,8 @@ def main(argv=None, env=None):
         p.print_help()
         return EX_USAGE
     env = env or pu.Env()
+    if args.cmd == "dates":
+        return cmd_dates(env, args.conf, args.apply, stdin or sys.stdin)
     try:
         if args.cmd in ("install", "uninstall"):
             refuse_if_agent(args.cmd, env.environ)
@@ -1049,6 +1523,7 @@ def selftest():
                      environ={} if environ is None else environ, home=home)
         env.now = lambda: now
         env.disk_free = lambda: free_gb * (1 << 30)
+        env.memory_read = lambda: (60, 0.0)
         env.temp_areas = lambda: [("session scratch", os.path.join(home, "no-scratch")),
                                   ("TMPDIR", os.path.join(home, "no-tmpdir"))]
         env.http_status = lambda url: door if "door" in url else net
@@ -1073,6 +1548,152 @@ def selftest():
         check("…and writes the status file the monitor reads",
               (doc["schema"], doc["result"], doc["fingerprint"]), (STATUS_SCHEMA, "ok", "ok"))
         check("…readable by another account (0644)", oct(os.stat(status_file).st_mode & 0o777), "0o644")
+
+        # -- the machine and the budget (KIT-609) ------------------------------------------------------------
+        def mem_pass(readings, **conf_over):
+            """One pass per reading (free %, swap GB) or exception, in one state: the findings of the last."""
+            cc = conf(HEALTH_STATUS_FILE=status_file, **conf_over)
+            env_ = make_env(home)
+            last = None
+            for r in readings:
+                def read(r=r):
+                    if isinstance(r, Exception):
+                        raise r
+                    return r
+                env_.memory_read = read
+                st = load_state(env_)
+                last = check_memory(env_, cc, st)
+                _atomic_write(state_path(env_), st)
+            return last, load_state(env_)
+        state_file_ = state_path(make_env(home))
+        if os.path.exists(state_file_):
+            os.unlink(state_file_)
+        f, st = mem_pass([(60, 0.5)])
+        check("memory: plenty free is ok and says the numbers", (f["state"], f["summary"]), ("ok", "60% of memory free, 0.5 GB of swap used"))
+        os.unlink(state_file_)
+        f, st = mem_pass([(6, 0.5)])
+        check("memory: one pass under the floor is a spike, not an alert", (f["state"], "only if the next pass is too" in f["summary"]), ("ok", True))
+        f, st = mem_pass([(6, 0.5)])
+        check("memory: the second pass in a row fires, with how far under and what the system does",
+              (f["state"], "only 6% of memory is free (the floor is 10%)" in f["summary"], "This check only reports it" in f["summary"], "New starts are held" in f["summary"]), ("firing", True, True, False))
+        f, st = mem_pass([(60, 0.5)])
+        check("memory: a good pass clears it", f["state"], "ok")
+        os.unlink(state_file_)
+        f, st = mem_pass([(50, 5.2), (50, 5.2)])
+        check("memory: swap over the ceiling on two passes fires, and names the swap only",
+              (f["state"], "5.2 GB of swap is in use (the ceiling is 4 GB)" in f["summary"], "free" in f["summary"].split("swap")[0].split("short of memory:")[1]), ("firing", True, False))
+        os.unlink(state_file_)
+        f, st = mem_pass([(6, 0.5), MemoryUnreadable("x"), (6, 0.5)])
+        check("memory: a spike, an unreadable pass and another spike are not consecutive, so they never fire", f["state"], "ok")
+        os.unlink(state_file_)
+        f, st = mem_pass([(6, 0.5), (60, 0.5), (6, 0.5)])
+        check("memory: a spike, a good pass and another spike never fire (the count starts over)", f["state"], "ok")
+        os.unlink(state_file_)
+        f, st = mem_pass([MemoryUnreadable("memory_pressure did not give the free percentage")])
+        check("memory: a reading that cannot be taken is unknown, never fine", (f["state"], "could not read" in f["summary"]), ("unknown", True))
+        f, st = mem_pass([(12, 0.5)], MEMORY_FREE_FLOOR_PCT="15")
+        f, st = mem_pass([(12, 0.5)], MEMORY_FREE_FLOOR_PCT="15")
+        check("memory: the floor lives in the conf", f["state"], "firing")
+        check("memory: the week's lows are kept day by day for the sprint review",
+              [(d, v["min_free_pct"], v["max_swap_gb"]) for d, v in st["memory_trend"].items()], [(_iso(T)[:10], 12, 0.5)])
+        os.unlink(state_file_)
+        mem_pass([(40, 1.0), (20, 3.0), (55, 0.2)])
+        check("memory: the day's lowest free and most swap are kept, not the last",
+              [(v["min_free_pct"], v["max_swap_gb"]) for v in load_state(make_env(home))["memory_trend"].values()], [(20, 3.0)])
+        os.unlink(state_file_)
+        check("memory: the real reader parses macOS's own words",
+              (read_memory(type("E", (), {"runner": se.FakeRunner([
+                  ("memory_pressure", 0, "The system has 17179869184 (1048576 pages)\nSystem-wide memory free percentage: 53%\n"),
+                  ("vm.swapusage", 0, "vm.swapusage: total = 2048.00M  used = 1186.25M  free = 861.75M  (encrypted)\n")])})())[0],
+               round(read_memory(type("E", (), {"runner": se.FakeRunner([
+                   ("memory_pressure", 0, "System-wide memory free percentage: 53%\n"),
+                   ("vm.swapusage", 0, "vm.swapusage: total = 2048.00M  used = 1186.25M  free = 861.75M  (encrypted)\n")])})())[1], 3)),
+              (53, 1.158))
+        for label, table in (("no free percentage", [("memory_pressure", 0, "nothing useful\n"), ("vm.swapusage", 0, "used = 1.00M\n")]),
+                             ("a failing tool", [("memory_pressure", 1, ""), ("vm.swapusage", 0, "used = 1.00M\n")]),
+                             ("no swap figure", [("memory_pressure", 0, "free percentage: 40%\n"), ("vm.swapusage", 0, "garbage\n")]),
+                             ("a percentage over 100", [("memory_pressure", 0, "free percentage: 140%\n"), ("vm.swapusage", 0, "used = 1.00M\n")])):
+            try:
+                read_memory(type("E", (), {"runner": se.FakeRunner(table)})())
+                got_ = "read"
+            except MemoryUnreadable:
+                got_ = "unreadable"
+            check("memory: %s is unreadable, never a guess" % label, got_, "unreadable")
+
+        usage_f = os.path.join(home, "burn-usage.json")
+        week_reset = T + 3 * 86400            # four days into the week at T
+
+        def usage_doc(week_util=0.38, five_util=0.2, resets=None, written=None, **over):
+            doc = {"schema": USAGE_SCHEMA, "written_at": _iso(written or T - 300), "result": "ok", "status": {"windows": {
+                "five_hour": {"utilization": five_util, "resets_at": _iso(T + 3600)},
+                "seven_day": {"utilization": week_util, "resets_at": _iso(resets or week_reset)}}}}
+            doc.update(over)
+            with open(usage_f, "w", encoding="utf-8") as fh:
+                json.dump(doc, fh)
+
+        def burn(**conf_over):
+            return check_burn(make_env(home), conf(BURN_USAGE_FILE=usage_f, **conf_over))
+        usage_doc()
+        f = burn()
+        check("burn: 38% used four days in projects to 66%, which is ok, and says both", (f["state"], f["summary"]),
+              ("ok", "38% of the weekly window used, 66% projected at the reset"))
+        usage_doc(week_util=0.60)
+        f = burn()
+        check("burn: 60% used four days in projects to 105% and fires, with the line and what is done about it",
+              (f["state"], "At this pace the weekly window will be 105% used at its reset (60% used, 4.0 days into the week; the line is 90%)." in f["summary"],
+               "Nothing is stopped by this" in f["summary"]), ("firing", True, True))
+        check("burn: the threshold lives in the conf", burn(BURN_WEEK_PCT="120")["state"], "ok")
+        usage_doc(five_util=0.95)
+        f = burn()
+        check("burn: the 5-hour window near its limit fires on its own", (f["state"], "The 5-hour window is 95% used (the line is 90%)." in f["summary"]), ("firing", True))
+        usage_doc(five_util=0.95, resets=T + 30 * 86400)
+        check("burn: a weekly reset that is not this week's is unknown, but a 5-hour firing still says so", burn()["state"], "firing")
+        usage_doc(resets=T + 30 * 86400)
+        check("burn: a weekly reset that is not this week's is unknown, never judged", burn()["state"], "unknown")
+        usage_doc(week_util=0.5, resets=T + 6.8 * 86400)
+        check("burn: early in the week it does not project (too little time to say)", (burn()["state"], "too early in the week" in burn()["summary"]), ("ok", True))
+        usage_doc(week_util=0.95, resets=T + 6.8 * 86400)
+        check("burn: early in the week, a window already past the line still fires, saying so",
+              (burn()["state"], "already 95% used, only 5 hours into the week" in burn()["summary"]), ("firing", True))
+        usage_doc()
+        doc_ = json.load(open(usage_f))
+        del doc_["status"]["windows"]["five_hour"]
+        json.dump(doc_, open(usage_f, "w"))
+        check("burn: a 5-hour figure that cannot be read is unknown, saying the weekly reading, never a plain ok",
+              (burn()["state"], "5-hour window's figure could not be read" in burn()["summary"], "projected at the reset" in burn()["summary"]),
+              ("unknown", True, True))
+        doc_["status"]["windows"]["seven_day"]["utilization"] = 0.60
+        json.dump(doc_, open(usage_f, "w"))
+        check("burn: …but a weekly projection over the line fires whatever the 5-hour figure", burn()["state"], "firing")
+        usage_doc(five_util="lots")
+        check("burn: a 5-hour figure that is not a number is unknown too", burn()["state"], "unknown")
+        usage_doc(written=T - 3 * 3600)
+        check("burn: a stale usage file is unknown, with its age", (burn()["state"], "last written 180 minutes ago" in burn()["summary"]), ("unknown", True))
+        usage_doc(result="failed")
+        check("burn: a failed usage pass is unknown", burn()["state"], "unknown")
+        usage_doc(week_util=None)
+        check("burn: a missing figure is unknown, never zero", burn()["state"], "unknown")
+        usage_doc(week_util=True)
+        check("burn: a boolean is not a figure", burn()["state"], "unknown")
+        os.unlink(usage_f)
+        check("burn: no usage file is unknown", burn()["state"], "unknown")
+        check("burn: with no file named it is not watched, and says so", check_burn(make_env(home), conf())["summary"].startswith("BURN_USAGE_FILE is not set"), True)
+        for key, bad_value in (("MEMORY_FREE_FLOOR_PCT", "0"), ("SWAP_CEILING_GB", "x"), ("SWAP_CEILING_GB", "0"), ("SWAP_CEILING_GB", "9999"), ("MEMORY_FREE_FLOOR_PCT", "90"), ("BURN_WEEK_PCT", "10"), ("BURN_FIVE_HOUR_PCT", "101"), ("BURN_USAGE_FILE", "rel.json")):
+            try:
+                conf(**{key: bad_value})
+                got_ = "accepted"
+            except AssertionError as exc:
+                got_ = key in str(exc)
+            check("conf: %s=%s is refused, by key" % (key, bad_value), got_, True)
+        usage_doc(week_util=0.60)
+        env_b = make_env(home)
+        cb = conf(HEALTH_STATUS_FILE=status_file, BURN_USAGE_FILE=usage_f)
+        run_pass(env_b, cb)
+        doc_b = json.load(open(status_file))
+        check("burn and memory are advisory: a firing one never makes the status file a problem, and opens no GitHub issue",
+              (doc_b["result"], "burn" in doc_b["advisory"], "burn" in doc_b["firing"], env_b.runner.writes), ("ok", True, False, []))
+        os.unlink(usage_f)
+        os.unlink(state_path(make_env(home)))
 
         # -- upkeep kinds open their GitHub issue but never page Slack (KIT-264) ----------
         # Owner decision 2026-10-27: a Slack ping must mean something is broken. Pending
@@ -1492,6 +2113,71 @@ def selftest():
             check("...and it is a Slack-only kind, so the alert workflow need not know it",
                   ("watcher-page" in SLACK_ONLY_KINDS, "watcher-page" in fh.read()), (True, False))
 
+        # -- the bridge's push-connection job (KIT-561): off unless its heartbeat is named; a stale,
+        #    disconnected, silent, unreadable, foreign or missing one fires on the second bad pass; it
+        #    repeats nothing the file says, and reaches Slack through the status file alone ---------
+        pc_dir = os.path.join(home, "push")
+        os.makedirs(pc_dir)
+        pc_beat = os.path.join(pc_dir, "bridge-push-heartbeat.json")
+
+        def push_beat(**fields):
+            doc = {"schema": PUSH_SCHEMA, "at": _iso(T - 20), "connected": True,
+                   "last_heard_at": _iso(T - 40), "error": None}
+            doc.update(fields)
+            with open(pc_beat, "w") as fh:
+                json.dump(doc, fh)
+        env, st_c, cc = make_env(home), {}, conf(PUSH_HEARTBEAT_FILE=pc_beat)
+        check("the push job is said off where PUSH_HEARTBEAT_FILE is not set",
+              check_push_connection(env, conf(), st_c)["summary"].split(":")[0],
+              "PUSH_HEARTBEAT_FILE is not set")
+        push_beat()
+        check("a push job connected and recently heard is ok",
+              check_push_connection(env, cc, st_c)["state"], OK)
+        bad = []
+        for name, make in (("stale", lambda: push_beat(at=_iso(T - 3600))),
+                           ("not connected", lambda: push_beat(connected=False,
+                                                               error="could not connect: <b>x</b>")),
+                           ("silent", lambda: push_beat(last_heard_at=_iso(T - 3600))),
+                           ("never heard", lambda: push_beat(last_heard_at=None)),
+                           ("no time", lambda: push_beat(at=None)),
+                           ("another shape", lambda: push_beat(schema="other/1")),
+                           ("unreadable", lambda: open(pc_beat, "w").write("{ nope")),
+                           ("never written", lambda: os.remove(pc_beat))):
+            make()
+            st_c = {}
+            two = [check_push_connection(env, cc, st_c) for _ in range(2)]
+            bad.append((name, two[0]["state"], two[1]["state"]))
+        check("a stale, disconnected, silent, foreign, unreadable or missing push job is unknown on "
+              "one pass and fires on two",
+              bad, [(n, UNKNOWN, FIRING) for n in ("stale", "not connected", "silent", "never heard",
+                                                   "no time", "another shape", "unreadable",
+                                                   "never written")])
+        push_beat(connected=False, error="could not connect: <script>alert(1)</script>")
+        st_c = {}
+        said_c = [check_push_connection(env, cc, st_c) for _ in range(2)][1]["summary"]
+        check("a disconnected push job is named in our words, and nothing the file says is repeated",
+              ("not connected to Slack" in said_c, "<script>" in said_c, "once a minute" in said_c),
+              (True, False, True))
+        push_beat(connected=False)
+        pc_home = os.path.join(home, "push-pass")
+        os.makedirs(pc_home)
+        pc_status = os.path.join(home, "push-status.json")
+        env = make_env(pc_home, gh=gh_ok(T))
+        for _ in range(2):
+            run_pass(env, conf(PUSH_HEARTBEAT_FILE=pc_beat, HEALTH_STATUS_FILE=pc_status,
+                               KIT_CHECKOUT=kit))
+        check("...its firing reaches the status file the monitor reads, and no GitHub issue",
+              (json.load(open(pc_status))["firing"], env.runner.writes), (["push-connection"], []))
+        with open(os.path.join(KIT, "templates", "workflows", "pipeline-alert.yml")) as fh:
+            check("...and it is a Slack-only kind, so the alert workflow need not know it",
+                  ("push-connection" in SLACK_ONLY_KINDS, "push-connection" in fh.read()),
+                  (True, False))
+        check("a relative PUSH_HEARTBEAT_FILE is refused by name",
+              ([e for e in pu.validate_conf(dict(base_c, PUSH_HEARTBEAT_FILE="push.json"))[1]
+                if "PUSH_HEARTBEAT_FILE" in e] != [],
+               [e for e in pu.validate_conf(dict(base_c, PUSH_HEARTBEAT_FILE="/srv/push.json"))[1]
+                if "PUSH_HEARTBEAT_FILE" in e]), (True, []))
+
         # -- the yearly credentials (KIT-579): the owner writes each date down; the kind
         #    warns CREDENTIAL_WARN_DAYS ahead and after, names only, and is upkeep -------------
         import datetime as _dt
@@ -1780,6 +2466,165 @@ def selftest():
               (code, os.path.isabs(doc["ProgramArguments"][3]),
                os.path.realpath(doc["ProgramArguments"][3])),
               (EX_OK, True, os.path.realpath(os.path.join(home, "watch-rel.conf"))))
+
+        # -- the stored keys' end dates (KIT-667): `dates` reads, `dates --apply` writes ------------------
+        import io as _io
+
+        class NoRead(object):
+            def read(self, *_a):
+                raise AssertionError("standard input was read")
+
+        d_kit = os.path.join(home, "dates-kit")
+        os.makedirs(d_kit)
+
+        def secret(key, name, ends, clock=None):
+            s = {"key": key, "default_name": name, "what": "The %s key." % name.lower(), "ends": ends}
+            if clock:
+                s.update(clock=clock, date_from="Read it at the %s page." % clock)
+            return s
+        gh_tok = secret("GITHUB_TOKEN_ENV", "GH_TOKEN", "set-when-made", "gh-tok")
+        parts_doc = {"schema": "pipeline-parts/1", "parts": [
+            {"id": "p1", "settings": {"file": "a.conf"}, "secrets": [
+                gh_tok, secret("TURN_TOKEN_ENV", "TURN_TOKEN", "one-year", "claude-tok"),
+                secret("APP_TOKEN_ENV", "APP_TOKEN", "unknown", "unk-tok"),
+                secret("LINEAR_KEY_ENV", "TRACKER_KEY", "never")]},
+            {"id": "p2", "settings": {"file": "b.conf"}, "secrets": [gh_tok]},
+            {"id": "p3", "settings": {"file": "c.conf"}, "secrets": [secret("X_ENV", "OFF_TOKEN", "one-year", "off-tok")]},
+            {"id": "p4", "settings": {"file": None}, "secrets": []}]}
+        parts_path = os.path.join(d_kit, "pipeline-parts.json")
+
+        def put_parts(doc):
+            with open(parts_path, "w", encoding="utf-8") as fh:
+                json.dump(doc, fh)
+        put_parts(parts_doc)
+        for name in ("a.conf", "b.conf"):
+            open(os.path.join(d_kit, name), "w").close()      # present and empty: never opened
+        d_conf = os.path.join(d_kit, "update.conf")
+
+        def put_conf(expiries=None, tail="", **over):
+            lines = ["# my settings\r\n" if tail == "crlf" else "# my settings\n"]
+            lines += ["%s=%s\n" % (k, v) for k, v in conf(**over).items()
+                      if not k.startswith("__") and k != "CREDENTIAL_EXPIRIES"]
+            if expiries is not None:
+                lines.insert(3, "CREDENTIAL_EXPIRIES=%s\n" % expiries)
+            with open(d_conf, "w", encoding="utf-8", newline="") as fh:
+                fh.write("".join(lines))
+            os.chmod(d_conf, 0o640)
+
+        def d_run(*args, environ=None, stdin=None, now=T):
+            env = make_env(home, environ=environ, now=now)
+            env.kit = d_kit
+            mark = len(quiet)
+            code = main(["--conf", d_conf] + list(args), env=env, stdin=stdin)
+            return code, list(quiet[mark:])
+
+        def d_rows(out):
+            return [line.split("\t") for line in "\n".join(out).splitlines() if "\t" in line]
+
+        def d_file():
+            with open(d_conf, "rb") as fh:
+                return fh.read()
+        put_conf()
+        before = d_file()
+        code, out = d_run("dates")
+        rows = d_rows(out)
+        check("dates prints the header, then one row of five fields per listed key, each once",
+              (out[0], [r[0] for r in rows[1:]], {len(r) for r in rows}),
+              ("clock\twhat\tdate\tdays_left\tdate_from", ["gh-tok", "claude-tok", "unk-tok"], {5}))
+        check("…a part whose settings file is not in the kit folder lists nothing, and a key that never ends has no row",
+              any("off-tok" in line or "tracker" in line.lower() for line in out), False)
+        check("…a missing date reads `missing` with no days, and where to read it is the last field",
+              rows[1], ["gh-tok", "The gh_token key.", "missing", "-", "Read it at the gh-tok page."])
+        check("…a one-year or set-when-made key with no date makes it exit 10", code, EX_FIRING)
+        check("…and it wrote nothing", d_file(), before)
+        put_conf(expiries="gh-tok:%s,claude-tok:%s" % (on(200), on(300)))
+        code, out = d_run("dates")
+        check("every date set and far, with a key of unknown end still missing: exit 0, and that row says missing",
+              (code, d_rows(out)[1][3], d_rows(out)[3][2:4]), (EX_OK, "200", ["missing", "-"]))
+        put_conf(expiries="gh-tok:%s,claude-tok:%s,unk-tok:%s" % (on(200), on(300), on(30)))
+        check("a date on the warning's last day is due: exit 10; one day further is not",
+              (d_run("dates")[0],
+               (put_conf(expiries="gh-tok:%s,claude-tok:%s,unk-tok:%s" % (on(200), on(300), on(31))),
+                d_run("dates")[0])[1]), (EX_FIRING, EX_OK))
+        put_conf(expiries="gh-tok:%s,claude-tok:%s,old-key:%s" % (on(200), on(300), on(-2)))
+        code, out = d_run("dates")
+        kept = d_rows(out)[-1]
+        check("a name the parts list does not know is listed, marked kept as written, and a past date is due",
+              (code, kept[0], "kept as written" in kept[1], kept[3]), (EX_FIRING, "old-key", True, "-2"))
+        put_parts({"parts": "x"})
+        check("a parts list that cannot be read is exit 4 for dates and 1 for --apply, with nothing written",
+              (d_run("dates")[0], d_run("dates", "--apply", stdin=_io.StringIO("gh-tok:2027-01-01\n"))[0],
+               d_file().count(b"2027-01-01")), (EX_UNKNOWN, EX_FAILED, 0))
+        put_parts(parts_doc)
+        put_conf(expiries="not-a-date")
+        check("a conf that cannot be read is exit 4", d_run("dates")[0], EX_UNKNOWN)
+
+        # --apply
+        put_conf(expiries="gh-tok:%s,old-key:%s" % (on(200), on(250)))
+        before = d_file()
+        code, out = d_run("dates", "--apply", environ={"CLAUDECODE": "1"}, stdin=NoRead())
+        check("--apply in a Claude session is refused (exit 3) before it reads standard input or the file",
+              (code, d_file() == before, "REFUSED" in out[0]), (EX_REFUSED, True, True))
+        said = "\n".join(out)
+        check("…and says it writes the end dates the health check warns from, points to `dates`, and speaks of no job",
+              ("writes the end dates the health check warns from" in said,
+               "pipeline_watch.py dates\n" in said + "\n", "run --dry-run" in said, "loads or removes" in said),
+              (True, True, False, False))
+        try:
+            refuse_if_agent("install", {"CLAUDECODE": "1"})
+            said_install = ""
+        except pu.Refusal as exc:
+            said_install = str(exc)
+        check("…while install's refusal keeps its own words and its `run --dry-run`",
+              ("loads or removes a job" in said_install, "pipeline_watch.py run --dry-run" in said_install,
+               "end dates" in said_install), (True, True, False))
+        check("…while plain dates is not refused there",
+              d_run("dates", environ={"CLAUDECODE": "1"})[0] in (EX_OK, EX_FIRING), True)
+        code, out = d_run("dates", "--apply", stdin=_io.StringIO("claude-tok:2027-03-04\ngh-tok:2027-05-06\n\nunk-tok:2027-07-08\n"))
+        after = d_file()
+        want_value = "gh-tok:2027-05-06,old-key:%s,claude-tok:2027-03-04,unk-tok:2027-07-08" % on(250)
+        expect_bytes = before.replace(("gh-tok:%s,old-key:%s" % (on(200), on(250))).encode(), want_value.encode())
+        check("--apply replaces a date in place, adds the new ones, keeps the other entry, exit 0",
+              (code, after == expect_bytes), (EX_OK, True))
+        check("…every other byte of the file is as it was, and the mode is kept",
+              (after.replace(want_value.encode(), b"") == before.replace(
+                  ("gh-tok:%s,old-key:%s" % (on(200), on(250))).encode(), b""),
+               oct(os.stat(d_conf).st_mode & 0o7777)), (True, "0o640"))
+        check("…and the rows afterwards show the new dates",
+              (out[0].startswith("WRITTEN: 3"), d_rows(out)[1][2], d_rows(out)[2][2]),
+              (True, "2027-05-06", "2027-03-04"))
+        put_conf(tail="crlf")
+        raw = d_file()
+        code, _out = d_run("dates", "--apply", stdin=_io.StringIO("gh-tok:2027-05-06"))
+        check("with no CREDENTIAL_EXPIRIES line, --apply adds one at the end and changes nothing above it",
+              (code, d_file() == raw + b"CREDENTIAL_EXPIRIES=gh-tok:2027-05-06\n"), (EX_OK, True))
+        put_conf(expiries="gh-tok:%s" % on(200))
+        before = d_file()
+        bads = ["gh-tok:2027-02-30\n", "gh-tok:2027-5-6\n", "nothing-listed:2027-05-06\n", "gh-tok:2027-05-06\ngh-tok:2027-06-06\n",
+                "claude-tok:2027-05-06\n" + TOKENISH + "\n", "", "\n\n"]
+        results = [d_run("dates", "--apply", stdin=_io.StringIO(b)) for b in bads]
+        check("a bad line (impossible date, short date, unlisted name, repeat, a token, nothing at all) is exit 2 and writes nothing",
+              ([r[0] for r in results], d_file() == before), ([EX_USAGE] * 7, True))
+        check("…and names the line by its number, never its text",
+              ("line 2" in " ".join(results[4][1]), TOKENISH in " ".join(results[4][1])), (True, False))
+        real_write = write_atomic
+        try:
+            def broken(path, data):
+                raise OSError("disk full")
+
+            def lying(path, data):
+                real_write(path, data.replace(b"2027-05-06", b"2027-05-07"))
+            globals()["write_atomic"] = broken
+            code_w = d_run("dates", "--apply", stdin=_io.StringIO("gh-tok:2027-05-06\n"))[0]
+            same_w = d_file() == before
+            globals()["write_atomic"] = lying
+            code_l = d_run("dates", "--apply", stdin=_io.StringIO("gh-tok:2027-05-06\n"))[0]
+        finally:
+            globals()["write_atomic"] = real_write
+        check("a write that fails, and one that reads back differently, are exit 1",
+              (code_w, same_w, code_l), (EX_FAILED, True, EX_FAILED))
+        leftovers = [n for n in os.listdir(d_kit) if n.startswith(".update.conf-")]
+        check("…and a failed write leaves no temp file beside the conf", leftovers, [])
 
     check("the probe names itself: Cloudflare refuses Python's default user agent",
           _request("https://door.example.com/status").get_header("User-agent"), USER_AGENT)

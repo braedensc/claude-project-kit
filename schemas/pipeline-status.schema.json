@@ -80,6 +80,30 @@
       "type": ["boolean", "null"],
       "description": "KIT-487. true: every such repository's open pull requests were listed. false: at least one was not, or there were more than 200, and `sources.github` says why. null: no repository is named by key, so none was looked for. An empty list is \"none open\" only when this is true."
     },
+    "kit_clone": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["state", "head", "merges_behind", "files", "files_total", "checked_at", "reason"],
+          "properties": {
+            "state": {"enum": ["current", "behind", "unknown"]},
+            "head": {"type": ["string", "null"], "pattern": "^[0-9a-f]{12}$"},
+            "merges_behind": {"type": ["integer", "null"], "minimum": 0},
+            "files": {
+              "type": "array",
+              "maxItems": 10,
+              "items": {"type": "string", "pattern": "^(scripts|schemas)/[A-Za-z0-9._-]{1,100}$"}
+            },
+            "files_total": {"type": ["integer", "null"], "minimum": 0},
+            "checked_at": {"$ref": "#/$defs/time_or_null"},
+            "reason": {"type": ["string", "null"], "maxLength": 120}
+          }
+        }
+      ],
+      "description": "KIT-581. Whether the checkout these jobs run from, the role account's copy of the kit, is behind the repository's branch. null: the job is not told a repository (`kit_repo`). `behind`: a file the jobs run, or a schema they read, changed between the checkout's head (`head`, twelve characters) and the branch; `merges_behind` counts the commits, and `files` names up to ten of the files, out of `files_total`. `current`: no file the jobs run changed (a doc or a test only may have). `unknown`: the question could not be answered, with `reason` in fixed words; never read as current. Optional: a file from before KIT-581 has none."
+    },
     "queue_room": {
       "oneOf": [
         {"type": "null"},

@@ -329,6 +329,9 @@ WATCHERS = {
         # KIT-481: review tickets whose close gave up. The beat carries the count for as long
         # as any stays open, so a log line nobody reads becomes a page.
         "gave_up_count": ("counts", "close_gave_up"),
+        # KIT-597: repositories whose reviews are paused (a routing stop, a probe not signed
+        # or no longer current). The row names them from that count alone.
+        "paused_count": ("counts", "reviews_paused"),
     },
     "bounce-driver": {
         "label": "bounce driver",
@@ -957,6 +960,16 @@ def _judge_beat(job, spec, raw, now, limit, blind, awake=None):
                          % (human_age(out["age_seconds"]), slept_note, blocked,
                             "" if blocked == 1 else "s"))
         return out
+    paused = _blocked_count(doc, spec, "paused_count")
+    if paused:
+        # The job RAN and holds its own work on purpose (KIT-597): reviews of these
+        # repositories wait for a routing probe signed after the reason. Its log says which.
+        out["verdict"] = "failing"
+        out["detail"] = ("last beat %s ago%s: reviews are paused for %d repositor%s, until the "
+                         "routing probe is signed again. Its log names each one and why"
+                         % (human_age(out["age_seconds"]), slept_note, paused,
+                            "y" if paused == 1 else "ies"))
+        return out
     gave_up = _blocked_count(doc, spec, "gave_up_count")
     if gave_up:
         # The job RAN, and has review tickets it could not close (KIT-481): the dispatcher
@@ -1268,7 +1281,7 @@ def build_comment(report, state_note, carried, recovery, watched_intervals):
     return "\n".join(lines)
 
 
-def render_report(report, intervals, notify_target=None):
+def render_report(report, intervals, notify_target=None, stale_multiplier=None):
     """The stdout form of a pass. Every pass prints this, including a quiet one — §13's
     'nothing to do' has to say what it asked and what the answer was.
 
@@ -1284,9 +1297,18 @@ def render_report(report, intervals, notify_target=None):
     for job in report.get("not_yet") or ():
         out.append("  %-15s %-18s no heartbeat yet: not installed here, or it has never run"
                    % (job, "not-running-yet"))
-    out.append("  asked: %d heartbeat file(s) against longest healthy gaps %s"
-               % (len(report["verdicts"]),
-                  ", ".join("%s=%ds" % (k, v) for k, v in sorted(intervals.items()))))
+    # The interval is how often a job runs; the limit is the age at which its heartbeat is
+    # stale (interval x stale_multiplier, floored). Printing only the interval sent a drill to
+    # the wrong minute (KIT-204), so both are printed when the multiplier is known.
+    if stale_multiplier is None:
+        gaps = ", ".join("%s=%ds" % (k, v) for k, v in sorted(intervals.items()))
+        out.append("  asked: %d heartbeat file(s) against run intervals %s"
+                   % (len(report["verdicts"]), gaps))
+    else:
+        gaps = ", ".join("%s=%ds, stale past %ds" % (k, v, stale_after(v, stale_multiplier))
+                         for k, v in sorted(intervals.items()))
+        out.append("  asked: %d heartbeat file(s) against run intervals and stale limits %s"
+                   % (len(report["verdicts"]), gaps))
     out.append("  answer: %s" % ("%d problem(s)" % len(report["problems"])
                                  if report["problem"] else "every watched job is reporting"))
     out.append("  paging: %s" % ("one comment on %s when the verdict changes" % notify_target
@@ -1681,7 +1703,8 @@ def run_pass(cfg, post=True, dry_run=False, poster=None):
     if state_note:
         log("NOTE: %s" % state_note)
     report = judge(cfg, state, now)
-    print(render_report(report, cfg["intervals"], cfg["notify_ticket_id"] or None))
+    print(render_report(report, cfg["intervals"], cfg["notify_ticket_id"] or None,
+                       cfg["stale_multiplier"]))
 
     should, why, carried = decide_post(report, state, now, cfg["min_seconds_between_comments"],
                                        cfg["notify_ticket_id"] or None)
@@ -1991,6 +2014,24 @@ def selftest():
                      NOW, 600, False)["verdict"] == "ok"
            for c in ({"close_gave_up": 0}, {}, {"close_gave_up": True}, {"close_gave_up": "2"},
                      {"close_gave_up": -1}, None)))
+    # KIT-597: the review poller's count of repositories whose reviews are paused. The row
+    # says so from that count alone, whatever the result word, and names the job.
+    held = judge_one(rp, WATCHERS[rp], beat(rp, result="error", ended_at=fresh,
+                                            counts={"reviews_paused": 2}), NOW, 600, False)
+    ok("KIT-597 a review poller with paused repositories is failing, and its row says reviews "
+       "are paused and what clears them",
+       held["verdict"] == "failing" and not held.get("planning_paused")
+       and "reviews are paused for 2 repositories" in held["detail"]
+       and "routing probe" in held["detail"] and page_job_keys([held]) == [rp], held)
+    ok("KIT-597 …one repository reads in the singular, even beside an ok result word",
+       "reviews are paused for 1 repository," in judge_one(
+           rp, WATCHERS[rp], beat(rp, result="ok", ended_at=fresh, counts={"reviews_paused": 1}),
+           NOW, 600, False)["detail"])
+    ok("KIT-597 a paused count of zero, none, or not a whole number above zero pages nothing",
+       all(judge_one(rp, WATCHERS[rp], beat(rp, result="ok", ended_at=fresh, counts=c),
+                     NOW, 600, False)["verdict"] == "ok"
+           for c in ({"reviews_paused": 0}, {}, {"reviews_paused": True}, {"reviews_paused": "2"},
+                     {"reviews_paused": -1}, None)))
     # Review of #330: Stage A is installed after Stage E, so the planner is listed before it
     # exists. Until its first beat, no file says it is not running here yet and pages
     # nothing; once seen, a file gone pages as missing.
@@ -2607,6 +2648,12 @@ def selftest():
     ok("a quiet pass still prints the answer", "every watched job is reporting" in quiet)
     loud = render_report(worse, {"review-poller": 300, "bounce-driver": 300})
     ok("a problem pass counts the problems", "2 problem(s)" in loud)
+    # KIT-204: the check line prints the stale limit, not only the interval it comes from.
+    limited = render_report(healthy, {"finding-poller": 1200}, None, 2)
+    ok("the check line prints each job's interval and its stale limit (2 x 1200 = 2400)",
+       "finding-poller=1200s, stale past 2400s" in limited, limited)
+    ok("the check line no longer calls an interval a healthy gap",
+       "longest healthy gaps" not in limited and "longest healthy gaps" not in quiet, limited)
     ok("every pass says whether paging is even on (off)",
        "paging: OFF" in render_report(healthy, {}, None))
     ok("every pass says whether paging is even on (on)",

@@ -14,13 +14,21 @@
 # it a generous timeout — the provisioning script talks to the local stack:
 #
 #   { "hooks": [ { "type": "command",
-#       "command": "bash \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/session-start-provision-env.sh",
+#       "command": "bash \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/session-start-provision-env.sh \"$CLAUDE_PROJECT_DIR\"/scripts/dev-worktree-login.sh",
 #       "timeout": 60 } ] }
+#
+# NAME THE PROVISIONING SCRIPT IN THE WIRING, AS ABOVE (KIT-603). This hook and the
+# script it runs both run outside the Bash sandbox, at every start and resume, from
+# $CLAUDE_PROJECT_DIR: on the dispatcher's lane that is the session's own worktree. The
+# PreToolUse hook self-protects every file a hook command in the settings names through
+# $CLAUDE_PROJECT_DIR, so a session cannot edit either one. This hook runs only the
+# script its wiring names. Wired without it, or with a path outside the project, it
+# provisions nothing and says so.
 #
 # No-ops silently (no error, no output) when:
 #   - .env.local already exists (already provisioned, or not a fresh worktree)
-#   - this isn't one of this project's worktrees (backend config absent, or no
-#     provisioning script)
+#   - this isn't one of this project's worktrees (backend config absent, or the
+#     named provisioning script is missing)
 #   - the local backend stack isn't running yet — legitimate; don't block
 #     session startup on it, and don't nag every session until it is.
 #
@@ -41,7 +49,6 @@ set -u
 cd "${CLAUDE_PROJECT_DIR:-.}" || exit 0
 
 [ -f .env.local ] && exit 0
-[ -x ./scripts/dev-worktree-login.sh ] || exit 0
 
 # ── STACK-SPECIFIC: project-detection + stack-up guards — swap at bootstrap ──
 # Gate on YOUR backend's config file and a "local stack is running" probe
@@ -51,9 +58,23 @@ command -v supabase >/dev/null 2>&1 || exit 0
 supabase status >/dev/null 2>&1 || exit 0
 # ── end STACK-SPECIFIC ───────────────────────────────────────────────────────
 
+# The provisioning script is the one the wiring names, never one this file picks, so it
+# is a file the settings name and therefore self-protected (KIT-603; see the header).
+provision="${1:-}"
+case "$provision" in
+  *..*) provision="" ;;                          # a `..` path is never one the hook protects
+  "${CLAUDE_PROJECT_DIR:-.}"/*) ;;
+  *) provision="" ;;
+esac
+if [ -z "$provision" ]; then
+  printf '%s\n' '{"systemMessage": "Worktree provisioning skipped: its SessionStart wiring must name the provisioning script under $CLAUDE_PROJECT_DIR, after the hook, so both stay self-protected. See the header of .claude/hooks/session-start-provision-env.sh."}'
+  exit 0
+fi
+[ -x "$provision" ] || exit 0
+
 slug="$(basename "$(pwd)")"
 
-if ./scripts/dev-worktree-login.sh "$slug" >/dev/null 2>&1; then
+if "$provision" "$slug" >/dev/null 2>&1; then
   printf '{"systemMessage": "Auto-provisioned .env.local + local login (%s@dev.local) for this worktree."}\n' "$slug"
 fi
 exit 0

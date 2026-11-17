@@ -1,0 +1,73 @@
+name: CI on the Mac's Python
+
+# KIT-653. Every job and hook on the owner's Mac runs /usr/bin/python3, which is 3.9.6. Kit
+# checks runs the Ubuntu runner's Python (3.12) and "CI on the newest image" runs the newest
+# 3.x, so before this job nothing in CI ran 3.9: a PR using anything newer passed every check,
+# merged, and then broke the live jobs. A GitHub macOS runner has Apple's Python at the same
+# path and version, so this job runs the batteries on it.
+#
+# It is a NEW workflow with its own job name on purpose: "Kit checks" is a required status
+# context, and renaming or matrixing it would leave every PR waiting forever. This job is NOT
+# required until the owner adds it (docs/TESTING.md, "Which Python each job runs"); a failure
+# turns the PR red. No `continue-on-error`: a failure that succeeds tells nobody.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  mac-python:
+    name: Kit checks (Python 3.9, the Mac's)
+    runs-on: macos-15
+    # 30: not yet measured on this image. The same batteries take 5.8 to 7.7 minutes on Ubuntu;
+    # macOS runners are slower. Set the limit from three measured runs (docs/TESTING.md).
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # The npm scripts call `python3`, and on this runner the PATH may offer a newer one. Put a
+      # link to Apple's /usr/bin/python3 first, then ASSERT it: the job never goes green on the
+      # wrong Python.
+      - name: Make python3 the Mac's Python, and prove it
+        run: |
+          set -euo pipefail
+          shim="$RUNNER_TEMP/mac-python-bin"
+          mkdir -p "$shim"
+          ln -sf /usr/bin/python3 "$shim/python3"
+          echo "$shim" >> "$GITHUB_PATH"
+          PATH="$shim:$PATH"
+          got="$(python3 -V 2>&1)"
+          want="$(/usr/bin/python3 -V 2>&1)"
+          echo "python3 on the PATH: $got ($(command -v python3))"
+          echo "/usr/bin/python3:    $want"
+          case "$got" in "Python 3.9"*) ;; *) echo "::error::python3 is '$got', not Python 3.9"; exit 1;; esac
+          [ "$got" = "$want" ] || { echo "::error::python3 ('$got') is not /usr/bin/python3 ('$want')"; exit 1; }
+
+      - name: Install dependencies
+        run: |
+          python3 -m pip install --quiet --user pyyaml
+          npm ci
+
+      # The compiled files go to a folder under RUNNER_TEMP, so the checkout stays clean.
+      - name: Byte-compile every tracked Python file
+        run: |
+          set -euo pipefail
+          python3 -V
+          export PYTHONPYCACHEPREFIX="$RUNNER_TEMP/pycache"
+          git ls-files -z '*.py' | xargs -0 python3 -m py_compile
+          echo "compiled $(git ls-files '*.py' | wc -l | tr -d ' ') files"
+
+      # Includes the hook battery (test:hooks), then every other test:* battery, one at a time.
+      - name: Every selftest battery, one at a time
+        run: |
+          python3 -V
+          npm run check:temp-leaks

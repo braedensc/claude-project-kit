@@ -4,6 +4,10 @@
   in place of the first draft of this note, which only re-worded today's chain, and said yes
   to the design that afternoon. They chose the plain DM (choice 2).
 - **Date:** 2026-11-05
+- **Piece 5, the cutover:** built 11 Nov 2026 (KIT-492). The tech lead's turn is on by default.
+  The back room, the relay, request lines, the chat bot's rules and the writer are out of the
+  kit, and the bridge's `verify` says, in its `old-paths` row, whether a deployment still runs
+  them.
 - **Builds on:** `2026-10-10-slack-bridge-acts-for-the-owner.md` (code acts only on a
   member's yes) and `2026-10-30-one-dm-tech-lead-voice.md` (one DM). The safety rules of both stand.
   The back room and relay of the second go.

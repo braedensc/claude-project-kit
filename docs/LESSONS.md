@@ -519,10 +519,16 @@ which consults all three trust-settings domains; inside the sandbox the user and
 domains answer `errSecNotAvailable` ("No keychain is available") where outside they answer
 the benign `errSecNoTrustSettings` ("No Trust Settings were found"). **Those two share an
 exit code and mean opposite things** — comparing exit codes rather than messages produced
-a confident wrong diagnosis before the messages were read. Not fixable from config: the
-sandbox exposes filesystem and network controls, with no way to permit a Mach service.
-`curl`, Python and Node all honour `SSL_CERT_FILE`, so anything but a Go binary works;
-`scripts/gh_fallback.py` is the fallback, and it reports which path it took so a silent
+a confident wrong diagnosis before the messages were read. This lesson once said config
+could not fix it. Claude Code's sandbox docs now name the failure ("Go-based CLIs fail TLS
+verification on macOS") and give two fixes, and **each one widens the sandbox**. A `gh *`
+pattern in `excludedCommands` runs `gh` outside the sandbox with full access, and `gh`
+runs extensions and aliases, so that is an unsandboxed shell. `enableWeakerNetworkIsolation`
+is meant for a MITM proxy with its own CA, which this proxy is not (it passes GitHub
+through), and the same docs list it among the keys that weaken the sandbox. **The kit takes
+neither** (KIT-71): nothing a session does needs `gh` itself. `curl`, Python and Node all
+honour `SSL_CERT_FILE`, so anything but a Go binary works. `scripts/gh_fallback.py` is the
+design for a sandboxed session, not a stopgap. It reports which path it took, so a silent
 substitution cannot hide either the day `gh` recovers or the day the fallback breaks.
 
 **A PR body is the wrong home for anything that must outlive review.** It is read once,

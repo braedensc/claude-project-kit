@@ -133,6 +133,33 @@ def _inside(path, root):
     return (path.rstrip(os.sep) + os.sep).startswith(root)
 
 
+def config_for_worktree(config_dir, here=None):
+    """The one config in `config_dir` whose `worktree` is the folder this server was started in (KIT-571).
+
+    The acceptance entry's MCP config lists this server once, with `--config-dir`. Before each check's session starts,
+    the live pass writes one config into that folder, naming the session's worktree and the plan. The dispatcher starts
+    the session, and so this server, in that worktree, which the session cannot change: it cannot pick another check's
+    config. The folder is outside every worktree, so the session cannot write one either. No config naming this folder,
+    or more than one, is a refusal, said in words; a file that is not a config is passed over."""
+    here = os.path.realpath(here or os.getcwd())
+    try:
+        names = sorted(n for n in os.listdir(config_dir) if n.endswith(".json"))
+    except OSError as exc:
+        raise Refused("could not list the look tool's config folder %s: %s" % (config_dir, exc.strerror or exc))
+    found = []
+    for name in names:
+        try:
+            cfg = load_config(os.path.join(config_dir, name))
+        except Refused:
+            continue
+        if cfg["worktree"] == here:
+            found.append(dict(cfg, _config_path=os.path.join(config_dir, name)))
+    if len(found) != 1:
+        raise Refused("%s look config in %s names this worktree (%s): the live pass writes exactly one for each check, "
+                      "before its session starts" % ("no" if not found else "more than one", config_dir, here))
+    return found[0]
+
+
 def _records(cfg, counted=False):
     """The plan's record names. With `counted`, only those that used one of the plan's runs: a record that says
     no browser was started (`playwright_from: none`, a tool-side misconfiguration) does not."""
@@ -412,6 +439,11 @@ def keep_shots(dest, items):
 
 def look_run(cfg, args, runner=None, now=None):
     """(text, images): refuses with Refused; otherwise runs, records, and returns what was seen."""
+    # KIT-571: a server that found its config in a folder of per-check configs looks again at every call. The live pass
+    # removes a check's config when it stops the check past its time limit, and from then on every run is refused.
+    if cfg.get("_config_path") and not os.path.isfile(cfg["_config_path"]):
+        raise Refused("this check was stopped: its config is gone, so no more runs are allowed. Say in your result what "
+                      "you could not check")
     if not os.path.isfile(PROFILE):
         raise Refused("the kit's sandbox profile is missing (%s): the runner is never run without it" % PROFILE)
     build, block, delivery = check_request(cfg, args)
@@ -591,17 +623,19 @@ def serve(cfg, stdin=None, stdout=None, runner=None):
 
 def main(argv=None):
     p = argparse.ArgumentParser(description="The look tool: one browser check in a locked sandbox (KIT-323).")
-    p.add_argument("--config")
+    p.add_argument("--config", help="one config file, for one session")
+    p.add_argument("--config-dir", help="a folder of per-check configs; the one naming this worktree is used (KIT-571)")
     p.add_argument("--selftest", action="store_true")
     args = p.parse_args(argv)
     if args.selftest:
         from scratch_run import contained
         return contained(selftest, "look-selftest-run-")
-    if not args.config:
+    if bool(args.config) == bool(args.config_dir):
         p.print_usage(sys.stderr)
+        sys.stderr.write("look: give exactly one of --config and --config-dir\n")
         return 2
     try:
-        cfg = load_config(args.config)
+        cfg = load_config(args.config) if args.config else config_for_worktree(args.config_dir)
     except Refused as exc:
         sys.stderr.write("look: %s\n" % exc)
         return 2
@@ -1008,6 +1042,40 @@ def selftest():
             "name": "look_run", "arguments": good}}, conf(plan="plan-6"), fake)
         check("a good call returns text and the screenshot as an image", [c["type"] for c in good_call["result"]["content"]],
               ["text", "image"])
+
+        # KIT-571: one server line for every acceptance session; each finds the one config naming its own worktree
+        cdir = os.path.join(root, "per-check")
+        wt2 = os.path.join(root, "wt2")
+        os.makedirs(cdir)
+        os.makedirs(wt2)
+
+        def put(name, **over):
+            doc = {"worktree": wt, "record_dir": rec, "node": node, "browsers": root + "/browsers", "role_home": home,
+                   "plan": "TOD-100", "max_runs": 2, "playwright_dir": pwd}
+            doc.update(over)
+            with open(os.path.join(cdir, name), "w") as fh:
+                json.dump(doc, fh)
+        put("ACC-1.json")
+        put("ACC-2.json", worktree=wt2, plan="TOD-200")
+        with open(os.path.join(cdir, "broken.json"), "w") as fh:
+            fh.write("{not json")
+        check("a server started in a worktree takes the one config naming it, and nothing else",
+              [(config_for_worktree(cdir, w)["worktree"], config_for_worktree(cdir, w)["plan"]) for w in (wt, wt2)],
+              [(wt, "TOD-100"), (wt2, "TOD-200")])
+        check("a server started anywhere else is refused, in words",
+              "no look config" in (refusal(lambda: config_for_worktree(cdir, root)) or ""), True)
+        put("ACC-3.json", plan="TOD-300")
+        check("two configs naming one worktree are refused: a session never gets to pick",
+              "more than one look config" in (refusal(lambda: config_for_worktree(cdir, wt)) or ""), True)
+        check("a config folder that cannot be read is refused",
+              "could not list" in (refusal(lambda: config_for_worktree(os.path.join(root, "nowhere"), wt)) or ""), True)
+        check("exactly one of --config and --config-dir", [main([]), main(["--config", cfgfile, "--config-dir", cdir])],
+              [2, 2])
+        os.unlink(os.path.join(cdir, "ACC-3.json"))
+        mine = config_for_worktree(cdir, wt)
+        os.unlink(os.path.join(cdir, "ACC-1.json"))
+        check("once a stopped check's config is gone, a server that found it refuses every run",
+              "this check was stopped" in (refusal(lambda: look_run(mine, good, fake)) or ""), True)
 
         # KIT-567: the screenshots are kept beside the record, from the bytes that were hashed, and nothing else is
         def fake_with(make, rc=0):

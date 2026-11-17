@@ -73,6 +73,12 @@ counts these in `counts.close_gave_up`, for as long as any stays open. Above zer
 reads **failing**, whatever the result word, and says how many tickets need closing. The job
 is still the review poller, so the page names it as before.
 
+**The review poller's paused reviews (KIT-597).** On the work teams, a repository's reviews
+pause after a misroute, without a current routing sign-off, or on another dispatcher version.
+The heartbeat counts paused repositories in `counts.reviews_paused`. Above zero, the row reads
+**failing**, whatever the result word, and says reviews are paused until the routing probe is
+signed again. The poller's log names each repository and why.
+
 **The conflict waker** runs under your own login, and its heartbeat sits in your home, which
 the role account cannot read. So the health watch reads it instead, as its `conflict-waker`
 kind, and this monitor names the waker on the page from the health watch's row (below).

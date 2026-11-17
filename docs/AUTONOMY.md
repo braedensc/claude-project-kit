@@ -23,8 +23,14 @@ the rung the other three are built on, and the one to start from.
 **One ordering matters before any of this.** `delivery.json`'s existence is the entire
 discriminator (§2), which makes it a one-way switch: the commit that adds it turns every
 pipeline guard live at once, including guards for machinery the project has not ported
-yet. Port or build the pieces first and commit the config last — configured early, a
+yet. Port or build the pieces first and commit the config after them — configured early, a
 project reads as enforcing while nothing enforces ([`LESSONS.md`](LESSONS.md)).
+**But not after the dispatcher's first session.** On a dispatcher that writes no pin, the
+hook and the lane marker *are* the enforcement. The hook's pipeline guards run only
+once the config exists. Without the config, a dispatched session meets no pipeline
+guard. With it but no marker, the hook takes the session for a person's: it can create
+tickets, write any ticket and set its own supervision labels. So the config and the marker both come
+before that first session — [`START-HERE.md`](START-HERE.md), part 2, steps 3 to 6.
 
 One thing *is* required before any of it works: **[the push credential](#the-push-credential--required-before-any-tier-does-anything)**.
 Without it the dispatcher and the bounce workflow skip, on purpose.
@@ -498,6 +504,30 @@ approve itself, the pipeline could widen its own mandate by writing a ticket, an
 ticket asking for X"* is a capability every one of those paths has. `epic/*` is the only
 class whose approval traces back to something a person did.
 
+### A prerequisite filed under an approved plan (KIT-611)
+
+One thing is filed under an approved plan without a person: a missing prerequisite. A
+started piece of the plan writes a plan note saying work no piece covers is missing. The
+tech lead judges it, and the Slack bridge's own code decides
+([`BRIDGE-OPERATOR.md`](BRIDGE-OPERATOR.md), "When a piece says the plan needs changing").
+The plan executor's `--prerequisite` mode then files one ticket. It sits under the epic, in
+its team and project, in the backlog, with `provenance:agent`, and blocks the piece.
+
+This relaxes the executor's rule 1 for one path. Rule 1 says a child's parent is only the
+epic made in the same run. Here the parent comes from the bridge's own approval record:
+the executor reads that record itself and refuses any epic or piece it does not hold. Text
+a session wrote never names the parent. The ticket is `agent`, so this tier never approves
+it, and the bridge starts only pieces the owner approved. It starts when a person hands
+it over. A runaway cap holds: at most 15 per plan per day. The decision is
+[`adr/2026-11-12-a-prerequisite-filed-under-an-approved-plan.md`](adr/2026-11-12-a-prerequisite-filed-under-an-approved-plan.md).
+
+Good: *I filed PROD-61 under PROD-50: PROD-51 needs it first, and no piece of the plan
+covered it.* PROD-61 sits in the backlog, `provenance:agent`, and waits for your hand-over.
+Not that: a prerequisite in `ready`, or started by itself. Nothing files into `ready` and
+nothing starts it; look for who moved it.
+Not that: a prerequisite under a plan the note named in its text. The parent comes from
+the record alone; report it as a bug.
+
 ### Turning it on
 
 1. `autonomy.autoApproveProvenance` is `["epic"]` in `delivery.json` (the shipped
@@ -531,6 +561,11 @@ ruleset, targeting the default branch:
 - **Require a pull request before merging**, with at least **1 approving review**
 - **Require linear history**
 - **Block force pushes**
+
+With the validator approving merges in your place, its `Validator` check takes the place of
+the approving review: `scripts/pipeline_validator_app.py` adds the check with the validator's
+own app as its source, and drops the review, on your typed yes (docs/VALIDATOR-OPERATOR.md,
+*Make the check required*).
 
 Then create the label the grader-path job needs:
 

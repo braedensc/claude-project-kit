@@ -1,3 +1,5 @@
+> Plain-language pages for the idea gate: the guide `docs/guides/idea-gate.md`, the lesson `docs/lessons/idea-gate.md` and the runbook `docs/runbooks/idea-gate.md`. This file stays the dense reference.
+
 # Stage A — the idea gate, for the operator
 
 The sibling of `docs/STAGE-E-OPERATOR.md`, pointed at planning instead of review. It says
@@ -59,7 +61,11 @@ Never both on one ticket.
      directive and fence marker removed, including one spelt with an escape or a
      character reference;
    - its only label is the repository's **routing label**, of the same name;
-   - it has no project.
+   - it has no project;
+   - every `$` in its title and text is written `$$` (KIT-614). The dispatcher puts both
+     into the session's prompt with a replace that reads `$` sequences, and turns each
+     `$$` back into one `$`, so the session reads your idea as you wrote it. In the
+     tracker, the planning ticket shows the doubled `$`.
 
    It creates the ticket and hands it to the agent in one call.
 4. The dispatcher starts a **planning session** in the repository's planning entry.
@@ -138,9 +144,29 @@ next time the installer writes its settings: they leave out the probe block, and
 nothing without it (KIT-526). Good: no such line. Not that: the line above. Run the probe, sign
 it, run the installer. A probe signed before this check has no fingerprint, so it is not asked.
 
+**The same probe proves the review entries** (KIT-598). Where this Mac also runs Stage E,
+the probe files two more tickets per reviewed repository: one carrying the tag and the label
+`reviews-<name>`, one carrying the label alone. Both are closed when the probe ends. A
+signed probe then writes `~/.stage-a/routing-signoff.json` under the role account: when it
+was signed, on which dispatcher version, and which entries it reached by which route. The
+review poller reads that file, and files no review for a repository whose entry it does not
+show reached both ways. The installer removes the file on any pass where the probe no longer
+holds. That covers another dispatcher version, one it cannot read, changed routing code, a
+changed planning entry, and a planning stop after the sign-off. Reviews then pause until the
+probe is signed again. One re-sign clears a stop and a version change for both lanes. Review probes are filed only
+once the review entries route by their own label; until then the run says so, and signs
+planning alone. Good: `filed PROD-12 (tag and label) and PROD-13 (label only) for
+reviews-kit`. Not that: `the review entry reviews-kit is not covered by the probe yet` after
+a signed probe. Run the probe again.
+
 **What is left:** a planning ticket that misses both routes runs in the coding setup for the
 seconds before the cancel lands. It works from the clean copy, its working copy is deleted,
 and it cannot merge.
+
+**Review tickets sit on the same team, and the planner's jobs skip them too** (KIT-595).
+The executor's duplicate check leaves them out, by their `reviews-…` label or opening tag, as
+it leaves out planning tickets. So do the finding poller and the catch-up poller. A mark is
+enough for those skips: each only spares work.
 
 ## 4. What each part refuses
 
@@ -196,6 +222,37 @@ and it cannot merge.
 - Files a proposal once: the epic carries a receipt.
 - Lists children whose titles look like recent tickets, leaving out the idea and every
   planning ticket.
+
+**The executor's prerequisite mode (KIT-611)**
+
+A started piece of an approved plan may say work no piece covers is missing. When the
+Slack bridge decides to file it, it runs the executor with `--prerequisite`, its request,
+and `--approvals`, its own state file. Nothing else runs this mode, and no session can
+select it. It:
+- Files one ticket: under the epic, in its team and project, in the team's first backlog
+  state, with `provenance:agent` and no other label. One `blocks` edge runs to the piece.
+- Takes the parent from the bridge's approval record alone. It refuses an epic the record
+  does not hold, a piece the record does not approve under it, and an identifier. It also
+  refuses an epic now on another team, and a piece the tracker no longer lists under it.
+- Refuses a record a session could have written: a link, another account's file, a file
+  or folder others may write, or one inside a git working tree.
+- Files at most 15 under one plan in a day, counted from the tracker. The 16th is refused.
+- Files a request once: the ticket carries a `Prerequisite id:` receipt. A retry makes
+  only an edge that is missing, and never touches a ticket a person cancelled or took the
+  label off.
+- Posts no comment, moves nothing, and runs no readiness gate: no approval releases a
+  `provenance:agent` ticket. It waits for a person to hand it over.
+
+Exit codes are the executor's own: 0 filed, 3 refused, 2 failed. A partial filing, the
+ticket made but not its edge, is 2, and its verdict names the ticket.
+
+Good: `filed PROD-61 under PROD-50, in the backlog with provenance:agent, blocking PROD-51.`
+Good: a refusal at the cap, `15 prerequisites were filed under PROD-50 in the last day`, and
+the bridge asks you instead.
+Not that: `the epic is not a plan the bridge's approval record holds`. The request named an
+epic the bridge never approved; report it as a bug. Nothing was filed.
+Not that: `the approval record is inside a git working tree`. The bridge's `state_dir` must
+sit outside every checkout; fix the config, never the check.
 
 **Other jobs on the same team** skip planning tickets. The finding poller skips one by its
 label or its opening tag. The review poller's discovery and the criteria snapshot also need
@@ -288,11 +345,22 @@ What it does, in order:
      read it. It records the sign-off and closes the tickets.
 
      Two more questions come only when a list was not measured. If a list came back but
-     could not be read, it asks about that list alone. If no helper list came back, it
-     says the helper was not measured and asks whether to sign anyway. If a helper list
-     came back but the log shows no helper started, that list is **not counted**, even
-     as prose. It says so and asks the same question. The record says which lists were
-     read, and how. A session list nothing measured is never signed.
+     could not be read, it asks about that list alone. It asks the same when a list names
+     a tool server or a rule, like `mcp__linear__*`, only in a sentence. The sentence may
+     say the session holds those tools or that it does not, so you read it.
+
+     A line that may name a tool is never passed over in silence, however many clean lines
+     sit beside it (KIT-734). That covers a note such as `Read (and Bash)`, a sentence such
+     as `I also hold Bash and Write`, and a name wrapped in punctuation, such as `**Bash**`.
+     The probe shows you the line and asks the same question. An exact `mcp__` tool name
+     still stops the probe, wrapped in underscores or not. A line with no capital letter and
+     no `mcp__` in it, such as a code fence or `sorted by name`, names no tool and is
+     ignored. So is a lower-case sentence that uses `read` or `write` as a verb. A lower-case
+     `bash`, `webfetch` or `notebookedit` is not ignored: no English word looks like them. If no helper
+     list came back, it says the helper was not measured and asks whether to sign anyway.
+     If a helper list came back but the log shows no helper started, that list is **not
+     counted**, even as prose. It says so and asks the same question. The record says
+     which lists were read, and how. A session list nothing measured is never signed.
 
      The same session's log also says whether a helper started and whether the test file
      was read. An older session's log never answers for it. If that log holds no call
@@ -451,6 +519,19 @@ Exit codes: `0` the pass ran, `1` something will be retried, was given up on, or
 blocked, and it says so, `2` config or credential, nothing was touched, `4` the pass hit its
 wall clock.
 
+### The order page: a piece handed over before what it waits on is Done (KIT-239)
+
+The Slack bridge (`docs/BRIDGE-OPERATOR.md`) starts an approved plan's pieces in order, only when
+every ticket that blocks one is Done. You can still hand a piece to the agent yourself in Linear.
+When you do, while something it waits on is open, you get one DM: *PROD-52 was handed to the
+agent while it still waits on PROD-51 (Backlog).* It means the piece may build on code that is
+not merged, so its pull request can fail or repeat work. Nothing was stopped or changed.
+
+What to do: if you meant it, nothing. If not, take the agent off the piece in Linear, then hand
+it over again once what it waits on is Done, or let the bridge start it in order. It is
+sent once per session, and never for a hand-over the bridge made itself (a session that starts
+within ten minutes of it). You handing the same piece over again later is checked on its own.
+
 ### What a planning run came to (KIT-373)
 
 The executor writes what it did to a file the job names (`--verdict-file`), on every exit
@@ -552,6 +633,11 @@ else happened (`created`, `already-filed`, `asked`, `no-proposal`, `no-message`,
   this happens on a live session is not yet seen. If the log shows no helper started, a
   helper list in the answer is not counted, and the record says so. A fenced tool named
   in it still stops the probe (KIT-261).
+- **A helper's list is the session's own words.** The probe asks about every line that may
+  name a tool (KIT-734). It cannot catch a paraphrase that names none, such as "a shell",
+  or a lower-case `read`, `write` or `edit`, which are also ordinary verbs. Only a helper
+  whose tools the runner records closes that. The dispatcher's log records the session's
+  tools, never a helper's.
 - **The duplicate check compares titles, not intent.**
 - **The heartbeat monitor watches the job, once the Stage E installer has run.** It reads
   `~/.stage-a/state/heartbeat.json` as its seventh job (`docs/HEARTBEAT-MONITOR.md`): a stale

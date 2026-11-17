@@ -9,7 +9,8 @@ exactly what to do, and exits 10. You do that one thing and run the SAME command
 again: it checks your work and carries on. It never asks you to type `y`.
 
 WHAT IT BUILDS.  The review-and-bounce layer beside an already-running
-dispatcher: a Reviews team in the tracker, an env file and four config files
+dispatcher: a routing label per reviewed repository in the tracker (review tickets
+sit on the work teams, KIT-599), an env file and four config files
 under the dispatcher's role account (the review poller's, the bounce driver's,
 the finding poller's and the catch-up poller's), one repository entry per
 reviewed repository in the dispatcher's own config, and three system LaunchDaemons
@@ -149,14 +150,14 @@ WHAT IT REFUSES
     was for.  But it is not a boundary, and writing it as one is how a
     guarantee ends up narrower than its own wording.
 
-    THE DURABLE BOUNDARIES ARE ELSEWHERE, AND THEY ARE THE ONES TO RELY ON:
-    the PreToolUse hook, which is self-protected and which a session cannot
-    edit (a deny rule for this file invoked with a marker unset or emptied is
-    a HUMAN's change to make, deliberately not attempted from here); and the
-    role account's own file permissions, which is why the credential lives at
-    mode 600 under ITS home and is reached only through `sudo -u`.  A machine
-    whose owner wants the stronger claim adds the first; this file's job is to
-    state which claim it is actually making.
+    THE DURABLE BOUNDARY IS ELSEWHERE, AND IT IS THE ONE TO RELY ON: the role
+    account's own file permissions, which is why the credential lives at mode
+    600 under ITS home and is reached only through `sudo -u`.  The PreToolUse
+    hook (self-protected) now also refuses a Bash command that runs this file,
+    or any gated kit script, while removing or blanking a marker (KIT-107).
+    It reads command text, so it is advisory like every Bash pattern guard
+    (docs/SECURITY.md): it makes the deliberate version visible, nothing
+    more.  This file's job is to state which claim it is actually making.
   * MERGING, APPROVING, LABELLING.  There is no code path to any of them.  The
     installer CHECKS whether the pull requests are merged and PRINTS the exact
     commands for a person.  `--selftest` asserts the banned tokens are absent
@@ -226,6 +227,9 @@ from pipeline_dispatch_local import AGENT_ENV_MARKERS  # noqa: E402
 # Stage E's own GitHub app (KIT-578). The `github-app` step proves it with the same helper the
 # review poller posts with, so the two cannot disagree about what the app is.
 import pipeline_github_app as gha  # noqa: E402
+# What the review lane shares with the idea gate: the routing sign-off and the stop file,
+# by their place under the role account's home (KIT-599).
+import pipeline_machine_tickets as machine  # noqa: E402
 
 SCHEMA = "stage-e-setup/1"
 LINEAR_API = "https://api.linear.app/graphql"
@@ -360,7 +364,7 @@ MCP_FENCE_RULE_RE = re.compile(r"^mcp__([A-Za-z0-9_-]+?)(__\*)?$")
 MCP_SERVER_NAME_RE = re.compile(r"^[A-Za-z0-9-]+(?:_[A-Za-z0-9-]+)*$")
 
 # --------------------------------------------------------------------------- #
-# ONE REVIEW ENTRY PER REVIEWED REPOSITORY — and one Reviews team.
+# ONE REVIEW ENTRY PER REVIEWED REPOSITORY — and its tickets on the work teams.
 #
 # A review session's worktree is cut from ONE entry's clone. While there was a
 # single `reviews` entry, its `repositoryPath` was copied from the first entry
@@ -378,6 +382,13 @@ MCP_SERVER_NAME_RE = re.compile(r"^[A-Za-z0-9-]+(?:_[A-Za-z0-9-]+)*$")
 # `[repo=reviews-<name>]` into the review ticket it files, and the dispatcher's
 # router reads description tags FIRST — before labels, projects and team keys.
 #
+# KIT-599: there is no Reviews team either. A review ticket sits on the coding ticket's
+# own work team, whose key belongs to the CODING entry, so the entry claims no team key
+# and routes on its own label `reviews-<name>` instead: the second net for a tag that
+# failed to route. An entry with a routing label is never a catch-all. The poller checks
+# the dispatcher's routing note on every review ticket in the same pass, and pauses that
+# repository's reviews on a wrong one (scripts/pipeline_review_poller.py).
+#
 # THE NAME IS THE REVIEW ENTRY'S, NEVER THE REPOSITORY'S. A tag matches an entry
 # by githubUrl tail, by name or by id, and the router starts a session in EVERY
 # entry it matches, so `[repo=<the repository>]` would also match the CODING
@@ -386,20 +397,8 @@ MCP_SERVER_NAME_RE = re.compile(r"^[A-Za-z0-9-]+(?:_[A-Za-z0-9-]+)*$")
 REVIEW_ENTRY_PREFIX = "reviews-"
 
 # The id the single-entry installer wrote. A pass that finds it REMOVES it: left
-# in place it still claims the Reviews team key, and the router hands the key to
-# whichever entry claims it first — which would be the one this change exists to
-# retire, pointed at the wrong clone.
+# in place it still claims the old Reviews team key, and pointed at the wrong clone.
 LEGACY_REVIEW_ENTRY_ID = "reviews"
-
-# WHY EVERY REVIEW ENTRY CARRIES A ROUTING LABEL THAT MUST NEVER EXIST.
-# The router's last resort before giving up is a "catch-all": the first entry
-# with no teamKeys, no routingLabels and no projectKeys. Exactly one review
-# entry carries the Reviews team key (below), so without this the others would
-# be catch-all candidates — and a ticket from some unconfigured team, which
-# today raises a "which repository?" prompt, would silently start a reviewer
-# session instead. The label names itself: creating it in the tracker is the
-# only way to route by it, and nobody has a reason to.
-REVIEW_ENTRY_NEVER_LABEL = "stage-e-review-entry-never-label-routed"
 
 # The characters the dispatcher's bracketed-tag pattern accepts, minus `/` and
 # `#`, which mean something else inside a tag. Kept identical to the poller's
@@ -477,15 +476,35 @@ SIBLING_JOBS = (
                             "pipeline_bridge_plans.py", "pipeline_bridge_replan.py",
                             "pipeline_bridge_requests.py", "pipeline_bridge_tech_lead.py",
                             "pipeline_bridge_tracker.py", "pipeline_bridge_transport.py",
-                            "pipeline_bridge_wake.py", "pipeline_bridge_watch.py",
+                            "pipeline_bridge_watch.py",
                             "pipeline_notify_events.py", "pipeline_notify_local.py",
                             "pipeline_plan_poller.py", "pipeline_plan_executor.py",
                             "pipeline_queue_order.py", "pipeline_queue_pool.py",
-                            "pipeline_queue_read.py", "pipeline_queue_start.py",
-                            "pipeline_sprint.py", "pipeline_standup.py",
+                            "pipeline_queue_read.py", "pipeline_queue_settings.py", "pipeline_queue_start.py",
+                            "pipeline_sprint.py", "pipeline_sprint_changes.py", "pipeline_sprint_plan.py",
+                            "pipeline_sprint_review.py", "pipeline_standup.py",
                             "pipeline_tech_lead_tools.py",
                             "pipeline_tech_lead_turn.py", "pipeline_voice.py",
                             "pipeline_window.py")),
+    # The bridge's always-on job (KIT-561): Slack's push connection, run by its own LaunchDaemon from
+    # the same clone. It loads the bridge, and the standard-library WebSocket client it reads Slack with.
+    ("pipeline_bridge_push.py", ("pipeline_bridge.py", "pipeline_bridge_answers.py",
+                                "pipeline_bridge_bind.py", "pipeline_bridge_config.py",
+                                "pipeline_bridge_direct.py", "pipeline_bridge_handover.py",
+                                "pipeline_bridge_pings.py", "pipeline_bridge_plans.py",
+                                "pipeline_bridge_push.py", "pipeline_bridge_replan.py",
+                                "pipeline_bridge_requests.py", "pipeline_bridge_tech_lead.py",
+                                "pipeline_bridge_tracker.py", "pipeline_bridge_transport.py",
+                                "pipeline_bridge_watch.py",
+                                "pipeline_notify_events.py", "pipeline_notify_local.py",
+                                "pipeline_plan_executor.py", "pipeline_plan_poller.py",
+                                "pipeline_queue_order.py", "pipeline_queue_pool.py",
+                                "pipeline_queue_read.py", "pipeline_queue_settings.py", "pipeline_queue_start.py",
+                                "pipeline_sprint.py", "pipeline_sprint_changes.py", "pipeline_sprint_plan.py",
+                                "pipeline_sprint_review.py", "pipeline_standup.py",
+                                "pipeline_tech_lead_tools.py", "pipeline_tech_lead_turn.py",
+                                "pipeline_voice.py", "pipeline_window.py",
+                                "pipeline_ws_client.py")),
     # The queue's two jobs (KIT-456): the usage job, and the morning job.
     ("pipeline_usage_local.py", ("pipeline_usage_local.py", "pipeline_usage_runs.py")),
     ("pipeline_morning.py", ("pipeline_bridge.py", "pipeline_bridge_answers.py",
@@ -494,14 +513,15 @@ SIBLING_JOBS = (
                              "pipeline_bridge_pings.py", "pipeline_bridge_plans.py",
                              "pipeline_bridge_replan.py", "pipeline_bridge_requests.py",
                              "pipeline_bridge_tech_lead.py", "pipeline_bridge_tracker.py",
-                             "pipeline_bridge_transport.py", "pipeline_bridge_wake.py",
+                             "pipeline_bridge_transport.py",
                              "pipeline_bridge_watch.py", "pipeline_day_plan.py",
                              "pipeline_day_planner.py", "pipeline_morning.py",
                              "pipeline_notify_events.py", "pipeline_notify_local.py",
                              "pipeline_plan_executor.py", "pipeline_plan_poller.py",
                              "pipeline_queue_order.py", "pipeline_queue_pool.py",
-                             "pipeline_queue_read.py", "pipeline_queue_start.py",
-                             "pipeline_sprint.py", "pipeline_standup.py",
+                             "pipeline_queue_read.py", "pipeline_queue_settings.py", "pipeline_queue_start.py",
+                             "pipeline_sprint.py", "pipeline_sprint_changes.py", "pipeline_sprint_plan.py",
+                             "pipeline_sprint_review.py", "pipeline_standup.py",
                              "pipeline_tech_lead_tools.py",
                              "pipeline_tech_lead_turn.py", "pipeline_usage_local.py",
                              "pipeline_usage_runs.py", "pipeline_voice.py",
@@ -519,6 +539,9 @@ SIBLING_JOBS = (
                                     "pipeline_tech_lead_turn.py", "pipeline_voice.py")),
     # The sweep (KIT-464, KIT-467): it loads nothing beyond REQUIRED_SCRIPTS.
     ("pipeline_sweep.py", ("pipeline_sweep.py",)),
+    # The acceptance check's live pass (KIT-571), run from this clone by its own LaunchDaemon, which the acceptance installer
+    # puts in place (KIT-326). It loads the poller that decides and judges, and the look tool's record reader.
+    ("pipeline_acceptance_run.py", ("pipeline_acceptance_poller.py", "pipeline_acceptance_run.py", "pipeline_look.py")),
 )
 SIBLING_ENTRY_SCRIPTS = tuple(entry for entry, _files in SIBLING_JOBS)
 
@@ -535,11 +558,7 @@ CLONE_JOB_SCRIPTS = REQUIRED_SCRIPTS + tuple(sorted(
 # without touching a single script.
 RUNTIME_DATA_DIRS = ("schemas",)
 
-# The workflow states a Reviews team needs beyond the stock set. `Ready`
-# authorises nothing here — review tickets are delegated on creation — but the
-# board stays legible next to the work teams if it carries the same shape.
-REQUIRED_STATES = (("Ready", "unstarted"), ("In Review", "started"),
-                   ("Blocked", "started"))
+# The colour of a label this installer creates.
 STATE_COLOR = "#95a2b3"
 
 REVIEWER_BRIEF = (
@@ -724,11 +743,20 @@ def secret_shape(name, value):
 # The conf
 # --------------------------------------------------------------------------- #
 CONF_REQUIRED = ("ROLE_ACCOUNT", "DISPATCHER_SERVICE", "DISPATCHER_CONFIG",
-                 "KIT_REPO_URL", "REVIEWS_TEAM_KEY", "AGENT_DISPLAY_NAME",
+                 "KIT_REPO_URL", "AGENT_DISPLAY_NAME",
                  "MODEL_LABEL", "OWNER_LINEAR_EMAIL", "REVIEW_REPOS")
+# KIT-599: review tickets are filed on the work teams, so there is no Reviews team to name.
+# These two keys are accepted for one release so an older stage-e.conf still parses, and
+# are ignored; the tracker step says so by name.
+RETIRED_CONF_KEYS = ("REVIEWS_TEAM_KEY", "REVIEWS_TEAM_NAME")
 CONF_DEFAULTS = {
-    "REVIEWS_TEAM_NAME": "Reviews",
+    "REVIEWS_TEAM_KEY": "",
+    "REVIEWS_TEAM_NAME": "",
     "MANAGED_TEAM_KEYS": "",
+    # The dispatcher's own port on this machine. The review poller reads its `/version`
+    # there and pauses reviews on any version other than the one the routing probe was
+    # signed on (KIT-597). The idea gate's installer reads the same port.
+    "DISPATCHER_PORT": "3456",
     "POLL_INTERVAL_SECONDS": "120",
     "BOUNCE_INTERVAL_SECONDS": "120",
     "FINDING_INTERVAL_SECONDS": "300",
@@ -788,7 +816,7 @@ CONF_DEFAULTS = {
     # KIT-380: the model a filed finding runs on once a person hands it to the agent, as a
     # `[model=…]` tag opening its description. The dispatcher's default model also runs the
     # chat bot, so set this before moving that default. Empty files no tag. Review tickets
-    # and the bounce driver's fix ticket carry MODEL_LABEL instead, which a default never moves.
+    # carry MODEL_LABEL instead, which a default never moves.
     "TICKET_MODEL": "",
     # KIT-418: the label a review ticket gets INSTEAD of MODEL_LABEL when its PR changes a
     # guarded path (the grader-path floor, plus the base's autonomy.riskPaths). Empty: one
@@ -895,14 +923,10 @@ def validate_conf(values):
     if conf.get("KIT_REPO_URL") and not conf["KIT_REPO_URL"].startswith("https://"):
         errors.append("KIT_REPO_URL must be an https git URL — the role account has no keys "
                       "(got %r)" % conf["KIT_REPO_URL"])
-    if conf.get("REVIEWS_TEAM_KEY") and not _TEAM_KEY_RE.match(conf["REVIEWS_TEAM_KEY"]):
-        errors.append("REVIEWS_TEAM_KEY %r must be 1-5 upper-case letters or digits — it "
-                      "becomes a branch prefix" % conf["REVIEWS_TEAM_KEY"])
-    for key in ("REVIEWS_TEAM_KEY",):
-        for other in split_list(conf.get("MANAGED_TEAM_KEYS", "")):
-            if conf.get(key) and other.upper() == conf[key].upper():
-                errors.append("REVIEWS_TEAM_KEY %s also appears in MANAGED_TEAM_KEYS — a "
-                              "review team must not be a work team" % conf[key])
+    port = str(conf.get("DISPATCHER_PORT") or "")
+    if not (port.isdigit() and 1 <= int(port) <= 65535):
+        errors.append("DISPATCHER_PORT %r is not a port number — the review poller reads the "
+                      "dispatcher's version at http://127.0.0.1:<port>/version" % port)
     # EMPTY IS NOT "ANY TEAM" ANY MORE. Since the finding poller joined the
     # install (#94) this value feeds its `teams`, and that component REFUSES an
     # empty list — it scans work teams for finding comments, and a scan of no
@@ -1279,9 +1303,13 @@ class SudoSession(object):
     it to be killed mid-sleep.
     """
 
-    def __init__(self, validate=None, refresh=None, interval=SUDO_REFRESH_SECONDS):
+    def __init__(self, validate=None, refresh=None, interval=SUDO_REFRESH_SECONDS,
+                 probe=None):
         self._validate = validate or _sudo_validate
         self._refresh = refresh or _sudo_refresh
+        # Is a password already live in this terminal? `sudo -n -v` can never prompt.
+        # A session given a stand-in password (a selftest) never probes the real sudo.
+        self._probe = probe or (_sudo_refresh if validate is None else (lambda: 1))
         self._interval = interval
         self.acquisitions = 0     # `--selftest` asserts this never exceeds 1
         self.refreshes = 0
@@ -1294,6 +1322,12 @@ class SudoSession(object):
         untouched. Idempotent: the second call through any path is a no-op, so
         no code path can turn this back into a prompt per probe."""
         if self.held:
+            return True
+        if self._live():
+            # ALREADY LIVE — an earlier step of the same run asked a moment ago, in this
+            # terminal. Held and kept fresh, with no second banner claiming to ask again.
+            self.held = True
+            self._start_keepalive()
             return True
         self.acquisitions += 1
         say("")
@@ -1326,6 +1360,15 @@ class SudoSession(object):
         self.held = True
         self._start_keepalive()
         return True
+
+    def _live(self):
+        """True only when the probe exits 0. Anything else — a password needed, no
+        sudo, the probe itself failing — is a check that could not see a live password,
+        so the caller asks exactly as before."""
+        try:
+            return self._probe() == 0
+        except Exception:
+            return False
 
     def _start_keepalive(self):
         # At most one keeper at a time. `acquire` already guards on `held`, so
@@ -1412,34 +1455,22 @@ def acquire_privilege(ctx, command, dry_run):
 Q_TEAM_BY_KEY = ("query FindTeamByKey($filter: TeamFilter!) "
                  "{ teams(filter: $filter, first: 10) "
                  "{ nodes { id key name parent { id key name } } } }")
-Q_TEAM_STATES = ("query TeamStates($id: String!) { team(id: $id) "
-                 "{ id key name states(first: 100) { nodes { id name type } } } }")
-# The git automations, READ rather than assumed. `Team.gitAutomationStates` is
-# the API behind the dashboard's "git automations": one rule per Git event
-# (draft|start|review|mergeable|merge), `state` naming the workflow state a
-# linked issue is moved into, and a null `state` meaning the rule fires and
-# does nothing. A rule with a non-null state is a rule that would move a review
-# ticket, which is the thing that must not happen.
-Q_TEAM_AUTOMATIONS = ("query TeamGitAutomations($id: String!) { team(id: $id) "
-                      "{ gitAutomationStates(first: 100) { nodes { id event "
-                      "state { id name } targetBranch { id branchPattern } } } } }")
-M_AUTOMATION_DELETE = ("mutation GitAutomationDelete($id: String!) "
-                       "{ gitAutomationStateDelete(id: $id) { success } }")
+# KIT-599: no Reviews team, so no team, workflow state or git automation is created, read
+# or written here. A work team's automations are what move a coding ticket into review;
+# deleting them, or adding `started` states that could become its lowest one, would break
+# the work team itself.
 Q_LABELS = ("query FindLabel($filter: IssueLabelFilter!) "
             "{ issueLabels(filter: $filter, first: 10) { nodes { id name team { id } } } }")
 Q_AGENT_USER = ("query FindAgentUser($filter: UserFilter!) "
                 "{ users(filter: $filter, first: 10) { nodes { id name displayName active } } }")
 Q_MEMBERS = ("query TeamMembers($id: String!) { team(id: $id) "
              "{ members(first: 100) { nodes { id displayName } } } }")
-M_TEAM_CREATE = ("mutation TeamCreate($input: TeamCreateInput!) "
-                 "{ teamCreate(input: $input) { success team { id key name } } }")
-M_STATE_CREATE = ("mutation StateCreate($input: WorkflowStateCreateInput!) "
-                  "{ workflowStateCreate(input: $input) "
-                  "{ success workflowState { id name type } } }")
+# KIT-662: one ticket on a team that is delegated to the agent, which proves a delegation there
+# reaches it. Team access, which is what delegation needs, is not something this key can read.
+Q_DELEGATED = ("query DelegatedOnTeam($filter: IssueFilter!) "
+               "{ issues(filter: $filter, first: 1) { nodes { id identifier } } }")
 M_LABEL_CREATE = ("mutation LabelCreate($input: IssueLabelCreateInput!) "
                   "{ issueLabelCreate(input: $input) { success issueLabel { id name } } }")
-M_MEMBER_CREATE = ("mutation MemberCreate($input: TeamMembershipCreateInput!) "
-                   "{ teamMembershipCreate(input: $input) { success } }")
 
 # WHICH CALL WAS REFUSED, AND WHAT TO DO ABOUT IT.
 #
@@ -1454,18 +1485,10 @@ M_MEMBER_CREATE = ("mutation MemberCreate($input: TeamMembershipCreateInput!) "
 # valid; the OPERATION needs more than it has. Those are different sentences and
 # they must not share one.
 _ADMIN_SCOPED = {
-    "teamCreate":
-        "Creating a team is ADMIN-scoped in the tracker. A personal key with read+write on all\n"
-        "  workspace data is NOT enough, and this is not a rejected key — every read just\n"
-        "  succeeded. Either use a key whose user is a workspace admin, or create the team by\n"
-        "  hand in the tracker's UI (its key and name are the ones in your conf) and run this\n"
-        "  again: the tracker step finds an existing team and carries on from there.",
-    "workflowStateCreate":
-        "Creating a workflow state is admin-scoped in the tracker. Add the missing states to the\n"
-        "  Reviews team by hand, then run this again — it re-reads them and carries on.",
     "issueLabelCreate":
-        "Creating a label is admin-scoped in the tracker. Create the model label by hand at\n"
-        "  WORKSPACE scope (a team-scoped label of the same name does not count), then re-run.",
+        "Creating a label is admin-scoped in the tracker. Create the missing label by hand at\n"
+        "  WORKSPACE scope — the model label, or a repository's routing label `reviews-<name>`\n"
+        "  (a team-scoped label of the same name does not count) — then run this again.",
 }
 
 
@@ -1764,42 +1787,26 @@ CARDS = {
         "good": "the env file exists, mode 600, owned by the role account, both names set",
         "attest": None,
     },
-    "CK-3": {
-        "title": "Turn the Reviews team's git automations off by hand",
-        "why": ("A review ticket must never move because a pull request moved: an "
-                "automation that closes a review when its PR merges destroys the record "
-                "the poller reads back. THIS IS NORMALLY AUTOMATIC — the rules are "
-                "`Team.gitAutomationStates` in the tracker's API, and the installer reads "
-                "them and deletes every rule that would move a ticket. You are seeing this "
-                "card because that read did not answer on this workspace, or because a "
-                "rule survived the delete. Nothing here knows what those rules are now, "
-                "and \"I could not look\" is a different answer from \"there was nothing "
-                "to look at\"."),
-        "do": ["In the tracker: Team settings -> Issue statuses and automations ->",
-               "git automations, for the Reviews team ONLY.",
-               "Set every one of the five to no action:",
-               "  - branch created / draft pull request opened",
-               "  - pull request opened",
-               "  - review requested",
-               "  - pull request ready to merge",
-               "  - pull request merged",
-               "Then sign it off — this run could not read them for you:",
-               "    python3 scripts/pipeline_stage_e_setup.py attest A-AUTOMATIONS "
-               "--initials " + INITIALS_PLACEHOLDER,
-               "(YOUR initials, 2-4 letters — the placeholder above is refused as typed.)"],
-        "good": "the review ticket stays put when its pull request opens and when it merges",
-        "attest": "A-AUTOMATIONS",
-    },
     "CK-4": {
-        "title": "Add the dispatcher's agent to the Reviews team",
-        "why": ("A ticket cannot be delegated to an agent in a team it is not a member of. "
-                "The installer asked the API to add it and the API declined or does not "
-                "expose the mutation on this workspace."),
-        "do": ["In the tracker: the Reviews team -> Members -> add the agent whose DISPLAY",
-               "NAME is your AGENT_DISPLAY_NAME. It is usually lower-case, and is not the",
-               "capitalised label the members list shows.",
-               "Then run the installer again; it re-reads the membership and carries on."],
-        "good": "the agent appears in the Reviews team's member list",
+        "title": "Show that the dispatcher's agent takes delegations on a work team",
+        "why": ("Review tickets are filed on the work teams (KIT-599) and delegated to the "
+                "dispatcher's agent. Linear lets an agent take delegations on the teams it was "
+                "given access to when it was installed. That access is not team membership, "
+                "and this installer cannot read it. So it looks for proof on each work team: "
+                "the agent is a member, or a ticket there is delegated to it. It found neither "
+                "on the team the run named. The installer only reads both: it never changes a "
+                "work team."),
+        "do": ["In the tracker: Settings -> AI & Agents -> Installed Agents -> the agent:",
+               "make sure it has access to the team the run named.",
+               "Then give the run its proof, either way:",
+               "  - delegate one ticket on that team to the agent. That starts a session,",
+               "    so pick one you want worked; or",
+               "  - add the agent to that team's members. Its DISPLAY NAME is your",
+               "    AGENT_DISPLAY_NAME, usually lower-case, not the capitalised label the",
+               "    members list shows.",
+               "Then run the installer again; it reads both again and carries on."],
+        "good": ("each MANAGED_TEAM_KEYS team has a ticket delegated to the agent, or the agent "
+                 "among its members"),
         "attest": None,
     },
     "CK-5": {
@@ -1860,7 +1867,8 @@ CARDS = {
         "do": ["Delegate one real ticket in the normal way and leave the loop alone for a",
                "full cycle. Watch for, in order:",
                "  1. a worktree for the coding ticket, and a pull request",
-               "  2. a review ticket in the Reviews team, delegated to the agent",
+               "  2. a review ticket on the coding ticket's own work team, carrying the",
+               "     label reviews-<repo name> and delegated to the agent",
                "  3. a reply on it carrying one fenced pipeline-review/1 block",
                "     …and, if you review more than one repository, that the review",
                "     session's worktree is under a clone of the SAME repository as the",
@@ -1871,9 +1879,10 @@ CARDS = {
                "  5. the review ticket closed, and only its own worktree gone",
                "Read the heartbeat files rather than the logs: a stale timestamp means",
                "NOT RUNNING; a fresh one with a non-ok result means RAN AND COULD NOT.",
-               "Then probe the fence. Create a ticket by hand in the Reviews team, with",
-               "[repo=reviews-<repo name>] as its first line, and delegate it to the",
-               "agent. Ask the reviewer to list every tool it has, by exact name.",
+               "Then probe the fence. Create a ticket by hand on a work team, with",
+               "[repo=reviews-<repo name>] as its first line and the label",
+               "reviews-<repo name>, and delegate it to the agent. Ask the reviewer to",
+               "list every tool it has, by exact name.",
                "Nothing posts on a pull request: the poller collects only its own tickets.",
                "  6. the list holds NO name outside this read-only set:",
                ] + ["       " + line for line in textwrap.wrap(
@@ -2013,11 +2022,24 @@ CARDS = {
         "good": "the `status` step says the job is loaded and wrote its file",
         "attest": None,
     },
+    "CK-13": {
+        "title": "Let the reviews in flight finish, then run this again",
+        "why": ("This run would change how the review entries route (onto the work teams, "
+                "KIT-599), and writing the dispatcher's config restarts it. A restart ends "
+                "every session it is running, so a review in flight would be cut off "
+                "half-way and its pull request declined. Nothing was written."),
+        "do": ["Wait for the reviews named above to finish. Most take under fifteen",
+               "minutes; the review poller closes each ticket when it is done.",
+               "Then run the same command again. It reads the poller's record afresh",
+               "and writes the entries only once none is in flight."],
+        "good": "the `dispatcher-entry` step writes the review entries and proves them loaded",
+        "attest": None,
+    },
 }
 
+# KIT-599: A-AUTOMATIONS (the Reviews team's automations, card CK-3) is retired with the
+# team. A ledger that still holds it loads as before; nothing reads it.
 ATTESTATIONS = {
-    "A-AUTOMATIONS": ("the Reviews team's git automations are off — the fallback for a "
-                      "workspace whose API would not name them (CK-3)"),
     "A-DRY-RUN": "the dry-run count is the number you meant (CK-5)",
     "A-FIRST-TICKET": ("one real ticket ran end to end and was reviewed, and a reviewer's "
                        "tools were probed under the fence the entries carry (CK-7)"),
@@ -2150,6 +2172,8 @@ class Ctx(object):
         # Daemons this run stopped and has not started again. A run that ends
         # early with these set has switched the review loop OFF, and must say so.
         self.unloaded = []
+        # …and the ones `run` loaded again on its way out, after a stop (KIT-661).
+        self.reloaded = []
         # Jobs other installers own (the notifier, the Slack bridge) that launchd would not
         # load again after `code` stopped them for the clone's move (KIT-199). No later step
         # loads them, so the notice on the way out names them; the ledger keeps them too
@@ -2317,7 +2341,7 @@ class Ctx(object):
         if key is None:
             raise Unknown(
                 "the tracker was not read: %s, and this command never asks for a "
-                "credential. The Reviews team, the labels and the ids are UNMEASURED "
+                "credential. The work teams, the labels and the ids are UNMEASURED "
                 "here — that is not the same as saying they are wrong." % source,
                 "the key is read as %s out of %s/env, which is the file `run` writes at\n"
                 "mode 600. Put one there with the one command that is allowed to ask:\n"
@@ -2968,9 +2992,12 @@ def _load_clone_jobs(ctx, labels):
     ledger and ctx.clone_jobs_off then list exactly those; a recording runner changes neither."""
     refused = {}
     for label in labels:
+        loaded_at = int(time.time())
         said = _load_again(ctx.runner, label)
         if said:
             refused[label] = said
+        else:
+            _note_daemon_load(ctx, label, loaded_at)
     if not ctx.runner.dry_run:
         listed = dict((ctx.state.data.get("notes") or {}).get(CLONE_JOBS_OFF_NOTE) or {})
         for label in labels:
@@ -3105,6 +3132,15 @@ def _clone_jobs_notes(jobs, unknown, owed, held=None):
                      "the Stage E jobs"]
 
 
+def _launchd_holds(r, label):
+    """Does launchd hold `label` (KIT-661)? Only its own "Could not find service" (exit 113)
+    is a no. A look that fails any other way counts as a yes: a job `code` stops is loaded
+    again on a stop, so one counted in by mistake is at worst named, never forgotten."""
+    got = r.as_root(["launchctl", "print", "system/" + label])
+    text = (got.out or "") + (got.err or "")
+    return got.ok or not (got.rc == 113 or "Could not find service" in text)
+
+
 def step_code(ctx, apply_it):
     """The role account's own clone, and the scripts the daemons exec."""
     r, conf = ctx.runner, ctx.conf
@@ -3203,6 +3239,12 @@ def step_code(ctx, apply_it):
         return True, same, []
 
     stop_labels = all_daemon_labels(conf)
+    # ONLY A JOB launchd HOLDS NOW IS ONE THIS RUN STOPS (KIT-661). On any stop after this
+    # step, `run` loads again on its way out each job it stopped, so each of the three is asked
+    # here, before anything stops. One launchd does not hold (a first install, or a job a
+    # person booted out on purpose) is still unloaded below, which does nothing, and is never
+    # loaded on a stop: loading it is `enable`'s, as before.
+    held_now = [label for label in stop_labels if _launchd_holds(r, label)]
     # The catch-up poller execs from the same clone, and is stopped only when it is loaded:
     # a job never installed (its first count unsigned, or `off`) is not one to report as off.
     if r.as_root(["launchctl", "print", "system/" + catchup_label(conf)]).ok:
@@ -3247,9 +3289,12 @@ def step_code(ctx, apply_it):
     if not r.dry_run:
         # Loading the three again is the `enable` step, several checkpoints
         # downstream, and loading the monitor is the `heartbeat-monitor` step after
-        # it. If this run stops before them, those jobs are OFF and the only thing
-        # that says so is the notice cmd_run prints off this list.
-        ctx.unloaded = list(stop_labels)
+        # it. A run that stops before them loads each listed here again on its way
+        # out, and names any launchd would not take back (KIT-661). The catch-up
+        # poller, the status job and the monitor are in `stop_labels` only when
+        # launchd held them.
+        ctx.unloaded = held_now + [label for label in stop_labels
+                                   if label not in all_daemon_labels(conf)]
 
     if head.ok and head.out.strip():
         res = r.as_role(ctx.account,
@@ -3303,12 +3348,66 @@ def step_code(ctx, apply_it):
     return False, "clone placed and level with origin; all %d scripts present" % len(
         REQUIRED_SCRIPTS), notes
 
+def _ensure_workspace_label(api, name, apply_it, created, what):
+    """The id of the ONE workspace label named `name`, created when absent on a real run;
+    None on a dry pass that would create it. A team-scoped label of the same name is
+    refused, never counted: the dispatcher matches a label by name, and one scoped to a
+    team is invisible on every other team's tickets."""
+    def find():
+        d = api.post(Q_LABELS, {"filter": {"name": {"eq": name}}})
+        nodes = ((d.get("issueLabels") or {}).get("nodes")) or []
+        return ([x for x in nodes if not (x.get("team") or {}).get("id")],
+                [x for x in nodes if (x.get("team") or {}).get("id")])
+    workspace, scoped = find()
+    if scoped and what == "routing":
+        raise SetupError("a TEAM-SCOPED label named %r exists. A review ticket may be filed on "
+                         "any work team, and the dispatcher routes it by that name, so the "
+                         "routing label must be one workspace label. Rename or delete the "
+                         "team-scoped one, then run this again." % name)
+    if scoped:
+        warn("%d label(s) named %r are TEAM-SCOPED and do not count: the dispatcher reads "
+             "labels off a ticket by name, and a label scoped to one team is invisible to "
+             "every other team's tickets." % (len(scoped), name))
+    if len(workspace) > 1:
+        raise SetupError("%d workspace labels are named %r — refusing to guess which"
+                         % (len(workspace), name))
+    if workspace:
+        return workspace[0]["id"]
+    if not apply_it:
+        return None
+    api.post(M_LABEL_CREATE, {"input": {"name": name, "color": STATE_COLOR}})
+    created.append("label " + name)
+    workspace, _scoped = find()
+    if len(workspace) != 1:
+        raise SetupError("label %r is not there exactly once at workspace scope after the "
+                         "create" % name)
+    return workspace[0]["id"]
+
+
 def step_tracker(ctx, apply_it):
-    """The Reviews team, its states, the model label, the agent's membership,
-    and every id the four daemons need — resolved BY NAME, recorded by id."""
+    """The work teams, the labels, the agent's membership, and every id the daemons need —
+    resolved BY NAME, recorded by id.
+
+    KIT-599: review tickets are filed on the coding ticket's own work team, so this step
+    creates no team and no workflow state, and reads or writes no git automation. A work
+    team's automations move a coding ticket into review; deleting them would break that,
+    and a new `started` state could become the lowest one the dispatcher moves every
+    session into. What it ensures is labels: the model labels, `provenance:agent`, and one
+    workspace routing label `reviews-<name>` per reviewed repository, the second net the
+    review entry routes on."""
     conf, st = ctx.conf, ctx.state
     ids = dict(st.data.get("ids") or {})
-    key = conf["REVIEWS_TEAM_KEY"]
+    keys = [k.upper() for k in split_list(conf["MANAGED_TEAM_KEYS"])]
+    notes = []
+    retired = [k for k in RETIRED_CONF_KEYS if (conf.get(k) or "").strip()]
+    if retired:
+        notes.append("%s %s retired and ignored: review tickets are filed on the work teams "
+                     "(MANAGED_TEAM_KEYS), and this installer creates and manages no Reviews "
+                     "team. Delete %s from stage-e.conf. A Reviews team you already have is "
+                     "archived by hand once no review is in flight on it (docs/STAGE-E-"
+                     "OPERATOR.md, \"Moving off a Reviews team\")."
+                     % (" and ".join(retired), "is" if len(retired) == 1 else "are",
+                        "the line" if len(retired) == 1 else "both lines"))
 
     # The client is built HERE, where the first tracker call is about to be
     # made, and not one line earlier — and building it reads the key out of the
@@ -3317,130 +3416,48 @@ def step_tracker(ctx, apply_it):
     # without a prompt.
     api = ctx.linear()
 
-    def teams():
-        d = api.post(Q_TEAM_BY_KEY, {"filter": {"key": {"eq": key}}})
-        return ((d.get("teams") or {}).get("nodes")) or []
+    d = api.post(Q_TEAM_BY_KEY, {"filter": {"key": {"in": keys}}})
+    found = {}
+    for team in ((d.get("teams") or {}).get("nodes")) or []:
+        found.setdefault(team.get("key"), []).append(team)
+    problems = ["MANAGED_TEAM_KEYS names %s, and no team has that key" % k
+                for k in keys if not found.get(k)]
+    problems += ["team key %s matches %d teams — refusing to guess which" % (k, len(found[k]))
+                 for k in keys if len(found.get(k) or ()) > 1]
+    if problems:
+        raise SetupError("; ".join(problems))
+    ids["team_ids"] = dict((k, found[k][0]["id"]) for k in keys)
+    ids.pop("reviews_team_id", None)
 
-    found = teams()
-    created, changed = [], []
-    if not found:
-        if not apply_it:
-            return False, "the Reviews team %s does not exist yet" % key, []
-        api.post(M_TEAM_CREATE, {"input": {"key": key, "name": conf["REVIEWS_TEAM_NAME"]}})
-        created.append("team " + key)
-        found = teams()
-        if not found:
-            raise SetupError("team %s is still absent after teamCreate" % key)
-    if len(found) > 1:
-        raise SetupError("team key %s matches %d teams — refusing to guess which"
-                         % (key, len(found)))
-    team = found[0]
-    ids["reviews_team_id"] = team["id"]
-
-    # A SUB-TEAM is fatal, and it is machine-readable — `Team.parent` — so it is
-    # read rather than left on a card. A sub-issue is based on its parent's
-    # branch, and a review must never share a branch with the code it judges.
-    parent = team.get("parent") or {}
-    if parent.get("id"):
-        raise SetupError(
-            "team %s is a SUB-TEAM of %s. A sub-issue is based on its parent's branch, so "
-            "a review ticket in a nested team would share a branch with the code it is "
-            "judging. Move %s to the top level, or point REVIEWS_TEAM_KEY at a team that "
-            "is not nested." % (key, parent.get("key") or parent.get("name") or parent["id"],
-                                key))
-
-    d = api.post(Q_TEAM_STATES, {"id": team["id"]})
-    states = (((d.get("team") or {}).get("states") or {}).get("nodes")) or []
-    have_states = {s["name"].lower() for s in states}
-    want_states = [(n, t) for n, t in REQUIRED_STATES if n.lower() not in have_states]
-    if want_states:
-        if not apply_it:
-            return False, "team %s is missing workflow state(s): %s" % (
-                key, ", ".join(n for n, _t in want_states)), []
-        refused = []
-        for name, stype in want_states:
-            res = api.post(M_STATE_CREATE, {"input": {"teamId": team["id"], "name": name,
-                                                      "type": stype, "color": STATE_COLOR}})
-            if not mutation_ok(res, "workflowStateCreate"):
-                refused.append(name)
-            created.append("state %s" % name)
-        # READ BACK. This was the one mutation here nothing re-queried, so a
-        # create that answered `success: false` with no GraphQL error was
-        # reported as a state that exists. It self-heals next run — and the run
-        # that failed said it succeeded, which is the one signal that would
-        # bring anyone to look.
-        d = api.post(Q_TEAM_STATES, {"id": team["id"]})
-        states = (((d.get("team") or {}).get("states") or {}).get("nodes")) or []
-        have_states = {s["name"].lower() for s in states}
-        absent = [n for n, _t in REQUIRED_STATES if n.lower() not in have_states]
-        if absent:
-            why = ""
-            if refused:
-                why = " (the create itself answered success:false for %s)" % ", ".join(refused)
-            raise SetupError(
-                "these workflow states are not in team %s on a re-read after creating "
-                "them: %s%s. Nothing here reports a create it could not see."
-                % (key, ", ".join(absent), why))
-        want_states = []
-
-    d = api.post(Q_LABELS, {"filter": {"name": {"eq": conf["MODEL_LABEL"]}}})
-    labels = ((d.get("issueLabels") or {}).get("nodes")) or []
-    workspace_labels = [x for x in labels if not (x.get("team") or {}).get("id")]
-    scoped = len(labels) - len(workspace_labels)
-    if not workspace_labels:
-        if not apply_it:
-            return False, ("the model label %r does not exist at workspace scope"
-                           % conf["MODEL_LABEL"]), []
-        api.post(M_LABEL_CREATE, {"input": {"name": conf["MODEL_LABEL"],
-                                            "color": STATE_COLOR}})
-        created.append("label " + conf["MODEL_LABEL"])
-        d = api.post(Q_LABELS, {"filter": {"name": {"eq": conf["MODEL_LABEL"]}}})
-        labels = ((d.get("issueLabels") or {}).get("nodes")) or []
-        workspace_labels = [x for x in labels if not (x.get("team") or {}).get("id")]
-        if not workspace_labels:
-            raise SetupError("label %r is still absent at workspace scope after create"
-                             % conf["MODEL_LABEL"])
-    if scoped:
-        warn("%d label(s) named %r are TEAM-SCOPED and do not count: the dispatcher reads "
-             "labels off a ticket by name, and a label scoped to one team is invisible to "
-             "every other team's tickets." % (scoped, conf["MODEL_LABEL"]))
-    ids["model_label_id"] = workspace_labels[0]["id"]
-
+    created = []
+    model = _ensure_workspace_label(api, conf["MODEL_LABEL"], apply_it, created, "model")
+    if model is None:
+        return False, ("the model label %r does not exist at workspace scope"
+                       % conf["MODEL_LABEL"]), notes
+    ids["model_label_id"] = model
     # KIT-418: the guarded label, ensured the same way. The poller resolves it by name on
     # every run and stops with a config error when it is gone, so it is not recorded here.
     guarded = (conf.get("MODEL_LABEL_GUARDED") or "").strip()
-
-    def guarded_labels():
-        d = api.post(Q_LABELS, {"filter": {"name": {"eq": guarded}}})
-        return [x for x in (((d.get("issueLabels") or {}).get("nodes")) or [])
-                if not (x.get("team") or {}).get("id")]
-    if guarded and not guarded_labels():
-        if not apply_it:
-            return False, ("the guarded model label %r does not exist at workspace scope"
-                           % guarded), []
-        api.post(M_LABEL_CREATE, {"input": {"name": guarded, "color": STATE_COLOR}})
-        created.append("label " + guarded)
-        if not guarded_labels():
-            raise SetupError("label %r is still absent at workspace scope after create" % guarded)
-
-    # KIT-96: the finding poller marks every ticket it files `provenance:agent`, and
-    # a session can request no provenance (§5, §8). Ensure that label exists at
-    # WORKSPACE scope — the poller resolves it by name per team and refuses to file
-    # a finding it cannot mark. Same read-back-after-create discipline as above.
-    d = api.post(Q_LABELS, {"filter": {"name": {"eq": "provenance:agent"}}})
-    prov = [x for x in (((d.get("issueLabels") or {}).get("nodes")) or [])
-            if not (x.get("team") or {}).get("id")]
-    if not prov:
-        if not apply_it:
-            return False, "the provenance:agent label does not exist at workspace scope", []
-        api.post(M_LABEL_CREATE, {"input": {"name": "provenance:agent", "color": STATE_COLOR}})
-        created.append("label provenance:agent")
-        d = api.post(Q_LABELS, {"filter": {"name": {"eq": "provenance:agent"}}})
-        prov = [x for x in (((d.get("issueLabels") or {}).get("nodes")) or [])
-                if not (x.get("team") or {}).get("id")]
-        if not prov:
-            raise SetupError("label 'provenance:agent' is still absent at workspace scope "
-                             "after create")
+    if guarded and _ensure_workspace_label(api, guarded, apply_it, created, "model") is None:
+        return False, ("the guarded model label %r does not exist at workspace scope"
+                       % guarded), notes
+    # KIT-96: the finding poller marks every ticket it files `provenance:agent`, and refuses
+    # to file a finding it cannot mark.
+    if _ensure_workspace_label(api, "provenance:agent", apply_it, created, "provenance") is None:
+        return False, "the provenance:agent label does not exist at workspace scope", notes
+    # KIT-599: one routing label per reviewed repository, named like its review entry. Only
+    # that entry routes on it, so a review ticket whose tag fails to route still reaches it.
+    route_ids, absent = {}, []
+    for repo in split_list(conf["REVIEW_REPOS"]):
+        name = review_entry_name(repo)
+        label = _ensure_workspace_label(api, name, apply_it, created, "routing")
+        if label is None:
+            absent.append(name)
+        else:
+            route_ids[repo] = label
+    if absent:
+        return False, "the routing label(s) %s do not exist yet" % ", ".join(absent), notes
+    ids["review_label_ids"] = route_ids
 
     d = api.post(Q_AGENT_USER, {"filter": {"displayName": {"eq": conf["AGENT_DISPLAY_NAME"]}}})
     users = [u for u in (((d.get("users") or {}).get("nodes")) or []) if u.get("active")]
@@ -3461,90 +3478,57 @@ def step_tracker(ctx, apply_it):
                          % (conf["OWNER_LINEAR_EMAIL"], len(owners)))
     ids["owner_user_id"] = owners[0]["id"]
 
-    d = api.post(Q_MEMBERS, {"id": team["id"]})
-    members = (((d.get("team") or {}).get("members") or {}).get("nodes")) or []
-    is_member = any(m.get("id") == ids["agent_user_id"] for m in members)
-    if not is_member:
-        if not apply_it:
-            return False, "the agent is not a member of team %s" % key, []
+    # WHAT DELEGATION NEEDS, READ AS PROOF (KIT-662). Linear lets an agent take delegations on
+    # the teams it was given access to when it was installed, and that access is not team
+    # membership: on 11 Nov the agent was a member of neither work team and took every
+    # delegation on both, while this step blocked on membership. This key cannot read team
+    # access, so each team needs proof: the agent is a member, or a ticket there is delegated
+    # to it. Neither is card CK-4. Both are READ: a work team is the owner's, and this
+    # installer never changes one.
+    outside, proven = [], []
+    for key in keys:
+        d = api.post(Q_MEMBERS, {"id": ids["team_ids"][key]})
+        members = (((d.get("team") or {}).get("members") or {}).get("nodes")) or []
+        if any(m.get("id") == ids["agent_user_id"] for m in members):
+            continue
         try:
-            api.post(M_MEMBER_CREATE, {"input": {"teamId": team["id"],
-                                                 "userId": ids["agent_user_id"]}})
-            created.append("membership")
-            d = api.post(Q_MEMBERS, {"id": team["id"]})
-            members = (((d.get("team") or {}).get("members") or {}).get("nodes")) or []
-            is_member = any(m.get("id") == ids["agent_user_id"] for m in members)
+            d = api.post(Q_DELEGATED, {"filter": {
+                "team": {"id": {"eq": ids["team_ids"][key]}},
+                "delegate": {"id": {"eq": ids["agent_user_id"]}}}})
         except SetupError as exc:
-            warn("the tracker would not add the agent to the team through the API: %s" % exc)
-            is_member = False
-        if not is_member:
-            st.data["ids"] = ids
-            raise Blocked("CK-4", "a ticket cannot be delegated to an agent in a team it "
-                                  "is not a member of")
-
+            # COULD NOT TELL is not "no": a read that failed is never the card, and never a pass.
+            raise Unknown("the agent is not a member of %s, and the tracker would not say whether "
+                          "a ticket there is delegated to it: %s" % (key, str(exc)[:200]),
+                          "run this again once the tracker answers. Or add the agent to %s's "
+                          "members, which is proof on its own (card CK-4 says how)" % key)
+        found = (((d.get("issues") or {}).get("nodes")) or [])
+        if found:
+            proven.append((key, found[0].get("identifier") or found[0].get("id") or "a ticket"))
+        else:
+            outside.append(key)
     st.data["ids"] = ids
+    if outside:
+        raise Blocked("CK-4", "the agent is not a member of %s, and no ticket there is delegated to "
+                              "it, so nothing shows a review ticket filed there would reach it"
+                              % ", ".join(outside))
+    # WHAT THE PROOF SAYS, AND NO MORE (Stage E review): a delegated ticket shows a delegation
+    # reached the agent there once. Access removed since is caught where it matters: the review
+    # poller's same-pass routing check stops that repository's reviews and pages the owner.
+    notes.extend("the agent is not a member of %s, and %s is delegated to it there, so a "
+                 "delegation has reached it on that team. Delegation needs the team access "
+                 "Linear gave the agent when it was installed, not membership, so this does not "
+                 "block. That ticket may be an old one: if the access was removed since, the "
+                 "review poller's routing check stops that repository's reviews at its first "
+                 "review ticket and pages you" % (key, ident)
+                 for key, ident in proven)
 
-    live, why_not = git_automations(api, team["id"])
-    if live is None:
-        # The API on THIS workspace would not name them. That is UNKNOWN, not
-        # off, so the card is still there — as the fallback it always should
-        # have been, not as the unconditional path.
-        if not st.attested("A-AUTOMATIONS"):
-            raise Blocked("CK-3", "the git automations for team %s could not be read "
-                                  "through the API (%s)" % (key, (why_not or "")[:110]))
-        automations = "git automations signed off by hand (the API would not name them)"
-    elif live:
-        events = ", ".join(sorted(str(rule.get("event") or "?") for rule in live))
-        if not apply_it:
-            return False, "team %s has %d live git automation(s) (%s) that would move a " \
-                          "review ticket" % (key, len(live), events), []
-        for rule in live:
-            res = api.post(M_AUTOMATION_DELETE, {"id": rule["id"]})
-            if not mutation_ok(res, "gitAutomationStateDelete"):
-                warn("the tracker declined to delete the %r git automation on team %s"
-                     % (rule.get("event"), key))
-        still, why_not = git_automations(api, team["id"])
-        if still is None:
-            raise Unknown("the git automations for team %s could not be re-read after "
-                          "turning them off (%s)" % (key, (why_not or "")[:110]),
-                          "run the same command again; a read that failed once is not a "
-                          "rule that is off")
-        if still:
-            raise Blocked("CK-3", "these git automations survived the delete: %s"
-                          % ", ".join(sorted(str(r.get("event") or "?") for r in still)))
-        changed.append("turned off %d git automation(s) (%s)" % (len(live), events))
-        automations = "no git automation moves a %s ticket" % key
-    else:
-        automations = "no git automation moves a %s ticket" % key
-
-    detail = "team %s=%s, agent=%s, label=%s, owner=%s; %s" % (
-        key, team["id"], ids["agent_user_id"], ids["model_label_id"], ids["owner_user_id"],
-        automations)
-    parts = (["created " + ", ".join(created)] if created else []) + changed
-    if parts:
-        return False, detail + "; " + "; ".join(parts), []
-    return True, detail + "; nothing to create", []
-
-
-def git_automations(api, team_id):
-    """(rules-that-would-move-a-ticket, None), or (None, why-it-could-not-be-read).
-
-    A rule whose `state` is null fires and does nothing; it is left alone,
-    because deleting an explicit "take no action" override would change the
-    board for no gain. Only a rule with a state is a rule that moves a ticket.
-
-    A workspace whose API does not expose the field answers with a GraphQL
-    error, which arrives here as SetupError. That is UNKNOWN — the caller falls
-    back to the checkpoint card — and never "there is nothing to turn off"."""
-    try:
-        d = api.post(Q_TEAM_AUTOMATIONS, {"id": team_id})
-    except SetupError as exc:
-        return None, str(exc)
-    team = (d or {}).get("team")
-    if not isinstance(team, dict) or not isinstance(team.get("gitAutomationStates"), dict):
-        return None, "the answer carried no gitAutomationStates object"
-    nodes = (team["gitAutomationStates"].get("nodes")) or []
-    return [r for r in nodes if (r.get("state") or {}).get("id")], None
+    detail = "work teams %s, routing labels %s, agent=%s, label=%s, owner=%s" % (
+        ", ".join("%s=%s" % (k, ids["team_ids"][k]) for k in keys),
+        ", ".join(review_entry_name(r) for r in sorted(route_ids)) or "none",
+        ids["agent_user_id"], ids["model_label_id"], ids["owner_user_id"])
+    if created:
+        return False, detail + "; created " + ", ".join(created), notes
+    return True, detail + "; nothing to create", notes
 
 
 # The env file, measured without reading it. It prints the mode, the owner, and
@@ -3967,7 +3951,7 @@ def step_configs(ctx, apply_it):
     shared file still works. Those two rules do not compose."""
     r, conf, st = ctx.runner, ctx.conf, ctx.state
     ids = st.data.get("ids") or {}
-    for need in ("reviews_team_id", "agent_user_id", "model_label_id", "owner_user_id"):
+    for need in ("team_ids", "agent_user_id", "model_label_id", "owner_user_id"):
         if not ids.get(need):
             return False, "the tracker step has not resolved %s yet" % need, []
 
@@ -3990,8 +3974,14 @@ def step_configs(ctx, apply_it):
         notes = list(notes) + [said]
 
     poller = {
-        "reviews_team_key": conf["REVIEWS_TEAM_KEY"],
-        "reviews_team_id": ids["reviews_team_id"],
+        # KIT-599: review tickets on the work teams. The sign-off and the stop are the idea
+        # gate's, shared; the poller pauses a repository's reviews without a current one.
+        "routing_signoff_file": "~/" + machine.ROUTING_SIGNOFF_RELPATH,
+        "shared_stop_file": "~/" + machine.SHARED_STOP_RELPATH,
+        "dispatcher_version_url": "http://127.0.0.1:%s/version" % conf["DISPATCHER_PORT"],
+        # How long a review ticket's routing note may take, written out so the operator
+        # sees it: the poller's own default, pinned to it by --selftest.
+        "routing_wait_seconds": ROUTING_WAIT_SECONDS,
         "agent_user_name": conf["AGENT_DISPLAY_NAME"],
         "cyrus_agent_user_id": ids["agent_user_id"],
         "model_label_name": conf["MODEL_LABEL"],
@@ -4024,10 +4014,7 @@ def step_configs(ctx, apply_it):
         "team_keys": [k.upper() for k in split_list(conf["MANAGED_TEAM_KEYS"])],
         "github_token_env": conf["GITHUB_TOKEN_ENV"],
         "linear_api_key_env": conf["LINEAR_KEY_ENV"],
-        "reviews_team_id": ids["reviews_team_id"],
         "dispatcher_app_user_id": ids["agent_user_id"],
-        "model_label_id": ids["model_label_id"],
-        "dispatcher_repo_names": _dispatcher_repo_names(ctx),
         "required_checks": checks,
         # WRITTEN BESIDE `required_checks`, NEVER SUBTRACTED FROM IT. `required_checks`
         # stays the verbatim answer the code host gave, which is what keeps "an empty
@@ -4039,7 +4026,7 @@ def step_configs(ctx, apply_it):
         # KIT-130: where the model a re-prompted session ran with is recorded.
         "session_log_root": dispatcher_session_logs(conf),
     }
-    # KIT-96 finding poller config. It scans the WORK teams (not the reviews team)
+    # KIT-96 finding poller config. It scans the WORK teams
     # for pipeline-finding/1 comments, trusts only the dispatcher's agent user, and
     # files into the source team's backlog. Its state is isolated under
     # ~/.stage-e/finding so its heartbeat.json cannot collide with the review poller's.
@@ -4120,6 +4107,21 @@ def step_configs(ctx, apply_it):
                              "whole config and file nothing. Nothing was written. Leave "
                              "TICKET_MODEL empty until origin carries the change, then run "
                              "this again.")
+    if "poller.json" in stale and "routing_signoff_file" in poller:
+        # KIT-599, the same hazard: a review poller from before the work teams refuses the
+        # whole config (it does not know `routing_signoff_file`), and then reviews nothing.
+        code = r.as_role(ctx.account, "cat %s/kit/scripts/pipeline_review_poller.py "
+                         "2>/dev/null" % ctx.stage_home)
+        if not code.ok and not code.skipped:
+            raise Unknown("could not read the review poller's own code, to see whether it "
+                          "files review tickets on the work teams",
+                          "run this from a terminal as yourself")
+        if code.ok and '"routing_signoff_file"' not in (code.out or ""):
+            raise SetupError("the role account's clone runs a review poller from before review "
+                             "tickets moved onto the work teams, which would refuse its whole "
+                             "config and review nothing. Nothing was written. Run this again "
+                             "once origin carries the change: the `code` step moves the clone "
+                             "first.")
     if "poller.json" in stale and "model_label_name_guarded" in poller:
         # KIT-418, the same hazard: a review poller from before the key refuses its WHOLE
         # config, and then no PR is reviewed at all.
@@ -4503,7 +4505,7 @@ def _origin_slug(ctx, path):
 # `repositoryPath` — a clone of the planned repository, which it reads code in — so it
 # answers "which entry manages this repository?" as truthfully as a coding entry does,
 # and in file order it can answer FIRST. It must not: the entry this lookup returns is
-# where a fallback fix ticket is routed, and a planning entry cannot push a fix. It is
+# the clone a review entry copies, and a planning entry is not the coding one. It is
 # recognised by the id and name that installer gives it, which is also the only thing a
 # routing tag can match.
 PLANNING_ENTRY_PREFIX = "stage-a-planning-"
@@ -4532,23 +4534,6 @@ def _entries_by_repo(ctx):
                 or _repo_slug(entry.get("githubUrl")))
         if slug and slug not in out:
             out[slug] = entry
-    return out
-
-
-def _dispatcher_repo_names(ctx):
-    """OWNER/NAME -> the CODING entry `name` that manages it. Read out of the dispatcher's
-    config, never typed: the fallback fix ticket routes on it, and it must land in the
-    entry that can actually push a fix — never in a read-only review entry."""
-    out = {}
-    known = _entries_by_repo(ctx)
-    for repo in split_list(ctx.conf["REVIEW_REPOS"]):
-        entry = known.get(repo.lower())
-        if entry and entry.get("name"):
-            out[repo] = entry["name"]
-        else:
-            warn("no dispatcher entry's clone has %s as its `origin`, so the fallback fix "
-                 "ticket for it has nowhere to route. The primary re-prompt is "
-                 "unaffected." % repo)
     return out
 
 
@@ -4681,8 +4666,8 @@ def _owns_review_entry(entry):
     (`replaced <id>`, echoed from the reconcile, and named as `would write <id>` on a dry
     run) and it is recoverable (the config is backed up in the same run, and the step
     refuses to write at all if the backup fails). What ownership prevents is a pass
-    DELETING an entry it did not write; a stranger claiming the Reviews team key stops the
-    run instead."""
+    DELETING an entry it did not write; a stranger routing on a review entry's own label
+    stops the run instead (KIT-599)."""
     eid = (entry.get("id") or "")
     if not (eid == LEGACY_REVIEW_ENTRY_ID or eid.startswith(REVIEW_ENTRY_PREFIX)):
         return False
@@ -4864,7 +4849,7 @@ def reviews_entries(ctx):
     fence = review_fence(ctx)
 
     out = []
-    for at, repo in enumerate(repos):
+    for repo in repos:
         # ONE entry supplies BOTH the clone path and its base branch — the entry
         # that manages THIS repository. Taking the path from one entry and the
         # branch from another would cut review worktrees from a branch that does
@@ -4877,21 +4862,14 @@ def reviews_entries(ctx):
             "baseBranch": (model.get("baseBranch") or "main"),
             "workspaceBaseDir": bases[0],
             "linearWorkspaceId": spaces[0],
-            "routingLabels": [REVIEW_ENTRY_NEVER_LABEL],
+            # KIT-599: its own routing label, the name only it routes on. No team key: on
+            # a work team that key is the coding entry's.
+            "routingLabels": [review_entry_name(repo)],
             "isActive": True,
             "disallowedTools": list(fence),
             "userAccessControl": {"allowedUsers": [ids.get("owner_user_id", "")]},
             "appendInstruction": REVIEWER_BRIEF,
         }
-        # THE TEAM KEY GOES ON EXACTLY ONE ENTRY, and it is the fallback for a
-        # review ticket that somehow carries no routing tag. Team routing takes
-        # the FIRST entry claiming the key, so two claimants would make which
-        # clone a reviewer reads depend on file order. With one, a missing tag
-        # degrades to the old behaviour — a read-only reviewer, possibly in the
-        # wrong repository — instead of falling through to catch-all routing and
-        # starting a session in an entry that has Bash and Write.
-        if at == 0:
-            entry["teamKeys"] = [conf["REVIEWS_TEAM_KEY"]]
         out.append(entry)
     return out
 
@@ -4981,6 +4959,78 @@ def back_up_dispatcher_config(ctx, stamp):
     return lines[-1]
 
 
+def _label_claims(entry):
+    """Every label name an entry routes on: its `routingLabels`, and the labels of each
+    prompt type in `labelPrompts` (a list, or an object carrying `labels`)."""
+    names = set(str(x) for x in (entry.get("routingLabels") or []) if x)
+    prompts = entry.get("labelPrompts") or {}
+    for value in (prompts.values() if isinstance(prompts, dict) else ()):
+        labels = value.get("labels") if isinstance(value, dict) else value
+        names.update(str(x) for x in (labels or []) if isinstance(x, str) and x)
+    return names
+
+
+# The review poller's seen-set, read as the role account: the file, schema and statuses
+# the poller itself writes (`seen_path`, SEEN_SCHEMA, COLLECT_STATUSES), which --selftest
+# pins to the poller's own. A review is in flight while its record is in one of these
+# statuses: its ticket is live, and its session may be running.
+REVIEW_SEEN_FILE = "seen-prs.json"
+REVIEW_SEEN_SCHEMA = "pipeline-review-poller-seen/2"
+ROUTING_WAIT_SECONDS = 120          # the review poller's DEFAULT_ROUTING_WAIT_SECONDS
+REVIEWS_IN_FLIGHT_STATUSES = ("pending", "delivering", "publish-failed", "close-pending")
+NO_SEEN_SET = "no-seen-set"
+
+
+def _reviews_in_flight(ctx):
+    """["owner/repo#N (TICKET)"] for every review the poller has in flight, read from its
+    seen-set as the role account. No seen-set yet is nothing in flight: the poller writes
+    it with its first ticket. Any other failure to read or parse it is UNKNOWN, never
+    "none": the restart it gates would end every session it could not see (§13)."""
+    # Unquoted on purpose, as every role-account read here: the Stage E home starts with
+    # `$HOME`, which the role account's shell expands. Only an ABSENT file is answered
+    # with the marker; `cat` reports any other failure in its own exit status.
+    path = "%s/state/%s" % (ctx.stage_home, REVIEW_SEEN_FILE)
+    res = ctx.runner.as_role(ctx.account, "if [ -e %s ]; then cat %s; else echo %s; fi"
+                             % (path, path, NO_SEEN_SET), why="read the review poller's seen-set")
+    if res.skipped:
+        return []
+    if not res.ok:
+        raise Unknown("could not read the review poller's seen-set at %s, to see whether any "
+                      "review is in flight" % path, "run this from a terminal as yourself")
+    text = (res.out or "").strip()
+    if text == NO_SEEN_SET:
+        return []
+    try:
+        doc = json.loads(text)
+    except ValueError:
+        doc = None
+    seen = doc.get("seen") if isinstance(doc, dict) else None
+    if not isinstance(seen, dict) or doc.get("schema") != REVIEW_SEEN_SCHEMA:
+        raise Unknown("the review poller's seen-set at %s could not be parsed as %s, so it is "
+                      "not known whether a review is in flight" % (path, REVIEW_SEEN_SCHEMA),
+                      "read it as the role account, then run this again")
+    return sorted("%s (%s)" % (key, rec.get("review_ticket") or "no ticket yet")
+                  for key, rec in seen.items() if isinstance(rec, dict)
+                  and rec.get("status") in REVIEWS_IN_FLIGHT_STATUSES)
+
+
+def _poller_off_at_the_gate(ctx, poller, in_flight, moving):
+    """What the drain gate says when reviews are in flight and the review poller is not loaded
+    (KIT-661): they cannot settle, so it stops rather than wait on CK-13. When this run stopped
+    the poller, the run loads it again on its way out; when it was off before, the line that
+    loads it."""
+    said = ("%d review(s) are in flight (%s), and the review entries %s are about to change or "
+            "go. The review poller (system/%s) is not loaded, and only it settles a review, so "
+            "waiting for them on card CK-13 would never end. Nothing was written."
+            % (len(in_flight), ", ".join(in_flight[:10]), ", ".join(moving), poller))
+    if poller in ctx.unloaded:
+        return said + ("\n  This run stopped the poller so the clone could move. It loads it again "
+                       "on its way out, and says below whether it could.\n  Once the reviews "
+                       "above have settled, run the same command again.")
+    return said + ("\n  Load it, wait for the reviews above to settle, then run the same command "
+                   "again:\n    sudo launchctl bootstrap system %s" % _dispatcher_plist(poller))
+
+
 def step_dispatcher_entry(ctx, apply_it):
     r, conf = ctx.runner, ctx.conf
     want = reviews_entries(ctx)
@@ -4991,25 +5041,23 @@ def step_dispatcher_entry(ctx, apply_it):
     have_by_id = {e.get("id"): e for e in owned}
     # A review entry for a repository this conf no longer reviews — and the
     # single `reviews` entry an older installer wrote. Left in place, either one
-    # still claims the Reviews team key and still points at a clone this conf
-    # never chose, and team routing hands the key to whichever claims it first.
+    # points at a clone this conf never chose.
     stale = sorted(i for i in have_by_id if i not in wanted_ids)
 
-    # A review entry this installer did NOT write, still claiming the key. It is
-    # not ours to delete and it would fight the fallback, so the run stops and
-    # names it rather than silently leaving two claimants.
-    foreign = [e.get("id") or e.get("name") for e in entries
-               if not _owns_review_entry(e)
-               and conf["REVIEWS_TEAM_KEY"] in (e.get("teamKeys") or [])]
+    # KIT-599: an entry this installer did NOT write that routes on one of the review
+    # labels. Two entries matched by one label run ONE session whose fence is the
+    # intersection, so a stranger claiming a review label could widen what a reviewer
+    # holds. It is not ours to change, so the run stops and names it.
+    foreign = sorted("%r routes on %s" % (e.get("id") or e.get("name"), label)
+                     for e in entries if e.get("id") not in wanted_ids
+                     and not _owns_review_entry(e)
+                     for label in sorted(_label_claims(e) & set(names)))
     if foreign:
         raise SetupError(
-            "the dispatcher config already has %s claiming the Reviews team key %s, and "
-            "this installer did not write %s (the reviewer brief is not in its "
-            "appendInstruction). Two claimants make which clone a reviewer reads depend "
-            "on file order. Remove or re-key %s by hand, then re-run."
-            % (", ".join(repr(f) for f in foreign), conf["REVIEWS_TEAM_KEY"],
-               "them" if len(foreign) > 1 else "it",
-               "them" if len(foreign) > 1 else "it"))
+            "the dispatcher config has an entry this installer did not write that routes on "
+            "a review entry's own label: %s. Only the review entry may route on its label. "
+            "Remove that label from the other entry by hand, then run this again."
+            % "; ".join(foreign))
 
     problems = _tag_ambiguity(entries, want, dead=stale)
     if problems:
@@ -5069,6 +5117,30 @@ def step_dispatcher_entry(ctx, apply_it):
             " — %s" % signoff_why_not if signoff_why_not else ""), row_notes()
 
     if not same:
+        # KIT-599: a write restarts the dispatcher, and a restart ends every session it is
+        # running. A review whose routing is about to move (onto the work teams, or off
+        # them) must finish first: its session would be cut off mid-review. So the run
+        # waits for the reviews in flight, names each, and writes nothing until they settle.
+        # A review entry about to GO (a repository no longer reviewed, or the single
+        # `reviews` entry an older installer wrote) ends its sessions the same way.
+        moving = [w["id"] for w in want
+                  if have_by_id.get(w["id"]) is not None
+                  and any(have_by_id[w["id"]].get(k) != w.get(k)
+                          for k in ("teamKeys", "routingLabels"))] + list(stale)
+        if moving:
+            in_flight = _reviews_in_flight(ctx)
+            poller = daemon_labels(conf)[0]
+            if in_flight and (poller in ctx.unloaded or not _service_in_domain(r, poller)):
+                # ONLY THE REVIEW POLLER SETTLES A REVIEW (KIT-661). Unloaded, by `code` on
+                # this run or before it, the wait on CK-13 would never end: on 11 Nov it
+                # waited on reviews only the unloaded poller could settle. So the gate says so
+                # and stops instead, and the run loads the poller again on its way out.
+                raise SetupError(_poller_off_at_the_gate(ctx, poller, in_flight, moving))
+            if in_flight:
+                raise Blocked("CK-13", "%d review(s) are in flight (%s); the review entries %s "
+                                       "are about to change or go, and the restart would end "
+                                       "them" % (len(in_flight), ", ".join(in_flight[:10]),
+                                                 ", ".join(moving)))
         body = json.dumps({"entries": want, "remove": stale},
                           indent=2, sort_keys=True) + "\n"
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -5395,8 +5467,8 @@ def _reconcile_entries_py(path):
     rewrite, from stdin (`{"entries": [...], "remove": [id, ...]}`).
 
     One write, not one per entry: a config left half-reconciled by a failure in
-    the middle would have two entries claiming the Reviews team key, which is
-    the state this whole change exists to make impossible. Idempotent — a file
+    the middle would hold entries from two different shapes at once, routing some
+    reviews one way and some another. Idempotent — a file
     already holding exactly these entries is reported and not rewritten."""
     return (
         "import json,os,sys,tempfile\n"
@@ -5821,7 +5893,38 @@ def step_daemons(ctx, apply_it):
 
     for label in sorted(stale):
         _install_plist(r, label, want[label])
+    if not r.dry_run:
+        # Owed to `enable` until launchd loads each, in the ledger: a run may stop first.
+        owed = _plists_not_loaded(ctx)
+        owed.update((label, now_iso()) for label in stale)
+        ctx.state.data.setdefault("notes", {})[PLISTS_NOT_LOADED_NOTE] = owed
     return False, "installed " + ", ".join(sorted(stale)) + " (not loaded yet — CK-5)", []
+
+
+# THE PLISTS `daemons` WROTE THAT launchd HAS NOT LOADED YET (Stage E review of KIT-661), as
+# {label: when written}. launchd keeps the definition it loaded until the job is loaded again,
+# so a plist written under a loaded daemon changes nothing by itself, and `enable` used to
+# read a loaded daemon with its heartbeats as done. A daemon a stopped run loaded again on its
+# way out runs the plist on disk then, which the next run may replace. In the ledger, not only
+# on ctx: a run that writes a plist and stops before `enable` leaves the load owed to the next.
+# Each entry goes once launchd loads that daemon from the plist on disk: in `enable`, or on a
+# stopped run's way out.
+PLISTS_NOT_LOADED_NOTE = "plists-not-loaded-yet"
+
+
+def _plists_not_loaded(ctx):
+    return dict((ctx.state.data.get("notes") or {}).get(PLISTS_NOT_LOADED_NOTE) or {})
+
+
+def _plist_loaded(ctx, label):
+    """launchd has loaded `label` from the plist on disk: it owes `enable` nothing more."""
+    owed = _plists_not_loaded(ctx)
+    if owed.pop(label, None) is not None:
+        notes = ctx.state.data.setdefault("notes", {})
+        if owed:
+            notes[PLISTS_NOT_LOADED_NOTE] = owed
+        else:
+            notes.pop(PLISTS_NOT_LOADED_NOTE, None)
 
 
 def _install_plist(r, label, body):
@@ -5889,6 +5992,51 @@ def _say_declines(text):
         say("    (its output named no NOT REVIEWED line — read the dry run above)")
     elif len(shown) > 20:
         say("    …and %d more" % (len(shown) - 20))
+
+
+# A POLLER PAUSED FOR WANT OF THE ROUTING SIGN-OFF IS NOT A FAILED INSTALL (KIT-733). On the
+# work teams the review poller pauses every repository's reviews until the routing probe has
+# written its sign-off, and a pass with a paused repository exits 1. The probe is the idea
+# gate's, and the one command runs the idea gate AFTER this installer, so a machine with no
+# sign-off yet (a first install, or the review entries just changed) could never get past this
+# step to the only place that writes it. Held here for the reason COMPONENT_EXIT_DECLINED is,
+# and pinned the same way: the battery builds these lines from the poller's own code.
+COMPONENT_EXIT_ERROR = 1
+POLLER_PAUSED_LINE = re.compile(r"^PAUSED (\S+): reviews are paused — (.*)$")
+NO_SIGNOFF_PAUSE = re.compile(
+    r"^there is no routing sign-off at .+: the probe has not been signed, or it no longer "
+    r"holds\. The one command offers to run it$")
+# The lines the poller prints beside every error it counts (`result.errors += 1`): its
+# `FAIL:` lines, a review it will try again (`RETRY`), and a telemetry row it lost.
+POLLER_ERROR_LINE = re.compile(r"^(FAIL:|RETRY |TELEMETRY LOST)")
+
+
+def paused_only_for_the_probe(said):
+    """True when the poller's output has a PAUSED line, every PAUSED line gives an absent
+    routing sign-off as its ONLY reason, and none of its error lines (`POLLER_ERROR_LINE`)
+    is there.
+
+    A sign-off that cannot be read or is not one, a stop, a missing routing label and a
+    changed dispatcher version are NOT that: each makes its PAUSED line more than the one
+    sentence, and each still fails the install, because each needs a person to look. The
+    match is the whole sentence, so a second reason joined onto it ("...; stopped since ...")
+    cannot ride in behind it.
+
+    WHAT IT CANNOT SEE. Every other line is ignored. A pass can exit 1 for a cause that
+    prints none of the above: a close or a telemetry row still pending on an earlier review.
+    A dry run says nothing of it, and it shows on the poller's heartbeat and in the heartbeat
+    monitor instead."""
+    paused = 0
+    for raw in said.splitlines():
+        line = raw.strip()
+        if POLLER_ERROR_LINE.match(line):
+            return False
+        found = POLLER_PAUSED_LINE.match(line)
+        if found:
+            if not NO_SIGNOFF_PAUSE.match(found.group(2)):
+                return False
+            paused += 1
+    return paused > 0
 
 
 def step_dry_run(ctx, apply_it):
@@ -5979,7 +6127,12 @@ def step_dry_run(ctx, apply_it):
     # always read this way; the poller was not.
     ok_codes = (0, COMPONENT_EXIT_DECLINED)
     problems = []
-    if poller.rc not in ok_codes:
+    # A FIFTH STATE, for the poller alone (KIT-733): paused for want of the routing sign-off.
+    # Exit 1, and expected until the idea gate's probe writes the sign-off. Only that reason
+    # and only that exit: see `paused_only_for_the_probe` for what is still a failure.
+    probe_unsigned = (poller.rc == COMPONENT_EXIT_ERROR
+                      and paused_only_for_the_probe(poller.out + poller.err))
+    if poller.rc not in ok_codes and not probe_unsigned:
         problems.append("the poller's dry run failed (exit %d). Nothing was created: %s"
                         % (poller.rc, (poller.err or poller.out).strip()[-400:]))
     # A FOURTH STATE, for the same reason as the third. The driver exits 2 when it CANNOT
@@ -6089,8 +6242,17 @@ def step_dry_run(ctx, apply_it):
     if '"unknown"' in blob or "checks_source: unknown" in blob:
         raise Blocked("CK-6", "the bounce driver reports its required-check source as "
                               "UNKNOWN for at least one repository")
+    # ONE PLAIN LINE, and before CK-5 below can stop the run: a pause that counted nothing is
+    # said wherever the step ends. It does not skip the cost gate: with no count signed off,
+    # CK-5 still stops here, and its row says nothing was counted.
+    if probe_unsigned:
+        say("  The poller is paused until the idea gate's routing probe is signed (no routing "
+            "sign-off stands), so this dry run counted no pull requests. That is expected: "
+            "the idea gate's installer asks \"Run the probe now?\" after this one.")
     if not ctx.state.attested("A-DRY-RUN"):
-        raise Blocked("CK-5", "the counts above have not been signed off")
+        raise Blocked("CK-5", "the counts above have not been signed off"
+                              + ("; the poller counted nothing while its reviews are paused"
+                                 if probe_unsigned else ""))
     # EVERY candidate, not the WOULD lines: those are only what one pass posts under the cap,
     # and none while a disabled webhook holds them. Each candidate is a paid session in time.
     # The catch-up step reads this list; it decides, and it never stops the run.
@@ -6098,7 +6260,9 @@ def step_dry_run(ctx, apply_it):
         l.split("] CANDIDATE", 1)[1].strip() for l in catchup_said.splitlines()
         if "] CANDIDATE " in l]
     return True, ("all five dry runs ran and the count is signed off; "
-                  + ("the poller declined at least one pull request"
+                  + ("the poller is paused until the routing probe is signed"
+                     if probe_unsigned else
+                     "the poller declined at least one pull request"
                      if declined else "the poller did not decline")), notes
 
 
@@ -6111,6 +6275,105 @@ HEARTBEAT_WAIT_SECONDS = 90
 # The catch-up poller's first pass may reply three times, a minute apart, before it writes
 # its heartbeat.
 CATCHUP_HEARTBEAT_WAIT_SECONDS = 180
+
+# A HEARTBEAT PROVES A DAEMON ONLY IF IT WAS WRITTEN AFTER THAT DAEMON'S LOAD (KIT-702).
+# One left from before the load was written by the old code, and passing it showed nothing
+# about the code just loaded. This installer records the second it loads each daemon, by
+# label, on its ledger; `enable` and `verify` both compare each heartbeat with its own daemon's.
+DAEMON_LOADS_NOTE = "daemon-loads"
+HEARTBEAT_STATES = ("ok", "older", "missing")
+
+# The role account's shell: one line per heartbeat, `<file> ok`, `<file> older` or `<file>
+# missing`. With a floor (whole seconds) a file is `ok` only if last written at or after it;
+# with `-`, any file that is there is. `date -r FILE +%s` is the file's last write, on the
+# macOS this runs on and on the Linux the battery also runs on, where the selftest executes it.
+_HEARTBEAT_CHK = (
+    r'''chk() { if [ ! -f "$2" ]; then printf '%s missing\n' "$1"; '''
+    r'''elif [ "$3" = - ] || [ "$(date -r "$2" +%s)" -ge "$3" ]; then printf '%s ok\n' "$1"; '''
+    r'''else printf '%s older\n' "$1"; fi; }; ''')
+
+
+def heartbeat_probe(stage_home, pairs):
+    """The shell for `pairs`, [(heartbeat file, floor or None)]. Floors are whole seconds."""
+    return _HEARTBEAT_CHK + " ".join(
+        'chk %s "%s/%s" %s;' % (rel, stage_home, rel, "-" if floor is None else int(floor))
+        for rel, floor in pairs)
+
+
+def _daemon_floors(ctx, labels):
+    """{label: the first whole second a heartbeat may count from, or None where this installer
+    has no record of loading the daemon}.
+
+    THE SECOND AFTER THE LOAD, not the load's own. Both sides are whole seconds, so a heartbeat
+    the old job wrote just before it exited cannot be told from one the new job wrote, if the
+    load fell in the same second. The floor takes the safe side: a new pass quicker than that
+    waits one more pass, and an old heartbeat never passes as proof of the new load."""
+    loads = (ctx.state.data.get("notes") or {}).get(DAEMON_LOADS_NOTE)
+    loads = loads if isinstance(loads, dict) else {}
+    return dict((l, loads[l] + 1 if isinstance(loads.get(l), int)
+                 and not isinstance(loads.get(l), bool) else None) for l in labels)
+
+
+def _record_load(ctx, label, when):
+    notes = ctx.state.data.setdefault("notes", {})
+    loads = dict(notes.get(DAEMON_LOADS_NOTE) or {})
+    loads[label] = int(when)
+    notes[DAEMON_LOADS_NOTE] = loads
+
+
+def _note_daemon_load(ctx, label, when):
+    """A load made OUTSIDE `enable`: `code` loads the daemons again as soon as the clone stops
+    moving, and a run that stops loads them again on its way out. The heartbeat that proves THAT
+    load is one written after it, so it goes on the ledger too (KIT-702): without it, `enable`
+    would hold a heartbeat the old code wrote just before the move to an older load, and pass
+    it. Only the three daemons `enable` proves; a dry run records nothing."""
+    if label in all_daemon_labels(ctx.conf) and not ctx.runner.dry_run:
+        _record_load(ctx, label, when)
+
+
+def _heartbeat_report(ctx, labels, floors):
+    """{heartbeat file: "ok" | "older" | "missing"} as the role account sees it now, each
+    held to its own daemon's load. A file the probe said nothing of is missing: a probe that
+    could not run proves nothing."""
+    pairs = [(rel, floors.get(label)) for label, rel in zip(labels, DAEMON_HEARTBEATS)]
+    got = ctx.runner.as_role(ctx.account, heartbeat_probe(ctx.stage_home, pairs))
+    seen = {}
+    for line in got.out.splitlines():
+        bits = line.split()
+        if len(bits) == 2 and bits[1] in HEARTBEAT_STATES:
+            seen[bits[0]] = bits[1]
+    return dict((rel, seen.get(rel, "missing")) for rel, _floor in pairs)
+
+
+def _unproven(report, labels, waited=None):
+    """THE ONE SENTENCE `enable` AND `verify` BOTH SAY for a daemon nothing proves (KIT-702).
+    UNKNOWN, never done: the daemon may be fine, and nothing here can tell."""
+    why = {"older": "its heartbeat is from before the load", "missing": "no heartbeat"}
+    bad = [(l, report[rel]) for l, rel in zip(labels, DAEMON_HEARTBEATS) if report[rel] != "ok"]
+    return ("%d of %d daemons have not written a heartbeat since they were loaded%s: %s"
+            % (len(bad), len(labels), " (waited %ds)" % waited if waited else "",
+               "; ".join("%s: %s" % (l.rsplit(".", 1)[-1], why[s]) for l, s in bad)))
+
+
+UNPROVEN_REMEDY = ("read the logs under the role account's ~/.stage-e/, one per daemon: a stale "
+                   "timestamp means NOT RUNNING, a fresh one with a non-ok result means RAN AND "
+                   "COULD NOT. A heartbeat from before the load is not counted: it says nothing "
+                   "about the code just loaded")
+
+
+def _prove_after_load(ctx, labels, floors):
+    """Wait, up to HEARTBEAT_WAIT_SECONDS, for every daemon's heartbeat to be newer than its
+    own load. Polls at least once; never returns done on anything less."""
+    deadline = time.time() + HEARTBEAT_WAIT_SECONDS
+    while True:
+        report = _heartbeat_report(ctx, labels, floors)
+        if all(state == "ok" for state in report.values()):
+            return False, "all %d daemons loaded; each wrote a heartbeat after its load" % len(
+                labels), []
+        if time.time() >= deadline:
+            break
+        _pause(5)
+    raise Unknown(_unproven(report, labels, HEARTBEAT_WAIT_SECONDS), UNPROVEN_REMEDY)
 
 
 def step_enable(ctx, apply_it):
@@ -6127,12 +6390,10 @@ def step_enable(ctx, apply_it):
         got = r.as_root(["launchctl", "print", "system/" + label])
         if not got.ok:
             missing.append(label)
-    beats = r.as_role(ctx.account,
-                      "for f in %s; do "
-                      "[ -f %s/$f ] && printf '%%s ok\\n' \"$f\" || "
-                      "printf '%%s missing\\n' \"$f\"; done"
-                      % (" ".join(DAEMON_HEARTBEATS), ctx.stage_home))
-    have_beats = [l.split()[0] for l in beats.out.splitlines() if l.endswith(" ok")]
+    # Held to the load this installer recorded for each daemon, where it recorded one.
+    floors = _daemon_floors(ctx, labels)
+    report = _heartbeat_report(ctx, labels, floors)
+    have_beats = [rel for rel, state in report.items() if state != "missing"]
 
     # A PAUSE IS INVISIBLE TO EVERY ALARM (KIT-112, review of #137). A paused bounce driver
     # beats on schedule and reads healthy, by design — so nothing would ever mention a pause
@@ -6148,13 +6409,36 @@ def step_enable(ctx, apply_it):
             % (ctx.stage_home,
                " (%s)" % " ".join(paused.out.split())[:120] if paused.out.strip() else ""))
 
-    if not missing and set(DAEMON_HEARTBEATS) <= set(have_beats):
+    # A LOADED DAEMON MAY RUN AN OLDER PLIST (Stage E review of KIT-661): `daemons` wrote a newer
+    # one after launchd loaded it, and launchd keeps what it loaded until the job is loaded again.
+    owed = [l for l in labels if l in _plists_not_loaded(ctx)]
+    if not missing and not owed and "missing" not in report.values():
+        # Every daemon is loaded and every heartbeat is there. Whether each is PROOF is the
+        # ledger's to say (KIT-702): a heartbeat counts only if written after its daemon's load.
         ctx.unloaded = [l for l in ctx.unloaded if l not in labels]
-        return True, "all %d daemons loaded and all heartbeats present" % len(
-            DAEMON_HEARTBEATS), pause_notes
+        if all(state == "ok" for state in report.values()):
+            if all(f is not None for f in floors.values()):
+                return True, "all %d daemons loaded; each wrote a heartbeat after its load" % len(
+                    labels), pause_notes
+            # Loaded by an older installer, or by hand: no load is recorded, so no heartbeat can
+            # be tied to one. Said, not guessed at; the next run that loads them records it.
+            return True, "all %d daemons loaded and all heartbeats present" % len(
+                labels), pause_notes + [
+                "the heartbeats are present, but no load of them is recorded here, so none is "
+                "tied to one: they show the daemons run, not that they run the code just loaded. "
+                "The next run that loads them records it"]
+        # A load is recorded and a heartbeat is older than it: that daemon has not finished a
+        # pass since. `verify` says so at once; `run` gives it the time to write one.
+        if not apply_it:
+            raise Unknown(_unproven(report, labels), UNPROVEN_REMEDY)
+        return _prove_after_load(ctx, labels, floors)
     if not apply_it:
-        return False, "would load %s; heartbeats present: %s" % (
-            ", ".join(missing) or "none", ", ".join(have_beats) or "none"), pause_notes
+        again = [l for l in owed if l not in missing]
+        return False, "would load %s%s; heartbeats present: %s" % (
+            ", ".join(missing) or "none",
+            ("; would load %s again: launchd runs an older plist than the one on disk"
+             % ", ".join(again)) if again else "",
+            ", ".join(have_beats) or "none"), pause_notes
 
     # THIS STEP RE-ARMS A DAEMON YOU STOPPED ON PURPOSE, and says so before it
     # does. `launchctl bootout` is the documented way to pause one half — but the
@@ -6185,33 +6469,25 @@ def step_enable(ctx, apply_it):
             _wait_until_gone(r, label,
                              _exit_timeout(r, _dispatcher_plist(label))
                              + EXIT_TIMEOUT_HEADROOM)
+        # The second BEFORE the load: a heartbeat the new job writes is at or after it, and one
+        # the old job wrote before the bootout is not. Each daemon has its own (KIT-702).
+        loaded_at = int(time.time())
         res = r.as_root(["launchctl", "bootstrap", "system", _dispatcher_plist(label)],
                         why="load %s" % label)
         if not res.ok and not res.skipped:
             raise SetupError("could not load %s: %s" % (label, (res.err or "")[:200]))
+        # Off the list as soon as launchd takes it (KIT-661): a stop later in this loop then
+        # loads again, on the way out, only the ones still off. And it runs the plist on disk.
+        ctx.unloaded = [l for l in ctx.unloaded if l != label]
+        if not res.skipped:
+            _plist_loaded(ctx, label)
+            _record_load(ctx, label, loaded_at)
     # Only these four: a heartbeat monitor `code` stopped is the next step's to load.
     ctx.unloaded = [l for l in ctx.unloaded if l not in labels]
     if ctx.runner.dry_run:
         return False, "would load the daemons and wait for their heartbeats", []
 
-    deadline = time.time() + HEARTBEAT_WAIT_SECONDS
-    while time.time() < deadline:
-        beats = r.as_role(ctx.account,
-                          "for f in %s; do "
-                          "[ -f %s/$f ] && printf '%%s ok\\n' \"$f\" || "
-                          "printf '%%s missing\\n' \"$f\"; done"
-                          % (" ".join(DAEMON_HEARTBEATS), ctx.stage_home))
-        have_beats = [l.split()[0] for l in beats.out.splitlines() if l.endswith(" ok")]
-        if set(DAEMON_HEARTBEATS) <= set(have_beats):
-            return False, "all %d daemons loaded; all heartbeats appeared" % len(
-                DAEMON_HEARTBEATS), []
-        time.sleep(5)
-    raise Unknown("the daemons were loaded and only %d of %d heartbeats appeared within %ds "
-                  "(%s)" % (len(have_beats), len(DAEMON_HEARTBEATS), HEARTBEAT_WAIT_SECONDS,
-                            ", ".join(have_beats) or "none"),
-                  "read the logs under the role account's ~/.stage-e/, one per daemon: a "
-                  "stale timestamp means NOT RUNNING, a fresh one with a non-ok result "
-                  "means RAN AND COULD NOT")
+    return _prove_after_load(ctx, labels, _daemon_floors(ctx, labels))
 
 
 def step_conflict_waker(ctx, apply_it):
@@ -6312,7 +6588,7 @@ MONITOR_HEARTBEAT_POLL_SECONDS = 5
 # finding its run, then watching it), plus the checks, plus up to 60 s counting temp space
 # (KIT-461). Ten kinds send one (the conflict waker's and the watcher page's are Slack only, KIT-339;
 # the notifier and monitor kinds do send, KIT-286, and so does `credentials`, KIT-579), which makes that
-# 4260 s, so 4300 s is added to its interval, as each daemon's pass clock is to its own. The minimum interval is the watch's own floor. The battery asserts both against the
+# 4260 s, so 4300 s is added to its interval (`memory` and `burn`, KIT-609, send nothing, and their reads add at most 30 s to a pass), as each daemon's pass clock is to its own. The minimum interval is the watch's own floor. The battery asserts both against the
 # watch when that script is in the checkout.
 HEALTH_WATCH_JOB = "health-watch"
 HEALTH_WATCH_PASS_SECONDS = 4300
@@ -7388,7 +7664,7 @@ def step_handover(ctx, apply_it):
 STEPS = (
     ("preflight", "the machine, the dispatcher and your conf", step_preflight),
     ("code", "the role account's clone and its scripts", step_code),
-    ("tracker", "the Reviews team, the labels and every id", step_tracker),
+    ("tracker", "the work teams, the labels and every id", step_tracker),
     ("credentials", "the role account's own env file, mode 600", step_credentials),
     ("configs", "the poller's config and the driver's", step_configs),
     ("github-app", "Stage E's own GitHub app: its login, its key and a test comment's author",
@@ -7617,12 +7893,22 @@ def cmd_run(ctx, dry_run):
     # the other seven rows and another pass to see them. That matters most on
     # the very first dry run, when no key is stored yet and the tracker row is
     # the one that cannot be measured.
-    code, rows = run_steps(ctx, apply_it=not dry_run, keep_going=dry_run,
-                           resume="run --dry-run" if dry_run else "run")
-    _unloaded_notice(ctx)
-    # LAST, so it is the final thing on the screen. It is the most serious
-    # state this command can end in, and the two notices can both be true.
-    _dispatcher_down_notice(ctx)
+    # ON EVERY WAY OUT (a card, a could-not-tell, a failure, a crash or Ctrl-C), each job `code`
+    # stopped for the clone's move that no later step loaded is loaded again (KIT-661). On 11
+    # Nov a run stopped at a card after the move, and every Stage E job stayed off for an hour
+    # with nothing saying so.
+    ctx.reloaded, off = [], {}
+    try:
+        code, rows = run_steps(ctx, apply_it=not dry_run, keep_going=dry_run,
+                               resume="run --dry-run" if dry_run else "run")
+    finally:
+        try:
+            off = _load_stopped_jobs_again(ctx)
+        finally:
+            _unloaded_notice(ctx, off)
+            # LAST, so it is the final thing on the screen. It is the most serious
+            # state this command can end in, and the two notices can both be true.
+            _dispatcher_down_notice(ctx)
     if dry_run:
         say("")
         if ctx.runner.writes:
@@ -7644,6 +7930,10 @@ def cmd_run(ctx, dry_run):
         say("clearing a row above:")
         say("    python3 %s run --dry-run" % _self_path())
         return code
+    if _jobs_still_off(ctx):
+        # NOT DONE, whatever the rows say: a job this run stopped is still off. The notice
+        # above names each one, with the line that loads it (KIT-661).
+        return EX_FAILED
     if code == EX_OK:
         done = sum(1 for _, o, _ in rows if o in (DONE, ALREADY_DONE))
         say("")
@@ -7652,16 +7942,95 @@ def cmd_run(ctx, dry_run):
     return code
 
 
-def _unloaded_notice(ctx):
-    """Say it out loud when a run ends with the loops switched off.
+def _left_off_by_conf(conf, label):
+    """True for a job `code` stopped that the conf now declines by name. Its own step unloads
+    it and removes its plist, so a stop never loads it again (KIT-661)."""
+    return ((label == catchup_label(conf) and catchup_off(conf))
+            or (label == status_label(conf) and status_off(conf))
+            or (label == monitor_label(conf) and monitor_ticket(conf) == "off"))
 
-    `code` stops every daemon before it moves the clone under them. The
-    far-downstream `enable` step starts the four again, and the
-    `heartbeat-monitor` step after it starts the monitor. A run that blocks in
-    between leaves those jobs OFF, and silence there looks exactly like a
-    healthy install. Each is named for what it is: a run that stops at the
-    monitor's step has review, bounce, finding and catch-up running, and saying they are
-    off would send a person to look at loops that are fine."""
+
+def _jobs_still_off(ctx):
+    """The jobs `code` stopped that are still off, less the ones the conf declines."""
+    return [label for label in ctx.unloaded if not _left_off_by_conf(ctx.conf, label)]
+
+
+def _rearm_sh(ctx):
+    """The heartbeat monitor's rearm, as the role account runs it."""
+    return ("/usr/bin/python3 %s/kit/scripts/%s rearm --config %s/%s"
+            % (ctx.stage_home, MONITOR_SCRIPT, ctx.stage_home, MONITOR_CONFIG))
+
+
+def _load_one_again(ctx, label):
+    """'' once launchd holds `label` again, else why it does not (KIT-661)."""
+    r = ctx.runner
+    if _service_in_domain(r, label):
+        # Told to stop by `code` and still on its way out, or loaded again since, by hand. A
+        # job told to stop is gone once its exit timeout has run out, so one launchd still
+        # holds after that was loaded again: it is not off.
+        gone, _waited = _wait_until_gone(r, label, _exit_timeout(r, _dispatcher_plist(label))
+                                         + EXIT_TIMEOUT_HEADROOM)
+        if not gone:
+            return ""
+    if label == monitor_label(ctx.conf):
+        # Rearmed first, as its own step does, so its first pass does not judge the heartbeats
+        # this stop made old as stale.
+        rearm = r.as_role(ctx.account, _rearm_sh(ctx),
+                          why="rearm %s's run clock before loading it again" % label)
+        if not rearm.ok and not rearm.skipped:
+            return ("its rearm failed (exit %d), so it was not loaded: %s"
+                    % (rearm.rc, ((rearm.err or rearm.out).strip() or "no output")[-160:]))
+    loaded_at = int(time.time())
+    said = _load_again(r, label)
+    if said:
+        return "launchd said: " + said
+    # Loaded from the plist on disk, so `enable` owes it no load of a newer one.
+    _plist_loaded(ctx, label)
+    _note_daemon_load(ctx, label, loaded_at)
+    return ""
+
+
+def _load_stopped_jobs_again(ctx):
+    """{label: why it is still off}, after loading again each job `code` stopped for the
+    clone's move that no later step loaded (KIT-661). The monitor goes last, after the jobs
+    it watches. A job the conf declines is left off: its own step removes it. Each one
+    launchd takes back moves from `ctx.unloaded` to `ctx.reloaded`. A fault while loading one
+    is said as why it is off, and never stops the loads after it."""
+    if ctx.runner.dry_run:
+        return {}
+    mlabel = monitor_label(ctx.conf)
+    todo = _jobs_still_off(ctx)
+    todo = [label for label in todo if label != mlabel] + [l for l in todo if l == mlabel]
+    off = {}
+    for label in todo:
+        try:
+            said = _load_one_again(ctx, label)
+        except Exception as exc:  # noqa: BLE001 — said as why it is off, never swallowed
+            said = "loading it raised %s: %s" % (type(exc).__name__, str(exc)[:160])
+        if said:
+            off[label] = said
+            continue
+        ctx.unloaded = [l for l in ctx.unloaded if l != label]
+        ctx.reloaded.append(label)
+    if ctx.reloaded:
+        # `run_steps` saved the ledger before this ran, and a load clears what it owed.
+        ctx.state.save()
+    return off
+
+
+def _unloaded_notice(ctx, off=None):
+    """Say what became of the jobs `code` stopped, and say it loudest when one is still off.
+
+    `code` stops every job that runs from the clone before it moves the clone under them.
+    `enable` loads the three daemons again, and the catch-up, status and heartbeat-monitor
+    steps load their own jobs. A run that stops before one of them loads it again on its way
+    out (`_load_stopped_jobs_again`, KIT-661), and this names each one it loaded. Each one
+    still off is said under NOT DONE, with launchd's words when it said any and the lines
+    that load it: silence there looks exactly like a healthy install (§13). Each is named for
+    what it is: a run that stops at the monitor's step has review, bounce, finding and
+    catch-up running, and saying they are off would send a person to look at loops that are
+    fine."""
+    off = off or {}
     if ctx.clone_jobs_off:
         one = len(ctx.clone_jobs_off) == 1
         it = "it" if one else "them"
@@ -7679,30 +8048,43 @@ def _unloaded_notice(ctx):
             % (it, it, it))
         for label in ctx.clone_jobs_off:
             say("    sudo launchctl disable system/%s" % label)
+    reloaded = list(getattr(ctx, "reloaded", None) or ())
+    if reloaded:
+        one = len(reloaded) == 1
+        say("")
+        say("A JOB THIS RUN STOPPED IS LOADED AGAIN. The run unloaded it so the clone could move,"
+            if one else
+            "THE JOBS THIS RUN STOPPED ARE LOADED AGAIN. The run unloaded them so the clone could")
+        say("and ended before the step that loads it. So it was loaded on the way out:" if one
+            else "move, and ended before the steps that load them. So they were loaded on the "
+                 "way out:")
+        for label in reloaded:
+            say("    system/%s" % label)
+        say("%s the clone as it is now." % ("It runs" if one else "They run"))
     if not ctx.unloaded:
         return
     mlabel = monitor_label(ctx.conf)
     clabel = catchup_label(ctx.conf)
     slabel = status_label(ctx.conf)
-    core = [l for l in ctx.unloaded if l not in (mlabel, clabel, slabel)]
-    advice = list(core)
-    if clabel in ctx.unloaded and not catchup_off(ctx.conf):
-        advice.append(clabel)
-    if slabel in ctx.unloaded and not status_off(ctx.conf):
-        advice.append(slabel)
-    if core or clabel in advice or slabel in advice:
-        named = ["review", "bounce", "finding"] if core else []
-        if clabel in advice:
-            named.append("catch-up")
-        if slabel in advice:
-            named.append("status")
+    still = _jobs_still_off(ctx)
+    daemons = [l for l in still if l != mlabel]
+    if still:
         say("")
-        say("THE STAGE E DAEMONS ARE UNLOADED. This run stopped them so the clone could move")
-        say("under them, and did not get as far as the step that loads them again — so %s %s"
-            % (", ".join(named[:-1]) + (" and " if len(named) > 1 else "") + named[-1],
-               "is OFF until it does:" if len(named) == 1 else "are OFF until it does:"))
-        for label in advice:
-            say("    %s" % label)
+        say("NOT DONE: %s." % ("A STAGE E JOB IS OFF" if len(still) == 1
+                                else "%d STAGE E JOBS ARE OFF" % len(still)))
+    if daemons:
+        names = dict(zip(daemon_labels(ctx.conf) + (finding_label(ctx.conf), clabel, slabel),
+                         ("review", "bounce", "finding", "catch-up", "status")))
+        named = [names.get(l, l) for l in daemons]
+        it = "it" if len(named) == 1 else "them"
+        say("THE STAGE E DAEMONS ARE UNLOADED. This run stopped %s so the clone could move" % it)
+        say("under %s, ended before the step that loads %s again, and could not load" % (it, it))
+        say("%s on its way out, so %s %s"
+            % (it, ", ".join(named[:-1]) + (" and " if len(named) > 1 else "") + named[-1],
+               "is OFF until it is loaded:" if len(named) == 1
+               else "are OFF until they are loaded:"))
+        for label in daemons:
+            say("    system/%s%s" % (label, "  (%s)" % off[label] if off.get(label) else ""))
     if clabel in ctx.unloaded and catchup_off(ctx.conf):
         say("")
         say("The catch-up poller was stopped too. CATCHUP_INTERVAL_SECONDS=off, so leave it")
@@ -7713,7 +8095,6 @@ def _unloaded_notice(ctx):
         say("The status job was stopped too. STATUS_INTERVAL_SECONDS=off, so leave it")
         say("unloaded. The `status` step removes its plist; until that step runs, the next")
         say("boot loads it again.")
-    rearm = None
     if mlabel in ctx.unloaded:
         say("")
         if monitor_ticket(ctx.conf) == "off":
@@ -7721,22 +8102,23 @@ def _unloaded_notice(ctx):
             say("unloaded. The `heartbeat-monitor` step removes its plist; until that step runs,")
             say("the next boot loads it again.")
         else:
-            say("THE HEARTBEAT MONITOR IS UNLOADED. This run stopped it with the daemons and did")
-            say("not get as far as its own step, so nothing reads their heartbeats until it does:")
-            say("    %s" % mlabel)
-            advice.append(mlabel)
+            say("THE HEARTBEAT MONITOR IS UNLOADED. This run stopped it with the daemons and could")
+            say("not load it again, so nothing reads their heartbeats until it is loaded:")
+            say("    system/%s%s" % (mlabel, "  (%s)" % off[mlabel] if off.get(mlabel) else ""))
+    if not still:
+        return
+    say("")
+    say("Load %s yourself, then check that launchd holds it:"
+        % ("it" if len(still) == 1 else "each one"))
+    for label in still:
+        if label == mlabel:
             # Rearmed first, as its step does, so its first pass does not page on the
             # heartbeats this stop made old.
-            rearm = ("sudo -u %s -H /bin/sh -c 'cd / && /usr/bin/python3 %s/kit/scripts/%s "
-                     "rearm --config %s/%s'" % (ctx.account, ctx.stage_home, MONITOR_SCRIPT,
-                                                ctx.stage_home, MONITOR_CONFIG))
-    if not advice:
-        return
-    say("Clear the row above and run the same command again, or load them yourself:")
-    for label in advice:
-        if label == mlabel and rearm:
-            say("    %s" % rearm)
+            say("    sudo -u %s -H /bin/sh -c 'cd / && %s'" % (ctx.account, _rearm_sh(ctx)))
         say("    sudo launchctl bootstrap system %s" % _dispatcher_plist(label))
+        say("    sudo launchctl print system/%s" % label)
+    say("Or clear the row above and run the same command again: its later steps load %s too."
+        % ("it" if len(still) == 1 else "them"))
 
 
 def _dispatcher_down_notice(ctx):
@@ -8115,11 +8497,13 @@ def _no_real_app_signer(key_file, account):
 
 class FakeLinear(object):
     def __init__(self, teams=None, labels=None, users=None, members=None, refuse=(),
-                 no_field=(), reject_key=False):
+                 no_field=(), reject_key=False, delegated=None):
         self.teams = teams if teams is not None else []
         self.labels = labels if labels is not None else []
         self.users = users if users is not None else []
         self.members = members if members is not None else []
+        # Tickets delegated to an agent: {"team": team id, "delegate": user id, "identifier"}.
+        self.delegated = list(delegated or [])
         # `refuse`: operations that answer `success: false` and do nothing —
         # HTTP 200, no GraphQL error, no change. `no_field`: operations this
         # workspace's schema does not expose, which arrive as a GraphQL error.
@@ -8159,8 +8543,9 @@ class FakeLinear(object):
             self.created.append("automation-delete")
             return {"gitAutomationStateDelete": {"success": True}}
         if op == "FindTeamByKey":
-            key = variables["filter"]["key"]["eq"]
-            return {"teams": {"nodes": [t for t in self.teams if t["key"] == key]}}
+            flt = variables["filter"]["key"]
+            keys = flt["in"] if "in" in flt else [flt["eq"]]
+            return {"teams": {"nodes": [t for t in self.teams if t["key"] in keys]}}
         if op == "TeamStates":
             for t in self.teams:
                 if t["id"] == variables["id"]:
@@ -8176,6 +8561,13 @@ class FakeLinear(object):
             return {"users": {"nodes": [u for u in self.users if u.get(field) == want]}}
         if op == "TeamMembers":
             return {"team": {"members": {"nodes": list(self.members)}}}
+        if op == "DelegatedOnTeam":
+            f = variables["filter"]
+            team, who = f["team"]["id"]["eq"], f["delegate"]["id"]["eq"]
+            return {"issues": {"nodes": [{"id": "i-" + d["identifier"],
+                                          "identifier": d["identifier"]}
+                                         for d in self.delegated
+                                         if d["team"] == team and d["delegate"] == who][:1]}}
         if op == "TeamCreate":
             self._n += 1
             t = {"id": "team%d" % self._n, "key": variables["input"]["key"],
@@ -8214,7 +8606,6 @@ ROLE_ACCOUNT=_exdispatch
 DISPATCHER_SERVICE=com.example.dispatcher
 DISPATCHER_CONFIG=/opt/example-dispatch/config.json
 KIT_REPO_URL=https://github.com/example-org/kit
-REVIEWS_TEAM_KEY=REV
 AGENT_DISPLAY_NAME=dispatcher-agent
 MODEL_LABEL=haiku
 OWNER_LINEAR_EMAIL=owner@example.com
@@ -8233,7 +8624,9 @@ HEARTBEAT_MONITOR_TICKET=off
 # WOULD-CHANGE, and step_tracker's dry run would return at the provenance check
 # before its user look-ups ever ran.
 STOCKED_WS_LABELS = [{"id": "l1", "name": "haiku", "team": None},
-                     {"id": "lp", "name": "provenance:agent", "team": None}]
+                     {"id": "lp", "name": "provenance:agent", "team": None},
+                     # KIT-599: the routing label of REVIEW_REPOS=example-org/kit.
+                     {"id": "lr", "name": "reviews-kit", "team": None}]
 
 
 def _quiet(fn):
@@ -8297,7 +8690,8 @@ def _selftest_body():
            "DISPATCHER_SERVICE=notrdns\n"
            "DISPATCHER_CONFIG=relative/path\n"
            "KIT_REPO_URL=git@example.com:x/y\n"
-           "REVIEWS_TEAM_KEY=toolongkey\n"
+           "REVIEWS_TEAM_KEY=REV\n"
+           "DISPATCHER_PORT=notaport\n"
            "AGENT_DISPLAY_NAME=agent\n"
            "MODEL_LABEL=haiku\n"
            "OWNER_LINEAR_EMAIL=you@example.com\n"
@@ -8313,7 +8707,7 @@ def _selftest_body():
     allerr = errs + more
     wanted_fragments = ["duplicate key", "not KEY=value", "unknown key NOT_A_KEY",
                         "DISPATCHER_SERVICE", "DISPATCHER_CONFIG", "KIT_REPO_URL",
-                        "REVIEWS_TEAM_KEY", "OWNER_LINEAR_EMAIL", "REVIEW_REPOS",
+                        "DISPATCHER_PORT", "OWNER_LINEAR_EMAIL", "REVIEW_REPOS",
                         "SEVERITY_THRESHOLD", "GITHUB_TOKEN_ENV", "DIFF_CAP_CHARS",
                         "STATE_KEEP_DAYS", "MANAGED_TEAM_KEYS"]
     for frag in wanted_fragments:
@@ -8386,10 +8780,12 @@ def _selftest_body():
         _ex_values, _ex_errors = parse_conf(_example_text, "stage-e.conf.example")
         expect("conf-example-complete", not _ex_errors,
                "the committed example does not parse cleanly: %s" % _ex_errors)
-        expect("conf-example-complete", set(_ex_values) == CONF_KEYS,
+        # KIT-599: the retired keys are accepted for an older conf, and taught nowhere.
+        _live_keys = CONF_KEYS - set(RETIRED_CONF_KEYS)
+        expect("conf-example-complete", set(_ex_values) == _live_keys,
                "example ⇄ CONF_KEYS drift — missing from the example: %s; unknown to this "
-               "file: %s" % (sorted(CONF_KEYS - set(_ex_values)),
-                             sorted(set(_ex_values) - CONF_KEYS)))
+               "file, or retired: %s" % (sorted(_live_keys - set(_ex_values)),
+                                         sorted(set(_ex_values) - _live_keys)))
         # …and it is a conf NOBODY EDITED: the only complaints are the two
         # placeholders that exist to stop it being run as shipped.
         _ex_conf, _ex_more = validate_conf(_ex_values)
@@ -8568,6 +8964,263 @@ def _selftest_body():
     expect("KIT-112 a PAUSED file the installer finds is said on the row",
            not [n for n in (notes_q or []) if "PAUSED" in str(n)],
            "step_enable invented a pause where there is none: %r" % (notes_q,))
+
+    # -- KIT-702. `enable` counts a heartbeat only if it was written after THAT daemon's load ---- #
+    # It used to ask whether the file existed, so one left from before the load (written by the
+    # old code, before the clone moved) passed at once, and `enable` never showed that a daemon
+    # ran the code it had just loaded. The probe below is EXECUTED by /bin/sh against real
+    # files with set times: the comparison with the load is the shell's own, not a guess.
+    cases += 1
+    conf_e, _ = validate_conf(parse_conf(GOOD_CONF)[0])
+    labels_e = all_daemon_labels(conf_e)
+    expect("KIT-702 each heartbeat belongs to one daemon",
+           [(l.rsplit(".", 1)[1], f) for l, f in zip(labels_e, DAEMON_HEARTBEATS)]
+           == [("stage-e-poller", "state/heartbeat.json"),
+               ("stage-e-bounce", "state/bounce-heartbeat.json"),
+               ("stage-e-finding", "finding/heartbeat.json")] and len(labels_e) == len(DAEMON_HEARTBEATS),
+           "the daemons and the heartbeat files no longer pair up: %s" % list(zip(labels_e, DAEMON_HEARTBEATS)))
+
+    class _LiveBeats(FakeLaunchd):
+        """A launchd that holds nothing at first, runs the heartbeat probe for real against a
+        folder standing in for the role account's home, and — when `new_job_writes` — has each
+        job write its heartbeat the moment it is loaded, as RunAtLoad does."""
+
+        def __init__(self, home, ctx_ref, new_job_writes=(), clock=None, probe_fails=False, **kw):
+            FakeLaunchd.__init__(self, **kw)
+            self.present, self.home, self.ctx_ref = False, home, ctx_ref
+            self.new_job_writes, self.probes, self.clock = set(new_job_writes), [], clock
+            self.probe_fails = probe_fails
+
+        def beat(self, label, when):
+            rel = DAEMON_HEARTBEATS[list(all_daemon_labels(conf_e)).index(label)]
+            path = os.path.join(self.home, ".stage-e", rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("{}\n")
+            os.utime(path, (when, when))
+
+        def _exec(self, argv, stdin, timeout, cwd=None):
+            line = _fmt(argv)
+            if " launchctl bootstrap system " in line:
+                got = FakeLaunchd._exec(self, argv, stdin, timeout, cwd=cwd)
+                label = os.path.basename(line.split()[-1])[:-len(".plist")]
+                if got.ok and label in self.new_job_writes:
+                    self.beat(label, time.time() + 5)
+                return got
+            if argv[:2] == ["sudo", "-u"] and "date -r" in argv[-1] and "heartbeat.json" in argv[-1]:
+                self.probes.append(argv[-1])
+                if self.probe_fails:          # sudo declined, or the shell died: no answer
+                    return Result(1, "", "sudo: a password is required")
+                if self.clock:
+                    self.clock(self)
+                ran = subprocess.run(["/bin/sh", "-c", argv[-1]], capture_output=True, text=True,
+                                     env=dict(os.environ, HOME=self.home))
+                return Result(ran.returncode, ran.stdout, ran.stderr)
+            return FakeLaunchd._exec(self, argv, stdin, timeout, cwd=cwd)
+
+    def _enable_world(tag, old_beats=(), **kw):
+        home = tempfile.mkdtemp(prefix="stage-e-beats-%s." % tag)
+        ctxE, _fE = _settled_ctx(conf_e)
+        runE = _LiveBeats(home, ctxE, answers=list(_fE.answers), **kw)
+        ctxE.runner = runE
+        for label in old_beats:                   # left by the OLD code, a day ago
+            runE.beat(label, time.time() - 86400)
+        return ctxE, runE
+
+    def _enable(ctxE, apply_it=True):
+        """(the row, or the exception that ended the step), and what it printed."""
+        try:
+            return _quiet(lambda: step_enable(ctxE, apply_it=apply_it))
+        except (SetupError, Unknown, Blocked) as exc:
+            return exc, ""
+
+    saved_wait, saved_pause_e = globals()["HEARTBEAT_WAIT_SECONDS"], globals()["_pause"]
+    globals()["HEARTBEAT_WAIT_SECONDS"], globals()["_pause"] = 0, (lambda _s: None)
+    try:
+        # A heartbeat written after the load passes, and the load is on the ledger.
+        ctxF, runF = _enable_world("fresh", old_beats=labels_e, new_job_writes=labels_e)
+        rowF, _pF = _enable(ctxF)
+        loadsF = (ctxF.state.data.get("notes") or {}).get(DAEMON_LOADS_NOTE) or {}
+        expect("KIT-702 a heartbeat written after the load is proof",
+               isinstance(rowF, tuple) and rowF[0] is False and "after its load" in rowF[1]
+               and sorted(loadsF) == sorted(labels_e) and all(isinstance(v, int) for v in loadsF.values()),
+               "a heartbeat the new jobs wrote did not pass, or the loads were not recorded: %r %r"
+               % (rowF, loadsF))
+        # One left from BEFORE the load is not proof. This passed at once before KIT-702.
+        ctxO, runO = _enable_world("older", old_beats=labels_e)
+        rowO, _pO = _enable(ctxO)
+        expect("KIT-702 a heartbeat from before the load is not proof",
+               isinstance(rowO, Unknown) and "have not written a heartbeat since they were loaded" in rowO.what
+               and "from before the load" in rowO.what,
+               "heartbeats the old code left passed as proof of the new load: %r" % (rowO,))
+        # None at all says the same, and never DONE.
+        ctxN2, runN2 = _enable_world("none")
+        rowN2, _pN2 = _enable(ctxN2)
+        expect("KIT-702 no heartbeat at all is unproven",
+               isinstance(rowN2, Unknown) and "no heartbeat" in rowN2.what
+               and "have not written a heartbeat since they were loaded" in rowN2.what,
+               "no heartbeat did not say unproven: %r" % (rowN2,))
+        # A probe that could not run proves nothing: the heartbeats are there, the jobs wrote
+        # them, and still no answer is no proof. UNKNOWN, never DONE.
+        ctxZ, runZ = _enable_world("probe-fails", old_beats=labels_e, new_job_writes=labels_e,
+                                   probe_fails=True)
+        rowZ, _pZ = _enable(ctxZ)
+        expect("KIT-702 a probe that could not run proves nothing",
+               isinstance(rowZ, Unknown) and "no heartbeat" in rowZ.what
+               and "3 of 3" in rowZ.what,
+               "an unanswered probe was read as proof: %r" % (rowZ,))
+        # One daemon proven and one not: only the one that did not write is named.
+        ctxP, runP = _enable_world("partial", old_beats=labels_e,
+                                   new_job_writes=labels_e[:2])
+        rowP, _pP = _enable(ctxP)
+        expect("KIT-702 only the daemon that did not write is named",
+               isinstance(rowP, Unknown) and "1 of 3" in rowP.what
+               and labels_e[2].rsplit(".", 1)[1] in rowP.what
+               and labels_e[0].rsplit(".", 1)[1] not in rowP.what,
+               "the unproven daemon was not the one named: %r" % (rowP,))
+
+        # EACH DAEMON'S OWN LOAD, not the first one's. A clock that moves 100 s at every
+        # reading puts the three loads apart; the finding poller's heartbeat is newer than
+        # the review poller's load but older than its own, so it is not proof.
+        def _between(runX):
+            floors = (runX.ctx_ref.state.data.get("notes") or {}).get(DAEMON_LOADS_NOTE) or {}
+            if len(floors) == 3 and not getattr(runX, "_set", False):
+                runX._set = True
+                for lb in labels_e[:2]:
+                    runX.beat(lb, floors[lb] + 1)
+                runX.beat(labels_e[2], floors[labels_e[0]] + 1)
+
+        ticks = [time.time()]
+        real_time = time.time
+
+        def _tick():
+            ticks[0] += 100
+            return ticks[0]
+        time.time = _tick
+        try:
+            ctxT, runT = _enable_world("apart", clock=_between)
+            rowT, _pT = _enable(ctxT)
+        finally:
+            time.time = real_time
+        expect("KIT-702 each daemon is held to its own load",
+               isinstance(rowT, Unknown) and "1 of 3" in rowT.what
+               and labels_e[2].rsplit(".", 1)[1] in rowT.what,
+               "a heartbeat newer than another daemon's load counted for this one: %r" % (rowT,))
+
+        # THE LOAD'S OWN SECOND (Stage E's review). In whole seconds a heartbeat the old job wrote
+        # just before it exited cannot be told from one the new job wrote in the second of the
+        # load, so the first second that counts is the one after. A new pass quicker than that
+        # waits one more pass; an old heartbeat never passes as proof of the new load.
+        def _beat_at(offset):
+            def _set(runX):
+                loads = (runX.ctx_ref.state.data.get("notes") or {}).get(DAEMON_LOADS_NOTE) or {}
+                if len(loads) == 3 and not getattr(runX, "_set", False):
+                    runX._set = True
+                    for lb in labels_e:
+                        runX.beat(lb, loads[lb] + offset)
+            return _set
+        ctxSS, runSS = _enable_world("same-second", clock=_beat_at(0))
+        rowSS, _pSS = _enable(ctxSS)
+        ctxNS, runNS = _enable_world("next-second", clock=_beat_at(1))
+        rowNS, _pNS = _enable(ctxNS)
+        expect("KIT-702 a heartbeat from the load's own second is not proof",
+               isinstance(rowSS, Unknown) and "3 of 3" in rowSS.what
+               and "from before the load" in rowSS.what,
+               "a heartbeat written in the second of the load passed as proof: %r" % (rowSS,))
+        expect("KIT-702 a heartbeat from the second after the load is proof",
+               isinstance(rowNS, tuple) and rowNS[0] is False and "after its load" in rowNS[1],
+               "a heartbeat written the second after the load did not pass: %r" % (rowNS,))
+
+        # `verify` reads the same ledger and says the same thing in the same words.
+        def _loaded_ctx(tag, beats_at, recorded=True):
+            ctxV, runV = _enable_world(tag)
+            runV.present = True
+            floor = int(time.time()) - 600
+            if recorded:
+                ctxV.state.data.setdefault("notes", {})[DAEMON_LOADS_NOTE] = dict(
+                    (lb, floor) for lb in labels_e)
+            for lb in labels_e:
+                runV.beat(lb, floor + beats_at)
+            return ctxV
+        # `verify` never waits: with a wait on offer it still polls once and says so.
+        globals()["HEARTBEAT_WAIT_SECONDS"] = 5
+        ctxV1 = _loaded_ctx("verify-older", -60)
+        rowV1, _p1 = _enable(ctxV1, apply_it=False)
+        globals()["HEARTBEAT_WAIT_SECONDS"] = 0
+        expect("KIT-702 verify does not wait for a heartbeat", len(ctxV1.runner.probes) == 1,
+               "verify polled %d times for a heartbeat it could only read once"
+               % len(ctxV1.runner.probes))
+        rowV2, _p2 = _enable(_loaded_ctx("verify-fresh", +60), apply_it=False)
+        rowV3, _p3 = _enable(_loaded_ctx("verify-unrecorded", -60, recorded=False), apply_it=False)
+        stem = "have not written a heartbeat since they were loaded"
+        expect("KIT-702 verify says the same thing in the same words",
+               isinstance(rowV1, Unknown) and stem in rowV1.what and "from before the load" in rowV1.what
+               and isinstance(rowO, Unknown) and stem in rowO.what,
+               "verify and enable do not use the same words for a daemon nothing proves: %r / %r"
+               % (rowV1, rowO))
+        expect("KIT-702 verify passes a heartbeat newer than the recorded load",
+               isinstance(rowV2, tuple) and rowV2[0] is True and "after its load" in rowV2[1],
+               "verify did not pass a heartbeat newer than the load: %r" % (rowV2,))
+        # No load on the ledger (loaded by an older installer, or by hand): nothing is excused
+        # as proof, and nothing is made up. The row passes as it always did, and says why it
+        # proves nothing about the code.
+        expect("KIT-702 verify without a recorded load says no heartbeat is tied to one",
+               isinstance(rowV3, tuple) and rowV3[0] is True
+               and any("no load of them is recorded" in str(n) for n in (rowV3[2] or [])),
+               "an unrecorded load was passed in silence: %r" % (rowV3,))
+        # The probe the role account runs asks after every heartbeat, and gives a load time only
+        # where one is known: the first poll of a `run` has all three, the legacy one none.
+        expect("KIT-702 the probe asks after every heartbeat, each with its own load",
+               all(f in runF.probes[-1] for f in DAEMON_HEARTBEATS)
+               and len(re.findall(r' (\d{9,})\;', runF.probes[-1])) == 3
+               and ' -;' in runF.probes[0],
+               "the probe after the load leaves a heartbeat out or gives it no load time, or the "
+               "one before any load invented one: %r" % runF.probes[-1:])
+        expect("KIT-702 the probe asks for a bare existence only when no load is recorded",
+               len(re.findall(r' -;', heartbeat_probe("$HOME/.stage-e", [(f, None) for f in DAEMON_HEARTBEATS]))) == 3,
+               "a heartbeat with no recorded load was still given a floor")
+
+        # THE LOADS `enable` DID NOT MAKE. `code` loads the daemons again as soon as the clone
+        # stops moving, and a run that stops loads them again on its way out; `enable`, later,
+        # must hold each heartbeat to THAT load. Without it, a heartbeat the old code wrote just
+        # before the move was held to an older load and passed: the defect, one step earlier.
+        def _bootstraps(runX):
+            return [w for w in runX.writes if "launchctl bootstrap system" in _fmt(w["argv"])]
+        ctxL, runL = _enable_world("code-reload", old_beats=labels_e)
+        refusedL = _load_clone_jobs(ctxL, list(labels_e))
+        loadsL = (ctxL.state.data.get("notes") or {}).get(DAEMON_LOADS_NOTE) or {}
+        rowL, _pL = _enable(ctxL)
+        expect("KIT-702 a load by the code step is held to its own heartbeat",
+               not refusedL and sorted(loadsL) == sorted(labels_e)
+               and isinstance(rowL, Unknown) and "from before the load" in rowL.what,
+               "the code step's reload was not recorded, or enable passed a heartbeat from before "
+               "it: refused %r, loads %r, row %r" % (refusedL, loadsL, rowL))
+        ctxL2, runL2 = _enable_world("code-reload-fresh", old_beats=labels_e, new_job_writes=labels_e)
+        _load_clone_jobs(ctxL2, list(labels_e))
+        loaded_by_code = len(_bootstraps(runL2))
+        rowL2, _pL2 = _enable(ctxL2)
+        expect("KIT-702 enable proves the code step's load without loading again",
+               isinstance(rowL2, tuple) and rowL2[0] is True and "after its load" in rowL2[1]
+               and loaded_by_code == 3 and len(_bootstraps(runL2)) == 3,
+               "enable did not prove a load the code step made, or loaded the daemons again: %r"
+               % (rowL2,))
+        ctxM, runM = _enable_world("exit-reload", old_beats=labels_e)
+        said_exit = _load_one_again(ctxM, labels_e[0])
+        loadsM = (ctxM.state.data.get("notes") or {}).get(DAEMON_LOADS_NOTE) or {}
+        expect("KIT-702 a load on the way out is recorded too",
+               said_exit == "" and list(loadsM) == [labels_e[0]],
+               "the reload a stopped run makes on its way out left no load on the ledger: %r %r"
+               % (said_exit, loadsM))
+        # A dry run, and a monitor or catch-up poller (not a daemon `enable` proves), record none.
+        ctxD0, runD0 = _enable_world("no-record")
+        _note_daemon_load(ctxD0, catchup_label(conf_e), 1)
+        runD0.dry_run = True
+        _note_daemon_load(ctxD0, labels_e[0], 1)
+        expect("KIT-702 only a real load of one of the three daemons is recorded",
+               not (ctxD0.state.data.get("notes") or {}).get(DAEMON_LOADS_NOTE),
+               "a load that is no daemon's, or a dry run's, reached the ledger")
+    finally:
+        globals()["HEARTBEAT_WAIT_SECONDS"], globals()["_pause"] = saved_wait, saved_pause_e
 
     cases += 1
     fr_cwd = FakeRunner([("true", 0, "")])
@@ -8828,7 +9481,7 @@ def _selftest_body():
         ctxG, fakeG = _settled_ctx(dict(conf, MODEL_LABEL_GUARDED=guarded))
         fakeG.answers = [("cat $HOME/.stage-e/poller.json", 0, ""),
                          ("cat $HOME/.stage-e/kit/scripts/pipeline_review_poller.py", 0,
-                          'CONFIG_KEYS = {"model_label_name_guarded": ""}\n'),
+                          '"routing_signoff_file"\nCONFIG_KEYS = {"model_label_name_guarded": ""}\n'),
                          ("cat > ", 0, "")] + list(fakeG.answers)
         step_configs(ctxG, apply_it=True)
         wrote = [w for w in fakeG.writes if "cat > $HOME/.stage-e/poller.json" in _fmt(w["argv"])]
@@ -8843,7 +9496,7 @@ def _selftest_body():
     ctxGO, fakeGO = _settled_ctx(dict(conf, MODEL_LABEL_GUARDED="sonnet"))
     fakeGO.answers = [("cat $HOME/.stage-e/poller.json", 0, ""),
                       ("cat $HOME/.stage-e/kit/scripts/pipeline_review_poller.py", 0,
-                       'CONFIG_KEYS = {"model_label_name": ""}\n'),
+                       '"routing_signoff_file"\nCONFIG_KEYS = {"model_label_name": ""}\n'),
                       ("cat > ", 0, "")] + list(fakeGO.answers)
     try:
         step_configs(ctxGO, apply_it=True)
@@ -8863,7 +9516,7 @@ def _selftest_body():
         ctxK, fakeK = _settled_ctx(dict(conf, STATE_KEEP_DAYS=keep))
         fakeK.answers = [("cat $HOME/.stage-e/poller.json", 0, ""),
                          ("cat $HOME/.stage-e/kit/scripts/pipeline_review_poller.py", 0,
-                          'CONFIG_KEYS = {"state_keep_days": ""}\n'),
+                          '"routing_signoff_file"\nCONFIG_KEYS = {"state_keep_days": ""}\n'),
                          ("cat > ", 0, "")] + list(fakeK.answers)
         step_configs(ctxK, apply_it=True)
         wroteK = [w for w in fakeK.writes if "cat > $HOME/.stage-e/poller.json" in _fmt(w["argv"])]
@@ -8876,7 +9529,7 @@ def _selftest_body():
     ctxKO, fakeKO = _settled_ctx(dict(conf, STATE_KEEP_DAYS="7"))
     fakeKO.answers = [("cat $HOME/.stage-e/poller.json", 0, ""),
                       ("cat $HOME/.stage-e/kit/scripts/pipeline_review_poller.py", 0,
-                       'CONFIG_KEYS = {"model_label_name": ""}\n'),
+                       '"routing_signoff_file"\nCONFIG_KEYS = {"model_label_name": ""}\n'),
                       ("cat > ", 0, "")] + list(fakeKO.answers)
     try:
         step_configs(ctxKO, apply_it=True)
@@ -8972,90 +9625,208 @@ def _selftest_body():
     expect("idempotent-mutant", bool(fake3.writes),
            "the idempotency check cannot see an unconditional write")
 
-    # -- 10. the tracker step is idempotent and creates what is missing ------
+    # -- 10. the tracker step (KIT-599): the work teams are read, never changed; the
+    #        labels are ensured; nothing about a team, a state or an automation is written.
     cases += 1
-    ctx4, _f4 = _settled_ctx(conf)
-    empty = FakeLinear(users=[{"id": "u-agent", "displayName": "dispatcher-agent",
-                               "active": True},
-                              {"id": "u-owner", "email": "owner@example.com",
-                               "active": True}])
-    ctx4.linear_factory = lambda key: empty
-    ctx4.key_reader = lambda prompt: "lin_api_" + "k" * 30
-    ctx4.tty = True
+    work_team = {"id": "t-kit", "key": "KIT", "name": "Kit"}
+    people = [{"id": "u-agent", "displayName": "dispatcher-agent", "active": True},
+              {"id": "u-owner", "email": "owner@example.com", "active": True}]
+
+    def _tracker(conf_=None, **kw):
+        ctxT, _fT = _settled_ctx(conf_ or conf)
+        fakeT = FakeLinear(**dict(dict(teams=[dict(work_team)], users=[dict(u) for u in people],
+                                       members=[{"id": "u-agent", "displayName": "agent"}]), **kw))
+        ctxT.linear_factory = lambda key: fakeT
+        ctxT.key_reader = lambda prompt: "lin_api_" + "k" * 30
+        ctxT.tty = True
+        return ctxT, fakeT
+
+    team_writes = ("TeamCreate", "StateCreate", "TeamGitAutomations", "GitAutomationDelete",
+                   "MemberCreate", "TeamStates")
+    ctx4, empty = _tracker()
     (ok, detail, _x), _n = _quiet(lambda: step_tracker(ctx4, apply_it=True))
-    expect("tracker-creates", ok is False and "created" in detail,
-           "an empty workspace was not built out: %s" % detail)
-    expect("tracker-creates", "team" in empty.created and "label" in empty.created
-           and "member" in empty.created, "created: %s" % empty.created)
-    # …and it needed NO sign-off to get there: the git automations were read.
-    expect("tracker-creates", not ctx4.state.attested("A-AUTOMATIONS"),
-           "the happy path still demands a hand sign-off for the automations")
+    made = sorted(x["name"] for x in empty.labels)
+    expect("tracker-creates", ok is False and "created" in detail
+           and made == ["haiku", "provenance:agent", "reviews-kit"],
+           "an empty workspace did not get its labels: %s, labels %s" % (detail, made))
+    expect("tracker-touches-no-team", not [op for op in empty.asked if op in team_writes],
+           "the tracker step reached for a team operation: %s"
+           % [op for op in empty.asked if op in team_writes])
+    ids4 = ctx4.state.data.get("ids") or {}
+    expect("tracker-records-work-teams",
+           (ids4.get("team_ids"), ids4.get("review_label_ids", {}).get("example-org/kit") is not None,
+            "reviews_team_id" in ids4) == ({"KIT": "t-kit"}, True, False),
+           "the ids are not the work teams' and the routing label's: %s" % ids4)
     before = list(empty.created)
     (ok, detail, _x), _n = _quiet(lambda: step_tracker(ctx4, apply_it=True))
-    expect("tracker-idempotent", ok is True and "nothing to create" in detail,
-           "the second tracker pass was not already-done: %s" % detail)
-    expect("tracker-idempotent", empty.created == before,
-           "the second pass created something: %s" % empty.created)
+    expect("tracker-idempotent", ok is True and "nothing to create" in detail
+           and empty.created == before,
+           "the second tracker pass was not already-done: %s, created %s" % (detail, empty.created))
 
-    # -- 11. the git automations are READ, and every live one is turned off --
-    # They are `Team.gitAutomationStates`, not a toggle nothing can see. The
-    # card survives only for a workspace whose API will not name them.
+    # A dry pass names a missing routing label and creates nothing.
+    ctxD, fakeD = _tracker(labels=[dict(x) for x in STOCKED_WS_LABELS if x["name"] != "reviews-kit"])
+    (okD, detailD, _x), _n = _quiet(lambda: step_tracker(ctxD, apply_it=False))
+    expect("tracker-dry-names-routing-label",
+           (okD, "reviews-kit" in detailD, fakeD.created) == (False, True, []),
+           "a dry pass did not name the missing routing label: %s" % detailD)
+
+    # A team-scoped label of the routing label's name is refused, never counted.
+    ctxS, _fS = _tracker(labels=[dict(x) for x in STOCKED_WS_LABELS if x["name"] != "reviews-kit"]
+                         + [{"id": "lx", "name": "reviews-kit", "team": {"id": "t-kit"}}])
+    try:
+        _quiet(lambda: step_tracker(ctxS, apply_it=True))
+        refusedS = ""
+    except SetupError as exc:
+        refusedS = str(exc)
+    expect("tracker-refuses-team-scoped-routing-label", "TEAM-SCOPED" in refusedS,
+           "a team-scoped routing label was not refused: %r" % refusedS)
+
+    # A managed team key that names no team is refused by name.
+    ctxK, _fK = _tracker(dict(conf, MANAGED_TEAM_KEYS="KIT,NOPE"))
+    try:
+        _quiet(lambda: step_tracker(ctxK, apply_it=True))
+        refusedK = ""
+    except SetupError as exc:
+        refusedK = str(exc)
+    expect("tracker-unknown-team", "NOPE" in refusedK,
+           "an unknown work team was not refused by name: %r" % refusedK)
+
+    # KIT-662: CK-4 CHECKS WHAT DELEGATION NEEDS. Linear lets an agent take delegations on the
+    # teams it was given access to when it was installed, and that access is not membership:
+    # on 11 Nov the agent was a member of neither work team and took every delegation on both.
+    # So the step reads proof: the agent is a member, or a ticket on the team is delegated to
+    # it. An agent with neither on a team cannot be reached there: card CK-4, naming the team.
+    # Nothing is ever added to a work team.
+    ctxM, fakeM = _tracker(members=[])
+    try:
+        _quiet(lambda: step_tracker(ctxM, apply_it=True))
+        blockedM = ""
+    except Blocked as exc:
+        blockedM = "%s %s" % (exc.card_id, exc.extra)
+    expect("tracker-unreachable-agent-is-ck-4",
+           blockedM.startswith("CK-4") and "KIT" in blockedM and "MemberCreate" not in fakeM.asked
+           and "DelegatedOnTeam" in fakeM.asked,
+           "an agent with no membership and no delegation on KIT was not CK-4 naming the team, "
+           "or no delegation was asked for: %r, asked %s" % (blockedM, fakeM.asked))
+    # …an agent that is NOT a member, but takes delegations on the team, passes, and the row's
+    # note names the ticket that proves it.
     cases += 1
-
-    def _stocked_team(automations):
-        return {"id": "t1", "key": "REV", "name": "Reviews",
-                "states": [{"id": "s", "name": n, "type": t} for n, t in REQUIRED_STATES],
-                "automations": list(automations)}
-
-    def _stocked(**kw):
-        return FakeLinear(
-            labels=[dict(x) for x in STOCKED_WS_LABELS],
-            users=[{"id": "u-agent", "displayName": "dispatcher-agent", "active": True},
-                   {"id": "u-owner", "email": "owner@example.com", "active": True}],
-            members=[{"id": "u-agent", "displayName": "dispatcher-agent"}], **kw)
-
-    ctx5, _f5 = _settled_ctx(conf)
-    autos = _stocked(teams=[_stocked_team([
-        # one rule that would move a review ticket, and one that fires and does
-        # nothing — an explicit "no action" override, which is left alone.
-        {"id": "ga-merge", "event": "merge", "state": {"id": "s9", "name": "Done"}},
-        {"id": "ga-start", "event": "start", "state": None}])])
-    ctx5.linear_factory = lambda key: autos
-    ctx5.key_reader = lambda prompt: "lin_api_" + "k" * 30
-    ctx5.tty = True
-    (ok, detail, _x), _n = _quiet(lambda: step_tracker(ctx5, apply_it=True))
-    expect("automations-read", ok is False and "turned off 1 git automation" in detail,
-           "the live automation was not turned off: %s" % detail)
-    expect("automations-read",
-           [a["id"] for a in autos.teams[0]["automations"]] == ["ga-start"],
-           "the wrong rules were deleted: %s" % autos.teams[0]["automations"])
-    expect("automations-read", not ctx5.state.attested("A-AUTOMATIONS"),
-           "the installer signed off a checkpoint on the owner's behalf")
-    (ok2, detail2, _x), _n = _quiet(lambda: step_tracker(ctx5, apply_it=True))
-    expect("automations-read", ok2 is True and "nothing to create" in detail2,
-           "the second pass was not already-done: %s" % detail2)
-    # …and a dry run reports them without deleting one.
+    ctxD, fakeD = _tracker(members=[], delegated=[{"team": "t-kit", "delegate": "u-agent",
+                                                    "identifier": "KIT-70"}])
+    try:
+        (_okD, _detailD, notesD), _x = _quiet(lambda: step_tracker(ctxD, apply_it=True))
+        heldD = ""
+    except (Blocked, Unknown, SetupError) as exc:
+        notesD, heldD = [], "%s: %s" % (type(exc).__name__, exc)
+    expect("tracker-delegation-without-membership-passes",
+           not heldD and "MemberCreate" not in fakeD.asked
+           and any("KIT-70" in n and "not a member" in n for n in notesD),
+           "an agent that takes delegations on KIT without being a member was held, or the "
+           "note did not name its proof: %r; %r" % (heldD, notesD))
+    # …a ticket delegated to someone else on the team, or to the agent on another team, proves
+    # nothing about this team.
     cases += 1
-    ctx5b, _f5b = _settled_ctx(conf)
-    autos_b = _stocked(teams=[_stocked_team(
-        [{"id": "ga-merge", "event": "merge", "state": {"id": "s9", "name": "Done"}}])])
-    ctx5b.linear_factory = lambda key: autos_b
-    ctx5b.key_reader = lambda prompt: "lin_api_" + "k" * 30
-    ctx5b.tty = True
-    (ok, detail, _x), _n = _quiet(lambda: step_tracker(ctx5b, apply_it=False))
-    expect("automations-read", ok is False and "live git automation" in detail,
-           "a dry run did not report the live automation: %s" % detail)
-    expect("automations-read", autos_b.created == [],
-           "a dry run deleted an automation: %s" % autos_b.created)
+    ctxO, _fakeO = _tracker(members=[], delegated=[
+        {"team": "t-kit", "delegate": "u-owner", "identifier": "KIT-71"},
+        {"team": "t-other", "delegate": "u-agent", "identifier": "OTH-1"}])
+    try:
+        _quiet(lambda: step_tracker(ctxO, apply_it=True))
+        blockedO = ""
+    except Blocked as exc:
+        blockedO = exc.card_id
+    expect("tracker-another-delegation-proves-nothing", blockedO == "CK-4",
+           "a delegation to someone else, or on another team, was taken as proof: %r" % blockedO)
+    # …a member needs no second read, and a read that fails is UNKNOWN: never a pass, never
+    # the card.
+    cases += 1
+    ctxP, fakeP = _tracker()
+    _quiet(lambda: step_tracker(ctxP, apply_it=True))
+    expect("tracker-member-needs-no-delegation-read", "DelegatedOnTeam" not in fakeP.asked,
+           "a member's team was asked for a delegation too: %s" % fakeP.asked)
+    cases += 1
+    ctxU, _fakeU = _tracker(members=[], no_field=("DelegatedOnTeam",))
+    try:
+        _quiet(lambda: step_tracker(ctxU, apply_it=True))
+        heldU = "no stop"
+    except Unknown as exc:
+        heldU = "unknown: %s || %s" % (exc.what, exc.remedy)
+    except (Blocked, SetupError) as exc:
+        heldU = "%s: %s" % (type(exc).__name__, exc)
+    expect("tracker-delegation-read-fails-is-unknown",
+           heldU.startswith("unknown:") and "KIT" in heldU and "CK-4" in heldU,
+           "a delegation read that failed was not UNKNOWN naming the team and the card: %r"
+           % heldU)
+
+    # The retired keys are a note, never an error.
+    ctxR, _fR = _tracker(dict(conf, REVIEWS_TEAM_KEY="REV", REVIEWS_TEAM_NAME="Reviews"),
+                         labels=[dict(x) for x in STOCKED_WS_LABELS])
+    (okR, _dR, notesR), _n = _quiet(lambda: step_tracker(ctxR, apply_it=True))
+    expect("tracker-retired-keys-noted",
+           okR is True and any("REVIEWS_TEAM_KEY and REVIEWS_TEAM_NAME are retired" in n
+                               for n in notesR),
+           "the retired keys were not named in a note: %s" % notesR)
+
+    # -- 10g. KIT-599: a deployed review poller from before the work teams is never handed
+    # the work-team config: it would refuse the whole file and review nothing.
+    cases += 1
+    ctxW, fakeW = _settled_ctx(conf)
+    fakeW.answers = [("cat $HOME/.stage-e/poller.json", 0, ""),
+                     ("cat $HOME/.stage-e/kit/scripts/pipeline_review_poller.py", 0,
+                      'CONFIG_KEYS = {"reviews_team_key": ""}\n'),
+                     ("cat > ", 0, "")] + list(fakeW.answers)
+    try:
+        step_configs(ctxW, apply_it=True)
+        refusedW = ""
+    except SetupError as exc:
+        refusedW = str(exc)
+    expect("configs-work-teams-old-poller-refused",
+           "Nothing was written" in refusedW and "work teams" in refusedW
+           and not [w for w in fakeW.writes if "cat >" in _fmt(w["argv"])],
+           "an old review poller was handed the work-team config: %r" % refusedW)
+    composed = {}
+    ctxW2, fakeW2 = _settled_ctx(conf)
+    fakeW2.answers = [("cat $HOME/.stage-e/poller.json", 0, ""), ("cat > ", 0, "")] + list(fakeW2.answers)
+    step_configs(ctxW2, apply_it=True)
+    for w in fakeW2.writes:
+        if "poller.json" in _fmt(w["argv"]) and w.get("stdin"):
+            try:
+                composed = json.loads(w["stdin"])
+            except ValueError:
+                pass
+    expect("configs-work-teams-shape",
+           (composed.get("routing_signoff_file"), composed.get("shared_stop_file"),
+            composed.get("dispatcher_version_url"), "reviews_team_key" in composed)
+           == ("~/.stage-a/routing-signoff.json", "~/.stage-a/state/stop.json",
+               "http://127.0.0.1:3456/version", False),
+           "the poller's config is not the work-team shape: %s" % composed)
+    # ...and it is a config the review poller itself accepts, read by its own loader in
+    # work-team mode: the two files ship apart, so a key one renames is caught here.
+    cases += 1
+    import pipeline_review_poller as _prp_load
+    loaded_mode, load_error = None, None
+    with tempfile.TemporaryDirectory() as tmp_load:
+        path_load = os.path.join(tmp_load, "poller.json")
+        with open(path_load, "w") as fh:
+            json.dump(composed, fh)
+        try:
+            loaded_mode = _prp_load.load_config(path_load).get("mode")
+        except _prp_load.PollerError as exc:
+            load_error = str(exc)
+    expect("configs-work-teams-pass-the-pollers-own-loader",
+           (loaded_mode, load_error) == (_prp_load.MODE_WORK_TEAMS, None),
+           "the review poller refuses the config this installer writes: %s" % load_error)
+    cases += 1
+    expect("configs-work-teams-carry-the-routing-wait",
+           composed.get("routing_wait_seconds") == _prp_load.DEFAULT_ROUTING_WAIT_SECONDS,
+           "the poller's config does not carry the routing wait the poller defaults to: %r"
+           % composed.get("routing_wait_seconds"))
+
     # -- 11a. KIT-418: MODEL_LABEL_GUARDED is ensured at workspace scope the way MODEL_LABEL
     # is: named on a dry run, created on apply and read back, and left alone once there.
     cases += 1
     for apply_g in (False, True):
-        ctxGL, _fGL = _settled_ctx(dict(conf, MODEL_LABEL_GUARDED="sonnet"))
-        stockedG = _stocked(teams=[_stocked_team([])])
-        ctxGL.linear_factory = lambda key, s=stockedG: s
-        ctxGL.key_reader = lambda prompt: "lin_api_" + "k" * 30
-        ctxGL.tty = True
+        ctxGL, stockedG = _tracker(dict(conf, MODEL_LABEL_GUARDED="sonnet"),
+                                   labels=[dict(x) for x in STOCKED_WS_LABELS])
         (okG, detailG, _x), _n = _quiet(lambda: step_tracker(ctxGL, apply_it=apply_g))
         madeG = [x["name"] for x in stockedG.labels if x["name"] == "sonnet"]
         expect("tracker-guarded-label",
@@ -9065,55 +9836,6 @@ def _selftest_body():
     (okG2, detailG2, _x), _n = _quiet(lambda: step_tracker(ctxGL, apply_it=True))
     expect("tracker-guarded-label", okG2 is True and "nothing to create" in detailG2,
            "a second pass after the guarded label exists was not already-done: %s" % detailG2)
-
-    # -- 11b. …and CK-3 survives ONLY as the fallback for an API that cannot -
-    cases += 1
-    ctx5c, _f5c = _settled_ctx(conf)
-    blind = _stocked(teams=[_stocked_team([])], no_field={"TeamGitAutomations"})
-    ctx5c.linear_factory = lambda key: blind
-    ctx5c.key_reader = lambda prompt: "lin_api_" + "k" * 30
-    ctx5c.tty = True
-    try:
-        _quiet(lambda: step_tracker(ctx5c, apply_it=True))
-        failures.append("automations-fallback: a workspace whose API would not name the "
-                        "automations was passed as if they were off")
-    except Blocked as exc:
-        expect("automations-fallback", exc.card_id == "CK-3", "blocked on %s" % exc.card_id)
-    ctx5c.state.attest("A-AUTOMATIONS", "bc")
-    (ok, _d, _x), _n = _quiet(lambda: step_tracker(ctx5c, apply_it=True))
-    expect("automations-fallback", ok is True, "a signed-off board still blocked")
-
-    # -- 11c. a SUB-TEAM is fatal, and it is read rather than left on a card -
-    cases += 1
-    ctx5d, _f5d = _settled_ctx(conf)
-    nested = _stocked_team([])
-    nested["parent"] = {"id": "t0", "key": "ENG", "name": "Engineering"}
-    ctx5d.linear_factory = lambda key: _stocked(teams=[nested])
-    ctx5d.key_reader = lambda prompt: "lin_api_" + "k" * 30
-    ctx5d.tty = True
-    try:
-        _quiet(lambda: step_tracker(ctx5d, apply_it=True))
-        failures.append("sub-team: a nested Reviews team was accepted")
-    except SetupError as exc:
-        expect("sub-team", "SUB-TEAM" in str(exc) and "ENG" in str(exc),
-               "the refusal did not name the parent: %s" % exc)
-
-    # -- 11d. a workflow state nobody could see created is never reported ----
-    cases += 1
-    ctx5e, _f5e = _settled_ctx(conf)
-    liar = _stocked(teams=[{"id": "t1", "key": "REV", "name": "Reviews", "states": [],
-                            "automations": []}], refuse={"StateCreate"})
-    ctx5e.linear_factory = lambda key: liar
-    ctx5e.key_reader = lambda prompt: "lin_api_" + "k" * 30
-    ctx5e.tty = True
-    try:
-        _quiet(lambda: step_tracker(ctx5e, apply_it=True))
-        failures.append("state-read-back: `success: false` with no error was reported as "
-                        "three created workflow states")
-    except SetupError as exc:
-        expect("state-read-back", "on a re-read" in str(exc)
-               and all(n in str(exc) for n, _t in REQUIRED_STATES),
-               "the failure did not name the states that are not there: %s" % exc)
 
     # -- 12. an empty required-check set is never invented -------------------
     cases += 1
@@ -9356,8 +10078,12 @@ def _selftest_body():
                "a tag matches by name OR id, and both must name the same entry")
         expect("entry-shape", "REVIEW-ONLY session" in entry["appendInstruction"],
                "the reviewer brief is not in appendInstruction")
-    expect("entry-shape", entries7[0]["teamKeys"] == ["REV"],
-           "the fallback team key is not on the first entry")
+    # KIT-599: no entry claims a team key — on a work team that key is the coding entry's —
+    # and each routes on its own label, the name only it answers to.
+    expect("entry-shape", not any(e.get("teamKeys") for e in entries7)
+           and all(e.get("routingLabels") == [e["name"]] for e in entries7),
+           "a review entry claims a team key, or does not route on its own label: %s"
+           % [(e.get("name"), e.get("teamKeys"), e.get("routingLabels")) for e in entries7])
 
     # -- 7c. KIT-310: the review poller and the bounce driver run every two minutes by default,
     # in the code, the committed example and the guide's table, so a PR no longer waits about
@@ -9589,9 +10315,9 @@ def _selftest_body():
     expect("entry-per-repo", multi[1]["baseBranch"] == "trunk",
            "the base branch came from a different entry than the path did — a worktree "
            "cut from a branch that may not exist in that clone")
-    expect("entry-per-repo", [bool(e.get("teamKeys")) for e in multi] == [True, False],
-           "the Reviews team key is on %d entries; two claimants make the no-tag fallback "
-           "depend on file order" % sum(1 for e in multi if e.get("teamKeys")))
+    expect("entry-per-repo", [bool(e.get("teamKeys")) for e in multi] == [False, False],
+           "a team key is on %d review entries; on a work team that key is the coding "
+           "entry's (KIT-599)" % sum(1 for e in multi if e.get("teamKeys")))
     # …and the clone's identity is READ, never inferred: the `app` entry has no
     # githubUrl at all, and its path's basename is the only other thing that
     # could have matched it — so only `git remote get-url origin` can have.
@@ -9612,8 +10338,7 @@ def _selftest_body():
     # -- 14b-ii. a PLANNING entry manages a clone too, and is never the answer - #
     # The idea gate points its entry at a clone of the same repository. It sits first
     # in this fixture, which is where file order would have made it win. The lookup
-    # must skip it: a fallback fix ticket routed there would reach a session with no
-    # shell and no write, which cannot fix anything (KIT-155).
+    # must skip it: a review entry copies the clone the coding entry reads (KIT-155).
     cases += 1
     planning = {"id": PLANNING_ENTRY_PREFIX + "plan", "name": PLANNING_ENTRY_PREFIX + "plan",
                 "repositoryPath": "/x/kit", "baseBranch": "main", "teamKeys": ["PLAN"]}
@@ -9628,11 +10353,6 @@ def _selftest_body():
            (by_repo.get("example-org/kit") or {}).get("id") == "kit",
            "example-org/kit resolved to %r, not the coding entry that manages it"
            % (by_repo.get("example-org/kit") or {}).get("id"))
-    expect("planning-entry-skipped",
-           "example-org/kit" in _dispatcher_repo_names(ctx14)
-           and _dispatcher_repo_names(ctx14)["example-org/kit"] == "kit",
-           "the fallback fix ticket would route to %r"
-           % _dispatcher_repo_names(ctx14).get("example-org/kit"))
     ctx14.dispatcher["entries"] = [e for e in ctx14.dispatcher["entries"]
                                    if not _is_planning_entry(e)]
     ctx14.origin_slugs.clear()
@@ -9661,16 +10381,15 @@ def _selftest_body():
                                                  dead=["other", "byurl", "bylab"]),
            "entries this pass is about to REMOVE were still counted as matches")
     # NO REVIEW ENTRY IS THE WORKSPACE CATCH-ALL. The router's last resort is
-    # the first entry with no teamKeys, no routingLabels and no projectKeys —
-    # so without the never-routed label the second entry would quietly swallow
-    # every ticket from an unconfigured team, which today raises a prompt.
+    # the first entry with no teamKeys, no routingLabels and no projectKeys. Each
+    # review entry routes on its own label (KIT-599), so none is a candidate.
     for entry in multi:
         expect("never-catch-all",
                entry.get("teamKeys") or entry.get("routingLabels") or entry.get("projectKeys"),
                "%s is a catch-all candidate" % entry["name"])
-    expect("never-catch-all", all(e.get("routingLabels") == [REVIEW_ENTRY_NEVER_LABEL]
-                                  for e in multi),
-           "the never-routed label is missing or changed shape: %s"
+    expect("never-catch-all", [e.get("routingLabels") for e in multi]
+           == [[e["name"]] for e in multi],
+           "a review entry does not route on its own label alone: %s"
            % [e.get("routingLabels") for e in multi])
 
     # -- 14d. the two files spell the entry name the same way ---------------- #
@@ -10274,23 +10993,170 @@ def _selftest_body():
     expect("reconcile-runs", "nothing changed" in again.stdout,
            "a second identical pass was not a no-op: %r" % again.stdout)
 
-    # -- 15f3. a review entry this installer did not write is never deleted -- #
-    # It is not ours, and it would fight the fallback, so the run stops and
-    # names it rather than silently leaving two claimants or removing a
-    # stranger's entry.
+    # -- 15f3. an entry this installer did not write never routes on a review label -- #
+    # Two entries matched by one label run ONE session whose fence is the intersection, so
+    # a stranger routing on `reviews-kit` (as a routing label, or a prompt type's label)
+    # stops the run, named, rather than widening what a reviewer holds (KIT-599).
+    for label, stranger in (
+            ("a routing label", {"routingLabels": ["reviews-kit"]}),
+            ("a prompt type's label", {"labelPrompts": {"debugger": {"labels": ["reviews-kit"]}}}),
+            ("a prompt type's plain list", {"labelPrompts": {"builder": ["reviews-kit"]}})):
+        cases += 1
+        ctxF, _fF = _settled_ctx(conf)
+        _install_review_entries(ctxF)
+        ctxF.dispatcher["entries"].append(dict(
+            {"id": "by-hand", "name": "by-hand", "repositoryPath": "/x/kit",
+             "appendInstruction": "something a person wrote"}, **stranger))
+        try:
+            _quiet(lambda: step_dispatcher_entry(ctxF, apply_it=True))
+            refusedF = ""
+        except SetupError as exc:
+            refusedF = str(exc)
+        expect("foreign-entry", "'by-hand' routes on reviews-kit" in refusedF
+               and "by hand" in refusedF,
+               "an entry routing on the review label by %s was not refused by name: %r"
+               % (label, refusedF))
+
+    # -- 15f4. KIT-599: the move onto the work teams waits for the reviews in flight -- #
+    # The entries this conf now wants route on their own label with no team key; entries an
+    # older installer wrote (the never-routed label, a team key on the first) are about to
+    # be rewritten, and the restart that follows would end a review half-way.
+    def _old_shape(ctx_):
+        rows = _install_review_entries(ctx_)
+        for at, row in enumerate(rows):
+            row["routingLabels"] = ["stage-e-review-entry-never-label-routed"]
+            if at == 0:
+                row["teamKeys"] = ["REV"]
+        return rows
+
+    seen_doc = {"schema": "pipeline-review-poller-seen/2", "seen": {
+        "example-org/kit#7": {"status": "pending", "review_ticket": "REV-40"},
+        "example-org/kit#6": {"status": "collected", "review_ticket": "REV-39"}}}
+    # The review poller runs: only then do the reviews in flight settle, and only then is
+    # CK-13 a wait with an end (KIT-661).
+    poller_runs = ("launchctl print system/" + daemon_labels(conf)[0], 0, "\tstate = not running\n")
     cases += 1
-    ctxF, _fF = _settled_ctx(conf)
-    _install_review_entries(ctxF)
-    ctxF.dispatcher["entries"].append(
-        {"id": "reviews-by-hand", "name": "reviews-by-hand", "repositoryPath": "/x/kit",
-         "teamKeys": ["REV"], "appendInstruction": "something a person wrote"})
+    ctxG, fakeG = _settled_ctx(conf)
+    _old_shape(ctxG)
+    fakeG.answers = [("state/seen-prs.json", 0, json.dumps(seen_doc)),
+                     poller_runs] + list(fakeG.answers)
     try:
-        _quiet(lambda: step_dispatcher_entry(ctxF, apply_it=True))
-        failures.append("foreign-entry: a second claimant of the Reviews team key was "
-                        "accepted")
-    except SetupError as exc:
-        expect("foreign-entry", "reviews-by-hand" in str(exc) and "by hand" in str(exc),
-               "the refusal does not name it or say who removes it: %s" % exc)
+        _quiet(lambda: step_dispatcher_entry(ctxG, apply_it=True))
+        blockedG = ""
+    except Blocked as exc:
+        blockedG = "%s %s" % (exc.card_id, exc.extra)
+    expect("drain-gate", blockedG.startswith("CK-13") and "example-org/kit#7 (REV-40)" in blockedG
+           and "REV-39" not in blockedG
+           and not [w for w in fakeG.writes if "reconcile the review entries" in (w.get("why") or "")],
+           "a routing move with a review in flight was not held on CK-13 with nothing "
+           "written: %r" % blockedG)
+    cases += 1
+    ctxG2, fakeG2 = _settled_ctx(conf)
+    _old_shape(ctxG2)
+    settled_doc = dict(seen_doc, seen={"example-org/kit#6": seen_doc["seen"]["example-org/kit#6"]})
+    fakeG2.answers = [("state/seen-prs.json", 0, json.dumps(settled_doc))] + list(fakeG2.answers)
+    try:
+        _quiet(lambda: step_dispatcher_entry(ctxG2, apply_it=True))
+        heldG2 = ""
+    except Blocked as exc:
+        heldG2 = exc.card_id
+    except (Unknown, SetupError):
+        heldG2 = ""          # past the gate: the restart and its proof are other cases' concern
+    expect("drain-gate-clear", heldG2 == ""
+           and [w for w in fakeG2.writes if "copy the dispatcher config" in (w.get("why") or "")],
+           "with nothing in flight the move was still held (%r), or never reached the write "
+           "(its backup comes first)" % heldG2)
+    cases += 1
+    ctxG3, fakeG3 = _settled_ctx(conf)
+    _old_shape(ctxG3)
+    fakeG3.answers = [("state/seen-prs.json", 0, "{not json")] + list(fakeG3.answers)
+    try:
+        _quiet(lambda: step_dispatcher_entry(ctxG3, apply_it=True))
+        unknownG3 = False
+    except Unknown:
+        unknownG3 = True
+    expect("drain-gate-unread", unknownG3
+           and not [w for w in fakeG3.writes if "reconcile the review entries" in (w.get("why") or "")],
+           "a seen-set that could not be parsed was read as nothing in flight")
+    # Stage E on the KIT-599 PR (11 Nov): the gate reads the file the poller WRITES, by the
+    # poller's own name and schema; a read that fails is unknown, never "none"; an absent
+    # seen-set is nothing in flight; and a review entry about to GO is gated too.
+    cases += 1
+    import pipeline_review_poller as _prp_seen
+    expect("drain-gate-reads-the-pollers-own-seen-set",
+           (globals().get("REVIEW_SEEN_FILE"), globals().get("REVIEW_SEEN_SCHEMA"),
+            globals().get("NO_SEEN_SET"),
+            set(REVIEWS_IN_FLIGHT_STATUSES) <= set(_prp_seen.COLLECT_STATUSES))
+           == (os.path.basename(_prp_seen.seen_path("x")), _prp_seen.SEEN_SCHEMA, "no-seen-set",
+               True),
+           "the drain gate does not read the file, schema and statuses the review poller "
+           "writes")
+    cases += 1
+    ctxG4, fakeG4 = _settled_ctx(conf)
+    _old_shape(ctxG4)
+    # A read that FAILED, though what it printed parses as a quiet seen-set: the exit
+    # status alone decides, never the output's look.
+    fakeG4.answers = [("state/seen-prs.json", 1, json.dumps(settled_doc))] + list(fakeG4.answers)
+    try:
+        _quiet(lambda: step_dispatcher_entry(ctxG4, apply_it=True))
+        unknownG4 = False
+    except Unknown:
+        unknownG4 = True
+    # A role-account read that names its purpose is recorded with the writes.
+    read_cmds = [_fmt(w["argv"]) for w in fakeG4.writes if "seen-prs.json" in _fmt(w["argv"])]
+    expect("drain-gate-read-fails",
+           unknownG4 and read_cmds and not any("|| true" in c or "2>/dev/null" in c
+                                                 for c in read_cmds)
+           and not [w for w in fakeG4.writes if "reconcile the review entries" in (w.get("why") or "")],
+           "a seen-set read that failed was taken as nothing in flight, or the read swallows "
+           "its own errors: %r" % read_cmds)
+    cases += 1
+    ctxG7, fakeG7 = _settled_ctx(conf)
+    _old_shape(ctxG7)
+    fakeG7.answers = [("state/seen-prs.json", 0, json.dumps(dict(settled_doc,
+                                                                 schema="pipeline-review-poller-seen/1")))
+                      ] + list(fakeG7.answers)
+    try:
+        _quiet(lambda: step_dispatcher_entry(ctxG7, apply_it=True))
+        unknownG7 = False
+    except Unknown:
+        unknownG7 = True
+    expect("drain-gate-other-schema", unknownG7
+           and not [w for w in fakeG7.writes if "reconcile the review entries" in (w.get("why") or "")],
+           "a seen-set in another schema was read as one this gate understands")
+    cases += 1
+    ctxG5, fakeG5 = _settled_ctx(conf)
+    _old_shape(ctxG5)
+    try:
+        _quiet(lambda: step_dispatcher_entry(ctxG5, apply_it=True))
+        heldG5 = ""
+    except Blocked as exc:
+        heldG5 = exc.card_id
+    except (Unknown, SetupError):
+        heldG5 = ""
+    expect("drain-gate-no-seen-set-yet", heldG5 == ""
+           and [w for w in fakeG5.writes if "copy the dispatcher config" in (w.get("why") or "")],
+           "with no seen-set yet the move was held (%r) or never reached the write" % heldG5)
+    cases += 1
+    ctxG6, fakeG6 = _settled_ctx(conf)
+    rowsG6 = _install_review_entries(ctxG6)
+    retired = dict(rowsG6[0], id=REVIEW_ENTRY_PREFIX + "retired",
+                   name=REVIEW_ENTRY_PREFIX + "retired")
+    ctxG6.dispatcher["entries"].append(retired)
+    fakeG6.answers = [("state/seen-prs.json", 0, json.dumps(seen_doc)),
+                      poller_runs] + list(fakeG6.answers)
+    try:
+        _quiet(lambda: step_dispatcher_entry(ctxG6, apply_it=True))
+        blockedG6 = ""
+    except Blocked as exc:
+        blockedG6 = "%s %s" % (exc.card_id, exc.extra)
+    except (Unknown, SetupError) as exc:
+        blockedG6 = "other: %s" % exc
+    expect("drain-gate-stale-entry", blockedG6.startswith("CK-13")
+           and REVIEW_ENTRY_PREFIX + "retired" in blockedG6
+           and not [w for w in fakeG6.writes if "reconcile the review entries" in (w.get("why") or "")],
+           "removing a review entry with a review in flight was not held on CK-13: %r"
+           % blockedG6)
 
     # complement: an entry that DIFFERS must still stop and restart it.
     cases += 1
@@ -10872,6 +11738,236 @@ def _selftest_body():
            "a real driver failure was excused by a CANNOT EVALUATE line beside it: %r"
            % (rowD6 if not isinstance(rowD6, SetupError) else ""))
 
+    # -- 15j2. a poller paused for want of the routing sign-off is expected (KIT-733) ---- #
+    # THE LIVE STATE, found 12 Nov 2026 in the move onto the work teams: the review entries
+    # were rewritten, so the old routing probe no longer held and its sign-off was gone. The
+    # poller (work-team config) then pauses every repository for want of it and exits 1, this
+    # step read that as a failed install, and the one command stopped here for good: the
+    # probe that writes the sign-off is the idea gate's, which runs AFTER this installer.
+    # Every PAUSED line below is built by the poller's own code (`review_blockers`) from
+    # a real tmp tree, so the wording this file reads is the wording the poller prints.
+    cases += 1
+    import pipeline_machine_tickets as _machine_mod
+    nosig_repos = ["example-org/kit", "example-org/app"]
+    tmpNOSIG = tempfile.mkdtemp(prefix="stage-e-nosignoff.")
+
+    def _nosig_cfg(tag):
+        base = os.path.join(tmpNOSIG, tag)
+        return {"routing_signoff_file": os.path.join(base, ".stage-a", "routing-signoff.json"),
+                "shared_stop_file": os.path.join(base, ".stage-a", "state", "stop.json"),
+                "state_dir": os.path.join(base, "state"),
+                "dispatcher_version_url": "http://127.0.0.1:3456/version",
+                "_route_labels": dict((_poller_mod.review_entry_name(r), "label-" + r)
+                                      for r in nosig_repos)}
+
+    def _poller_says(cfg, seen=None):
+        """The lines the poller prints for these repositories, from its own code."""
+        blockers = _poller_mod.review_blockers(cfg, set(nosig_repos), "key", seen=seen)
+        return ["PAUSED %s: reviews are paused — %s"
+                % (repo, "; ".join(detail for _code, detail in reasons))
+                for repo, reasons in sorted(blockers.items())]
+
+    def _paused_out(lines, extra=""):
+        return ("resolved workspace ws-1, agent user a, model label m, guarded label g\n"
+                + "\n".join(lines) + "\n"
+                + "paused example-org/kit#75: told once on the PR [dry-run]\n" + extra)
+
+    # The frame the lines above are printed in, pinned to the poller's source.
+    with open(_poller_mod.__file__, encoding="utf-8") as fh:
+        poller_source = fh.read()
+    expect("unsigned-probe-is-expected", 'log("PAUSED %s: reviews are paused — %s"' in poller_source,
+           "the poller prints its pause in another frame now, so the lines this file reads "
+           "are no longer the lines it prints")
+    expect("unsigned-probe-is-expected", COMPONENT_EXIT_ERROR == _poller_mod.EXIT_ERROR,
+           "this file says a paused poller exits %d and the poller says %d — a number copied "
+           "out of another module has drifted" % (COMPONENT_EXIT_ERROR, _poller_mod.EXIT_ERROR))
+    missing_cfg = _nosig_cfg("missing")
+    live_lines = _poller_says(missing_cfg)
+    expect("unsigned-probe-is-expected",
+           len(live_lines) == 2 and all("there is no routing sign-off at" in l for l in live_lines),
+           "the fixture is not the live state (both repositories paused for want of the "
+           "sign-off, and nothing else): %r" % live_lines)
+    live_out = _paused_out(live_lines)
+
+    def _nosig_row(poller, attested=True):
+        c, _f = _dry_run_ctx(conf, poller=poller)
+        if not attested:
+            c.state.data["attestations"].pop("A-DRY-RUN", None)
+        return _quiet(lambda: _dry_run_row(c))
+
+    # …expected, while the sign-off is absent: the row passes, and ONE plain line names the
+    # probe, so the pause is neither a failure nor a silence.
+    rowNOSIG, printedNOSIG = _nosig_row((1, live_out))
+    okNOSIG = isinstance(rowNOSIG, tuple) and rowNOSIG[0] is True
+    expect("unsigned-probe-is-expected", okNOSIG,
+           "a poller paused for want of the routing sign-off stopped the install: %s"
+           % (rowNOSIG[1] if isinstance(rowNOSIG, tuple) else rowNOSIG))
+    saidProbe = [l for l in printedNOSIG.splitlines() if "Run the probe now?" in l]
+    expect("unsigned-probe-is-expected",
+           len(saidProbe) == 1 and "routing probe" in saidProbe[0] and "expected" in saidProbe[0],
+           "the pause was not explained in one plain line that names the probe: %r"
+           % printedNOSIG[-600:])
+    expect("unsigned-probe-is-expected",
+           okNOSIG and "paused" in rowNOSIG[1] and "routing probe" in rowNOSIG[1],
+           "…and the row hid the pause behind a clean-sounding verdict: %r"
+           % (rowNOSIG[1] if isinstance(rowNOSIG, tuple) else rowNOSIG))
+    expect("unsigned-probe-is-expected", "there is no routing sign-off at" in printedNOSIG,
+           "the poller's own PAUSED lines were not left on screen for the person to read")
+
+    # …but ONLY that. Every other way the poller is red is still a failure, in the same
+    # output, beside the same line, or alone.
+    sign_bad = _nosig_cfg("unreadable")
+    os.makedirs(sign_bad["routing_signoff_file"])            # a folder where the file should be
+    junk = _nosig_cfg("malformed")
+    os.makedirs(os.path.dirname(junk["routing_signoff_file"]))
+    with open(junk["routing_signoff_file"], "w", encoding="utf-8") as fh:
+        fh.write("{}")
+    stopped = _nosig_cfg("stopped")
+    _machine_mod.write_stop_if_absent(stopped["shared_stop_file"], _machine_mod.stop_document(
+        "a review ticket misrouted", "example-org/kit", "review", {}))
+    nolabel = _nosig_cfg("nolabel")
+    nolabel["_route_labels"].pop(_poller_mod.review_entry_name("example-org/app"))
+    saved_gql = _poller_mod.linear_graphql
+    _poller_mod.linear_graphql = lambda *_a, **_k: {"issueLabels": {"nodes": []}}
+    try:
+        nolabel_lines = _poller_says(nolabel)
+    finally:
+        _poller_mod.linear_graphql = saved_gql
+    expect("unsigned-probe-is-expected", len(nolabel_lines) == 2
+           and all("no routing sign-off" in l for l in nolabel_lines)
+           and len([l for l in nolabel_lines if "exactly once" in l]) == 1,
+           "the fixture for a missing label is not one repository paused for want of the "
+           "sign-off beside one paused for that and a missing label: %r" % nolabel_lines)
+    others = (
+        ("a FAIL line beside the pause", (1, _paused_out(
+            live_lines, "FAIL: could not discover pipeline PRs from Linear (HTTP 502)\n"))),
+        ("a RETRY line beside the pause", (1, _paused_out(
+            live_lines, "RETRY example-org/kit#75: attempt 1 of 3, re-selected next pass\n"))),
+        ("a TELEMETRY LOST line beside the pause", (1, _paused_out(
+            live_lines, "TELEMETRY LOST: example-org/kit#75 is due for a re-review, so its "
+                        "record is being re-opened\n"))),
+        ("a sign-off that cannot be read", (1, _paused_out(_poller_says(sign_bad)))),
+        ("a sign-off that is not one", (1, _paused_out(_poller_says(junk)))),
+        ("a stop that stands, beside a pure pause", (1, _paused_out(_poller_says(stopped)))),
+        # A misroute a dry run counts silently (`settle_misroute` prints nothing there) still
+        # shows in the pause: the seen-set record makes its repository's line carry a stop.
+        ("a misroute in the seen-set, beside a pure pause", (1, _paused_out(_poller_says(
+            _nosig_cfg("misroute"), seen={"k": {
+                "repo": "example-org/kit", "status": _poller_mod.MISROUTING_STATUS,
+                "created_at": "2026-11-10T00:00:00Z",
+                "routing": {"checked_at": "2026-11-10T00:00:00Z", "reason": "wrong team"}}})))),
+        ("a missing routing label, beside a pure pause", (1, _paused_out(nolabel_lines))),
+        ("a usage error beside the pause", (2, live_out)),
+        ("exit 1 with no pause line at all", (1, "resolved workspace ws-1\nboom\n")),
+    )
+    for what, poller in others:
+        cases += 1
+        rowO, _pO = _nosig_row(poller)
+        expect("unsigned-probe-is-expected",
+               isinstance(rowO, SetupError) and "exit %d" % poller[0] in str(rowO),
+               "%s: a poller red for another reason was excused beside the unsigned probe: %r"
+               % (what, rowO if not isinstance(rowO, SetupError) else str(rowO)[:200]))
+
+    # THE COST GATE IS NOT SKIPPED. A pause counted nothing, so the dry-run count was never
+    # read; with no sign-off recorded the step still stops at CK-5, after saying so.
+    cases += 1
+    rowCK, printedCK = _nosig_row((1, live_out), attested=False)
+    expect("unsigned-probe-is-expected",
+           isinstance(rowCK, Blocked) and rowCK.card_id == "CK-5"
+           and "Run the probe now?" in printedCK,
+           "a paused dry run with no count signed off did not stop at CK-5 with the pause "
+           "explained: %r" % (rowCK, ))
+
+    # THE WHOLE RUN, from the live state (every step holds; the poller is paused; no
+    # sign-off). `verify` and `run` both end clean, which is exactly what the one command
+    # reads as "Stage E is up to date" and carries on from, to the idea gate's probe.
+    cases += 1
+    ctxNL, fakeNL, _apiNL = _healthy_ctx(conf)
+    fakeNL.answers = [("scan --dry-run", 1, live_out)] + list(fakeNL.answers)
+    (codeNLv, rowsNLv), _pNLv = _quiet(lambda: run_steps(ctxNL, apply_it=False, keep_going=True))
+    (codeNLr, rowsNLr), _pNLr = _quiet(lambda: run_steps(ctxNL, apply_it=True))
+    expect("unsigned-probe-is-expected", (codeNLv, codeNLr) == (EX_OK, EX_OK),
+           "from the live state, verify exited %s and run exited %s, not 0 and 0: %s"
+           % (codeNLv, codeNLr, [(s, o, d[:80]) for s, o, d in rowsNLv + rowsNLr
+                                 if o not in (ALREADY_DONE, DONE)]))
+    expect("unsigned-probe-is-expected",
+           dict((s, o) for s, o, _d in rowsNLr).get("dry-run") in (ALREADY_DONE, DONE),
+           "the dry-run row is not a pass from the live state: %s" % rowsNLr)
+
+    # THE ONE COMMAND, from the same state (Stage E's review of this change). Its own Stage E
+    # part and idea-gate part are driven here with Stage E answered by THIS file's real `verify`
+    # on the fixture above: it reads Stage E as up to date, carries on, and the next thing it
+    # runs is the idea gate's installer, whose probe step is what asks "Run the probe now?".
+    # That installer is a recording stand-in: its question and the sign-off it then writes are
+    # pinned by its own battery (`test:stage-a-setup`), and the question is pinned below by name.
+    cases += 1
+    import pipeline_install as _install_mod
+
+    class _OneCommand(object):
+        """The one command's seam: Stage E is this file's `verify`, the idea gate is recorded."""
+        interrupted = False
+
+        def __init__(self, ctx):
+            self.ctx, self.ran, self.lines = ctx, [], []
+
+        def say(self, line=""):
+            self.lines.append(line)
+
+        def now(self):
+            return "2026-11-12T00:00:00Z"
+
+        def measure(self, argv, timeout=None):
+            return None, "not measured here"
+
+        def run(self, argv, capture=False):
+            step = (os.path.basename(argv[1]), argv[2])
+            self.ran.append(step)
+            if step == ("pipeline_stage_e_setup.py", "verify"):
+                return cmd_verify(self.ctx), ""
+            if step == ("pipeline_stage_a_setup.py", "run"):
+                return EX_BLOCKED, ""
+            raise AssertionError("an unscripted program ran: %r" % (argv,))
+
+    oc_conf = os.path.join(tmpNOSIG, "stage-e.conf")
+    open(oc_conf, "w", encoding="utf-8").close()
+
+    def _one_command(poller_out):
+        ctxOC, fakeOC, _apiOC = _healthy_ctx(conf)
+        fakeOC.answers = [("scan --dry-run", 1, poller_out)] + list(fakeOC.answers)
+        io, rep = _OneCommand(ctxOC), _install_mod.Report()
+
+        def _steps():
+            """In `main`'s order, and as `main` does: a part that returns a code stops the run."""
+            carry = _install_mod.step_stage_e(io, oc_conf, False, rep)
+            if carry is not None:
+                return carry, None
+            return carry, _install_mod.step_stage_a(
+                io, os.path.join(tmpNOSIG, "stage-a.conf"), oc_conf, rep)
+        (carry, reached), _pOC = _quiet(_steps)
+        return carry, reached, io, rep
+
+    carryOC, reachedOC, ioOC, repOC = _one_command(live_out)
+    expect("unsigned-probe-is-expected",
+           carryOC is None and repOC.steps.get("stage_e", ("",))[0] == _install_mod.OUT_OK
+           and ioOC.ran == [("pipeline_stage_e_setup.py", "verify"),
+                            ("pipeline_stage_a_setup.py", "run")] and reachedOC == EX_BLOCKED,
+           "from the live state the one command did not go from Stage E to the idea gate in one "
+           "run: carried on %r, stage_e %r, ran %r" % (carryOC, repOC.steps.get("stage_e"), ioOC.ran))
+    # …and the same chain STOPS, before the idea gate, when the poller is red for any other
+    # reason: the control that shows the run above is not a chain that cannot fail.
+    carryS, _reachedS, ioS, _repS = _one_command(_paused_out(_poller_says(stopped)))
+    expect("unsigned-probe-is-expected",
+           carryS not in (None, 0) and ("pipeline_stage_a_setup.py", "run") not in ioS.ran,
+           "a poller red for another reason let the one command reach the idea gate: %r %r"
+           % (carryS, ioS.ran))
+    # The question this file's line promises is the idea gate's own, by name.
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "pipeline_stage_a_setup.py"),
+              encoding="utf-8") as fh:
+        stage_a_source = fh.read()
+    expect("unsigned-probe-is-expected", 'ctx.confirm("Run the probe now?")' in stage_a_source,
+           "the idea gate's installer no longer asks \"Run the probe now?\", which Stage E's line "
+           "tells the person to expect")
+
     # -- 15k. the bounce driver is invoked with arguments it accepts -------- #
     # It never was. `decide` with neither --pr nor --all is a usage error, and
     # because the poller was judged first and raised, that error was invisible:
@@ -11055,7 +12151,7 @@ def _selftest_body():
     ctxUN, _fUN = _settled_ctx(conf)
     ctxUN.unloaded = [catchup_label(conf)]
     _x, saidUN = _quiet(lambda: _unloaded_notice(ctxUN))
-    expect("catchup-unloaded-notice", "catch-up is OFF until it does" in saidUN
+    expect("catchup-unloaded-notice", "catch-up is OFF until it is loaded" in saidUN
            and "review" not in saidUN.split("so ", 1)[-1].split("OFF")[0],
            "the notice for a stopped catch-up poller named the wrong jobs: %r" % saidUN[-400:])
     ctxUO, _fUO = _settled_ctx(dict(conf, CATCHUP_INTERVAL_SECONDS="off"))
@@ -11401,7 +12497,7 @@ def _selftest_body():
         _x, saidSU = _quiet(lambda: _unloaded_notice(ctxSU))
     except Exception as exc:  # noqa: BLE001 — an escape fails this case, by name
         saidSU = "the notice raised %s: %s" % (type(exc).__name__, exc)
-    expect("status-unloaded-notice", "status is OFF until it does" in saidSU
+    expect("status-unloaded-notice", "status is OFF until it is loaded" in saidSU
            and "review" not in saidSU.split("so ", 1)[-1].split("OFF")[0],
            "the notice for a stopped status job named the wrong jobs: %r" % saidSU[-400:])
 
@@ -11988,7 +13084,10 @@ def _selftest_body():
             return sum(("bootstrap system " + _dispatcher_plist(label)) in s for s in run.seq)
 
         cases += 1
-        outM, ctxM, runM = _behind_run({labN: True, labB: True})
+        # The three Stage E daemons are loaded too, so `code` records each as one it stopped
+        # (KIT-661: only a job launchd held is one a stop loads again).
+        outM, ctxM, runM = _behind_run(dict({labN: True, labB: True},
+                                            **dict.fromkeys(all_daemon_labels(conf), True)))
         moved_at = _at(runM.seq, "pull --ff-only")
         stage_e_at = min([i for i in (_at(runM.seq, "launchctl bootout system/" + lb)
                                       for lb in all_daemon_labels(conf)) if i > -1] or [-1])
@@ -12508,6 +13607,456 @@ def _selftest_body():
                "a first install: %r; looked for jobs %d time(s)" % (outF, len(lookedF)))
 
     _kit280_clone_jobs()
+
+    # -- KIT-661. A RUN THAT STOPS AFTER THE MOVE NEVER LEAVES STAGE E OFF ---------------- #
+    # 11 Nov: `run` moved the clone, unloading the poller, bounce, finding, catch-up and status
+    # jobs first, then stopped at card CK-4, before `enable`. All five stayed off for an hour
+    # and nothing said so. The drain gate (CK-13) then waited on reviews only the unloaded
+    # poller could settle. Every stop after `code` ends one of two ways: each job `code`
+    # stopped is loaded again, or the run ends NOT DONE and names each one still off with the
+    # line that loads it. A silent stop fails the case.
+    def _kit661_stops_after_the_move():
+        nonlocal cases
+        beef = "beef000000000000000000000000000000000000\tHEAD\n"
+        level = "abc1234000000000000000000000000000000000\tHEAD\n"
+        eio = "Bootstrap failed: 5: Input/output error"
+        five = list(all_daemon_labels(conf)) + [catchup_label(conf), status_label(conf)]
+        never = "reconcile the review entries"
+
+        class _Jobs(FakeRunner):
+            """launchd per label, as a domain answers it: `print` says whether it holds the
+            job, `bootout` lets it go, and `bootstrap` loads it unless `refuse` names it. A job
+            in `linger` is let go only after that many more looks, as one finishing a pass is;
+            a load into a domain that still holds it answers EIO. The fast-forward exits
+            `pull`; after one that worked, `after_pull` answers first (by default, origin level
+            with the clone). `seq` is every command, in order."""
+
+            def __init__(self, answers, loaded, refuse=(), pull=0, after_pull=None, linger=None,
+                         plists=None):
+                FakeRunner.__init__(self, answers)
+                self.loaded, self.refuse, self.seq = dict(loaded), set(refuse), []
+                self.linger, self.leaving = dict(linger or {}), {}
+                self.pull = pull
+                self.after_pull = ([("ls-remote origin HEAD", 0, level)] if after_pull is None
+                                   else list(after_pull))
+                # The plist on disk for each label in `plists`, and the one launchd loaded from
+                # (`running`): launchd keeps the definition it loaded until the job is loaded
+                # again, whatever is written to disk meanwhile.
+                self.plists = None if plists is None else dict(plists)
+                self.running = dict((label, body) for label, body in (plists or {}).items()
+                                    if self.loaded.get(label))
+
+            def look(self, label):
+                """One look at `label`, as time passing: a job letting go goes after its looks."""
+                if label in self.leaving:
+                    self.leaving[label] -= 1
+                    if self.leaving[label] < 0:
+                        del self.leaving[label]
+                        self.loaded[label] = False
+
+            def _exec(self, argv, stdin, timeout, cwd=None):
+                line = _fmt(argv)
+                self.seq.append(line)
+                if self.plists is not None and "/Library/LaunchDaemons/" in line:
+                    label = os.path.basename(line.split()[-1])[:-len(".plist")]
+                    if label in self.plists and " cat /Library/LaunchDaemons/" in line:
+                        return Result(0, self.plists[label])
+                    if label in self.plists and " install -o root " in line:
+                        with open(argv[-2], encoding="utf-8") as fh:
+                            self.plists[label] = fh.read()
+                        return Result(0)
+                if line.startswith("plutil -lint "):
+                    return Result(0, "OK\n")
+                if " launchctl bootstrap system " in line:
+                    label = os.path.basename(line.split()[-1])[:-len(".plist")]
+                    if self.loaded.get(label) or label in self.refuse:
+                        return Result(5, "", eio)
+                    self.loaded[label] = True
+                    if self.plists is not None and label in self.plists:
+                        self.running[label] = self.plists[label]
+                    return Result(0)
+                for verb in ("print", "bootout"):
+                    if " launchctl %s system/" % verb in line:
+                        label = line.split("system/", 1)[1]
+                        if verb == "print":
+                            self.look(label)
+                        was = self.loaded.get(label, False)
+                        if verb == "bootout" and was:
+                            if label in self.linger:
+                                self.leaving[label] = self.linger[label]
+                            else:
+                                self.loaded[label] = False
+                        return (Result(0, "\tstate = not running\n") if was else
+                                Result(113 if verb == "print" else 3, "", "Could not find service"))
+                if "pull --ff-only" in line:
+                    if self.pull == 0:
+                        self.answers = self.after_pull + self.answers
+                    return Result(self.pull, "", "" if self.pull == 0 else
+                                  "fatal: Not possible to fast-forward, aborting.")
+                return FakeRunner._exec(self, argv, stdin, timeout, cwd=cwd)
+
+        def _machine(cconf=None, loaded=None, behind=True, old_plists=False, **kw):
+            """A settled machine whose clone is behind origin (or level, `behind` False).
+            launchd holds each job in `loaded`: by default the dispatcher and the five Stage E
+            jobs, as on 11 Nov. With `old_plists`, the three daemons' plists on disk, and the
+            ones launchd runs, are older than what this run renders."""
+            cc = cconf or conf
+            ctxX, fakeX, _apiX = _healthy_ctx(cc)
+            held = dict((label, True) for label in [cc["DISPATCHER_SERVICE"]]
+                        + list(all_daemon_labels(cc)) + [catchup_label(cc), status_label(cc)])
+            if old_plists:
+                kw["plists"] = dict((label, "<plist>an older one</plist>\n")
+                                    for label in all_daemon_labels(cc))
+            runX = _Jobs(([("ls-remote origin HEAD", 0, beef)] if behind else [])
+                         + [("/Library/LaunchDaemons/*.plist", 0, "END\n")]
+                         + [a for a in fakeX.answers
+                            if not (behind and a[0] == "ls-remote origin HEAD")],
+                         held if loaded is None else loaded, **kw)
+            ctxX.runner = runX
+            return ctxX, runX
+
+        def _run(ctxX, stop_at="tracker", how="CK-4"):
+            """`run`, end to end and never sleeping, with the step `stop_at` replaced by one
+            that stops the way `how` names: a card by its id, "unknown", "failed" or "crash".
+            By default, card CK-4 at `tracker`, as on 11 Nov. (its exit code, or the crash, and
+            what it printed)"""
+            import io as _io
+            saved_steps, saved_pause = globals()["STEPS"], globals()["_pause"]
+
+            def _stop(_ctx, _apply_it):
+                what = "a stop at %s" % stop_at
+                if how.startswith("CK-"):
+                    raise Blocked(how, what)
+                if how == "unknown":
+                    raise Unknown(what, "nothing to clear")
+                if how == "failed":
+                    raise SetupError(what)
+                raise RuntimeError(what)
+
+            globals()["STEPS"] = tuple((sid, t, _stop if sid == stop_at else fn)
+                                       for sid, t, fn in saved_steps)
+            globals()["_pause"] = lambda _s: None
+            buf, real = _io.StringIO(), sys.stdout
+            sys.stdout = buf
+            try:
+                try:
+                    got = cmd_run(ctxX, dry_run=False)
+                except RuntimeError as exc:
+                    got = exc
+            finally:
+                sys.stdout = real
+                globals()["STEPS"], globals()["_pause"] = saved_steps, saved_pause
+            return got, buf.getvalue()
+
+        def _off(runX, labels):
+            return [label for label in labels if not runX.loaded.get(label)]
+
+        def _silent(runX, said, labels):
+            """Each of `labels` that ends neither loaded nor named as off, under NOT DONE, with
+            the line that loads it: a silent stop."""
+            return [label for label in _off(runX, labels)
+                    if not ("NOT DONE" in said and "system/" + label in said
+                            and "sudo launchctl bootstrap system " + _dispatcher_plist(label)
+                            in said)]
+
+        def _row(ctxX, sid):
+            return (ctxX.state.data.get("steps") or {}).get(sid) or {}
+
+        # (1) 11 Nov: the clone moves, then the `tracker` step stops on card CK-4.
+        cases += 1
+        ctx1, run1 = _machine()
+        code1, said1 = _run(ctx1)
+        expect("KIT-661 the-11-nov-stop-loads-the-jobs-again",
+               code1 == EX_BLOCKED and _row(ctx1, "tracker").get("detail") == "CK-4"
+               and any("pull --ff-only" in s for s in run1.seq)
+               and not _off(run1, five) and ctx1.unloaded == [] and "NOT DONE" not in said1
+               and all("system/" + label in said1 for label in five),
+               "exit %r; tracker %r; still off %s; unloaded %s; said %r"
+               % (code1, _row(ctx1, "tracker"), _off(run1, five), ctx1.unloaded, said1[-700:]))
+
+        # (2) A stop at EVERY step after `code`, in each way a step stops: a card, a
+        # could-not-tell, a failure, and a crash nothing caught.
+        order = [sid for sid, _t, _f in STEPS]
+        kinds = (("CK-1", EX_BLOCKED), ("unknown", EX_UNKNOWN), ("failed", EX_FAILED),
+                 ("crash", None))
+        for at, sid in enumerate(order[order.index("code") + 1:]):
+            cases += 1
+            how, want = kinds[at % len(kinds)]
+            ctxS, runS = _machine()
+            gotS, saidS = _run(ctxS, stop_at=sid, how=how)
+            expect("KIT-661 a-stop-at-%s-ends-with-the-jobs-loaded" % sid,
+                   not _silent(runS, saidS, five) and not _off(runS, five)
+                   and ctxS.unloaded == [] and "NOT DONE" not in saidS
+                   and any("pull --ff-only" in s for s in runS.seq)
+                   and (isinstance(gotS, RuntimeError) if want is None else gotS == want),
+                   "%s (%s): exit %r; still off %s; silent %s; said %r"
+                   % (sid, how, gotS, _off(runS, five), _silent(runS, saidS, five),
+                      saidS[-600:]))
+
+        # (3) …and the stops inside `code` itself, once it has unloaded the jobs: a
+        # fast-forward that fails, scripts still absent after the move (CK-1), and a clone
+        # still not level with origin after it.
+        for why, kw, want in (
+                ("the fast-forward failed", {"pull": 1}, EX_FAILED),
+                ("scripts absent after the move",
+                 {"after_pull": [("ls-remote origin HEAD", 0, level),
+                                 ("ls $HOME/.stage-e/kit/scripts", 0, "\n")]}, EX_BLOCKED),
+                ("the clone still not level", {"after_pull": []}, EX_FAILED)):
+            cases += 1
+            ctxC, runC = _machine(**kw)
+            gotC, saidC = _run(ctxC, stop_at=None)
+            expect("KIT-661 a-stop-inside-code-after-the-unload-loads-them-again",
+                   gotC == want and _row(ctxC, "code").get("outcome") in (FAILED, BLOCKED)
+                   and not _silent(runC, saidC, five) and not _off(runC, five)
+                   and ctxC.unloaded == [],
+                   "%s: exit %r; code %r; still off %s; said %r"
+                   % (why, gotC, _row(ctxC, "code"), _off(runC, five), saidC[-600:]))
+
+        # (4) A job launchd will not load again is NAMED: NOT DONE, the job, launchd's own
+        # words and the line that loads it. The run exits FAILED, and the others are loaded.
+        cases += 1
+        bounce = daemon_labels(conf)[1]
+        ctx4, run4 = _machine(refuse=(bounce,))
+        code4, said4 = _run(ctx4)
+        expect("KIT-661 a-job-launchd-will-not-take-back-is-named",
+               code4 == EX_FAILED and "NOT DONE" in said4 and eio in said4
+               and "system/" + bounce in said4
+               and "sudo launchctl bootstrap system " + _dispatcher_plist(bounce) in said4
+               and ctx4.unloaded == [bounce] and _off(run4, five) == [bounce]
+               and not _silent(run4, said4, five),
+               "exit %r; unloaded %s; still off %s; said %r"
+               % (code4, ctx4.unloaded, _off(run4, five), said4[-800:]))
+
+        # (5) Only what THIS run stopped is loaded again. A job launchd did not hold when the
+        # run began (a first install, or a job a person stopped on purpose) stays as it was,
+        # and is not named as off: no part of this run turned it off.
+        cases += 1
+        ctx5, run5 = _machine(loaded=dict(
+            (label, True) for label in [conf["DISPATCHER_SERVICE"]] + five if label != bounce))
+        code5, said5 = _run(ctx5)
+        expect("KIT-661 only-the-jobs-this-run-stopped-are-loaded-again",
+               code5 == EX_BLOCKED and not run5.loaded.get(bounce)
+               and not [s for s in run5.seq if " launchctl bootstrap system "
+                        + _dispatcher_plist(bounce) in s]
+               and _off(run5, five) == [bounce] and "NOT DONE" not in said5
+               and "system/" + bounce not in said5,
+               "exit %r; launchd %r; said %r" % (code5, run5.loaded, said5[-600:]))
+
+        # (6) The heartbeat monitor `code` stopped is rearmed, then loaded again after the jobs
+        # it watches, as its own step does: its first pass does not judge the heartbeats this
+        # stop made old. A rearm that fails leaves it off, and named.
+        cm6 = validate_conf(parse_conf(GOOD_CONF.replace(
+            "HEARTBEAT_MONITOR_TICKET=off", "HEARTBEAT_MONITOR_TICKET=KIT-7"))[0])[0]
+        m6 = monitor_label(cm6)
+        for rearm_rc in (0, 1):
+            cases += 1
+            ctx6, run6 = _machine(cconf=cm6)
+            run6.loaded[m6] = True
+            run6.answers = [(" rearm --config ", rearm_rc, "")] + run6.answers
+            code6, said6 = _run(ctx6)
+            boots = [i for i, s in enumerate(run6.seq) if " launchctl bootstrap system " in s]
+            m_boot = next((i for i in boots if _dispatcher_plist(m6) in run6.seq[i]), -1)
+            rearm_at = next((i for i, s in enumerate(run6.seq) if " rearm --config " in s), -1)
+            if rearm_rc == 0:
+                expect("KIT-661 the-monitor-is-rearmed-then-loaded-last",
+                       code6 == EX_BLOCKED and run6.loaded.get(m6) is True
+                       and -1 < rearm_at < m_boot == max(boots) and not _off(run6, five),
+                       "exit %r; rearm at %d, monitor loaded at %d of %s; said %r"
+                       % (code6, rearm_at, m_boot, boots, said6[-600:]))
+            else:
+                expect("KIT-661 a-monitor-whose-rearm-fails-is-named-off",
+                       code6 == EX_FAILED and not run6.loaded.get(m6) and m_boot == -1
+                       and "NOT DONE" in said6 and " rearm --config " in said6
+                       and "sudo launchctl bootstrap system " + _dispatcher_plist(m6) in said6
+                       and not _off(run6, five),
+                       "exit %r; monitor %r; said %r" % (code6, run6.loaded.get(m6), said6[-800:]))
+
+        # (7) CK-13 never waits while the review poller is unloaded. The run that moves the
+        # clone stops at the gate, says why, and loads the poller again on its way out. The
+        # next run, with the poller running, waits on CK-13 as before.
+        poller = daemon_labels(conf)[0]
+
+        def _moving_with_a_review_in_flight(ctxX, runX):
+            """The review entries in an older installer's shape, so this run rewrites them, and
+            one review in flight (example-org/kit#7, REV-40)."""
+            for at, row in enumerate(e for e in ctxX.dispatcher["entries"]
+                                     if _owns_review_entry(e)):
+                row["routingLabels"] = ["stage-e-review-entry-never-label-routed"]
+                if at == 0:
+                    row["teamKeys"] = ["REV"]
+            runX.answers = [("state/seen-prs.json", 0, json.dumps(seen_doc))] + [
+                a for a in runX.answers if a[0] != "workspace_base_dirs"] + [
+                ("workspace_base_dirs", 0, json.dumps(ctxX.dispatcher))]
+
+        ctx7, run7 = _machine()
+        _moving_with_a_review_in_flight(ctx7, run7)
+        cases += 1
+        code7, said7 = _run(ctx7, stop_at=None)
+        row7 = _row(ctx7, "dispatcher-entry")
+        expect("KIT-661 ck-13-never-waits-on-an-unloaded-poller",
+               code7 == EX_FAILED and row7.get("outcome") == FAILED
+               and "example-org/kit#7 (REV-40)" in said7 and "system/" + poller in said7
+               and "loads it again on its way out" in said7
+               and "bootstrap system " + _dispatcher_plist(poller) not in said7
+               and run7.loaded.get(poller) is True and not _off(run7, five)
+               and "NOT DONE" not in said7
+               and not [w for w in run7.writes if never in (w.get("why") or "")],
+               "exit %r; row %r; poller loaded %r; said %r"
+               % (code7, row7, run7.loaded.get(poller), said7[-900:]))
+        cases += 1
+        code7b, said7b = _run(ctx7, stop_at=None)
+        row7b = _row(ctx7, "dispatcher-entry")
+        expect("KIT-661 ck-13-waits-once-the-poller-runs",
+               code7b == EX_BLOCKED and row7b.get("outcome") == BLOCKED
+               and row7b.get("detail") == "CK-13" and run7.loaded.get(poller) is True
+               and not [w for w in run7.writes if never in (w.get("why") or "")],
+               "exit %r; row %r; said %r" % (code7b, row7b, said7b[-600:]))
+
+        # (8) A poller that was off before this run is named with the line that loads it.
+        # This run did not stop it, so this run does not load it.
+        cases += 1
+        ctx8, fake8 = _settled_ctx(conf)
+        _old_shape(ctx8)
+        fake8.answers = [("state/seen-prs.json", 0, json.dumps(seen_doc))] + list(fake8.answers)
+        try:
+            _quiet(lambda: step_dispatcher_entry(ctx8, apply_it=True))
+            said8 = "no stop"
+        except Blocked as exc:
+            said8 = "card %s" % exc.card_id
+        except SetupError as exc:
+            said8 = str(exc)
+        expect("KIT-661 ck-13-names-a-poller-that-was-off-before",
+               "sudo launchctl bootstrap system " + _dispatcher_plist(poller) in said8
+               and "would never end" in said8 and "example-org/kit#7 (REV-40)" in said8
+               and not [w for w in fake8.writes if never in (w.get("why") or "")],
+               "%r" % said8)
+
+        # (9) …and one this run stopped that launchd still lets go of when the gate runs is
+        # not read as running: the gate stops rather than wait on CK-13.
+        cases += 1
+        ctx9, run9 = _machine(linger={poller: 6})
+        _moving_with_a_review_in_flight(ctx9, run9)
+        code9, said9 = _run(ctx9, stop_at=None)
+        expect("KIT-661 ck-13-never-waits-on-a-poller-still-letting-go",
+               code9 == EX_FAILED and _row(ctx9, "dispatcher-entry").get("outcome") == FAILED
+               and not [w for w in run9.writes if never in (w.get("why") or "")],
+               "exit %r; row %r; said %r" % (code9, _row(ctx9, "dispatcher-entry"),
+                                            said9[-600:]))
+
+        # (10) A job still letting go when the run stops is waited for, then loaded. One seen
+        # in the domain on its way out is not one that is loaded: it is gone a moment later.
+        cases += 1
+        ctx10, run10 = _machine(linger={poller: 3})
+        code10, said10 = _run(ctx10)
+        for _ in range(5):
+            run10.look(poller)
+        expect("KIT-661 a-job-still-letting-go-is-waited-for-then-loaded",
+               code10 == EX_BLOCKED and run10.loaded.get(poller) is True
+               and poller not in run10.leaving and not _off(run10, five)
+               and "NOT DONE" not in said10,
+               "exit %r; poller loaded %r, letting go %r; said %r"
+               % (code10, run10.loaded.get(poller), run10.leaving, said10[-500:]))
+
+        # (11) A stop inside `enable` loads again only what is still off. The daemon it
+        # loaded before the stop is neither loaded twice nor said to be.
+        cases += 1
+        ctx11, run11 = _machine(refuse=(bounce,))
+        code11, said11 = _run(ctx11, stop_at=None)
+        finding = finding_label(conf)
+        expect("KIT-661 a-stop-inside-enable-loads-only-what-is-still-off",
+               code11 == EX_FAILED and _row(ctx11, "enable").get("outcome") == FAILED
+               and ctx11.reloaded == [finding, catchup_label(conf), status_label(conf)]
+               and ctx11.unloaded == [bounce] and run11.loaded.get(poller) is True
+               and "NOT DONE" in said11 and "system/" + bounce in said11,
+               "exit %r; enable %r; reloaded %s; unloaded %s; said %r"
+               % (code11, _row(ctx11, "enable"), ctx11.reloaded, ctx11.unloaded,
+                  said11[-600:]))
+
+        # (12) A job the conf now turns off is left off on a stop: its own step removes it.
+        cases += 1
+        coff = dict(conf, CATCHUP_INTERVAL_SECONDS="off")
+        ctx12, run12 = _machine(cconf=coff)
+        code12, said12 = _run(ctx12)
+        expect("KIT-661 a-job-the-conf-turns-off-stays-off-on-a-stop",
+               code12 == EX_BLOCKED and not run12.loaded.get(catchup_label(conf))
+               and "NOT DONE" not in said12 and "CATCHUP_INTERVAL_SECONDS=off" in said12
+               and all(run12.loaded.get(l) for l in five if l != catchup_label(conf)),
+               "exit %r; launchd %r; said %r" % (code12, run12.loaded, said12[-600:]))
+
+        # (13) The re-run of 12 Nov: an A-ENTRY-LOADED sign-off from before KIT-149 names no
+        # entries, so `dispatcher-entry` cannot prove their load. It stops UNKNOWN after `code`
+        # moved the clone, and the jobs come back all the same.
+        cases += 1
+        ctx13, run13 = _machine()
+        ctx13.state.data["notes"].pop(ENTRY_PROOF_NOTE, None)
+        ctx13.state.data["attestations"]["A-ENTRY-LOADED"] = {
+            "initials": "bc", "note": "saw the banner", "at": "2026-09-08T03:31:23Z"}
+        code13, said13 = _run(ctx13, stop_at=None)
+        expect("KIT-661 an-unproven-entry-load-after-the-move-loads-the-jobs-again",
+               code13 == EX_UNKNOWN and _row(ctx13, "dispatcher-entry").get("outcome") == UNKNOWN
+               and "names no entries" in said13 and not _off(run13, five)
+               and ctx13.unloaded == [] and "NOT DONE" not in said13,
+               "exit %r; entry row %r; still off %s; said %r"
+               % (code13, _row(ctx13, "dispatcher-entry"), _off(run13, five), said13[-600:]))
+
+        owed_key = globals().get("PLISTS_NOT_LOADED_NOTE", "plists-not-loaded-yet")
+
+        # (14) Stage E on this PR: a daemon loaded again on the way out runs the plist on disk
+        # then, which may be older than the one this run renders. launchd keeps the definition
+        # it loaded until the job is loaded again, so the next run that writes the new plist
+        # must load the daemon again, though it is loaded and its heartbeats are there.
+        cases += 1
+        ctx14, run14 = _machine(old_plists=True)
+        _run(ctx14)
+        older = dict(run14.running)
+        code14, said14 = _run(ctx14, stop_at=None)
+        stale14 = [label for label in all_daemon_labels(conf)
+                   if run14.running.get(label) != run14.plists.get(label)]
+        expect("KIT-661 a-daemon-loaded-on-the-way-out-runs-the-next-plist",
+               not stale14 and all(older.get(l) != run14.plists.get(l)
+                                   for l in all_daemon_labels(conf))
+               and _row(ctx14, "enable").get("outcome") == DONE
+               and not (ctx14.state.data.get("notes") or {}).get(owed_key),
+               "launchd still runs an older plist for %s; enable %r; owed %r; said %r"
+               % (stale14, _row(ctx14, "enable"),
+                  (ctx14.state.data.get("notes") or {}).get(owed_key),
+                  said14[-500:]))
+
+        # (15) …and a plist written by a run that stops before `enable`, with nothing unloaded
+        # (the clone was level), is owed to the next run: `verify` says so, and the next
+        # `enable` loads it.
+        cases += 1
+        ctx15, run15 = _machine(old_plists=True, behind=False)
+        _run(ctx15, stop_at="dry-run", how="failed")
+        # …read from the ledger on disk, as the next process reads it.
+        owed15 = dict((State(ctx15.state.root).data.get("notes") or {}).get(owed_key) or {})
+        ok15, said15v, _n15 = _quiet(lambda: step_enable(ctx15, apply_it=False))[0]
+        _run(ctx15, stop_at=None)
+        stale15 = [label for label in all_daemon_labels(conf)
+                   if run15.running.get(label) != run15.plists.get(label)]
+        expect("KIT-661 a-plist-written-before-a-stop-is-loaded-by-the-next-enable",
+               sorted(owed15) == sorted(all_daemon_labels(conf)) and ok15 is False
+               and "again" in said15v and not stale15,
+               "owed %s; verify %r %r; launchd still runs an older plist for %s"
+               % (sorted(owed15), ok15, said15v, stale15))
+
+        # (16) …while a daemon loaded on the way out FROM the newer plist owes nothing: the next
+        # `verify` reads `enable` as done, rather than ask for a restart that changes nothing.
+        cases += 1
+        ctx16, run16 = _machine(old_plists=True)
+        _run(ctx16, stop_at="dry-run", how="failed")
+        ok16, said16v, _n16 = _quiet(lambda: step_enable(ctx16, apply_it=False))[0]
+        stale16 = [label for label in all_daemon_labels(conf)
+                   if run16.running.get(label) != run16.plists.get(label)]
+        expect("KIT-661 a-daemon-loaded-on-the-way-out-from-the-new-plist-owes-nothing",
+               ok16 is True and not stale16
+               and not (ctx16.state.data.get("notes") or {}).get(owed_key)
+               and not (State(ctx16.state.root).data.get("notes") or {}).get(owed_key),
+               "verify %r %r; older plist for %s; owed %r"
+               % (ok16, said16v, stale16,
+                  (ctx16.state.data.get("notes") or {}).get(owed_key)))
+
+    _kit661_stops_after_the_move()
     # …and the key it used is the STORED one, read out of the env file rather
     # than requested. Same value, different provenance, and only one of the two
     # costs the owner a keystroke on every single pass.
@@ -13964,6 +15513,52 @@ def _selftest_body():
            "a session that forgets it holds access still validated %d time(s) — the "
            "at-most-once check cannot see a prompt per probe" % len(validations2))
 
+    # -- 19a2. a password already live in this terminal is held, not asked again ----
+    # One run of the one command starts several installers; each used to print its own
+    # banner and prompt. A live timestamp (`sudo -n -v` exits 0) is now held silently;
+    # anything else — a password needed, sudo missing, the probe itself raising — is
+    # today's banner and prompt, word for word.
+    cases += 1
+    validationsR = []
+    sudoR = SudoSession(validate=lambda: (validationsR.append(1), 0)[1],
+                        refresh=lambda: 0, probe=lambda: 0, interval=3600)
+    _vR, printedR = _quiet(lambda: [sudoR.acquire("because %d" % i, "run") for i in range(3)])
+    expect("sudo-reuse-live", sudoR.held and not validationsR and sudoR.acquisitions == 0,
+           "a live timestamp was asked for again: %d validation(s)" % len(validationsR))
+    expect("sudo-reuse-live", "ADMINISTRATOR PASSWORD" not in printedR
+           and "WHY IT IS NEEDED" not in printedR,
+           "a live timestamp still printed the password banner: %r" % printedR)
+    expect("sudo-reuse-live", sudoR._thread is not None and sudoR._thread.daemon,
+           "a reused timestamp is not kept fresh by the daemon keep-alive")
+    sudoR.release()
+
+    def _probe_raises():
+        raise OSError("probe could not look")
+
+    for labelN, probeN in (("needs a password", lambda: 1), ("sudo missing", lambda: 127),
+                           ("probe raised", _probe_raises)):
+        validationsN = []
+        sudoN = SudoSession(validate=lambda: (validationsN.append(1), 0)[1],
+                            refresh=lambda: 0, probe=probeN, interval=3600)
+        _vN, printedN = _quiet(lambda: [sudoN.acquire("because %d" % i, "run")
+                                        for i in range(3)])
+        sudoN.release()
+        expect("sudo-reuse-not-live", len(validationsN) == 1 and sudoN.acquisitions == 1
+               and "ONCE" in printedN and "WHY IT IS NEEDED: because 0" in printedN,
+               "%s: not today's one banner and one prompt (%d validation(s))"
+               % (labelN, len(validationsN)))
+    sudoF = SudoSession(validate=lambda: 1, refresh=lambda: 0, probe=lambda: 1)
+    try:
+        _quiet(lambda: sudoF.acquire("because", "run"))
+        failures.append("sudo-reuse-not-live: a refused password did not raise NoPrivilege")
+    except NoPrivilege:
+        expect("sudo-reuse-not-live", not sudoF.held, "a refused password left `held` set")
+    # A test double for the password never touches the real sudo, and the real probe can
+    # never prompt.
+    expect("sudo-reuse-not-live", SudoSession(validate=lambda: 0)._probe() != 0
+           and SudoSession()._probe is _sudo_refresh,
+           "an injected validate falls through to the machine's real sudo probe")
+
     # -- 19b. sudo refused: stop at once, distinctly, having done nothing ----
     cases += 1
     ctxSU, fakeSU, apiSU = _healthy_ctx(conf)
@@ -14125,14 +15720,15 @@ def _selftest_body():
     with open(main_conf, "w") as fh:
         fh.write(GOOD_CONF)
 
-    def _drive(argv):
-        """Run main(argv) with the machine stubbed out; return (rc, order)."""
+    def _drive(argv, live=False):
+        """Run main(argv) with the machine stubbed out; return (rc, order). `live` is
+        whether a password is already live in this terminal (the `sudo -n -v` probe)."""
         del order[:]
         g = globals()
         saved_globals = {k: g[k] for k in ("Runner", "_sudo_validate", "_sudo_refresh")}
         g["Runner"] = lambda dry_run=False: _OrderRunner(dry_run=dry_run)
         g["_sudo_validate"] = lambda: (order.append("acquire"), 0)[1]
-        g["_sudo_refresh"] = lambda: 0
+        g["_sudo_refresh"] = lambda: 0 if live else 1
         try:
             rc, _printed = _quiet(lambda: main(list(argv) + [
                 "--conf", main_conf, "--state", os.path.join(main_tmp, "state")]))
@@ -14156,6 +15752,10 @@ def _selftest_body():
     expect("main-acquires-once", orderD.count("acquire") == 1 and orderD[:1] == ["acquire"],
            "`run --dry-run` through main() acquired %d time(s) and began with %r"
            % (orderD.count("acquire"), (orderD[:1] or ["nothing"])))
+    _rcL, orderL = _drive(["verify"], live=True)
+    expect("main-acquires-once", orderL.count("acquire") == 0 and "probe" in orderL,
+           "`verify` through main() with a password already live asked again %d time(s)"
+           % orderL.count("acquire"))
     for read_only in (["status"], ["card", "CK-1"]):
         _rcQ, orderQ = _drive(read_only)
         expect("main-acquires-once", orderQ.count("acquire") == 0,
@@ -15825,7 +17425,7 @@ def _selftest_body():
         ctx_gc, fake_gc = _settled_ctx(c)
         fake_gc.answers = [("cat $HOME/.stage-e/poller.json", 0, ""),
                            ("cat $HOME/.stage-e/kit/scripts/pipeline_review_poller.py", 0,
-                            'cfg["github_app"] = github_app_setting(raw.get("github_app"))\n'),
+                            '"routing_signoff_file"\ncfg["github_app"] = github_app_setting(raw.get("github_app"))\n'),
                            ("cat > ", 0, "")] + list(fake_gc.answers)
         step_configs(ctx_gc, apply_it=True)
         wrote_gc = [w["stdin"] for w in fake_gc.writes
@@ -15851,7 +17451,7 @@ def _selftest_body():
            "the review poller's own loader on the composed app: %s" % taken_ga)
     # …and never to a review poller from before the key; one whose code cannot be read is UNKNOWN.
     for label, answer, want in (
-            ("an older poller is refused", (0, 'CONFIG_KEYS = {"model_label_name": ""}\n'),
+            ("an older poller is refused", (0, '"routing_signoff_file"\nCONFIG_KEYS = {"model_label_name": ""}\n'),
              "failed"),
             ("a poller that cannot be read is unknown", (1, ""), "unknown")):
         cases += 1
@@ -16164,7 +17764,9 @@ def _settled_ctx(conf):
     """A context whose machine already holds everything a settled install has.
     Used to prove a second pass writes nothing."""
     state = State(tempfile.mkdtemp(prefix="stage-e-selftest."))
-    state.data["ids"] = {"reviews_team_id": "t1", "agent_user_id": "u-agent",
+    state.data["ids"] = {"team_ids": {"KIT": "t-kit"},
+                         "review_label_ids": {"example-org/kit": "lr"},
+                         "agent_user_id": "u-agent",
                          "model_label_id": "l1", "owner_user_id": "u-owner"}
     fake = FakeRunner()
     ctx = Ctx(conf, fake, state, tty=False)
@@ -16190,7 +17792,10 @@ def _settled_ctx(conf):
         answers.append(("cat /Library/LaunchDaemons/%s.plist" % status_label(ctx.conf), 0,
                         _status_plist(ctx)))
     poller = {
-        "reviews_team_key": "REV", "reviews_team_id": "t1",
+        "routing_signoff_file": "~/.stage-a/routing-signoff.json",
+        "shared_stop_file": "~/.stage-a/state/stop.json",
+        "dispatcher_version_url": "http://127.0.0.1:3456/version",
+        "routing_wait_seconds": 120,
         "agent_user_name": "dispatcher-agent", "cyrus_agent_user_id": "u-agent",
         "model_label_name": "haiku", "model_label_id": "l1",
         "repos": ["example-org/kit"], "team_keys": ["KIT"],
@@ -16201,8 +17806,7 @@ def _settled_ctx(conf):
     bounce = {
         "state_dir": "~/.stage-e/state", "repos": ["example-org/kit"], "team_keys": ["KIT"],
         "github_token_env": "GH_TOKEN", "linear_api_key_env": "STAGE_E_LINEAR_API_KEY",
-        "reviews_team_id": "t1", "dispatcher_app_user_id": "u-agent", "model_label_id": "l1",
-        "dispatcher_repo_names": {"example-org/kit": "kit"},
+        "dispatcher_app_user_id": "u-agent",
         "required_checks": {"example-org/kit": ["Kit checks", "Provenance scan"]},
         "human_pending_checks": ["Hooks change guard"],
         "session_log_root": "/opt/example-dispatch/logs",
@@ -16285,6 +17889,12 @@ def _settled_ctx(conf):
         # `--all` the driver requires, so the fixture answered a command the
         # driver would have rejected. Spelled from the constant for that reason.
         (" ".join(BOUNCE_DRY_RUN_ARGS), 0, "checks_source: config\nnothing to bounce\n"),
+        # KIT-599: the deployed review poller files on the work teams. Last, so a case
+        # that stubs an older poller's code answers first.
+        ("cat $HOME/.stage-e/kit/scripts/pipeline_review_poller.py", 0,
+         '"routing_signoff_file"\n'),
+        # …and the review poller's seen-set: none yet, so nothing in flight.
+        ("state/seen-prs.json", 0, "no-seen-set"),
     ]
     fake.answers = answers
     return ctx, fake
@@ -16399,10 +18009,7 @@ def _healthy_ctx(conf, linear=None, stored_env=True):
     there was no such fixture, because there was no such outcome."""
     ctx, fake = _settled_ctx(conf)
     api = linear if linear is not None else FakeLinear(
-        teams=[{"id": "t1", "key": "REV", "name": "Reviews",
-                "states": [{"id": "s-%s" % n, "name": n, "type": t}
-                           for n, t in REQUIRED_STATES],
-                "automations": []}],
+        teams=[{"id": "t-kit", "key": "KIT", "name": "Kit"}],
         labels=[dict(x) for x in STOCKED_WS_LABELS],
         users=[{"id": "u-agent", "displayName": "dispatcher-agent", "active": True},
                {"id": "u-owner", "email": "owner@example.com", "active": True}],
@@ -16459,9 +18066,13 @@ def _unsettled_ctx(conf, linear=None, stored_env=True):
     `stored_env=False` for the other one — no key anywhere, nothing to ask,
     and a tracker row that must say so."""
     ctx, fake = _settled_ctx(conf)
+    # KIT-599: an empty tracker still has its WORK teams — they are the owner's, and this
+    # installer never creates one — with the agent a member. What is missing is labels.
     api = linear if linear is not None else FakeLinear(
+        teams=[{"id": "t-kit", "key": "KIT", "name": "Kit"}],
         users=[{"id": "u-agent", "displayName": "dispatcher-agent", "active": True},
-               {"id": "u-owner", "email": "owner@example.com", "active": True}])
+               {"id": "u-owner", "email": "owner@example.com", "active": True}],
+        members=[{"id": "u-agent", "displayName": "dispatcher-agent"}])
     ctx.linear_factory = lambda key: api
     ctx.key_reader = lambda prompt: "lin_api_" + "k" * 30
     ctx.secret_reader = lambda prompt: "ghp_" + "s" * 36

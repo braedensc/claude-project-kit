@@ -52,8 +52,6 @@ whole machine:
 - macOS (KIT-229);
 - the role account's kit clones and the user-scope skills. `scripts/pipeline_install.py`
   moves those.
-  It also brings the tech lead's rules level, asking first, when `chat-lane.conf` has
-  `CHAT_RULES=on` (KIT-582).
 - each served repository's vendored contract (`/sync-kit`);
 - the kit's npm dev dependencies and pinned GitHub Action versions;
 - credential expiry (KIT-60, KIT-143).
@@ -164,7 +162,10 @@ KIT-214, broke every desktop session's guards for six days and told no one.
 | `temp` | your account's temp space holds more than `TEMP_CEILING_GB` (default 10): Claude Code's per-session scratch, `/tmp/claude-<uid>`, and your own `TMPDIR`, together. The alert names the three largest folders. A session's scratch folder is safe to remove once that session has ended, and a restart clears both. A count that cannot run, or runs past 60 seconds under the line, is `UNKNOWN`. Added 2026-11-04 (KIT-461): on 4 Nov the scratch held 49.5 GB before the disk ran out |
 | `conflict-waker` | the conflict waker's heartbeat, in `CONFLICT_WAKER_STATE_DIR`, has not changed for an hour, reports `problems` or `error`, or was never written, for two passes. Empty: no waker is watched, and every pass says so. It reaches Slack only, never GitHub (KIT-339) |
 | `watcher-page` | the watcher's page job's heartbeat, in `WATCHER_PAGE_HEARTBEAT_FILE`, is older than `WATCHER_PAGE_MAX_AGE_MINUTES` (default 120), unreadable, in another shape or missing, or says a page could not be sent and by which route, for two passes. Empty: it is not watched, and every pass says so. It reaches Slack only, never GitHub (KIT-549) |
+| `push-connection` | the bridge's push-connection job's heartbeat, in `PUSH_HEARTBEAT_FILE` (KIT-561, only with `PUSH_MODE=yes` in bridge.conf), is older than ten minutes, unreadable, in another shape or missing, says the job is not connected to Slack, or shows nothing heard from Slack for five minutes, for two passes. Empty: it is not watched, and every pass says so. It reaches Slack only, never GitHub: the bridge's once-a-minute pass still answers a DM, only not at once |
 | `credentials` | a date you wrote in `CREDENTIAL_EXPIRIES` is within `CREDENTIAL_WARN_DAYS` (default 30) of today, or past. Empty: no dates are watched, and every pass says so. Upkeep like `updates`: a GitHub issue, never a Slack page (KIT-579) |
+| `memory` | less than `MEMORY_FREE_FLOOR_PCT` (default 10) of memory is free, or more than `SWAP_CEILING_GB` (default 4) of swap is used, on two passes in a row, so one brief spike says nothing. Read from macOS's own `memory_pressure` and `sysctl vm.swapusage`, without sudo; a reading that cannot be taken is `UNKNOWN`. A concern, not an outage: it is listed as advisory, opens no GitHub issue and pages nobody; the stand-up says one line about it (KIT-609). The watch also keeps each day's lowest free memory and most swap, for the sprint review |
+| `burn` | the weekly window's use, projected to its reset from the use so far and the time left, reaches `BURN_WEEK_PCT` (default 90), or the 5-hour window is at `BURN_FIVE_HOUR_PCT` (default 90). It reads only the usage job's file, `BURN_USAGE_FILE`; a figure it cannot read, or a file more than two hours old, is `UNKNOWN`, never zero. In the first 12 hours of a week it does not project (too little to say). Advisory like `memory` (KIT-609). Empty: not watched, and every pass says so |
 | `notifier` | the notifier's heartbeat, in `NOTIFIER_HEARTBEAT_FILE`, is an hour old, unreadable, in another shape or missing, for two passes. Empty: it is not watched, and every pass says so (KIT-286) |
 | `monitor` | the same, for the heartbeat monitor's own heartbeat in `MONITOR_HEARTBEAT_FILE` (KIT-286). Nothing else reads it |
 
@@ -199,6 +200,18 @@ CREDENTIAL_WARN_DAYS=30
 
 Good: `credentials OK none expires within 30 days; the next is dispatcher-token on 2027-07-27`.
 Not: `CREDENTIAL_EXPIRIES is not set` once you hold a year-long token, which means nothing is watching it.
+
+- **List the dates.** `python3 scripts/pipeline_watch.py --conf update.conf dates` prints one row per stored key: its
+  name, what it is, the date on record or `missing`, the days left, and where to read the date. It asks nothing and
+  writes nothing. Exit 0 all set; 10 a date is missing or due; 4 a file could not be read.
+  Good: `gh-tok  ...  2027-05-06  240  ...` and exit 0.
+  Not that: a row that says `missing` for a key that ends in a year, which means nothing watches it.
+- **Record new dates.** `printf 'gh-tok:2027-05-06\n' | python3 scripts/pipeline_watch.py --conf update.conf dates --apply`
+  changes only the `CREDENTIAL_EXPIRIES` line, then reads the file back. Run it yourself: it refuses inside a Claude
+  session. Exit 0 written; 2 a bad line (named by number), nothing written; 1 the write failed; 3 refused.
+  Good: `WRITTEN: 1 date(s) in CREDENTIAL_EXPIRIES; every other line is as it was.`
+  Not that: a token pasted as a line. It is refused by line number, and the text is never printed.
+- **The one command asks for these.** `python3 scripts/pipeline_install.py` asks for each missing end date, lists the answers on its consent page, and writes them through `dates --apply` after you type `yes`.
 
 **The two clerks (KIT-286).** The notifier cannot page about itself, and nothing scheduled read the
 monitor's own heartbeat. So each is a kind here, and each opens a GitHub issue, since Slack is what a

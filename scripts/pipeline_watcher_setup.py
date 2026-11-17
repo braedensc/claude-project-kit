@@ -24,16 +24,19 @@ WHAT IT DOES, in order. `run` shows the whole plan first, asks for ONE typed `ye
      script cannot see a key's scope, and the watcher sends nothing but GETs and one fixed read-only query.
   6. Checks that neither the role account nor your own can write the install folder, the rules, the manifest
      or the state folder.
-  7. The job (a LaunchDaemon that runs as the watcher account), loaded only after the typed yes, and its first
-     pass read back.
+  7. With a USAGE_FILE: the copier (KIT-573). A second, small job that runs as root and copies the usage file the
+     workers write into a root-owned folder each pass, refusing a link, a file of another account or an oversize
+     file. The rules name the copy, so the watcher never reads a file a worker could edit.
+  8. The job (a LaunchDaemon that runs as the watcher account), loaded only after the typed yes, and its first
+     pass read back. With a copier, that is loaded first and its first pass is read back too.
 
 WHAT IT NEVER DOES.  Run under a model (REFUSED before the conf is read; there is no override). Print or keep
 a key. Touch anything but the paths in the conf, the one account and the one job. Merge, approve or label.
 It writes nothing outside the paths the conf names.
 
-NOT DONE HERE.  The read-only copy of the usage file the watcher reads from the worker side: a root job that
-copies a worker-writable path is its own security surface and its own change. Until then `spend` and `runs`
-read the worker's usage file as second-hand, and say so. The pager and the judge are separate jobs.
+NOT DONE HERE.  The pager and the judge are separate jobs. The copy protects the watcher's reading from an edit
+AFTER the copy; it cannot tell a true figure from a false one the workers' account wrote on purpose
+(docs/WATCHER.md says what it does and does not protect).
 
 EXIT CODES:  0 done (or nothing to do)  1 failed  2 conf  3 refused (an agent's environment)
              4 not measured (something could not be read, so it is not called fine)  5 no administrator access
@@ -60,13 +63,17 @@ if HERE not in sys.path:
 
 EX_OK, EX_FAILED, EX_CONF, EX_REFUSED, EX_UNKNOWN, EX_NOSUDO = 0, 1, 2, 3, 4, 5
 MANIFEST_SCHEMA = "pipeline-watcher-manifest/1"
-RULES_NAME, MANIFEST_NAME = "etc/watcher.json", "manifest.json"
+RULES_NAME, MANIFEST_NAME, COPIER_RULES_NAME = "etc/watcher.json", "manifest.json", "etc/copier.json"
 # The files the watcher runs from: its import closure, derived by the selftest with `ast`, and its schema.
 WATCHER_FILES = ("scripts/pipeline_watcher_local.py", "scripts/pipeline_watcher_tracker.py",
                  "scripts/pipeline_hold.py", "scripts/check_schemas.py", "scripts/jsonschema_mini.py",
                  "schemas/pipeline-watcher.schema.json")
+COPIER_FILES = ("scripts/pipeline_watcher_copy.py",)       # the root copier: stdlib only, run with -I
+INSTALLED_FILES = WATCHER_FILES + COPIER_FILES
 ENTRY = "scripts/pipeline_watcher_local.py"
-SELFTESTS = ("scripts/pipeline_watcher_local.py", "scripts/pipeline_watcher_tracker.py")
+COPIER_ENTRY = "scripts/pipeline_watcher_copy.py"
+SELFTESTS = ("scripts/pipeline_watcher_local.py", "scripts/pipeline_watcher_tracker.py",
+             "scripts/pipeline_watcher_copy.py")
 FIRST_PASS_WAIT_SECONDS = 90
 
 UNSAFE_PREFIXES = ("/Users/", "/private/tmp", "/tmp", "/var/tmp")      # where a user's session can write
@@ -81,7 +88,8 @@ CONF_KEYS = set(CONF_REQUIRED) | set(CONF_DEFAULTS)
 ACCOUNT_RE = re.compile(r"^_?[a-z][a-z0-9_-]{1,30}\Z")
 RDNS_RE = re.compile(r"^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+\Z")
 ENV_RE = re.compile(r"^[A-Z][A-Z0-9_]*\Z")
-PATH_RE = re.compile(r"^/[A-Za-z0-9_./-]{1,200}\Z")
+PATH_LIMIT = 1000      # the system allows 1024 characters in a path; the character set is what keeps a value safe, not a short limit
+PATH_RE = re.compile(r"^/[A-Za-z0-9_./-]{1,%d}\Z" % PATH_LIMIT)
 REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+\Z")
 CRED_RE = re.compile(r"(ghp_|gho_|ghs_|github_pat_|lin_api_|xox[bpas]-|sk-ant-|-----BEGIN)")
 
@@ -160,6 +168,9 @@ def validate_conf(values, user=None):
     need(not (a and b) or not (a == b or a.startswith(b + "/") or b.startswith(a + "/")),
          "INSTALL_DIR and STATE_DIR must be two separate folders, neither inside the other")
     need(c.get("USAGE_FILE") == "" or PATH_RE.match(c.get("USAGE_FILE", "")), "USAGE_FILE must be an absolute path, or empty")
+    need(not c.get("USAGE_FILE") or not any(c.get("USAGE_FILE", "").startswith(d.rstrip("/") + "/")
+                                            for d in (c.get("INSTALL_DIR", ""), c.get("STATE_DIR", "")) if d.rstrip("/")),
+         "USAGE_FILE is the workers' file: it must be outside INSTALL_DIR and STATE_DIR")
     need(c.get("KIT_CHECKOUT") and os.path.isabs(c["KIT_CHECKOUT"]), "KIT_CHECKOUT must be an absolute path")
     need(ENV_RE.match(c.get("GITHUB_TOKEN_ENV", "")), "GITHUB_TOKEN_ENV must be the NAME of an environment variable")
     need(c.get("LINEAR_KEY_ENV") == "" or ENV_RE.match(c["LINEAR_KEY_ENV"]),
@@ -192,12 +203,25 @@ def load_conf(path, user=None):
 # --------------------------------------------------------------------------- #
 # What is composed: the rules, the manifest, the plist
 # --------------------------------------------------------------------------- #
+def plist_path(label):
+    return "/Library/LaunchDaemons/%s.plist" % label
+
+
+def copier_label(c):
+    return c["JOB_LABEL"] + ".copier"
+
+
 def paths(c):
     inst, state = c["INSTALL_DIR"].rstrip("/"), c["STATE_DIR"].rstrip("/")
     return {"install": inst, "state": state, "rules": "%s/%s" % (inst, RULES_NAME),
             "manifest": "%s/%s" % (inst, MANIFEST_NAME), "entry": "%s/%s" % (inst, ENTRY),
             "env": state + "/env", "status": state + "/watcher-status.json", "hold": state + "/hold.json",
-            "log": state + "/watcher.log", "plist": "/Library/LaunchDaemons/%s.plist" % c["JOB_LABEL"]}
+            "log": state + "/watcher.log", "plist": plist_path(c["JOB_LABEL"]),
+            # the copier's: all in a folder of root's, which the workers cannot write
+            "copy_dir": inst + "/copy", "copy": inst + "/copy/usage.json",
+            "copy_status": inst + "/copy/copier-status.json", "copier_rules": "%s/%s" % (inst, COPIER_RULES_NAME),
+            "copier_entry": "%s/%s" % (inst, COPIER_ENTRY), "copier_log": inst + "/copy/copier.log",
+            "copier_plist": plist_path(copier_label(c))}
 
 
 def compose_rules(c, watcher):
@@ -207,7 +231,8 @@ def compose_rules(c, watcher):
            "github_token_env": c["GITHUB_TOKEN_ENV"], "repos": split_list(c["WATCH_REPOS"]),
            "trusted_actors": split_list(c["TRUSTED_ACTORS"]), "install_manifest": p["manifest"]}
     if c["USAGE_FILE"]:
-        doc["usage_file"] = c["USAGE_FILE"]
+        # The watcher reads root's copy, never the workers' file; the copier's status says the copy is real.
+        doc["usage_file"], doc["usage_copy_status"] = p["copy"], p["copy_status"]
     limits = {}
     for key, name in (("LIMIT_DAY_USD", "day_usd"), ("LIMIT_PIECE_USD", "piece_usd"),
                       ("LIMIT_DAY_RUNS", "day_runs"), ("LIMIT_PIECE_RUNS", "piece_runs")):
@@ -222,6 +247,21 @@ def compose_rules(c, watcher):
         watcher.validate_config(doc)
     except watcher.ConfigError as exc:
         raise SetupError("REFUSED by the watcher's own loader: %s" % exc)
+    return (json.dumps(doc, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def compose_copier_rules(c):
+    """The copier's rules, judged by the copier's own loader; None when there is no usage file to copy."""
+    if not c["USAGE_FILE"]:
+        return None
+    import pipeline_watcher_copy as copier  # noqa: PLC0415 -- this checkout's, which preflight proved is the commit's
+    p = paths(c)
+    doc = {"schema": copier.RULES_SCHEMA, "status_file": p["copy_status"],
+           "copies": [{"source": c["USAGE_FILE"], "owner": c["ROLE_ACCOUNT"], "dest": p["copy"],
+                       "max_bytes": copier.DEFAULT_MAX_BYTES}]}
+    _rules, errors = copier.validate_rules(doc)
+    if errors:
+        raise SetupError("REFUSED by the copier's own loader: %s" % "; ".join(errors))
     return (json.dumps(doc, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
 
@@ -240,6 +280,17 @@ def job_body(c):
         "Label": c["JOB_LABEL"], "UserName": c["WATCHER_ACCOUNT"], "ProgramArguments": ["/bin/sh", "-c", command],
         "StartInterval": int(c["INTERVAL_SECONDS"]), "RunAtLoad": True, "WorkingDirectory": p["state"],
         "StandardOutPath": p["log"], "StandardErrorPath": p["log"],
+        "EnvironmentVariables": {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin"}}, sort_keys=True)
+
+
+def copier_job_body(c):
+    """The copier's LaunchDaemon: no UserName, so it runs as root; no shell; Python in isolated mode, so nothing
+    in a folder or the environment is imported; it takes its rules and nothing else."""
+    p = paths(c)
+    return plistlib.dumps({
+        "Label": copier_label(c), "ProgramArguments": [c["PYTHON"], "-I", p["copier_entry"], "run", "--config", p["copier_rules"]],
+        "StartInterval": int(c["INTERVAL_SECONDS"]), "RunAtLoad": True, "WorkingDirectory": p["copy_dir"],
+        "StandardOutPath": p["copier_log"], "StandardErrorPath": p["copier_log"],
         "EnvironmentVariables": {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin"}}, sort_keys=True)
 
 
@@ -433,7 +484,7 @@ def step_preflight(ctx, apply_it):
     tmp = tempfile.mkdtemp(prefix="watcher-setup-tree-")
     ctx.tree = tmp
     h.export_commit(c["KIT_CHECKOUT"], c["KIT_COMMIT"], tmp)
-    for rel in WATCHER_FILES:
+    for rel in INSTALLED_FILES:
         data = h.read(os.path.join(tmp, rel))
         if data is None:
             raise SetupError("%s is not in the commit" % rel)
@@ -442,10 +493,13 @@ def step_preflight(ctx, apply_it):
     if here != ctx.files[ENTRY]:
         raise SetupError("this checkout's watcher is not the commit's: run this script from a checkout of %s"
                          % c["KIT_COMMIT"][:12])
+    if h.read(os.path.join(HERE, "pipeline_watcher_copy.py")) != ctx.files[COPIER_ENTRY]:
+        raise SetupError("this checkout's copier is not the commit's: run this script from a checkout of %s"
+                         % c["KIT_COMMIT"][:12])
     bad = [rel for rel in SELFTESTS if not h.run_selftest(c["PYTHON"], os.path.join(tmp, rel), tmp)]
     if bad:
         raise SetupError("the commit's own selftest FAILED: %s" % ", ".join(bad))
-    return False, "commit %s is on origin/main, this checkout is its watcher, and its watcher and tracker selftests pass" % (
+    return False, "commit %s is on origin/main, this checkout is its watcher and copier, and their selftests pass" % (
         c["KIT_COMMIT"][:12])
 
 
@@ -473,7 +527,8 @@ def step_account(ctx, apply_it):
 def step_folders(ctx, apply_it):
     h, p = ctx.host, ctx.p
     want = [(d, "root") for d in (p["install"], p["install"] + "/scripts", p["install"] + "/schemas",
-                                  p["install"] + "/etc")] + [(p["state"], ctx.conf["WATCHER_ACCOUNT"])]
+                                  p["install"] + "/etc")] + (
+        [(p["copy_dir"], "root")] if ctx.conf["USAGE_FILE"] else []) + [(p["state"], ctx.conf["WATCHER_ACCOUNT"])]
     todo = []
     for path, owner in want:
         st = h.lstat(path)
@@ -515,13 +570,21 @@ def step_files(ctx, apply_it):
 
 def step_rules(ctx, apply_it):
     h, p = ctx.host, ctx.p
-    body = compose_rules(ctx.conf, ctx.watcher)
-    if _current(h, p["rules"]) == body:
-        return False, "the rules are current, root's (0644), and accepted by the watcher's own loader"
+    want = [(p["rules"], compose_rules(ctx.conf, ctx.watcher))]
+    copier = compose_copier_rules(ctx.conf)
+    if copier is not None:
+        want.append((p["copier_rules"], copier))
+    todo = [path for path, body in want if _current(h, path) != body]
+    if not todo:
+        return False, "the rules are current, root's (0644), and accepted by the %s own loader%s" % (
+            "watcher's and the copier's" if copier is not None else "watcher's",
+            "; they name the copy, not the workers' file" if copier is not None else "")
     if not apply_it:
-        return True, "would write %s (root's, 0644); the watcher's own loader accepts it" % p["rules"]
-    h.install_root(body, p["rules"], 0o644)
-    return True, "wrote %s" % p["rules"]
+        return True, "would write %s (root's, 0644); the loaders accept them" % ", ".join(todo)
+    for path, body in want:
+        if path in todo:
+            h.install_root(body, path, 0o644)
+    return True, "wrote %s" % ", ".join(todo)
 
 
 def step_keys(ctx, apply_it):
@@ -554,7 +617,8 @@ def step_permissions(ctx, apply_it):
     c, h, p = ctx.conf, ctx.host, ctx.p
     who = [c["ROLE_ACCOUNT"], h.user]
     guarded = [p["install"]] + ["%s/%s" % (p["install"], d) for d in ("scripts", "schemas", "etc")] + [
-        p["rules"], p["manifest"], p["state"]] + ["%s/%s" % (p["install"], rel) for rel in WATCHER_FILES]
+        p["rules"], p["manifest"], p["state"]] + ["%s/%s" % (p["install"], rel) for rel in INSTALLED_FILES] + (
+        [p["copy_dir"], p["copy"], p["copy_status"], p["copier_rules"]] if c["USAGE_FILE"] else [])
     bad, unknown = [], []
     for path in guarded:
         if h.lstat(path) is None:
@@ -569,66 +633,98 @@ def step_permissions(ctx, apply_it):
         raise SetupError("not independent: %s" % "; ".join(bad))
     if unknown:
         raise NotMeasured("could not tell: %s" % "; ".join(unknown))
-    return False, "neither the role account (%s) nor you can write the install folder, the rules, the manifest or the state folder" % (
-        c["ROLE_ACCOUNT"])
+    return False, "neither the role account (%s) nor you can write the install folder, the rules, the manifest%s" % (
+        c["ROLE_ACCOUNT"], ", the copy and its status, the copier's rules or the state folder" if c["USAGE_FILE"]
+        else " or the state folder")
+
+
+def job_list(ctx):
+    """[(label, plist path, body, the entry the job must run, who runs it)]: the copier first, so a pass of the
+    watcher never reads a copy that is not there yet."""
+    c, p = ctx.conf, ctx.p
+    jobs = []
+    if c["USAGE_FILE"]:
+        jobs.append((copier_label(c), p["copier_plist"], copier_job_body(c), p["copier_entry"], "root"))
+    jobs.append((c["JOB_LABEL"], p["plist"], job_body(c), p["entry"], c["WATCHER_ACCOUNT"]))
+    return jobs
 
 
 def step_job(ctx, apply_it):
-    c, h, p = ctx.conf, ctx.host, ctx.p
-    body = job_body(c)
-    have = _current(h, p["plist"])
-    if have is not None and have != body:
-        try:
-            ours = plistlib.loads(have).get("ProgramArguments", [""])[-1].find(p["entry"]) >= 0
-        except Exception:  # noqa: BLE001 -- an unreadable plist is not ours
-            ours = False
-        if not ours:
-            raise SetupError("%s is NOT this watcher's job: replacing it would destroy another job. Pick another JOB_LABEL"
-                             % p["plist"])
-    loaded, text = h.loaded(c["JOB_LABEL"])
-    current = have == body and loaded and p["entry"] in text
-    if current:
-        return False, "the job is installed and loaded, running its own plist: system/%s every %s s" % (
-            c["JOB_LABEL"], c["INTERVAL_SECONDS"])
+    c, h = ctx.conf, ctx.host
+    todo, said = [], []
+    for label, plist, body, entry, who in job_list(ctx):
+        have = _current(h, plist)
+        if have is not None and have != body:
+            try:
+                ours = entry in " ".join(str(a) for a in plistlib.loads(have).get("ProgramArguments", []))
+            except Exception:  # noqa: BLE001 -- an unreadable plist is not ours
+                ours = False
+            if not ours:
+                raise SetupError("%s is NOT this watcher's job: replacing it would destroy another job. Pick another JOB_LABEL"
+                                 % plist)
+        loaded, text = h.loaded(label)
+        if have == body and loaded and entry in text:
+            said.append("system/%s (as %s) is installed and loaded, running its own plist" % (label, who))
+            continue
+        todo.append((label, plist, body, have, loaded, who))
+    if not todo:
+        return False, "%s, every %s s" % ("; ".join(said), c["INTERVAL_SECONDS"])
     if not apply_it:
-        return True, "would %s the job %s (runs as %s every %s s), and run it once" % (
-            "install and load" if have is None else "reinstall and reload", c["JOB_LABEL"], c["WATCHER_ACCOUNT"],
-            c["INTERVAL_SECONDS"])
-    if have != body:
-        h.install_root(body, p["plist"], 0o644)
-    if loaded:
-        h.bootout(c["JOB_LABEL"])
-    h.bootstrap(p["plist"])
-    return True, "installed and loaded system/%s" % c["JOB_LABEL"]
+        return True, "would %s, and run once" % "; ".join(
+            "%s the job %s (runs as %s every %s s)" % ("install and load" if have is None else "reinstall and reload",
+                                                         label, who, c["INTERVAL_SECONDS"])
+            for label, _pl, _b, have, _l, who in todo)
+    for label, plist, body, have, loaded, _who in todo:
+        if have != body:
+            h.install_root(body, plist, 0o644)
+        if loaded:
+            h.bootout(label)
+        h.bootstrap(plist)
+    return True, "installed and loaded %s" % ", ".join("system/" + t[0] for t in todo)
 
 
-def step_first_pass(ctx, apply_it):
-    c, h, p = ctx.conf, ctx.host, ctx.p
-    if not apply_it:
-        return False, "would run the job once and read its first pass back"
-    started = h.now()
-    h.kickstart(c["JOB_LABEL"])
+def _wait_for(ctx, path, started, what, log):
+    """The JSON file at `path`, once it says it was written at or after `started`. SetupError if it never is."""
+    h = ctx.host
     deadline = started + FIRST_PASS_WAIT_SECONDS
     while True:
-        raw = h.read(p["status"])
-        doc = None
+        raw = h.read(path)
         try:
             doc = json.loads(raw.decode("utf-8")) if raw else None
         except ValueError:
             doc = None
         written = ctx.watcher._epoch(doc.get("written_at")) if isinstance(doc, dict) else None
         if written is not None and written >= started - 2:
-            break
+            return doc
         if h.now() >= deadline:
-            raise SetupError("the job ran, and no status file appeared at %s within %d s: read %s" % (
-                p["status"], FIRST_PASS_WAIT_SECONDS, p["log"]))
+            raise SetupError("the job ran, and no %s appeared at %s within %d s: read %s" % (
+                what, path, FIRST_PASS_WAIT_SECONDS, log))
         h.sleep(3)
+
+
+def step_first_pass(ctx, apply_it):
+    c, h, p = ctx.conf, ctx.host, ctx.p
+    if not apply_it:
+        return False, "would run the job once and read its first pass back"
+    copied = ""
+    if c["USAGE_FILE"]:
+        began = h.now()
+        h.kickstart(copier_label(c))
+        cdoc = _wait_for(ctx, p["copy_status"], began, "copier status file", p["copier_log"])
+        rows = cdoc.get("copies") if isinstance(cdoc.get("copies"), list) else []
+        bad = [r.get("reason") for r in rows if not isinstance(r, dict) or r.get("state") != "copied"]
+        copied = "the copier %s; " % ("made the usage copy" if rows and not bad else
+                                      "REFUSED the usage file (%s): spend and runs stay blind until that is fixed" % (
+                                          "; ".join(str(b) for b in bad) or "no copy was reported"))
+    started = h.now()
+    h.kickstart(c["JOB_LABEL"])
+    doc = _wait_for(ctx, p["status"], started, "status file", p["log"])
     on = [m for m in doc["monitors"] if m["state"] != "off"]
     bad = [m["name"] for m in doc["monitors"] if m["state"] == "blind" and "do not match" in (m["reason"] or "")]
     if bad or doc.get("error"):
         raise SetupError("the first pass was blind on its own files or crashed: read %s" % p["log"])
-    return True, "the first pass wrote %s: %s, %d monitor(s) on (%s)" % (
-        p["status"], doc["result"], len(on), ", ".join("%s %s" % (m["name"], m["state"]) for m in on))
+    return True, "%sthe first pass wrote %s: %s, %d monitor(s) on (%s)" % (
+        copied, p["status"], doc["result"], len(on), ", ".join("%s %s" % (m["name"], m["state"]) for m in on))
 
 
 STEPS = (("preflight", step_preflight), ("account", step_account), ("folders", step_folders),
@@ -753,7 +849,9 @@ LINEAR_KEY_ENV=
 TRACKER_TEAMS=
 TRACKER_TRUSTED_USERS=
 
-# Optional: the usage file, and the limits.  The limits are the owner's decision (docs/WATCHER.md): empty = that monitor is off.
+# Optional: the usage file the workers write (the SOURCE).  A small job of root's copies it each pass into root's copy
+# folder and the watcher reads the copy, never your file (KIT-573).  Outside INSTALL_DIR and STATE_DIR.  Empty = no copier.
+# The limits are the owner's decision (docs/WATCHER.md): empty = that monitor is off.
 USAGE_FILE=
 LIMIT_DAY_USD=
 LIMIT_PIECE_USD=
@@ -800,6 +898,7 @@ class FakeHost(SystemHost):
         self.first_pass, self.first_pass_blind = True, False
         self.secret_args = []
         self.exported = []
+        self.source_uid, self.copier_rc, self.copier_rules, self.copier_runs = os.getuid(), None, None, True
 
     def _real(self, path):
         for prefix, sub in (("/Library/LaunchDaemons", "launchd"), (self.root, "")):
@@ -844,6 +943,7 @@ class FakeHost(SystemHost):
     def mkdir_root(self, path):
         self.calls.append(("mkdir_root", path))
         os.makedirs(self._real(path), exist_ok=True)
+        os.chmod(self._real(path), 0o755)
         self.meta[path] = ("root", 0o755)
 
     def mkdir_owned(self, path, account):
@@ -890,6 +990,8 @@ class FakeHost(SystemHost):
 
     def kickstart(self, label):
         self.calls.append(("kickstart", label))
+        if label.endswith(".copier"):
+            return self._run_copier(label)
         if not self.first_pass:
             return
         import check_schemas
@@ -899,6 +1001,20 @@ class FakeHost(SystemHost):
         if self.first_pass_blind:
             doc["monitors"][0].update(state="blind", reason="its own files do not match their manifest (x)")
         self._status_doc = doc
+
+    def _run_copier(self, label):
+        """The real copier, on the installed rules, with this host's clock and the one account that owns the
+        source stood in for: what the root job would do, to the files this host installed."""
+        if not self.copier_runs:
+            return
+        import pipeline_watcher_copy as copier
+        saved = (copier.resolve_uid, copier._iso)
+        copier.resolve_uid = lambda name: self.source_uid if name == "_clawdispatch" else None
+        copier._iso = lambda epoch=None: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.clock + 1))
+        try:
+            self.copier_rc = copier.run_rules(self._real(self.copier_rules), io.StringIO())
+        finally:
+            copier.resolve_uid, copier._iso = saved
 
     def git(self, checkout, *args):
         self.calls.append(("git",) + args)
@@ -910,7 +1026,7 @@ class FakeHost(SystemHost):
 
     def export_commit(self, checkout, commit, dest):
         self.exported.append(dest)
-        for rel in WATCHER_FILES:
+        for rel in INSTALLED_FILES:
             os.makedirs(os.path.dirname(os.path.join(dest, rel)), exist_ok=True)
             with open(os.path.join(dest, rel), "wb") as fh, open(os.path.join(REPO, rel), "rb") as src:
                 fh.write(src.read() + (b"# another commit\n" if getattr(self, "other_commit", False) and rel == ENTRY else b""))
@@ -936,6 +1052,19 @@ def selftest():
     import contextlib
     failures, total = [], [0]
     import pipeline_watcher_local as watcher
+    saved_prefixes = globals()["UNSAFE_PREFIXES"]
+
+    def finish():
+        """Puts the refused-folder list back, prints every failure, and returns the exit code. Also how a run
+        that did not end fine stops the selftest: with its own output, never a crash on a later line."""
+        globals()["UNSAFE_PREFIXES"] = saved_prefixes
+        if failures:
+            for line in failures:
+                print(line)
+            print("watcher setup selftest: %d of %d checks failed" % (len(failures), total[0]))
+            return 1
+        print("OK: watcher setup selftest (%d checks)" % total[0])
+        return 0
 
     def check(name, got, want):
         total[0] += 1
@@ -964,6 +1093,13 @@ def selftest():
         c, errs = validate_conf(dict(values, KIT_CHECKOUT=REPO, INSTALL_DIR="/opt/watch/inst",
                                      STATE_DIR="/opt/watch/state"), "alice")
         check("a good conf validates", errs, [])
+        # A deep temp folder is a real place (a session's scratch folder is over 200 characters), so the length
+        # of a path is not what a selftest may depend on. The limit is the system's, not a guess.
+        deep = "/opt/watch/" + "/".join(["d" * 40] * 8)
+        _c, e = validate_conf(dict(values, KIT_CHECKOUT=REPO, INSTALL_DIR=deep + "/i", STATE_DIR=deep + "/s"), "alice")
+        check("conf: a path of more than 300 characters, as a deep temp folder gives, is accepted", e, [])
+        _c, e = validate_conf(dict(values, KIT_CHECKOUT=REPO, INSTALL_DIR="/opt/" + "d" * PATH_LIMIT), "alice")
+        check("conf: a path past the system's limit is refused, by key", any("INSTALL_DIR" in x for x in e), True)
         _v, perrs = parse_conf("WATCHER_ACCOUNT=_w\nGITHUB_TOKEN_ENV=WATCHER_GITHUB_TOKEN\nLINEAR_KEY_ENV=lin_api_" + "k" * 30 + "\n")
         check("a conf with a credential shape is refused, naming the line and not the value",
               (len(perrs), "CREDENTIAL SHAPE" in perrs[0], "lin_api_" in " ".join(perrs)), (1, True, False))
@@ -1017,6 +1153,7 @@ def selftest():
             h = FakeHost(tmp)
             h.clock += 1000 * counter[0]
             h.status_path = state + "/watcher-status.json"
+            h.copier_rules = inst + "/" + COPIER_RULES_NAME
             for k, v in kw.items():
                 setattr(h, k, v)
             return h
@@ -1039,7 +1176,6 @@ def selftest():
         # /tmp on Linux, /var/folders on a Mac, and any place at all when TMPDIR is set (a folder under
         # /Users included, as on a Mac whose temp is outside the home but still under it). So the list is
         # emptied for them, and the refusals above have already shown it refuses each place by name.
-        saved_prefixes = globals()["UNSAFE_PREFIXES"]
         globals()["UNSAFE_PREFIXES"] = ()
         _c, e = validate_conf(dict(values, KIT_CHECKOUT=REPO, INSTALL_DIR=USERS + "Shared/w", STATE_DIR="/tmp/s"), "alice")
         check("the machine tests accept a temp folder wherever the machine puts it, under /Users or /tmp",
@@ -1093,18 +1229,28 @@ def selftest():
         # the whole run
         h = machine()
         rc, out, asked = go(h)
-        check("a full run asks ONE question and ends fine", (rc, len(asked)), (EX_OK, 1))
+        check("a full run asks ONE question and ends fine", (rc, len(asked), out if rc else ""), (EX_OK, 1, ""))
+        if rc != EX_OK:
+            # Everything below reads what this run installed. Stop here, and say why the run failed.
+            failures.append("the full run did not end fine, so the checks that read what it installed were skipped; "
+                            "its output was:\n" + out)
+            return finish()
         names = [c_[0] for c_ in h.calls]
         check("the account, folders, files, keys and job were made, in that order",
               [n for n in names if n in ("create_account", "mkdir_root", "mkdir_owned", "install_root", "write_as", "bootstrap", "kickstart")][:4],
               ["create_account", "mkdir_root", "mkdir_root", "mkdir_root"])
-        check("the account is hidden, with no login shell", h.accounts["_clawwatcher"]["shell"], "/usr/bin/false")
+        check("the account is hidden, with no login shell", h.accounts.get("_clawwatcher", {}).get("shell"), "/usr/bin/false")
         check("the job is loaded after the files, and run once",
               names.index("bootstrap") > max(i for i, n in enumerate(names) if n == "install_root") and names.count("kickstart") == 1, True)
         check("every file is root's, and no file is writable by group or other",
               all(h.meta[d][0] == "root" and not h.meta[d][1] & 0o022 for d in h.meta if d.startswith(inst)), True)
         check("the rules, the manifest and every file are at their paths",
-              all(os.path.exists(h._real(inst + "/" + rel)) for rel in WATCHER_FILES + (RULES_NAME, MANIFEST_NAME)), True)
+              all(os.path.exists(h._real(inst + "/" + rel)) for rel in INSTALLED_FILES + (RULES_NAME, MANIFEST_NAME)), True)
+        check("with no usage file there is no copier: no folder, no rules, no job, no mention in the watcher's rules",
+              (os.path.exists(h._real(inst + "/copy")), os.path.exists(h._real(inst + "/" + COPIER_RULES_NAME)),
+               [n for n in h.loaded_labels if n.endswith(".copier")],
+               "usage_copy_status" in json.loads(h.read(inst + "/" + RULES_NAME)), names.count("kickstart")),
+              (False, False, [], False, 1))
         # the watcher's own check accepts exactly what was installed, and refuses a tamper
         check("the watcher's own self-check accepts what the installer wrote",
               watcher.install_problem(inst + "/" + MANIFEST_NAME), None)
@@ -1207,6 +1353,157 @@ def selftest():
         rc, out10, _a = go(h10, tty=False)
         check("with no terminal and no key, it says so and exits 4", (rc, "no terminal" in out10), (EX_UNKNOWN, True))
 
+        # --- the read-only copy of the usage file (KIT-573) ---------------------------------------------
+        import check_schemas
+        usage_dir = os.path.join(tmp, "usage")
+        usage_src = os.path.join(usage_dir, "usage.json")
+
+        def put_usage(h, how="file"):
+            shutil.rmtree(usage_dir, ignore_errors=True)
+            os.makedirs(usage_dir)
+            doc = copy.deepcopy(check_schemas.VALID_USAGE)
+            doc["written_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(h.clock))
+            if how == "link":
+                with open(os.path.join(tmp, "elsewhere.json"), "w", encoding="utf-8") as fh:
+                    json.dump(doc, fh)
+                os.symlink(os.path.join(tmp, "elsewhere.json"), usage_src)
+            else:
+                with open(usage_src, "w", encoding="utf-8") as fh:
+                    json.dump(doc, fh)
+            return doc
+
+        for label, over, needle in (("inside the install folder", {"USAGE_FILE": inst + "/usage.json"}, "outside INSTALL_DIR"),
+                                    ("inside the state folder", {"USAGE_FILE": state + "/usage.json"}, "outside INSTALL_DIR")):
+            _c, e = validate_conf(dict(values, KIT_CHECKOUT=REPO, **over), "alice")
+            check("conf: a USAGE_FILE %s is refused" % label, any(needle in x for x in e), True)
+        put_conf(KIT_CHECKOUT=REPO, USAGE_FILE=usage_src, LIMIT_DAY_USD="50")
+        h = machine()
+        put_usage(h)
+        rc, out, asked = go(h)
+        names = [c_[0] for c_ in h.calls]
+        cl, wl = "local.test-claw-watcher.copier", "local.test-claw-watcher"
+        check("with a usage file a full run still asks ONE question and ends fine", (rc, len(asked), out if rc else ""), (EX_OK, 1, ""))
+        boots = [c_[1] for c_ in h.calls if c_[0] == "bootstrap"]
+        kicks = [c_[1] for c_ in h.calls if c_[0] == "kickstart"]
+        check("two jobs are loaded, the copier first, and run once each, the copier first",
+              ([os.path.basename(b) for b in boots], kicks), (["%s.plist" % cl, "%s.plist" % wl], [cl, wl]))
+        plist = plistlib.loads(h.read("/Library/LaunchDaemons/%s.plist" % cl))
+        check("the copier's job runs as root (no UserName), without a shell, in Python's isolated mode, on its own rules only",
+              ("UserName" in plist, plist["ProgramArguments"], "EnvironmentVariables" in plist and list(plist["EnvironmentVariables"])),
+              (False, ["/usr/bin/python3", "-I", inst + "/scripts/pipeline_watcher_copy.py", "run", "--config",
+                       inst + "/" + COPIER_RULES_NAME], ["PATH"]))
+        check("the copier job logs into root's copy folder, never the watcher's state folder",
+              (plist["StandardOutPath"].startswith(inst + "/copy/"), plist["StandardOutPath"].startswith(state)), (True, False))
+        wrules = json.loads(h.read(inst + "/" + RULES_NAME))
+        crules = json.loads(h.read(inst + "/" + COPIER_RULES_NAME))
+        check("the watcher's rules name the copy and its status, not the workers' file",
+              (wrules["usage_file"], wrules["usage_copy_status"], usage_src in json.dumps(wrules)),
+              (inst + "/copy/usage.json", inst + "/copy/copier-status.json", False))
+        check("the copier's rules name the one source it was told, the role account as its owner, and the copy",
+              [(c_["source"], c_["owner"], c_["dest"]) for c_ in crules["copies"]],
+              [(usage_src, "_clawdispatch", inst + "/copy/usage.json")])
+        check("the copy is the source, whole, root's, 0644, in a folder of root's",
+              (open(h._real(inst + "/copy/usage.json"), "rb").read() == open(usage_src, "rb").read(),
+               h.meta[inst + "/copy"], h.copier_rc), (True, ("root", 0o755), EX_OK))
+        check("the first pass says the copier made the copy", "the copier made the usage copy" in out, True)
+        check("the watcher's own loader reads the installed copy as fresh, whole and the copier's",
+              (lambda d_w: (d_w[0] is not None, d_w[1]))(watcher.read_usage(
+                  watcher.load_config(h._real(inst + "/" + RULES_NAME)), h.clock + 1)), (True, None))
+        with open(h._real(inst + "/copy/usage.json"), "ab") as fh:
+            fh.write(b" ")
+        check("a copy edited after the copier made it is blind for the watcher",
+              "not the copy the copier made" in (watcher.read_usage(
+                  watcher.load_config(h._real(inst + "/" + RULES_NAME)), h.clock + 1)[1] or ""), True)
+        man = json.loads(h.read(inst + "/" + MANIFEST_NAME))
+        check("the copier script is in the manifest the watcher checks every pass",
+              COPIER_ENTRY in man["files"] and watcher.install_problem(inst + "/" + MANIFEST_NAME) is None, True)
+        # a second run changes nothing
+        h2 = FakeHost(tmp)
+        h2.status_path, h2.copier_rules = h.status_path, h.copier_rules
+        h2.accounts, h2.meta, h2.loaded_labels = h.accounts, h.meta, h.loaded_labels
+        rc, out2, asked2 = go(h2)
+        check("a second run with a copier finds nothing to change", (rc, asked2, "Nothing to change" in out2), (EX_OK, [], True))
+        # independence: a worker who can write the copy, its status or the copier's rules
+        for who, rel, label in (("_clawdispatch", "/copy/usage.json", "the role account can write the copy"),
+                                ("alice", "/copy/copier-status.json", "you can write the copy's status"),
+                                ("_clawdispatch", "/copy", "the role account can write the copy folder"),
+                                ("_clawdispatch", "/" + COPIER_RULES_NAME, "the role account can write the copier's rules"),
+                                ("_clawdispatch", "/scripts/pipeline_watcher_copy.py", "the role account can write the copier")):
+            h4 = FakeHost(tmp)
+            h4.status_path, h4.copier_rules = h.status_path, h.copier_rules
+            h4.accounts, h4.meta, h4.loaded_labels = h.accounts, h.meta, h.loaded_labels
+            h4.can[(who, inst + rel)] = True
+            rc, out4, _a = go(h4, check_only=True)
+            check("%s: not independent, named" % label,
+                  (rc, "not independent" in out4, "%s can write %s%s" % (who, inst, rel) in out4), (EX_FAILED, True, True))
+        # a worker who can write the copy the FIRST pass makes is caught in the same run (the verify pass), named
+        hf = machine()
+        put_usage(hf)
+        hf.can[("_clawdispatch", inst + "/copy/usage.json")] = True
+        rc, outf, _a = go(hf)
+        check("a worker able to write the copy that the first pass made is caught in the same run, named",
+              (rc, "not independent" in outf, "_clawdispatch can write %s/copy/usage.json" % inst in outf), (EX_FAILED, True, True))
+        # a planted line in the copier is named by the watcher's own check
+        with open(h._real(inst + "/scripts/pipeline_watcher_copy.py"), "ab") as fh:
+            fh.write(b"# planted\n")
+        check("a planted line in the copier makes the watcher's own check name it",
+              "pipeline_watcher_copy.py" in (watcher.install_problem(inst + "/" + MANIFEST_NAME) or ""), True)
+        # a foreign plist at the copier's label is never replaced
+        h6 = machine()
+        put_usage(h6)
+        os.makedirs(os.path.join(tmp, "launchd"), exist_ok=True)
+        with open(os.path.join(tmp, "launchd", cl + ".plist"), "wb") as fh:
+            fh.write(plistlib.dumps({"Label": cl, "ProgramArguments": ["/bin/other"]}))
+        rc, out6, _a = go(h6)
+        check("a plist that is not the copier's is never replaced", (rc, "NOT this watcher's job" in out6,
+                                                                      [c_[0] for c_ in h6.calls if c_[0] == "bootstrap"]),
+              (EX_FAILED, True, []))
+        # hostile sources: the copier refuses, the run says so and does not call it fine, and no copy is left
+        for how, label in (("link", "a usage file that is a link"),):
+            h7 = machine()
+            put_usage(h7, how)
+            rc, out7, _a = go(h7)
+            check("%s: the copier refuses it, the run says spend and runs stay blind, and no copy exists" % label,
+                  (rc, "REFUSED the usage file (the source is a link)" in out7, h7.copier_rc,
+                   os.path.exists(h7._real(inst + "/copy/usage.json"))), (EX_OK, True, 4, False))
+        h8 = machine()
+        put_usage(h8)
+        h8.source_uid = os.getuid() + 1
+        rc, out8, _a = go(h8)
+        check("a usage file of another account is refused the same way",
+              (rc, "not owned by the account that is meant to write it" in out8, os.path.exists(h8._real(inst + "/copy/usage.json"))),
+              (EX_OK, True, False))
+        h9 = machine(copier_runs=False)
+        put_usage(h9)
+        rc, out9, _a = go(h9)
+        check("a copier that leaves no status is a failure, said, with where to look",
+              (rc, "no copier status file appeared" in out9), (EX_FAILED, True))
+        # the copier is stdlib only: it runs as root with -I, so it can import nothing of ours
+        with open(os.path.join(HERE, "pipeline_watcher_copy.py"), encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+        mods = set()
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Import):
+                mods.update(a.name.split(".")[0] for a in n.names)
+            elif isinstance(n, ast.ImportFrom) and n.module:
+                mods.add(n.module.split(".")[0])
+        def is_stdlib(name):
+            # sys.stdlib_module_names is Python 3.10+; the Mac runs 3.9 (KIT-653), so there the
+            # module's own file is judged: built in, or under the standard library's folder.
+            known = getattr(sys, "stdlib_module_names", None)
+            if known is not None:
+                return name in known
+            import importlib.util
+            import sysconfig
+            spec = importlib.util.find_spec(name)
+            origin = getattr(spec, "origin", None) or ""
+            return origin in ("built-in", "frozen") or (
+                origin.startswith(sysconfig.get_paths()["stdlib"] + os.sep)
+                and "site-packages" not in origin)
+        check("the copier imports only the standard library (the selftest's helper is the one allowed exception)",
+              sorted(m for m in mods if not is_stdlib(m)), ["scratch_run"])
+        put_conf(KIT_CHECKOUT=REPO)
+
         # the real host's commands, pinned: each is one fixed argv, no shell string with a value in it
         seen_argv = []
 
@@ -1251,14 +1548,7 @@ def selftest():
                       "/usr/bin:/bin:/usr/sbin:/sbin", "/usr/local/claw-watcher", "/var/claw-watcher", "/var/tmp"])
         check("the one place it names the launchd folder is the job's plist path",
               above.count("/Library/LaunchDaemons/%s.plist"), 1)
-    globals()["UNSAFE_PREFIXES"] = saved_prefixes
-    if failures:
-        for line in failures:
-            print(line)
-        print("watcher setup selftest: %d of %d checks failed" % (len(failures), total[0]))
-        return 1
-    print("OK: watcher setup selftest (%d checks)" % total[0])
-    return 0
+    return finish()
 
 
 if __name__ == "__main__":

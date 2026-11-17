@@ -111,7 +111,7 @@ def handover_parts(kind, issue, since, requester, cfg, by_bot=False, dm=False, t
     state = notify.safe_title((issue.get("state") or {}).get("name") or "an unknown state")
     team = ((issue.get("team") or {}).get("key")) or "?"
     if by_bot:
-        who = "the tech lead" if requester == cfg.get("chat_bot_user_id") else "a bot"
+        who = "a bot"            # the tech lead's own lines name it in their terms (KIT-492)
     else:
         who = ("<@%s>" % requester) if SLACK_USER_RE.match(requester or "") else "a bot"
     then = RETRY_THEN_BIND if kind == "retry" else START_THEN_BIND

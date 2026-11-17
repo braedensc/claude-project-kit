@@ -39,6 +39,11 @@ the file is deliberately not self-protected, and its root falls back to the
 model-mutable cwd rather than `pre-tool-use.py`'s `CLAUDE_PROJECT_DIR` anchor. A guard
 that needs the pinned ticket reads the pin itself.
 
+> **Update, 2026-11-11 (KIT-463).** `session-start.py` is now self-protected, because it
+> runs on resume outside the Bash sandbox. The conclusion stands: its output is still not
+> a trust source. The cwd reason is unchanged, and self-protection's Bash half is
+> advisory (`docs/SECURITY.md`), so the file's claims about itself still prove nothing.
+
 ## Why
 
 The kit already had a doctrine for user data — `docs/SECURITY.md`: frame it as *data,

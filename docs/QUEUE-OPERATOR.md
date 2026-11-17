@@ -7,6 +7,12 @@ feed it: the usage job (KIT-422) and the morning job (KIT-446). `scripts/pipelin
 **It needs Stage E and the bridge first** (`docs/BRIDGE-OPERATOR.md`, *With the queue on*). The jobs run as the
 dispatcher's role account, from Stage E's clone, with its env file. The installer creates none of these.
 
+
+**Review tickets are never work** (KIT-596). They sit on the work teams, told by their
+`[repo=reviews-…]` tag or `reviews-…` label, and the pool names them `review-ticket`.
+`REVIEWS_TEAM_KEY` in `queue.conf` is optional: set it only to name an old separate Reviews
+team, whose tickets are never work either.
+
 ## Run it
 
     cp queue.conf.example queue.conf && chmod 600 queue.conf    # edit it; none of it is secret
@@ -23,8 +29,9 @@ edit them. `UNKNOWN` means it could not look, which is not a pass.
 Good: one line saying all pass. Not that: `the clone ... is not level with this checkout`. Merge the change, then let
 Stage E's installer move the clone. Not that: `lacks <name>`. That name is missing from the env file.
 
-**config.** It writes two files, mode 600, after the jobs' own loaders accept them.
-Good: `wrote ..., mode 600`. Not that: `the jobs' own loaders REFUSE this composition`. Their words follow. Nothing was written.
+**config.** It writes three files, mode 600, after the jobs' own loaders accept them: the two configs, and an installed
+copy of your queue.conf beside the queue's config (KIT-700). First it carries in any queue setting the tech lead changed
+(next section). Good: `wrote ..., mode 600`. Not that: `the jobs' own loaders REFUSE this composition`. Their words follow. Nothing was written.
 
 **jobs.** It installs two LaunchDaemon plists and does not load them.
 Good: `installed ... NOT loaded`. Not that: `... is NOT the usage job`. Another job's plist is already there, so it will not
@@ -100,6 +107,53 @@ Good: `paced to the weekly reset: 54.0 left of 90 at the start of today, over 3 
 `pacing is on, but the usage file cannot place the plan's week, so the day stays at its configured figures`. The day then
 runs at `PLANNED_LOAD` and `DAY_STOP`, as if pacing were off. Check the usage job. Other causes: a reset in the past or more
 than eight days off, no spend for today in the usage file, and no working window before the reset.
+
+## Sprint planning at the reset
+
+A sprint is the plan's week (`scripts/pipeline_sprint.py`). Set `SPRINT_PLAN_FILE` and `WEEKLY_BUDGET_USD` in `queue.conf`
+and, on the first morning of each new sprint, the morning job also writes **one proposal** of the week's work into that
+file: the pieces the pool admitted, in the queue's own order, as many as fit the week's budget less what the week has
+spent, each at its effort's estimate. What does not fit says why: over the budget, no size yet, or the pool's reason in plain words.
+
+A held piece that one reply would start keeps that reply in the list. The proposal offers nothing the pool did not
+admit, so it never offers work the pipeline cannot land. It is not proposed again for the same sprint. The stand-up
+sends it (`docs/STANDUP.md`, "The sprint plan"), and your reply `plan sprint <date>` records the plan in the same file.
+
+What the queue does with a recorded plan: **its pieces go first** among the pieces already allowed to start, both in the
+morning job's day plan and in the starter that actually starts them (it reads the same `morning.sprint_plan_file`). That is all.
+It admits nothing, raises no budget and changes no stop. With no plan recorded, the order is what it was.
+
+Settings (`queue.conf` key, then the morning job's key): `SPRINT_PLAN_FILE` is `morning.sprint_plan_file`; `WEEKLY_BUDGET_USD` is
+`order.weekly_budget_usd`. The working days a sprint counts are `morning.sprint_days` (default `mon` to `sat`). A plan file
+must be outside every git working tree: it holds your yes. Name the same path in `bridge.conf` (`STANDUP_SPRINT_PLAN_FILE`).
+
+Good: `proposed a sprint plan for the week starting 2026-11-11: 4 piece(s), $18.00 of estimates`. Not that:
+`no sprint plan was proposed: the sprint is not known (...)`, or `... what the week has spent so far could not be read ...`.
+The morning job then exits 3. A plan file it cannot read is never planned over, since your yes may be in it.
+
+## When the tech lead changes a setting
+
+Ask in your DM, in one sentence: a verb such as set, lower or raise, the setting, and the new value. *Lower the planned
+load to 30*, *raise the day stop to 80*, *make it two lanes per repo, so lanes 2*. A question asks for nothing (*can you
+raise the day stop to 80?*), and neither does a sentence with don't, not, never or keep. Neither does a number in a time,
+a date or a percentage. The tech lead can change three settings: `PLANNED_LOAD`, `DAY_STOP` and
+`LANES_PER_REPO`. The rest of queue.conf stays yours to edit.
+
+The jobs' account cannot reach your queue.conf. So the change goes into the installed copy beside the queue's config,
+and into the config itself, and both are read back. The queue uses it from its next pass. The tech lead then tells you
+the old and the new value. Each change adds one row to `settings-changes.jsonl` in the same folder, and the next
+stand-up names it.
+
+Your next queue install carries each change into your own queue.conf, and says so: `carried PLANNED_LOAD 40 -> 30 (the
+tech lead's change)`. If you changed that line yourself since the last install, your value stays, and it says that too.
+A run with `--dry-run` only says what it would carry.
+
+A value the queue would refuse is never written: the day's planned load above the day stop, a fourth lane, zero. The
+tech lead says why, in the queue's own words. A change a ticket, a pull request or a session asks for is refused, even
+when the tech lead read it and tried: only your own message counts.
+
+Good: *Changed the planned load (PLANNED_LOAD) from 40 to 30. ...* Not that: *I didn't change the planned load to 9:
+your own message has to name that setting and the new value*. Ask again in your own words.
 
 ## Pausing it
 

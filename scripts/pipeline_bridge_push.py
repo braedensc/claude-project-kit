@@ -23,8 +23,8 @@ WHAT IT DOES FOR ONE EVENT
      the message to `Pass.handle_once`: a command, a bare yes or no and the tech lead's turn all
      go the way a pass sends them, and code decides them exactly as there. The turn's reply goes in
      a thread under the owner's message; the bridge's own yes/no questions stay top-level, where a
-     yes is looked for. A reply inside that thread continues its conversation; a new top-level
-     message starts a new one.
+     yes is looked for. There is one conversation per DM: a reply inside that thread and a new
+     top-level message both continue it (KIT-751).
   5. A message already `handled` (by a pass, or by an earlier delivery) is never answered again. The
      state is read under the lock, so a message both this job and a pass see is answered once.
 
@@ -81,6 +81,8 @@ PHRASES = {
     "resume": "lining up a resume question", "cancel": "lining up a cancel question",
     "retry": "lining up a retry question", "start": "lining up a start question",
     "answer": "lining up an answer", "answer_plan": "lining up an answer to a plan's question",
+    "queue_setting": "lining up a queue setting change",
+    "plan_change": "weighing a change to a plan",
 }
 
 
@@ -186,6 +188,7 @@ class PushJob(object):
         self.lock = threading.Lock()                # the heartbeat's numbers
         self.connected, self.last_heard, self.handled, self.connects = False, None, 0, 0
         self.error, self.beat_at = None, 0.0
+        self.streamed, self.stream_refused, self.stream_why = 0, 0, None     # KIT-565
 
     # -- saying and the heartbeat ---------------------------------------------------------
     def log(self, line):
@@ -209,6 +212,11 @@ class PushJob(object):
                    "last_heard_at": iso(self.last_heard) if self.last_heard else None,
                    "handled": self.handled, "reconnects": max(0, self.connects - 1),
                    "error": self.error}
+            if self.cfg.get("stream_answers") is True:
+                # KIT-565: absent when the stream is off. When Slack refuses it the answer goes
+                # out whole, and this says why, in Slack's own word.
+                doc["stream"] = {"streamed": self.streamed, "refused": self.stream_refused,
+                                 "last_refusal": self.stream_why}
             try:
                 os.makedirs(self.cfg["state_dir"], exist_ok=True)
                 bridge.notify._atomic_write_json(path, doc)
@@ -271,6 +279,7 @@ class PushJob(object):
     def read(self, sock):
         """Read one connection until it ends. True when it said hello (it was a real connection)."""
         hello = False
+        frames = getattr(sock, "frame_count", 0)
         try:
             while not self.stop.is_set():
                 try:
@@ -278,6 +287,14 @@ class PushJob(object):
                 except ws.WSError as exc:
                     self.set(error="the connection ended: %s" % str(exc)[:120])
                     return hello
+                # Slack's pings come about every half minute on a quiet connection, and the client
+                # answers them itself: any frame at all is Slack heard from, so a quiet connection is
+                # told from a dead one by this (KIT-561).
+                now_frames = getattr(sock, "frame_count", 0)
+                if now_frames != frames:
+                    frames = now_frames
+                    with self.lock:
+                        self.last_heard = self.clock()
                 self.beat()
                 if got is None:
                     continue
@@ -451,6 +468,10 @@ class PushJob(object):
         live = dict(gathered.get(msg["ts"]) or msg)
         p.handle_once(channel, live)
         p.save()
+        with self.lock:
+            self.streamed += p.counts.get("streamed", 0)
+            self.stream_refused += p.counts.get("stream_refused", 0)
+            self.stream_why = p.stream_why or self.stream_why
         return recorder.posts
 
     # -- Slack's lines under the thread ------------------------------------------------------------
@@ -500,6 +521,45 @@ class PushJob(object):
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════
+# The probe (KIT-561)
+# ══════════════════════════════════════════════════════════════════════════════════════
+PROBE_SECONDS = 10.0
+
+
+def probe(slack, app_token, connect=None, seconds=PROBE_SECONDS, clock=time.monotonic):
+    """(ok, one line): can this account open the connection through its network, and does Slack say
+    hello on it. The installer's `verify` and `push` run it as the role account, with the job's own
+    config and token, so it measures the limits that account's network puts on the job. It reads and
+    answers nothing: a message sent while it is open goes unacknowledged on this connection, and
+    Slack sends it again on the job's. Said in fixed words: no address, no ticket, no token."""
+    connect = connect or (lambda url: ws.connect(url, (".slack.com",), timeout=10))
+    try:
+        sock = connect(slack.open_socket_url(app_token))
+    except (BridgeError, ws.WSError) as exc:
+        return False, "could not open the connection: %s" % str(exc)[:120]
+    try:
+        started = clock()
+        while clock() - started < seconds:
+            got = sock.recv(timeout=1.0)
+            if got is None:
+                continue
+            kind, data = got
+            if kind == "close":
+                return False, "Slack closed the connection straight away"
+            if kind == "text":
+                try:
+                    if json.loads(data).get("type") == "hello":
+                        return True, "Slack said hello after %.1f seconds" % (clock() - started)
+                except (ValueError, AttributeError):
+                    continue
+        return False, "Slack did not say hello within %d seconds" % int(seconds)
+    except ws.WSError as exc:
+        return False, "the connection ended: %s" % str(exc)[:120]
+    finally:
+        sock.close()
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════
 # The command line
 # ══════════════════════════════════════════════════════════════════════════════════════
 def main(argv=None):
@@ -507,8 +567,20 @@ def main(argv=None):
     if argv == ["--selftest"]:
         from scratch_run import contained
         return contained(_selftest, "bridge-push-selftest-run-")
+    if len(argv) == 3 and argv[0] == "probe" and argv[1] == "--config":
+        try:
+            cfg = bridge.load_config(argv[2])
+            slack = bridge.SlackClient(cfg, bridge.credential(cfg, "slack_token_env"))
+            app_token = bridge.credential(cfg, "push_token_env")
+        except BridgeError as exc:
+            sys.stdout.write("push probe: could not start: %s\n" % exc)
+            return exc.code
+        ok, line = probe(slack, app_token)
+        sys.stdout.write("push probe: %s\n" % line)
+        return EXIT_OK if ok else 1
     if len(argv) != 3 or argv[0] != "run" or argv[1] != "--config":
-        sys.stderr.write("usage: pipeline_bridge_push.py run --config PATH | --selftest\n")
+        sys.stderr.write("usage: pipeline_bridge_push.py run --config PATH | probe --config PATH"
+                         " | --selftest\n")
         return EXIT_USAGE
     try:
         cfg = bridge.load_config(argv[2])
@@ -583,6 +655,35 @@ def selftest_body():
             self.calls.append(("delete", channel, ts))
             self.deleted.append(ts)
 
+        # KIT-565: the stream is one message that grows; a call named in `stream_fail` is refused.
+        def _stream(self, name, *what):
+            self.calls.append((name,) + what)
+            if name in getattr(self, "stream_fail", ()):
+                raise BridgeError("Slack chat.%s refused: stream_not_supported" % name)
+
+        def _message(self, ts):
+            return next(m for m in self.messages if m.get("ts") == ts)
+
+        def start_stream(self, channel, thread_ts, text, user, team):
+            self._stream("startStream", channel, thread_ts, text, user, team)
+            self._clock += 1
+            ts = "%.6f" % (self.now - 10000 + self._clock)
+            m = {"ts": ts, "thread_ts": thread_ts, "text": text, "user": bridge.ME,
+                 "bot_id": bridge.BOT, "_channel": channel}
+            self.messages.append(m)
+            return ts
+
+        def append_stream(self, channel, ts, text):
+            self._stream("appendStream", ts, text)
+            self._message(ts)["text"] += text
+
+        def stop_stream(self, channel, ts):
+            self._stream("stopStream", ts)
+
+        def update_message(self, channel, ts, text):
+            self._stream("update", ts, text)
+            self._message(ts)["text"] = text
+
         def post(self, channel, thread_ts, text):
             ts = bridge.FakeSlack.post(self, channel, thread_ts, text)
             self.calls.append(("post", channel, thread_ts, text))
@@ -605,7 +706,6 @@ def selftest_body():
             json.dump({"team_keys": ["PROD"], "linear_key_file": key, "outbox_dir": ob}, fh)
         raw = dict(bridge.EXAMPLE_CONFIG, channel_ids=[CHAN], owner_user_id=OWNER, bot_user_id=ME,
                    state_dir=os.path.join(root, "state"), dm_user_ids=[ALICE],
-                   ask_tech_lead=True, chat_bot_user_id=bridge.CHATBOT, back_room_channel_id=CHAN,
                    tech_lead_turn=True, turn_bin="/opt/bin/claude", turn_tools_config=conf,
                    push_mode=True, act=True, agent_user_name="Agent")
         raw.update(over)
@@ -622,10 +722,15 @@ def selftest_body():
             self.answers, self.calls, self.during = list(answers), [], kw.get("during")
 
         def __call__(self, cfg, text, session, now, **kw):
-            self.calls.append({"text": text, "session": session})
+            self.calls.append({"text": text, "session": session,
+                               "streamed": kw.get("on_text") is not None})
             if self.during:
                 self.during()
-            a = self.answers.pop(0) if self.answers else {}
+            a = dict(self.answers.pop(0) if self.answers else {})
+            if kw.get("on_text"):
+                for piece in a.pop("stream", None) or []:      # KIT-565: as the CLI writes it
+                    kw["on_text"](piece)
+            a.pop("stream", None)
             return dict({"text": None, "why": "", "session_id": None, "resumed": False,
                          "cost": None, "turns": None}, **a)
 
@@ -704,19 +809,20 @@ def selftest_body():
           (("status", DM, "1760000001.000100", ""), []))
     st = json.load(open(bridge.state_path(cfg)))
     check("reply: the message is recorded as handled, so a pass leaves it, and the turn's "
-          "session is the thread's",
+          "session is the DM's",
           ("%s:1760000001.000100" % DM in st["handled"],
            sorted(st["turn_sessions"]), turn.calls[0]["session"]),
-          (True, ["%s:1760000001.000100" % DM], None))
-    # the owner replies inside that thread: the same conversation. A new top-level message: a new one.
+          (True, [DM], None))
+    # the owner replies inside that thread: the same conversation. A new top-level message: the same
+    # one too (KIT-751): one conversation per DM; the thread decides only where the answer is posted.
     turn.answers += [{"text": "Still ready.", "session_id": SID, "resumed": True},
                      {"text": "A new topic.", "session_id": SID2}]
     job.handle(event("1760000002.000100", text="and the plan?", thread="1760000001.000100"))
     job.handle(event("1760000003.000100", text="something else"))
-    check("thread: a reply inside the thread resumes its session; a new message starts another",
+    check("thread: a reply inside the thread and a new top-level message both resume the DM's one session",
           ([c["session"] and c["session"]["id"] for c in turn.calls],
            sorted(json.load(open(bridge.state_path(cfg)))["turn_sessions"])),
-          ([None, SID, None], sorted(["%s:1760000001.000100" % DM, "%s:1760000003.000100" % DM])))
+          ([None, SID, SID], [DM]))
     check("thread: every reply is under its own conversation's root",
           [c[2] for c in slack.calls if c[0] == "post"],
           ["1760000001.000100", "1760000001.000100", "1760000003.000100"])
@@ -1018,6 +1124,91 @@ def selftest_body():
     check("log: neither the app token nor the connection's ticket appears in anything said",
           [l for l in job.lines if "SECRETAPPTOKEN" in l or "SECRETTICKET" in l or "xapp-" in l], [])
 
+    # KIT-561: a ping is Slack heard from. A quiet connection gets no text for hours, only the pings
+    # the client answers itself; the job sees them in the client's frame count.
+    cfg, slack, tracker, tcfg, ob = world()
+    tick = [NOW]
+
+    class PingWS(FakeWS):
+        frame_count = 0
+    quiet = PingWS([lambda: setattr(quiet, "frame_count", 1), text({"type": "hello"}),
+                    lambda: (tick.__setitem__(0, NOW + 100), setattr(quiet, "frame_count", 2)),
+                    None])
+    job = job_for(cfg, slack, tracker, tcfg, FakeTurn(), clock=lambda: tick[0])
+    job.read(quiet)
+    check("heard: a ping with no text after the hello still counts as Slack heard from, and the "
+          "heartbeat says when",
+          (job.last_heard, json.load(open(os.path.join(cfg["state_dir"], HEARTBEAT_FILE)))[
+              "last_heard_at"]), (NOW + 100, iso(NOW + 100)))
+    cfg, slack, tracker, tcfg, ob = world()
+    still = FakeWS([text({"type": "hello"}), lambda: tick.__setitem__(0, NOW + 500), None])
+    job = job_for(cfg, slack, tracker, tcfg, FakeTurn(), clock=lambda: tick[0])
+    tick[0] = NOW
+    job.read(still)
+    check("heard: a socket with no frame count is heard from by its text alone, as before",
+          job.last_heard, NOW)
+
+    # -- the probe (KIT-561): one connection, hello or why not, in fixed words
+    class ProbeSock(object):
+        def __init__(self, *frames):
+            self.frames_, self.closed = list(frames), False
+
+        def recv(self, timeout=None):
+            if not self.frames_:
+                return None
+            f = self.frames_.pop(0)
+            if isinstance(f, Exception):
+                raise f
+            return f
+
+        def close(self):
+            self.closed = True
+    ticks = iter([0.0, 0.5, 1.0, 1.5] + [20.0] * 10)
+    ps = ProbeSock(None, ("text", json.dumps({"type": "hello"})))
+    ok_p, line_p = probe(PushSlack(NOW), "xapp-SECRETAPPTOKEN", connect=lambda u: ps,
+                         clock=lambda: next(ticks))
+    check("probe: hello on the connection is a pass, said with how long it took, and the socket closes",
+          (ok_p, line_p, ps.closed), (True, "Slack said hello after 1.5 seconds", True))
+    for name, sock_, connect_, want in (
+            ("no hello", ProbeSock(None), None, "Slack did not say hello within 10 seconds"),
+            ("closed", ProbeSock(("close", (1001, "bye"))), None,
+             "Slack closed the connection straight away"),
+            ("broke", ProbeSock(ws.WSError("the connection broke")), None,
+             "the connection ended: the connection broke"),
+            ("refused", None, ws.WSError("could not reach wss-primary.slack.com"),
+             "could not open the connection: could not reach wss-primary.slack.com")):
+        def cn(url, s_=sock_, e_=connect_):
+            if e_:
+                raise e_
+            return s_
+        t0 = iter([0.0, 5.0, 11.0] + [99.0] * 10)
+        ok_p, line_p = probe(PushSlack(NOW), "xapp-SECRETAPPTOKEN", connect=cn,
+                             clock=lambda: next(t0))
+        check("probe: %s is a fail, in fixed words with no token or address" % name,
+              (ok_p, line_p, "SECRET" in line_p), (False, want, False))
+
+    conf_probe = os.path.join(ROOTDIR, "probe.json")
+    json.dump(dict(bridge.EXAMPLE_CONFIG, channel_ids=[CHAN], owner_user_id=OWNER, bot_user_id=ME,
+                   state_dir=os.path.join(ROOTDIR, "probe"), push_mode=True, tech_lead_turn=True,
+                   turn_bin="/opt/bin/claude", turn_tools_config="/etc/tl.json"),
+              open(conf_probe, "w"))
+    saved_env = dict(os.environ)
+    for name_ in ("BRIDGE_SLACK_BOT_TOKEN", "BRIDGE_PUSH_APP_TOKEN"):
+        os.environ.pop(name_, None)
+    out_p, real_out = io.StringIO(), sys.stdout
+    sys.stdout = out_p
+    try:
+        code_p = main(["probe", "--config", conf_probe])
+        code_u = main(["probe"])
+    finally:
+        sys.stdout = real_out
+        os.environ.clear()
+        os.environ.update(saved_env)
+    check("probe: with no token in the environment it says it could not start and names no value; bad "
+          "arguments are a usage error",
+          (code_p != EXIT_OK, out_p.getvalue().startswith("push probe: could not start:"), code_u),
+          (True, True, EXIT_USAGE))
+
     # an ack comes before the handler ever runs
     cfg, slack, tracker, tcfg, ob = world()
     order = []
@@ -1090,7 +1281,7 @@ def selftest_body():
           "remembers the thread as the conversation",
           ([(c, t, x) for c, t, x in slack.posts if x == "Caught up."], sorted(st["turn_threads"]),
            sorted(st["turn_sessions"])), ([(DM, top, "Caught up.")], ["%s:%s" % (DM, top)],
-                                          ["%s:%s" % (DM, top)]))
+                                          [DM]))
     reply = slack.add(ALICE, "and the plan?", thread=top, channel=DM, at=NOW - 20)
     turn = FakeTurn({"text": "Same thread.", "session_id": SID, "resumed": True})
     pass_run(cfg, slack, tracker, turn)
@@ -1122,6 +1313,8 @@ def selftest_body():
     # -- 9. the config: off by default, the job refuses to run off, keys are checked ----------------------------------------
     check("config: push_mode is off by default and the token name has a default",
           (cfg0["push_mode"], cfg0["push_token_env"]), (False, "BRIDGE_PUSH_APP_TOKEN"))
+    check("config: stream_answers is off by default, and valid with the push job and the turn on",
+          (cfg0["stream_answers"], world(stream_answers=True)[0]["stream_answers"]), (False, True))
     refused = io.StringIO()
     real_err, sys.stderr = sys.stderr, refused
     try:
@@ -1138,7 +1331,10 @@ def selftest_body():
     for bad, want in ((dict(push_mode="yes"), "config 'push_mode' must be true or false"),
                       (dict(push_token_env="lower"), "config 'push_token_env' must be an ENV VAR NAME"),
                       (dict(push_token_env="BRIDGE_SLACK_BOT_TOKEN"), "may not be the bot token's"),
-                      (dict(push_mode=True, ask_tech_lead=True), "needs 'tech_lead_turn' on")):
+                      (dict(push_mode=True, tech_lead_turn=False), "needs 'tech_lead_turn' on"),
+                      # KIT-565: one key, off by default, and only with the push job
+                      (dict(stream_answers="yes"), "config 'stream_answers' must be true or false"),
+                      (dict(stream_answers=True), "needs 'push_mode' on")):
         try:
             bridge.validate_config(dict(bridge.EXAMPLE_CONFIG, channel_ids=[CHAN],
                                         owner_user_id=OWNER, bot_user_id=ME,
@@ -1210,6 +1406,183 @@ def selftest_body():
           ([{"envelope_id": "EL"}], ["Over the wire."], False))
     check("loopback: nothing of the connection's ticket is in what was said",
           [l for l in job.lines if "SECRETTICKET" in l], [])
+
+    # -- 12. THE STREAM (KIT-565): the answer is shown as it is written, with nothing raw in it ------------
+    import pipeline_bridge_tech_lead as tl_module
+
+    def chunks(text, n=9):
+        return [text[i:i + n] for i in range(0, len(text), n)]
+
+    def beat_of(cfg_):
+        return json.load(open(os.path.join(cfg_["state_dir"], HEARTBEAT_FILE)))
+
+    def in_thread(slack_):
+        return [(m["ts"], m["text"]) for m in slack_.messages
+                if m.get("user") == bridge.ME and m["ts"] not in slack_.deleted]
+
+    def run_one(over, answer, ts="1760000100.000100", **world_kw):
+        cfg_, slack_, tracker_, tcfg_, _ob = world(**dict(world_kw, **over))
+        turn_ = FakeTurn(answer)
+        job_ = job_for(cfg_, slack_, tracker_, tcfg_, turn_)
+        made_ = []
+        inner = job_.pass_factory
+
+        def collecting(recorder, state):
+            made_.append(inner(recorder, state))
+            return made_[-1]
+        job_.pass_factory = collecting
+        job_.handle(event(ts))
+        job_.beat(force=True)
+        return cfg_, slack_, turn_, made_, job_
+
+    KEY = "sk-ant-api03-" + "Ab1" * 20
+    TEXT = ("PROD-6 is ready.\nType approve PROD-6 to start it.\n\nIt waits on evil.example.com "
+            "and PROD-5.\n  - indented stays")
+    cfg0s = world(stream_answers=True)[0]
+    hosts_s = cfg0s["tech_lead_link_hosts"]
+    WORDS, MADE, REMOVED = bridge.tech_lead_words(TEXT, hosts_s)
+
+    cfg_s, slack_s, turn_s, made_s, job_s = run_one(
+        {"stream_answers": True}, {"text": TEXT, "session_id": SID, "stream": chunks(TEXT)})
+    names = [c[0] for c in slack_s.calls]
+    start_call = slack_s.calls[names.index("startStream")]
+    check("stream: the answer streams in the thread under the message, for the member, and no "
+          "separate answer is posted",
+          (turn_s.calls[0]["streamed"], names[0], names.count("startStream"),
+           names.count("stopStream"),
+           [c[3] for c in slack_s.calls if c[0] == "post" and not c[3].startswith("Some links")],
+           start_call[1:3], start_call[4:5]),
+          (True, "status", 1, 1, [], (DM, "1760000100.000100"), (ALICE,)))
+    check("stream: the stream is stopped and the message updated to the words, always, last",
+          [c[0] for c in slack_s.calls if c[0] in ("startStream", "stopStream", "update")],
+          ["startStream", "stopStream", "update"])
+    check("stream: the message Slack holds at the end is exactly the words the whole-answer path "
+          "posts, with the line that tells him what to type left out and the link made plain",
+          ([t for _ts, t in in_thread(slack_s) if t == WORDS], "approve" in WORDS,
+           "evil[.]example[.]com" in WORDS),
+          ([WORDS], False, True))
+    check("stream: a left-out line is counted and leaves no note; the plain-links line is still said",
+          (made_s[0].counts.get("lines_left_out"), REMOVED, MADE > 0,
+           [t for _ts, t in in_thread(slack_s) if t.startswith("Some links")] != [],
+           [t for _ts, t in in_thread(slack_s) if "type" in t.lower() and "approve" in t.lower()]),
+          (1, 1, True, True, []))
+    final_msg = [m for m in slack_s.messages if m["text"] == WORDS][0]
+    check("stream: the streamed message is recorded as posted, and the answer counted",
+          ("%s:%s" % (DM, final_msg["ts"]) in json.load(open(bridge.state_path(cfg_s)))["posted"],
+           made_s[0].counts.get("streamed"), made_s[0].counts.get("stream_refused")),
+          (True, 1, None))
+    relayed_s = json.load(open(bridge.state_path(cfg_s)))["relayed_posts"]
+    check("stream: the streamed message is recorded as the tech lead's own words, with the "
+          "tickets they name, and it is the only record (KIT-492)",
+          (sorted(relayed_s), relayed_s.get("%s:%s" % (DM, final_msg["ts"]), {}).get("ids")),
+          (["%s:%s" % (DM, final_msg["ts"])], ["PROD-5", "PROD-6"]))
+    check("stream: the heartbeat counts it and says nothing was refused",
+          beat_of(cfg_s)["stream"], {"streamed": 1, "refused": 0, "last_refusal": None})
+
+    # off by default: with the key off the answer goes out whole and the heartbeat has no stream
+    cfg_o, slack_o, turn_o, made_o, job_o = run_one({}, {"text": TEXT, "session_id": SID,
+                                                          "stream": chunks(TEXT)})
+    check("stream-off: the turn is given no callback, the answer is one post, and the heartbeat "
+          "says nothing of a stream",
+          (turn_o.calls[0]["streamed"], [c[0] for c in slack_o.calls],
+           [c[3] for c in slack_o.calls if c[0] == "post"][0] == WORDS, "stream" in beat_of(cfg_o)),
+          (False, ["status", "post", "post", "status"], True, False))
+    check("stream-off: the whole post is recorded with the same tickets as the streamed message",
+          [v["ids"] for v in json.load(open(bridge.state_path(cfg_o)))["relayed_posts"].values()],
+          [["PROD-5", "PROD-6"]])
+
+    # a secret: the stream stops, the message is replaced by the held-back line, nothing stays
+    SECRET = "Fine so far.\nThe key is %s ok.\nNever sent line." % KEY
+    cfg_k, slack_k, turn_k, made_k, job_k = run_one(
+        {"stream_answers": True}, {"text": SECRET, "session_id": SID, "stream": chunks(SECRET, 5)})
+    every = json.dumps([slack_k.calls, [m["text"] for m in slack_k.messages]])
+    check("stream-secret: the line is never sent to Slack, in any call or message",
+          (KEY in every, "Never sent" in every), (False, False))
+    check("stream-secret: the message is replaced with the bridge's own held-back line, and "
+          "nothing else is posted for it",
+          ([t for _ts, t in in_thread(slack_k)], [c[0] for c in slack_k.calls
+                                                  if c[0] in ("update", "post", "delete")]),
+          ([tl_module.TL_WITHHELD_BIND], ["update"]))
+    check("stream-secret: the held-back line is never recorded as the tech lead's words",
+          json.load(open(bridge.state_path(cfg_k)))["relayed_posts"], {})
+
+    # Slack refuses the stream: the answer goes out whole, and the heartbeat says why
+    cfg_r, slack_r, tracker_r, tcfg_r, _o = world(stream_answers=True)
+    slack_r.stream_fail = ("startStream",)
+    turn_r = FakeTurn({"text": TEXT, "session_id": SID, "stream": chunks(TEXT)})
+    job_r = job_for(cfg_r, slack_r, tracker_r, tcfg_r, turn_r)
+    job_r.handle(event("1760000101.000100"))
+    job_r.beat(force=True)
+    check("stream-refused: the answer goes out whole, as a post, exactly as with the stream off",
+          ([c[3] for c in slack_r.calls if c[0] == "post"][0] == WORDS,
+           [c[0] for c in slack_r.calls].count("startStream")), (True, 1))
+    check("stream-refused: the heartbeat says why, in Slack's own word",
+          beat_of(cfg_r)["stream"],
+          {"streamed": 0, "refused": 1,
+           "last_refusal": "Slack chat.startStream refused: stream_not_supported"})
+
+    # Slack refuses to make the message exact: it is removed and the answer posted whole
+    LONG = "\n".join("line %d of an answer that runs a good deal long" % i for i in range(120))
+    cfg_u, slack_u, tracker_u, tcfg_u, _o = world(stream_answers=True)
+    slack_u.stream_fail = ("update",)
+    turn_u = FakeTurn({"text": LONG, "session_id": SID, "stream": chunks(LONG, 40)})
+    job_u = job_for(cfg_u, slack_u, tracker_u, tcfg_u, turn_u)
+    job_u.handle(event("1760000102.000100"))
+    long_words = bridge.tech_lead_words(LONG, hosts_s)[0]
+    check("stream-refused: an update Slack refuses removes the streamed message and posts the "
+          "whole answer once",
+          ([t for _ts, t in in_thread(slack_u) if t.endswith("(cut)")] == [long_words],
+           len([t for _ts, t in in_thread(slack_u) if t.startswith("line 0 of")]),
+           len(slack_u.deleted)), (True, 1, 1))
+    check("stream-refused: the record names the whole post, never the removed stream",
+          sorted(json.load(open(bridge.state_path(cfg_u)))["relayed_posts"]),
+          ["%s:%s" % (DM, ts_) for ts_, t in in_thread(slack_u) if t == long_words])
+
+    # a turn that fails after it began to write: what was streamed is removed
+    cfg_f, slack_f, tracker_f, tcfg_f, _o = world(stream_answers=True)
+    turn_f = FakeTurn({"text": None, "why": "the turn took longer than 90 seconds",
+                       "stream": ["Half an ans", "wer so far\nand more\n"]})
+    job_f = job_for(cfg_f, slack_f, tracker_f, tcfg_f, turn_f)
+    job_f.handle(event("1760000103.000100"))
+    check("stream-failed: the half-written answer is removed, and the one fixed line is said",
+          (in_thread(slack_f)[-1][1].startswith(bridge.FORWARD_NO_ANSWER_SAYS), len(slack_f.deleted),
+           "Half" in json.dumps([t for _ts, t in in_thread(slack_f)])), (True, 1, False))
+
+    # a fault after the stream began, before it ended: the half-written message is removed
+    saved_outbox = bridge.Pass.read_outbox
+
+    def broken_outbox(self):
+        raise ValueError("a fault after the turn")
+    bridge.Pass.read_outbox = broken_outbox
+    try:
+        cfg_x, slack_x, turn_x, made_x, job_x = run_one(
+            {"stream_answers": True}, {"text": TEXT, "session_id": SID, "stream": chunks(TEXT)},
+            ts="1760000104.000100")
+    finally:
+        bridge.Pass.read_outbox = saved_outbox
+    check("stream-fault: a fault between the turn and the ending removes the half-written message",
+          (len(slack_x.deleted), [t for _ts, t in in_thread(slack_x) if "PROD-6 is ready" in t]),
+          (1, []))
+
+    # THE MUTANTS on the wiring: each is seen to differ from the real run.
+    def broken(attr, value):
+        saved = getattr(bridge.Pass, attr)
+        setattr(bridge.Pass, attr, value)
+        try:
+            return run_one({"stream_answers": True},
+                           {"text": SECRET, "session_id": SID, "stream": chunks(SECRET, 5)},
+                           ts="1760000110.000100")
+        finally:
+            setattr(bridge.Pass, attr, saved)
+    _c, slack_m, _t, _m, _j = broken("stream_judge", lambda self, raw: ("", raw))
+    check("mutant: a judge that lets a line through raw puts the key in Slack, and is caught",
+          KEY in json.dumps(slack_m.calls), True)
+    _c, slack_m, _t, made_m, _j = broken("open_stream", lambda self, channel, msg: None)
+    check("mutant: a pass that never opens the stream is caught",
+          (made_m[0].counts.get("streamed"), [c[0] for c in slack_m.calls].count("startStream")),
+          (None, 0))
+    check("mutant: the real run streams (so the two above differ from it)",
+          [c[0] for c in slack_s.calls].count("startStream"), 1)
 
     if failures:
         print("FAIL: pipeline_bridge_push selftest (%d of %d cases failed)" % (len(failures),

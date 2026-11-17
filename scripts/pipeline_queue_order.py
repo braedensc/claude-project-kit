@@ -109,6 +109,7 @@ DEFAULTS = {
     "handoff_states": ["Needs Approval"],    # where a ticket's pull request waits for a merge
     "pace_to_reset": False,              # true: each day is paced to the plan's weekly reset
     "weekly_budget_usd": None,           # the week's budget in dollars at API prices, for pacing
+    "sprint_planned": [],                # tickets in the owner's recorded sprint plan (KIT-575): they go first
 }
 
 
@@ -192,6 +193,7 @@ def config(raw):
     need("handoff_states", names(cfg["handoff_states"]) and cfg["handoff_states"],
          "must list state names")
     need("pace_to_reset", isinstance(cfg["pace_to_reset"], bool), "must be true or false")
+    need("sprint_planned", names(cfg["sprint_planned"], TICKET_RE), "must list ticket ids")
     need("weekly_budget_usd", cfg["weekly_budget_usd"] is None or (
         amount(cfg["weekly_budget_usd"]) and cfg["weekly_budget_usd"] > 0),
         "must be a number above 0, or null")
@@ -324,9 +326,12 @@ def effective_priority(p):
     return p["priority"] or p["plan_priority"]
 
 
-def sort_key(p, dep):
+def sort_key(p, dep, planned=()):
+    """A piece in the owner's recorded sprint plan goes before one that is not (KIT-575). It admits nothing:
+    only pieces already admitted are sorted at all. With no plan the order is what it was."""
     rank = effective_priority(p)
-    return (rank if rank else len(PRIORITIES) + 1,
+    return (0 if p["ticket"] in planned else 1,
+            rank if rank else len(PRIORITIES) + 1,
             p["at_epoch"] if p["at_epoch"] is not None else math.inf,
             ticket_number(p["plan"] or p["ticket"]), p["plan"] or p["ticket"],
             dep.get(p["ticket"], 0))
@@ -550,7 +555,8 @@ def order(cfg, now, pieces, running, usage, ledger):
         if dig(usage, "week", "known") is False:
             notes.append("week-unknown")
     dep, by = dependency_index(ps), dict((p["ticket"], p) for p in ps)
-    queue = sorted((p for p in ps if p["admitted"] or p["reply"]), key=lambda p: sort_key(p, dep))
+    planned = frozenset(cfg["sprint_planned"])
+    queue = sorted((p for p in ps if p["admitted"] or p["reply"]), key=lambda p: sort_key(p, dep, planned))
     # The estimate of what runs now counts toward the day: a session's cost is not in the usage
     # file until it ends. One that names no effort counts at the largest.
     worst = max(cfg["estimates"].values())
@@ -1123,6 +1129,23 @@ def _cases(check):
                        ("a switch that is not true or false", dict(pace_to_reset=1))):
         check("a bad pacing config is refused: %s" % name, bool(config(over)[1]), True)
     check("a pacing config that is sound is accepted", config(pc_on)[1], [])
+    # KIT-575: the owner's recorded sprint plan puts a piece first. It admits nothing, and with no plan nothing moves.
+    sp = [piece(1, prio=1), piece(2, prio=2), piece(3, prio=4), piece(4, admitted=False)]
+    sp_cfg = dict(running_cap=9, starts_cap=9, lanes_per_repo=3, planned_load=90, day_stop=100, piece_stop=50)
+    plain = order(sp_cfg, NOW, sp, [], usage(), ledger())
+    planned = order(dict(sp_cfg, sprint_planned=["ENG-3"]), NOW, sp, [], usage(), ledger())
+    check("with no plan the order is by priority, as it was",
+          ([s["ticket"] for s in plain["start"]], DEFAULTS["sprint_planned"]), (["ENG-1", "ENG-2", "ENG-3"], []))
+    check("a planned piece starts before a higher priority one that is not planned",
+          [s["ticket"] for s in planned["start"]], ["ENG-3", "ENG-1", "ENG-2"])
+    only_held = order(dict(sp_cfg, sprint_planned=["ENG-4", "ENG-99"]), NOW, sp, [], usage(), ledger())
+    check("a plan that names a piece the pool did not admit, or one that does not exist, starts nothing extra",
+          ([s["ticket"] for s in only_held["start"]], "ENG-4" in [s["ticket"] for s in only_held["start"]]),
+          (["ENG-1", "ENG-2", "ENG-3"], False))
+    for label, bad in (("a ticket id that is not one", ["not-a-ticket"]), ("a string, not a list", "ENG-3"),
+                       ("a number", [3])):
+        check("a bad sprint_planned is refused: %s" % label, bool(config(dict(sprint_planned=bad))[1]), True)
+    check("a sound sprint_planned is accepted", config(dict(sprint_planned=["ENG-3"]))[1], [])
     check("a config that is not an object is refused", config("x"),
           (None, ["the config is not an object"]))
     try:

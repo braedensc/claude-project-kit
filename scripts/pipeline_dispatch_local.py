@@ -268,9 +268,10 @@ def refuse_if_agent():
     # fully UNSETS them is indistinguishable from a person's terminal to
     # anything reading `os.environ`. What closes is the cheaper of the two
     # tampers; the remaining one leaves a command in the transcript that says
-    # what it was for, which is the whole of "tamper-evident". The durable
-    # boundaries are elsewhere and are the ones to rely on: the self-protected
-    # PreToolUse hook (a deny rule a human adds), the role account's own file
+    # what it was for, which is the whole of "tamper-evident". The PreToolUse
+    # hook now refuses that command too (KIT-107), but it reads command text and
+    # is advisory like every Bash pattern guard. The durable boundaries are
+    # elsewhere and are the ones to rely on: the role account's own file
     # permissions, and the sandbox.
     present = [k for k in AGENT_ENV_MARKERS if k in os.environ]
     if not present:

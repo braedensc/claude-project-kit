@@ -53,9 +53,13 @@ One pass every few minutes, as the role account:
 | `daemon-health-recovered` | the heartbeat monitor | every watched job is checking in again; nothing more is needed | none |
 | `ready-to-merge` | the bounce driver | the review found nothing worth sending back, so the pull request is yours to merge, with its link, how many small notes the review left, and whether the `hooks-change` label is still owed | none |
 | `finding-filed` | the finding job | a dev's follow-up was filed in the backlog; nothing is needed unless you want it done | none |
+| `acceptance-finding-filed` | the finding job, for a follow-up the acceptance check asked for (KIT-607) | the acceptance check's follow-up was filed in the backlog; nothing is needed unless you want it done | none |
 | `fix-not-pushed` | the bounce driver, six hours after a fix was asked for and nothing was pushed (KIT-336) | a fix was asked for and nothing has been pushed since; the dev may have stopped | none: the driver adds `agent:needs-human` itself |
 | `review-declined` | the review poller's own records, never a comment (KIT-336) | the review couldn't run, why, from a fixed list, and that a person needs to read the change | none |
 | `review-partial` | the review poller's own records, never a comment (KIT-336) | the review left files unread, and how many a person needs to read | none |
+| `acceptance-passed` | the acceptance poller's ledger, never a comment (KIT-555) | a plan's acceptance check passed; how many follow-ups it filed; its screenshots | none |
+| `acceptance-held` | the acceptance poller's ledger, never a comment (KIT-555) | a problem, or a run that failed in the browser, holds the plan open; how many of each; its screenshots | none |
+| `acceptance-could-not-check` | the acceptance poller's ledger, never a comment (KIT-555) | the check could not check, why from a fixed list, and that this is not a pass | none |
 
 A ping reads like this:
 
@@ -176,6 +180,9 @@ It pings once per finding ticket, even if the job wrote the mark twice
 - **A review whose pull request moved on first.** A push before that review of the
   withheld files means it never comes. The ping goes at once and says the files won't be
   reviewed automatically. The two-hour ping above then never follows. (KIT-455)
+- **A review its parts ceiling stopped.** The poller files at most `max_review_parts`
+  review parts for one pull request at one head. When it reaches that ceiling, no more
+  parts come, so the files-unread ping goes at once instead of after two hours. (KIT-613)
 
 The three review pages are read from the review poller's own records, in `REVIEW_STATE_DIR`
 (Stage E's state directory by default). A session can write a comment, so a review mark in
@@ -202,6 +209,51 @@ that ticket's comments. If the pass did not read that ticket, or can't tell, not
 and the pass says so (exit 3). Each pings once, from entries under two days old.
 `STATUS_FILE=off` turns all three off, and every pass then says `status file: OFF`. A file
 that isn't there, or can't be read, is named and declines the pass (exit 3).
+
+**The acceptance check's page (KIT-555).** After a plan's acceptance check, its result pages
+you. It is read from the acceptance poller's own ledger, never from a comment, which a session
+can write. One page per check: a check you ask to run again at the same head (`check <plan>`)
+pages again. Three marks, one per verdict:
+
+- **Passed.** Nothing the check found holds the plan open. The page says how many follow-ups
+  went to the backlog. Nothing is needed from you for the check.
+- **Held.** A problem still serious after the second look, or a run that failed in the
+  browser, holds the plan open. The page says how many of each. The plan stays open until a new
+  push passes.
+- **Could not check.** The page says why, from a fixed list, and says this is not a pass. A
+  person needs to look.
+
+```text
+The acceptance check held this plan open: one problem is still serious after a second look. It sent one follow-up to the backlog. The plan stays open until a new push passes the check. The plan's ticket lists what holds it. 2 screenshots follow in the thread.
+Ticket: TOD-700
+https://linear.app/example-org/issue/TOD-700
+```
+
+**It never carries the session's words.** The poller records counts, flags and one closed
+word for why. The notifier puts them into its own words. With the writer on, the writer words
+them from those facts alone. A could-not-check page must keep "could not check" and "not a
+pass". No page may name another verdict. A passed page never says "held" or "could not check".
+A held page never says "passed" or "could not check". A could-not-check page never says
+"passed" or "held". Any other words, or a writer that fails, and the fixed text goes out.
+
+**Screenshots.** Up to four, chosen by the poller from what the look tool kept: the one a
+surviving problem names first, then a failed run's, then one per screen size and mode. The page
+goes first, then they go into its thread. They need `LOOK_RECORD_DIR` and `PAGE_IMAGES=yes`
+(card `CK-N6` adds `files:write`). Without them the page still goes, and says so. A screenshot
+that cannot be read or sent is said in the thread and in the pass summary, and never stops the
+page.
+
+**A verdict whose comment was not confirmed still pages.** The poller records the verdict,
+then posts it on the plan's epic. If that post failed, or the poller stopped mid-way for more
+than 15 minutes, the page goes anyway and says the verdict may not be on the plan's ticket.
+
+`ACCEPTANCE_LEDGER=off` turns the page off, and every pass then says `acceptance pages: OFF`.
+Until the poller's first check there is no ledger, and every pass says `no ledger yet`. A ledger
+that cannot be read, or a verdict out of its shape, is named and declines the pass (exit 3).
+
+Good: `acceptance pages: ON, read from …/acceptance-ledger.json, with screenshots from …/look-records`.
+Not: a could-not-check page that reads like a pass. The notifier refuses any wording that says
+"passed" or "held" there.
 
 **Turning the reply relay on (KIT-177).** The relay lets you answer a stopped dev from the
 channel: your threaded reply under its `agent:blocked` ping becomes one comment in that dev's own
@@ -247,8 +299,9 @@ finished ticket is not named again. If the count surprises you, stop and decide 
 `notifier.conf` to a comma list of Slack member ids. To find one, open the person's profile
 in Slack, then `⋮`, then **Copy member ID**. Every ping that asks something of you then opens
 with an @mention of each of them, so Slack alerts them as it does for any mention of them.
-That is every mark above except `daemon-health-recovered` and `finding-filed`. The mark
-decides, never who wrote it: one tracker key writes several jobs' marks.
+That is every mark above except `daemon-health-recovered`, `finding-filed`,
+`acceptance-finding-filed` and `acceptance-passed`. The mark decides, never who wrote it: one tracker key writes several jobs'
+marks.
 
 Empty, the default, mentions nobody, and the notifier's config stays exactly as it was.
 Whether a ping with no mention reaches your phone is up to your Slack settings for the
@@ -256,11 +309,12 @@ channel.
 
 - Name people only, each a member of the private channel. A bot named here could be woken by
   every ping.
-- Set `CHAT_BOT_USER_IDS` to the tech lead's chat bot's member ID, the same value as
-  `CHAT_BOT_USER_ID` in `bridge.conf` (KIT-283). The installer then refuses a mention list
-  or a `DM_USER_IDS` that names it: every ping that needs you would reach the tech lead, and
-  each wake is a paid model turn. Left empty, the `handover` row says each list that is set
-  is not proven free of it.
+- Set `CHAT_BOT_USER_IDS` to the dispatcher's chat bot's member ID while its chat lane is on
+  (KIT-283). The installer then refuses a mention list or a `DM_USER_IDS` that names it: every
+  ping that needs you would reach that bot, and each wake is a paid model turn. Left empty,
+  the `handover` row says each list that is set is not proven free of it. Since the cutover
+  (KIT-492) the tech lead answers in the bridge's DM and that lane stays off, so no chat bot
+  is there to wake.
 - The installer checks each id's shape. It never asks Slack whose id it is.
 - A mention makes a forged mark louder too. The `agent:*` marks and `needs-human-session` are
   accepted from any author, so a session that writes many of them buzzes your phone for each, up to
@@ -454,9 +508,8 @@ none.
 
 **On, a page carries up to four.** Set `PAGE_IMAGES=yes` in `notifier.conf`. The page goes
 first, as text. Then its screenshots go into its thread, by Slack's external upload: an upload
-address for each, the bytes sent there, and one share into the thread. Today only the
-acceptance check's page has screenshots, and that page is still to come (KIT-555). Until it
-lands, `PAGE_IMAGES=yes` changes nothing you can see: no page sends screenshots yet.
+address for each, the bytes sent there, and one share into the thread. Only the acceptance
+check's page has screenshots (KIT-555), read from `LOOK_RECORD_DIR`.
 
 **It needs `files:write`.** The app that posts the pages needs it: the Slack bridge's app in DM
 mode, or the notifier's own. Adding a scope is yours to do. The installer's `credentials` row
@@ -652,7 +705,7 @@ Printed only when you ask. No step stops on it and nothing is signed on it. Its 
 come filled in from your `notifier.conf`:
 
 - **The heartbeat and the log's last lines,** read as the role account:
-  `sudo -u <role-account> -H /bin/sh -c 'cd / && cat "$HOME/.stage-e/state/notifier-heartbeat.json"; tail -20 "$HOME/.stage-e/notifier.log"'`
+  `sudo -u <role-account> -H /bin/sh -c 'cd / && cat "$HOME/.stage-e/state/notifier-heartbeat.json"; echo; tail -20 "$HOME/.stage-e/notifier.log"'`
 - **`verify`**, and **`sudo launchctl print system/<JOB_LABEL>`**.
 - **Whether the clone runs this checkout's notifier:** the same comparison preflight makes,
   one `shasum` line per file, each `OK` or `FAILED`. It hashes the installer's own

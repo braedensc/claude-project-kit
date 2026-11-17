@@ -1,5 +1,13 @@
 # Chat lane — operator steps
 
+> **Since the cutover (KIT-492), keep this lane off.** You talk to the tech lead in one chat:
+> your DM with the bridge, where its own turn answers (`docs/BRIDGE-OPERATOR.md`, "The tech
+> lead's own turn"). The dispatcher keeps dev sessions only. A lane that is on today goes off
+> with card CK-C6 ("Turning it off", below). The fences, the grant and the port block stay,
+> as that card says, and `verify` still measures them. Piece 8, the chat bot's rules, is
+> gone: `verify`'s `chat-rules` row now checks that the old file is gone too. The rest of
+> this guide is how the lane was built, kept so `verify`'s rows can be read.
+
 The chat lane lets you mention the dispatcher's Slack bot in a private channel and get an
 answer. A session reads the tracker, the code and the web, then replies in the thread. It is
 the dispatcher's own built-in Slack transport, with its tool list cut down. **That session
@@ -23,7 +31,7 @@ private runbook.
 
 Every claim about the dispatcher cites its source at version 0.2.69 as `File.js:line`.
 Step 6's Slack app was read again at 0.2.73, and what this guide says about `groups:read`
-cites the 0.2.74 prerelease. *The tech lead's model*, and the model rows in the tables,
+cites the 0.2.74 prerelease. *The dispatcher's chat model*, and the model rows in the tables,
 cite 0.2.73.
 
 ---
@@ -63,24 +71,26 @@ $EDITOR chat-lane.conf                                      # none of them secre
 python3 scripts/pipeline_chat_lane_setup.py compose         # prints every piece
 ```
 
-The conf has nine values, and optional ones besides. Piece 8 reads `DISPATCHER_SERVICE`,
-`FRONT_DOOR_SERVICE`, `FRONT_DOOR_CONFIG`, `FRONT_DOOR_BIN`, `FRONT_DOOR_MATCHER`,
-`IDEA_TEAM_KEYS`, `HEALTH_STATUS_FILE`, `PIPELINE_STATUS_FILE` and `KIT_DOCS_DIR`, and piece 5 reads
-`SANDBOX_TRUST_FILES` (Step 4). One of the nine, `CHAT_RULES`, stays `off` until Step 14. Leave an optional one unset and every printed command that needs it
+The conf has seven values, and optional ones besides. The printed commands read
+`DISPATCHER_SERVICE`, `FRONT_DOOR_SERVICE`, `FRONT_DOOR_CONFIG`, `FRONT_DOOR_BIN` and
+`FRONT_DOOR_MATCHER`. Piece 5 reads `PIPELINE_STATUS_FILE`, `KIT_DOCS_DIR` and
+`SANDBOX_TRUST_FILES` (Step 4). Piece 8's five keys are retired (KIT-492): `CHAT_RULES`,
+`BRIDGE_DM_QUESTIONS`, `BRIDGE_WAKES`, `IDEA_TEAM_KEYS` and `HEALTH_STATUS_FILE`. A conf that
+still has them loads, and `compose` and `verify` name the lines to take out. Leave an optional
+one unset and every printed command that needs it
 says `not composed: set <KEY> in chat-lane.conf`, and a subcommand that needs it refuses.
 Nothing is guessed. A conf with a problem (an unknown key, say) composes nothing: `card`
 lists the problems first, prints the card without its commands, and exits 2.
 
 | Command | What it does |
 |---|---|
-| `compose` | Prints all eight pieces and the order to apply them. Reads no live file, needs no access to the role account, changes nothing. Exit 0, or 2 on a conf error. |
+| `compose` | Prints all seven pieces and the order to apply them. Reads no live file, needs no access to the role account, changes nothing. Exit 0, or 2 on a conf error. |
 | `compose --piece N` | Prints one piece alone. `--piece 4` prints only the port-block script, so you can save it to a file. |
 | `verify` | Reads the dispatcher's config, its env file, the role account's user settings, any trust file (Step 4: a yes or no for a private key, never its bytes), the front door's config, the newest chat session's start-up tool list and the last few chat turns' logs **as the role account**, and asks pf **as root** which rules it holds. One outcome per check. Prints names, tool lists, allowlist paths, model names and costs, never a secret or a message. Changes nothing. Refuses to run under a model. |
-| `merge` | Pieces 1, 2 and 5, and the tech lead's model pair when `chat-lane.conf` sets `CHAT_MODEL`. Prints what it would change in the dispatcher's config and the role account's user settings, and changes nothing. `merge --apply` writes it, as the role account. |
+| `merge` | Pieces 1, 2 and 5, and the dispatcher's model pair when `chat-lane.conf` sets `CHAT_MODEL`. Prints what it would change in the dispatcher's config and the role account's user settings, and changes nothing. `merge --apply` writes it, as the role account. |
 | `env-names` | Piece 3. Once the fence and the port block measure as applied, asks for the chat app's two secrets at hidden prompts and writes the four names into the dispatcher's env file. `env-names --remove` takes them out. |
 | `front-door` | Piece 7. Prints the front door's allowlist line and what it would add. `front-door --apply` writes it; `--remove` takes the path off. |
-| `chat-rules` | Piece 8, once `CHAT_RULES=on` (Step 14). Says what it would write and changes nothing. `chat-rules --apply` writes the chat bot's rules, as the role account. While `CHAT_RULES=off` it refuses. |
-| `card CK-C1` | Prints a checkpoint card: `CK-C1` create the chat app, `CK-C2` the front door, `CK-C3` the live check, `CK-C4` the port, from a second device, `CK-C5` restart the dispatcher only when it is idle, `CK-C6` turn the lane off, `CK-C7` give the chat app `groups:read` before a dispatcher upgrade past 0.2.73, `CK-C8` move the tech lead to another model. |
+| `card CK-C1` | Prints a checkpoint card: `CK-C1` create the chat app, `CK-C2` the front door, `CK-C3` the live check, `CK-C4` the port, from a second device, `CK-C5` restart the dispatcher only when it is idle, `CK-C6` turn the lane off, `CK-C7` give the chat app `groups:read` before a dispatcher upgrade past 0.2.73, `CK-C8` move the dispatcher's chat model (the tech lead's own is `TURN_MODEL` in `bridge.conf`). |
 
 Every command exits like the Stage E installer's. Read the exit code, not the word on the
 line: a `REFUSED:` line can end in 10, 2 or 3.
@@ -89,7 +99,7 @@ line: a `REFUSED:` line can end in 10, 2 or 3.
 |---|---|
 | **0** | Done, or nothing left to do. |
 | **10** | Something is not applied yet, or a step must come first. A writer's dry run that found work. `env-names` before the fence or the port block, or with no terminal. A file a writer will not touch: missing, a symbolic link, or owned by another account. A front-door file without exactly one allowlist line, a line that reaches the dispatcher's control routes, or a removal that would empty it. |
-| **2** | Nothing was attempted: a conf error, a conf key the command needs is unset, `chat-rules` while `CHAT_RULES=off`, or a pasted secret has the wrong shape. |
+| **2** | Nothing was attempted: a conf error, a conf key the command needs is unset, or a pasted secret has the wrong shape. |
 | **4** | A check could not measure. `env-names` also exits 4 when it cannot read the file it compares the token with. Not a pass. |
 | **1** | Something is broken, or a write failed. |
 | **5** | No administrator password. |
@@ -132,8 +142,7 @@ the role account's env file. So do this soon after you pull:
    by hand in the absolute form, `Read(//Users/<role>/.stage-e/backups/**)`, stays; it is
    redundant and harmless.
 5. Run `front-door`. Good: `/slack-webhook is already on the line. Nothing to change.`
-6. Run `verify` again. Good: exit 0. The `chat-rules` row says the rules are off; Step 14
-   turns them on.
+6. Run `verify` again. Good: exit 0. The `chat-rules` row says the old rules are gone.
 
 ### Already on before the diff rules? (KIT-212)
 
@@ -826,8 +835,8 @@ python3 scripts/pipeline_chat_lane_setup.py verify
 | `user-settings` | the role account's settings file exists and carries every composed deny rule, the role account's env file, its backups folder and the six diff tools included |
 | `trust-files` | every `SANDBOX_TRUST_FILES` entry is in the user settings' `sandbox.filesystem.allowRead`. A missing one says what to run. **Fails** when any `allowRead` entry is a glob, a folder, ends with `/`, is not a path, is longer than 4096 characters or re-opens a file piece 5 denies (in any spelling the disk treats as the same name, with or without `/private`, or through a linked folder), or when a trust file is a symbolic link, a hard link, not a regular file, larger than 1 MiB, holds the text `PRIVATE KEY`, holds no PEM certificate, or holds a line shaped like a secret or a setting (a config that also holds a certificate). Lines say how many text lines a trust file holds beside its certificates, and when the role account could change it after the check. A trust file it cannot read says `UNKNOWN`. With the list empty it says `No trust files are allowed` |
 | `chat-tools` | the newest chat session's start-up tool list, read from its own log by tool name only, holds tracker tools and none of the six diff tools that write. It holds neither the session-feedback tool nor a timer (`ScheduleWakeup`, `CronCreate`, `RemoteTrigger`). A tracker tool the list does not name, whose name says it merges, approves or acts on a diff, is named too. With no chat session yet, or one given no tracker tools, it says `UNKNOWN`: ask the bot one question, then run it again |
-| `chat-model` | the model a chat turn starts on and its backup, from the dispatcher's config, differ. It then lists the last five chat turns, newest first: when, the model, what each cost and how it ended. **Fails** when the backup is the model itself, and when the chat runs since the last logged turn heard nothing from the model: either way, chat turns are failing before they start. Fails too when `chat-lane.conf` sets `CHAT_MODEL` and the pair the dispatcher takes, its older `defaultModel` keys included, is another: `merge --apply` has not written it. An env-file override and silent runs are named before that, since `merge` fixes neither. So is an equal pair, which fails every turn; with `CHAT_MODEL` set, `merge --apply` fixes that one. Says `UNKNOWN` when the dispatcher's env file sets a model override, whose value it does not read, or can't be read; and until a chat turn is seen running on the pair: none logged yet, or the newest one ran on another model, as a turn from before a change does. See *The tech lead's model* |
-| `chat-rules` | with `CHAT_RULES=off`, the default until Step 14, it says `chat rules: off` and does not fail `verify`. With `CHAT_RULES=on`, the chat bot's rules file (piece 8) is byte for byte what this checkout composes. Missing says what to run; changed is a **failure**: the kit changed the rules, or someone edited the file |
+| `chat-model` | the model a chat turn starts on and its backup, from the dispatcher's config, differ. It then lists the last five chat turns, newest first: when, the model, what each cost and how it ended. **Fails** when the backup is the model itself, and when the chat runs since the last logged turn heard nothing from the model: either way, chat turns are failing before they start. Fails too when `chat-lane.conf` sets `CHAT_MODEL` and the pair the dispatcher takes, its older `defaultModel` keys included, is another: `merge --apply` has not written it. An env-file override and silent runs are named before that, since `merge` fixes neither. So is an equal pair, which fails every turn; with `CHAT_MODEL` set, `merge --apply` fixes that one. Says `UNKNOWN` when the dispatcher's env file sets a model override, whose value it does not read, or can't be read; and until a chat turn is seen running on the pair: none logged yet, or the newest one ran on another model, as a turn from before a change does. See *The dispatcher's chat model* |
+| `chat-rules` | the chat bot's old rules file (piece 8, gone since KIT-492) is not there. A file left behind is not applied: the row prints the command that takes it out, as the role account. A file it could not check is `UNKNOWN` (Step 14) |
 | `front-door` | the one allowlist line carries `/slack-webhook` and the tracker's `/linear-webhook`, and nothing that reaches the dispatcher's control routes: a wildcard, or a path under `/api/update/` or `/mcp/`, fails the row. Any other path on it is named, not failed. With `FRONT_DOOR_CONFIG` or `FRONT_DOOR_MATCHER` unset it says `NOT MEASURED` and names the key, and `verify` exits 4 |
 
 Good: `No drift: every check measures as applied.` and exit 0.
@@ -879,175 +888,38 @@ Not that: a `Write` or a `touch` that ran. The grant did not load: restart the d
 Expected, and accepted: tools named `mcp__cyrus-tools__…` appear. The trim cannot remove
 that server.
 
-### Step 14 — The chat bot's rules (piece 8, KIT-226)
+### Step 14 — The chat bot's old rules are gone (KIT-492)
 
-Do this once the bridge runs (`docs/BRIDGE-OPERATOR.md`). The rules hand every request to it.
+Piece 8 wrote the chat bot's rules into `<dispatcher home>/slack-workspaces/CLAUDE.md`, where
+every chat session reads them (KIT-226). They went with the cutover, with the `chat-rules`
+command and their five conf keys. Nothing writes them now. While the file is there, a chat
+session would still read it, so `verify` checks it is gone.
 
-First set `CHAT_RULES=on` in `chat-lane.conf`. Until then, `verify`'s `chat-rules` row says
-the rules are off, and `chat-rules` refuses. `compose --piece 8` prints the rules, so you
-can read them first.
-
-```sh
-$EDITOR chat-lane.conf                                        # CHAT_RULES=on
-python3 scripts/pipeline_chat_lane_setup.py compose --piece 8   # read them
-python3 scripts/pipeline_chat_lane_setup.py chat-rules
-python3 scripts/pipeline_chat_lane_setup.py chat-rules --apply
-```
-
-**After a kit update, the one command does this for you (KIT-582).** `python3
-scripts/pipeline_install.py` runs `chat-rules` as a dry run when this Mac has a `chat-lane.conf`
-with `CHAT_RULES=on`. If the rules are what the checkout composes, it says so and carries on. If
-they differ, it asks before it runs `chat-rules --apply`. Say no and it stops, with the rules named
-as behind; the chat lane's `verify` fails until they are written. If the check could not run, it
-stops and does not call the rules up to date. With no `chat-lane.conf`, or `CHAT_RULES=off`, it
-names that and carries on. Use `--chat-lane-conf` for a file elsewhere.
-
-Good: *The tech lead's rules are written and read back: up to date.*
-Not: the one command ending green while `verify`'s `chat-rules` row still fails.
-
-**Why.** The dispatcher's own Slack prompt tells a chat session to create an issue and
-assign it to itself. It says that assignment "kicks off work". Here only your own hand-over
-starts work, so that starts nothing, and the bot would say it had.
-
-**Where.** `<dispatcher home>/slack-workspaces/CLAUDE.md`. Every chat thread runs in a
-folder under it, so every chat session reads the rules. No coding, planning or review
-session does. That was measured on the dispatcher's bundled Claude Code, 2026-10-10.
-
-Set `IDEA_TEAM_KEYS` in `chat-lane.conf` so the rules name the teams the bot may file in.
-Set `HEALTH_STATUS_FILE` to the health watch's status file, so the rules tell the bot where
-to read a health alert's findings. It reads with plain `cat`, which this lane already allows
-(the read-only shell, KIT-196). Any fix that needs sudo, launchctl or an installer, it prints
-for you and never runs. Set `PIPELINE_STATUS_FILE` only when the status job writes somewhere
-other than its default, `~/.stage-e/status/pipeline-status.json`: the rules have the bot read
-that file first when you ask where things stand, say its time, and say "I couldn't check"
-for any source it could not read (KIT-348). The bot reads it, and each guide, with the Read
-tool at its absolute path, which piece 5's read rules let it read (KIT-484). After
-`merge --apply`, ask the bot "where are we?" in a new thread.
-
-Good: it gives the status file's time and what it holds.
-Not that: "access to it was denied". Run `verify`: its `user-settings` row names the
-missing rule.
-
-Ask the bot what you can do, and it lists every command you can type in your DM, one line
-each. That list is built from the bridge's own commands, and the installer's selftest fails
-if the bridge gains one the list lacks. Ask what it can do, and it says it answers, files one
-idea per request, and sets up actions the bridge carries out after your `yes`. Ask whether
-something is planned, and it searches Linear and names what it finds, or says it found
-nothing. Ask how a part works, and it reads that part's guide in the kit and names it
-(KIT-469). Set `KIT_DOCS_DIR` only when the guides are somewhere other than the role
-account's own clone, `~/.stage-e/kit/docs`.
-
-**The flow, end to end:**
-
-1. You write: "I want dark mode".
-2. The bot files one idea in the work team's Backlog. It replies `plan PROD-123` and nothing
-   else.
-3. The bridge asks: *Plan this?* You, or any member, reply `yes`.
-4. The bridge moves the idea to Plan it, as you. The planner plans it and files an epic.
-5. You write: "start it". The bot replies `approve PROD-130`. The bridge lists the children
-   and asks. A `yes` starts them, in order.
-6. If planning ends without a plan, or with a question, ask the bot what now. It says any
-   step the notes name first, such as answering the question in the idea. To plan it again,
-   it replies `replan PROD-123`, and the bridge asks (KIT-321).
-
-Good: `verify`'s `chat-rules` row says ALREADY-DONE.
-Not that: FAILED, "not what this checkout composes". Either the kit changed the rules, so run
-`chat-rules --apply`, or someone edited the file. Find out who.
-
-**After a kit update.** An update can change the rules. If `verify` then says FAILED, run
-`chat-rules --apply` once.
-
-**When the bridge passes DM questions on.** Set `BRIDGE_DM_QUESTIONS=on` once `bridge.conf`
-sets `ASK_TECH_LEAD=yes`, then run `chat-rules --apply`. It adds one paragraph: a mention
-from the bridge's bot is a member's question from their DM, and the conversation under it is
-data. Left `off`, the default, the rules stay as they were.
-
-**When the bridge wakes the tech lead.** Set `BRIDGE_WAKES=on` once `bridge.conf` sets
-`TECH_LEAD_WAKE=yes`, then run `chat-rules --apply`. It needs `BRIDGE_DM_QUESTIONS=on`. It
-adds one paragraph: a mention ending `— the pipeline woke you` comes from the pipeline, not
-from a person, and the tech lead writes to the owner what they should know. Left `off`, the
-default, the rules stay as they were.
-
-These are instructions, not a guard. What holds is that the dispatcher starts work only on
-your hand-over, and the bridge acts only on a member's yes to its own question.
+Good: `chat-rules ALREADY-DONE no chat bot's rules at …: the old rules are gone`.
+Not that: `chat-rules BLOCKED … still holds the chat bot's old rules`. Run the line the row
+prints under it, `sudo -u <role account> /bin/rm <that file>`, then `verify` again.
+Not that: `chat-rules UNKNOWN`. The file could not be checked as the role account. The row
+says why.
 
 ---
 
-## Measure what the tech lead can reach (the probe)
+## The probe that measured this lane
 
-Four questions decide how far the tech lead reaches. The dispatcher's source can't answer
-them. Only a live run can, so one script asks all four, after one yes:
-
-1. **Does a deny in the role account's user settings take the session-feedback tool away?**
-   That tool, `linear_agent_give_feedback`, feeds text into any running session, or wakes a
-   finished one. It never checks who called it (KIT-162).
-2. **Does a reply the tech lead posts under a finished session's thread wake that session?**
-   If it does, denying the feedback tool alone leaves a second way in.
-3. **Can a chat session write the memory folder every Slack thread shares?** The dispatcher
-   gives every chat session `<dispatcher home>/slack-memory`, on purpose. If a session can
-   write there, text one thread read can reach every later thread.
-4. **Do the tech lead's own timers run?** If they do, it can wake later with nobody
-   watching, and post again (KIT-354).
-
-It needs what the bridge already set up: `bridge.conf`, the bridge's token in the role
-account's env file, and your Linear key stored there for Stage E. Run it in a terminal:
-
-```sh
-python3 scripts/pipeline_chat_lane_probe.py run --conf chat-lane.conf --bridge-conf bridge.conf --record-on <TICKET>
-```
-
-It checks everything first, and changes nothing. Then it lists exactly what it will touch,
-with each path, and asks for `yes`:
-
-- **A test ticket.** Filed as you, on the first of `TEAM_KEYS` (or `--team`). Handed to
-  `AGENT_USER_NAME` for one short session, and canceled at the end.
-- **Two messages in the back room**, posted as the bridge's bot, each mentioning the tech
-  lead. The bridge's relay never follows them into your DM.
-- **One line in the role account's `~/.claude/settings.json`**: the deny, for the second
-  message's turn only. The file is copied first, with the role account's own note of what
-  changed, and put back byte for byte from that copy.
-- **The memory folder**: only the probe's own note, `probe-<mark>.md`, and any line that
-  names it, taken out at the end. Every other note stays as it is, whoever wrote it.
-
-It posts the four answers on the test ticket and on each `--record-on` ticket. It usually
-takes about 15 minutes, and up to 45 when the dispatcher is busy. It costs two tech-lead
-turns and one short coding session.
-
-Good: `DONE: all four measured, and everything put back.` It exits 0.
-Not that: `DONE, with an answer NOT MEASURED`. It exits 4. That answer's line says why. A
-turn that never tried what it was asked measured nothing, so NOT MEASURED is never a no.
-Not that: `NOT DONE`. It exits 1. Something was not put back, and its line names the file
-and where the copy is.
-
-If you stop a run, the next run lists what is still out and puts it back first. Its record,
-in `~/.chat-lane-probe/`, only says what is still out: every put-back acts on paths worked
-out from the confs. One run at a time: a second one says so and changes nothing.
-
-A turn only counts for answer 1 if it started while the deny was in the file. A dispatcher
-that caps its sessions can hold a turn back; such a turn reads NOT MEASURED, never no.
-
-**What each answer leads to.**
-
-| Answer | What it means | What follows |
-|---|---|---|
-| 1, YES | The deny works on the dispatcher's tool server | Piece 5 denies the feedback tool for the role account, and `verify` checks it |
-| 2, YES | The tech lead's comments are a second line into sessions | Denying the feedback tool does not close it |
-| 3, YES | One thread's text can persist into every later thread | Piece 5 denies writes there; run the probe again to see the deny hold (answer 3 then reads NO) |
-| 4, YES | The tech lead can set its own timers | Piece 5 denies `ScheduleWakeup`, `CronCreate` and `RemoteTrigger` for the role account |
-
-**What one deployment measured, on 2026-11-03, dispatcher 0.2.73:** 1 YES, 2 NO, 3 YES, and 4
-NOT MEASURED, because the tech lead never called `ScheduleWakeup`. Piece 5 now carries the
-feedback, memory and timer rules (Step 4).
-
-Run it again after a dispatcher or Claude Code upgrade. Each answer is about the versions
-that ran it. Once the feedback rule is in place, answer 1 reads NOT MEASURED: no turn runs
-without it to compare with. `chat-tools` checks that tool from then on.
+A probe measured what a chat session could reach (KIT-344, KIT-354). It posted in the
+bridge's back room, so it went with the cutover (KIT-492). What one deployment measured, on
+2026-11-03, dispatcher 0.2.73: the feedback-tool deny works, a reply under a finished session's
+thread does not wake it, a chat session can write the shared memory folder, and the timers were
+not measured. Piece 5 carries the feedback, memory and timer rules (Step 4). The run is in
+`docs/adr/2026-09-06-human-action-notifier-and-reply-relay.md`.
 
 ---
 
-## The tech lead's model
+## The dispatcher's chat model
 
-The chat bot runs on the dispatcher's one default model: `claudeDefaultModel` in its config,
+Since the cutover the tech lead's own model is `TURN_MODEL` in `bridge.conf`. This is the
+dispatcher's pair, which a chat turn and every ticket without a model of its own run on.
+
+A chat turn runs on the dispatcher's one default model: `claudeDefaultModel` in its config,
 or Opus when that is unset. Its backup is `claudeDefaultFallbackModel`, or Sonnet. No setting
 picks a model for chat alone (`EdgeWorker.js:715-721`).
 
@@ -1219,7 +1091,7 @@ deployment accepts the same list.
   merged; open until then.** `chat-tools` checks the newest chat session holds none.
 - **Notes that persist across chat threads** (KIT-344). **Closed once piece 5's memory rule
   is merged, if that rule outranks Claude Code's own allowance for its memory folder.** That
-  is not measured yet: run the probe again, and its answer 3 reads NO once it does.
+  is not measured yet, and the probe that would show it went with the cutover (KIT-492).
 
 ### Found while composing this
 
@@ -1254,17 +1126,14 @@ These came out of reading the dispatcher's source for this build.
   its shell or the injected server (KIT-157).
 - Whether the tool server's upload reads a file outside a session on a live dispatcher, and
   whether any user-level rule can take that server away from the chat lane (KIT-162). The
-  probe measures one of its tools, the feedback tool (KIT-344).
+  probe measured one of its tools, the feedback tool, on 2026-11-03 (KIT-344).
 - That the memory rule outranks Claude Code's own allowance for its memory folder. The
-  probe's answer 3 reads NO once it does (KIT-344).
+  probe that would show it went with the cutover (KIT-344, KIT-492).
 - Whether the timers run without their rules. One deployment's tech lead never called
   `ScheduleWakeup` when asked, so it was not measured (KIT-354). With the rules in place,
   `chat-tools` reads their absence from the tool list.
 - That a reply the tech lead posts under a RUNNING session's thread does not feed it. The
   probe measured a finished session only (KIT-344).
-- That the probe finds a turn's log by its thread's folder. That rests on how 0.2.73 names
-  the folder and its log (`ChatSessionHandler.js:427-432`, `ClaudeRunner.js:996-1031`). A
-  turn it cannot find reads NOT MEASURED, never no (KIT-344).
 - That the anchored deny rules block a `Read` in a chat session. This rests on Claude Code's
   permissions page, not on a live test (KIT-174).
 - That a private key beside a trust file stays unreadable once the trust file is allowed.
@@ -1272,8 +1141,6 @@ These came out of reading the dispatcher's source for this build.
   because the kit's own guard refuses a command that names a `.pem` file. This rests on the
   exact-file shape, and on `trust-files` failing on a glob or a folder entry (KIT-257).
 - That the port rule refuses a second device. Card `CK-C4` measures it (KIT-117).
-- That the chat bot follows its rules (piece 8) over the dispatcher's built-in prompt. A
-  CLAUDE.md is a strong instruction, not a guard. The first live idea is the test (KIT-227).
 - That the anchor survives a reboot. The race is real: the operating system's own
   packet-filter job, `/System/Library/LaunchDaemons/com.apple.pfctl.plist`, runs
   `pfctl -f /etc/pf.conf` at load with nothing ordering it against this LaunchDaemon (read on

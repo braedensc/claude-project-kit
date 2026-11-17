@@ -46,14 +46,17 @@ never work around it.** Full reference: `.claude/hooks/README.md`.
 One honest qualification, measured 2026-08-26 and extended 2026-09-20 (`npm run
 test:bypass`, docs/SECURITY.md § *What the pattern guards actually carry*): the **Bash**
 guards below read raw command text that bash rewrites before running it, and all seven
-classify as **advisory** — a respelling gets past them. That is a fact about the threat
-model, **not a licence**.
+measured ones classify as **advisory** — a respelling gets past them. The newer
+marker-scrub guard (KIT-107) is advisory by construction and unmeasured. That is a
+fact about the threat model, **not a licence**.
 Working around a block is exactly the behaviour the guard exists to make visible, and
 the durable layers (branch protection, CI, `permissions.deny`, the sandbox) will catch
 it anyway. If a guard is in your way, say so and stop — never respell the command.
 
 - **Branch guard** — no `Edit`/`Write`/`git commit` on `main`/`master`. Branch first:
   `git checkout -b <type>/<short-kebab-desc>` (type ∈ feat|fix|chore|refactor|docs).
+  A commit is judged where it lands: a `cd` or `git -C` into the main checkout is
+  blocked too (KIT-237). Commit with `git -C <your worktree>`, never from another checkout.
 - **Stacked-branch guard — never stack a PR.** **Every branch is cut from the base
   branch and merges back into it.** A feature branch is never branched off another
   feature branch, and two feature branches are never merged into each other. "Cut from
@@ -106,16 +109,22 @@ it anyway. If a guard is in your way, say so and stop — never respell the comm
   (`bug`) and `gh label create` (defining a label is setup). CI checks **who** applied
   it, so borrowing another spelling does not help.
 - **Self-protection** — **you cannot edit the hook scripts (`pre-tool-use.py`,
-  `audit.py`, `stop-pr-check.py`, `session-end.py`), `.claude/settings.json`, or
-  `.claude/settings.local.json`.** Edit/Write and Bash mutations (`>`, `sed -i`,
-  `cp`/`mv`/`rm`, `chmod`/`chown`/`awk`, `git checkout/restore/reset/clean/stash/
-  apply/rm/mv`, *any* `python`/`node`/`ruby` invocation naming a protected path) of
+  `audit.py`, `stop-pr-check.py`, `session-start.py`, `session-end.py`),
+  `.claude/settings.json`, or `.claude/settings.local.json`.** Edit/Write and Bash
+  mutations (`>`, `sed -i`, `cp`/`mv`/`rm`, `chmod`/`chown`/`awk`, `git checkout/
+  restore/reset/clean/stash/apply/rm/mv`, *any* `python`/`node`/`ruby` invocation
+  naming a protected path) of
   them are blocked; reads are fine. **To change one: write the new version to a
   scratch file (use a different basename — interpreter commands naming a protected
   basename are blocked), validate it, then hand the human a terminal command to
   apply it.** This is by design — a guard you can edit is theater. Compose +
   validate *before* the change lands, since the running hook forbids editing itself
   and a syntax error fails closed. (docs/LESSONS.md.)
+- **Marker-scrub guard** — no running a gated kit script (`scripts/pipeline_*.py`,
+  `pr_conflict.py`, `sync_user_skills.py`) on a line that removes or blanks one of
+  Claude Code's agent markers (`env -u`/`--unset`/`-i`, `unset`, `export -n`, an empty
+  `CLAUDECODE=`). Those scripts refuse a model's environment on purpose, so if one
+  refuses you, stop and report: that step is the owner's (KIT-107).
 - **Secrets / destructive ops** — no Bash command *naming* `.env*` (non-example)/
   `*.pem`/`*.key`/`id_rsa`/`credentials` (path-target match, any leading command),
   no embedding secret values, no `rm -rf`, no `curl|sh`, no push to `main`, no bare
@@ -151,10 +160,11 @@ Two non-enforcing complements: `.claude/settings.json` also carries native
 `permissions.deny` rules that hard-block reads of secret files independently of the
 Python hook (deny wins even under `bypassPermissions`); and
 `.claude/hooks/session-start.py` is an *advisory* SessionStart hook that injects repo
-orientation at startup — deliberately **not** self-protected, since it informs rather
-than blocks. A third, `.claude/hooks/session-end.py`, removes the ending session's own
+orientation at startup and on resume. It informs rather than blocks, yet it is
+self-protected (KIT-463): it runs on a resume after the session could edit it, outside
+the Bash sandbox. A third, `.claude/hooks/session-end.py`, removes the ending session's own
 scratch folder, the one Claude Code names in the hook input, and nothing else (KIT-460).
-It is self-protected: it runs after the session could edit it, outside the Bash sandbox.
+It is self-protected for the same reason.
 **Your scratchpad does not outlive your session:** keep anything you need again in a
 persistent path.
 
@@ -211,7 +221,8 @@ npm run test:approve    # auto-approval gate selftest (§5, §11)
 npm run test:merge      # auto-merge tier selftest (§11)
 npm run test:graders    # grader-path gate: gated set + who may apply the label
 npm run test:safe-outputs    # safe-outputs absence-vs-failure selftest (§13, §8)
-npm run test:plan-executor   # idea-gate executor: tree validate, DoR-gate, forced fields (§8, §13)
+npm run test:plan-executor   # idea-gate executor: tree validate, DoR-gate, forced fields (§8, §13);
+                             #   its prerequisite mode: the parent from the bridge's record, cap 15 (KIT-611)
 npm run test:plan-poller     # the planner job: the owner's move on a work team is the
                              #   trigger, the delegated ticket is a clean copy, its routing
                              #   is checked (a miss stops planning), the plan read back
@@ -231,17 +242,22 @@ npm run test:workflow-calls  # reusable-workflow caller⇄callee contract selfte
 npm run lint:workflow-calls  # …and the same check over this repo's own call sites
 npm run test:gh-fallback     # GitHub REST fallback selftest (and that it cannot merge)
 npm run test:review-local    # Stage E publisher: fork guard, secret scrub, 0/3/2 exits
-npm run test:review-poller   # Stage E poller: discovery, sanitizer, delegate-and-collect
+npm run test:review-poller   # Stage E poller: discovery, sanitizer, delegate-and-collect;
+                             #   on the work teams, routing checked in the same pass and a
+                             #   misroute pauses one repository (KIT-597)
 npm run test:bounce          # Stage E bounce driver: ledger, budget source, needs-human
 npm run test:criteria-snapshot  # the review basis's tier 2 (KIT-131): snapshot at a
                              #   person's delegation, lag recorded, one change notice
 npm run test:notifier        # human-action notifier: marks table, the three §13
                              #   states, label-only tracker mutation (KIT-115); a page's
-                             #   screenshots, off by default, never stop the page (KIT-568)
+                             #   screenshots, off by default, never stop the page (KIT-568);
+                             #   the acceptance page, from the poller's ledger, never worded
+                             #   as a pass when it could not check (KIT-555)
 npm run test:heartbeat-monitor  # the job that READS the three heartbeats: one comment
                              #   per incident, the sleep blind spot, §13 exit codes
 npm run test:notifier-setup  # notifier installer (KIT-116): conf-all-errors, agent-refused, no secret in output
-npm run test:stage-e-setup   # Stage E installer: conf errors all-at-once, idempotency,
+npm run test:stage-e-setup   # Stage E installer: conf errors all-at-once, idempotency, no
+                             #   Reviews team (labels on the work teams, a drain gate, KIT-599),
                              #   agent-refused, §13 exit codes, no secret in any output
 npm run test:stage-e-app     # Stage E's own GitHub app (KIT-578): agent-refused, one yes, no key in any output
 npm run test:github-app      # the shared GitHub App helper (KIT-578): one host, no redirect, a real
@@ -252,6 +268,7 @@ npm run test:stage-a-setup   # Stage A (idea-gate) installer: planning built int
                              #   a typed yes, the delivery PR opened, the drill, agent-refused
 npm run test:install         # the one command (scripts/pipeline_install.py): skills, then
                              #   Stage E after a yes, then Stage A; refused under a model
+npm run test:parts           # every part listed once (pipeline-parts.json): owners, needs, cards, docs/PARTS.md
 npm run test:chat-lane-setup # chat-lane composer: owner's grant, fence keeps defaults, verify agent-refused
 npm run test:model-switch    # the tech lead's model switch (KIT-385): the pair alone or no
                              #   go, every open pipeline ticket on the default tagged first
@@ -264,16 +281,21 @@ npm run test:bridge-transport  # the bridge's transport (KIT-388): its Slack cli
 npm run test:ws-client       # the standard-library WebSocket client (KIT-559, a slice of KIT-557):
                              #   handshake, masking, fragments, ping/pong, close, and every frame
                              #   a server may not send, against a server it starts itself
+npm run test:bridge-push-setup  # switching instant replies on (KIT-561): the conf, the manifest's
+                             #   Socket Mode and agent view, the always-on job's plist, the heartbeat
+                             #   judged (down or too old is no pass; unreadable is UNKNOWN)
 npm run test:bridge-push     # the push-connection job (KIT-560): Slack's Socket Mode, an owner's DM
                              #   acked and answered at once in a thread, a status line, the
-                             #   bridge's lock, reconnects, and the pass as the catch-up
+                             #   bridge's lock, reconnects, and the pass as the catch-up; and the
+                             #   answer streamed line by line (KIT-565): each filter on the line,
+                             #   the secret stop, the refused-stream fallback
 npm run test:bridge-modules  # the rest of the bridge, split by concern (KIT-312): each module's
                              #   own cases and pins (no HTTP call or GraphQL write of its own;
                              #   the tracker calls only the transport's); test:bridge runs all
 npm run test:bridge-requests # the bridge's requests (ACT-3): the fixed reader of a member's
                              #   own ask, over the design's 100 phrasings, and its way through
 npm run test:bridge-setup    # bridge installer: hidden-prompt token, never loads, agent-refused
-npm run test:voice           # tech lead voice (KIT-294): one tool-less model call, or the plain text
+npm run test:voice           # the notifier's voice (KIT-294): one tool-less model call, or the plain text
 npm run test:conflict        # conflict loop: fix request, bounded escalation, unforgeable
                              #   markers, stale-label sweep, waker refused in an agent env,
                              #   local-session-only worktrees, capped pass, heartbeat
@@ -300,26 +322,48 @@ npm run test:hold            # the watcher's hold (KIT-515): absent is none, any
                              #   only the owner clears it
 npm run test:watcher-setup  # the watcher's own install (KIT-517): its account, a root-owned folder, a manifest it checks
                              #   every pass; one typed yes; a key never in a command line; workers who can write it fail it
+npm run test:watcher-copy   # the watcher's read-only copier (KIT-573): a root job copies the workers' usage file; a link,
+                             #   a stranger's file, an oversize file or a path it was not told are refused, the old copy removed
 npm run test:watcher-tracker # the watcher's one POST (KIT-556): one fixed read-only tracker query, pinned: one host,
                              #   no variables, no mutation, no redirect followed, a failure never read as clear
 npm run test:watcher-judge   # the watcher's judge (KIT-516): explains a flag in plain words, can lower, clear and hold
                              #   nothing; a failed judge is said; its own day cap
 npm run test:watcher-page    # the watcher's urgent page (KIT-519): once per change of answer, a failed
                              #   page sent again and never recorded as sent, no credential in any file
+npm run test:validator-ledger  # the validator's ledger (KIT-535): one writer, append-only, one verdict
+                             #   per head; a ledger it cannot trust gives no rows, never an empty list
 npm run test:watcher         # the watcher's monitors (KIT-514): each ends clear, flagged, blind or
                              #   off; blind is never clear; an unsafe rules file is judged first
+npm run test:validator-settings  # the validator's switches (KIT-533): absent, invalid or
+                             #   untrusted is every switch off; the safety system is never one
 npm run test:validator-evidence  # the validator's evidence (KIT-534): checks, Stage E's review at the
                              #   PR's own head, acceptance, merge state; anything unread is no
+npm run test:validator-check  # the Validator check (KIT-540): the ledger's decision at its own head,
+                             #   posted as its own app; nothing for an unjudged head, holds in words
+npm run test:validator-app  # the validator's owner script (KIT-541): its app and its required check,
+                             #   one typed yes, refused under a model, a rerun changes nothing
 npm run test:tech-lead-tools # the tech lead's read tools over MCP (KIT-488): hostile
                              #   arguments refused, reads only, the key in no answer
+npm run test:validator-brief  # the validator agent's brief and answer (KIT-536): fenced input, a
+                             #   closed two-line answer, a cleaned reason; it can only hold
+npm run test:validator-limits  # the validator's hard limits (KIT-538): pass or closed reasons;
+                             #   each fact from its owner's reader; the floor is never a switch
 npm run test:day-planner     # the day planner (KIT-439): ticket text fenced as data in its brief, one
                              #   answer block read, every pick checked, a failing one dropped with a reason
 npm run test:morning         # the morning job (KIT-446): once a day inside the window, one tool-less call,
                              #   every pick checked; the plain queue plans when the call gives nothing usable
 npm run test:tech-lead-turn  # the tech lead's turn (KIT-489): one headless CLI run, its exact argv and
                              #   environment, nothing of the account's setup loaded, a failure said in fixed words
-npm run test:standup         # the daily stand-up (KIT-349): asks first with exact replies,
-                             #   old news never sent, the plain text when the writer fails
+npm run test:sprint-plan     # sprint planning (KIT-575): one proposal a sprint, built by code; only the owner's exact
+                             #   reply records the plan; the queue puts planned pieces first and admits nothing
+npm run test:sprint-review   # the sprint review (KIT-576): a recap built by code from the usage file and GitHub,
+                             #   one Linear document, one DM message, once a sprint; a failure is said, never silent
+npm run test:queue-settings  # the one write path into queue.conf (KIT-700): the owner's own DM words only, the
+                             #   queue's own loader judges, read back, a ledger row, carried at the next install
+npm run test:sprint-changes  # the changes it proposes (KIT-577): at most three, lower settings only, from a short
+                             #   allowed list; only the owner's exact reply makes one, and it shows old and new
+npm run test:standup         # the daily stand-up (KIT-349): short, in the tech lead's words held
+                             #   to code's facts, else code's short version (KIT-718); no old news
 npm run test:window          # the working window (KIT-437): open or closed at a time, DST and midnight
 npm run test:queue-order     # the queue's order and limits (KIT-434): what starts next, in lanes,
                              #   within the day's load; each runaway stop holds every start
@@ -334,16 +378,33 @@ npm run test:queue-read      # the queue's reader (KIT-445): the tracker and thr
                              #   a history whole or null, what it could not read said
 npm run test:queue-start     # the queue's starter (KIT-452): what may start now, inside the window
                              #   only; the ledger row written before each start, never a title
+npm run test:runner-store    # the runner's store (KIT-642): requests and run records behind
+                             #   walls, each caller for its own kinds; unreadable runs are None
+npm run test:runner          # the runner (KIT-642): start, resume, stop and a restart against a
+                             #   stand-in; the owner's approval from the history; the pin; the one
+                             #   command line; a run that died resumed once; leaves nothing behind
+npm run test:runner-limits   # the runner's limits (KIT-643): stand-ins that grow without bound
+                             #   in memory (a child that left the group too) and on disk stopped
+                             #   with their whole tree; the floor; each incident told once
 npm run test:queue-setup     # the queue's installer (KIT-456): configs pass the jobs' own loaders; no plist
                              #   overwritten, no job loaded; refused under a model
 npm run test:day-plan        # the day plan file (KIT-438): the queue's decision as fields only, each
                              #   reply built from two fixed patterns, a document that fails never written
 npm run test:acceptance-poller  # the acceptance poller: its start rule and one-check-per-head ledger,
                              #   the result read, the second pass, and one verdict comment per head
-                             #   whose first-line mark session text can never forge (KIT-551..554)
+                             #   whose first-line mark session text can never forge (KIT-551..554);
+                             #   the owner's page as fields, its screenshots from the record alone (KIT-555)
+npm run test:acceptance-run   # the acceptance check's live pass (KIT-571): the facts from the owner's
+                             #   approvals, a start that writes the check's own look config before it
+                             #   delegates, the result read back, follow-ups marked, the time limit
+npm run test:acceptance-setup  # the acceptance installer (KIT-326): the browser, the profile, the MCP config, the
+                             #   dispatcher entry and the job, one row each; configs pass the tools' own loaders;
+                             #   refused under a model; the job is installed, never loaded
 npm run test:union           # union check: green alone + red together, bisected, report-only
 npm run test:hooks-path      # core.hooksPath pinned absolute: a worktree runs the pre-commit hook (KIT-420)
 npm run test:runner-pin       # no workflow on a moving -latest runner image (KIT-429)
+npm run test:stdlib-only    # the kit's Python imports only the standard library, bar a named list (KIT-652)
+npm run lint:stdlib-only    # …and the same check over this repo's tracked .py files
 npm run test:pr-base         # PR-base gate: a PR's base must be a base branch; an unknown
                              #   event or missing value FAILS, main() itself is exercised
 npm run test:alert-pages     # alert templates page a person (ALERT_PAGE_TO, else a user
@@ -352,10 +413,10 @@ npm run lint:secrets    # secretlint over every tracked file, read as git stores
 npm run test:secret-scan  # the scan finds a key in every file shape, never reports a scan
                         #   it did not finish as clean, and runs first in CI (KIT-400)
 python3 scripts/check_placeholders.py   # {{…}} tokens used == documented in PLACEHOLDERS.md
-npm run test:session-brief   # SESSION-BRIEF's mark and finding block match their readers
-npm run test:chat-lane-probe # the chat-lane probe (CI ran it; npm did not before KIT-450),
-                             #   with test:machine-tickets, test:routing-tags and
-                             #   test:sync-kit, three selftests that ran nowhere before
+npm run test:session-brief   # SESSION-BRIEF's mark and finding block match their readers,
+                             #   and its gate lines match the /work skill's (KIT-315)
+npm run test:machine-tickets # with test:routing-tags and test:sync-kit, three selftests
+                             #   that ran nowhere before KIT-450
 npm run test:scratch-run     # the batteries' temp helper: one folder per run, gone on a
                              #   pass, a failure, Ctrl-C or a SIGTERM (KIT-450)
 npm run test:temp-leaks      # the leak check's own selftest
@@ -388,10 +449,12 @@ validation, the reusable-workflow call-contract check, the PR-base selftest, the
 placeholder integrity, the DoR, delivery-config, generation-gate, auto-approve,
 auto-merge, grader-path, safe-outputs, conflict-loop, union-check, telemetry, dashboard
 and weekly-review selftests, the secret-scan selftest, and, as its first step, the secret
-scan on every PR. Its last two steps run every battery again, each in its own empty TMPDIR,
-once to the end and once stopped by a SIGTERM, and fail on anything one leaves behind
-(KIT-450). `main` is protected: **three** contexts are required —
-**Kit checks**, **Provenance scan** and **Hooks change guard** — with admins enforced.
+scan on every PR. A separate job, **Temp-leak sweeps**, runs every battery again, each in
+its own empty TMPDIR, once to the end and once stopped by a SIGTERM, and fails on anything
+one leaves behind (KIT-450, KIT-617). `main` is protected: **four** contexts are required —
+**Kit checks**, **Provenance scan**, **Hooks change guard** and **Temp-leak sweeps** (since
+12 Nov 2026, KIT-699) — with admins enforced, so a leak blocks the merge. Each job's limit,
+and what to do near one, is in `docs/TESTING.md` ("Job limits and what to do near one").
 A fourth workflow, **PR base** (`.github/workflows/pr-base.yml`), fails any PR not
 based on a base branch and re-runs on a retarget. It is deliberately not required:
 every PR into `main` passes it, and branch protection never covers a PR based on a
@@ -518,9 +581,10 @@ The loop, when it *is* on:
    is reporting only: it can never buy a session more budget, an approval, or a merge.
 
 `.claude/hooks/session-start.py` injects the pinned ticket's title and acceptance
-criteria behind the same fence — **advisory only**. That hook is deliberately not
-self-protected *and* its root falls back to the model-mutable cwd, so nothing may ever
-treat its output as a trust source; a guard that needs the pin reads the pin itself.
+criteria behind the same fence — **advisory only**. That hook's self-protection is a
+first line whose Bash half is advisory, *and* its root falls back to the model-mutable
+cwd, so nothing may ever treat its output as a trust source; a guard that needs the pin
+reads the pin itself.
 
 **Around that loop sit three autonomy tiers** (§11, `docs/AUTONOMY.md`), each narrower
 than the last and each off by default above the first: *dispatch* (may an approved
@@ -554,4 +618,5 @@ self-protection, runbooks) ·
 `docs/COLLABORATION.md` (branch/worktree/parallel-session protocol + the enforcement
 list) · `docs/TESTING.md` · `docs/LESSONS.md` (every gotcha, incl. the self-protection
 build-before-lock lesson) · `docs/STACK-RATIONALE.md` · `.claude/hooks/README.md` ·
-`docs/adr/` (why the kit is shaped as it is).
+`docs/adr/` (why the kit is shaped as it is) · `docs/OPERATIONS.md` (what to do when the
+pipeline stops: symptom → cause → check → who acts).

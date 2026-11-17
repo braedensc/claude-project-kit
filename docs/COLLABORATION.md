@@ -415,13 +415,20 @@ Stop hook between them:
    - **Protects itself**: blocks Edit/Write (and Bash mutations — redirects, `sed -i`,
      `cp`/`mv`/`rm`, `chmod`/`chown`/`awk`, `git checkout/restore/reset/clean/stash/
      apply/rm/mv`, any interpreter invocation naming a protected path) of the hook
-     scripts, `settings.json`, **and `settings.local.json`** (local settings override
+     scripts, every file a hook command in the settings names (KIT-603: a project's own
+     hooks run outside the sandbox too), `settings.json`, **and `settings.local.json`**
+     (local settings override
      project scalars, so writing it could neutralize every guard), so a guard can't be
      edited away or unwired — changing them is a human-only terminal step. (Reads are
      fine.)
    - Blocks `Edit`/`Write`/`git commit` while on `main`/`master` — a new task is
      forced onto a branch. The project's CLAUDE.md (from docs/CLAUDE-template.md)
-     also tells Claude to branch *proactively* before ever hitting the block.
+     also tells Claude to branch *proactively* before ever hitting the block. A
+     commit is also judged by the checkout it lands in (KIT-237): a persisted `cd`, a
+     `cd`/`pushd` on the same line, or `git -C <dir> commit` into another worktree of
+     the repository on `main`/`master` or a badly named branch is blocked. Another
+     repository is never judged. Advisory like every Bash guard: `--git-dir` and a
+     `$VAR` path get past it.
    - Blocks the same on a branch **not matching** `<type>/<short-kebab-desc>`, so an
      auto-generated `claude/<codename>` worktree branch is renamed before any work
      (one landed unrenamed in a real PR).
@@ -454,8 +461,8 @@ Stop hook between them:
      the one its **transcript folder** names (exactly one existing worktree of this
      repo; otherwise `CLAUDE_PROJECT_DIR`) — since Claude Code 2.1.286 the desktop
      app's `CLAUDE_PROJECT_DIR` is the main checkout, so read alone it judged every
-     desktop session as `main` (KIT-214). It is further **widened to the hook
-     process's cwd only for a genuine
+     desktop session as `main` (KIT-214). It is further **widened to the payload's
+     `cwd` only for a genuine
      subagent** (payload has `agent_id`) whose cwd is a worktree of the *same* repo
      (shared `--git-common-dir`) — subagents inherit that env var from their *parent*,
      which used to false-block them inside their own SDK-created worktrees and let
@@ -507,6 +514,16 @@ Stop hook between them:
      model-movable. Reads and a plain `git fetch` (the one honest writer of
      `origin/main`) are untouched, as is `git remote add origin`. Tamper-**evident**,
      not tamper-proof: the backstop stays the reviewed PR + CI.
+   - **Marker scrub** (KIT-107) — blocks running a gated kit script
+     (`scripts/pipeline_*.py`, `scripts/pr_conflict.py`, `scripts/sync_user_skills.py`)
+     on a line that removes or blanks one of Claude Code's agent markers (`env -u`,
+     `env --unset`, `env -i`, `unset`, `export -n`, or an empty `M=`). Those scripts
+     refuse to run where the markers are set, so a session cannot place its own
+     dispatch pin, install or change the pipeline, or read the owner's stored
+     credentials. Removing the markers makes a session's shell look like the owner's
+     terminal, which no script can tell apart; the hook reads the command first. A grep
+     that only names a script passes. Advisory: a marker name held in a variable gets
+     through. What holds is the role account's mode-600 files and the sandbox.
    - **Pipeline guards** (`docs/PIPELINE-CONTRACT.md`) — six more blocks that exist
      **only** when a project opted into the agentic delivery pipeline. The single
      discriminator is whether `delivery.json` exists at the repo root, and the

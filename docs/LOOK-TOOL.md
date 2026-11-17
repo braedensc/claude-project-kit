@@ -56,6 +56,24 @@ environment, where the record goes, or how many runs a plan gets. Those are in t
 | `base_git_dir` | A git directory the tool's own account owns, never the session's worktree, holding the base branch (for example a bare clone the installer keeps current). Absolute, outside the worktree, owned by the tool's account and not writable by others. Unset: no base copy is made. |
 | `base_ref` | The branch in that directory the fake backend and the `acceptance` section are copied from (default `origin/main`). |
 
+### One server line for every check: `--config-dir` (KIT-571)
+
+An acceptance entry's MCP config cannot name each session's worktree. So it starts the tool with a folder instead:
+
+```
+python3 scripts/pipeline_look.py --config-dir /path/to/look-configs
+```
+
+The acceptance poller's live pass writes one config per check into that folder before the check's session starts. The
+tool takes **the one config whose `worktree` is the folder it was started in**. The dispatcher starts the session there,
+and the session cannot change it. No config naming it, or more than one, is a refusal, said in words.
+
+The tool looks for its config file again at every run. When the live pass stops a check past its time limit, it removes
+the file, and every run after that is refused.
+
+**Good:** `--config-dir` on a folder outside every worktree, which only the role account outside the sandbox writes.
+**Not:** a config folder inside a worktree. A session could write a config there and point the tool at another plan.
+
 ---
 
 ## What it refuses, in words
