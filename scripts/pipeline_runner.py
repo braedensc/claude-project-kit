@@ -1844,7 +1844,9 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                   not [x for x in runner.runs() if x["ticket"] == ident and x["state"] in store.LIVE] and
                   not [x for x in runner.runs() if x["ticket"] == ident and x["auto_resume"] == "pending"],
                   20)
-            return store.read_run(sdir, store.answer(sdir, rq)["run"])
+            got = store.answer(sdir, rq)
+            return (store.read_run(sdir, got["run"]) if got and got["run"] else None) or \
+                dict.fromkeys(store.RUN_KEYS)
 
         lost = ended_code_run("ENG-31")
         os.unlink(os.path.join(bindir, "sessions", lost["session_id"]))   # the program lost it
@@ -1853,25 +1855,28 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                (tried["state"], tried["reason"], tried["why"], tried["session_id"], tried["auto_resume"]),
                ("ended", "session-gone", "the session it resumed is gone: the program no longer has "
                 "its conversation", lost["session_id"], "started"))
-        anew = store.read_run(sdir, tried["resumed_by"])
+        anew = (store.read_run(sdir, tried["resumed_by"]) if tried["resumed_by"] else None) or {}
         expect("…and is started afresh once, in the same workspace, and its record says so",
-               (anew["started_for"], anew["how"], anew["caller"], anew["request"], anew["resumes"],
-                anew["gone_session"], anew["workspace"], anew["branch"], anew["kind"], anew["state"],
-                anew["session_id"] in (lost["session_id"], None)),
+               tuple(anew.get(k) for k in ("started_for", "how", "caller", "request", "resumes",
+                                           "gone_session", "workspace", "branch", "kind", "state"))
+               + (anew.get("session_id") in (lost["session_id"], None),),
                ("session-gone", "fresh-session", "runner", None, tried["run"], lost["session_id"],
                 lost["workspace"], lost["branch"], "fix", "ended", False))
-        fresh_call = [c for c in _calls(calls) if c.get("argv") and anew["session_id"] in c["argv"]][0]
+        fresh_call = ([c for c in _calls(calls) if c.get("argv") and anew.get("session_id") in c["argv"]]
+                      or [{"argv": [], "prompt": ""}])[0]
+        given = fresh_call["argv"]
         expect("…as a new session, never a resume of the lost one",
-               (fresh_call["argv"][fresh_call["argv"].index("--session-id") + 1], "--resume" in fresh_call["argv"]),
-               (anew["session_id"], False))
+               (given[given.index("--session-id") + 1] if "--session-id" in given else None,
+                "--resume" in given), (anew.get("session_id"), False))
+        said_in = [fresh_call["prompt"].find(s) for s in
+                   (FRESH_TEXT, "<untrusted-ticket-data>", "<untrusted-request-data>")]
         expect("…told so first, then given the ticket and the same request's text, each fenced",
-               (fresh_call["prompt"].index(FRESH_TEXT) < fresh_call["prompt"].index("<untrusted-ticket-data>")
-                < fresh_call["prompt"].index("<untrusted-request-data>"),
+               (-1 not in said_in and said_in == sorted(said_in),
                 "Its session is lost" in fresh_call["prompt"], "Fix finding A" in fresh_call["prompt"]),
                (True, True, True))
         gone = ended_code_run("ENG-32")
         tried = resume_until_settled("ENG-32", gone["run"], "Fix finding B STANDIN:gonejson")
-        anew = store.read_run(sdir, tried["resumed_by"]) if tried["resumed_by"] else {}
+        anew = (store.read_run(sdir, tried["resumed_by"]) if tried["resumed_by"] else None) or {}
         expect("the program's error result saying so counts too, and a fresh start that hears it "
                "again is never started afresh again",
                (tried["reason"], tried["auto_resume"], anew.get("how"), anew.get("reason"),
