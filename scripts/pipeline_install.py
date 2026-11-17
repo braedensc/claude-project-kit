@@ -284,8 +284,11 @@ class Io(object):
             previous = signal.signal(signal.SIGINT,
                                      lambda _s, _f: setattr(self, "interrupted", True))
             try:
+                # The child writes into a pipe, which a Python child buffers by blocks. Unbuffered, so
+                # an installer's words (why it needs the Mac password) arrive before sudo asks.
                 child = subprocess.Popen(argv, cwd=KIT, stdout=subprocess.PIPE,
                                          stderr=subprocess.STDOUT,
+                                         env=dict(os.environ, PYTHONUNBUFFERED="1"),
                                          preexec_fn=lambda: signal.signal(signal.SIGINT,
                                                                           signal.SIG_DFL))
                 for raw in iter(child.stdout.readline, b""):
@@ -2834,6 +2837,26 @@ def selftest():
     check("watch-level-an-unreadable-job-file-is-unmeasured", level()[0], "unmeasured")
     check("watch-level-unreadable-settings-are-unmeasured",
           watch_level(os.path.join(tmp, "nope.conf"), home, 501, launchctl(0))[0], "unmeasured")
+
+    # A line an installer prints arrives while it is still running, not when it ends (a buffered child would
+    # show sudo's bare prompt first). The child waits for the line to reach this program's own output.
+    marker = os.path.join(tmp, "line-arrived")
+    child_code = ("import os, time\nprint('early')\nfor _ in range(100):\n"
+                  "    if os.path.exists(%r):\n        break\n    time.sleep(0.1)\n"
+                  "print('late' if os.path.exists(%r) else 'never')\n" % (marker, marker))
+
+    class Watching(object):
+        def write(self, text):
+            if "early" in text:
+                open(marker, "w").close()
+        def flush(self):
+            pass
+    real_out, sys.stdout = sys.stdout, Watching()
+    try:
+        got = Io().run_seen([sys.executable, "-c", child_code])
+    finally:
+        sys.stdout = real_out
+    check("run-seen-passes-a-line-on-while-the-child-is-still-running", got, (0, "early\nlate\n"))
     os.unlink(update_conf)
 
     # 7. CTRL-C REACHES THE INSTALLER AND ITS CLEAN-UP RUNS TO THE END. Real processes:
