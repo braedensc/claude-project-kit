@@ -1,0 +1,20 @@
+{
+  "schema": "pipeline-session-kind/1",
+  "kind": "review",
+  "about": "Reads one pull request and answers with one block of findings. It changes nothing.",
+  "brief": "Review the pull request this ticket describes. Change nothing.",
+  "mode": "diagnosis",
+  "branch": {"type": "chore", "word": "review"},
+  "approval": {"newest_move": false, "states": "review"},
+  "permissions": "deny-unlisted",
+  "tools": ["Read", "Grep", "Glob"],
+  "allow": {"Read": "workspace", "Grep": "workspace", "Glob": "workspace"},
+  "deny": ["store", "pins", "keys", "home"],
+  "wall": "own-sandbox",
+  "hosts": [],
+  "env": ["PATH", "HOME", "TMPDIR", "LANG", "CLAUDE_CODE_OAUTH_TOKEN", "DISABLE_AUTOUPDATER",
+          "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"],
+  "guards": ["pre-tool-use"],
+  "tool_servers": [],
+  "limits": {"wall_minutes": 180, "memory_mb": 4096, "disk_mb": 20480}
+}

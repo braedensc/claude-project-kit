@@ -14,8 +14,9 @@ The formats it reads and writes: `docs/PIPELINE-CONTRACT.md` section 28, and sec
 - **Nothing installs it yet.** Its installer comes with the first lane that moves.
 - **No real session goes through it yet.** Its selftest runs it against a stand-in program.
 
-One piece comes before any lane moves: each kind of session as measured data, the kit's guard
-from a root-owned copy, and a live probe of the walls as the role account (KIT-704).
+Each kind of session is data now, behind walls KIT-630 measured (KIT-704). Two things still come
+before any lane moves: the probe of each kind's walls, run live as the role account, and a
+root-owned copy of the kit for the runner to run from. Its installer makes that copy.
 
 ## What it does
 
@@ -60,7 +61,8 @@ ticket's effort label.
 ## Its limits
 
 Every run is held to three limits, and the machine to a floor. Each sits far above any real run: a
-limit hit in normal use is a defect.
+limit hit in normal use is a defect. Each kind of session also has its own ceilings (below), and a
+run is held to the smaller of the two.
 
 | Limit | What it measures | Default |
 | --- | --- | --- |
@@ -88,15 +90,116 @@ Not: the same session is told about again on every pass.
 The health watch does not page from the incidents file yet. It learns the runner with the runner's
 installer, when the first lane moves.
 
+## Each kind of session
+
+Each kind is one data file in `session-kinds/`, checked by `scripts/pipeline_session_kinds.py`.
+One adapter, `scripts/pipeline_harness_claude.py`, turns a kind into the program's command line,
+settings and environment. A second program would be a second adapter, reading the same files.
+
+| Kind | Tools | Wall | Hosts | Time, memory |
+| --- | --- | --- | --- | --- |
+| code | Bash, Read, Edit, Write | the built-in sandbox | the project's list | 360 min, 8 GB |
+| fix, conflict | the same: each is a resume of a code run | the built-in sandbox | the project's list | 360 min, 8 GB |
+| review | Read, Grep, Glob | our own sandbox | none | 180 min, 4 GB |
+| plan | Read, Grep, Glob | our own sandbox | none | 180 min, 4 GB |
+| acceptance | Bash, Read: it builds the app it checks | the built-in sandbox | the project's list | 180 min, 8 GB |
+
+Every kind's disk ceiling is 20 GB. What no kind's data can say, because the loader refuses it:
+
+- **A mode that skips the checks.** The only value is `deny-unlisted`: what no rule allows is refused.
+- **A file tool allowed by name.** Each is allowed by the workspace's path only.
+- **Bash inside our own sandbox,** or a kind without Bash outside it.
+- **Less than the four walls:** the store, the pins, the keys and the sessions' own state.
+- **An environment name the adapter has no source for,** so no API key, proxy or address can pass.
+- **A review tool outside the reviewer's read-only set.** The selftest checks the review kind
+  against the same allow list the old lane's probe uses, and the plan kind against the planner's.
+
+The files sit behind the `hooks-change` label: a change to one changes what a session may reach.
+
 ## What a session is given
 
 - **Nothing from its workspace.** No settings, hooks, tool servers or `CLAUDE.md` load from it.
 - **The project's instructions,** read from its default branch by the runner, handed in as a file.
-- **The ticket,** as the runner read it, fenced as data.
-- **Its tools, each by the workspace's path.** No file tool is ever allowed by bare name.
-- **A kind with Bash** gets the built-in sandbox, with a deny-read list.
-- **A short environment:** the path, a home of its own, a temp folder, the language, the sign-in
-  token, and two switches.
+- **The ticket,** as the runner read it, fenced as data. A resume's text is fenced the same way.
+- **Its kind's tools, each file tool by the workspace's path.** None is allowed by its bare name.
+- **Deny rules** for the runner's store, the pins, the tracker key and the program's own state in
+  the sessions' home (its `.claude` folder and `.claude.json`, which hold every transcript).
+- **A kind with Bash** gets the built-in sandbox: a deny-read list of those places, and the
+  project's hosts only.
+- **A kind without Bash** runs inside our own macOS sandbox, written for the run. It may write only
+  the program's home and the run's temp folder. It may not read the store, the pins or the key,
+  apart from its own inputs and its own pin.
+- **The kit's guard on every tool call,** from the engine's own folder (below).
+- **A short environment,** exactly its kind's names: the path (the program's own folder first),
+  a home, a temp folder, the language, the sign-in token, and two switches.
+
+Good: a review session's Grep reaches only its workspace, and the system itself stops it writing.
+Not: a review session is given Bash, or a file tool allowed by its bare name.
+
+**A workspace `.env` that names a variable the program reads is refused.** An API key there would
+move the lane from the plan's usage window to a card, and a base address or a proxy would send its
+traffic elsewhere. The runner checks the dotenv files a loader reads by itself (`.env`, `.env.local`
+and the like) before every start and resume. It names the file and the variable, never the value.
+`.env.example` is documentation, and is not read.
+
+## Guards from the engine's own folder
+
+The runner runs from a copy of the kit: the engine's folder. A session's walls come from there: the
+kinds' data, the adapter and the kit's guard. On this Mac that copy is root-owned, so a session
+cannot change its own guard.
+
+- **The runner checks it.** No session starts while this account could change the engine's
+  folder, a folder above it, its scripts, its kinds' data or its guards. The request waits, and the
+  runner says why once.
+- **The guard is told its folder.** The kit's guard finds its project from `CLAUDE_PROJECT_DIR`,
+  and without it from its own file's folder. Run from the engine, that is the wrong checkout, and a
+  branch check outside a repository lets an edit through. So a small launcher,
+  `scripts/pipeline_runner_guard.py`, runs it. The runner writes the workspace into the launcher's
+  command line, in the run's settings, outside the workspace.
+- **The launcher refuses** when no workspace is named, or the one named is not the top of a git
+  working tree, or `CLAUDE_PROJECT_DIR` names another folder. It refuses when the guard is missing,
+  crashes or does not answer. The program reads any exit but 2 as "go ahead", so a crash becomes a
+  refusal.
+
+## The walls, measured (KIT-630, as the role account on 12 Nov 2026)
+
+| Row | What it found | What the kinds do |
+| --- | --- | --- |
+| r1, r1c | With the three flags nothing in the worktree loads, and instructions from outside arrive | Every kind runs with them |
+| r2, r2k | A guard run from outside the worktree refuses an edit on main, in its own words | Every kind's tool calls go through the kit's guard, from the engine's folder |
+| r3, r3b | The built-in sandbox holds Bash; it reads outside unless a deny-read list says not to | Every kind with Bash has the built-in sandbox and a deny-read list |
+| r4a | A file tool allowed by its bare name reads and writes outside, sandbox or not | No kind allows a file tool by name |
+| r4b to r4d | Allowed by the workspace's path only, the outside is refused with no deny rule | Every file tool is allowed by the workspace's path, and denied the walls too |
+| r5a | Our own macOS sandbox around the program holds the file tools | Review and plan run inside it |
+| **r5b, FAIL** | Inside both sandboxes Bash does not start (`sandbox_apply: Operation not permitted`) | **The answer is a rule, in the data:** a kind with Bash has the built-in sandbox and rules for its file tools; a kind without Bash has our own sandbox. The loader refuses any other pairing. The acceptance kind keeps Bash, because its look tool starts its own sandbox, which could not start inside ours |
+| **r3c, not measured** | The control with no sandbox: the model declined the commands | **A gap that proves nothing either way.** Row r4a wrote to the same folder, so r3's refused write was the sandbox's. No kind runs Bash with no sandbox |
+
+What the program itself does, outside its tools, is held by our own sandbox only for review and
+plan. For a kind with Bash it is the built-in sandbox and the rules: the program's own process is
+not walled. That is r5b's cost, and a second account for sessions is the later wall (KIT-701,
+decision 4).
+
+## The probe
+
+`scripts/pipeline_runner_probe.py` proves each kind's walls live, as the role account. A person
+runs it, never a session: it starts about ten short sessions on the small model, about a dollar.
+It builds each kind exactly as the runner would, from the same data, adapter and launcher. Then it
+asks each session to reach past each wall. It judges from files on disk and the program's own
+record of each call, never from what the model says.
+
+```bash
+python3 scripts/pipeline_runner_probe.py run --claude <the role's claude> --out <folder>
+```
+
+| Its rows | Must |
+| --- | --- |
+| Walls: its tools are only its kind's; nothing in the workspace loads; no read outside, of the store, the pins, the key or another session's transcript; the guard refuses a `.env` read and write; no write outside; Bash reaches no unlisted host and sees no key | PASS |
+| Work: the instructions arrive; reads, searches and writes inside work; Bash writes its workspace and temp folder; `git status` and a commit; a listed host is reached | WORKS, or the lane cannot move |
+| Facts: whether the code host's command-line tool gets through TLS in the sandbox, and whether the program reads a `.env` in its working folder | recorded |
+
+A row the session never tried is NOT MEASURED, never PASS. A refusal counts as the guard's only
+when its own words are seen. Exit 0 means every wall held; 1 a wall failed; 2 some wall was not
+measured; 3 it could not run.
 
 ## Settings
 
@@ -136,7 +239,9 @@ npm run test:runner
 ```
 
 The selftest starts, resumes and stops sessions of a stand-in program, kills the runner mid-run to
-show the session lives on, and leaves nothing behind.
+show the session lives on, and leaves nothing behind. The kinds, the adapter, the guards' launcher
+and the probe each have their own: `test:session-kinds`, `test:harness-claude`, `test:runner-guard`
+and `test:runner-probe`.
 
 ## When it refuses
 
@@ -150,6 +255,9 @@ Each refusal says why, in the request's answer (`<store_dir>/taken/<id>.json`).
 | `<name>` is not set | The sign-in token's variable is missing from the job's environment. |
 | the tracker could not be read | Nothing to do: the request waits, and the next pass tries again. |
 | the machine is below its floor | Free disk or memory. The request waits; it starts when there is room. |
+| the workspace's `.env` names a variable the program reads | Take the variable out of that file, or out of the project's committed copy. |
+| the engine's folder could be changed by this account | The runner runs from its own copy of the kit, owned by root. The request waits until it does. |
+| the session kinds could not be loaded | A kind's data file is missing or wrong: `python3 scripts/pipeline_session_kinds.py --check` says which. |
 
 The runner refuses to start from inside a Claude session, or as root.
 
@@ -158,4 +266,9 @@ The runner refuses to start from inside a Claude session, or as root.
 - That a session outlives a restart of the runner under launchd. The selftest proves it for a runner
   killed with its whole process group. One live check is owed.
 - That one sign-in serves the runner and the tech lead together (KIT-629).
-- That sandboxed Bash may write the session's temp folder. Each kind's walls are measured in KIT-704.
+- Each kind's walls as the role account: the probe above has not been run live yet. Until it
+  passes, no real session goes through the runner. It also measures what is still open here: that
+  sandboxed Bash may write its temp folder, that a commit works in a workspace whose git folder sits
+  in the runner's clone, and whether the code host's command-line tool gets through TLS.
+- That our own sandbox lets the real program run for a review or plan session. The selftest runs
+  the profile on a Mac with a stand-in. The probe runs the real program in it.

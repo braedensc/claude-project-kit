@@ -129,6 +129,10 @@ FLOOR = (
     # reach, so an edit to either needs the same label.
     "scripts/look_runner.mjs",
     "templates/sandbox/**",
+    # Each kind of session the runner starts, as data (KIT-704): its tools, its rules, its wall,
+    # its hosts and its environment. A change to one is a change to what a session may reach,
+    # whatever the file's name says, so it needs the same label as the code that reads it.
+    "session-kinds/**",
     # gh_fallback.py is not a grader — it gates nothing — and the tempting call is to
     # excuse it below. That would be wrong. It holds the GitHub token and writes to the
     # API, and the ONLY thing stopping it from merging is the endpoint set inside it.
@@ -452,6 +456,8 @@ def _selftest():
     expect("floor gates the look tool's runner and its sandbox profile",
            (gated("scripts/look_runner.mjs"), gated("templates/sandbox/look.sb"), gated("scripts/pipeline_look.py")),
            (True, True, True))
+    expect("floor gates each session kind's data, and the adapter that reads it",
+           (gated("session-kinds/review.json"), gated("scripts/pipeline_harness_claude.py")), (True, True))
     expect("floor gates the safe-outputs template",
            gated("templates/workflows/pipeline-safe-outputs.yml"), True)
     expect("floor gates the dispatch template",
