@@ -340,14 +340,16 @@ them would hold that PR forever. It holds and uses no secret.
   scripts, the checkout action's log) are not in it.
 - Each check is shown to fail. The job plants a file in the empty home, in the real `~/.claude`
   and in the checkout, and a token of every shape the scan knows; and the checks that read text
-  must refuse four broken copies of the look's output and a refusal with one line too many, for
+  must refuse five broken copies of the look's output and a refusal with one line too many, for
   the right reason. A green run is never a check that compared nothing.
 
 **The "Only you can do these" list.** A clean Mac never prints it: every part with a check is off,
 so no waiting part's own output names a card, and the command prints that list only for a card.
 The job accepts what is printed instead, one "`<name>` is waiting on you" line for each part that
-waits, and requires it to name every one of them; the `host` part has no check or card, so it does
-not appear there at all (a separate ticket).
+waits, and requires it to name every one of them. The `host` part has no installer, but the
+command looks for a host itself (the pipeline's account and its lane marker). A clean Mac has none,
+so the host must read "waiting on you" and the list must open with "Build this first." and name
+`docs/HOST.md`; a fifth broken copy that drops that line must be refused (KIT-756).
 
 First measured 13 Nov 2026: macOS 15.8.2 (image `macos-15-arm64` 20261104.0514.1), `/usr/bin/python3`
 3.9.6, the developer tools of Xcode 16.4, passwordless `sudo`. The job ran in 14 seconds, after

@@ -293,6 +293,10 @@ class Io(object):
     def exists(self, path):
         return os.path.exists(path)
 
+    def host_state(self):
+        """(state, why) of this Mac's host (KIT-756); see host_state()."""
+        return host_state()
+
     def parts(self):
         """The pipeline's parts, in the list's order. Raises OSError or ValueError."""
         import pipeline_parts
@@ -1189,6 +1193,48 @@ def settings_path(part, files):
     return conf_path(name, files) if name.endswith((".conf", ".json")) else None
 
 
+# KIT-756: does this Mac have a host? Read-only, no password, nothing changed. The lane marker
+# folder (docs/HOST.md) is readable by everyone and holds one empty file named for the pipeline's
+# account; the account must exist and have its home folder. Anything that cannot be told is
+# "unknown": never "has one".
+HOST_MARKERS = "/etc/claude-pipeline/dispatched-lane"
+HOST_NONE = "no pipeline account was found on this Mac"
+HOST_FIRST = ("Building the host takes hours, and the kit does not do it for you. Every other "
+              "part needs it first; the steps are in docs/HOST.md.")
+
+
+def host_state(listdir=os.listdir, getpwnam=None, isdir=os.path.isdir):
+    """('yes' | 'none' | 'unknown', why)."""
+    if getpwnam is None:
+        try:
+            import pwd
+            getpwnam = pwd.getpwnam
+        except ImportError:
+            return "unknown", "this Mac's accounts could not be read"
+    try:
+        names = sorted(n for n in listdir(HOST_MARKERS) if n.startswith("_"))
+    except (FileNotFoundError, NotADirectoryError):
+        return "none", "%s: no lane marker folder at %s" % (HOST_NONE, HOST_MARKERS)
+    except OSError as exc:
+        return "unknown", "the lane marker folder could not be read (%s)" % exc
+    for name in names:
+        try:
+            home = getpwnam(name).pw_dir
+        except KeyError:
+            continue
+        except Exception as exc:                       # an unreadable account list is not "none"
+            return "unknown", "the account %s could not be looked up (%s)" % (name, exc)
+        if isdir(home):
+            return "yes", "the pipeline's account %s and its home folder are here" % name
+    return "none", "%s: no marker names an account that exists with a home folder" % HOST_NONE
+
+
+def host_outcome(io):
+    state, why = io.host_state()
+    return {"yes": OUT_OK, "none": OUT_WAITING}.get(state, OUT_UNMEASURED), (
+        why if state != "unknown" else "not measured: " + why)
+
+
 def outcome_of_check(code, out):
     """A part's own read-only check, read the one way for every part: 0 is up to date, 10 is
     waiting on you, and anything else, a child that did not finish included, is a thing that
@@ -1249,6 +1295,8 @@ def build_records(io, parts, rep, files, reached):
                 code, out = seen[tuple(argv)]
                 rec["outcome"], rec["detail"] = outcome_of_check(code, out)
                 texts[part["id"]] = out or ""
+        elif part["id"] == "host" and not io.interrupted:
+            rec["outcome"], rec["detail"] = host_outcome(io)
         else:
             nocheck.append(part["name"])
             continue
@@ -1341,7 +1389,16 @@ def finish(io, parts, rep, files, reached, stop_code, stopped, unreadable=None):
                "a pass (exit %d)." % (counts[OUT_UNMEASURED], counts[OUT_NOT_REACHED], code))
     mine, signs, lone = short_list(parts, records, texts)
     io.say("")
-    if not (mine or signs or lone):
+    hosts = [r for r in records if r["id"] == "host" and r["outcome"] == OUT_WAITING]
+    if hosts:
+        # The host comes first, ahead of every other item (KIT-756), and is not named twice.
+        lone = [n for n in lone if n != hosts[0]["name"]]
+        io.say("Build this first. Nothing else here works without it (%s):" % hosts[0]["name"])
+        for step in next(p for p in parts if p["id"] == "host").get("person_steps") or []:
+            io.say("  - %s" % step["words"])
+        io.say("  %s" % HOST_FIRST)
+        io.say("")
+    if not (mine or signs or lone or hosts):
         if counts[OUT_WAITING] == 0:
             io.say("Nothing is waiting on you.")
         return code
@@ -1609,7 +1666,7 @@ class FakeIo(Io):
     program this case did not script is a failure of the case, never a silent pass."""
 
     def __init__(self, codes=None, answers=(), env=None, uid=501, tty=True, git_state=None,
-                 steps=None, typed=None, record=None, conf=None):
+                 steps=None, typed=None, record=None, conf=None, host=None):
         # The first screen and the consent read lines from `typed` (default: Manual, then
         # yes), so the cases written before them keep their meaning. `record` is what the
         # consent record reads as: (state, data, why). Everything the new seams do is logged.
@@ -1619,6 +1676,7 @@ class FakeIo(Io):
         self.record_reads = []
         self.conf = dict(conf or {})
         self.conf_reads = []
+        self.host = host or ("yes", "the pipeline's account _x and its home folder are here")
         # The ask (KIT-735) finds nothing unless a case scripts it, so a machine's own settings
         # files can never reach a case written before it. Its battery (pipeline_ask.py) puts the
         # real seams back over files of its own.
@@ -1701,6 +1759,9 @@ class FakeIo(Io):
         if path.startswith(KIT + os.sep):
             return path in self.present
         return os.path.exists(path)
+
+    def host_state(self):
+        return self.host
 
     def parts(self):
         if isinstance(self.parts_list, Exception):
@@ -1942,7 +2003,7 @@ def selftest_look(check, base, se_conf, tmp):
           (io.lines[:3], "only looked" in ONLY_LOOKED, "changed nothing" in ONLY_LOOKED),
           (["", "== 0. Where this is running", ONLY_LOOKED], True, True))
     closing = [ln for ln in io.lines if ln.startswith("No check of their own: ")]
-    bare = [p["name"] for p in real if not step_of(p) and not p.get("check")]
+    bare = [p["name"] for p in real if not step_of(p) and not p.get("check") and p["id"] != "host"]
     line_of = lambda r: "  %-22s %s%s" % (r["outcome"], r["name"],                 # noqa: E731
                                           " (%s)" % r["detail"] if r["detail"] else "")
     check("kit736-one-line-per-part-in-the-parts-list",
@@ -2470,6 +2531,46 @@ def selftest():
           [r["detail"] for r in io.records if r["id"] == "cleanup"], ["no sweep.conf in %s" % tmp])
     check("lines-a-part-off-never-runs-its-check",
           "pipeline_notifier_setup.py run" in io.measured, False)
+
+    # 9c. KIT-756: the host. Read-only; a Mac with none puts building it first on the closing
+    #     list; one that has it says nothing; one that cannot be told is never "has one".
+    check("kit756-a-mac-with-a-host-reads-up-to-date-and-is-not-on-the-list",
+          (by_id(go()[1])["host"], any("Build this first" in ln for ln in go()[1].lines)),
+          (OUT_OK, False))
+    code, io = go(host=("none", HOST_NONE + ": test"))
+    lines = io.lines
+    at = [i for i, ln in enumerate(lines) if ln.startswith("Build this first")]
+    check("kit756-no-host-reads-waiting-and-exits-10",
+          (by_id(io)["host"], code), (OUT_WAITING, EX_BLOCKED))
+    check("kit756-no-host-is-the-first-item-with-its-steps-and-the-guide",
+          (len(at), lines[at[0] + 1].startswith("  - Build the host"),
+           any(ln == "  " + HOST_FIRST for ln in lines), "docs/HOST.md" in HOST_FIRST),
+          (1, True, True, True))
+    others = [i for i, ln in enumerate(lines) if ln.startswith(("Only you can do these:",
+                                                                 "Sign-offs still asked for:"))
+              or ln.endswith(" is waiting on you; its own lines above say what for.")]
+    check("kit756-the-host-comes-before-every-other-list-item",
+          all(at[0] < i for i in others), True)
+    check("kit756-the-host-is-not-named-a-second-time",
+          sum(1 for ln in lines if "host" in ln.lower() and ln.endswith("is waiting on you; its own lines above say what for.")), 0)
+    code, io = go(host=("unknown", "the lane marker folder could not be read (x)"))
+    check("kit756-an-unreadable-host-is-not-measured-never-has-one",
+          (by_id(io)["host"], code, [r["detail"] for r in io.records if r["id"] == "host"][0][:13]),
+          (OUT_UNMEASURED, EX_UNMEASURED, "not measured:"))
+    code, io = go(host=("none", HOST_NONE))
+    check("kit756-the-host-is-no-longer-on-the-no-check-line",
+          any("The always-on machine" in ln and ln.startswith("No check of their own") for ln in io.lines), False)
+    Pw = type("Pw", (), {"pw_dir": "/home/x"})
+    check("kit756-host-state-no-folder-is-none",
+          host_state(listdir=lambda p: (_ for _ in ()).throw(FileNotFoundError()))[0], "none")
+    check("kit756-host-state-unreadable-is-unknown",
+          host_state(listdir=lambda p: (_ for _ in ()).throw(PermissionError()))[0], "unknown")
+    check("kit756-host-state-marker-without-account-is-none",
+          host_state(listdir=lambda p: ["_a"], getpwnam=lambda n: (_ for _ in ()).throw(KeyError(n)))[0], "none")
+    check("kit756-host-state-account-without-home-is-none",
+          host_state(listdir=lambda p: ["_a"], getpwnam=lambda n: Pw, isdir=lambda d: False)[0], "none")
+    check("kit756-host-state-account-with-home-is-yes",
+          host_state(listdir=lambda p: ["junk", "_a"], getpwnam=lambda n: Pw, isdir=lambda d: True)[0], "yes")
 
     # up to date vs updated, from the step's own result
     code, io = go(codes={"sync_user_skills.py --apply": 0, "sync_user_skills.py": [1]},
