@@ -1433,7 +1433,11 @@ def run_cases(check):
           ("update-conf" in helped, "bridge-conf" in helped), (False, False))
     install_src = open(os.path.join(HERE, "pipeline_install.py"), encoding="utf-8").read()
     check("kit735-the-flags-default-to-the-kit-folder",
-          ('os.path.join(KIT, "update.conf")' in install_src, 'os.path.join(KIT, "bridge.conf")' in install_src),
+          ('os.path.join(KIT, "update.conf")' in install_src,
+           # KIT-752: the bridge's file is the kit folder's unless the machine's one place says
+           # it is kept elsewhere; conf_path falls back to the kit folder.
+           'conf_path("bridge.conf", {})' in install_src
+           and pi.conf_path("bridge.conf", {}) == os.path.join(pi.KIT, "bridge.conf")),
           (True, True))
     for verb in ("pr " + "merge", "--" + "approve", "--add-" + "label", "auto-" + "merge"):
         check("kit735-no-verb:%s" % verb, verb in src, False)

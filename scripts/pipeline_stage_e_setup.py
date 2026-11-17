@@ -6604,7 +6604,73 @@ NOTIFIER_DEFAULT_STATE_DIR = "~/.stage-e/state"
 _RUN_INTERVAL_RE = re.compile(r"^\s*run interval = (\d+) seconds?\s*$", re.MULTILINE)
 
 
-def monitor_config(conf, notifier=None, catchup=False, status=False):
+# The Slack bridge (the tech lead), as a watched job (KIT-752). It is found by what its plist RUNS,
+# the way `clone_jobs` finds every job that runs from the clone, so no conf key names it and no
+# person picks a scope: where the bridge runs, the monitor watches it. Its heartbeat directory is
+# the `state_dir` of its own config, read as the role account; absent there, the default.
+BRIDGE_WATCH_JOB = "bridge"
+BRIDGE_ENTRY_SCRIPT = "pipeline_bridge.py"
+BRIDGE_CONFIG_FILE = "bridge.json"
+BRIDGE_DEFAULT_STATE_DIR = "~/.stage-e/state"
+
+
+def measure_bridge(ctx):
+    """What the monitor needs to watch the bridge, measured; never raises.
+    None: no installed job runs the bridge here. {"paused": True, "label"}: its plist is installed
+    and launchd does not hold it. {"unread": why}: it could not be told, which is said by name and
+    never read as "not running here". Else {"label", "interval", "state_dir"}."""
+    try:
+        mine = [(label, loaded) for label, loaded, entry in clone_jobs(ctx)
+                if entry == BRIDGE_ENTRY_SCRIPT]
+        if not mine:
+            return None
+        label, loaded = sorted(mine)[0]
+        if not loaded:
+            return {"label": label, "paused": True}
+        text = ""
+        got = ctx.runner.as_root(["launchctl", "print", "system/" + label])
+        text = (got.out or "") + (got.err or "")
+        found = _RUN_INTERVAL_RE.search(text)
+        if not got.ok or not found:
+            return {"label": label, "unread": "launchd gave no run interval for system/%s" % label}
+        runs = _notifier_config_arg(text)
+        tail = "/.stage-e/" + BRIDGE_CONFIG_FILE
+        if runs not in ("$HOME" + tail, "${HOME}" + tail, "~" + tail,
+                        (ctx.role_home or "-").rstrip("/") + tail):
+            return {"label": label, "unread": "system/%s runs on a config this step does not "
+                                              "read (%s)" % (label, runs or "none named")}
+        cfg = ctx.runner.as_role(ctx.account, 'f="%s/%s"; [ -e "$f" ] || exit 9; cat "$f"'
+                                 % (ctx.stage_home, BRIDGE_CONFIG_FILE))
+        if cfg.rc == 9:
+            return {"label": label, "unread": "~/.stage-e/%s is missing" % BRIDGE_CONFIG_FILE}
+        doc = json.loads(cfg.out) if cfg.ok else None
+        if not isinstance(doc, dict):
+            return {"label": label, "unread": "~/.stage-e/%s could not be read" % BRIDGE_CONFIG_FILE}
+        state_dir = doc.get("state_dir") or BRIDGE_DEFAULT_STATE_DIR
+        if not isinstance(state_dir, str):
+            return {"label": label, "unread": "its state_dir is not a path"}
+        return {"label": label, "interval": int(found.group(1)), "state_dir": state_dir}
+    except (Unknown, SetupError, ValueError, OSError) as exc:
+        return {"unread": "the bridge's job could not be looked up (%s)" % str(exc)[:120]}
+
+
+def _bridge_watched(bridge):
+    return bridge if bridge and "interval" in bridge else None
+
+
+def _bridge_watch_note(bridge):
+    if not bridge:
+        return "the bridge is not watched: no installed job runs it here"
+    if bridge.get("paused"):
+        return "the bridge is paused (system/%s is installed, not loaded): not watched" % bridge["label"]
+    if bridge.get("unread"):
+        return "the bridge is NOT watched, because it could not be measured: %s" % bridge["unread"]
+    return ("it watches the bridge system/%s: every %d + %d s pass = %d s"
+            % (bridge["label"], bridge["interval"], MONITOR_DAEMON_PASS_SECONDS,
+               bridge["interval"] + MONITOR_DAEMON_PASS_SECONDS))
+
+
+def monitor_config(conf, notifier=None, catchup=False, status=False, bridge=None):
     """The monitor's config, from the same conf values the four daemons are scheduled
     by — so its idea of "stale" follows the interval launchd really uses.
 
@@ -6647,6 +6713,11 @@ def monitor_config(conf, notifier=None, catchup=False, status=False):
         doc["status_file"] = status_file(conf)
     doc["watch"].append(PLANNER_WATCH_JOB)
     doc["intervals"][PLANNER_WATCH_JOB] = MONITOR_PLANNER_SECONDS
+    bridge = _bridge_watched(bridge)
+    if bridge:
+        doc["watch"].append(BRIDGE_WATCH_JOB)
+        doc["intervals"][BRIDGE_WATCH_JOB] = bridge["interval"] + MONITOR_DAEMON_PASS_SECONDS
+        doc["bridge_state_dir"] = bridge["state_dir"]
     if notifier:
         doc["watch"].append(NOTIFIER_WATCH_JOB)
         doc["intervals"][NOTIFIER_WATCH_JOB] = notifier["interval"] + notifier["run_timeout"]
@@ -7210,7 +7281,8 @@ def step_heartbeat_monitor(ctx, apply_it):
     watch_note = _notifier_watch_note(notifier)
     # The row is cut at 96 characters when printed, and this clause sits at its end, so it is
     # ALSO returned as a note, which prints whole — watched, paused, or not configured.
-    watch_notes = [watch_note, _health_watch_note(conf)]
+    bridge = measure_bridge(ctx)
+    watch_notes = [watch_note, _health_watch_note(conf), _bridge_watch_note(bridge)]
     catchup_on = (not catchup_off(conf)
                   and r.read(["test", "-f", _dispatcher_plist(catchup_label(conf))]).ok)
     watch_notes.append("it watches the catch-up poller" if catchup_on else
@@ -7221,7 +7293,8 @@ def step_heartbeat_monitor(ctx, apply_it):
                        "the status job is not watched: it is not installed")
     watch_notes.append("it watches the planner job from its first heartbeat, and says until "
                        "then that it is not running here yet")
-    want_conf = monitor_config(conf, notifier, catchup=catchup_on, status=status_on)
+    want_conf = monitor_config(conf, notifier, catchup=catchup_on, status=status_on,
+                               bridge=bridge)
     want_plist = _monitor_plist(ctx)
     got = r.as_role(ctx.account, "cat %s/%s 2>/dev/null" % (ctx.stage_home, MONITOR_CONFIG))
     try:
@@ -16733,6 +16806,59 @@ def _selftest_body():
         expect("notifier-watch-off", okNU is True and "notifier" in detailNU
                and "NOTIFIER_JOB_LABEL" in detailNU and "not watched" in detailNU,
                "an unwatched notifier must be named as such: %r" % detailNU)
+
+        # KIT-752: where the bridge runs, the monitor watches it. Found from the installed job
+        # (what its plist runs), never from a conf key; a bridge that could not be measured is
+        # said by name and never read as "not running here".
+        _bprint = ("system/com.example.bridge = {\n\tprogram = /bin/sh\n\targuments = {\n\t\t/bin/sh\n"
+                   "\t\t-c\n\t\tset -a; . \"$HOME/.stage-e/env\"; set +a; exec /usr/bin/python3 "
+                   "\"$HOME/.stage-e/kit/scripts/pipeline_bridge.py\" run --config "
+                   "\"$HOME/.stage-e/bridge.json\"\n\t}\n\trun interval = 120 seconds\n}\n")
+        _real_clone_jobs = globals()["clone_jobs"]
+
+        def _bridge_ctx(jobs, printed=(0, _bprint), bconf=('{"state_dir": "~/.stage-e/bstate"}', 0)):
+            ctx_b, fake_b = _monitor_ctx()
+            fake_b.answers = [("launchctl print system/com.example.bridge", printed[0], printed[1]),
+                              (".stage-e/" + BRIDGE_CONFIG_FILE, bconf[1], bconf[0])] + fake_b.answers
+            globals()["clone_jobs"] = lambda _c: jobs
+            return ctx_b
+
+        try:
+            _b = measure_bridge(_bridge_ctx([("com.example.bridge", True, "pipeline_bridge.py")]))
+            expect("bridge-watch-found-from-the-installed-job",
+                   _b == {"label": "com.example.bridge", "interval": 120,
+                          "state_dir": "~/.stage-e/bstate"}, "measured %r" % (_b,))
+            expect("bridge-watch-none-when-no-job-runs-it",
+                   measure_bridge(_bridge_ctx([("com.example.notifier", True, "pipeline_notify_local.py")])) is None,
+                   "a machine with no bridge job must not watch one")
+            expect("bridge-watch-paused-is-not-watched-and-said",
+                   _bridge_watched(measure_bridge(_bridge_ctx([("com.example.bridge", False, "pipeline_bridge.py")]))) is None
+                   and "paused" in _bridge_watch_note({"label": "x", "paused": True}),
+                   "a paused bridge must not be watched")
+            _bu = measure_bridge(_bridge_ctx([("com.example.bridge", True, "pipeline_bridge.py")],
+                                             bconf=("", 9)))
+            expect("bridge-watch-unreadable-is-said-never-clear",
+                   _bridge_watched(_bu) is None and "NOT watched" in _bridge_watch_note(_bu),
+                   "an unread bridge config read %r" % (_bu,))
+        finally:
+            globals()["clone_jobs"] = _real_clone_jobs
+        _bw = {"label": "com.example.bridge", "interval": 120, "state_dir": "~/.stage-e/bstate"}
+        _bdoc = monitor_config(_monitor_conf("KIT-7")[0], bridge=_bw)
+        expect("bridge-watch-in-the-monitor-config",
+               "bridge" in _bdoc["watch"] and _bdoc["intervals"]["bridge"] == 120 + MONITOR_DAEMON_PASS_SECONDS
+               and _bdoc["bridge_state_dir"] == "~/.stage-e/bstate"
+               and "bridge" not in monitor_config(_monitor_conf("KIT-7")[0])["watch"],
+               "a running bridge must be in the watch list: %r" % (_bdoc,))
+        _bpath = os.path.join(_mdir, "monitor-bridge.json")
+        with open(_bpath, "w", encoding="utf-8") as fh:
+            json.dump(dict(_bdoc, state_dir=os.path.join(_mdir, "s"),
+                           finding_state_dir=os.path.join(_mdir, "f"),
+                           bridge_state_dir=os.path.join(_mdir, "b")), fh)
+        try:
+            expect("bridge-watch-accepted-by-the-monitors-loader",
+                   "bridge" in hbm.load_config(_bpath)["watch"], "the monitor refused the bridge")
+        except hbm.MonitorError as exc:
+            failures.append("bridge-watch-accepted-by-the-monitors-loader: %s" % exc)
 
         # Watched and settled: the monitor already watches it, with launchd's interval plus
         # the notifier's own pass clock, and its own state dir. Nothing is written.
