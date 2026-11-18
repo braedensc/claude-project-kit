@@ -413,6 +413,10 @@ npm run test:stdlib-only    # the kit's Python imports only the standard library
 npm run lint:stdlib-only    # …and the same check over this repo's tracked .py files
 npm run test:pr-base         # PR-base gate: a PR's base must be a base branch; an unknown
                              #   event or missing value FAILS, main() itself is exercised
+npm run test:label-gate      # the label gate runs the default branch's workflow and code on
+                             #   pull_request_target, never the PR's: one closed reason per rule (KIT-668)
+npm run test:gate-policy     # the owner's Actions policy that lets the gate run after 2 Dec 2026:
+                             #   check, show, one typed yes, one POST, read back; refused under a model
 npm run test:alert-pages     # alert templates page a person (ALERT_PAGE_TO, else a user
                              #   owner) or fail their run; runs each copy under node
 npm run lint:secrets    # secretlint over every tracked file, read as git stores it
