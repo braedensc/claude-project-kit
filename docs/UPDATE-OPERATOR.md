@@ -263,6 +263,13 @@ python3 scripts/pipeline_watch.py install          # shows a pass that sends not
 python3 scripts/pipeline_watch.py status           # the last pass, per kind
 ```
 
+**The one command checks it too** (`python3 scripts/pipeline_install.py`, step 3f) when this Mac has an `update.conf`.
+It looks, and changes nothing, at whether the job file is there, names this kit, this settings file and this interval,
+and is held by launchd. If not, it asks, then runs the `install` above, which still shows its dry pass and asks for its
+own `yes`. It looks again after, and a job it did not see loaded reads "could not be measured", never "updated".
+Its line says whether the job is installed and current, not what a pass finds: run `pipeline_watch.py run --dry-run`
+or `status` for that.
+
 `install` refuses in an agent environment. It records the `brew`, `gh`, `npm` and `git`
 directories your shell has now in the job's `PATH`. Re-run it after moving any of them. A
 "no" changes nothing: a job already loaded keeps running.
