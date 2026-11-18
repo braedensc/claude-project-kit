@@ -180,10 +180,12 @@ usage job reads every ledger beside the logs and counts its calls into the day a
 The usage file's `spend` names each ledger, and the pass's summary says one line for each.
 
 Good: `spend    morning         read, 1 call, $0.04`. Not that: `spend    tech_lead       could-not-read: ...`. The
-reason names what to check. That ledger's calls are not counted, never as zero, and the pass is `partial`.
+reason names what to check. That ledger's calls are not counted, never as zero, and the pass is `partial`. A call
+whose row could not be written is marked beside its ledger, and the line says it was not counted.
 
-The three ledgers in the role account's home are read by default. The waker runs as you, so its ledger is in your own
-home, where the role account cannot read. It stays `off`, and the waker's calls are not counted.
+No caller writes its ledger yet. KIT-687 adds the writers, and with them turns on the three ledgers in the role
+account's home. Until then each line says `off`, never `read` with no calls. The waker runs as you, so its ledger is in
+your own home, where the role account cannot read. It stays `off`, and the waker's calls are not counted.
 
 ## Pausing it
 

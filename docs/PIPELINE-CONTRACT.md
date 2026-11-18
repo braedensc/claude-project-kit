@@ -2296,8 +2296,9 @@ and its calls, unpriced calls, dollars, models and billing in the lookback's day
 `could-not-read` (its folder is missing, this account may not read it, or no line is a row) has no
 calls counted, and **no figure: null, never zero**, and `result` is `partial`. A `partly-read`
 ledger makes it `partial` too: some of its lines were not rows, and only the rows it read are
-counted. A ledger not written yet, in a folder that exists, is `read` with no calls. A missing
-folder's reason names the config key to check.
+counted. A ledger not written yet, in a folder that exists, is `read` with no calls, unless its
+mark says a call lost its row (§30). A missing folder's reason names the config key to check. No
+caller writes its ledger yet (KIT-687 adds them), so the config's defaults leave every ledger off.
 
 The fixed lines are `Stage E bounce`, `Stage E conflict fix` and `Catch-up`, as the bounce driver
 and the catch-up job write them; the selftest reads their source to keep this true. The kind of
@@ -2380,12 +2381,12 @@ Words from the closed lists and numbers only: nothing a run said is kept.
   },
   "judge": {"state": "read", "reason": null},
   "spend": {
-    "morning": {"state": "read", "reason": null, "calls": 6, "unpriced": 0, "usd": 0.9,
-                "models": {"claude-sonnet-5-5": 6}, "billing": {"plan": 6}},
-    "standup": {"state": "read", "reason": null, "calls": 11, "unpriced": 1, "usd": 0.5,
-                "models": {"claude-sonnet-5-5": 10}, "billing": {"plan": 11}},
-    "tech_lead": {"state": "read", "reason": null, "calls": 31, "unpriced": 0, "usd": 4.2,
-                  "models": {"claude-sonnet-5-5": 31}, "billing": {"plan": 31}},
+    "morning": {"state": "read", "reason": null, "calls": 4, "unpriced": 0, "usd": 0.6,
+                "models": {"claude-sonnet-5-5": 4}, "billing": {"plan": 4}},
+    "standup": {"state": "read", "reason": null, "calls": 8, "unpriced": 1, "usd": 0.4,
+                "models": {"claude-sonnet-5-5": 7}, "billing": {"plan": 8}},
+    "tech_lead": {"state": "read", "reason": null, "calls": 20, "unpriced": 0, "usd": 3.1,
+                  "models": {"claude-sonnet-5-5": 20}, "billing": {"plan": 20}},
     "conflict_waker": {"state": "off", "reason": null, "calls": null, "unpriced": null, "usd": null,
                        "models": null, "billing": null}
   },
@@ -2395,7 +2396,7 @@ Words from the closed lists and numbers only: nothing a run said is kept.
     "resets_at": "2026-11-06T09:00:00Z",
     "usd": 42.337,
     "runs": 142,
-    "unpriced": 2,
+    "unpriced": 3,
     "seconds": 51234,
     "by_kind": {
       "tech_lead": {"runs": 20, "usd": 3.1}, "review": {"runs": 18, "usd": 6.5},
@@ -2408,7 +2409,7 @@ Words from the closed lists and numbers only: nothing a run said is kept.
     "by_model": {"claude-opus-5-5": 30.2, "claude-sonnet-5-5": 12.137}
   },
   "days": [
-    {"date": "2026-11-02", "usd": 9.75, "runs": 34, "unpriced": 0, "seconds": 11800, "by_kind": {
+    {"date": "2026-11-02", "usd": 9.75, "runs": 34, "unpriced": 1, "seconds": 11800, "by_kind": {
       "tech_lead": {"runs": 4, "usd": 0.8}, "review": {"runs": 5, "usd": 1.9},
       "planner": {"runs": 1, "usd": 0.6}, "coding": {"runs": 10, "usd": 4.1},
       "bounce_fix": {"runs": 4, "usd": 1.2}, "conflict_fix": {"runs": 1, "usd": 0.3},
@@ -2449,7 +2450,9 @@ Words from the closed lists and numbers only: nothing a run said is kept.
 The example leaves out six of the lookback's eight days, and five of the week's pieces, for
 room. The ledger's review record that could not be read makes the pass `partial`. Two runs
 signed in with a key, and one of them was a chat, so one is listed. Three spend ledgers were
-read, and one stand-up call could not be priced and named no model; the waker's ledger is off.
+read, and every call in them falls inside the week, so each ledger's figures are its kind's for the
+week: the tech lead's 20 runs are all its turns. One stand-up call, on 2 November, could not be
+priced and named no model: it is one of the week's three unpriced runs. The waker's ledger is off.
 
 ### The file
 
@@ -2581,7 +2584,7 @@ that shows.
 | `stage_e_state_dir` | `~/.stage-e/state` | Stage E's state folder. An empty string turns the `ledger` source off. |
 | `stage_a_state_dir` | `~/.stage-a/state` | The idea gate's state folder. An empty string turns the `planner` source off. |
 | `judge_file` | empty: off | The watcher judge's `judge-calls.json` (KIT-569): each call's time and dollars, no words. Empty turns the judge's cost off, and the file's `judge` says `off`. |
-| `spend_ledgers` | the three in the role account's home; the waker's off | For each caller, its spend ledger's path (§30, KIT-844): `morning` `~/.stage-e/queue/morning-spend.jsonl`, `standup` `~/.stage-e/state/standup-spend.jsonl`, `tech_lead` `~/.stage-e/state/tech-lead-spend.jsonl`, `conflict_waker` empty. A caller left out keeps its default, and an empty path turns its ledger off. The waker's ledger is in the owner's home, which the role account cannot read, so it is named only where this account can read it. A path inside a git working tree is a config error. |
+| `spend_ledgers` | every one off | For each caller, its spend ledger's path (§30, KIT-844), where its job writes it: `morning` `~/.stage-e/queue/morning-spend.jsonl`, `standup` `~/.stage-e/state/standup-spend.jsonl`, `tech_lead` `~/.stage-e/state/tech-lead-spend.jsonl`. An empty path, or a caller left out, turns its ledger off. No caller writes its ledger yet: KIT-687 adds the writers and names the three role-account ledgers by default. Until then each is off, since a ledger nothing writes would read as no calls. The waker's ledger is in the owner's home, which the role account cannot read, so it is named only where this account can read it. A path inside a git working tree is a config error. |
 | `reviews_team_key` | empty | Optional (KIT-596): the key of an old separate Reviews team, such as `REV`. A review on a work team is told by the review poller's record, and a record that cannot be read is said in the Stage E source. |
 | `out` | `~/.stage-e/usage/usage.json` | Where the file is written, outside every git working tree. |
 | `lookback_days` | 8 | How many local dates the file covers, from 1 to 31. |
@@ -3470,11 +3473,17 @@ reads every ledger beside the dispatcher's logs (KIT-844). Machine-readable:
 builds a row from the CLI's JSON output. `append()` adds it, and nothing else writes a ledger.
 `read()` is the one reader, and the usage job reads every ledger through it.
 
-**Append-only, one line at a time.** `append()` stamps the row's time, refuses a row that is not
-one and a ledger inside a git working tree, and adds the row as one line at the ledger's end, in
-one write, never through a link. A last line that a crash left without its line break gets one
-first, so the torn row stays one bad line and the new row stays whole. A caller that cannot add its
-row says so in its own output: the call happened, and the usage file is short by it.
+**Append-only, one line at a time.** `append()` stamps the row's time, checks the row, and adds
+it as one line at the ledger's end, in one write, never through a link. A last line that a crash
+left without its line break gets one first, so the torn row stays one bad line and the new row
+stays whole.
+
+**A lost row is never read as no call.** When the row is not one, or the ledger cannot be written,
+`append()` raises, and first adds the call's time as one line to a mark beside the ledger,
+`<ledger>.failed`. The reader counts each time in the mark from the time asked for: the ledger is
+then `partly-read`, or `could-not-read` when no row could be trusted. A folder that takes no write
+at all (a full disk, say) cannot hold the mark either, and then the caller's own output is the
+only word (Stage E on #622).
 
 **Fields only.** Numbers, closed words, a model name that matches §17's pattern, a session id and a
 time. No prompt, reply or error text reaches a row.
@@ -3497,7 +3506,9 @@ one row per line, oldest first, only ever added to, mode 644.
 
 The first three are in the role account's home, where the usage job runs. The waker runs as a
 person, so its ledger is in that person's home, which the role account cannot read: the usage job
-leaves it off unless its config names it.
+leaves it off unless its config names it. **No caller writes its ledger yet.** KIT-687 adds the
+writers, and with them names the three role-account ledgers in the usage job's defaults. Until then
+every ledger is off there, since a ledger nothing writes would read as no calls.
 
 ### A row
 
@@ -3527,14 +3538,17 @@ fixed words. It never quotes a line of the ledger.
 | State | When |
 |---|---|
 | `off` | No path is named. |
-| `read` | Every line is a row of this ledger. A ledger not written yet, in a folder that exists, is read: no call yet. |
-| `partly-read` | Some lines are not rows of this ledger, or its end does not reach back to the time asked for. The rows it read are given. |
-| `could-not-read` | Its folder is missing, this account may not read it, it is a link or not a regular file, or no line is a row. No calls are given at all, never an empty list, so nothing can count it as zero. |
+| `read` | Every line is a row of this ledger, and its mark records no failed call from the time asked for. A ledger not written yet, in a folder that exists, is read: no call yet. |
+| `partly-read` | Some lines are not rows of this ledger, its mark records a failed call, or its end does not reach back to the time asked for. The rows it read are given. |
+| `could-not-read` | Its folder is missing, this account may not read it, it is a link or not a regular file, it is inside a git working tree (where a session could write rows), or no row could be trusted. No calls are given at all, never an empty list, so nothing can count it as zero. |
 
 A line is left out when it is longer than 2 KiB, is not JSON, is not a row, or is another caller's
-row. Rows are appended in time order, so a bad line before a row older than the time asked for is
-older still, and it does not make the read partial: a row a crash tore months ago does not mark the
-ledger forever. Past 4 MiB only the ledger's end is read, which holds over ten thousand rows.
+row. Rows are appended in time order, so a bad line that comes before the first row from the time
+asked for, and before a row older than that time, is older still: it does not make the read
+partial, and a row a crash tore months ago does not mark the ledger forever. A bad line after a row
+from the time asked for always counts, even when a row stamped older follows it: that only says the
+clock went back (Stage E on #622). Past 4 MiB only the ledger's end is read, which holds over ten
+thousand rows. The same holds for the mark.
 
 ### Who reads it
 

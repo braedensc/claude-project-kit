@@ -86,15 +86,18 @@ DEFAULT_DISPATCHER_HOME = "~/.cyrus"
 DEFAULT_STAGE_E_STATE = "~/.stage-e/state"
 DEFAULT_STAGE_A_STATE = "~/.stage-a/state"
 DEFAULT_OUT = "~/.stage-e/usage/usage.json"
-# Each caller's spend ledger where its job writes it with its installer's defaults (contract §30):
-# the morning job's beside the day plan, the stand-up's and the tech lead's in the bridge's state
-# folder. The waker's is in the person's own home, which this account cannot read: off.
-DEFAULT_SPEND_LEDGERS = {
+# Where each caller's job writes its spend ledger with its installer's defaults (contract §30): the
+# morning job's beside the day plan, the stand-up's and the tech lead's in the bridge's state folder.
+# The waker's is in the person's own home, which this account cannot read, so it has none here.
+SPEND_LEDGER_PATHS = {
     "morning": "~/.stage-e/queue/" + spend_ledger.FILE_NAMES["morning"],
     "standup": "~/.stage-e/state/" + spend_ledger.FILE_NAMES["standup"],
     "tech_lead": "~/.stage-e/state/" + spend_ledger.FILE_NAMES["tech_lead"],
-    "conflict_waker": "",
 }
+# No caller writes its ledger yet, so every one is off by default: a ledger nothing writes would read
+# as no calls, a zero nobody measured (Stage E on #622). KIT-687 adds the writers, and with them
+# makes SPEND_LEDGER_PATHS the defaults.
+DEFAULT_SPEND_LEDGERS = dict((caller, "") for caller in spend_ledger.CALLERS)
 DEFAULT_LOOKBACK_DAYS = 8
 MAX_LOOKBACK_DAYS = 31
 
@@ -151,11 +154,10 @@ CONFIG_KEYS = {
     "judge_file": "the watcher judge's judge-calls.json, whose calls the judge's cost is read "
                   "from (default: empty, which turns this source off)",
     "spend_ledgers": "for each caller (%s), its spend ledger's path, absolute or ~/ (contract "
-                     "section 30); a caller left out keeps its default, and \"\" turns its "
-                     "ledger off (default %s)"
+                     "section 30), where its job writes it: %s. \"\" or a caller left out turns "
+                     "its ledger off, and every one is off by default until its caller writes it"
                      % (", ".join(spend_ledger.CALLERS),
-                        ", ".join("%s %s" % (k, v or "off")
-                                  for k, v in sorted(DEFAULT_SPEND_LEDGERS.items()))),
+                        ", ".join("%s %s" % kv for kv in sorted(SPEND_LEDGER_PATHS.items()))),
     "reviews_team_key": "optional: the KEY of an old Reviews team, e.g. \"REV\": a run in a folder "
                         "that starts with KEY- is a review (default: empty, which leaves it out)",
     "out": "where the file is written; absolute or ~/, outside every git working tree "
@@ -1218,6 +1220,19 @@ def _cases(check):
             check("…and the summary names it",
                   any(l.startswith("  spend    %s" % caller) and "could-not-read" in l
                       for l in said_u), True)
+        root_k = os.path.join(tmp, "spend-marked")
+        marked = spend_world(root_k)
+        with open(marked["morning"] + spend_ledger.FAILED_SUFFIX, "w") as fh:
+            fh.write("2026-11-03T10:00:00Z\n")
+        cfg_k2, _ = std_world(root_k, spend_ledgers=marked)
+        code_k, _said_k = go(cfg_k2)
+        doc_k2 = written(cfg_k2)
+        check("a call whose row could not be written is said from its ledger's mark: partly read, "
+              "the rows it read still count, the pass partial (Stage E on #622)",
+              (code_k, dig(doc_k2, "result"), dig(doc_k2, "spend", "morning", "state"),
+               dig(doc_k2, "spend", "morning", "reason"), dig(doc_k2, "spend", "morning", "calls")),
+              (EXIT_PARTIAL, PARTIAL, PARTLY,
+               "1 call could not be recorded in it, so its spend is not counted", 2))
         code_q, _said_q, doc_q = spend_pass(
             "spend-partly", tech_lead=SPEND_ROWS["tech_lead"] + ["not a row"])
         check("a ledger with a line that is not a row is partly read: the rows it read count, "
@@ -1631,18 +1646,21 @@ def _cases(check):
         # KIT-844: each caller's spend ledger, its default unless named, off when empty.
         home_db = os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir)
         led = os.path.join(tmp, "ledgers")
-        check("spend_ledgers: a caller left out keeps its default, \"\" turns one off, and the "
-              "waker's is off unless named",
+        check("spend_ledgers: a caller named is read from its path, \"\" or a caller left out "
+              "is off",
               load_config(conf_file(dict(example, spend_ledgers={
                   "morning": os.path.join(led, "m.jsonl"), "standup": ""})))["spend_ledgers"],
-              {"morning": os.path.join(led, "m.jsonl"), "standup": "",
-               "tech_lead": os.path.join(home_db, ".stage-e", "state", "tech-lead-spend.jsonl"),
+              {"morning": os.path.join(led, "m.jsonl"), "standup": "", "tech_lead": "",
                "conflict_waker": ""})
-        check("…the defaults are where each job writes its ledger, under this account's home",
+        check("…every ledger is off by default until its caller writes it, never read as no calls "
+              "(Stage E on #622); a ~/ path is under this account's home",
               (load_config(conf_file(dict((k, v) for k, v in example.items()
-                                          if k != "spend_ledgers")))["spend_ledgers"]["morning"],
-               EXAMPLE_CONFIG["spend_ledgers"] == DEFAULT_SPEND_LEDGERS),
-              (os.path.join(home_db, ".stage-e", "queue", "morning-spend.jsonl"), True))
+                                          if k != "spend_ledgers")))["spend_ledgers"],
+               EXAMPLE_CONFIG["spend_ledgers"] == DEFAULT_SPEND_LEDGERS,
+               load_config(conf_file(dict(example, spend_ledgers={
+                   "morning": SPEND_LEDGER_PATHS["morning"]})))["spend_ledgers"]["morning"]),
+              (dict((c, "") for c in spend_ledger.CALLERS), True,
+               os.path.join(home_db, ".stage-e", "queue", "morning-spend.jsonl")))
         os.symlink(led, os.path.join(tmp, "ledgers-link"))
         check("…a ledger's folder is resolved and its file name kept, so a ledger that is a link "
               "is left for the reader to refuse",

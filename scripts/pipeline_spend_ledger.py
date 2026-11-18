@@ -21,17 +21,20 @@ was paid for. Fields only: numbers, closed words, a model name that matches a st
 session id and a time. A cost the caller could not read is null, never 0.
 
 THE WRITER.  `append()` stamps the row's time, checks the row, and adds it as one line at the end
-of the ledger, in one write, never through a link. It refuses a row that is not one, and a ledger
-inside a git working tree, and writes nothing then. A caller says in its own output that a row
-could not be added: the call happened, and its spend is then missing from the usage file.
+of the ledger, in one write, never through a link. A row that is not one, or a ledger it cannot
+write, raises, and first leaves a mark beside the ledger (`<ledger>.failed`, the time, one line per
+failed call) that the reader counts: a call whose row was lost is never read as no call (Stage E
+on #622). A folder that takes no write at all, a full disk say, cannot hold the mark either; the
+caller says so in its own output.
 
 THE READER.  `read()` gives a ledger's calls since a time, and a note: `read`, `partly-read`,
 `could-not-read` or `off`, and why, in fixed words. A ledger not written yet, in a folder that
-exists, has no calls yet. A ledger that cannot be read gives no calls at all: None, never an empty
-list, so nothing can count it as zero. A line that is not a row of this ledger is left out and
-said, unless a row older than the time asked for comes after it: appends come in time order, so
-that line is older still. Past READ_MAX bytes only the ledger's end is read, and an end that does
-not reach back to the time asked for is said too.
+exists, has no calls yet, unless its mark says a call failed. A ledger that cannot be read gives no
+calls at all: None, never an empty list, so nothing can count it as zero, and so does one inside a
+git working tree, where a session could write rows. A line that is not a row of this ledger is
+left out and said, unless it comes before the first row from the time asked for and before a row
+older than that time: appends come in time order, so that line is older still. Past READ_MAX bytes
+only the ledger's end is read, and an end that does not reach back to the time asked for is said.
 
 WHAT IT NEVER DOES (asserted in --selftest).  It opens no socket and starts no process. `read()`
 opens nothing for writing, and `append()` writes nothing but its one line.
@@ -78,8 +81,12 @@ NOT_ALLOWED = "this account may not read it"
 A_LINK = "it is a link, and a ledger is never read through one"
 NOT_REGULAR = "it is not a regular file"
 NOT_OPENED = "it could not be opened"
+IN_WORKTREE = "it is inside a git working tree, where a session could write rows"
 SHORT = ("only its last %d MiB were read, and they do not reach back to the time asked for"
          % (READ_MAX >> 20))
+UNMARKED = "its record of failed writes could not be read"
+# The mark a failed append leaves beside its ledger: one UTC time per failed call.
+FAILED_SUFFIX = ".failed"
 
 # Python's `$` also matches before a final line break, so every whole-value pattern ends with
 # `\Z`. MODEL_RE is the usage file's own (scripts/pipeline_usage_runs.py), which the selftest
@@ -227,20 +234,47 @@ def inside_git_worktree(path):
         cur = parent
 
 
+def _mark_failed(path, when):
+    """Best effort: the time of a call whose row could not be added, as one line in the ledger's
+    mark, never through a link. Nothing else of the call is kept."""
+    try:
+        fd = os.open(path + FAILED_SUFFIX, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW
+                     | os.O_NONBLOCK, 0o644)
+    except OSError:
+        return
+    try:
+        info = os.fstat(fd)
+        if stat.S_ISREG(info.st_mode):
+            if not info.st_size:
+                os.fchmod(fd, 0o644)
+            os.write(fd, (_iso(when) + "\n").encode("ascii"))
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
 def append(path, row, now=None):
     """THE ONE WRITER: `row` (from row_from_result), stamped with the time and added as one line at
     the end of the ledger at `path`, in one write, never through a link; a ledger it makes is
     mode 644. A last line a crash left without its line break gets one first, so the torn row
     stays one line and this row its own. Returns the row as written. ValueError for a row that is
-    not one, or a ledger inside a git working tree: nothing is written. OSError when the ledger
-    cannot be written."""
-    stamped = dict(row, at=_iso(time.time() if now is None else now))
-    problems = row_problems(stamped)
-    if problems:
-        raise ValueError("not a spend ledger row: " + problems[0])
-    if inside_git_worktree(os.path.dirname(os.path.abspath(path))):
-        raise ValueError("a spend ledger is never inside a git working tree: a session could "
-                         "write it")
+    not one, OSError for a ledger it cannot write: either way no row is written, and the call's
+    time goes in the ledger's mark of failed writes first, so the reader counts it."""
+    when = time.time() if now is None else now
+    stamped = dict(row, at=_iso(when))
+    try:
+        problems = row_problems(stamped)
+        if problems:
+            raise ValueError("not a spend ledger row: " + problems[0])
+        _write_row(path, stamped)
+    except (OSError, ValueError):
+        _mark_failed(path, when)
+        raise
+    return stamped
+
+
+def _write_row(path, stamped):
     data = (json.dumps(stamped, sort_keys=True, separators=(",", ":"), allow_nan=False)
             + "\n").encode("utf-8")
     flags = os.O_RDWR | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK
@@ -261,7 +295,6 @@ def append(path, row, now=None):
         os.fsync(fd)
     finally:
         os.close(fd)
-    return stamped
 
 
 # --------------------------------------------------------------------------- #
@@ -307,17 +340,76 @@ def _tail(fd, size):
     return b"".join(chunks), start
 
 
+def _rows(data, start, caller, since):
+    """(calls from `since` on, whether a row older than `since` was read, lines that were not
+    rows and may be calls from `since` on). A bad line that comes before the first row from
+    `since` and before a row older than `since` is older still: appends come in time order. One
+    after a row from `since` is from `since` on, whatever follows it: a later row stamped older
+    only says the clock went back (Stage E on #622)."""
+    lines = data.split(b"\n")
+    if start:
+        lines = lines[1:]             # cut by the tail, or the oldest row read: left unread
+    calls, pending, bad, reached, seen = [], 0, 0, False, False
+    for raw in lines:
+        if not raw.strip():
+            continue
+        row = _row_of(raw, caller)
+        if row is None:
+            if seen:
+                bad += 1
+            else:
+                pending += 1
+        elif row["epoch"] < since:
+            reached = True
+            if not seen:
+                pending = 0
+        else:
+            seen = True
+            calls.append(row)
+    calls.sort(key=lambda r: r["epoch"])
+    return calls, reached, bad + pending
+
+
+def _failures(path, since):
+    """How many calls from `since` on the ledger's mark says lost their row: 0 for no mark, and
+    None when the mark is there and cannot be read. A line that is not a time counts too."""
+    try:
+        fd = os.open(path + FAILED_SUFFIX, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    except OSError as exc:
+        return 0 if exc.errno == errno.ENOENT else None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            return None
+        data, start = _tail(fd, info.st_size)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    count = 0
+    for raw in data.split(b"\n")[1 if start else 0:]:
+        text = raw.strip().decode("ascii", "replace")
+        if text:
+            when = _epoch(text)
+            count += when is None or when >= since
+    return count
+
+
 def read(path, caller, since):
     """THE ONE READER: (note, calls) for the ledger at `path`, which holds `caller`'s rows.
 
     `calls` are the rows from `since` (seconds since 1970) on, oldest first, each with its time as
     `epoch` too. They are None when the ledger is off or could not be read: unknown, never an
     empty list. `note` is {"state", "reason"}, the reason in fixed words, never a line of the
-    ledger: `off` for no path; `could-not-read` when no row could be trusted; `partly-read` when
-    some lines were not this ledger's rows, or its end did not reach back to `since`; else `read`.
-    A ledger not written yet, in a folder that exists, is `read` with no calls."""
+    ledger: `off` for no path; `could-not-read` when no row could be trusted, or the ledger is
+    inside a git working tree; `partly-read` when some lines were not this ledger's rows, its mark
+    says a call from `since` on lost its row, or its end did not reach back to `since`; else
+    `read`. A ledger not written yet, in a folder that exists, with no such mark, is `read` with
+    no calls."""
     if not path:
         return _note(OFF), None
+    if inside_git_worktree(os.path.dirname(os.path.abspath(path))):
+        return _note(COULD_NOT, IN_WORKTREE), None
     try:
         if not stat.S_ISDIR(os.stat(os.path.dirname(path)).st_mode):
             return _note(COULD_NOT, NOT_A_FOLDER), None
@@ -325,42 +417,35 @@ def read(path, caller, since):
         if exc.errno in (errno.ENOENT, errno.ENOTDIR):
             return _note(COULD_NOT, NO_FOLDER), None
         return _note(COULD_NOT, _why_not(exc)), None
+    data, start = b"", 0
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
     except OSError as exc:
-        if exc.errno == errno.ENOENT:
-            return _note(READ), []                 # no call recorded yet
-        return _note(COULD_NOT, _why_not(exc)), None
-    try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode):
-            return _note(COULD_NOT, NOT_REGULAR), None
-        data, start = _tail(fd, info.st_size)
-    except OSError as exc:
-        return _note(COULD_NOT, _why_not(exc)), None
-    finally:
-        os.close(fd)
-    lines = data.split(b"\n")
-    if start:
-        lines = lines[1:]             # cut by the tail, or the oldest row read: left unread
-    calls, bad, reached = [], 0, False
-    for raw in lines:
-        if not raw.strip():
-            continue
-        row = _row_of(raw, caller)
-        if row is None:
-            bad += 1
-        elif row["epoch"] < since:
-            # Appends come in time order, so every line before this row is older still.
-            bad, reached = 0, True
-        else:
-            calls.append(row)
-    calls.sort(key=lambda r: r["epoch"])
+        if exc.errno != errno.ENOENT:
+            return _note(COULD_NOT, _why_not(exc)), None
+        fd = None                     # no row written yet: its mark still says what failed
+    if fd is not None:
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                return _note(COULD_NOT, NOT_REGULAR), None
+            data, start = _tail(fd, info.st_size)
+        except OSError as exc:
+            return _note(COULD_NOT, _why_not(exc)), None
+        finally:
+            os.close(fd)
+    calls, reached, bad = _rows(data, start, caller, since)
+    failed = _failures(path, since)
     why = []
     if bad:
         why.append("%d line%s in it %s not a row of this ledger, so %s spend is not counted"
                    % (bad, "" if bad == 1 else "s", "is" if bad == 1 else "are",
                       "its" if bad == 1 else "their"))
+    if failed is None:
+        why.append(UNMARKED)
+    elif failed:
+        why.append("%d call%s could not be recorded in it, so %s spend is not counted"
+                   % (failed, "" if failed == 1 else "s", "its" if failed == 1 else "their"))
     if start and not reached:
         why.append(SHORT)
     if not why:
@@ -552,19 +637,50 @@ def selftest():
             took = True
         except ValueError:
             took = False
-        check("a row that is not one is refused, and nothing is written",
+        check("a row that is not one is refused, and no row is written",
               (took, os.path.getsize(led)), (False, before))
+        note_m, calls_m = read(led, "morning", T - DAY)
+        check("…but its failure is marked beside the ledger, so the reader says its call is not "
+              "counted, and the rows before it still count (Stage E on #622)",
+              (note_m, None if calls_m is None else len(calls_m)),
+              (_note(PARTLY, "1 call could not be recorded in it, so its spend is not counted"),
+               2))
+        fresh = path_in(os.path.join(root, "fresh"), "standup")
+        os.makedirs(os.path.dirname(fresh))
+        try:
+            append(fresh, dict(row_from_result("standup", DOC, "plan"), billing="free"), now=T)
+        except ValueError:
+            pass
+        check("…a ledger with no row yet and a failed write is never read as no call: no calls "
+              "at all, unknown", read(fresh, "standup", T - DAY),
+              (_note(COULD_NOT, "1 call could not be recorded in it, so its spend is not "
+                                "counted"), None))
+        check("…a failure from before the time asked for is not counted",
+              read(fresh, "standup", T + DAY), (_note(READ), []))
+        if os.geteuid() != 0:
+            stuck = path_in(os.path.join(root, "stuck"), "tech_lead")
+            os.makedirs(os.path.dirname(stuck))
+            append(stuck, row_from_result("tech_lead", DOC, "plan"), now=T)
+            os.chmod(stuck, 0o444)
+            try:
+                append(stuck, row_from_result("tech_lead", DOC, "plan"), now=T + 60)
+                took = True
+            except OSError:
+                took = False
+            note_s, calls_s = read(stuck, "tech_lead", T - DAY)
+            check("a ledger this account may not write: the row fails, its mark is said, and the "
+                  "rows written before still count", (took, note_s["state"], len(calls_s)),
+                  (False, PARTLY, 1))
+            os.chmod(stuck, 0o644)
         repo = os.path.join(root, "repo")
         os.makedirs(os.path.join(repo, ".git"))
         os.makedirs(os.path.join(repo, "state"))
         inside = os.path.join(repo, "state", FILE_NAMES["morning"])
-        try:
-            append(inside, row, now=T)
-            took = True
-        except ValueError:
-            took = False
-        check("a ledger inside a git working tree is refused, and nothing is written",
-              (took, os.path.exists(inside)), (False, False))
+        append(inside, row, now=T)
+        check("a ledger inside a git working tree is written, as its caller's folder is, and "
+              "never read: a session could write rows there",
+              (os.path.exists(inside), read(inside, "morning", T - DAY)),
+              (True, (_note(COULD_NOT, IN_WORKTREE), None)))
         target = os.path.join(root, "elsewhere.txt")
         with open(target, "w") as fh:
             fh.write("keep\n")
@@ -644,6 +760,10 @@ def selftest():
         late_tear = ledger("late-tear", [at(T - 5 * DAY), '{"schema": "pipe', at(T)])
         check("a torn line after the last older row may be a call in the window: said",
               read(late_tear, "tech_lead", T - DAY)[0]["state"], PARTLY)
+        stepped = ledger("clock-back", [at(T), '{"schema": "pipe', at(T - 5 * DAY)])
+        check("a torn line after a row in the window is in the window, even when a row stamped "
+              "before the window follows it (the clock went back): said (Stage E on #622)",
+              read(stepped, "tech_lead", T - DAY)[0]["state"], PARTLY)
         long_line = ledger("long-line", [json.dumps(at(T)) + " " * LINE_MAX, at(T)])
         check("a line longer than a row can be is not one",
               read(long_line, "tech_lead", T - DAY)[0]["state"], PARTLY)

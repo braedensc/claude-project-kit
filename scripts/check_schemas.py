@@ -640,16 +640,17 @@ def _usage_kinds(*pairs):
     return out
 
 
-# §17's spend ledgers (KIT-844): three read, one with a call it could not price; the waker's off.
+# §17's spend ledgers (KIT-844): three read, every call inside the week, one stand-up call unpriced;
+# the waker's off.
 _SPEND_OFF = {"state": "off", "reason": None, "calls": None, "unpriced": None, "usd": None,
               "models": None, "billing": None}
 _USAGE_SPEND = {
-    "morning": {"state": "read", "reason": None, "calls": 6, "unpriced": 0, "usd": 0.9,
-                "models": {"claude-sonnet-5-5": 6}, "billing": {"plan": 6}},
-    "standup": {"state": "read", "reason": None, "calls": 11, "unpriced": 1, "usd": 0.5,
-                "models": {"claude-sonnet-5-5": 10}, "billing": {"plan": 11}},
-    "tech_lead": {"state": "read", "reason": None, "calls": 31, "unpriced": 0, "usd": 4.2,
-                  "models": {"claude-sonnet-5-5": 31}, "billing": {"plan": 31}},
+    "morning": {"state": "read", "reason": None, "calls": 4, "unpriced": 0, "usd": 0.6,
+                "models": {"claude-sonnet-5-5": 4}, "billing": {"plan": 4}},
+    "standup": {"state": "read", "reason": None, "calls": 8, "unpriced": 1, "usd": 0.4,
+                "models": {"claude-sonnet-5-5": 7}, "billing": {"plan": 8}},
+    "tech_lead": {"state": "read", "reason": None, "calls": 20, "unpriced": 0, "usd": 3.1,
+                  "models": {"claude-sonnet-5-5": 20}, "billing": {"plan": 20}},
     "conflict_waker": _SPEND_OFF,
 }
 
@@ -671,13 +672,13 @@ VALID_USAGE = {
     "spend": _USAGE_SPEND,
     "week": {
         "known": True, "starts_at": "2026-10-30T09:00:00Z", "resets_at": "2026-11-06T09:00:00Z",
-        "usd": 42.337, "runs": 142, "unpriced": 2, "seconds": 51234,
+        "usd": 42.337, "runs": 142, "unpriced": 3, "seconds": 51234,
         "by_kind": _usage_kinds((20, 3.1), (18, 6.5), (4, 2.4), (52, 21.3), (14, 4.2), (3, 0.9),
                                 (1, 0.15), (18, 2.787), (0, 0), (4, 0.6), (8, 0.4)),
         "by_model": {"claude-opus-5-5": 30.2, "claude-sonnet-5-5": 12.137},
     },
     "days": [
-        {"date": "2026-11-02", "usd": 9.75, "runs": 34, "unpriced": 0, "seconds": 11800,
+        {"date": "2026-11-02", "usd": 9.75, "runs": 34, "unpriced": 1, "seconds": 11800,
          "by_kind": _usage_kinds((4, 0.8), (5, 1.9), (1, 0.6), (10, 4.1), (4, 1.2), (1, 0.3),
                                  (0, 0), (6, 0.6), (0, 0), (1, 0.15), (2, 0.1))},
         {"date": "2026-11-03", "usd": 7.45, "runs": 26, "unpriced": 2, "seconds": 9100,
