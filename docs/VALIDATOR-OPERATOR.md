@@ -314,7 +314,7 @@ pull request. The code is `scripts/pipeline_validator_evidence.py`.
 | What | `yes` means | Some reasons for `no` |
 |---|---|---|
 | The head | GitHub's head is that exact commit. A push makes old evidence count for nothing. | `head-moved` |
-| Checks | Every check is finished and green, and every check the branch requires has run. A check is known by its workflow and name. | `check-pending`, `check-failed`, `check-missing` |
+| Checks | Every check is finished and green, and every check the branch requires has run. A check is known by its workflow and name. A required check counts only from the app your branch rules name as its source; one of the same name from another app is not it. | `check-pending`, `check-failed`, `check-missing` |
 | Stage E's review | A full review of this exact head, never edited, from Stage E's own bot login, named in your settings. | `review-login-unset`, `review-login-shared`, `review-missing`, `review-stale`, `review-partial`, `review-declined`, `review-edited` |
 | Its findings | Nothing at or above the bar. The bar is `medium` unless set. | `review-finding-at-bar`, `review-unreadable` |
 | Acceptance | For a plan's last piece, the acceptance check passed. | `acceptance-none`, `acceptance-not-passed` |
