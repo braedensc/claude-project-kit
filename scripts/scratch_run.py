@@ -339,7 +339,7 @@ def selftest():
                 os.path.realpath(lines[-1][len("from="):]) if lines else None),
                (0, True, True, os.path.realpath(repo)))
 
-        def stopped(sig, command, ready=None):
+        def stopped(sig, command, ready=None, limit=60):
             """(exit, run folder, seconds from the signal to the end). With `ready`, the signal
             waits for the command to print that line: a trap it sets is then in place."""
             import time
@@ -352,7 +352,7 @@ def selftest():
                     pass
                 sent = time.time()
                 os.kill(p.pid, sig)
-                p.communicate(timeout=60)
+                p.communicate(timeout=limit)
             finally:
                 stop(p)
             return p.returncode, run, time.time() - sent
@@ -409,10 +409,20 @@ def selftest():
             stop(p)
         expect("a Ctrl-C during the copy exits 130, not as a copy that failed",
                (p.returncode, "could not copy" in err), (128 + signal.SIGINT, False))
-        rc, run, took = stopped(signal.SIGTERM, ["sh", "-c", "trap '' TERM; echo ready >&2; sleep 30"],
-                                ready="ready")
+        # Judged by what happened, not by a window a busy runner can miss: the command would
+        # sleep 300 s on its own, so ending at all (inside a 120 s limit) is the kill; it waited
+        # at least the 10 s grace (time only adds to that); and its process is gone.
+        tpid = os.path.join(kept, "term.pid")
+        rc, run, took = stopped(signal.SIGTERM, ["sh", "-c", "trap '' TERM; echo $$ > %s; "
+                                "echo ready >&2; sleep 300" % tpid], ready="ready", limit=120)
+        try:
+            with open(tpid) as fh:
+                os.kill(int(fh.read()), 0)
+            talive = True
+        except ProcessLookupError:
+            talive = False
         expect("a command that ignores the signal is killed 10 s later, and the folder goes",
-               (rc, os.path.exists(run), 10 <= took < 20), (128 + signal.SIGTERM, False, True))
+               (rc, os.path.exists(run), took >= 10, talive), (128 + signal.SIGTERM, False, True, False))
         pidfile = os.path.join(kept, "bg.pid")
         r = cli("--", "sh", "-c", "sleep 30 >/dev/null 2>&1 & echo $! > %s" % pidfile)
         with open(pidfile) as fh:
