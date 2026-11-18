@@ -63,11 +63,25 @@ EXIT CODES — contract §13, the Stage E installer's own numbers.
     10  BLOCKED-ON-HUMAN — a card is printed; do it and re-run
 
 THE SIGN-OFF HOLDS ONLY FOR WHAT IT SIGNED (KIT-688).  Each dry run records what it ran with:
-every setting but LABEL, the transcripts folder, and any line it prints about what a fix
-session may do. `attest` binds the sign-off to that record. A later run that measures
-anything else asks again at CK-W1 and names what changed. A sign-off made before the binding
-names nothing, so it asks once more. The count is not part of the record, because it moves with
-the pull requests; the note carries it.
+every setting but LABEL, and the transcripts folder. `attest` binds the sign-off to that record.
+A later run that measures anything else asks again at CK-W1 and names what changed. A sign-off
+made before the binding names nothing, so it asks once more. The count is not part of the
+record, because it moves with the pull requests; the note carries it. The record also keeps
+every dry-run line that starts `fix session:`, saying what a session may do. Today's waker
+prints none, so that part is empty; the tool list is bound through CLAUDE_ARGS meanwhile. Once
+the waker prints those lines (KIT-676), a change in them asks again too.
+
+THE OTHER INSTALLERS' SIGN-OFFS.  Each is bound to what it measured, or holds nothing that can
+drift:
+  * notifier: A_PRIVATE is bound to the channel, and A_FIRST_PING to the config's hash;
+  * Stage E: CK-7's sign-off is bound to the review entries' fence, A-ENTRY-LOADED to the
+    entries, and A-CATCHUP-COUNT to the count its note names. A-DRY-RUN (CK-5) is not bound
+    yet: KIT-790 binds it to the settings its count depends on;
+  * Stage A: CA-PROBE is bound to the routing code and the entries. CA-LANE and CA-HANDOVER
+    record a run the person watched after that probe, and a routing change asks again
+    through CA-PROBE;
+  * bridge and acceptance: no sign-off is kept. Each asks for a typed yes in the same run that
+    shows and applies its plan, so no yes outlives the plan it was given for.
 
 WHAT IT REFUSES.  `run` (not --dry-run) and `attest` under an agent environment — a
 session that installs a job which starts sessions is the attack; the markers are the
@@ -323,13 +337,17 @@ FACTS_NOTE = "dry-run-facts"
 # Every setting but LABEL, launchd's name for the job: each of the rest changes what a fix session
 # may do, how many start, how often, from which code, or for which checkouts.
 SIGNED_SETTINGS = tuple(sorted(k for k in CONF_KEYS if k != "LABEL"))
-SESSION_LINE = "fix session:"   # how a waker's dry run says what a session may do
+# How a waker's dry run says what a session may do. Today's waker prints none, so this part of the
+# record is empty and the tool list is bound through CLAUDE_ARGS. Once the waker prints them
+# (KIT-676), a change in them asks again.
+SESSION_LINE = "fix session:"
 
 
 def signed_facts(ctx, said=""):
     """What A-WAKE-DRY-RUN signs, besides the count its note names. The settings; the folder whose
     transcripts mark a worktree as yours; and every line of the dry run that says what a fix
-    session may do. The count is not one: it moves with the pull requests."""
+    session may do, which stays empty until the waker prints such lines. The count is not one:
+    it moves with the pull requests."""
     return {"settings": dict((k, ctx.conf.get(k, "")) for k in SIGNED_SETTINGS),
             "transcripts": ctx.claude_dir,
             "session": [ln.strip() for ln in (said or "").splitlines() if ln.strip().startswith(SESSION_LINE)]}
@@ -1453,6 +1471,7 @@ def _selftest_body():
              BLOCKED, ": REPO_DIRS."),
             ("the-transcripts-moved-asks", {"env": {"CLAUDE_CONFIG_DIR": "/Users/you/other-claude"}}, BLOCKED,
              "the transcripts folder"),
+            # The mechanism, ahead of the lines: today's waker prints none (KIT-676 adds them).
             ("a-session-line-changed-asks", {"said": "fix session: commands  git push --force\npending 1 · would wake [7]"},
              BLOCKED, "what a fix session may do")):
         (o, d), _c = dry_run_row(state=st, **kw)
