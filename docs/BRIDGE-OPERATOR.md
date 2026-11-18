@@ -453,6 +453,17 @@ Then *(Asked because its plan was just filed.)*
 Not that: no question after the page. The notifier read no plan line from that page, so it
 came from an older executor, or the plan failed a check. Say `approve <epic id>` to see why.
 
+**The validator may answer it for you** (KIT-544), while its plans switch is on. The bridge reads
+the validator's settings and ledger where the queue's config names them
+(`reader.validator_settings_file` and `reader.validator_ledger_file`). On each pass, after your own
+messages, an open approve question is approved when the validator's newest decision about that
+plan approves it. The plan must not have changed since the validator read it, and its idea must
+be yours. Every check your yes gets still applies. The bridge records the approval as the
+validator's, never yours, and says so where it asked: *The validator approved PROD-50 in your
+place.* Your own answer comes first, and a plan you declined stays declined. To stop a plan it
+approved, say `pause` or `cancel`, as for any plan. With the switch off, or either file unnamed or
+unreadable, nothing changes. Details: `docs/VALIDATOR-OPERATOR.md`, "A plan".
+
 ### Answer a plan's open questions
 
 Before you approve, send `answer <plan id>: <your answer>` in your direct messages (KIT-334).

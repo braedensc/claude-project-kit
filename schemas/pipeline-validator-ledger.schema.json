@@ -19,7 +19,7 @@
       "required": ["at", "subject", "ref", "head", "kind", "layers", "settings_on", "size_limits", "reasons", "agent_says"],
       "additionalProperties": false,
       "properties": {
-        "at": {"$ref": "#/$defs/time", "description": "When the writer added the row. The writer stamps it; a caller cannot."},
+        "at": {"$ref": "#/$defs/time", "description": "When the decision was made, by the clock the writer is handed: when it added the row, or for a plan, when the plan was read (KIT-544). The writer stamps it; a caller cannot put it in the row."},
         "subject": {"enum": ["plan", "piece", "merge"], "description": "What was decided: a plan's approval, a piece starting, or a pull request merging."},
         "ref": {"type": "string", "pattern": "^([A-Z][A-Z0-9]{0,9}-[0-9]{1,7}|[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}#[0-9]{1,7})$", "description": "A ticket id for a plan or a piece; `owner/name#N` for a merge."},
         "head": {"type": ["string", "null"], "pattern": "^[0-9a-f]{40}$", "description": "The pull request's head, in full, for a merge. Null for a plan or a piece."},

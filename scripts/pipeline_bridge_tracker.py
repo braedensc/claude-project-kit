@@ -69,11 +69,12 @@ query BridgeTrustHistory($id: String!, $after: String) {
 }"""
 # An epic and its children, with what blocks each child (and the root itself: the order check
 # reads one piece alone, as the root, KIT-239). The page sizes are bounded, and a
-# page that runs over is refused, never read as complete.
+# page that runs over is refused, never read as complete. When each last changed, so the
+# validator's approval acts only on the plan as it stands (KIT-544).
 Q_EPIC = """
 query BridgeEpic($id: String!) {
   issue(id: $id) {
-    id identifier title
+    id identifier title updatedAt
     state { id name type }
     team { key }
     delegate { id }
@@ -86,7 +87,7 @@ query BridgeEpic($id: String!) {
     }
     children(first: %d) {
       nodes {
-        id identifier title description
+        id identifier title description updatedAt
         project { id }
         state { id name type }
         team { key }
@@ -606,6 +607,10 @@ def cases_errors(kit):
             check("wiring-the-epic-read-names-the-epics-and-each-pieces-creator",
                   [part.count("creator { id }") for part in Q_EPIC.split("children(", 1)],
                   [1, 1])
+            # KIT-544: and when the epic and each piece last changed, which says whether the
+            # validator's approval is about the plan as it stands.
+            check("wiring-the-epic-read-dates-the-epics-and-each-pieces-last-change",
+                  [part.count("updatedAt") for part in Q_EPIC.split("children(", 1)], [1, 1])
             check("wiring-epic-children-and-blockers",
                   ([k["identifier"] for k in ep["children"]["nodes"]],
                    [b["identifier"] for b, _s in blockers_of(ep["children"]["nodes"][1])]),

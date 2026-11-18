@@ -736,3 +736,76 @@ ticket. Not that: a piece changed after the validator's approval starting on tha
 Exit 0: the pass ran and said what it did, or that it was off or held. 1: a ledger row could not
 be written. 2: the config needs fixing, or this is an agent's environment. 3: something could not
 be read.
+
+## 11. A plan
+
+With the plans switch on, the validator may approve a plan in place of your `approve <plan>`
+(KIT-544). It judges and records. The bridge approves the plan, on its next pass. The code is
+`scripts/pipeline_validator_plans.py` and `scripts/pipeline_bridge_plans.py`. Nothing schedules the
+plan pass yet: the install is a later piece.
+
+**Which plans it judges.** Only a plan whose `approve` question is open: one the bridge asked you
+about, that you have not answered. It reads those questions from the bridge's state, the file the
+queue's reader names (`reader.bridge_state_file`). A plan you approved, declined or were never
+asked about is not judged. Nor is one that has left the backlog.
+
+**What one pass does.**
+
+1. It reads the switches. The plans switch off: it stops and says `OFF`.
+2. It reads the watcher's hold. A hold, or a hold file it cannot read: it stops and says `HELD`.
+3. It reads the bridge's open questions. A state it cannot read: it stops, and says so.
+4. Each plan, oldest ticket first: its facts, the hard limits, then the agent.
+
+| What it finds | What it does |
+|---|---|
+| An idea you did not file | Never approved, whatever the switches. It waits for you, and says why. |
+| Pieces that touch the safety system, or a human-only class you have not allowed | A `held` row, once. It waits for you. An unchanged hold is not written again. |
+| A fact not read, or the window closed | Nothing written. It waits, and says why. |
+| The limits pass | One agent run and its row. A send-back becomes an escalation: a plan has no dev session yet. |
+| A plan it already decided, unchanged since | No second run. The plans after it get their turn. |
+| A plan edited while the agent judged it | Nothing written. A later pass judges it as it stands. |
+
+At most one agent run per pass. A row carries the time the plan was read, before the agent ran.
+A plan changed after that time needs a new decision.
+
+**The agent's brief.** Your idea's own text, and the plan with every piece as written. Each sits in
+its own fence, marked as data. The question is whether the plan asks for what your idea asks, and
+nothing else that needs you. The code is `build_ticket_brief` in `scripts/pipeline_validator_brief.py`.
+
+**How the bridge approves it.** On each pass, after your own messages, the bridge reads the
+validator's newest decision about each plan with an open question. An `approved` one counts only
+when all of these hold:
+
+- the plans switch is still on, in the settings the queue's reader names
+  (`reader.validator_settings_file`), and the ledger it names can be trusted;
+- the plan has not changed since the validator read it;
+- its idea is yours: filed with your key, marked `provenance:human`, with no parent;
+- every check your own `yes` gets passes.
+
+Then the bridge approves the plan as the validator's, never yours. Its record says
+`approved_by: validator`. The plan's comment, the reply where it asked you and each piece's start
+comment name the validator, and no person.
+
+**Your choice always stands.** Your own answer is read first. A plan you declined stays declined.
+You can still approve a plan yourself at any time. You can pause or cancel a plan the validator
+approved, as any other: `pause <plan>` or `cancel <plan>`.
+
+**A hold** is a blocker in the stand-up, with the reply that clears it: `approve <plan>`.
+
+**Its config** is the validator's one config, `~/.validator/config.json`, as the piece pass reads
+it. Both of the queue's validator files empty, or the plans switch off: your `approve` decides, as
+before.
+
+**Try one pass that writes nothing.** It reads and judges, runs no agent, and changes nothing. Run
+it in a terminal, as yourself: it is refused in an agent's environment.
+
+```bash
+python3 scripts/pipeline_validator_plans.py run --config ~/.validator/config.json --dry-run
+```
+
+Good: `TOD-10: the validator approved it.`, then in your DM: *The validator approved TOD-10 in your
+place.* Not that: a plan approved from an idea an agent filed.
+
+Exit 0: the pass ran and said what it did, or that it was off or held. 1: a ledger row could not
+be written. 2: the config needs fixing, or this is an agent's environment. 3: something could not
+be read: the hold, the ledger, or the bridge's questions.

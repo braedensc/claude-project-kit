@@ -89,9 +89,12 @@ changed after it is held for your `start` again, until the validator judges it a
 stops every start. A piece the validator held, or escalated, waits for you as before. Its start comment says the
 validator approved it, never that you did.
 
-Good: `Started by the queue, in lane acme/app:1: it is a piece of TOD-10, which you approved, and the validator
-approved its start at 2026-11-18 10:00 UTC.` Not that: a piece changed after the validator's approval starting on
-that approval.
+Good: `Started by the queue, in lane acme/app:1: it is a piece of TOD-10, and the validator approved its start at
+2026-11-18 10:00 UTC.` Not that: a piece changed after the validator's approval starting on that approval.
+
+The bridge reads the same two files for plans. With the plans switch on, the validator may approve a plan in your
+place (KIT-544, `docs/VALIDATOR-OPERATOR.md`, "A plan"). The bridge records that approval as the validator's, and
+the queue starts its pieces as it starts those of a plan you approved. Each start comment names the validator.
 
 ## When the Mac is short of room
 

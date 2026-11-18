@@ -917,6 +917,26 @@ def plan_run(node, owner):
     return runs[0].upper()
 
 
+def open_approvals(state):
+    """KIT-544: the plans an open `approve` question of the bridge's waits on, as {plan id: when it
+    was first asked, in seconds}, read from the bridge's state as it is saved. The validator's plan
+    pass judges only these plans, and the bridge acts on its approval only while one is open: a plan
+    approved, declined, expired or never asked about is none of them. A record that is not a question
+    is passed over. Raises ValueError for a state with no questions record."""
+    questions = state.get("questions") if isinstance(state, dict) else None
+    if not isinstance(questions, dict):
+        raise ValueError("the bridge's state holds no record of its questions")
+    out = {}
+    for q in questions.values():
+        if not isinstance(q, dict) or q.get("kind") != "approve" or q.get("status") != OPEN:
+            continue
+        ticket, asked = q.get("ticket"), q.get("asked_at")
+        if (isinstance(ticket, str) and re.match(r"^%s$" % TICKET_RE, ticket)
+                and isinstance(asked, (int, float)) and not isinstance(asked, bool)):
+            out[ticket] = min(asked, out.get(ticket, asked))
+    return out
+
+
 def ticket_number(identifier):
     try:
         return int((identifier or "").rsplit("-", 1)[1])
@@ -1053,6 +1073,26 @@ def cases_config(kit):
                        "question_ttl_hours",
                        "git working tree"):
             check("config-names:" + needle, needle in errs, True)
+        # KIT-544: the plans an open approve question waits on, the earliest ask of each; a plan
+        # approved, declined, expired or asked something else is none of them.
+        qs = {"a": {"kind": "approve", "ticket": "PROD-50", "status": OPEN, "asked_at": 200.0},
+              "b": {"kind": "approve", "ticket": "PROD-50", "status": OPEN, "asked_at": 100.0},
+              "c": {"kind": "approve", "ticket": "PROD-60", "status": DONE, "asked_at": 100.0},
+              "d": {"kind": "approve", "ticket": "PROD-61", "status": DECLINED, "asked_at": 1.0},
+              "e": {"kind": "approve", "ticket": "PROD-62", "status": EXPIRED, "asked_at": 1.0},
+              "f": {"kind": "pause", "ticket": "PROD-63", "status": OPEN, "asked_at": 1.0},
+              "g": {"kind": "approve", "ticket": "not a ticket", "status": OPEN, "asked_at": 1.0},
+              "h": {"kind": "approve", "ticket": "PROD-64", "status": OPEN, "asked_at": True},
+              "i": "not a question"}
+        check("config-open-approvals-are-the-open-approve-questions-earliest-first",
+              open_approvals({"questions": qs}), {"PROD-50": 100.0})
+        try:
+            open_approvals({"epics": {}})
+            no_record = "read"
+        except ValueError as exc:
+            no_record = str(exc)
+        check("config-a-state-with-no-questions-record-is-not-read-as-none",
+              no_record, "the bridge's state holds no record of its questions")
 
 
 def selftest():
