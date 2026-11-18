@@ -1776,8 +1776,12 @@ def selftest():
         return {"base": base, "home": home, "conf": conf, "kit": kit, "key": key, "env": envf,
                 "hold": hold_file}
 
+    made_fakes = []                        # every fake launchd a case used, for the sweep in 15
+
     def make_for(p, fake=None, ceiling=0):
         fake = fake if fake is not None else _FakeLaunchd()
+        if fake not in made_fakes:
+            made_fakes.append(fake)
         made = []
 
         def make(args, env):
@@ -1917,6 +1921,38 @@ def selftest():
     ok("secret: the env probe asked by NAME, and its shell ran with no environment of yours",
        any(a[2] == ENV_PROBE and a[-2:] == ["VALIDATOR_LINEAR_API_KEY", "CLAUDE_WRITER_OAUTH_TOKEN"]
            for a in fake.shells), fake.shells[:1])
+    # The key file is never opened by this process. Every open() here is watched for its path,
+    # through a whole install, a check, a look and `off`, whatever name or variable the path came
+    # through. It is mode 000 as well, so an open that got through could not read it.
+    import builtins
+    kt = place("keytrap")
+    key_real = os.path.realpath(kt["key"])
+    tried, real_opens = [], (builtins.open, io.open, os.open)
+
+    def trap(fn, name):
+        def watched(file, *a, **k):
+            try:
+                if os.path.realpath(os.fsdecode(file)) == key_real:
+                    tried.append(name)
+            except (TypeError, ValueError):
+                pass
+            return fn(file, *a, **k)
+        return watched
+    builtins.open, io.open, os.open = (trap(real_opens[0], "open"), trap(real_opens[1], "io.open"),
+                                       trap(real_opens[2], "os.open"))
+    launchd = _FakeLaunchd()                # one launchd for the four, as on one Mac
+    try:
+        trapped = [machine(kt, ["apply"], stdin=pipe_of(answers), make=make_for(kt, launchd))[0],
+                   machine(kt, ["check"], make=make_for(kt, launchd))[0],
+                   quiet(lambda: main(["verify", "--conf", kt["conf"]], env={},
+                                      make=make_for(kt, launchd)))[0],
+                   quiet(lambda: main(["off"], env={}, home=kt["home"], tty=True,
+                                      ask=lambda _p: "yes"))[0]]
+    finally:
+        builtins.open, io.open, os.open = real_opens
+    ok("secret: no open() in this process names the app's key file, through a whole install, a "
+       "check, a look and `off`: it is looked at by lstat only",
+       not tried and trapped == [EX_OK, EX_OK, EX_OK, EX_OK], (tried, trapped))
 
     # ── 5. A second run changes nothing, and says so ─────────────────────────────────────────
     calls_before = len(fake.calls)
@@ -2209,9 +2245,31 @@ def selftest():
        and not switches_on(vsettings.load(path)) and "not obeyed" in out, out)
 
     # ── 15. What this file can never do, read from its own source ───────────────────────────
-    consts = [n.value for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str)]
-    ok("source: no command anywhere names sudo, dscl or sysadminctl",
-       not [x_ for x_ in consts if x_ in ("sudo", "dscl", "sysadminctl")])
+    # No sudo, and no account made, in three parts that together cover every command. (1) One
+    # place starts a process: Runner._exec. (2) No command list in the code starts with one of
+    # those programs, by name or by path. (3) Every command the battery's runs sent through that
+    # place, each launchctl argv and each shell script, names none of them as a command.
+    banned = ("sudo", "dscl", "sysadminctl")
+    spawners = []
+    for owner in [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]:
+        for n in ast.walk(owner):
+            f = n.func if isinstance(n, ast.Call) else None
+            if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and (
+                    f.value.id == "subprocess" or (f.value.id == "os" and re.match(
+                        r"^(system|popen|exec|spawn|posix_spawn|fork)", f.attr))):
+                spawners.append((owner.name, "%s.%s" % (f.value.id, f.attr)))
+    ok("source: one place starts a process, Runner._exec, with subprocess.run",
+       spawners == [("_exec", "subprocess.run")], spawners)
+    firsts = [n.elts[0].value for n in ast.walk(tree) if isinstance(n, ast.List) and n.elts
+              and isinstance(n.elts[0], ast.Constant) and isinstance(n.elts[0].value, str)]
+    ok("source: no command list starts with sudo, dscl or sysadminctl, by name or by path",
+       not [x_ for x_ in firsts if os.path.basename(x_) in banned], firsts)
+    as_command = re.compile(r"(^|[\s;&|(`/])(%s)(\s|$)" % "|".join(banned))
+    sent = [" ".join(a) for f_ in made_fakes for a in f_.calls] + [
+        a[2] for f_ in made_fakes for a in f_.shells]
+    ok("behaviour: every command the battery's runs sent is launchctl or /bin/sh, and names no "
+       "sudo, dscl or sysadminctl", len(sent) > 20 and not [s_ for s_ in sent if as_command.search(s_)]
+       and all(a[0] in ("launchctl", "/bin/sh") for f_ in made_fakes for a in f_.reads), len(sent))
     lists = [n for n in ast.walk(tree) if isinstance(n, ast.List)
              and any(isinstance(e, ast.Constant) and e.value == "boot" + "strap" for e in n.elts)]
     ok("source: one command list loads the job, inside _bootstrap, reached only through load_job, "
@@ -2219,10 +2277,6 @@ def selftest():
        len(lists) == 1 and [n for n in ast.walk(funcs["_bootstrap"]) if n in lists] == lists
        and callers("_bootstrap") == ["load_job"] and callers("load_job") == ["switch_on"],
        (len(lists), callers("_bootstrap"), callers("load_job")))
-    ok("source: no open() call names the key file: it is looked at by lstat only",
-       "APP_KEY_FILE" not in "".join(
-           ast.get_source_segment(body, n) or "" for n in ast.walk(tree)
-           if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "open"))
 
     # ── 16. Root: refused first, with the shared words, and still one JSON document ─────────
     saved = rg._uid
