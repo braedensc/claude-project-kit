@@ -2480,18 +2480,17 @@
       "check": {
         "script": "scripts/pipeline_watch.py",
         "args": [
+          "check",
           "--conf",
-          "update.conf",
-          "run",
-          "--dry-run"
+          "update.conf"
         ]
       },
       "apply": {
         "script": "scripts/pipeline_watch.py",
         "args": [
+          "apply",
           "--conf",
-          "update.conf",
-          "install"
+          "update.conf"
         ]
       },
       "no_command_reason": null,
@@ -2539,9 +2538,10 @@
           "words": "Make a private alert repository and copy the alert workflow into it."
         }
       ],
-      "ceiling": null,
+      "ceiling": 3,
       "consent": [
-        "Installs an hourly job under your own login that opens or closes an issue in your private alert repository."
+        "Installs an hourly job under your own login that opens or closes an issue in your private alert repository.",
+        "Switches its job on by itself only when its first pass would raise no more alerts than its ceiling; above that the job stays off, and the end says why."
       ],
       "docs": {
         "guide": "docs/UPDATE-OPERATOR.md",
