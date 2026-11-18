@@ -492,7 +492,7 @@ def _stop_group(proc, first):
     for sig, grace in ((first, 10), (signal.SIGKILL, 5)):
         try:
             os.killpg(proc.pid, sig)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             break
         deadline = time.time() + grace
         while time.time() < deadline:
@@ -541,8 +541,8 @@ def main(argv):
         if proc is not None:
             try:
                 os.killpg(proc.pid, signum)
-            except ProcessLookupError:
-                pass
+            except (ProcessLookupError, PermissionError):
+                pass            # gone; macOS says EPERM for a group that is only zombies
     proc = None
     with scratch_run(label + "-run-", parent=parent) as run:
         # Handlers of its own while the command runs: a signal is passed to the whole
@@ -599,7 +599,7 @@ def main(argv):
                     if signalled is not None and time.time() - signalled > 10:
                         try:
                             os.killpg(proc.pid, signal.SIGKILL)
-                        except ProcessLookupError:
+                        except (ProcessLookupError, PermissionError):
                             pass
             if _stop_group(proc, signal.SIGTERM):
                 print("scratch_run: the command left a process running; it was stopped",
