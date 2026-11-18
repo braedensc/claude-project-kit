@@ -2185,7 +2185,8 @@ def selftest():
         code, io = go(env={marker: ""})
         check("refused-under:%s" % marker, (code, io.ran), (EX_REFUSED, []))
     code, io = go(uid=0)
-    check("refused-as-root", (code, io.ran), (EX_USAGE, []))
+    check("refused-as-root", (code, io.ran, __import__("pipeline_root_guard").BODY in "\n".join(io.lines)),
+          (EX_USAGE, [], True))
     code, io = go(tty=False)
     check("refused-without-a-person", (code, io.ran), (EX_USAGE, []))
 

@@ -1275,7 +1275,7 @@ def _selftest_cases(check, tmp, failures, cases):
         check("refused-under:%s" % marker, (code, io.lane.ran, tracker.queries, io.loads),
               (EX_REFUSED, [], [], 0))
     code, io, _t = go(uid=0)
-    check("refused-as-root", (code, io.lane.ran), (EX_REFUSED, []))
+    check("refused-as-root", (code, io.lane.ran, __import__("pipeline_root_guard").MESSAGE in "\n".join(io.out)), (EX_REFUSED, [], True))
     code, io, _t = go(tty=False)
     check("stopped-without-a-person", (code, io.lane.ran), (EX_USAGE, []))
     code, io, _t = go(["--conf", a_path])

@@ -871,7 +871,8 @@ def main(argv=None):
     args = ap.parse_args(argv)
     if args.selftest:
         from scratch_run import contained
-        return contained(selftest, "watcher-setup-selftest-run-")
+        import pipeline_root_guard as _rg   # KIT-693: the root case ends every installer's own selftest
+        return contained(selftest, "watcher-setup-selftest-run-") or _rg.root_case_rc(main, ["run"])
     import pipeline_root_guard as _rg   # KIT-693: the one refusal every installer shares
     _root = _rg.refusal()
     if _root:

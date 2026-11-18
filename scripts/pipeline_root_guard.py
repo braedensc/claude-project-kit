@@ -53,12 +53,14 @@ INSTALLERS = (
     ("pipeline_stage_e_setup", ["run"]),
     ("pipeline_chat_lane_setup", ["verify"]),
 )
-SEAMED = ("pipeline_install", "pipeline_model_switch", "pipeline_stage_e_app", "pipeline_conflict_waker_setup")
+SEAMED = ("pipeline_install", "pipeline_model_switch", "pipeline_stage_e_app", "pipeline_conflict_waker_setup",
+          "pipeline_validator_app")
 
 
-def _installers_as_root(expect):
-    """Every installer, run as root from an empty folder with an empty home: it refuses, and the
-    folder is still empty. Needs scratch_run (run from the scripts folder)."""
+def root_case(main, argv):
+    """Run `main(argv)` as root (the uid stubbed on the shared copy of this module) from an empty
+    folder with an empty home. Returns (exit code, whether it said MESSAGE, what it left behind).
+    An installer's own selftest calls `root_case_rc`; the battery below calls this for each."""
     import contextlib
     import importlib
     import io
@@ -70,28 +72,51 @@ def _installers_as_root(expect):
     # file is __main__ and a second copy).
     shared = importlib.import_module("pipeline_root_guard")
     real_uid, cwd, home = shared._uid, os.getcwd(), os.environ.get("HOME")
+    with tempfile.TemporaryDirectory(prefix="root-guard-") as tmp:
+        out, err = io.StringIO(), io.StringIO()
+        os.chdir(tmp)
+        os.environ["HOME"] = tmp
+        shared._uid = lambda: 0
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = main(argv)
+        except SystemExit as e:
+            rc = e.code
+        finally:
+            shared._uid = real_uid
+            os.chdir(cwd)
+            if home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = home
+        return rc, MESSAGE in out.getvalue() + err.getvalue(), os.listdir(tmp)
+
+
+def root_case_rc(main, argv):
+    """0 when `main(argv)` run as root refuses with exit 3, the one message, and leaves nothing;
+    else 1, with each fault printed. The last step of an installer's own selftest (KIT-693)."""
+    rc, said, left = root_case(main, argv)
+    faults = [w for ok, w in ((rc == 3, "exit %r, not 3" % (rc,)), (said, "the one message was not printed"),
+                              (left == [], "it left %r behind" % (left,))) if not ok]
+    for f in faults:
+        print("[FAIL] run as root: %s" % f)
+    if not faults:
+        print("[PASS] run as root: refused with exit 3, the one message, nothing changed")
+    return 1 if faults else 0
+
+
+def _installers_as_root(expect):
+    """Every installer, run as root: it refuses, and leaves nothing (the same case each one's own
+    selftest ends with). Then every installer still calls this helper."""
+    import importlib
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
     for name, argv in INSTALLERS:
-        with tempfile.TemporaryDirectory(prefix="root-guard-") as tmp:
-            mod = importlib.import_module(name)
-            out, err = io.StringIO(), io.StringIO()
-            os.chdir(tmp)
-            os.environ["HOME"] = tmp
-            shared._uid = lambda: 0
-            try:
-                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-                    rc = mod.main(argv)
-            except SystemExit as e:
-                rc = e.code
-            finally:
-                shared._uid = real_uid
-                os.chdir(cwd)
-                if home is None:
-                    os.environ.pop("HOME", None)
-                else:
-                    os.environ["HOME"] = home
-            expect("%s as root: exit 3" % name, rc, 3)
-            expect("%s as root: says the one message" % name, MESSAGE in out.getvalue() + err.getvalue(), True)
-            expect("%s as root: changed nothing" % name, os.listdir(tmp), [])
+        rc, said, left = root_case(importlib.import_module(name).main, argv)
+        expect("%s as root: exit 3" % name, rc, 3)
+        expect("%s as root: says the one message" % name, said, True)
+        expect("%s as root: changed nothing" % name, left, [])
     for name in [n for n, _ in INSTALLERS] + list(SEAMED):
         with open(os.path.join(here, name + ".py"), encoding="utf-8") as f:
             expect("%s calls the shared refusal" % name, "pipeline_root_guard" in f.read(), True)

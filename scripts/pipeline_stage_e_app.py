@@ -1166,7 +1166,8 @@ def selftest():
                os.path.exists(io.ledger_path())), (EX_REFUSED, True, [], [], [], 0, False))
         io = _FakeIO(w, d, uid=0)
         check("root is refused too: the ledger is YOUR home's",
-              (main(run_argv(conf), io), io.ran, io.calls), (EX_REFUSED, [], []))
+              (main(run_argv(conf), io), io.ran, io.calls, __import__("pipeline_root_guard").MESSAGE in io.said),
+              (EX_REFUSED, [], [], True))
 
         # 2. Without a typed yes, nothing changes: no app, no key, no ledger, no conf line.
         for typed in ("no", "y", "YES please", ""):
