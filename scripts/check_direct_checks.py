@@ -39,6 +39,8 @@ DIRECT = (
     "scripts/check_delivery_config.py",
     "scripts/check_alert_pages.py",
     "scripts/pipeline_parts.py check",
+    "scripts/check_label_gate.py",
+    "scripts/check_ci_covers_tests.py",
 )
 
 # Direct steps in Kit checks that are deliberately not in DIRECT: command -> reason.
