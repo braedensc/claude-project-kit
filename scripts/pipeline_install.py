@@ -62,6 +62,18 @@ WHAT IT DOES, IN ORDER
      printed no table, or ended with any other code, is never "up to date". A `run` that ends
      on a card stops the command in Manual and is carried past in Automatic. With no
      `notifier.conf` the part is "off on this Mac" and nothing runs.
+  3d. The Slack bridge and the stand-up (`scripts/pipeline_bridge_setup.py`), when this Mac has a
+     `bridge.conf` (`--bridge-conf` names another). It runs `install`, the installer's compare
+     without `--apply`: the job's config, its job file and the stand-up's settings file against
+     what `bridge.conf` composes. Exit 0 means they are level; exit 10 means one would be
+     written, so it asks, then runs `install --apply` on a yes. The stand-up's switch is one of
+     those files, so the same step covers it. After either, it reads the installer's `verify`
+     once for what only a person can do (the job is loaded, a token): 0 is "up to date" or
+     "updated", 10 is "waiting on you" (the idea gate is not held back), anything else is
+     never "up to date". A declined update reads "waiting on you". A `install --apply` that ends
+     on a card stops the command in Manual and is carried past in Automatic. With no
+     `bridge.conf` the part is "off on this Mac" and nothing runs. Instant replies keep their
+     own check at the end.
   3e. The usage job and the queue's morning job (`scripts/pipeline_queue_setup.py`), when this Mac
      has a `queue.conf` (`--queue-conf` names another). It runs the installer's own
      `run --dry-run`, shown as it runs. Exit 0 is "up to date". A step table with a WOULD-CHANGE
@@ -198,6 +210,7 @@ SKILLS = os.path.join(HERE, "sync_user_skills.py")
 STAGE_E = os.path.join(HERE, "pipeline_stage_e_setup.py")
 STAGE_A = os.path.join(HERE, "pipeline_stage_a_setup.py")
 SWEEP_SETUP = os.path.join(HERE, "pipeline_sweep_setup.py")
+BRIDGE_SETUP = os.path.join(HERE, "pipeline_bridge_setup.py")
 NOTIFIER_SETUP = os.path.join(HERE, "pipeline_notifier_setup.py")
 QUEUE_SETUP = os.path.join(HERE, "pipeline_queue_setup.py")
 WATCH = os.path.join(HERE, "pipeline_watch.py")
@@ -355,6 +368,9 @@ class Io(object):
         """(state, why) of the hourly health check's job: see watch_level. Reads only."""
         return watch_level(conf_path, os.path.expanduser("~"), os.getuid(), self.measure)
 
+    def host_state(self):
+        """(state, why) of this Mac's host (KIT-756); see host_state()."""
+        return host_state()
     def places(self, path):
         """({settings file name: where this Mac keeps it}, why it was ignored) (KIT-752)."""
         return load_places(path)
@@ -822,6 +838,13 @@ def step_sweep(io, conf, rep):
     return stop(io, "the sweep's installer stopped with exit %d. The lines above say why." % code, code)
 
 
+# What an installer's compare says when it would write something, as opposed to a block only a person
+# can clear (which running it again cannot). The selftest pins the line against the installer's source.
+def has_work(text, line):
+    """True when the compare printed `line`, the installer's own words for "I would write"."""
+    return line in (text or "")
+
+
 # What an installer that prints the Stage E step table says: a row whose outcome is WOULD-CHANGE
 # is work its `run` would do; a row that is only a card is work for a person, which running it
 # again cannot clear. The notifier installer prints this table; this file's selftest pins the
@@ -846,12 +869,47 @@ JOB_STEPS = (
      "look": ["run", "--dry-run"], "apply": ["run"],
      "note": "It writes the notifier's settings and its job file as the role account; it "
              "never loads the job."},
+    {"key": "bridge", "number": "3d", "title": "The Slack bridge and the stand-up",
+     "noun": "The bridge", "conf": "bridge.conf", "script": BRIDGE_SETUP,
+     # `install` without --apply compares the job's config, its plist and the stand-up's settings
+     # file with what bridge.conf composes. It exits 10 for two different things: it would write
+     # something (and prints `work_line`), or a block only a person can clear, before any write.
+     # `verify` is read afterwards for what only a person can do.
+     "work_line": "DRY RUN: nothing was written",
+     "look": ["install"], "apply": ["install", "--apply"], "then": ["verify"],
+     "note": "It writes the bridge's config, its job file and the stand-up's settings file as the "
+             "role account; it never loads the job."},
     {"key": "queue", "number": "3e", "title": "The usage job and the queue's morning job",
      "noun": "The usage job and the queue", "conf": "queue.conf", "script": QUEUE_SETUP,
      "look": ["run", "--dry-run"], "apply": ["run"],
      "note": "It writes the queue's settings and its two job files (the usage reader and the morning "
              "job) as the role account; it never loads them."},
 )
+
+
+def job_done(io, spec, base, conf, rep, updated):
+    """The settings are level. What is left for a person is read once from the installer's own
+    check (`then`); with none, this is the outcome. None to carry on, or an exit code."""
+    key, noun = spec["key"], spec["noun"]
+    if not spec.get("then"):
+        rep.note(key, OUT_UPDATED if updated else OUT_OK)
+        return None
+    code, _out = io.run_seen(base + spec["then"] + ["--conf", conf])
+    if io.interrupted:
+        rep.note(key, OUT_UNMEASURED, "interrupted during its check")
+        return stop(io, INTERRUPTED % (noun + "'s check"), code or EX_BLOCKED)
+    if code == 0:
+        rep.note(key, OUT_UPDATED if updated else OUT_OK)
+        return None
+    if code == EX_BLOCKED:
+        io.say("")
+        io.say("%s's settings are level; what is left is for you, named above." % noun)
+        rep.note(key, OUT_WAITING, "updated; a card is still yours" if updated
+                 else "a card is still yours", card_only=True)
+        return None
+    rep.note_code(key, code, "its check")
+    return stop(io, "%s's check stopped with exit %d. The lines above say why." % (noun, code),
+                code)
 
 
 def step_job(io, spec, files, rep):
@@ -871,14 +929,13 @@ def step_job(io, spec, files, rep):
         return stop(io, INTERRUPTED % (noun + "'s check"), code or EX_BLOCKED)
     if code == 0:
         io.say("")
-        io.say("%s is up to date. Nothing to do." % noun)
-        rep.note(key, OUT_OK)
-        return None
+        io.say("%s's settings are up to date. Nothing to change." % noun)
+        return job_done(io, spec, base, conf, rep, False)
     if code != EX_BLOCKED:
         rep.note_code(key, code, "its check")
         return stop(io, "%s's check stopped with exit %d. The lines above say why."
                     % (noun, code), code)
-    if not would_change(out):
+    if not (has_work(out, spec["work_line"]) if spec.get("work_line") else would_change(out)):
         io.say("")
         io.say("%s has nothing to change; what is left is for you, named above." % noun)
         rep.note(key, OUT_WAITING, "a card is still yours", card_only=True)
@@ -895,10 +952,9 @@ def step_job(io, spec, files, rep):
         return stop(io, INTERRUPTED % (noun + "'s installer"), code or EX_BLOCKED)
     io.say("")
     if code == 0:
-        io.say("%s is up to date." % noun)
-        rep.note(key, OUT_UPDATED)
+        io.say("%s's settings are up to date." % noun)
         rep.asked.add(key)
-        return None
+        return job_done(io, spec, base, conf, rep, True)
     rep.note_code(key, code, "its installer")
     if code == EX_BLOCKED and io.auto:
         io.say("%s waits for you at the card above. Carrying on; come back to it." % noun)
@@ -1396,6 +1452,7 @@ def step_write_settings(io, writes):
 # check script, never from a list of part ids, so a new part is picked up from the list.
 STEP_OF_SCRIPT = {"sync_user_skills.py": "skills", "pipeline_stage_e_setup.py": "stage_e",
                   "pipeline_sweep_setup.py": "sweep", "pipeline_stage_a_setup.py": "stage_a",
+                  "pipeline_bridge_setup.py": "bridge",
                   "pipeline_notifier_setup.py": "notifier",
                   "pipeline_queue_setup.py": "queue", "pipeline_watch.py": "watch"}
 
@@ -1410,6 +1467,8 @@ def step_of(part):
     base = os.path.basename(check["script"])
     if base == "pipeline_stage_e_setup.py" and (check.get("args") or [])[:1] != ["verify"]:
         return None
+    if base == "pipeline_bridge_setup.py" and ((part.get("apply") or {}).get("args") or [])[:1] != ["install"]:
+        return None            # instant replies (`push`) keep their own check at the end
     return STEP_OF_SCRIPT.get(base)
 
 
@@ -1475,6 +1534,48 @@ def settings_path(part, files):
     return conf_path(name, files) if name.endswith((".conf", ".json")) else None
 
 
+# KIT-756: does this Mac have a host? Read-only, no password, nothing changed. The lane marker
+# folder (docs/HOST.md) is readable by everyone and holds one empty file named for the pipeline's
+# account; the account must exist and have its home folder. Anything that cannot be told is
+# "unknown": never "has one".
+HOST_MARKERS = "/etc/claude-pipeline/dispatched-lane"
+HOST_NONE = "no pipeline account was found on this Mac"
+HOST_FIRST = ("Building the host takes hours, and the kit does not do it for you. Every other "
+              "part needs it first; the steps are in docs/HOST.md.")
+
+
+def host_state(listdir=os.listdir, getpwnam=None, isdir=os.path.isdir):
+    """('yes' | 'none' | 'unknown', why)."""
+    if getpwnam is None:
+        try:
+            import pwd
+            getpwnam = pwd.getpwnam
+        except ImportError:
+            return "unknown", "this Mac's accounts could not be read"
+    try:
+        names = sorted(n for n in listdir(HOST_MARKERS) if n.startswith("_"))
+    except (FileNotFoundError, NotADirectoryError):
+        return "none", "%s: no lane marker folder at %s" % (HOST_NONE, HOST_MARKERS)
+    except OSError as exc:
+        return "unknown", "the lane marker folder could not be read (%s)" % exc
+    for name in names:
+        try:
+            home = getpwnam(name).pw_dir
+        except KeyError:
+            continue
+        except Exception as exc:                       # an unreadable account list is not "none"
+            return "unknown", "the account %s could not be looked up (%s)" % (name, exc)
+        if isdir(home):
+            return "yes", "the pipeline's account %s and its home folder are here" % name
+    return "none", "%s: no marker names an account that exists with a home folder" % HOST_NONE
+
+
+def host_outcome(io):
+    state, why = io.host_state()
+    return {"yes": OUT_OK, "none": OUT_WAITING}.get(state, OUT_UNMEASURED), (
+        why if state != "unknown" else "not measured: " + why)
+
+
 def outcome_of_check(code, out):
     """A part's own read-only check, read the one way for every part: 0 is up to date, 10 is
     waiting on you, and anything else, a child that did not finish included, is a thing that
@@ -1535,6 +1636,8 @@ def build_records(io, parts, rep, files, reached):
                 code, out = seen[tuple(argv)]
                 rec["outcome"], rec["detail"] = outcome_of_check(code, out)
                 texts[part["id"]] = out or ""
+        elif part["id"] == "host" and not io.interrupted:
+            rec["outcome"], rec["detail"] = host_outcome(io)
         else:
             nocheck.append(part["name"])
             continue
@@ -1627,7 +1730,16 @@ def finish(io, parts, rep, files, reached, stop_code, stopped, unreadable=None):
                "a pass (exit %d)." % (counts[OUT_UNMEASURED], counts[OUT_NOT_REACHED], code))
     mine, signs, lone = short_list(parts, records, texts)
     io.say("")
-    if not (mine or signs or lone):
+    hosts = [r for r in records if r["id"] == "host" and r["outcome"] == OUT_WAITING]
+    if hosts:
+        # The host comes first, ahead of every other item (KIT-756), and is not named twice.
+        lone = [n for n in lone if n != hosts[0]["name"]]
+        io.say("Build this first. Nothing else here works without it (%s):" % hosts[0]["name"])
+        for step in next(p for p in parts if p["id"] == "host").get("person_steps") or []:
+            io.say("  - %s" % step["words"])
+        io.say("  %s" % HOST_FIRST)
+        io.say("")
+    if not (mine or signs or lone or hosts):
         if counts[OUT_WAITING] == 0:
             io.say("Nothing is waiting on you.")
         return code
@@ -1735,6 +1847,7 @@ def look_only(io, args):
     files = {"stage-a.conf": os.path.abspath(args.conf),
              "stage-e.conf": os.path.abspath(args.stage_e_conf),
              "sweep.conf": os.path.abspath(args.sweep_conf),
+             "bridge.conf": os.path.abspath(args.bridge_conf),
              "notifier.conf": os.path.abspath(args.notifier_conf),
              "queue.conf": os.path.abspath(args.queue_conf),
              "update.conf": os.path.abspath(args.update_conf)}
@@ -1819,9 +1932,9 @@ def main(argv=None, io=None):
                         "could run them could install its own supervisor. Open the Terminal "
                         "app, or this app's Terminal tab, and run it there." % ", ".join(found),
                     EX_REFUSED)
-    if io.uid() == 0:
-        return stop(io, "do not run this with sudo. Run it as yourself; it asks for your Mac "
-                        "password when it needs it.", EX_USAGE)
+    import pipeline_root_guard as rg      # KIT-693: the one refusal every installer shares
+    if rg.refusal(io.uid()):
+        return stop(io, rg.BODY, EX_USAGE)
     # KIT-752: the one place that says where a settings file is kept, read only now, past the two
     # refusals. A file that was ignored says why on the lines of the parts it would have found.
     found_places, PLACES_WHY[0] = io.places(args.settings_places)
@@ -1842,6 +1955,7 @@ def main(argv=None, io=None):
     files = {"stage-a.conf": os.path.abspath(args.conf),
              "stage-e.conf": os.path.abspath(args.stage_e_conf),
              "sweep.conf": os.path.abspath(args.sweep_conf),
+             "bridge.conf": os.path.abspath(args.bridge_conf),
              "notifier.conf": os.path.abspath(args.notifier_conf),
              "queue.conf": os.path.abspath(args.queue_conf),
              "update.conf": os.path.abspath(args.update_conf)}
@@ -1921,8 +2035,8 @@ class FakeIo(Io):
     program this case did not script is a failure of the case, never a silent pass."""
 
     def __init__(self, codes=None, answers=(), env=None, uid=501, tty=True, git_state=None,
-                 steps=None, typed=None, record=None, conf=None, places=None,
-                 places_why=""):
+                 steps=None, typed=None, record=None, conf=None, host=None,
+                 places=None, places_why=""):
         # The first screen and the consent read lines from `typed` (default: Manual, then
         # yes), so the cases written before them keep their meaning. `record` is what the
         # consent record reads as: (state, data, why). Everything the new seams do is logged.
@@ -1932,6 +2046,7 @@ class FakeIo(Io):
         self.record_reads = []
         self.conf = dict(conf or {})
         self.conf_reads = []
+        self.host = host or ("yes", "the pipeline's account _x and its home folder are here")
         self.placed = dict(places or {})
         self.places_why = places_why
         self.places_reads = []
@@ -2039,6 +2154,8 @@ class FakeIo(Io):
         got = self.levels
         return got.pop(0) if isinstance(got, list) and len(got) > 1 else (got[0] if isinstance(got, list) else got)
 
+    def host_state(self):
+        return self.host
     def places(self, path):
         self.places_reads.append(path)
         return dict(self.placed), self.places_why
@@ -2283,7 +2400,7 @@ def selftest_look(check, base, se_conf, tmp):
           (io.lines[:3], "only looked" in ONLY_LOOKED, "changed nothing" in ONLY_LOOKED),
           (["", "== 0. Where this is running", ONLY_LOOKED], True, True))
     closing = [ln for ln in io.lines if ln.startswith("No check of their own: ")]
-    bare = [p["name"] for p in real if not step_of(p) and not p.get("check")]
+    bare = [p["name"] for p in real if not step_of(p) and not p.get("check") and p["id"] != "host"]
     line_of = lambda r: "  %-22s %s%s" % (r["outcome"], r["name"],                 # noqa: E731
                                           " (%s)" % r["detail"] if r["detail"] else "")
     check("kit736-one-line-per-part-in-the-parts-list",
@@ -2516,6 +2633,8 @@ def selftest():
     base = ["--conf", a_conf, "--stage-e-conf", se_conf, "--sweep-conf", sweep_conf]
     healthy = {"sync_user_skills.py": 0, "pipeline_stage_e_setup.py verify": 0,
                "pipeline_stage_a_setup.py run": 0,
+               "pipeline_bridge_setup.py install": 0,         # asked only where bridge.conf is present
+               "pipeline_bridge_setup.py verify": 0,
                "pipeline_notifier_setup.py run --dry-run": 0,      # asked only where notifier.conf is present
                "pipeline_queue_setup.py run --dry-run": 0}        # asked only where queue.conf is present
 
@@ -2529,7 +2648,8 @@ def selftest():
         code, io = go(env={marker: ""})
         check("refused-under:%s" % marker, (code, io.ran), (EX_REFUSED, []))
     code, io = go(uid=0)
-    check("refused-as-root", (code, io.ran), (EX_USAGE, []))
+    check("refused-as-root", (code, io.ran, __import__("pipeline_root_guard").BODY in "\n".join(io.lines)),
+          (EX_USAGE, [], True))
     code, io = go(tty=False)
     check("refused-without-a-person", (code, io.ran), (EX_USAGE, []))
 
@@ -3040,6 +3160,102 @@ def selftest():
     os.unlink(notifier_conf)
     os.unlink(update_conf)
 
+    # 6d. THE BRIDGE AND THE STAND-UP (KIT-584): `install` compares, a question only when it would write, `install
+    #     --apply` on a yes, then `verify` once for what a person must do. Unmeasured is never up to date.
+    import inspect
+    import pipeline_bridge_setup as bridge_setup
+    bridge_conf = os.path.join(tmp, "bridge.conf")                # absent: the bridge is off
+    look, apply_, verify = ("pipeline_bridge_setup.py install", "pipeline_bridge_setup.py install --apply",
+                            "pipeline_bridge_setup.py verify")
+    spec = [sp for sp in JOB_STEPS if sp["key"] == "bridge"][0]
+    parts_by_id = dict((pt["id"], pt) for pt in Io().parts())
+    check("bridge-step-uses-the-parts-list-commands",
+          (spec["apply"], parts_by_id["tech-lead"]["apply"]["args"][:2], spec["then"],
+           parts_by_id["tech-lead"]["check"]["args"][:1], step_of(parts_by_id["tech-lead"]),
+           step_of(parts_by_id["instant-replies"])),
+          (["install", "--apply"], ["install", "--apply"], ["verify"], ["verify"], "bridge", None))
+    install_source = inspect.getsource(bridge_setup.cmd_install)
+    check("bridge-install-writes-the-standup-file-so-the-step-covers-it",
+          ("standup_needs_writing(conf, facts)" in install_source, "write_standup(conf, runner)" in install_source),
+          (True, True))
+
+    check("bridge-pin-the-work-line-is-the-installers-own",
+          spec["work_line"] in install_source, True)
+    would = "To write: config.\n" + spec["work_line"] + ". Run it again with --apply.\n"
+    blocked = "BLOCKED: the env file holds no tracker key under X. Run `token` first.\n"
+
+    def bridge(codes=None, answers=(), interrupt=(), seen=None, **kw):
+        io = FakeIo(codes=dict(healthy, **(codes or {})), answers=answers, **kw)
+        io.seen_out = {look: would} if seen is None else dict(seen)
+        io.interrupt_on = set(interrupt or ())
+        return main(base + ["--bridge-conf", bridge_conf], io=io), io
+
+    def bout(io):
+        return [(r["outcome"], r["detail"]) for r in io.records if r["id"] == "tech-lead"]
+
+    code, io = bridge()
+    check("bridge-no-conf-is-off-and-not-run",
+          (code, [k for k in io.ran if "bridge" in k], bout(io)),
+          (EX_OK, [], [(OUT_OFF, "no bridge.conf in %s" % tmp)]))
+    with open(bridge_conf, "w") as fh:
+        fh.write("APP_NAME=x\n")
+    code, io = bridge()
+    check("bridge-level-and-verified-is-up-to-date-and-asks-nothing",
+          (code, io.ran.count(apply_), io.asked, [k for k in io.ran if "bridge" in k], bout(io)),
+          (EX_OK, 0, [], [look, verify], [(OUT_OK, "")]))
+    code, io = bridge({look: 10, apply_: 0}, answers=[True])
+    check("bridge-would-write-asked-then-applied-then-verified-updated",
+          (code, [k for k in io.ran if "bridge" in k or "stage_a" in k], len(io.asked), bout(io)),
+          (EX_OK, [look, apply_, verify, "pipeline_stage_a_setup.py run"], 1, [(OUT_UPDATED, "")]))
+    code, io = bridge({look: 10}, seen={look: blocked})
+    check("bridge-a-blocked-compare-asks-nothing-is-waiting-and-carries-on",
+          (code, io.asked, apply_ in io.ran, "pipeline_stage_a_setup.py run" in io.ran, bout(io)),
+          (EX_BLOCKED, [], False, True, [(OUT_WAITING, "a card is still yours")]))
+    code, io = bridge({look: 10}, seen={look: ""})
+    check("bridge-a-compare-that-printed-nothing-is-never-up-to-date-and-asks-nothing",
+          (code, io.asked, bout(io)), (EX_BLOCKED, [], [(OUT_WAITING, "a card is still yours")]))
+    code, io = bridge({look: 10}, answers=[False])
+    check("bridge-declined-is-waiting-and-writes-nothing",
+          (code, io.ran.count(apply_), "pipeline_stage_a_setup.py run" in io.ran, bout(io)),
+          (EX_BLOCKED, 0, True, [(OUT_WAITING, "behind; you did not update it")]))
+    code, io = bridge({verify: 10})
+    check("bridge-level-but-a-card-is-left-is-waiting-and-carries-on",
+          (code, io.asked, "pipeline_stage_a_setup.py run" in io.ran, bout(io)),
+          (EX_BLOCKED, [], True, [(OUT_WAITING, "a card is still yours")]))
+    code, io = bridge({look: 10, apply_: 0, verify: 10}, answers=[True])
+    check("bridge-updated-with-a-card-left-says-both",
+          (code, bout(io)), (EX_BLOCKED, [(OUT_WAITING, "updated; a card is still yours")]))
+    for rc in (1, 2, 3, 4, 5, 77):
+        code, io = bridge({look: rc})
+        check("bridge-compare-exit-%d-stops-never-current" % rc,
+              (code, "pipeline_stage_a_setup.py run" in io.ran, verify in io.ran, bout(io)[0][0] != OUT_OK),
+              (rc, False, False, True))
+    for rc in (1, 4, 77):
+        code, io = bridge({verify: rc})
+        check("bridge-verify-exit-%d-stops-unmeasured" % rc,
+              (code, "pipeline_stage_a_setup.py run" in io.ran, [o for o, _d in bout(io)]),
+              (rc, False, [OUT_UNMEASURED]))
+    code, io = bridge({look: 10, apply_: 10}, answers=[True])
+    check("bridge-apply-ending-on-a-blocked-card-stops-in-manual-and-never-verifies",
+          (code, "pipeline_stage_a_setup.py run" in io.ran, verify in io.ran, [o for o, _d in bout(io)]),
+          (EX_BLOCKED, False, False, [OUT_WAITING]))
+    code, io = bridge({look: 10, apply_: 10}, answers=[True], typed=["1", "yes"])
+    check("bridge-apply-ending-on-a-blocked-card-is-carried-past-in-automatic",
+          (code, "pipeline_stage_a_setup.py run" in io.ran, [o for o, _d in bout(io)]),
+          (EX_BLOCKED, True, [OUT_WAITING]))
+    for rc in (1, 4):
+        code, io = bridge({look: 10, apply_: rc}, answers=[True])
+        check("bridge-apply-exit-%d-stops-unmeasured" % rc,
+              (code, "pipeline_stage_a_setup.py run" in io.ran, [o for o, _d in bout(io)]),
+              (rc, False, [OUT_UNMEASURED]))
+    code, io = bridge({}, interrupt={look})
+    check("bridge-ctrl-c-in-its-compare-stops-the-run",
+          (code, "pipeline_stage_a_setup.py run" in io.ran), (EX_BLOCKED, False))
+    code, io = bridge({}, interrupt={verify})
+    check("bridge-ctrl-c-in-its-verify-stops-the-run",
+          (code, "pipeline_stage_a_setup.py run" in io.ran), (EX_BLOCKED, False))
+    os.unlink(bridge_conf)
+
     # 7. CTRL-C REACHES THE INSTALLER AND ITS CLEAN-UP RUNS TO THE END. Real processes:
     #    a terminal's Ctrl-C goes to the whole process group, and a wrapper that did not
     #    step aside would kill the installer a quarter of a second in.
@@ -3100,6 +3316,46 @@ def selftest():
     check("lines-a-part-off-never-runs-its-check",
           "pipeline_notifier_setup.py run" in io.measured, False)
 
+    # 9c. KIT-756: the host. Read-only; a Mac with none puts building it first on the closing
+    #     list; one that has it says nothing; one that cannot be told is never "has one".
+    check("kit756-a-mac-with-a-host-reads-up-to-date-and-is-not-on-the-list",
+          (by_id(go()[1])["host"], any("Build this first" in ln for ln in go()[1].lines)),
+          (OUT_OK, False))
+    HOST_NAME = [p["name"] for p in Io().parts() if p["id"] == "host"][0]
+    code, io = go(host=("none", HOST_NONE + ": test"))
+    lines = io.lines
+    at = [i for i, ln in enumerate(lines) if ln.startswith("Build this first")]
+    check("kit756-no-host-reads-waiting-and-exits-10",
+          (by_id(io)["host"], code), (OUT_WAITING, EX_BLOCKED))
+    check("kit756-no-host-is-the-first-item-with-its-steps-and-the-guide",
+          (len(at), lines[at[0] + 1].startswith("  - Build the host"),
+           any(ln == "  " + HOST_FIRST for ln in lines), "docs/HOST.md" in HOST_FIRST),
+          (1, True, True, True))
+    others = [i for i, ln in enumerate(lines) if ln.startswith(("Only you can do these:",
+                                                                 "Sign-offs still asked for:"))
+              or ln.endswith(" is waiting on you; its own lines above say what for.")]
+    check("kit756-the-host-comes-before-every-other-list-item",
+          all(at[0] < i for i in others), True)
+    check("kit756-the-host-is-not-named-a-second-time",
+          sum(1 for ln in lines if ln.startswith(HOST_NAME) and ln.endswith("is waiting on you; its own lines above say what for.")), 0)
+    code, io = go(host=("unknown", "the lane marker folder could not be read (x)"))
+    check("kit756-an-unreadable-host-is-not-measured-never-has-one",
+          (by_id(io)["host"], code, [r["detail"] for r in io.records if r["id"] == "host"][0][:13]),
+          (OUT_UNMEASURED, EX_UNMEASURED, "not measured:"))
+    code, io = go(host=("none", HOST_NONE))
+    check("kit756-the-host-is-no-longer-on-the-no-check-line",
+          any("The always-on machine" in ln and ln.startswith("No check of their own") for ln in io.lines), False)
+    Pw = type("Pw", (), {"pw_dir": "/srv/acct"})
+    check("kit756-host-state-no-folder-is-none",
+          host_state(listdir=lambda p: (_ for _ in ()).throw(FileNotFoundError()))[0], "none")
+    check("kit756-host-state-unreadable-is-unknown",
+          host_state(listdir=lambda p: (_ for _ in ()).throw(PermissionError()))[0], "unknown")
+    check("kit756-host-state-marker-without-account-is-none",
+          host_state(listdir=lambda p: ["_a"], getpwnam=lambda n: (_ for _ in ()).throw(KeyError(n)))[0], "none")
+    check("kit756-host-state-account-without-home-is-none",
+          host_state(listdir=lambda p: ["_a"], getpwnam=lambda n: Pw, isdir=lambda d: False)[0], "none")
+    check("kit756-host-state-account-with-home-is-yes",
+          host_state(listdir=lambda p: ["junk", "_a"], getpwnam=lambda n: Pw, isdir=lambda d: True)[0], "yes")
     # 9b. KIT-752: a settings file kept outside the kit folder, found from the one place on the
     #     machine that says so. The kit folder stays the default; a part with no file anywhere
     #     still reads off, and says every place it looked.
@@ -3346,7 +3602,7 @@ def selftest():
     check("lines-steps-are-found-from-the-list",
           (keys["one-command"], keys["skills"], keys["cleanup"], keys["idea-gate"],
            set(k for k in keys.values() if k) == set(["checkout", "skills", "stage_e",
-                                                      "sweep", "stage_a", "notifier", "queue", "watch"]),
+                                                      "sweep", "stage_a", "bridge", "notifier", "queue", "watch"]),
            all(keys[pt["id"]] == "stage_e" for pt in real
                if pt["check"] and pt["check"]["script"].endswith("pipeline_stage_e_setup.py"))),
           ("checkout", "skills", "sweep", "stage_a", True, True))

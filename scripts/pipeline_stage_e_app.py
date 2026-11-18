@@ -755,9 +755,9 @@ def cmd_run(io, args):
                "never do that. Run it in your own terminal. (An agent's environment was found: "
                "%s.)" % ", ".join(found))
         return EX_REFUSED
-    if io.uid() == 0:
-        io.say("REFUSED: run this as yourself, not as root. Its ledger lives under YOUR home, "
-               "where the installer reads it.")
+    import pipeline_root_guard as rg      # KIT-693: the one refusal every installer shares
+    if rg.refusal(io.uid()):
+        io.say(rg.refusal(io.uid()))
         return EX_REFUSED
     conf, code = load_conf(io, args.conf)
     if conf is None:
@@ -1166,7 +1166,8 @@ def selftest():
                os.path.exists(io.ledger_path())), (EX_REFUSED, True, [], [], [], 0, False))
         io = _FakeIO(w, d, uid=0)
         check("root is refused too: the ledger is YOUR home's",
-              (main(run_argv(conf), io), io.ran, io.calls), (EX_REFUSED, [], []))
+              (main(run_argv(conf), io), io.ran, io.calls, __import__("pipeline_root_guard").MESSAGE in io.said),
+              (EX_REFUSED, [], [], True))
 
         # 2. Without a typed yes, nothing changes: no app, no key, no ledger, no conf line.
         for typed in ("no", "y", "YES please", ""):

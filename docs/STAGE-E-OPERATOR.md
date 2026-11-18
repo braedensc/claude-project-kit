@@ -674,8 +674,17 @@ wrote. On a separate Reviews team the same failure landed in a read-only reviewe
 - Right after filing, in the same pass, the poller reads the dispatcher's routing note on
   the ticket's first session. Only the earliest one counts: a model could imitate a later
   one. It must name `reviews-<name>` alone, by the tag or the label.
-- It waits up to `routing_wait_seconds` (default 120), or 330 seconds while a setup hook
-  runs. A check the pass had no time for is finished first on the next pass.
+- It waits `routing_wait_seconds` (default 120) when no other review ticket is in flight.
+  Each review ticket still in flight when this one was filed adds 60 seconds, up to 900
+  (15 minutes). In flight means filed and not yet collected. While a setup hook runs, the
+  wait is at least 330 seconds. The record keeps the count as `routing.in_flight`.
+- Why it grows (KIT-795): on 17 Nov a burst of review tickets met ten running reviews. One
+  note came late, the plain wait read it as a misroute, and every review paused for six hours.
+- A pass sleeps on a note only through the plain wait: `routing_wait_seconds`, or 330
+  seconds while a setup hook runs. A ticket past it, inside its own wait, is "not routed
+  yet": each later check reads it once, never every few seconds, and the heartbeat counts it
+  in `routing_waiting`. So a note that never comes trips up to one pass after the ticket's
+  wait ends. A check the pass had no time for is finished first on the next pass.
 - Only a confirmed review is collected. Until then the ticket's answer is never published.
 
 **When the note is wrong, or never comes:**
@@ -724,9 +733,9 @@ check catches it, and nothing is collected from it, but the session ran.
 | Finding poller | The same account, a third system LaunchDaemon | Same env file, same clone, **its own** state directory and config. Reads one tracker key. Creates backlog tickets, links each to its source, posts receipts and cap notes on the source ticket, and comments the finding-filed mark on the new ticket — nothing else. Not a session. |
 | Reviewer | The same account, sandboxed, the Reviews entry | Reads files and its ticket body, and nothing else. No shell, edits, fetch, scheduling or messaging tools, and none of the dispatcher's MCP servers: the fence names the four it injects and every one its platform MCP configs add (KIT-132). |
 | Coding session | The same account, sandboxed, the managed-repo entry | Unchanged. Receives bounces, and conflict fixes, as thread comments. |
-| Catch-up poller | The same account, a fourth system LaunchDaemon, installed only once you sign its first count (`CK-11`), unless `CATCHUP_INTERVAL_SECONDS=off` | Same env file, same clone, **its own** state directory and config. Reads one tracker key and the dispatcher's local status. Its only tracker write is one reply under a delegation the dispatcher never answered (`docs/CATCH-UP.md`). Not a session. |
+| Catch-up poller | The same account, a fourth system LaunchDaemon, installed only once you sign its first count (`CK-11`), unless `CATCHUP_INTERVAL_SECONDS=off` or every team is on the runner lane (step 5a) | Same env file, same clone, **its own** state directory and config. Reads one tracker key and the dispatcher's local status. Its only tracker write is one reply under a delegation the dispatcher never answered (`docs/CATCH-UP.md`). Not a session. |
 | Heartbeat monitor | The same account, a fifth system LaunchDaemon, unless `HEARTBEAT_MONITOR_TICKET=off` | Reads the daemons' heartbeats (the catch-up poller's once it is installed) — and the notifier's, when `NOTIFIER_JOB_LABEL` names it, and the health watch's status file, when `HEALTH_STATUS_FILE` names it — and one tracker key. Posts one comment per incident on one ticket, and nothing else. Its comments carry a mark the notifier pings on; its code reads no chat token. Not a session. |
-| Conflict waker | **You**, a user LaunchAgent, only while you are logged in | Uses your own `claude` and `gh` logins. Starts fix sessions **outside** any sandbox, so it takes only worktrees your own Claude Code worked in, and refuses to run as the role account. |
+| Conflict waker | **You**, a user LaunchAgent, only while you are logged in | Uses your own `claude` and `gh` logins. Each fix session is held to its worktree in Claude Code's sandbox and reads none of your home but what its tools need (KIT-676, KIT-786). It still pushes with your GitHub login, so the waker takes only worktrees your own Claude Code worked in, and refuses to run as the role account. |
 | State | `<role-account home>/.stage-e/state`, `…/.stage-e/finding` for the finding poller, and `…/.stage-e/catchup` for the catch-up poller | The sandbox denies sessions every read under that home. Same uid, so the sandbox is the whole boundary — see *Accepted risks*. |
 
 ### Why the role account and not yours
@@ -1921,7 +1930,7 @@ The last three rows have their own installer steps, after `enable` loads the fir
 - **The catch-up poller** is installed only once you sign its first count (card `CK-11`).
   Until then it has no plist at all, so no reboot can start it, and every run says so.
   Nothing else waits on it. `CATCHUP_INTERVAL_SECONDS=off` declines it by name, and removes
-  one an earlier run installed.
+  one an earlier run installed. So does a `RUNNER_LANE_REPOS` that covers every team (step 5a).
 - **The status job** writes one file of where every plan stands, which the Slack tech lead
   reads instead of GitHub (contract §16). Its dry run must read the tracker before it is
   installed (card `CK-12`). It writes that file and one small count of how long the tracker and
@@ -2142,33 +2151,47 @@ the number you sign off. Exits 1 and 2 are still failures. If exit 3 stopped the
 Stage E could never be switched on while any open PR's ticket lacked criteria, which is a
 property of your backlog, not of Stage E.
 
-**Exit 1 from a poller paused for want of the routing sign-off is an unsigned probe, not a
-broken install** (KIT-733). On the work teams the poller pauses every repository's reviews
-until the routing probe has written `~/.stage-a/routing-signoff.json`. A pass with a paused
-repository exits 1.
+**Exit 1 from a poller paused until the routing probe is signed is waiting on you, not a
+broken install** (KIT-733, KIT-794). On the work teams the poller pauses a repository's
+reviews until the routing probe's sign-off, `~/.stage-a/routing-signoff.json`, covers it. A
+pass with a paused repository exits 1.
 
 The probe belongs to the idea gate, and the one command runs the idea gate after this
-installer. A Mac with no sign-off yet could never reach the step that writes it. That is a
-first install, or one whose review entries were just rewritten.
+installer. Read as a failure, a pause stopped the one command at `verify`: before `run` moved
+the clone, and before the probe that clears it. That happened on a first install (KIT-733),
+and on 17 Nov after a review stop, when the owner needed `--skip-stage-e` (KIT-794).
 
-So the dry run reads a pause for that one reason as expected. It prints one line naming the
-routing probe, and the run goes on. It excuses nothing beside it. These still fail the step:
+So the dry run reads a pause as waiting on you when every reason on it is one that only a
+newer probe sign-off clears, and that the idea gate offers the probe for:
+
+- no sign-off at all;
+- a stop dated after the sign-off, when the shared stop file holds it too. The idea gate
+  reads only that file, so a stop only the poller's own record or its seen-set holds still
+  fails the step, unless the line also says one of the other two;
+- a dispatcher version other than the one the probe was signed on.
+
+It prints one line, `Waiting on you: sign the routing probe.`, naming the paused
+repositories and why. The step passes and the run goes on to the idea gate. These still fail
+the step, beside such a pause or alone:
 
 - a sign-off that cannot be read, or is not one;
-- a stop, a missing routing label, or a changed dispatcher version;
+- a stop file that cannot be read;
+- a review entry the sign-off does not prove by both routes;
+- a dispatcher version that cannot be read, or this poller's own stops record unreadable;
+- a missing routing label, or one that could not be read just now;
 - any `FAIL`, `RETRY` or `TELEMETRY LOST` line, and any other exit.
 
 A dry run cannot see every cause of exit 1. A close or a telemetry row still pending on an
 earlier review also exits 1, and prints nothing of it. That shows on the poller's heartbeat
 and in the heartbeat monitor.
 
-A paused poller counts no pull requests, so the count `CK-5` asks you to sign is empty until
-the probe is signed. Read it again with `run --dry-run` once it is.
+A paused repository's pull requests are not counted, so the count `CK-5` asks you to sign
+leaves them out until the probe is signed. Read it again with `run --dry-run` once it is.
 
-Good: `The poller is paused until the idea gate's routing probe is signed ... after this one.`,
-then the steps after the dry run.
+Good: `Waiting on you: sign the routing probe. Reviews of <repo> are paused ...`, then the
+steps after the dry run, then the idea gate's `Run the probe now?`.
 Not that: `FAILED at step dry-run: the poller's dry run failed (exit 1)`, with
-`there is no routing sign-off at ...` in it, and the idea gate never reached.
+`reviews are paused` in it, and the idea gate never reached.
 
 `decide --all` prints one line per PR that has a review outcome on file and says what it
 would do. With no outcomes yet it says so in words, and exits 0.
@@ -2506,6 +2529,41 @@ pass with a declined PR and a broken one exits `2`. The heartbeat's `result` say
   text, and a review ticket's id there could link the two. The ledger and the outcome file
   keep the id.
 
+### 5a. Fixes by resume, through the runner — one setting per repository
+
+Our own runner (`docs/RUNNER.md`) can resume a pull request's own coding session directly.
+For a repository named in `RUNNER_LANE_REPOS`, the driver sends each fix that way, as a resume
+request to the runner, not as a reply in the tracker thread. It is off while the key is empty.
+
+```
+RUNNER_LANE_REPOS=example-org/app:APP:app
+RUNNER_STORE_DIR=~/.pipeline-runner/store
+```
+
+Each entry is `OWNER/NAME:TEAM:PROJECT`. The repository is one you review, the team is its
+tracker team, and the project is its key in the runner's settings. Remove the entry and run
+the installer again to switch it back.
+
+- **What stays the same.** The ledger rows, the fix budget, the re-review request, exhaustion
+  and the page when a fix is never pushed. The visible record line goes on the ticket as one
+  top-level comment.
+- **What the driver needs.** The runner's record of the pull request's coding run, matched by
+  project, ticket and branch. With none, nothing is sent, no bounce is spent, and the pull
+  request says a person is needed. While that run is still going, the fix waits for it to end
+  and spends nothing. Past `blocked_after_seconds` that wait is said on the pull request
+  instead, since the runner may be down.
+- **The catch-up poller** leaves that repository's team out. With every team on this lane it
+  is not installed, as with `CATCHUP_INTERVAL_SECONDS=off`. It works by team, so a team leaves
+  it as a whole: name every repository of that team, or none. A repository of it still on the
+  thread would no longer have its lost delegations re-sent.
+- **A conflict** still goes by the thread. That move comes later.
+- **Name a repository only once its coding sessions run through the runner too.** Until then
+  every fix finds no run there, and says so on the pull request.
+
+Good: `delivered via runner (rq-…)` in the driver's log, one request in the runner's store,
+and one "sent to its coding session" comment on the ticket.
+Not that: a reply in the ticket's agent-session thread for a repository on this lane.
+
 ---
 
 ## Step 6 — Conflicts: two lanes, one monitor
@@ -2514,8 +2572,14 @@ A pull request that goes `CONFLICTING` after its session stopped skips its requi
 It can sit there looking green. The conflict monitor sees it and posts a **fix request** on
 the pull request. It allows three per pull request, ever, or the number the repository sets with
 `--max-fix-requests`. Then something must answer. The bounce driver stops at the same number, so
-update the role account's clone before you raise it. It reads that number from the request. A forged
-request from the repository's own bot account could raise it, to 20 at most.
+update the role account's clone before you raise it. It reads that number from the requests on the
+pull request and keeps the lowest one, so a later request can lower it but never raise it. A forged
+request from the repository's own bot account can stop fixes, but it cannot buy one.
+
+A raise reaches only pull requests whose first fix request comes after it. A pull request that was
+asked before keeps the old number: the driver stops there, the monitor's next request goes
+unanswered, and the monitor pages a person when its answer deadline passes. A lower number applies
+at the next request.
 
 **Who answers depends on who owns the session. Never both.**
 
@@ -2588,7 +2652,8 @@ Then run the installer as usual. Its `conflict-waker` step does the rest, as **y
 1. clones the waker's code to `~/.pr-conflict-waker/code`, level with origin;
 2. writes `~/Library/LaunchAgents/<LABEL>.plist` (no `sudo`, no role account);
 3. runs the waker's own dry run with the job's exact arguments;
-4. stops at **CK-8**: read the `would wake [...]` count and sign it off;
+4. stops at **CK-8**: read the `would wake [...]` count and sign it off. The sign-off holds
+   only for the settings that dry run ran with, so a later change to one asks again;
 5. loads the job and waits for its first heartbeat.
 
 Don't want it on this machine? Set `CONFLICT_WAKER_CONF=off`. The step then says **OFF**
@@ -2618,6 +2683,29 @@ none of your settings. It may run only the git and gh steps of its prompt and yo
 - Not: an empty `CHECK_COMMANDS` on a project that has a local gate. The session merges, runs
   no check, and pushes with only CI to test it.
 - Not: `CLAUDE_ARGS`. It is gone, and a conf that still sets it is refused by name.
+
+**What a fix session can read (KIT-786).** Its commands read nothing in your home, `/Users`,
+`/Volumes`, the temp folders, or other sessions' scratchpads. These stay readable, each for
+one reason:
+
+| Stays readable | Why |
+|---|---|
+| The worktree and its checkout | The session's own files, git's objects and hooks, and the pre-commit hook's scanner |
+| `/tmp/claude-<uid>` | The sandbox's temp folder. Each command's output is kept there |
+| `~/.gitconfig` and `~/.config/git` | git's settings: the name and email on the merge commit |
+| `~/.nvm` and `~/.pyenv` | Node, npm and Python, where those managers install them |
+| `~/Library/Keychains/login.keychain-db` | git's `osxkeychain` helper reads it to push |
+| System folders and Homebrew | They hold programs, not your files |
+
+The kit's secret files (`.env`, `*.pem`, `credentials` and the rest) stay refused inside each
+folder above. npm's cache, `~/.npm`, stays closed: `npm run` does not need it.
+
+- Good: checks whose programs come from Homebrew, the system, `~/.nvm` or `~/.pyenv`.
+- Not: a check whose program lives elsewhere in your home, such as `~/.cargo/bin`. Preflight
+  refuses it and names the folder.
+- Not held: your GitHub login. The push needs it, so any command in the session can ask git
+  for it. The measured table is in
+  `docs/adr/2026-11-18-the-conflict-fix-session-reads-only-what-it-needs.md`.
 
 **Is it running?** Read the heartbeat, not the log:
 

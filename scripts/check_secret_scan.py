@@ -878,6 +878,25 @@ def selftest():
           "exit %d: %s" % (rc, said[-3:]))
     shutil.rmtree(repo, ignore_errors=True)
 
+    # KIT-683: the pipeline's own credentials, from the one list the hook's battery reads too
+    # (scripts/secret_shapes.py). The real rules must find each sample by the rule the list
+    # names and nothing in any near miss, so the scan and the hook cannot drift apart on them.
+    from secret_shapes import SHAPES
+    files = {}
+    for n, (_name, _label, _rule, sample, near) in enumerate(SHAPES):
+        files[b"shapes/%02d-key.md" % n] = plain(("TOKEN=%s\n" % sample).encode("ascii"))
+        files[b"shapes/%02d-near.md" % n] = plain(("TOKEN=%s\n" % near).encode("ascii"))
+    repo = throwaway_repo(files)
+    rc, said, findings = scan_tracked(repo, tool, config)
+    for n, (name, _label, rule, _sample, _near) in enumerate(SHAPES):
+        hit = [f for f in findings if f[0] == "shapes/%02d-key.md" % n]
+        check("the pipeline's %s is found by %s (KIT-683)" % (name, rule),
+              any(f[3].endswith(rule) for f in hit), "found %s; exit %d: %s" % (hit, rc, said[-3:]))
+    near_hits = [f for f in findings if f[0].endswith("-near.md")]
+    check("…and nothing is found in any near miss the hook lets through (KIT-683)",
+          not near_hits, near_hits)
+    shutil.rmtree(repo, ignore_errors=True)
+
     # On a PR, CI scans the head's own tree as well: a base the PR names can delete one of
     # the head's files from the merge CI checks out, and retargeting to main brings it back
     # (KIT-410). Here the index has lost a file its commit still holds.

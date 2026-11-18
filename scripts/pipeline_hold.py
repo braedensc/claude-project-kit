@@ -37,8 +37,9 @@ import time
 
 HOLD_SCHEMA = "pipeline-hold/1"
 SCHEMA_NAME = "pipeline-hold"
-MONITORS = ("spend", "runs", "labels")
-WHATS = ("spend-day", "spend-piece", "key-run", "runs-day", "runs-piece", "protected-label")
+MONITORS = ("spend", "runs", "labels", "approval-rate")
+WHATS = ("spend-day", "spend-piece", "key-run", "runs-day", "runs-piece", "protected-label",
+         "merge-without-approval", "approval-rate")
 MAX_HOLDS = 50
 MAX_BYTES = 1024 * 1024
 REF_RE = re.compile(r"^[A-Za-z0-9_.:/#-]{1,200}\Z")
