@@ -6018,40 +6018,105 @@ def _say_declines(text):
 # and pinned the same way: the battery builds these lines from the poller's own code.
 COMPONENT_EXIT_ERROR = 1
 POLLER_PAUSED_LINE = re.compile(r"^PAUSED (\S+): reviews are paused — (.*)$")
-NO_SIGNOFF_PAUSE = re.compile(
-    r"^there is no routing sign-off at .+: the probe has not been signed, or it no longer "
-    r"holds\. The one command offers to run it$")
+# KIT-794: A STOP WAITS ON THE PROBE TOO. On 17 Nov a review ticket's routing note was late,
+# the poller stopped that repository's reviews, and this step read the pause as a failed
+# install. The one command then stopped before `run` (so the clone stayed behind) and before
+# the idea gate, whose probe sign-off is the only thing that clears a stop. So each reason
+# below, the poller's own wording, is one ONLY a newer routing-probe sign-off clears, and one
+# the idea gate's installer offers the probe for (`probe_needed` there). A PAUSED line passes
+# only when EVERY reason on it is one of these.
+PROBE_CLEARS = (
+    ("no-signoff", re.compile(r"there is no routing sign-off at .+: the probe has not been "
+                              r"signed, or it no longer holds\. The one command offers to run it")),
+    ("stopped", re.compile(r"stopped since (\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ): (.*)\. Only a probe "
+                           r"signed after it clears it")),
+    ("misrouted", re.compile(r"a review ticket misrouted at (\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ): "
+                             r"(.*)\. Its stop could not be written; only a probe signed after it "
+                             r"clears it")),
+    ("version-changed", re.compile(r"the dispatcher is version \S+, and the routing probe was "
+                                   r"signed on \S+; sign it again on this version")),
+)
+# The poller joins a line's reasons with "; ". A stop's own reason is free text and may hold
+# "; " too, so a line is cut only where a reason above BEGINS. Any other reason then stays
+# glued to the end of the one before it, which no longer ends the way that reason must, and
+# so fails: it never rides in behind a reason the probe clears.
+PROBE_REASON_CUT = re.compile(r"; (?=there is no routing sign-off at |stopped since |"
+                              r"a review ticket misrouted at |the dispatcher is version )")
+# A stop file that cannot be read counts as a stop, as of its last write or of no time at
+# all. A person has to look at that file, so it is never one the probe clears.
+UNREADABLE_STOP = re.compile(r"the stop at .* could not be read, so it counts as stopped")
+# BUT THE IDEA GATE SEES ONLY THE SHARED STOP (review of KIT-794). Its installer offers the
+# probe again for a stop only when the shared stop file is newer than the sign-off. The
+# poller also pauses on its own record of stops and on a misroute its seen-set holds, and
+# writes the shared file only when none stands. So a stop passes only when the same line
+# shows the shared stop holding too: the poller names that one first, then its own, so a
+# line with BOTH holds it. Or when the line also says no sign-off or a changed version: the
+# idea gate offers the probe for those anyway, and a new sign-off clears every stop beside
+# them. A stop alone in either record still fails the step, as before.
+PROBE_OFFERED_ANYWAY = frozenset(("no-signoff", "version-changed"))
+PROBE_SAYS = {"no-signoff": "no routing sign-off stands",
+              "stopped": "a review ticket did not reach its review setup, so reviews stopped "
+                         "as a precaution",
+              "misrouted": "a review ticket did not reach its review setup, so reviews stopped "
+                           "as a precaution",
+              "version-changed": "the dispatcher changed since the probe was signed"}
 # The lines the poller prints beside every error it counts (`result.errors += 1`): its
 # `FAIL:` lines, a review it will try again (`RETRY`), and a telemetry row it lost.
 POLLER_ERROR_LINE = re.compile(r"^(FAIL:|RETRY |TELEMETRY LOST)")
 
 
-def paused_only_for_the_probe(said):
-    """True when the poller's output has a PAUSED line, every PAUSED line gives an absent
-    routing sign-off as its ONLY reason, and none of its error lines (`POLLER_ERROR_LINE`)
-    is there.
+def probe_clears(reasons):
+    """The codes of one PAUSED line's reasons when only a newer routing-probe sign-off clears
+    every one of them (PROBE_CLEARS) AND the idea gate will offer that probe; or None. A stop
+    passes only beside the shared stop or a reason the probe is offered for anyway."""
+    codes = []
+    for part in PROBE_REASON_CUT.split(reasons):
+        for code, shape in PROBE_CLEARS:
+            found = shape.fullmatch(part)
+            if found:
+                break
+        else:
+            return None
+        if code == "stopped" and (found.group(1).startswith("9999")
+                                  or UNREADABLE_STOP.fullmatch(found.group(2))):
+            return None
+        codes.append(code)
+    stopped = codes.count("stopped") + codes.count("misrouted")
+    if stopped and codes.count("stopped") != 2 and not PROBE_OFFERED_ANYWAY & set(codes):
+        return None
+    return codes or None
 
-    A sign-off that cannot be read or is not one, a stop, a missing routing label and a
-    changed dispatcher version are NOT that: each makes its PAUSED line more than the one
-    sentence, and each still fails the install, because each needs a person to look. The
-    match is the whole sentence, so a second reason joined onto it ("...; stopped since ...")
-    cannot ride in behind it.
+
+def paused_only_for_the_probe(said):
+    """{OWNER/NAME: [reason codes]} when the poller's output has a PAUSED line, every reason on
+    every PAUSED line is one only a newer routing-probe sign-off clears (`probe_clears`), and
+    none of its error lines (`POLLER_ERROR_LINE`) is there; {} otherwise.
+
+    That is: no sign-off at all (KIT-733), a stop dated after the sign-off that the shared stop
+    file holds too, and a changed dispatcher version (KIT-794). A stop only the poller's own
+    record or its seen-set holds passes only beside no sign-off or a changed version: the idea
+    gate reads the shared file alone, so it would not offer the probe for it. A sign-off that
+    cannot be read or is not one, a stop file that cannot be read, a review entry the sign-off
+    does not prove, a version that cannot be read, an unreadable record of stops and a missing
+    or unreadable routing label are NOT that: each still fails the install, because each needs
+    a person to look, and the probe alone would not clear it.
 
     WHAT IT CANNOT SEE. Every other line is ignored. A pass can exit 1 for a cause that
     prints none of the above: a close or a telemetry row still pending on an earlier review.
     A dry run says nothing of it, and it shows on the poller's heartbeat and in the heartbeat
     monitor instead."""
-    paused = 0
+    paused = {}
     for raw in said.splitlines():
         line = raw.strip()
         if POLLER_ERROR_LINE.match(line):
-            return False
+            return {}
         found = POLLER_PAUSED_LINE.match(line)
         if found:
-            if not NO_SIGNOFF_PAUSE.match(found.group(2)):
-                return False
-            paused += 1
-    return paused > 0
+            codes = probe_clears(found.group(2))
+            if codes is None:
+                return {}
+            paused[found.group(1)] = codes
+    return paused
 
 
 def step_dry_run(ctx, apply_it):
@@ -6142,12 +6207,13 @@ def step_dry_run(ctx, apply_it):
     # always read this way; the poller was not.
     ok_codes = (0, COMPONENT_EXIT_DECLINED)
     problems = []
-    # A FIFTH STATE, for the poller alone (KIT-733): paused for want of the routing sign-off.
-    # Exit 1, and expected until the idea gate's probe writes the sign-off. Only that reason
-    # and only that exit: see `paused_only_for_the_probe` for what is still a failure.
-    probe_unsigned = (poller.rc == COMPONENT_EXIT_ERROR
-                      and paused_only_for_the_probe(poller.out + poller.err))
-    if poller.rc not in ok_codes and not probe_unsigned:
+    # A FIFTH STATE, for the poller alone (KIT-733, KIT-794): paused until the routing probe
+    # is signed again. Exit 1, and waiting on the person until the idea gate's probe writes a
+    # newer sign-off. Only those reasons and only that exit: see `paused_only_for_the_probe`
+    # for what is still a failure. {OWNER/NAME: [reason codes]}, or {}.
+    waits_on_probe = (poller.rc == COMPONENT_EXIT_ERROR
+                      and paused_only_for_the_probe(poller.out + poller.err)) or {}
+    if poller.rc not in ok_codes and not waits_on_probe:
         problems.append("the poller's dry run failed (exit %d). Nothing was created: %s"
                         % (poller.rc, (poller.err or poller.out).strip()[-400:]))
     # A FOURTH STATE, for the same reason as the third. The driver exits 2 when it CANNOT
@@ -6260,24 +6326,32 @@ def step_dry_run(ctx, apply_it):
     # ONE PLAIN LINE, and before CK-5 below can stop the run: a pause that counted nothing is
     # said wherever the step ends. It does not skip the cost gate: with no count signed off,
     # CK-5 still stops here, and its row says nothing was counted.
-    if probe_unsigned:
-        say("  The poller is paused until the idea gate's routing probe is signed (no routing "
-            "sign-off stands), so this dry run counted no pull requests. That is expected: "
-            "the idea gate's installer asks \"Run the probe now?\" after this one.")
+    if waits_on_probe:
+        why = []
+        for code in sorted(set(c for codes in waits_on_probe.values() for c in codes)):
+            if PROBE_SAYS[code] not in why:
+                why.append(PROBE_SAYS[code])
+        say("  Waiting on you: sign the routing probe. Reviews of %s are paused until it is "
+            "signed again (%s), so this dry run counted none of their pull requests. That is "
+            "expected, not a failed install: the idea gate's installer asks \"Run the probe "
+            "now?\" after this one." % (", ".join(sorted(waits_on_probe)), "; ".join(why)))
     if not ctx.state.attested("A-DRY-RUN"):
         raise Blocked("CK-5", "the counts above have not been signed off"
                               + ("; the poller counted nothing while its reviews are paused"
-                                 if probe_unsigned else ""))
+                                 if waits_on_probe else ""))
     # EVERY candidate, not the WOULD lines: those are only what one pass posts under the cap,
     # and none while a disabled webhook holds them. Each candidate is a paid session in time.
     # The catch-up step reads this list; it decides, and it never stops the run.
     ctx.catchup_candidates = None if catchup_off(ctx.conf) else [
         l.split("] CANDIDATE", 1)[1].strip() for l in catchup_said.splitlines()
         if "] CANDIDATE " in l]
+    if waits_on_probe:
+        # FIRST in the row, which the step table cuts at 96 characters.
+        return True, ("waiting on you: sign the routing probe; reviews of %d repositor%s are "
+                      "paused until then, and all five dry runs ran with the count signed off"
+                      % (len(waits_on_probe), "y" if len(waits_on_probe) == 1 else "ies")), notes
     return True, ("all five dry runs ran and the count is signed off; "
-                  + ("the poller is paused until the routing probe is signed"
-                     if probe_unsigned else
-                     "the poller declined at least one pull request"
+                  + ("the poller declined at least one pull request"
                      if declined else "the poller did not decline")), notes
 
 
@@ -11943,12 +12017,16 @@ def _selftest_body():
            "a real driver failure was excused by a CANNOT EVALUATE line beside it: %r"
            % (rowD6 if not isinstance(rowD6, SetupError) else ""))
 
-    # -- 15j2. a poller paused for want of the routing sign-off is expected (KIT-733) ---- #
+    # -- 15j2. a poller paused until the routing probe is signed is waiting on you (KIT-733,
+    #    KIT-794) ------------------------------------------------------------------------ #
     # THE LIVE STATE, found 12 Nov 2026 in the move onto the work teams: the review entries
     # were rewritten, so the old routing probe no longer held and its sign-off was gone. The
     # poller (work-team config) then pauses every repository for want of it and exits 1, this
     # step read that as a failed install, and the one command stopped here for good: the
     # probe that writes the sign-off is the idea gate's, which runs AFTER this installer.
+    # AND THE STOP, 17 Nov (KIT-794): a review ticket's late routing note stopped one
+    # repository's reviews. Read as a failure, the one command stopped before `run` and the
+    # idea gate, so neither the clone nor the pause moved, and the owner needed --skip-stage-e.
     # Every PAUSED line below is built by the poller's own code (`review_blockers`) from
     # a real tmp tree, so the wording this file reads is the wording the poller prints.
     cases += 1
@@ -11965,12 +12043,30 @@ def _selftest_body():
                 "_route_labels": dict((_poller_mod.review_entry_name(r), "label-" + r)
                                       for r in nosig_repos)}
 
-    def _poller_says(cfg, seen=None):
-        """The lines the poller prints for these repositories, from its own code."""
-        blockers = _poller_mod.review_blockers(cfg, set(nosig_repos), "key", seen=seen)
+    def _poller_says(cfg, seen=None, version="0.2.73"):
+        """The lines the poller prints for these repositories, from its own code. `version`
+        is what the dispatcher's own route answers, read only once a sign-off stands."""
+        blockers = _poller_mod.review_blockers(cfg, set(nosig_repos), "key", seen=seen,
+                                               version_reader=lambda _url: version)
         return ["PAUSED %s: reviews are paused — %s"
                 % (repo, "; ".join(detail for _code, detail in reasons))
                 for repo, reasons in sorted(blockers.items())]
+
+    def _sign(cfg, at, entries=None):
+        """A routing sign-off as the idea gate's probe writes it, proving every review entry
+        by both routes unless `entries` says otherwise."""
+        _machine_mod._atomic_write_json(cfg["routing_signoff_file"], _machine_mod.signoff_document(
+            at, "0.2.73", entries if entries is not None else dict(
+                (_poller_mod.review_entry_name(r), list(_machine_mod.ROUTE_METHODS))
+                for r in nosig_repos)))
+
+    def _review_stop(cfg, repo, at, reason):
+        """The 17 Nov state: the poller's own stop for `repo`, and the shared stop it writes
+        when none stands, both dated `at`."""
+        stop = _machine_mod.stop_document(reason, repo, "reviews", {"reason": reason}, at=at)
+        os.makedirs(cfg["state_dir"], exist_ok=True)
+        _poller_mod.save_review_stop(cfg["state_dir"], repo, stop)
+        _machine_mod.write_stop_if_absent(cfg["shared_stop_file"], stop)
 
     def _paused_out(lines, extra=""):
         return ("resolved workspace ws-1, agent user a, model label m, guarded label g\n"
@@ -12043,6 +12139,120 @@ def _selftest_body():
            and len([l for l in nolabel_lines if "exactly once" in l]) == 1,
            "the fixture for a missing label is not one repository paused for want of the "
            "sign-off beside one paused for that and a missing label: %r" % nolabel_lines)
+    # KIT-794: THE STOP, and every other pause only a newer probe sign-off clears, waits on
+    # the person the same way: the 17 Nov stop (the poller's own and the shared one), a stop
+    # beside no sign-off, a stop whose own reason holds "; ", a misroute the seen-set holds
+    # (a dry run counts it silently: `settle_misroute` prints nothing there), and a dispatcher
+    # that changed since the probe. Each passes, names its repositories, and says so.
+    incident = _nosig_cfg("incident")
+    _sign(incident, "2026-11-17T12:00:00Z")
+    _review_stop(incident, "example-org/kit", "2026-11-17T21:32:40Z",
+                 "no routing note from the dispatcher within 120 seconds")
+    incident_lines = _poller_says(incident)
+    expect("stop-waits-on-the-probe",
+           len(incident_lines) == 1 and incident_lines[0].startswith("PAUSED example-org/kit: ")
+           and incident_lines[0].count("stopped since 2026-11-17T21:32:40Z: ") == 2,
+           "the fixture is not the 17 Nov state (one repository stopped after the sign-off, by "
+           "its own stop and the shared one): %r" % incident_lines)
+    semi = _nosig_cfg("semicolon")
+    _sign(semi, "2026-11-17T12:00:00Z")
+    _review_stop(semi, "example-org/app", "2026-11-17T21:32:40Z",
+                 "the routing note names 2 setups (reviews-app, app); a review ticket must "
+                 "reach exactly one")
+    bumped = _nosig_cfg("bumped")
+    _sign(bumped, "2026-11-17T12:00:00Z")
+    misroute_seen = {"k": {"repo": "example-org/kit", "status": _poller_mod.MISROUTING_STATUS,
+                           "created_at": "2026-11-10T00:00:00Z",
+                           "routing": {"checked_at": "2026-11-10T00:00:00Z", "reason": "wrong team"}}}
+    waits = (
+        ("the 17 Nov stop, after the sign-off", incident_lines,
+         {"example-org/kit": ["stopped", "stopped"]}),
+        ("a stop beside no sign-off", _poller_says(stopped),
+         {"example-org/app": ["no-signoff"], "example-org/kit": ["no-signoff", "stopped"]}),
+        ("a stop whose own reason holds a '; '", _poller_says(semi),
+         {"example-org/app": ["stopped", "stopped"]}),
+        ("a misroute the seen-set holds, beside no sign-off",
+         _poller_says(_nosig_cfg("misroute"), seen=misroute_seen),
+         {"example-org/app": ["no-signoff"], "example-org/kit": ["no-signoff", "misrouted"]}),
+        ("a dispatcher that changed since the probe", _poller_says(bumped, version="0.2.74"),
+         {"example-org/app": ["version-changed"], "example-org/kit": ["version-changed"]}),
+    )
+    for what, lines, want in waits:
+        cases += 1
+        rowW, printedW = _nosig_row((1, _paused_out(lines)))
+        saidW = [l.strip() for l in printedW.splitlines() if "Run the probe now?" in l]
+        expect("stop-waits-on-the-probe", paused_only_for_the_probe(_paused_out(lines)) == want,
+               "%s: read as %r, not %r, from %r"
+               % (what, paused_only_for_the_probe(_paused_out(lines)), want, lines))
+        expect("stop-waits-on-the-probe",
+               isinstance(rowW, tuple) and rowW[0] is True
+               and rowW[1].startswith("waiting on you: sign the routing probe"),
+               "%s: the dry run did not read \"waiting on you: sign the routing probe\": %r"
+               % (what, rowW if not isinstance(rowW, tuple) else rowW[1]))
+        expect("stop-waits-on-the-probe",
+               len(saidW) == 1 and saidW[0].startswith("Waiting on you: sign the routing probe.")
+               and all(repo in saidW[0] for repo in want),
+               "%s: no one plain line said it waits on the probe and named %s: %r"
+               % (what, sorted(want), printedW[-600:]))
+
+    # …but ONLY those. Every other way the poller is red is still a failure, in the same
+    # output, beside the same line, or alone (KIT-794: as today).
+    badstop = _nosig_cfg("badstop")
+    _sign(badstop, "2026-11-17T12:00:00Z")
+    os.makedirs(os.path.dirname(badstop["shared_stop_file"]))
+    with open(badstop["shared_stop_file"], "w", encoding="utf-8") as fh:
+        fh.write("{")                                  # a stop file that cannot be read
+    # …and beside no sign-off, which the idea gate offers the probe for anyway: only the
+    # unreadable file can fail this line, so this one pins that rule on its own.
+    badstop_nosig = _nosig_cfg("badstop-nosig")
+    os.makedirs(os.path.dirname(badstop_nosig["shared_stop_file"]))
+    with open(badstop_nosig["shared_stop_file"], "w", encoding="utf-8") as fh:
+        fh.write("{")
+    unproven = _nosig_cfg("unproven")
+    _sign(unproven, "2026-11-17T12:00:00Z", {_poller_mod.review_entry_name("example-org/kit"):
+                                             list(_machine_mod.ROUTE_METHODS)})
+    stopsbad = _nosig_cfg("stopsbad")
+    _sign(stopsbad, "2026-11-17T12:00:00Z")
+    os.makedirs(stopsbad["state_dir"])
+    with open(_poller_mod.review_stops_path(stopsbad["state_dir"]), "w", encoding="utf-8") as fh:
+        fh.write("{")                                  # this poller's own stops, unreadable
+    # THE IDEA GATE SEES ONLY THE SHARED STOP (Stage E's review of this change). A review stop
+    # written after the sign-off, beside a stale shared stop from before it that the planner
+    # job has not cleared yet: the shared file was not written, so the idea gate would not
+    # offer the probe. And a misroute only the seen-set holds, after the sign-off.
+    stale = _nosig_cfg("stale")
+    _sign(stale, "2026-11-17T12:00:00Z")
+    _machine_mod.write_stop_if_absent(stale["shared_stop_file"], _machine_mod.stop_document(
+        "an older planning stop", "example-org/kit", "planning", {}, at="2026-11-17T08:00:00Z"))
+    _review_stop(stale, "example-org/kit", "2026-11-17T21:32:40Z",
+                 "no routing note from the dispatcher within 120 seconds")
+    stale_lines = _poller_says(stale)
+    expect("stop-waits-on-the-probe",
+           len(stale_lines) == 1 and stale_lines[0].count("stopped since") == 1
+           and "2026-11-17T21:32:40Z" in stale_lines[0]
+           and _machine_mod.read_stop(stale["shared_stop_file"])["at"] == "2026-11-17T08:00:00Z",
+           "the fixture is not a review stop held only in the poller's own record, beside a "
+           "stale shared stop: %r" % stale_lines)
+    seen_only = _nosig_cfg("seenonly")
+    _sign(seen_only, "2026-11-17T12:00:00Z")
+    seen_only_lines = _poller_says(seen_only, seen={"k": dict(
+        misroute_seen["k"], routing={"checked_at": "2026-11-17T21:32:40Z", "reason": "wrong team"})})
+    expect("stop-waits-on-the-probe",
+           len(seen_only_lines) == 1 and "a review ticket misrouted at" in seen_only_lines[0],
+           "the fixture is not a misroute only the seen-set holds: %r" % seen_only_lines)
+    stopnolabel = _nosig_cfg("stopnolabel")
+    _sign(stopnolabel, "2026-11-17T12:00:00Z")
+    _review_stop(stopnolabel, "example-org/kit", "2026-11-17T21:32:40Z", "a late note")
+    stopnolabel["_route_labels"].pop(_poller_mod.review_entry_name("example-org/kit"))
+    _poller_mod.linear_graphql = lambda *_a, **_k: {"issueLabels": {"nodes": []}}
+    try:
+        stopnolabel_lines = _poller_says(stopnolabel)
+    finally:
+        _poller_mod.linear_graphql = saved_gql
+    expect("stop-waits-on-the-probe", len(stopnolabel_lines) == 1
+           and "stopped since" in stopnolabel_lines[0] and "exactly once" in stopnolabel_lines[0],
+           "the fixture for a stop beside a missing label is not one line holding both: %r"
+           % stopnolabel_lines)
     others = (
         ("a FAIL line beside the pause", (1, _paused_out(
             live_lines, "FAIL: could not discover pipeline PRs from Linear (HTTP 502)\n"))),
@@ -12051,18 +12261,24 @@ def _selftest_body():
         ("a TELEMETRY LOST line beside the pause", (1, _paused_out(
             live_lines, "TELEMETRY LOST: example-org/kit#75 is due for a re-review, so its "
                         "record is being re-opened\n"))),
+        ("a review stop beside a stale shared stop", (1, _paused_out(stale_lines))),
+        ("a misroute only the seen-set holds, after the sign-off",
+         (1, _paused_out(seen_only_lines))),
+        ("a FAIL line beside the stop", (1, _paused_out(
+            incident_lines, "FAIL: could not list open PRs on example-org/app: HTTP 502\n"))),
         ("a sign-off that cannot be read", (1, _paused_out(_poller_says(sign_bad)))),
         ("a sign-off that is not one", (1, _paused_out(_poller_says(junk)))),
-        ("a stop that stands, beside a pure pause", (1, _paused_out(_poller_says(stopped)))),
-        # A misroute a dry run counts silently (`settle_misroute` prints nothing there) still
-        # shows in the pause: the seen-set record makes its repository's line carry a stop.
-        ("a misroute in the seen-set, beside a pure pause", (1, _paused_out(_poller_says(
-            _nosig_cfg("misroute"), seen={"k": {
-                "repo": "example-org/kit", "status": _poller_mod.MISROUTING_STATUS,
-                "created_at": "2026-11-10T00:00:00Z",
-                "routing": {"checked_at": "2026-11-10T00:00:00Z", "reason": "wrong team"}}})))),
+        ("a stop file that cannot be read", (1, _paused_out(_poller_says(badstop)))),
+        ("a stop file that cannot be read, beside no sign-off",
+         (1, _paused_out(_poller_says(badstop_nosig)))),
+        ("a review entry the sign-off does not prove", (1, _paused_out(_poller_says(unproven)))),
+        ("a dispatcher version that cannot be read, beside the stop",
+         (1, _paused_out(_poller_says(incident, version=None)))),
+        ("this poller's own stops, unreadable", (1, _paused_out(_poller_says(stopsbad)))),
         ("a missing routing label, beside a pure pause", (1, _paused_out(nolabel_lines))),
+        ("a missing routing label, beside the stop", (1, _paused_out(stopnolabel_lines))),
         ("a usage error beside the pause", (2, live_out)),
+        ("a usage error beside the stop", (2, _paused_out(incident_lines))),
         ("exit 1 with no pause line at all", (1, "resolved workspace ws-1\nboom\n")),
     )
     for what, poller in others:
@@ -12098,6 +12314,20 @@ def _selftest_body():
     expect("unsigned-probe-is-expected",
            dict((s, o) for s, o, _d in rowsNLr).get("dry-run") in (ALREADY_DONE, DONE),
            "the dry-run row is not a pass from the live state: %s" % rowsNLr)
+    # …and from the 17 Nov state too (KIT-794): a stop dated after the sign-off.
+    cases += 1
+    ctxNI, fakeNI, _apiNI = _healthy_ctx(conf)
+    fakeNI.answers = [("scan --dry-run", 1, _paused_out(incident_lines))] + list(fakeNI.answers)
+    (codeNIv, rowsNIv), _pNIv = _quiet(lambda: run_steps(ctxNI, apply_it=False, keep_going=True))
+    (codeNIr, rowsNIr), _pNIr = _quiet(lambda: run_steps(ctxNI, apply_it=True))
+    expect("stop-waits-on-the-probe", (codeNIv, codeNIr) == (EX_OK, EX_OK),
+           "from the 17 Nov state, verify exited %s and run exited %s, not 0 and 0: %s"
+           % (codeNIv, codeNIr, [(s, o, d[:80]) for s, o, d in rowsNIv + rowsNIr
+                                 if o not in (ALREADY_DONE, DONE)]))
+    expect("stop-waits-on-the-probe",
+           [d for s, _o, d in rowsNIr if s == "dry-run"][0].startswith(
+               "waiting on you: sign the routing probe"),
+           "the dry-run row from the 17 Nov state does not lead with the wait: %s" % rowsNIr)
 
     # THE ONE COMMAND, from the same state (Stage E's review of this change). Its own Stage E
     # part and idea-gate part are driven here with Stage E answered by THIS file's real `verify`
@@ -12109,11 +12339,16 @@ def _selftest_body():
     import pipeline_install as _install_mod
 
     class _OneCommand(object):
-        """The one command's seam: Stage E is this file's `verify`, the idea gate is recorded."""
+        """The one command's seam: Stage E is this file's `verify`, the idea gate is recorded.
+        KIT-794: Stage E's `run` answers `run_code` when one is given (the clone's move itself
+        is pinned by the code step's own cases), its record is the rows `verify` just wrote,
+        every question is answered yes, and the idea gate may sign the probe (`on_stage_a`)."""
         interrupted = False
+        auto = False
 
-        def __init__(self, ctx):
-            self.ctx, self.ran, self.lines = ctx, [], []
+        def __init__(self, ctx, run_code=None, on_stage_a=None):
+            self.ctx, self.ran, self.lines, self.asked = ctx, [], [], []
+            self.run_code, self.on_stage_a = run_code, on_stage_a
 
         def say(self, line=""):
             self.lines.append(line)
@@ -12124,22 +12359,40 @@ def _selftest_body():
         def measure(self, argv, timeout=None):
             return None, "not measured here"
 
+        def ask(self, question):
+            self.asked.append(question)
+            return True
+
+        def stage_e_steps(self, since):
+            return dict((sid, (row or {}).get("outcome"))
+                        for sid, row in self.ctx.state.data["steps"].items())
+
         def run(self, argv, capture=False):
             step = (os.path.basename(argv[1]), argv[2])
             self.ran.append(step)
             if step == ("pipeline_stage_e_setup.py", "verify"):
                 return cmd_verify(self.ctx), ""
+            if step == ("pipeline_stage_e_setup.py", "run") and self.run_code is not None:
+                return self.run_code, ""
             if step == ("pipeline_stage_a_setup.py", "run"):
-                return EX_BLOCKED, ""
+                return (self.on_stage_a() if self.on_stage_a else EX_BLOCKED), ""
             raise AssertionError("an unscripted program ran: %r" % (argv,))
 
     oc_conf = os.path.join(tmpNOSIG, "stage-e.conf")
     open(oc_conf, "w", encoding="utf-8").close()
 
-    def _one_command(poller_out):
+    # A clone BEHIND origin, as the code step reads it: a job's own script moved there.
+    behind_answers = [("ls-remote origin HEAD", 0, "beef000000000000000000000000000000000000\tHEAD\n"),
+                      ("fetch --quiet --no-tags origin HEAD", 0,
+                       "FETCH_HEAD beef00000000\nscripts/pipeline_review_poller.py\n")]
+
+    def _one_command(poller_out, rc=1, behind=False, run_code=None, on_stage_a=None):
         ctxOC, fakeOC, _apiOC = _healthy_ctx(conf)
-        fakeOC.answers = [("scan --dry-run", 1, poller_out)] + list(fakeOC.answers)
-        io, rep = _OneCommand(ctxOC), _install_mod.Report()
+        fakeOC.answers = ([("scan --dry-run", rc, poller_out)]
+                          + (list(behind_answers) if behind else [])
+                          + [a for a in fakeOC.answers
+                             if not (behind and a[0] == "ls-remote origin HEAD")])
+        io, rep = _OneCommand(ctxOC, run_code, on_stage_a), _install_mod.Report()
 
         def _steps():
             """In `main`'s order, and as `main` does: a part that returns a code stops the run."""
@@ -12148,7 +12401,8 @@ def _selftest_body():
                 return carry, None
             return carry, _install_mod.step_stage_a(
                 io, os.path.join(tmpNOSIG, "stage-a.conf"), oc_conf, rep)
-        (carry, reached), _pOC = _quiet(_steps)
+        (carry, reached), printed = _quiet(_steps)
+        io.printed = printed
         return carry, reached, io, rep
 
     carryOC, reachedOC, ioOC, repOC = _one_command(live_out)
@@ -12159,12 +12413,89 @@ def _selftest_body():
            "from the live state the one command did not go from Stage E to the idea gate in one "
            "run: carried on %r, stage_e %r, ran %r" % (carryOC, repOC.steps.get("stage_e"), ioOC.ran))
     # …and the same chain STOPS, before the idea gate, when the poller is red for any other
-    # reason: the control that shows the run above is not a chain that cannot fail.
-    carryS, _reachedS, ioS, _repS = _one_command(_paused_out(_poller_says(stopped)))
+    # reason: the control that shows the run above is not a chain that cannot fail. A stop
+    # waits on the probe now (KIT-794), so the control is a stop beside a missing label.
+    carryS, _reachedS, ioS, _repS = _one_command(_paused_out(stopnolabel_lines))
     expect("unsigned-probe-is-expected",
            carryS not in (None, 0) and ("pipeline_stage_a_setup.py", "run") not in ioS.ran,
            "a poller red for another reason let the one command reach the idea gate: %r %r"
            % (carryS, ioS.ran))
+
+    # THE 17 NOV STATE THROUGH THE WHOLE ONE COMMAND (KIT-794). A review stop stands, dated
+    # after the sign-off. The one command reads Stage E's dry run as waiting on the probe, not
+    # as FAILED, and carries on to the idea gate. The idea gate signs the probe (its stand-in
+    # writes the sign-off its probe step writes); the poller's own code then pauses nothing;
+    # and a rerun of the one command reads Stage E as up to date.
+    cases += 1
+    signed = []
+
+    def _signs_the_probe():
+        _sign(incident, "2026-11-18T03:20:00Z")
+        signed.append(True)
+        return EX_OK
+
+    carryI, reachedI, ioI, repI = _one_command(_paused_out(incident_lines),
+                                               on_stage_a=_signs_the_probe)
+    expect("stop-waits-on-the-probe",
+           carryI is None and ioI.ran == [("pipeline_stage_e_setup.py", "verify"),
+                                          ("pipeline_stage_a_setup.py", "run")]
+           and signed == [True] and reachedI == EX_OK,
+           "from the 17 Nov state the one command did not go from Stage E to the idea gate's "
+           "probe in one run: carried on %r, ran %r, signed %r" % (carryI, ioI.ran, signed))
+    expect("stop-waits-on-the-probe",
+           "Waiting on you: sign the routing probe." in ioI.printed
+           and "FAILED at step" not in ioI.printed,
+           "Stage E's dry run did not read \"waiting on you: sign the routing probe\": %r"
+           % ioI.printed[-800:])
+    after = _poller_says(incident)
+    expect("stop-waits-on-the-probe", after == [],
+           "the sign-off the probe wrote did not clear the pause, by the poller's own code: %r"
+           % after)
+    carryR, reachedR, ioR, repR = _one_command(
+        "resolved workspace ws-1, agent user a, model label m, guarded label g\n"
+        + "".join(line + "\n" for line in after), rc=1 if after else 0,
+        on_stage_a=lambda: EX_OK)
+    rowR = (ioR.ctx.state.data["steps"].get("dry-run") or {})
+    expect("stop-waits-on-the-probe",
+           carryR is None and reachedR == EX_OK
+           and repR.steps.get("stage_e", ("",))[0] == _install_mod.OUT_OK
+           and rowR.get("outcome") == ALREADY_DONE
+           and "waiting on you" not in (rowR.get("detail") or "")
+           and "Waiting on you" not in ioR.printed,
+           "after the sign-off a rerun did not read Stage E up to date, with no wait: carried on "
+           "%r, stage_e %r, dry-run %r" % (carryR, repR.steps.get("stage_e"), rowR))
+
+    # …AND THE CLONE MOVES (KIT-794): from the same state with the clone behind, `verify` has
+    # work for `run` (the code step) and no FAILED row, so the one command runs Stage E's
+    # installer, whose first change is the code step, and only then the idea gate. A failure
+    # of any other kind still stops it before `run`, as today, and the clone stays.
+    cases += 1
+    carryB, _reachedB, ioB, repB = _one_command(_paused_out(incident_lines), behind=True,
+                                                run_code=EX_OK)
+    rowsB = dict((sid, (row or {}).get("outcome"))
+                 for sid, row in ioB.ctx.state.data["steps"].items())
+    expect("stop-waits-on-the-probe",
+           carryB is None and ioB.ran == [("pipeline_stage_e_setup.py", "verify"),
+                                          ("pipeline_stage_e_setup.py", "run"),
+                                          ("pipeline_stage_a_setup.py", "run")]
+           and ioB.asked == ["Update Stage E now?"]
+           and repB.steps.get("stage_e", ("",))[0] == _install_mod.OUT_UPDATED
+           and (rowsB.get("code"), rowsB.get("dry-run")) == (WOULD_CHANGE, ALREADY_DONE),
+           "with the clone behind, a stop held back Stage E's own installer (the clone's move): "
+           "carried on %r, ran %r, asked %r, rows %r" % (carryB, ioB.ran, ioB.asked, rowsB))
+    # …and a review stop the idea gate cannot see stops the one command before the idea gate
+    # too, whose probe would never be offered for it.
+    carrySS, _rSS, ioSS, _repSS = _one_command(_paused_out(stale_lines))
+    expect("stop-waits-on-the-probe",
+           carrySS not in (None, 0) and ("pipeline_stage_a_setup.py", "run") not in ioSS.ran,
+           "a review stop beside a stale shared stop let the one command reach an idea gate that "
+           "would not offer the probe: %r %r" % (carrySS, ioSS.ran))
+    carryBS, _rBS, ioBS, _repBS = _one_command(_paused_out(stopnolabel_lines), behind=True,
+                                               run_code=EX_OK)
+    expect("stop-waits-on-the-probe",
+           carryBS not in (None, 0) and ("pipeline_stage_e_setup.py", "run") not in ioBS.ran,
+           "with the clone behind, a poller red for another reason still let `run` start: %r %r"
+           % (carryBS, ioBS.ran))
     # The question this file's line promises is the idea gate's own, by name.
     with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "pipeline_stage_a_setup.py"),
               encoding="utf-8") as fh:
