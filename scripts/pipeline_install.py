@@ -1811,9 +1811,9 @@ def main(argv=None, io=None):
                         "could run them could install its own supervisor. Open the Terminal "
                         "app, or this app's Terminal tab, and run it there." % ", ".join(found),
                     EX_REFUSED)
-    if io.uid() == 0:
-        return stop(io, "do not run this with sudo. Run it as yourself; it asks for your Mac "
-                        "password when it needs it.", EX_USAGE)
+    import pipeline_root_guard as rg      # KIT-693: the one refusal every installer shares
+    if rg.refusal(io.uid()):
+        return stop(io, rg.BODY, EX_USAGE)
     # KIT-752: the one place that says where a settings file is kept, read only now, past the two
     # refusals. A file that was ignored says why on the lines of the parts it would have found.
     found_places, PLACES_WHY[0] = io.places(args.settings_places)
@@ -2515,7 +2515,8 @@ def selftest():
         code, io = go(env={marker: ""})
         check("refused-under:%s" % marker, (code, io.ran), (EX_REFUSED, []))
     code, io = go(uid=0)
-    check("refused-as-root", (code, io.ran), (EX_USAGE, []))
+    check("refused-as-root", (code, io.ran, __import__("pipeline_root_guard").BODY in "\n".join(io.lines)),
+          (EX_USAGE, [], True))
     code, io = go(tty=False)
     check("refused-without-a-person", (code, io.ran), (EX_USAGE, []))
 

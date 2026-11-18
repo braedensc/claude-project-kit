@@ -108,8 +108,9 @@ def refused(io):
     env = io.env()
     if any(m in env for m in AGENT_ENV_MARKERS):
         return "an agent's environment: this script is yours to run, in your own terminal"
-    if io.uid() == 0:
-        return "root: run it as yourself"
+    import pipeline_root_guard as rg      # KIT-693: the one refusal every installer shares
+    if rg.refusal(io.uid()):
+        return rg.MESSAGE
     return None
 
 
@@ -1048,7 +1049,7 @@ def merges_off(io, repo, args, ledger, ledger_path):
 def cmd_merges(io, args):
     why = refused(io)
     if why:
-        io.say("REFUSED: %s. Nothing was read or changed." % why)
+        io.say(why if why.startswith("REFUSED") else "REFUSED: %s. Nothing was read or changed." % why)
         return EXIT_REFUSED
     args.settings_file = os.path.expanduser(args.settings_file)
     args.validator_ledger = os.path.expanduser(args.validator_ledger)
@@ -1084,7 +1085,7 @@ def default_name(io):
 def cmd_run(io, args):
     why = refused(io)
     if why:
-        io.say("REFUSED: %s. Nothing was read or changed." % why)
+        io.say(why if why.startswith("REFUSED") else "REFUSED: %s. Nothing was read or changed." % why)
         return EXIT_REFUSED
     key_file = os.path.expanduser(args.key_file)
     if not os.path.isabs(key_file) or inside_worktree(os.path.dirname(key_file) or "/"):
@@ -1139,7 +1140,7 @@ def cmd_run(io, args):
 def cmd_verify(io, args):
     why = refused(io)
     if why:
-        io.say("REFUSED: %s. Nothing was read." % why)
+        io.say(why if why.startswith("REFUSED") else "REFUSED: %s. Nothing was read." % why)
         return EXIT_REFUSED
     ledger, bad = read_ledger(io.ledger_path())
     if ledger is None:
@@ -1418,8 +1419,9 @@ def selftest():
             code = run(io, key)
             check("%s: refused, nothing read or changed" % label,
                   (code, io.asked, world.puts, world.app, os.path.exists(ledger),
-                   io.said[0].startswith("REFUSED")),
-                  (EXIT_REFUSED, [], [], None, False, True))
+                   io.said[0].startswith("REFUSED"),
+                   label != "root" or io.said[0] == __import__("pipeline_root_guard").MESSAGE),
+                  (EXIT_REFUSED, [], [], None, False, True, True))
         check("verify is refused in an agent's environment too",
               main(["verify", "--repo", "acme/app"],
                    io=_FakeIO(world, ledger, env={sorted(AGENT_ENV_MARKERS)[0]: "1"})),

@@ -536,9 +536,9 @@ def step_preflight(ctx, apply_it):
     if unsupported:
         raise Unsupported(unsupported)
     r, problems = ctx.runner, []
-    if ctx.uid == 0:
-        problems.append("this is root. The waker runs as the person whose local sessions it wakes; "
-                        "run the installer as that person, without sudo")
+    import pipeline_root_guard as rg      # KIT-693: the one rule every installer shares
+    if rg.refusal(ctx.uid):
+        problems.append(rg.BODY)          # the one shared wording; the waker runs as the person whose sessions it wakes
     role_env = os.path.join(ctx.home, prc.DISPATCHER_ENV_FILE[2:])
     if os.path.exists(role_env):
         problems.append("%s exists, so this is a dispatcher's role account. Its sessions are "
@@ -1548,7 +1548,7 @@ def _selftest_body():
         f.answers = []
         rows, _ = quiet(lambda: measure(c, apply_it=False))
         detail = rows[0][2] if rows else ""
-        expect("preflight-refuses", rows and rows[0][1] == FAILED and "root" in detail
+        expect("preflight-refuses", rows and rows[0][1] == FAILED and __import__("pipeline_root_guard").BODY in detail
                and "role account" in detail and "no gui/0 domain" in detail and "not on your PATH" in detail,
                detail)
 
