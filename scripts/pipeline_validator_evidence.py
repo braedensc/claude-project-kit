@@ -23,7 +23,8 @@ THE RULES, each one tested. Every one says `no` when it cannot tell.
     the base branch requires has run on it. A check is known by its workflow and its name, so a
     same-named job elsewhere cannot stand in for it. A required check counts only from the GitHub App
     the rule names (KIT-678): a same-named check from another app, or a commit status, is not it, and
-    the answer is `no` (check-missing). A rule that names no app takes it from any source. A re-run
+    the answer is `no` (check-missing). A rule that names no app takes it from any source; one whose
+    app is there but cannot be read as an app id is `no` (required-checks-unknown). A re-run
     counts once, its latest, and a run not yet finished makes it pending. No check at all, no
     required check configured, or a list that cannot be read is `no`. The validator's own check is
     set aside only when its own app posted it; one of that name from any other app is judged.
@@ -214,11 +215,14 @@ def review_reasons(comments, head, login, bar, pr_author=None):
 
 def requirement(entry):
     """One required check as (name, app id or None), from a `required` entry: a [name, app] pair as
-    `read_facts()` gives it, or a bare name, which any source satisfies. None when it is neither."""
+    `read_facts()` gives it, or a bare name, which any source satisfies. None when it is neither,
+    and when its app is there but is no app id: that is unreadable, never "any source"."""
     if isinstance(entry, str):
         return entry, None
     if isinstance(entry, (list, tuple)) and len(entry) == 2 and isinstance(entry[0], str):
-        return entry[0], app_id(entry[1])
+        if entry[1] is None:
+            return entry[0], None
+        return (entry[0], app_id(entry[1])) if app_id(entry[1]) else None
     return None
 
 
@@ -371,11 +375,16 @@ def _context(node):
 def _required(pr, owner_repo, base, run):
     """The base branch's required checks: its protection rule and its rulesets, as sorted
     [name, app] pairs, or None when either could not be read. `app` is the id of the one GitHub App
-    the rule takes the check from, and None where the rule takes it from any source (KIT-678)."""
+    the rule takes the check from, and None where the rule takes it from any source (KIT-678).
+    Only an app that is absent or null means any source. One that is there but is no app id (a
+    node with no id, `true`, a negative number, text) makes the whole list unreadable: a reading
+    that cannot tell which app may post a check never widens it to every app."""
     rule = (pr.get("baseRef") or {}).get("branchProtectionRule")
     pairs = set()
     for c in ((rule or {}).get("requiredStatusChecks") or []):
         if isinstance(c, dict) and isinstance(c.get("context"), str):
+            if c.get("app") is not None and app_id(c.get("app")) is None:
+                return None
             pairs.add((c["context"], app_id(c.get("app"))))
     if not base:
         return None
@@ -391,6 +400,10 @@ def _required(pr, owner_repo, base, run):
         if isinstance(r, dict) and r.get("type") == "required_status_checks":
             for c in ((r.get("parameters") or {}).get("required_status_checks") or []):
                 if isinstance(c, dict) and isinstance(c.get("context"), str):
+                    integration = c.get("integration_id")    # REST gives a number, never a node
+                    if integration is not None and (isinstance(integration, dict)
+                                                    or app_id(integration) is None):
+                        return None
                     pairs.add((c["context"], app_id(c.get("integration_id"))))
     return [[name, app] for name, app in sorted(pairs, key=lambda p: (p[0], p[1] or 0))]
 
@@ -597,6 +610,9 @@ def selftest():
     check("checks: a required entry that is neither a name nor a [name, app] pair is unknown, never met",
           run(with_(required=good["required"] + [{"context": "Kit checks"}]))["reasons"],
           ["required-checks-unknown"])
+    check("checks: a [name, app] pair whose app is there but is no app id is unknown, never any source",
+          [run(with_(required=[["Kit checks", bad], ["Provenance scan", GHA]], checks=impostor))["reasons"]
+           for bad in ("15368", True, -1, 0)], [["required-checks-unknown"]] * 4)
 
     # 2c. The validator's own check is set aside only when the validator's app posted it (KIT-678).
     own_queued = chk("Validator", status="QUEUED", conclusion=None, required=True, app=VAPP,
@@ -831,12 +847,32 @@ def selftest():
     unbound = copy.deepcopy(gql)
     unbound["data"]["repository"]["pullRequest"]["baseRef"]["branchProtectionRule"][
         "requiredStatusChecks"] = [{"context": "Kit checks", "app": None}]
-    odd_rules = [{"type": "required_status_checks", "parameters": {"required_status_checks": [
+    some_rules = [{"type": "required_status_checks", "parameters": {"required_status_checks": [
         {"context": "Provenance scan"}, {"context": "Bound", "integration_id": 7},
-        {"context": "Odd", "integration_id": True}, {"context": "Neg", "integration_id": -3}]}}]
-    check("read: each required check comes back with the app its rule names, and none means any source",
-          read_facts("acme/app", 12, stub({"graphql": unbound, "rules": odd_rules}))["required"],
-          [["Bound", 7], ["Kit checks", None], ["Neg", None], ["Odd", None], ["Provenance scan", None]])
+        {"context": "Null", "integration_id": None}]}}]
+    check("read: each required check comes back with the app its rule names; an absent or null app "
+          "means any source",
+          read_facts("acme/app", 12, stub({"graphql": unbound, "rules": some_rules}))["required"],
+          [["Bound", 7], ["Kit checks", None], ["Null", None], ["Provenance scan", None]])
+
+    def with_integration(bad):
+        return [{"type": "required_status_checks", "parameters": {"required_status_checks": [
+            {"context": "Provenance scan", "integration_id": GHA}, {"context": "Odd", "integration_id": bad}]}}]
+    check("read: an app id that is there but is no app id makes the list unreadable, never any source",
+          [read_facts("acme/app", 12, stub({"graphql": gql, "rules": with_integration(bad)}))["required"]
+           for bad in (True, -3, 0, "15368", 1.5, {"databaseId": GHA})], [None] * 6)
+    nodes = []
+    for node in ({}, {"databaseId": None}, {"databaseId": "15368"}, {"slug": "github-actions"}):
+        odd = copy.deepcopy(gql)
+        odd["data"]["repository"]["pullRequest"]["baseRef"]["branchProtectionRule"][
+            "requiredStatusChecks"] = [{"context": "Kit checks", "app": node}]
+        nodes.append(read_facts("acme/app", 12, stub({"graphql": odd, "rules": rules}))["required"])
+    check("read: a protection rule's app node with no readable id makes the list unreadable",
+          nodes, [None] * 4)
+    check("read then judge: a malformed app id says required-checks-unknown",
+          evidence_for("acme/app", 12, H, SETTINGS, "medium", False, None,
+                       run=stub({"graphql": gql, "rules": with_integration(-3)}))["reasons"],
+          ["required-checks-unknown"])
     forged = copy.deepcopy(gql)
     forged["data"]["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"]["statusCheckRollup"][
         "contexts"]["nodes"][0]["checkSuite"] = {"app": {"slug": "other-app", "databaseId": OTHER},
