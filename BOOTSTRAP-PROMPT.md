@@ -104,8 +104,15 @@ human-only steps at the end.
 >    guard is self-protected — fold that one edit into step 2's `cp` (one new hook
 >    version covers both changes) rather than a second terminal round-trip. Delete
 >    the concept only if I said none.
-> 4. Activate workflows: `git rm .github/workflows/ci.yml && git mv
->    templates/workflows/ci.yml .github/workflows/ci.yml` — it ships with the
+> 4. Activate workflows: `git rm .github/workflows/ci.yml
+>    .github/workflows/hooks-change-guard.yml && git mv
+>    templates/workflows/ci.yml .github/workflows/ci.yml && git mv
+>    templates/workflows/hooks-change-guard.yml .github/workflows/hooks-change-guard.yml`.
+>    The label gate is its own workflow that runs from the default branch on
+>    `pull_request_target`, so a PR cannot turn its own gate green. **If my repository is
+>    public, tell me it needs one Actions policy allow before 2 Dec 2026 or no PR can merge**,
+>    and give me the command: `python3 scripts/pipeline_gate_policy.py run` (keep that
+>    script; a private repository needs nothing). The CI file ships with the
 >    hook-battery step built in (`python3 .claude/hooks/test_hooks.py`); the battery
 >    must stay in CI. Move the other `templates/workflows/*.yml` (deploy-on-green,
 >    pipeline-failure-alert, backup-cron, keepalive, …) the same way; adapt their
