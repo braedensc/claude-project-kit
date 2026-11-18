@@ -462,7 +462,7 @@ the session starts**.
 
 ```
 <pinsRoot>/<pin_key>.json
-<pinsRoot>/ledger.jsonl        # append-only, one row per pin ever written
+<pinsRoot>/ledger.jsonl        # append-only: one row per pin written, one per release
 <pinsRoot>/dispatched-lane/<OS account>   # the OLDER lane marker (below); still counts
 /etc/claude-pipeline/dispatched-lane/<OS account>   # the lane marker (below); root's
 
@@ -606,9 +606,12 @@ empty rather than handed something invented.
 1. Create the worktree and branch.
 2. Write the pin to a temp file in `pinsRoot`, `fsync`, `chmod 0444`, then **atomically
    `rename()`** into `<pin_key>.json` — a reader never sees a half-written pin.
-3. Append one row to `ledger.jsonl`.
+3. Append one row to `ledger.jsonl`: `dispatch_id`, `ticket`, `worktree`, `pinned_at`.
 4. Spawn the session with cwd = worktree.
-5. On session end, the **dispatcher** deletes the pin. The agent never does.
+5. On session end, the **dispatcher** deletes the pin and appends a release row (the same
+   fields, with `released_at` in place of `pinned_at`). The agent never does either. The
+   hand-run dispatcher's `--release` and the runner write that row; the GitHub Actions
+   backend's runner is ephemeral, so its whole pins root, ledger included, ends with the job.
 
 ### Read protocol (hooks, validators)
 
@@ -621,6 +624,13 @@ empty rather than handed something invented.
    *broken* and fails closed. With no pin and no marker, checks that would *withhold*
    something fail open (a human's ad-hoc session in a configured repo must not be
    bricked) and checks that would *grant* extra autonomy fail closed.
+6. **A pin that is gone is not one that never was (KIT-674).** Before reading an absent
+   pin as a person's session, read `ledger.jsonl`. When its last row for this worktree is
+   a pin row under a day old (no kit dispatcher lets a pin live longer), or one whose age
+   cannot be read, the pin was deleted or moved: *missing*, and broken in every mode,
+   because the row does not carry the mode. A pin row more than a day old, and a release
+   row, expect nothing. A pin or ledger that cannot be read (anything but "no such file")
+   is broken too: could not check is not absent (§13).
 
 > **Tamper-evident, not tamper-proof.** The session's shell runs as the same user, so
 > `0444` and a path outside the repo raise the cost of tampering — they do not make it
@@ -1243,6 +1253,20 @@ partly applied, and the job says how far it got rather than implying it got nowh
 > path here points at agent-authored output: repointing it only costs the session its
 > own reporting channel. What the agent cannot influence is the artifact name the
 > dispatcher collects and the pinned ID the validator compares against.
+
+### On the runner's lane: tool calls in place of the file
+
+A session our own runner starts (§28) holds no tracker credential and writes no requests file.
+It has five tools tied to its run instead (`scripts/pipeline_session_tools.py`, KIT-706). This
+section's rule holds, checked at each call in place of a batch:
+
+- Every write goes to the run's own ticket. No tool takes a ticket as an argument.
+- A finding is a `pipeline-finding/1` comment, which the finding filer files into the backlog
+  (`docs/FINDING-POLLER.md`). Three a run.
+- No tool sets a state, a label or an approval.
+- The caps are the table above's: 20 writes a run, bodies of 16 000 characters, titles of 200.
+
+A refused call writes nothing, and a call the tracker did not confirm is not counted.
 
 ---
 
@@ -2689,7 +2713,8 @@ Ten, in this order. The file always lists all ten, so it never claims cover it l
 | `markers` | A pipeline marker on a comment's first line, by an author its readers would refuse: a marker only the workflow bot writes, from anyone else, or any other marker from an author whose association is not trusted. The workflow bot's own comments are always real. GitHub's comment feed. | first-hand |
 | `injection` | Prompt-injection shapes in pull request and comment text: an attempt to close the kit's fence, an instruction to ignore earlier instructions, a system-role tag, a request to print a secret, and characters a reader cannot see. A tripwire, not a filter. | first-hand |
 | `tracker-text` | The same shapes as `injection`, in ticket and comment text, and a pipeline marker on a comment's first line from an author who is not trusted. The tracker's newest 100 tickets and 100 comments, by one fixed read-only query in `scripts/pipeline_watcher_tracker.py` (KIT-556): the one request the watcher sends that is not a GET. A page that is all inside the lookback, in the wrong order, or a query that fails, makes it `blind`. A ticket's description is judged by who created it, not by who last edited it. | first-hand |
-| `guard-blocks`, `egress`, `outside-files`, `approval-rate` | Off, each with its reason: a producer does not exist yet (KIT-518). | none |
+| `approval-rate` | The validator's ledger (§24, KIT-546). Each pull request merged into a watched repository's default branch inside the lookback needs an `approved` row for its head, unless a login in the rules' `owner_logins` merged it: GitHub's own `merged_by` says who. An `approved` row still open a day later, with no newer row for it. The approvals of the last 24 hours against the rules' `day_approvals`. Each `escalated-urgent` row, which is how the validator's urgent page reaches the owner. On only when the rules name `validator_ledger` and `repos`. A ledger it cannot read or trust, or a merge list cut short, is `blind`. | second-hand |
+| `guard-blocks`, `egress`, `outside-files` | Off, each with its reason: a producer does not exist yet (KIT-518). | none |
 
 A *first-hand* signal comes from a platform the watcher reads with its own key. A *second-hand* signal is a file a worker-side job wrote: whoever controls that job could falsify it, so it can only under-report.
 
@@ -2704,15 +2729,15 @@ A *first-hand* signal comes from a platform the watcher reads with its own key. 
 
 | Level | Meaning |
 |---|---|
-| `pause` | Something got through, or money is moving: a protected label by a login not trusted, a billed run, spend or runs over the watcher's own limits. |
-| `page` | An attempt the readers ignored: a forged marker, a shape in text from an author not trusted. |
+| `pause` | Something got through, or money is moving: a protected label by a login not trusted, a billed run, spend or runs over the watcher's own limits, a merge with no approval from the validator and not by the owner, the validator's approvals over the watcher's own limit. |
+| `page` | An attempt the readers ignored: a forged marker, a shape in text from an author not trusted. Or something the owner must look at: an approval unmerged a day later, an urgent escalation from the validator. |
 | `record` | Noted, never paged: a shape in text from a trusted author. |
 
 This piece writes the level and nothing acts on it. A finding at `record` alone leaves its monitor `clear`.
 
 ### The rules file
 
-The watcher's limits and lists live only in the rules file its config names. Nothing else sets them. A pass judges the rules file before it obeys anything in it. A rules file that is inside a git working tree, is a link, is writable by group or other, is owned by another account, or sits in a folder others can write is not trusted, and nothing in it is obeyed: not its `on`, not what it names to watch, not whether it can be read. The six monitors that could be on are `blind`, by name, and the pass exits 4, so the cheapest way to switch the watcher off is not to edit its rules. Such a file also names where the output goes, so it may only replace a status file the watcher already wrote. A monitor whose limits the owner has not set is `off`, not `blind`: the limits are the owner's decision.
+The watcher's limits and lists live only in the rules file its config names. Nothing else sets them. A pass judges the rules file before it obeys anything in it. A rules file that is inside a git working tree, is a link, is writable by group or other, is owned by another account, or sits in a folder others can write is not trusted, and nothing in it is obeyed: not its `on`, not what it names to watch, not whether it can be read. The seven monitors that could be on are `blind`, by name, and the pass exits 4, so the cheapest way to switch the watcher off is not to edit its rules. Such a file also names where the output goes, so it may only replace a status file the watcher already wrote. A monitor whose limits the owner has not set is `off`, not `blind`: the limits are the owner's decision.
 
 ### The file
 
@@ -2770,7 +2795,7 @@ The watcher sends nothing but GETs, so it does not page. `scripts/pipeline_watch
 | Field | Type | Notes |
 |---|---|---|
 | `level` | `record` \| `page` \| `pause` | As above. |
-| `what` | enum | A word from a closed list: `spend-day`, `spend-piece`, `key-run`, `runs-day`, `runs-piece`, `protected-label`, `forged-marker`, or a shape: `shape-fence-tag`, `shape-ignore-instructions`, `shape-system-tag`, `shape-secret-ask`, `shape-hidden-char`. |
+| `what` | enum | A word from a closed list: `spend-day`, `spend-piece`, `key-run`, `runs-day`, `runs-piece`, `protected-label`, `forged-marker`, `merge-without-approval`, `approval-without-merge`, `approval-rate`, `urgent-escalation`, or a shape: `shape-fence-tag`, `shape-ignore-instructions`, `shape-system-tag`, `shape-secret-ask`, `shape-hidden-char`. |
 | `ref` | string | What it is about: a local date, a ticket id, or `owner/name#N`. |
 | `actor` | string \| null | A GitHub login: who applied the label or wrote the text. |
 | `at` | time \| null | When. |
@@ -2823,8 +2848,8 @@ One small file says that new starts are held, and why (KIT-515). The watcher (§
 
 | Field | Type | Notes |
 |---|---|---|
-| `monitor` | `spend` \| `runs` \| `labels` | The monitor that flagged it at level `pause`. |
-| `what` | enum | The watcher's closed word: `spend-day`, `spend-piece`, `key-run`, `runs-day`, `runs-piece` or `protected-label`. |
+| `monitor` | `spend` \| `runs` \| `labels` \| `approval-rate` | The monitor that flagged it at level `pause`. |
+| `what` | enum | The watcher's closed word: `spend-day`, `spend-piece`, `key-run`, `runs-day`, `runs-piece`, `protected-label`, `merge-without-approval` or `approval-rate`. |
 | `ref` | string | What it is about: a local date, a ticket id, or `owner/name#N`. |
 | `since` | time | When this hold was first set. A later pass never moves it. |
 
@@ -3048,9 +3073,9 @@ Each is `pass`, `fail`, `unsure` or `not-run`. `unsure` holds, as `fail` does. `
 
 ### Who reads it
 
-Stage E's bounce driver reads a `sent-back` row for a pull request at its current head, when its config names the ledger (`validator_ledger_file`, KIT-542). It re-prompts the dev session from its own ledger and budget.
+Stage E's bounce driver reads a `sent-back` row for a pull request at its current head, when its config names the ledger (`validator_ledger_file`, KIT-542). It re-prompts the dev session from its own ledger and budget. The watcher's `approval-rate` monitor (§19, KIT-546) reads it through `read()`: every merge against the `approved` rows, an approval still unmerged a day later, the day's approvals, and each urgent escalation.
 
-The stand-up reads it when its settings name it (`validator_ledger_file`, KIT-545), with `read()` and no model between. Each `approved` row since the last rundown is one line in code's words. The latest row for each plan, piece or pull request that is an escalation or a hold, while the status file shows it still waiting, is a blocker in the ledger's own words (`blocker()`), an urgent one first and marked urgent. With no status file to check against (none can be read, or Linear could not be read), each such row since the last rundown is listed instead, urgent first, said as not checked. The agent's reason is only its own marked line, with links made plain, and never in the facts the tech lead's turn reads. A ledger `read()` gives no rows for is said ("no approval is claimed"), never shown as none. Absent, or the setting empty, nothing is said. The sprint recap lists the period's rows from the same reader. The watcher reads the ledger in its own piece.
+The stand-up reads it when its settings name it (`validator_ledger_file`, KIT-545), with `read()` and no model between. Each `approved` row since the last rundown is one line in code's words. The latest row for each plan, piece or pull request that is an escalation or a hold, while the status file shows it still waiting, is a blocker in the ledger's own words (`blocker()`), an urgent one first and marked urgent. With no status file to check against (none can be read, or Linear could not be read), each such row since the last rundown is listed instead, urgent first, said as not checked. The agent's reason is only its own marked line, with links made plain, and never in the facts the tech lead's turn reads. A ledger `read()` gives no rows for is said ("no approval is claimed"), never shown as none. Absent, or the setting empty, nothing is said. The sprint recap lists the period's rows from the same reader.
 
 ---
 
@@ -3311,7 +3336,40 @@ list (§13). The usage job reads the runs through it once a lane moves to the ru
 
 **Fields only.** No ticket text is in a request or a record. A resume's `text` reaches the session
 fenced as data. Each run's own folder also holds its command's inputs, the program's output and its
-exit. Those are the run's, and nothing but the runner reads them.
+exit. Those are the run's. Only the runner reads them, except the run's own tool server, which
+reads its run file and keeps its counts there (below).
+
+### The session's own tool server (KIT-706)
+
+With the runner's `session_tools` setting, a `code`, `fix` or `conflict` run gets one tool server
+of its own: `scripts/pipeline_session_tools.py`. The session holds no tracker credential, and this
+server is its only way to the tracker. Its five tools are §8's requests as calls, with §8's caps.
+Two files in the run's folder hold its state.
+
+`runs/<run>/session-tools.json` is the run file. The runner writes it whole, mode 0600, before the
+program starts, and names it as the server's one start-up argument. The server does not start on
+one that is a link, another account's, changeable by others, or not this shape.
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `schema` | `"pipeline-session-tools/1"` | |
+| `run` | run id | This run. The telemetry block's `run_id` and `dispatch_id`. |
+| `kind` | `code` \| `fix` \| `conflict` | The kinds that get the tools. |
+| `ticket`, `team_key` | ticket id; its team's key | The only ticket any tool reads or writes. No tool takes a ticket. |
+| `auth_mode`, `model`, `started_at` | from the pin and the settings | For the telemetry block. |
+| `key_file` | absolute path | The session writer's tracker key. Walled from the session. |
+| `writer_user_id` | user id | The user the key must belong to. Checked with the tracker before the first call. |
+| `owner_user_ids` | user ids | The writer is never one of them. |
+
+`runs/<run>/session-tools-state.json` holds the run's counts. Only the server writes it, whole,
+mode 0600: `{"schema": "pipeline-session-tools-state/1", "run", "writes": [{"tool", "at",
+"state"}]}`. Each write's `state` is `pending`, `posted` or `failed`.
+
+- A write is recorded `pending` before it is sent. So a server that dies mid-write still counts it.
+- A `pending` or `posted` write counts against the caps. A `failed` one, which the tracker did not
+  confirm, does not.
+- A counts file that cannot be read is never read as no writes. Every write is refused until it
+  can be read.
 
 ---
 

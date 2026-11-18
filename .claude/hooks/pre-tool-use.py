@@ -12,7 +12,10 @@ as "block" and ANY OTHER non-zero exit (an uncaught exception → exit 1) as a
 All guards therefore run inside a fail-CLOSED boundary (`_dispatch`, bottom of
 file): if a crafted `tool_input` makes a matcher throw, we block instead of
 allowing. The workflow guards (branch / merged-PR / cross-worktree) swallow
-their own git/gh/network errors and deliberately stay fail-open.
+their own git/gh/network errors and deliberately stay fail-open. A hook that runs
+out of time is Claude Code's non-blocking error too, so the hook keeps a deadline
+of its own below the settings timeout and refuses the call when it hits it
+(HOOK_DEADLINE_SECONDS, KIT-684).
 
 Distilled from a production Claude Code hook suite (v2) — in production
 2026-06-23 → 2026-07-03 across a full build (Stages 0–6). The v2 hardening
@@ -47,9 +50,65 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 from datetime import datetime, timezone
+
+# ── The hook's own deadline (KIT-684) ─────────────────────────────────────────
+# Claude Code gives this hook the `timeout` seconds in .claude/settings.json and, when
+# they run out, treats it as a NON-blocking error: the tool call goes ahead unjudged.
+# One slow git (a locked repository, a stuck network mount) would switch every guard
+# off for that call. Every git and gh call here has its own timeout, but they add up,
+# so the hook keeps a deadline of its own, below the settings timeout, and refuses the
+# call when it hits it. The timer raises a BaseException, so no guard's `except
+# Exception` can swallow it and carry on, and the subprocess it interrupts is killed on
+# the way out. A second, short timer is the backstop: should that unwinding not finish,
+# or should the deadline land before the entry point can catch it, the process writes
+# the reason and exits 2 at once. The battery checks the two together stay under the
+# settings timeout.
+HOOK_DEADLINE_SECONDS = 7
+HOOK_DEADLINE_GRACE_SECONDS = 1
+HOOK_DEADLINE_HELP = (
+    "the hook ran out of time. It judges every tool call within its own deadline of "
+    "{seconds} seconds, under the timeout its wiring in .claude/settings.json allows, "
+    "and a call it could not judge in time is refused, never let through (KIT-684). "
+    "Usually a git call is stuck: a locked repository or a slow mount. Retry; if it "
+    "keeps happening, find what is slow."
+).format(seconds=HOOK_DEADLINE_SECONDS)
+
+
+class _HookDeadline(BaseException):
+    """The deadline's timer fired. A BaseException, so no `except Exception` stops it."""
+
+
+_DEADLINE_CATCHABLE = False      # True once the entry point can catch _HookDeadline
+
+
+def _deadline_hard_stop(_signum=None, _frame=None):
+    try:
+        os.write(2, ("[Security Hook] BLOCKED: %s\n" % HOOK_DEADLINE_HELP).encode("utf-8"))
+    finally:
+        os._exit(2)
+
+
+def _deadline_hit(_signum, _frame):
+    if not _DEADLINE_CATCHABLE:
+        _deadline_hard_stop()
+    signal.signal(signal.SIGALRM, _deadline_hard_stop)
+    signal.setitimer(signal.ITIMER_REAL, HOOK_DEADLINE_GRACE_SECONDS)
+    raise _HookDeadline()
+
+
+def _deadline_disarm():
+    """The call was judged in time: nothing is left for the timer to stop."""
+    if hasattr(signal, "setitimer"):
+        signal.setitimer(signal.ITIMER_REAL, 0)
+
+
+if hasattr(signal, "setitimer"):             # POSIX; there is no SIGALRM on Windows
+    signal.signal(signal.SIGALRM, _deadline_hit)
+    signal.setitimer(signal.ITIMER_REAL, HOOK_DEADLINE_SECONDS)
 
 
 def block(reason: str) -> None:
@@ -299,8 +358,8 @@ _SESSION_ROOT = PROJECT_ROOT
 
 # ── Branch guard: no edits or commits while on main ─────────────────────────
 # Enforces the feature-branch workflow automatically (see docs/COLLABORATION.md).
-# Edit/Write and `git commit` are blocked whenever this repo is on a protected
-# branch, so starting new work *forces* a branch first. This is what keeps main
+# Edit/Write/NotebookEdit and `git commit` are blocked whenever this repo is on a
+# protected branch, so starting new work *forces* a branch first. This is what keeps main
 # clean and conflict-free when several people (or agents) share the repo.
 PROTECTED_BRANCHES = {"main", "master"}
 BRANCH_HELP = (
@@ -2250,7 +2309,33 @@ PIN_BROKEN_HELP = (
     "warning. An expiry is not an absence: this session WAS dispatched with a "
     "binding and that binding has lapsed, so the ticket, scope and branch it "
     "bound can no longer be verified (§2 calls that BROKEN, and broken fails "
-    "closed). Ask the dispatcher to re-dispatch, or delete the stale pin file."
+    "closed). Ask the dispatcher to re-dispatch, or end the binding with its "
+    "release, which records it in the ledger (a pin deleted by hand within a day of "
+    "its writing reads as MISSING, KIT-674):\n"
+    "  python3 scripts/pipeline_dispatch_local.py --release --session-root {root}"
+)
+PIN_MISSING_HELP = (
+    "🔒 Dispatcher pin MISSING for this session root.\n"
+    "  pin file:     {path}\n"
+    "  ledger row:   dispatch {dispatch} for {ticket}, pinned {when}\n"
+    "  ledger:       {ledger}\n"
+    "  session root: {root}\n"
+    "The dispatcher's ledger says a pin was written for this worktree and nothing "
+    "released it, and the pin is not there: it was deleted or moved. A pin that is "
+    "gone is not one that never was, so the ticket, scope and branch it bound cannot "
+    "be checked, and every write fails closed, whatever the mode "
+    "(docs/PIPELINE-CONTRACT.md §3, KIT-674). A session never ends its own binding. "
+    "A person ends it with the dispatcher's release, which records it in the ledger:\n"
+    "  python3 scripts/pipeline_dispatch_local.py --release --session-root {root}"
+)
+PIN_UNREADABLE_HELP = (
+    "🔒 Dispatcher pin store could not be read for this session root.\n"
+    "  could not read: {what}\n"
+    "  session root:   {root}\n"
+    "A pin store the hook cannot read cannot show that nothing bound this worktree. "
+    "Could not check is not absent (docs/PIPELINE-CONTRACT.md §13, KIT-674), so every "
+    "write fails closed. The pins root and its ledger are this account's own: give it "
+    "read access to them again."
 )
 PINS_ROOT_HELP = (
     "🔒 `delivery.json` is BROKEN: `dispatch.pinsRoot` resolves to `{path}`, which "
@@ -2606,8 +2691,92 @@ def _worktree_ticket() -> str:
     return ""
 
 
+# ── a pin that is GONE is not one that never was (KIT-674) ───────────────────
+# Every kit dispatcher appends a row to <pinsRoot>/ledger.jsonl for each pin it writes,
+# and the hand-run dispatcher and the runner one carrying `released_at` for each pin they
+# release (contract §3). The ledger sits beside the pins, outside every worktree, where a
+# session can no more write than it can delete its pin. When an ABSENT pin's worktree has
+# a last ledger row that is a pin row under PIN_LIFE_MAX_SECONDS old, a dispatcher bound
+# this session and nothing released it: the pin was deleted or moved. That is MISSING, and
+# broken. Read as "a person's session", it switched every withholding guard off for the
+# very session that took the pin away. A row older than that names a pin that would have
+# expired by now and reads as absent, so an old dispatch whose release was never recorded
+# does not hold a worktree forever; a row whose age cannot be read still expects its pin.
+# A ledger the hook cannot read is UNREADABLE, never empty (contract §13). Tamper-evident,
+# not tamper-proof: a session that can delete its pin can edit the ledger too.
+PIN_LIFE_MAX_SECONDS = 24 * 60 * 60    # the longest a kit dispatcher lets a pin live
+PIN_LEDGER = "ledger.jsonl"
+PIN_LEDGER_TAIL_BYTES = 256 * 1024     # a day's rows sit at the end; read no more than this
+
+
+def _ledger_row_for_root(pins_root):
+    """(row, error): the LAST ledger row naming this session root's worktree, or None when
+    no row does or there is no ledger. `error` says what could not be read, else ""."""
+    if not pins_root:
+        return None, "the pins root does not resolve"
+    path = os.path.join(pins_root, PIN_LEDGER)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)   # a FIFO there never hangs us
+    except OSError as exc:
+        if exc.errno in (errno.ENOENT, errno.ENOTDIR):
+            return None, ""
+        return None, "%s (%s)" % (path, exc.strerror or exc)
+    try:
+        import stat
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return None, "%s (not a regular file)" % path
+        start = max(0, st.st_size - PIN_LEDGER_TAIL_BYTES)
+        os.lseek(fd, start, os.SEEK_SET)
+        data, chunk = b"", b"-"
+        while chunk and len(data) <= PIN_LEDGER_TAIL_BYTES:
+            chunk = os.read(fd, 65536)
+            data += chunk
+    except OSError as exc:
+        return None, "%s (%s)" % (path, exc.strerror or exc)
+    finally:
+        os.close(fd)
+    lines = data.split(b"\n")
+    if start:
+        lines = lines[1:]                  # the tail cut its first line in two
+    leaf = os.path.basename(PROJECT_ROOT)
+    last = None
+    for line in lines:
+        try:
+            row = json.loads(line.decode("utf-8"))
+            wt = row.get("worktree")
+            if isinstance(wt, str) and wt and (
+                    wt == PROJECT_ROOT or (os.path.basename(wt.rstrip("/")) == leaf
+                                           and os.path.realpath(wt) == PROJECT_ROOT)):
+                last = row
+        except Exception:
+            continue                       # not a row, so it names no worktree
+    return last, ""
+
+
+def _pin_expected(cfg):
+    """(row, error) for an ABSENT pin: the ledger row that says a pin must be here, or None
+    when nothing does (see PIN_LIFE_MAX_SECONDS above)."""
+    row, err = _ledger_row_for_root(_pins_root(cfg))
+    if err or row is None or "released_at" in row:
+        return None, err
+    when = _parse_iso_utc(row.get("pinned_at"))
+    if when is not None and (
+            datetime.now(timezone.utc) - when).total_seconds() >= PIN_LIFE_MAX_SECONDS:
+        return None, ""
+    return row, ""
+
+
+def _ledger_field(row, key):
+    """One ledger value for a block message: printable, short, and "?" when unset."""
+    v = (row or {}).get(key)
+    text = v if isinstance(v, str) else "" if v is None else str(v)
+    return re.sub(r"[^\x20-\x7e]", "?", text)[:80] or "?"
+
+
 def _read_pin(cfg):
-    """(pin, status, path). status ∈ ok | absent | expired | malformed | mismatch.
+    """(pin, status, path). status ∈ ok | absent | missing | unreadable | expired |
+    malformed | mismatch.
 
     **`expired` is not `absent`, and the difference is the whole point.** An absent
     pin means no dispatcher ever bound this session — a human's ad-hoc session in a
@@ -2624,11 +2793,28 @@ def _read_pin(cfg):
     because the worktree check runs FIRST: a lapsed pin we return is provably this
     session's own. A lapsed pin may never GRANT anything, but it must not silently
     WITHDRAW the constraints it was carrying either — an expiry that switched
-    guards off would make waiting an escape."""
+    guards off would make waiting an escape.
+
+    **`missing` is not `absent` either (KIT-674).** An absent pin the ledger still
+    expects was deleted or moved, and the first value returned is then that ledger
+    ROW, never a pin. A pin or ledger the hook could not read is `unreadable`, and the
+    path names what could not be read. Both are broken, whatever the mode."""
     path = _pin_path(cfg)
     try:
-        if not os.path.isfile(path):
-            return None, "absent", path
+        os.stat(path)
+        present = os.path.isfile(path)
+    except OSError as exc:
+        if exc.errno not in (errno.ENOENT, errno.ENOTDIR):
+            return None, "unreadable", "%s (%s)" % (path, exc.strerror or exc)
+        present = False
+    except Exception:
+        present = False
+    if not present:
+        row, err = _pin_expected(cfg)
+        if err:
+            return None, "unreadable", err
+        return (row, "missing", path) if row is not None else (None, "absent", path)
+    try:
         with open(path) as fh:
             pin = json.load(fh)
     except Exception:
@@ -3196,6 +3382,19 @@ def _pipeline_guards(tool, inp) -> None:
         pin, pin_status, pin_file = None, "ignored", ""
     else:
         pin, pin_status, pin_file = _read_pin(cfg)
+    # A pin the ledger says must be here is MISSING, and a pin store the hook cannot read
+    # is UNREADABLE (KIT-674). Either way the binding cannot be checked, so every write
+    # fails closed whatever the mode, which the ledger row does not carry. For `missing`
+    # the first value is that ledger row, never a pin: nothing below may read it as one.
+    if pin_status == "missing":
+        if mutating:
+            block(PIN_MISSING_HELP.format(
+                path=pin_file, dispatch=_ledger_field(pin, "dispatch_id"),
+                ticket=_ledger_field(pin, "ticket"), when=_ledger_field(pin, "pinned_at"),
+                ledger=os.path.join(_pins_root(cfg), PIN_LEDGER), root=PROJECT_ROOT))
+        pin = None
+    elif pin_status == "unreadable" and mutating:
+        block(PIN_UNREADABLE_HELP.format(what=pin_file, root=PROJECT_ROOT))
     ticket = pin.get("ticket") if (pin and isinstance(pin.get("ticket"), dict)) else None
     mode = str((pin or {}).get("session_mode") or "").strip().lower()
     pinned_id = str((ticket or {}).get("id") or "").strip().upper()
@@ -3224,7 +3423,8 @@ def _pipeline_guards(tool, inp) -> None:
     # ── ticket-branch: the branch must carry the PINNED id, case-insensitively ─
     if (cfg.get("branch") or {}).get("requireTicketId") and pinned_id:
         touches_branch = (
-            (tool in ("Edit", "Write") and _in_project(inp.get("file_path", "")))
+            (tool in ("Edit", "Write", "NotebookEdit")
+             and _in_project(inp.get("file_path", "") or inp.get("notebook_path", "")))
             or (tool == "Bash" and re.search(
                 r"\bgit\s+commit\b", _strip_prose(inp.get("command", ""))))
         )
@@ -3379,11 +3579,12 @@ def _dispatch(data) -> None:
         if _in_git_store(_spp):
             block(CONFIG_ANCHOR_HELP)
 
-    # Cross-worktree guard runs for ALL Edit/Write (not just in-project), and BEFORE
-    # the branch guard — a write into another checkout must be caught even though it
-    # is outside PROJECT_ROOT.
-    if tool in ("Edit", "Write"):
-        _fp = inp.get("file_path", "")
+    # Cross-worktree guard runs for ALL Edit/Write/NotebookEdit (not just in-project),
+    # and BEFORE the branch guard — a write into another checkout must be caught even
+    # though it is outside PROJECT_ROOT. A NotebookEdit names its file `notebook_path`,
+    # so a guard reading only `file_path` never saw it (KIT-673).
+    if tool in ("Edit", "Write", "NotebookEdit"):
+        _fp = inp.get("file_path", "") or inp.get("notebook_path", "")
         _owner = _owning_worktree(_fp, _worktree_roots()) if _fp else None
         if _owner and _owner != PROJECT_ROOT:  # both realpath'd
             try:
@@ -3395,7 +3596,8 @@ def _dispatch(data) -> None:
             block(CROSS_WORKTREE_HELP.format(owner=_owner, here=PROJECT_ROOT, suggested=_suggested)
                   + _ROOT_NOTE)
 
-    if tool in ("Edit", "Write") and _in_project(inp.get("file_path", "")):
+    if tool in ("Edit", "Write", "NotebookEdit") and _in_project(
+            inp.get("file_path", "") or inp.get("notebook_path", "")):
         branch = _current_branch()
         if branch in PROTECTED_BRANCHES:
             block(BRANCH_HELP.format(branch=branch) + _ROOT_NOTE)
@@ -3603,8 +3805,10 @@ def _dispatch(data) -> None:
             )
 
     # ── Edit / Write ──────────────────────────────────────────────────────────
-    if tool in ("Edit", "Write"):
-        path = inp.get("file_path", "")
+    # A NotebookEdit is judged here exactly as an Edit is: its file is `notebook_path`
+    # and its text is the cell's `new_source` (KIT-673).
+    if tool in ("Edit", "Write", "NotebookEdit"):
+        path = inp.get("file_path", "") or inp.get("notebook_path", "")
         basename = os.path.basename(path)
 
         # Block writing to real .env files
@@ -3621,7 +3825,8 @@ def _dispatch(data) -> None:
             )
 
         # Block embedding secret values in any file content
-        content = inp.get("new_string", "") or inp.get("content", "")
+        content = (inp.get("new_string", "") or inp.get("content", "")
+                   or inp.get("new_source", ""))
         SECRET_PATTERNS = [
             (r"sk-ant-[a-zA-Z0-9\-_]{20,}", "Anthropic API key (sk-ant-…)"),
             (r"(?:supabase|postgres)://[^:@\s]+:[^@\s]{8,}@", "DB connection string with password"),
@@ -3634,6 +3839,15 @@ def _dispatch(data) -> None:
             # merely ends in "sk" (desk-, task-) from reading as a key.
             (r"\bsk-(?:proj|svcacct|admin)-[A-Za-z0-9_-]{20,}", "OpenAI API key (sk-proj-…)"),
             (r"\bsk-[A-Za-z0-9]{32,}", "OpenAI legacy API key (sk-…)"),
+            # The pipeline's own credentials (KIT-683): the tracker's API key, Slack's bot,
+            # user and app-level tokens, and GitHub's fine-grained token, which the
+            # gh[pousr]_ shape above does not match. Each mirrors the secret scan's rule for
+            # it. scripts/secret_shapes.py is the one list: the hook battery checks this
+            # guard against it, and the scanner's selftest checks the real rules.
+            (r"\blin_api_[A-Za-z0-9_]{32,}", "Linear API key (lin_api_…)"),
+            (r"\b(?:xoxb|xoxp|xapp|xoxa|xoxo|xoxr)-(?:\d-)?(?:[A-Za-z0-9]{1,40}-)+"
+             r"[A-Za-z0-9]{1,40}\b", "Slack token (xoxb-, xoxp-, xapp-…)"),
+            (r"\bgithub_pat_[A-Za-z0-9_]{82}", "GitHub fine-grained token (github_pat_…)"),
             # Extension point: add patterns for providers YOUR project uses, and a battery
             # case in test_hooks.py for every pattern you add.
         ]
@@ -3691,28 +3905,37 @@ def _dispatch(data) -> None:
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
+# Everything below runs inside the deadline's catch (KIT-684): a call the hook could not
+# judge in time is refused. Past this line the deadline unwinds, killing the subprocess
+# it interrupts, rather than stopping the process where it stands.
+_DEADLINE_CATCHABLE = True
 try:
-    data = json.load(sys.stdin)
-except Exception:
-    # Fail-open on malformed input: a broken harness payload must not brick
-    # every tool call (the harness — not the model — builds this stdin). The
-    # battery asserts this behavior (case "garbage stdin").
-    sys.exit(0)
+    try:
+        data = json.load(sys.stdin)
+    except Exception:
+        # Fail-open on malformed input: a broken harness payload must not brick
+        # every tool call (the harness — not the model — builds this stdin). The
+        # battery asserts this behavior (case "garbage stdin").
+        _deadline_disarm()
+        sys.exit(0)
 
-# Fail CLOSED on internal errors: Claude Code treats a
-# non-2 nonzero exit as NON-blocking — the tool would run. If a security matcher
-# raises on a crafted/unexpected tool_input, block instead of crashing to exit 1.
-# The workflow guards inside swallow their own errors (fail-open by design), so
-# only genuine security-check failures reach here.
-try:
-    _dispatch(data)
-except SystemExit:
-    raise  # an explicit allow/deny already decided
-except Exception as exc:
-    print(
-        f"[Security Hook] internal error — failing closed ({type(exc).__name__})",
-        file=sys.stderr,
-    )
-    sys.exit(2)
+    # Fail CLOSED on internal errors: Claude Code treats a
+    # non-2 nonzero exit as NON-blocking — the tool would run. If a security matcher
+    # raises on a crafted/unexpected tool_input, block instead of crashing to exit 1.
+    # The workflow guards inside swallow their own errors (fail-open by design), so
+    # only genuine security-check failures reach here.
+    try:
+        _dispatch(data)
+    except SystemExit:
+        raise  # an explicit allow/deny already decided
+    except Exception as exc:
+        print(
+            f"[Security Hook] internal error — failing closed ({type(exc).__name__})",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    _deadline_disarm()
+except _HookDeadline:
+    block(HOOK_DEADLINE_HELP)
 
 sys.exit(0)

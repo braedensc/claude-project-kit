@@ -581,21 +581,61 @@ def write_pin(pins_root, key, pin, force):
 
 
 def append_ledger(pins_root, row):
-    """Append-only, one row per pin ever written (§3). Best-effort: a ledger
-    write that fails must not leave a placed pin looking un-placed."""
+    """Append-only: one row per pin written and one per release (§3). Best-effort
+    for a pin: a ledger write that fails must not leave a placed pin looking
+    un-placed. True when the row was written."""
     try:
         with open(os.path.join(pins_root, LEDGER), "a", encoding="utf-8") as fh:
             fh.write(json.dumps(row) + "\n")
+        return True
     except OSError as exc:
         print(f"warning: could not append to {LEDGER}: {exc}", file=sys.stderr)
+        return False
+
+
+def ledger_expects(pins_root, session_root):
+    """The ledger row that says a pin must be at this session root, or None (KIT-674).
+    The hook's `_pin_expected`, kept in step: the LAST row naming this worktree, when it
+    is a pin row (no `released_at`) under MAX_EXPIRY_MINUTES old, or one whose age
+    cannot be read. No ledger is no row; one that cannot be read raises OSError."""
+    try:
+        with open(os.path.join(pins_root, LEDGER), "rb") as fh:
+            data = fh.read()
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    last = None
+    for line in data.split(b"\n"):
+        try:
+            row = json.loads(line.decode("utf-8"))
+            wt = row.get("worktree")
+            if isinstance(wt, str) and wt and os.path.realpath(wt) == session_root:
+                last = row
+        except Exception:
+            continue                       # not a row, so it names no worktree
+    if last is None or "released_at" in last:
+        return None
+    try:
+        when = datetime.fromisoformat(str(last.get("pinned_at")).replace("Z", "+00:00"))
+    except ValueError:
+        return last
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    if (datetime.now(timezone.utc) - when).total_seconds() >= MAX_EXPIRY_MINUTES * 60:
+        return None
+    return last
 
 
 def read_pin(path, session_root):
-    """(pin, status) with the hook's own vocabulary: ok | absent | expired |
-    malformed | mismatch. Kept in step with `_read_pin` so --show reports what
-    the guard will actually conclude."""
+    """(pin, status) with the hook's own vocabulary: ok | absent | missing |
+    unreadable | expired | malformed | mismatch. Kept in step with `_read_pin` so
+    --show reports what the guard will actually conclude. `missing` is a pin the
+    ledger still expects (see ledger_expects), and the hook fails it closed."""
     if not os.path.isfile(path):
-        return None, "absent"
+        try:
+            expected = ledger_expects(os.path.dirname(path), session_root)
+        except OSError:
+            return None, "unreadable"
+        return None, ("missing" if expected is not None else "absent")
     try:
         with open(path, encoding="utf-8") as fh:
             pin = json.load(fh)
@@ -635,6 +675,16 @@ def action_show(pins_root, key, path, session_root):
         print(f"criteria     : {len(t.get('acceptance_criteria') or [])} item(s)")
     if status == "absent":
         print("\nThis session is UNBOUND. `/work` in `ticket` mode will fail closed (§2).")
+    if status == "missing":
+        row = ledger_expects(pins_root, session_root) or {}
+        print(f"ledger row   : dispatch {row.get('dispatch_id')} for {row.get('ticket')}, "
+              f"pinned {row.get('pinned_at')}")
+        print("\nThe pin is GONE, and the ledger says it was written and never released.\n"
+              "The hook fails every write closed here until the binding is released;\n"
+              "--release records that (KIT-674).")
+    if status == "unreadable":
+        print(f"\nThe pins ledger in {pins_root} could not be read, so the hook fails\n"
+              "every write closed here. Give this account read access to it again.")
     return 0
 
 
@@ -644,6 +694,25 @@ def action_release(pins_root, key, path, session_root):
     pin, status = read_pin(path, session_root)
     if status == "absent":
         print(f"nothing to release — no pin at {path}")
+        return 0
+    if status == "unreadable":
+        die(f"REFUSED: the pins ledger in {pins_root} could not be read, so nothing was "
+            f"released. Give this account read access to it again, then retry.", 1)
+    if status == "missing":
+        # KIT-674: the pin was deleted or moved while the ledger still expects it. The
+        # release row IS the release here, so a row that was not written is a failure.
+        row = ledger_expects(pins_root, session_root) or {}
+        if not append_ledger(pins_root, {
+                "dispatch_id": row.get("dispatch_id"),
+                "ticket": row.get("ticket"),
+                "worktree": session_root,
+                "released_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "stage": "local-release",
+        }):
+            die("could not record the release in the ledger, so the binding still holds", 1)
+        print(f"released the binding the ledger held for {session_root}")
+        print(f"(its pin was already gone: {path})")
+        print("this session is now UNBOUND.")
         return 0
     if status == "mismatch":
         die(f"REFUSED: {path} governs {(pin or {}).get('worktree')!r}, not this "
@@ -1172,6 +1241,33 @@ def selftest():
         r = _st_run(["--session-root", root, "--release"])
         expect(r.returncode == 0 and "nothing to release" in r.stdout,
                "--release must be idempotent")
+
+        # 3b. KIT-674: a pin deleted by hand is MISSING, not absent, while the ledger
+        #     still expects it, and --release ends it by recording the release.
+        r = _st_run(["ENG-123", "--session-root", root, "--ticket-file", tf])
+        expect(r.returncode == 0 and os.path.isfile(dest),
+               f"a dispatch after a release must place a pin: {r.stderr[-200:]}")
+        os.chmod(dest, 0o644)
+        os.remove(dest)
+        r = _st_run(["--session-root", root, "--show"])
+        expect("status       : missing" in r.stdout and "never released" in r.stdout,
+               f"--show must call a deleted pin missing: {r.stdout[-300:]}")
+        r = _st_run(["--session-root", root, "--release"])
+        rows = [json.loads(x) for x in open(ledger, encoding="utf-8")]
+        expect(r.returncode == 0 and "already gone" in r.stdout
+               and rows[-1].get("stage") == "local-release" and "released_at" in rows[-1]
+               and rows[-1].get("worktree") == root,
+               f"--release of a missing pin must record the release: {r.stdout[-200:]} "
+               f"{rows[-1]}")
+        r = _st_run(["--session-root", root, "--show"])
+        expect("status       : absent" in r.stdout,
+               f"after the release the session is unbound: {r.stdout[-300:]}")
+        with open(ledger, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"dispatch_id": "d_old", "worktree": root,
+                                 "pinned_at": "2020-01-01T00:00:00Z"}) + "\n")
+        r = _st_run(["--session-root", root, "--show"])
+        expect("status       : absent" in r.stdout,
+               f"a pin row older than any pin may live expects nothing: {r.stdout[-300:]}")
 
         # 4. Empty acceptance criteria: refuse, and write NOTHING. §3 —
         #    a missing section yields an empty list, never an inferred one.

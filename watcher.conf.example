@@ -36,3 +36,11 @@ LIMIT_DAY_USD=
 LIMIT_PIECE_USD=
 LIMIT_DAY_RUNS=
 LIMIT_PIECE_RUNS=
+
+# Optional: the validator's ledger (docs/WATCHER.md, approval-rate).  With it, every merge into a watched
+# repository is checked against the validator's approvals.  This account must be able to read the file.
+# OWNER_LOGINS: your own GitHub logins, comma-separated: your own merges need no approval.  Leave yours out,
+# and each of your merges holds new starts.  LIMIT_DAY_APPROVALS: the most approvals in 24 hours, a runaway's.
+VALIDATOR_LEDGER=
+OWNER_LOGINS=
+LIMIT_DAY_APPROVALS=

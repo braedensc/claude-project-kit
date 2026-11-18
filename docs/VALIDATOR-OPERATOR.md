@@ -126,9 +126,9 @@ are built, nothing is approved for you.
 
 Every decision the validator makes is one row in its ledger: what it decided, about what, and
 why. Only the validator writes it. The stand-up and the sprint recap read it (section 7, "In
-the stand-up"). The watcher will read it too, and check every merge against it. Nothing writes
-rows yet: the pieces that decide come next. The format is contract §24; the code is
-`scripts/pipeline_validator_ledger.py`.
+the stand-up"). The watcher checks every merge against it (`docs/WATCHER.md`, the
+`approval-rate` monitor). Nothing writes rows yet: the pieces that decide come next. The format
+is contract §24; the code is `scripts/pipeline_validator_ledger.py`.
 
 | A row says | For example |
 |---|---|
@@ -560,3 +560,50 @@ that: taking an urgent escalation as paged because it was written down.
 **Your `Validator` check.** Stage E's bounce driver never treats a red `Validator` check as
 something the dev session must fix, whatever your list of checks that wait on a person says. Its
 verdict is the validator's: a send-back has its own path, and an escalation or a hold is yours.
+
+## 8. The facts it reads
+
+Before it judges anything, the validator reads the facts about it once: who filed the idea, which
+files change, how big the change is, whether the window is open, and so on. The code is
+`scripts/pipeline_validator_facts.py`. It only reads. Nothing calls it yet: the merge path and the
+approvals are their own pieces.
+
+Each fact comes from the part of the kit that owns it, through that part's own reader:
+
+| Fact | Where it comes from |
+|---|---|
+| The ticket a pull request belongs to | The tracker's own link from the ticket to the pull request, never the branch name. |
+| Who filed the idea | The piece, then its plan, then the planning run, then the idea, judged by the queue's own rule for a ticket you filed. |
+| The files and the size | GitHub. A renamed file counts under both names. |
+| Your project's risk paths, and its send-back budget | `delivery.json` on the default branch. |
+| Send-backs spent | Stage E's own ledger. |
+| The window and the runaway stops | The queue's own config and its own stop checks. |
+| The watcher and its hold | The watcher's status file, and the hold file. |
+| The last piece of a plan, and its acceptance check | The tracker, and the acceptance check's own record at this head. |
+| The criteria | Stage E's snapshot of them, taken when the work was delegated. |
+| The diff | GitHub. |
+
+**A fact it could not read holds the item.** It is said by name, with the reason, and never read
+as clear, empty or zero. So a source that is down stops approvals instead of letting one through.
+
+Good: `ticket: the tracker records no one ticket for the pull request`, and the pull request waits.
+Not that: a pull request approved because its ticket could not be read.
+
+**Its sources are yours to point it at.** Its config names the tracker key's variable (a read-only
+key), the work teams, the queue's config, Stage E's ledger and snapshot folder, the acceptance
+ledger, and the watcher's status and hold files. One left empty is a source it does not read, and
+every fact from it is said as unread. The install (a later piece) sets them.
+
+**Read one pull request's facts yourself.** It prints the facts as fields, with the criteria and the
+diff as sizes only, and changes nothing:
+
+```bash
+python3 scripts/pipeline_validator_facts.py show --config ~/.validator/config.json \
+  --repo OWNER/NAME --pr 12
+```
+
+Exit 0: every fact was read. Exit 1: at least one was not, and `unread` says which. Exit 2: the
+config could not be read or is not valid.
+
+**What it does not read yet.** Agent-filed work's generation is the queue's to certify, from its own
+verdict, and is not read here: such work's provenance is said as unread, so it waits for you.
