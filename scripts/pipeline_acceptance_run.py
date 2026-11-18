@@ -187,6 +187,11 @@ class NotFound(RunError):
     """The tracker or GitHub answered that the thing is not there."""
 
 
+class NoMergedPR(RunError):
+    """A plan whose pieces are all Done has no merged pull request linked: nothing was merged to check, which is an
+    answer and not a failure to read."""
+
+
 class Deadline(BaseException):
     """The wall clock ran out (a BaseException, so no `except Exception` eats it)."""
 
@@ -1166,7 +1171,7 @@ class Pass:
         answer names no full head or no merge time. Never a guess."""
         merged = info.get("merged_prs") or []
         if not merged:
-            raise RunError("no merged pull request is linked to its pieces")
+            raise NoMergedPR("no merged pull request is linked to its pieces")
         if len(merged) > MAX_MERGED_PRS:
             raise RunError("%d merged pull requests are linked, past the %d it reads" % (len(merged), MAX_MERGED_PRS))
         best = None
@@ -1182,6 +1187,16 @@ class Pass:
 
     def coverage_path(self):
         return self.cfg["ledger"] + COVERAGE_SUFFIX
+
+    def coverage_entry(self, plan):
+        """The plan's record as the file holds it now, or None: no file, one not of this schema, or no entry."""
+        try:
+            with open(self.coverage_path(), encoding="utf-8") as fh:
+                doc = json.load(fh)
+            entry = doc["plans"].get(plan) if doc.get("schema") == COVERAGE_SCHEMA else None
+        except (OSError, ValueError, KeyError, AttributeError):
+            return None
+        return entry if isinstance(entry, dict) else None
 
     def write_coverage(self, plan, entry):
         """Set (or, with None, remove) one plan's record in the coverage file next to the ledger, atomically. A file that
@@ -1227,8 +1242,18 @@ class Pass:
             self.write_coverage(plan, None)
             return
         mine = [r for (pl, _h), r in rows.items() if pl == plan]
+        numbers = sorted({m["number"] for m in info.get("merged_prs") or []})
+        old = self.coverage_entry(plan)
+        if old is not None and old.get("covered") is True and old.get("merged_prs") == numbers and numbers:
+            return                  # settled, and its merged pull requests are the ones it read: no lookup again
         try:
             head, merged_at, number = self.last_merge(info)
+        except NoMergedPR as exc:
+            self.say("%-10s no merged head to check: %s" % (plan, exc))
+            self.write_coverage(plan, None)
+            if not mine:
+                self.start_default(plan, info, "its pieces merged before a check ran")
+            return
         except (RunError, NotFound) as exc:
             self.problems.append("%s: its last merged pull request could not be read (%s), so whether its merged head "
                                  "was checked is not known" % (plan, exc))
@@ -1238,8 +1263,8 @@ class Pass:
             return
         by = None
         for row in mine:
-            if row["status"] == "failed":
-                continue
+            if row["status"] == "failed" or (row.get("verdict") or {}).get("word") == "could-not-check":
+                continue                # a start that failed, or a check that could not check, covers nothing
             if row["head"] == head or (_epoch(row["at"]) or 0) >= merged_at:
                 by = row["head"]
                 break
@@ -2338,10 +2363,10 @@ def selftest():
     def seed(rows):
         poller.write_ledger(cfg["ledger"], {(r["plan"], r["head"]): r for r in rows})
 
-    def row(head, at, verdict=True, status="started"):
+    def row(head, at, verdict=True, status="started", word="passed"):
         doc = {"plan": "TOD-100", "head": head, "status": status, "at": _iso(at)}
         if verdict:
-            doc["verdict"] = {"word": "passed", "status": "written", "at": _iso(at + 60)}
+            doc["verdict"] = {"word": word, "status": "written", "at": _iso(at + 60)}
         return doc
 
     # 11a. KIT-763: after the merge, was the head the last piece merged at checked?
@@ -2383,6 +2408,23 @@ def selftest():
     code, out = go(lin, gh)
     expect((coverage() or {}).get("covered") is False and lin.kinds() == ["create", "delegate"],
            "a failed start covers nothing: %s %r" % (out, coverage()))
+    # (4b) a check that could not check covers nothing: a plan merged at that head is not covered.
+    clean()
+    lin, gh = merged_world()
+    seed([row(H1, NOW - 3000, word="could-not-check")])
+    code, out = go(lin, gh)
+    expect((coverage() or {}).get("covered") is False and (coverage() or {}).get("by") is None,
+           "a could-not-check verdict does not cover the merged head: %s %r" % (out, coverage()))
+    # (4c) a finished plan with no merged pull request linked is no failure of the pass, and gets no record.
+    clean()
+    lin, gh = merged_world()
+    for kid in lin.epics["e-TOD-100"]["children"]["nodes"]:
+        for att in kid["attachments"]["nodes"]:
+            att["metadata"]["status"] = "closed"
+    seed([row(H1, NOW - 3000)])
+    code, out = go(lin, gh)
+    expect(code == EXIT_OK and "NOT DONE" not in out and "no merged head to check" in out and coverage() is None,
+           "no merged pull request is said, never counted as a problem, and writes no record: %s" % out)
     # (5) the merge lookup cannot be read: no record is left (an old "covered" one is removed), it is said, and a plan
     #     with no check at all still gets its first one.
     clean()
@@ -2390,6 +2432,14 @@ def selftest():
     seed([row(H1, NOW - 3000)])
     go(lin, gh)
     expect((coverage() or {}).get("covered") is True, "the record is there before the lookup fails")
+    # (a covered plan is not looked up again while its merged pull requests are the ones the entry lists)
+    before = len([c for c in gh.calls if c[0] == "pr"])
+    go(lin, gh, now=NOW + 30)
+    expect(len([c for c in gh.calls if c[0] == "pr"]) == before and (coverage() or {}).get("covered") is True,
+           "a plan covered at the pull requests it has now is not asked about on GitHub again: %r" % gh.calls)
+    # a pull request added to the plan makes it look again, and here GitHub cannot be read
+    lin.epics["e-TOD-100"]["children"]["nodes"][1]["attachments"]["nodes"].append(
+        {"url": "https://github.com/acme/app/pull/9", "sourceType": "github", "metadata": {"status": "merged"}})
     gh.fail.add("pr")
     code, out = go(lin, gh, now=NOW + 60)
     expect(coverage() is None and "NOT DONE: TOD-100: its last merged pull request could not be read" in out
