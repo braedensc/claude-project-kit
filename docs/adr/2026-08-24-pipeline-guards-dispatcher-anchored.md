@@ -91,6 +91,12 @@ value, already covered by the contract's validator, rather than a fork of the ho
   needs `pull_request_target` plus a required review, which is owner-set and deliberately
   not claimed yet.
 
+  **Update (2026-11-17, KIT-668):** the label gate now runs on `pull_request_target`, from
+  the default branch, so a PR cannot change how it is judged and its own code cannot turn
+  the check green. A required review is still what makes the label a person's look under
+  one shared credential. `docs/SECURITY.md` says what holds, and what it needs from the
+  owner before 2 Dec 2026.
+
 ## Verified
 
 - **Battery: 218/218 green against the candidate** (was 147 before this change; 71 new

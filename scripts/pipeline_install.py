@@ -54,6 +54,14 @@ WHAT IT DOES, IN ORDER
   3b. The sweep (`scripts/pipeline_sweep_setup.py run`), when this Mac has a `sweep.conf`:
      it installs the job that removes what finished dispatcher runs left, and never loads
      it. Its card (CK-S1) is yours and does not hold the idea gate back.
+  3c. The notifier (`scripts/pipeline_notifier_setup.py`), when this Mac has a `notifier.conf`
+     (`--notifier-conf` names another). It runs the installer's own `run --dry-run`, shown as
+     it runs. Exit 0 is "up to date". A step table with a WOULD-CHANGE row is work: it asks,
+     then runs `run` on a yes ("updated"). Only a card left (a job to load, a ping to watch)
+     is "waiting on you": nothing is asked, because `run` cannot clear it. A dry run that
+     printed no table, or ended with any other code, is never "up to date". A `run` that ends
+     on a card stops the command in Manual and is carried past in Automatic. With no
+     `notifier.conf` the part is "off on this Mac" and nothing runs.
   3d. The Slack bridge and the stand-up (`scripts/pipeline_bridge_setup.py`), when this Mac has a
      `bridge.conf` (`--bridge-conf` names another). It runs `install`, the installer's compare
      without `--apply`: the job's config, its job file and the stand-up's settings file against
@@ -100,10 +108,12 @@ and Ctrl-C included; the refusals read nothing, so they print nothing)
   questions; Automatic cannot answer them yet". The note changes no outcome, no exit code
   and not the short list.
 
-  Two limits, plainly. "Off on this Mac" means the part's settings file is not in the kit
-  folder (or the folder you named with --conf and its kin); settings kept elsewhere read as
-  off. Checks that need the Mac password read "could not be measured", because they run
-  without a terminal and cannot ask for it.
+  Two limits, plainly. "Off on this Mac" means the part's settings file is in neither the kit
+  folder (or the folder you named with --conf and its kin) nor the place this Mac says it
+  keeps it: /Library/Application Support/claude-pipeline/settings-places.json, a file only
+  root can write, that maps a settings file's name to its full path (KIT-752). The kit folder
+  wins when the file is there. Checks that need the Mac password read "could not be measured",
+  because they run without a terminal and cannot ask for it.
 
 TO ONLY LOOK: --check (KIT-736)
   `pipeline_install.py --check` looks at every part and changes nothing. It needs no terminal,
@@ -135,7 +145,7 @@ TO ONLY LOOK: --check (KIT-736)
 
 Usage:
     pipeline_install.py [--conf stage-a.conf] [--stage-e-conf stage-e.conf]
-                        [--no-pull] [--skip-stage-e]
+                        [--no-pull] [--skip-stage-e] [--notifier-conf notifier.conf]
     pipeline_install.py --check [--conf stage-a.conf] [--stage-e-conf stage-e.conf]
                         [--sweep-conf sweep.conf] [--skip-stage-e]
     pipeline_install.py --selftest
@@ -185,6 +195,7 @@ STAGE_E = os.path.join(HERE, "pipeline_stage_e_setup.py")
 STAGE_A = os.path.join(HERE, "pipeline_stage_a_setup.py")
 SWEEP_SETUP = os.path.join(HERE, "pipeline_sweep_setup.py")
 BRIDGE_SETUP = os.path.join(HERE, "pipeline_bridge_setup.py")
+NOTIFIER_SETUP = os.path.join(HERE, "pipeline_notifier_setup.py")
 
 # What each installer's exit code means, in a sentence a person can act on. The codes are
 # the installers' own (their docstrings); an unknown one is passed through as it is.
@@ -334,6 +345,10 @@ class Io(object):
 
     def exists(self, path):
         return os.path.exists(path)
+
+    def places(self, path):
+        """({settings file name: where this Mac keeps it}, why it was ignored) (KIT-752)."""
+        return load_places(path)
 
     def parts(self):
         """The pipeline's parts, in the list's order. Raises OSError or ValueError."""
@@ -512,7 +527,12 @@ def missing(path):
     was named in (--conf and its kin can point elsewhere)."""
     here = os.path.dirname(os.path.abspath(path))
     where = "the kit folder" if here == KIT else here
-    return "no %s in %s" % (os.path.basename(path), where)
+    name = os.path.basename(path)
+    if PLACES_WHY[0]:
+        where += " (the places file at %s was not used: %s)" % (DEFAULT_PLACES, PLACES_WHY[0])
+    if name in PLACES and os.path.abspath(PLACES[name]) != os.path.abspath(path):
+        where += " (or at %s, where this Mac says it is kept)" % PLACES[name]
+    return "no %s in %s" % (name, where)
 
 
 def look_first(io, rep, key):
@@ -702,7 +722,7 @@ def step_stage_e(io, conf, skip, rep):
         io.say("Stage E is not up to date: the check above names what is outstanding.")
         io.say("Updating it can restart the dispatcher, which cuts off any session it is "
                "running.")
-        io.say("If it moves the clone, it also stops the notifier and the Slack bridge, where "
+        io.say("If it moves the clone, it also stops the notifier and the tech lead, where "
                "this Mac runs them, for a few seconds, and loads them again.")
         io.say("Check Linear first: nothing the dispatcher works on should be In Progress.")
         if not io.ask("Update Stage E now?"):
@@ -748,7 +768,7 @@ def step_stage_e(io, conf, skip, rep):
                                                 "(exit %d). The lines above say where." % code)
                     + " It loads the review jobs it unloaded again on its way out. Any it says "
                       "NOT DONE for stays off until it is loaded: it prints the line. A notifier "
-                      "or Slack bridge job it names as off stays off until it is loaded. Clear "
+                      "or tech lead job it names as off stays off until it is loaded. Clear "
                       "what it names, then run this command again.",
                     code)
     # ONLY A CARD IS LEFT, and Stage E's code is current. The idea gate needs Stage E's
@@ -800,10 +820,30 @@ def has_work(text, line):
     return line in (text or "")
 
 
+# What an installer that prints the Stage E step table says: a row whose outcome is WOULD-CHANGE
+# is work its `run` would do; a row that is only a card is work for a person, which running it
+# again cannot clear. The notifier installer prints this table; this file's selftest pins the
+# word against the installer's own constant.
+STEP_TABLE = "-- steps --"
+WOULD_CHANGE_ROW = re.compile(r"^\s+\S+\s+WOULD-CHANGE(\s|$)", re.M)
+
+
+def would_change(text):
+    """True when the dry run's step table has work its `run` would do. A dry run that printed
+    no table says nothing about what it found, so that counts as work too: it is asked about,
+    and never read as up to date."""
+    return STEP_TABLE not in (text or "") or bool(WOULD_CHANGE_ROW.search(text or ""))
+
+
 # The steps that run an optional job's installer when its settings file is on this Mac: look
 # first with the installer's own read-only pass, ask only when there is work, run it on a yes.
 # `note` is said before the question, for what a run of it may do.
 JOB_STEPS = (
+    {"key": "notifier", "number": "3c", "title": "The notifier, what pages you",
+     "noun": "The notifier", "conf": "notifier.conf", "script": NOTIFIER_SETUP,
+     "look": ["run", "--dry-run"], "apply": ["run"],
+     "note": "It writes the notifier's settings and its job file as the role account; it "
+             "never loads the job."},
     {"key": "bridge", "number": "3d", "title": "The Slack bridge and the stand-up",
      "noun": "The bridge", "conf": "bridge.conf", "script": BRIDGE_SETUP,
      # `install` without --apply compares the job's config, its plist and the stand-up's settings
@@ -865,7 +905,7 @@ def step_job(io, spec, files, rep):
         rep.note_code(key, code, "its check")
         return stop(io, "%s's check stopped with exit %d. The lines above say why."
                     % (noun, code), code)
-    if not has_work(out, spec["work_line"]):
+    if not (has_work(out, spec["work_line"]) if spec.get("work_line") else would_change(out)):
         io.say("")
         io.say("%s has nothing to change; what is left is for you, named above." % noun)
         rep.note(key, OUT_WAITING, "a card is still yours", card_only=True)
@@ -1299,7 +1339,8 @@ def step_write_settings(io, writes):
 # check script, never from a list of part ids, so a new part is picked up from the list.
 STEP_OF_SCRIPT = {"sync_user_skills.py": "skills", "pipeline_stage_e_setup.py": "stage_e",
                   "pipeline_sweep_setup.py": "sweep", "pipeline_stage_a_setup.py": "stage_a",
-                  "pipeline_bridge_setup.py": "bridge"}
+                  "pipeline_bridge_setup.py": "bridge",
+                  "pipeline_notifier_setup.py": "notifier"}
 
 
 def step_of(part):
@@ -1317,8 +1358,53 @@ def step_of(part):
     return STEP_OF_SCRIPT.get(base)
 
 
+# KIT-752: a settings file may live outside the kit folder. This Mac says where in ONE place,
+# a file only root could have written, read like the consent record: a map of file name to the
+# full path it is kept at. It is never read from the repository, and it holds paths, never
+# values. The kit folder stays the default: a file found there wins.
+DEFAULT_PLACES = "/Library/Application Support/claude-pipeline/settings-places.json"
+PLACES = {}
+PLACES_WHY = [""]          # why the places file, or part of it, was ignored; "" when it was not
+
+
+def load_places(path, lstat=os.lstat, realpath=os.path.realpath, read=_read_small):
+    """({file name: full path}, why). Empty, with the reason, when there is no such file, it is
+    not one only root could have written, or it is not a plain map of names to absolute
+    paths: the kit folder is then the only place, as before."""
+    try:
+        why = untrusted_why(path, lstat, realpath)
+    except FileNotFoundError:
+        return {}, ""
+    except OSError as exc:
+        return {}, "it could not be inspected (%s)" % exc
+    if why:
+        return {}, why
+    try:
+        data = json.loads(read(path))
+    except (OSError, ValueError) as exc:
+        return {}, "it could not be read (%s)" % exc
+    if not isinstance(data, dict):
+        return {}, "it is not a map of file names to paths"
+    out, dropped = {}, []
+    for name, where in data.items():
+        if (isinstance(name, str) and isinstance(where, str) and name == os.path.basename(name)
+                and name.endswith((".conf", ".json")) and os.path.isabs(where)
+                and os.path.basename(where) == name):
+            out[name] = where
+        else:
+            dropped.append(str(name)[:40])
+    return out, ("ignored %d entr%s that are not a file name with its own full path (%s)"
+                 % (len(dropped), "y" if len(dropped) == 1 else "ies", ", ".join(dropped))
+                 if dropped else "")
+
+
 def conf_path(name, files):
-    return files.get(name) or os.path.join(KIT, name)
+    if files.get(name):
+        return files[name]
+    here = os.path.join(KIT, name)
+    if name in PLACES and not os.path.exists(here) and os.path.exists(PLACES[name]):
+        return PLACES[name]
+    return here
 
 
 def check_argv(part, files):
@@ -1589,7 +1675,8 @@ def look_only(io, args):
     files = {"stage-a.conf": os.path.abspath(args.conf),
              "stage-e.conf": os.path.abspath(args.stage_e_conf),
              "sweep.conf": os.path.abspath(args.sweep_conf),
-             "bridge.conf": os.path.abspath(args.bridge_conf)}
+             "bridge.conf": os.path.abspath(args.bridge_conf),
+             "notifier.conf": os.path.abspath(args.notifier_conf)}
     rep, parts, unreadable = Report(), [], None
     try:
         parts = io.parts()
@@ -1640,6 +1727,9 @@ def main(argv=None, io=None):
                         help="use this checkout as it is, without pulling")
     parser.add_argument("--sweep-conf", default=os.path.join(KIT, "sweep.conf"),
                         help="the sweep's settings (default: sweep.conf in the kit; absent skips it)")
+    parser.add_argument("--notifier-conf", default=os.path.join(KIT, "notifier.conf"),
+                        help="the notifier's settings (default: notifier.conf in the kit; "
+                             "absent skips it)")
     parser.add_argument("--skip-stage-e", action="store_true",
                         help="do not check or update the review jobs")
     parser.add_argument("--check", action="store_true", help="only look: change nothing, ask nothing, no terminal needed")
@@ -1649,8 +1739,8 @@ def main(argv=None, io=None):
     parser.add_argument("--consent-record", default=DEFAULT_RECORD, help=argparse.SUPPRESS)
     parser.add_argument("--update-conf", default=os.path.join(KIT, "update.conf"),
                         help=argparse.SUPPRESS)
-    parser.add_argument("--bridge-conf", default=os.path.join(KIT, "bridge.conf"),
-                        help=argparse.SUPPRESS)
+    parser.add_argument("--bridge-conf", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--settings-places", default=DEFAULT_PLACES, help=argparse.SUPPRESS)
     parser.add_argument("--selftest", action="store_true")
     args = parser.parse_args(argv)
     if args.selftest:
@@ -1668,6 +1758,13 @@ def main(argv=None, io=None):
     if io.uid() == 0:
         return stop(io, "do not run this with sudo. Run it as yourself; it asks for your Mac "
                         "password when it needs it.", EX_USAGE)
+    # KIT-752: the one place that says where a settings file is kept, read only now, past the two
+    # refusals. A file that was ignored says why on the lines of the parts it would have found.
+    found_places, PLACES_WHY[0] = io.places(args.settings_places)
+    PLACES.clear()
+    PLACES.update(found_places)
+    if args.bridge_conf is None:
+        args.bridge_conf = conf_path("bridge.conf", {})
     if args.check:                   # KIT-736: it only looks, so it needs no terminal
         return look_only(io, args)
     if not io.is_tty():
@@ -1681,7 +1778,8 @@ def main(argv=None, io=None):
     files = {"stage-a.conf": os.path.abspath(args.conf),
              "stage-e.conf": os.path.abspath(args.stage_e_conf),
              "sweep.conf": os.path.abspath(args.sweep_conf),
-             "bridge.conf": os.path.abspath(args.bridge_conf)}
+             "bridge.conf": os.path.abspath(args.bridge_conf),
+             "notifier.conf": os.path.abspath(args.notifier_conf)}
     rep = Report()
     parts, unreadable = [], None
     try:
@@ -1757,7 +1855,8 @@ class FakeIo(Io):
     program this case did not script is a failure of the case, never a silent pass."""
 
     def __init__(self, codes=None, answers=(), env=None, uid=501, tty=True, git_state=None,
-                 steps=None, typed=None, record=None, conf=None):
+                 steps=None, typed=None, record=None, conf=None, places=None,
+                 places_why=""):
         # The first screen and the consent read lines from `typed` (default: Manual, then
         # yes), so the cases written before them keep their meaning. `record` is what the
         # consent record reads as: (state, data, why). Everything the new seams do is logged.
@@ -1767,6 +1866,9 @@ class FakeIo(Io):
         self.record_reads = []
         self.conf = dict(conf or {})
         self.conf_reads = []
+        self.placed = dict(places or {})
+        self.places_why = places_why
+        self.places_reads = []
         # The ask (KIT-735) finds nothing unless a case scripts it, so a machine's own settings
         # files can never reach a case written before it. Its battery (pipeline_ask.py) puts the
         # real seams back over files of its own.
@@ -1862,6 +1964,10 @@ class FakeIo(Io):
         if path.startswith(KIT + os.sep):
             return path in self.present
         return os.path.exists(path)
+
+    def places(self, path):
+        self.places_reads.append(path)
+        return dict(self.placed), self.places_why
 
     def parts(self):
         if isinstance(self.parts_list, Exception):
@@ -2332,11 +2438,13 @@ def selftest():
         fh.write("ROLE_ACCOUNT=_x\n")
     a_conf = os.path.join(tmp, "stage-a.conf")
     sweep_conf = os.path.join(tmp, "sweep.conf")                  # absent: the sweep is skipped
+    notifier_conf = os.path.join(tmp, "notifier.conf")           # absent: the notifier is off
     base = ["--conf", a_conf, "--stage-e-conf", se_conf, "--sweep-conf", sweep_conf]
     healthy = {"sync_user_skills.py": 0, "pipeline_stage_e_setup.py verify": 0,
                "pipeline_stage_a_setup.py run": 0,
                "pipeline_bridge_setup.py install": 0,         # asked only where bridge.conf is present
-               "pipeline_bridge_setup.py verify": 0}
+               "pipeline_bridge_setup.py verify": 0,
+               "pipeline_notifier_setup.py run --dry-run": 0}      # asked only where notifier.conf is present
 
     def go(codes=None, answers=(), argv=None, **kw):
         io = FakeIo(codes=dict(healthy, **(codes or {})), answers=answers, **kw)
@@ -2402,9 +2510,9 @@ def selftest():
           < io.ran.index("pipeline_stage_a_setup.py run"), True)
     check("stage-e-warns-about-the-restart",
           any("restart the dispatcher" in line for line in io.lines), True)
-    check("stage-e-warns-the-notifier-and-bridge-stop-for-the-move",
-          any("notifier" in line and "bridge" in line and "few seconds" in line
-              for line in io.lines), True)
+    check("stage-e-warns-the-notifier-and-tech-lead-stop-for-the-move",
+          any("notifier" in line and "tech lead" in line and "few seconds" in line
+              and "bridge" not in line for line in io.lines), True)
     code, io = go(codes={"pipeline_stage_e_setup.py verify": 10}, answers=[False])
     check("stage-e-declined-stops-before-the-idea-gate",
           (code, "pipeline_stage_e_setup.py run" in io.ran,
@@ -2468,8 +2576,8 @@ def selftest():
     check("stage-e-run-that-stopped-part-way-stops",
           (code, "pipeline_stage_a_setup.py run" in io.ran,
            any("unloaded" in line for line in io.lines)), (10, False, True))
-    check("stage-e-run-that-stopped-part-way-names-the-notifier-and-bridge",
-          any("notifier or Slack bridge job it names as off" in line for line in io.lines), True)
+    check("stage-e-run-that-stopped-part-way-names-the-notifier-and-tech-lead",
+          any("notifier or tech lead job it names as off" in line for line in io.lines), True)
     for rc in (1, 4):
         code, io = go(codes={"pipeline_stage_e_setup.py verify": 10,
                              "pipeline_stage_e_setup.py run": rc}, answers=[True],
@@ -2574,6 +2682,104 @@ def selftest():
               (code, "pipeline_stage_a_setup.py run" in io.ran), (rc, False))
     os.unlink(sweep_conf)
 
+    # 6c. THE NOTIFIER (KIT-583): its own dry run first, a question only when there is work, its `run` on a yes,
+    #     and an outcome by name. An unmeasured step is never up to date.
+    import contextlib
+    import io as stdio
+    import pipeline_notifier_setup as notifier_setup
+    look, apply_ = "pipeline_notifier_setup.py run --dry-run", "pipeline_notifier_setup.py run"
+
+    def table(*rows):
+        """A dry run's step table, printed by the notifier installer's own function."""
+        buf = stdio.StringIO()
+        with contextlib.redirect_stdout(buf):
+            notifier_setup._print_rows(list(rows))
+        return buf.getvalue()
+
+    work = table(("job", notifier_setup.WOULD_CHANGE, "the plist is not installed"),
+                 ("enable", notifier_setup.BLOCKED, "CK-N3: you load it"))
+    cards = table(("job", notifier_setup.ALREADY_DONE, "installed"),
+                  ("enable", notifier_setup.BLOCKED, "CK-N3: you load it"))
+    check("notifier-pin-would-change-word", (notifier_setup.WOULD_CHANGE, would_change(work),
+                                             would_change(cards), would_change("")),
+          ("WOULD-CHANGE", True, False, True))
+
+    def notifier(codes=None, seen=None, answers=(), interrupt=(), **kw):
+        io = FakeIo(codes=dict(healthy, **(codes or {})), answers=answers, **kw)
+        io.seen_out = dict(seen or {})
+        io.interrupt_on = set(interrupt or ())
+        return main(base + ["--notifier-conf", notifier_conf], io=io), io
+
+    def outcome(io, part="paging"):
+        return [(r["outcome"], r["detail"]) for r in io.records if r["id"] == part]
+
+    code, io = notifier()
+    check("notifier-no-conf-is-off-and-not-run",
+          (code, [k for k in io.ran if "notifier" in k], outcome(io)),
+          (EX_OK, [], [(OUT_OFF, "no notifier.conf in %s" % tmp)]))
+    with open(notifier_conf, "w") as fh:
+        fh.write("DM_USER_IDS=U1\n")
+    code, io = notifier({look: 0})
+    check("notifier-current-is-up-to-date-and-asks-nothing",
+          (code, io.ran.count(apply_), io.asked, outcome(io)), (EX_OK, 0, [], [(OUT_OK, "")]))
+    code, io = notifier({look: 10, apply_: 0}, {look: work}, answers=[True])
+    check("notifier-work-asked-then-run-then-updated",
+          (code, [k for k in io.ran if "notifier" in k or "stage_a" in k], len(io.asked), outcome(io)),
+          (EX_OK, [look, apply_, "pipeline_stage_a_setup.py run"], 1, [(OUT_UPDATED, "")]))
+    code, io = notifier({look: 10}, {look: work}, answers=[False])
+    check("notifier-declined-is-waiting-and-changes-nothing",
+          (code, io.ran.count(apply_), "pipeline_stage_a_setup.py run" in io.ran, outcome(io)),
+          (EX_BLOCKED, 0, True, [(OUT_WAITING, "behind; you did not update it")]))
+    code, io = notifier({look: 10}, {look: cards})
+    check("notifier-cards-only-asks-nothing-runs-nothing-is-waiting",
+          (code, io.asked, io.ran.count(apply_), "pipeline_stage_a_setup.py run" in io.ran, outcome(io)),
+          (EX_BLOCKED, [], 0, True, [(OUT_WAITING, "a card is still yours")]))
+    code, io = notifier({look: 10, apply_: 0}, {look: "no table here"}, answers=[True])
+    check("notifier-a-dry-run-with-no-table-is-asked-about-never-current",
+          (code, len(io.asked), outcome(io)), (EX_OK, 1, [(OUT_UPDATED, "")]))
+    code, io = notifier({look: 10, apply_: 10}, {look: work}, answers=[True])
+    check("notifier-a-run-ending-on-a-card-stops-in-manual",
+          (code, "pipeline_stage_a_setup.py run" in io.ran, [o for o, _d in outcome(io)]),
+          (EX_BLOCKED, False, [OUT_WAITING]))
+    code, io = notifier({look: 10, apply_: 10}, {look: work}, typed=["1", "yes"])
+    check("notifier-a-run-ending-on-a-card-is-carried-past-in-automatic",
+          (code, "pipeline_stage_a_setup.py run" in io.ran, [o for o, _d in outcome(io)]),
+          (EX_BLOCKED, True, [OUT_WAITING]))
+    for rc in (1, 2, 3, 4, 5, 77):
+        code, io = notifier({look: rc})
+        check("notifier-check-exit-%d-stops-never-current" % rc,
+              (code, "pipeline_stage_a_setup.py run" in io.ran, outcome(io)[0][0] != OUT_OK),
+              (rc, False, True))
+    for rc in (1, 4):
+        code, io = notifier({look: 10, apply_: rc}, {look: work}, answers=[True])
+        check("notifier-installer-exit-%d-stops-unmeasured" % rc,
+              (code, "pipeline_stage_a_setup.py run" in io.ran, [o for o, _d in outcome(io)]),
+              (rc, False, [OUT_UNMEASURED]))
+    code, io = notifier({look: 0}, interrupt={look})
+    check("notifier-ctrl-c-in-its-check-stops-the-run",
+          (code, "pipeline_stage_a_setup.py run" in io.ran), (EX_BLOCKED, False))
+
+    # A line an installer prints arrives while it is still running, not when it ends (a buffered child would
+    # show sudo's bare prompt first). The child waits for the line to reach this program's own output.
+    marker = os.path.join(tmp, "line-arrived")
+    child_code = ("import os, time\nprint('early')\nfor _ in range(100):\n"
+                  "    if os.path.exists(%r):\n        break\n    time.sleep(0.1)\n"
+                  "print('late' if os.path.exists(%r) else 'never')\n" % (marker, marker))
+
+    class Watching(object):
+        def write(self, text):
+            if "early" in text:
+                open(marker, "w").close()
+        def flush(self):
+            pass
+    real_out, sys.stdout = sys.stdout, Watching()
+    try:
+        got = Io().run_seen([sys.executable, "-c", child_code])
+    finally:
+        sys.stdout = real_out
+    check("run-seen-passes-a-line-on-while-the-child-is-still-running", got, (0, "early\nlate\n"))
+    os.unlink(notifier_conf)
+
     # 6d. THE BRIDGE AND THE STAND-UP (KIT-584): `install` compares, a question only when it would write, `install
     #     --apply` on a yes, then `verify` once for what a person must do. Unmeasured is never up to date.
     import inspect
@@ -2668,26 +2874,6 @@ def selftest():
     code, io = bridge({}, interrupt={verify})
     check("bridge-ctrl-c-in-its-verify-stops-the-run",
           (code, "pipeline_stage_a_setup.py run" in io.ran), (EX_BLOCKED, False))
-
-    # A line an installer prints arrives while it is still running, not when it ends (a buffered child would
-    # show sudo's bare prompt first). The child waits for the line to reach this program's own output.
-    marker = os.path.join(tmp, "line-arrived")
-    child_code = ("import os, time\nprint('early')\nfor _ in range(100):\n"
-                  "    if os.path.exists(%r):\n        break\n    time.sleep(0.1)\n"
-                  "print('late' if os.path.exists(%r) else 'never')\n" % (marker, marker))
-
-    class Watching(object):
-        def write(self, text):
-            if "early" in text:
-                open(marker, "w").close()
-        def flush(self):
-            pass
-    real_out, sys.stdout = sys.stdout, Watching()
-    try:
-        got = Io().run_seen([sys.executable, "-c", child_code])
-    finally:
-        sys.stdout = real_out
-    check("run-seen-passes-a-line-on-while-the-child-is-still-running", got, (0, "early\nlate\n"))
     os.unlink(bridge_conf)
 
     # 7. CTRL-C REACHES THE INSTALLER AND ITS CLEAN-UP RUNS TO THE END. Real processes:
@@ -2750,6 +2936,62 @@ def selftest():
     check("lines-a-part-off-never-runs-its-check",
           "pipeline_notifier_setup.py run" in io.measured, False)
 
+    # 9b. KIT-752: a settings file kept outside the kit folder, found from the one place on the
+    #     machine that says so. The kit folder stays the default; a part with no file anywhere
+    #     still reads off, and says every place it looked.
+    ops = os.path.join(tmp, "ops")
+    os.makedirs(ops)
+    placed = os.path.join(ops, "bridge.conf")
+    open(placed, "w").close()
+    bridge_id = "tech-lead"
+    code, io = go(argv=["--settings-places", "/x/places.json"], places={"bridge.conf": placed})
+    check("kit752-the-one-place-is-read", io.places_reads, ["/x/places.json"])
+    code, io2 = go()
+    check("kit752-a-plain-run-reads-the-default-place", io2.places_reads, [DEFAULT_PLACES])
+    code, io2 = go(env={AGENT_ENV_MARKERS[0]: ""})
+    check("kit752-nothing-is-read-before-the-refusals", io2.places_reads, [])
+    code, io2 = go(uid=0)
+    check("kit752-nothing-is-read-as-root", io2.places_reads, [])
+    code, io2 = go(argv=["--settings-places", "/x/places.json"], places_why="it is a link")
+    got = dict((r["id"], r) for r in io2.records)
+    check("kit752-an-ignored-places-file-says-why-on-the-line",
+          ("the places file at" in got["tech-lead"]["detail"], "it is a link" in got["tech-lead"]["detail"]),
+          (True, True))
+    got = dict((r["id"], r) for r in io.records)
+    check("kit752-a-placed-file-is-not-off",
+          (got[bridge_id]["outcome"] != OUT_OFF, "pipeline_bridge_setup.py verify" in io.measured),
+          (True, True))
+    code, io = go(argv=["--settings-places", "/x/places.json"],
+                  places={"bridge.conf": os.path.join(ops, "nowhere", "bridge.conf")})
+    got = dict((r["id"], r) for r in io.records)
+    check("kit752-a-placed-file-that-is-absent-reads-off-naming-both-places",
+          (got[bridge_id]["outcome"], "the kit folder (or at " in got[bridge_id]["detail"],
+           "nowhere" in got[bridge_id]["detail"]), (OUT_OFF, True, True))
+    code, io = go()
+    got = dict((r["id"], r) for r in io.records)
+    check("kit752-no-place-no-file-reads-off-as-before",
+          (got[bridge_id]["outcome"], got[bridge_id]["detail"]),
+          (OUT_OFF, "no bridge.conf in the kit folder"))
+    PLACES.clear()
+    from collections import namedtuple
+    PSt = namedtuple("PSt", "st_uid st_mode")
+    _Root = PSt(0, stat.S_IFREG | 0o644)
+    _User = PSt(501, stat.S_IFREG | 0o644)
+    _Dir = PSt(0, stat.S_IFDIR | 0o755)
+    fs = lambda who: (lambda q: _Dir if q == "/" else who)          # noqa: E731
+    for name, where in (("nested", {"a/b.conf": "/x/b.conf"}), ("relative", {"b.conf": "b.conf"}),
+                        ("other-name", {"b.conf": "/x/c.conf"}), ("not-a-conf", {"b.txt": "/x/b.txt"}),
+                        ("not-a-string", {"b.conf": 5})):
+        check("kit752-places-refuses-%s" % name,
+              load_places("/p", fs(_Root), lambda q: q, lambda q: json.dumps(where))[0], {})
+    check("kit752-places-takes-a-good-map",
+          load_places("/p", fs(_Root), lambda q: q,
+                      lambda q: json.dumps({"bridge.conf": "/ops/bridge.conf"}))[0],
+          {"bridge.conf": "/ops/bridge.conf"})
+    check("kit752-places-untrusted-reads-nothing",
+          load_places("/p", fs(_User), lambda q: q,
+                      lambda q: json.dumps({"bridge.conf": "/ops/bridge.conf"}))[0], {})
+
     # up to date vs updated, from the step's own result
     code, io = go(codes={"sync_user_skills.py --apply": 0, "sync_user_skills.py": [1]},
                   answers=[True])
@@ -2774,7 +3016,11 @@ def selftest():
     check("lines-waiting-says-nothing-is-waiting-never",
           "Nothing is waiting on you." in io.lines, False)
     paging_conf = kit_file("notifier.conf")
-    io = FakeIo(codes=dict(healthy))
+    waker_conf = kit_file("conflict-waker.conf")    # a part with a check and no step of its own
+    # The notifier is a step now: its dry run ends on a card alone, and its own check is read once
+    # more for the card ids.
+    io = FakeIo(codes=dict(healthy, **{"pipeline_notifier_setup.py run --dry-run": 10}))
+    io.seen_out = {"pipeline_notifier_setup.py run --dry-run": "-- steps --\n  enable   BLOCKED-ON-HUMAN  CK-N3\n"}
     io.present = {paging_conf}
     io.measure_codes = {"pipeline_notifier_setup.py run": 10}
     io.measure_out = {"pipeline_notifier_setup.py run": "CK-N1 is yours\nthen CK-N3 and CK-N10"}
@@ -2823,19 +3069,19 @@ def selftest():
     for name, measured in (("exit-1", 1), ("exit-4", 4), ("exit-5-no-password", 5),
                            ("did-not-finish", None)):
         io = FakeIo(codes=dict(healthy))
-        io.present = {paging_conf}
-        io.measure_codes = {"pipeline_notifier_setup.py run": measured}
+        io.present = {waker_conf}
+        io.measure_codes = {"pipeline_conflict_waker_setup.py run": measured}
         code = main(base, io=io)
         check("lines-check-%s-is-unmeasured-and-exits-4" % name,
-              (by_id(io)["paging"], code), (OUT_UNMEASURED, EX_UNMEASURED))
+              (by_id(io)["conflict-fixer"], code), (OUT_UNMEASURED, EX_UNMEASURED))
     for name, rc, words in (("exit-5", 5, ""), ("its-own-words", 1, "Mac password needed to continue")):
         io = FakeIo(codes=dict(healthy))
-        io.present = {paging_conf}
-        io.measure_codes = {"pipeline_notifier_setup.py run": rc}
-        io.measure_out = {"pipeline_notifier_setup.py run": words}
+        io.present = {waker_conf}
+        io.measure_codes = {"pipeline_conflict_waker_setup.py run": rc}
+        io.measure_out = {"pipeline_conflict_waker_setup.py run": words}
         main(base, io=io)
         check("lines-password-%s-detail" % name,
-              [r["detail"] for r in io.records if r["id"] == "paging"],
+              [r["detail"] for r in io.records if r["id"] == "conflict-fixer"],
               ["it needs your Mac password, which a check run without a terminal cannot ask for"])
     code, io = go(argv=["--no-pull"])
     check("lines-own-no-pull-is-unmeasured",
@@ -2864,15 +3110,15 @@ def selftest():
     check("lines-skipped-stage-e-is-unmeasured-not-up-to-date",
           (by_id(io)["review"], code), (OUT_UNMEASURED, EX_UNMEASURED))
     io = FakeIo(codes=dict(healthy))
-    io.present = {paging_conf, kit_file("update.conf")}
-    io.measure_codes = {"pipeline_notifier_setup.py run": 10, "pipeline_watch.py --conf": 1}
+    io.present = {waker_conf, kit_file("update.conf")}
+    io.measure_codes = {"pipeline_conflict_waker_setup.py run": 10, "pipeline_watch.py --conf": 1}
     code = main(base, io=io)
     check("lines-unmeasured-outranks-waiting", code, EX_UNMEASURED)
     code, io = go(codes={"pipeline_stage_a_setup.py run": 10})
     check("lines-the-idea-gate-at-10-still-exits-10", code, EX_BLOCKED)
     io = FakeIo(codes=dict(healthy, **{"pipeline_stage_a_setup.py run": 10}))
-    io.present = {paging_conf}
-    io.measure_codes = {"pipeline_notifier_setup.py run": 1}
+    io.present = {waker_conf}
+    io.measure_codes = {"pipeline_conflict_waker_setup.py run": 1}
     check("lines-the-idea-gate-at-10-with-an-unmeasured-part-exits-4",
           main(base, io=io), EX_UNMEASURED)
     check("lines-another-code-of-the-idea-gate-is-passed-through",
@@ -2897,19 +3143,19 @@ def selftest():
           (code, by_id(io)["review"], by_id(io)["idea-gate"]),
           (EX_BLOCKED, OUT_WAITING, OUT_NOT_REACHED))
     io = FakeIo(codes=dict(healthy))
-    io.present = {paging_conf}
+    io.present = {waker_conf}
     io.interrupt_on.add("sync_user_skills.py")
     code = main(base, io=io)
     got = by_id(io)
     check("lines-ctrl-c-prints-the-lines-and-runs-no-more-checks",
-          (code != EX_OK, got["skills"], got["idea-gate"], got["paging"], io.measured),
+          (code != EX_OK, got["skills"], got["idea-gate"], got["conflict-fixer"], io.measured),
           (True, OUT_UNMEASURED, OUT_NOT_REACHED, OUT_NOT_REACHED, []))
     io = FakeIo(codes=dict(healthy))
-    io.present = {paging_conf}
+    io.present = {waker_conf}
     io.interrupt_on.add("pipeline_stage_a_setup.py run")
     code = main(base, io=io)
     check("lines-ctrl-c-in-the-last-step-runs-no-more-checks",
-          (code != EX_OK, by_id(io)["idea-gate"], by_id(io)["paging"], "pipeline_notifier_setup.py run" in io.measured),
+          (code != EX_OK, by_id(io)["idea-gate"], by_id(io)["conflict-fixer"], "pipeline_conflict_waker_setup.py run" in io.measured),
           (True, OUT_UNMEASURED, OUT_NOT_REACHED, False))
     code, io = go(git_state={"rev-parse HEAD": [(0, "aaa"), (0, "bbb")]})
     check("lines-a-restart-that-returns-is-not-a-pass", code, EX_UNMEASURED)
@@ -2935,7 +3181,7 @@ def selftest():
     check("lines-steps-are-found-from-the-list",
           (keys["one-command"], keys["skills"], keys["cleanup"], keys["idea-gate"],
            set(k for k in keys.values() if k) == set(["checkout", "skills", "stage_e",
-                                                      "sweep", "stage_a", "bridge"]),
+                                                      "sweep", "stage_a", "bridge", "notifier"]),
            all(keys[pt["id"]] == "stage_e" for pt in real
                if pt["check"] and pt["check"]["script"].endswith("pipeline_stage_e_setup.py"))),
           ("checkout", "skills", "sweep", "stage_a", True, True))

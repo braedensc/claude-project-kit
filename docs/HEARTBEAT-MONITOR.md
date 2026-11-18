@@ -55,8 +55,11 @@ with nothing saying so. It is watched like the notifier, from `<bridge_state_dir
 (default: `state_dir`, where the bridge writes it). It is watched **only where it is installed**: add
 `bridge` to `watch` and a gap to `intervals` in `~/.stage-e/monitor.json` (the bridge's launchd
 interval plus its pass clock). Not listed, it is not watched: every pass prints it as `not-judged`, and nothing says it is healthy. A
-stale beat pages once, and its recovery pages once, as for every job. The Stage E installer does not
-add it yet.
+stale beat pages once, and its recovery pages once, as for every job. The Stage E installer adds it
+for you (KIT-752): where an installed job runs the bridge and launchd holds it, the `heartbeat-monitor`
+step lists `bridge`, with that job's launchd interval plus a pass clock and the `state_dir` of
+`~/.stage-e/bridge.json`. A paused bridge, or one it could not measure, is left out and the step's row says
+so by name.
 
 **The planner job (KIT-339)** is Stage A's planning poller, run as the same role account.
 The Stage E installer always lists it, with a gap that covers its largest interval, 3600 s,

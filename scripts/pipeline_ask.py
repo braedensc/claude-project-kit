@@ -41,9 +41,9 @@ WHAT IT WRITES, AND HOW
     * Dates go through `pipeline_watch.py dates --apply`'s own function, so its checks, its
       atomic write, the file's mode, every other entry and its read-back are the ones that
       command has.
-    * The name is set as APP_NAME by a small writer of its own (`set_name_line`) and a swap of the
-      whole file (a temp file beside it, made new and never through a link, the old mode kept,
-      renamed over). Only the active APP_NAME line changes: every other line keeps every byte, line
+    * The name is set as APP_NAME by the tech lead installer's one writer (`write_conf_name`, which
+      the installer's own question uses too): a swap of the whole file (a temp file beside it,
+      made new and never through a link, the old mode kept, renamed over). Only the active APP_NAME line changes: every other line keeps every byte, line
       endings and a missing final newline included. The file is read back and its bytes compared.
   Before writing, each file is read again: if it is no longer as it was when the person was asked
   (the value on record changed), nothing is written to it. A write that fails, or reads back
@@ -448,84 +448,29 @@ def write_dates(io, path, items, kit):
     return "%s: %s" % (name, " ".join(said.getvalue().split())[:300] or "exit %d" % code)
 
 
-def set_name_line(text, name):
-    """`text` with its active APP_NAME line set to `APP_NAME=<name>`, and no other byte changed.
-
-    The active line is found the way the tech lead installer's `set_conf_line` finds it: its key (the
-    part before the first `=`), stripped, is APP_NAME, and the line is not a comment. A line that
-    matches is replaced and keeps its own ending (none, if it is the last line and has none). A
-    commented `#APP_NAME=` example stays as it is. With no active line, one is added after the last
-    line, ended like the file's lines: CRLF when the last line that has an ending ends in CRLF, else
-    LF. A last line with no ending is ended in that style first. An empty file gets the line alone,
-    ended with LF. (`set_conf_line` joins every line again with LF, so it rewrites CRLF endings and
-    a missing final newline, which this does not.)"""
-    out, done, style, last_end = [], False, "\n", None
-    for piece in text.splitlines(keepends=True):
-        body = piece.splitlines()[0]
-        end = piece[len(body):]
-        last_end = end
-        if end:
-            style = "\r\n" if end == "\r\n" else "\n"
-        stripped = body.strip()
-        if stripped.split("=", 1)[0].strip() == NAME_KEY and not stripped.startswith("#"):
-            out.append("%s=%s%s" % (NAME_KEY, name, end))
-            done = True
-        else:
-            out.append(piece)
-    if not done:
-        if last_end == "":
-            out.append(style)            # the last line had no ending: end it first, in the file's style
-        out.append("%s=%s%s" % (NAME_KEY, name, style))
-    return "".join(out)
-
-
 def write_name(io, path, change):
-    """None when the name is written and read back; else why not, naming the file. The whole file is
-    swapped in: a temp file beside it, made new and never through a link, with the old mode. Only
-    the active APP_NAME line changes (`set_name_line`); every other byte of the file stays."""
+    """None when the name is written and read back; else why not, naming the file. The write is
+    the tech lead installer's one writer (`write_conf_name`): only the active APP_NAME line
+    changes, every other byte of the file stays, and the file is swapped in whole."""
     bs = _bridge()
     name = label(path)
+
+    def moved(text):
+        values, errors = bs.parse_conf(text)
+        return bool(errors or bs.names_its_lead(values)
+                    or (values.get(NAME_KEY) or None) != change.old)
     try:
-        with open(path, "rb") as fh:
-            old_bytes = fh.read()
-        mode = os.stat(path).st_mode & 0o777
-        old = old_bytes.decode("utf-8")
-    except (OSError, ValueError) as exc:
-        return "%s could not be read (%s), so nothing was written to it" % (name, type(exc).__name__)
-    values, errors = bs.parse_conf(old)
-    if errors or bs.names_its_lead(values) or (values.get(NAME_KEY) or None) != change.old:
-        return "%s changed while you were answering, so nothing was written to it" % name
-    new = set_name_line(old, change.new).encode("utf-8")
-    tmp = "%s.name.%d" % (path, os.getpid())
-    try:
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
-    except OSError as exc:
-        return "%s could not be written (%s); it is as it was" % (name, type(exc).__name__)
-    swapped = False
-    try:
-        with os.fdopen(fd, "wb") as fh:
-            os.fchmod(fh.fileno(), mode)
-            fh.write(new)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, path)
-        swapped = True
-    except OSError as exc:
-        return "%s could not be written (%s); it is as it was" % (name, type(exc).__name__)
-    finally:
-        if not swapped:                         # a failure or Ctrl-C: the temp file this call made,
-            try:                                # and nothing else, goes
-                os.remove(tmp)
-            except OSError:
-                pass
-    try:
-        with open(path, "rb") as fh:
-            back = fh.read()
-        back_values, back_errors = bs.parse_conf(back.decode("utf-8"))
-    except (OSError, ValueError) as exc:
-        return "%s was written but could not be read back (%s); check it by hand" % (
-            name, type(exc).__name__)
-    if back != new or back_errors or back_values.get(NAME_KEY) != change.new:
+        bs.write_conf_name(path, change.new, guard=moved)
+    except bs.NameWriteError as exc:
+        if exc.kind == "read":
+            return "%s could not be read (%s), so nothing was written to it" % (name, exc.detail)
+        if exc.kind == "changed":
+            return "%s changed while you were answering, so nothing was written to it" % name
+        if exc.kind == "write":
+            return "%s could not be written (%s); it is as it was" % (name, exc.detail)
+        if exc.kind == "readback":
+            return "%s was written but could not be read back (%s); check it by hand" % (
+                name, exc.detail)
         return "%s was written but reads back differently; check it by hand" % name
     io.say("Wrote %s in %s and read it back: it matches." % (NAME_KEY, name))
     return None
@@ -927,15 +872,33 @@ def run_cases(check):
     # C. WRITING (point 3): written, then read back; a failure names the file and leaves the old one.
     #    The name goes in by a writer of its own: only the active APP_NAME line changes, byte for byte.
     def named(text):
-        return set_name_line(text, "Rex")
-    for label_, text in (("no-name-line", "# c\nACT=no\n"),
-                         ("an-empty-name-line", "# c\nAPP_NAME=\nACT=no\n"),
-                         ("an-indented-empty-name-line", "ACT=no\n  APP_NAME = \nINTERVAL_SECONDS=60\n"),
-                         ("empty-quotes", 'ACT=no\nAPP_NAME=""\nINTERVAL_SECONDS=60\n'),
-                         ("a-commented-example-only", "#APP_NAME=Tech lead\nACT=no\n"),
-                         ("an-export-line-is-not-active", "export APP_NAME=\nACT=no\n")):
-        check("kit735-on-an-ordinary-file-the-two-writers-agree:%s" % label_,
-              named(text), bs.set_conf_line(text, "APP_NAME", "Rex"))
+        """The file the one writer leaves: `text` written to a real file, the name set through
+        write_conf_name (the path the one command takes), and the bytes read back."""
+        path = os.path.join(tmp, "named.conf")
+        with open(path, "wb") as fh:
+            fh.write(text.encode("utf-8"))
+        try:
+            bs.write_conf_name(path, "Rex")
+        except bs.NameWriteError as exc:
+            if exc.kind not in ("readback", "mismatch"):    # swapped in, but not a valid conf
+                return "failed: %s" % exc.kind              # (a case that is not): read it as it is
+        with open(path, "rb") as fh:
+            back = fh.read().decode("utf-8")
+        os.remove(path)
+        return back
+    for label_, text, want in (
+            ("no-name-line", "# c\nACT=no\n", "# c\nACT=no\nAPP_NAME=Rex\n"),
+            ("an-empty-name-line", "# c\nAPP_NAME=\nACT=no\n", "# c\nAPP_NAME=Rex\nACT=no\n"),
+            ("an-indented-empty-name-line", "ACT=no\n  APP_NAME = \nINTERVAL_SECONDS=60\n",
+             "ACT=no\nAPP_NAME=Rex\nINTERVAL_SECONDS=60\n"),
+            ("empty-quotes", 'ACT=no\nAPP_NAME=""\nINTERVAL_SECONDS=60\n',
+             "ACT=no\nAPP_NAME=Rex\nINTERVAL_SECONDS=60\n"),
+            ("a-commented-example-only", "#APP_NAME=Tech lead\nACT=no\n",
+             "#APP_NAME=Tech lead\nACT=no\nAPP_NAME=Rex\n"),
+            ("an-export-line-is-not-active", "export APP_NAME=\nACT=no\n",
+             "export APP_NAME=\nACT=no\nAPP_NAME=Rex\n")):
+        check("kit735-on-an-ordinary-file-the-name-goes-in-as-expected:%s" % label_,
+              named(text), want)
     check("kit735-a-crlf-file-keeps-its-endings-when-the-line-is-added",
           named("# c\r\nACT=no\r\n"), "# c\r\nACT=no\r\nAPP_NAME=Rex\r\n")
     check("kit735-a-crlf-file-has-its-active-line-replaced-in-place-with-its-own-ending",
@@ -987,7 +950,8 @@ def run_cases(check):
     check("kit735-after-the-write-a-second-run-asks-nothing", list(ask()), [])
     # an APP_NAME line that is empty is set in place
     put_bridge("APP_NAME=\nDM_USER_IDS=\n")
-    expected = bs.set_conf_line(get(bridge_conf).decode(), "APP_NAME", "Rex").encode()
+    expected = (b"# the tech lead\nACT=no\nINTERVAL_SECONDS=60\nAPP_NAME=Rex\nDM_USER_IDS=\n"
+                b"# end of file\n")
     check("kit735-an-empty-name-line-is-set-in-place",
           (write_answers(pi.FakeIo(), [name], kit), get(bridge_conf)), (None, expected))
     check("kit735-nothing-to-write-is-nothing-written", write_answers(pi.FakeIo(), [], kit), None)
@@ -1434,7 +1398,11 @@ def run_cases(check):
           ("update-conf" in helped, "bridge-conf" in helped), (False, False))
     install_src = open(os.path.join(HERE, "pipeline_install.py"), encoding="utf-8").read()
     check("kit735-the-flags-default-to-the-kit-folder",
-          ('os.path.join(KIT, "update.conf")' in install_src, 'os.path.join(KIT, "bridge.conf")' in install_src),
+          ('os.path.join(KIT, "update.conf")' in install_src,
+           # KIT-752: the bridge's file is the kit folder's unless the machine's one place says
+           # it is kept elsewhere; conf_path falls back to the kit folder.
+           'conf_path("bridge.conf", {})' in install_src
+           and pi.conf_path("bridge.conf", {}) == os.path.join(pi.KIT, "bridge.conf")),
           (True, True))
     for verb in ("pr " + "merge", "--" + "approve", "--add-" + "label", "auto-" + "merge"):
         check("kit735-no-verb:%s" % verb, verb in src, False)
