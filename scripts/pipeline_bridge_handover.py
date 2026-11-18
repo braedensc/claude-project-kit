@@ -302,7 +302,7 @@ class HandoverMixin(object):
                 self.say("  retry: Linear made no new hand-over for %s" % ident)
                 return
         name = self.name_of(msg["user"])
-        body = ("Handed to the agent%s by the Slack bridge for **%s** (Slack user %s), who "
+        body = ("Handed to the agent%s by the tech lead for **%s** (Slack user %s), who "
                 "said yes in Slack at %s." % (" again" if kind == "retry" else "", name,
                                               msg["user"], iso(ts_float(msg.get("ts")))))
         # The hand-over stands: it cannot be taken back. The record of who said yes is owed.
@@ -393,7 +393,7 @@ def cases_handover(kit):
                     "It was handed to the agent at %s and hasn't started." % iso(now)
                     in question, "and I'll hand it over to the agent again" in question,
                     t.delegations, said, len(t.comments),
-                    "Handed to the agent again by the Slack bridge" in t.comments[0][1],
+                    "Handed to the agent again by the tech lead" in t.comments[0][1],
                     statuses(c), getattr(t, "forgot", 0))
         check("ho-retry-past-linears-retries-asks-then-hands-it-over-again-on-a-yes",
               outcome(case_retried),
@@ -470,7 +470,7 @@ def cases_handover(kit):
             said = answered(c, s, t, now + 120)
             return (question.startswith("*Start this?* PROD-6"),
                     "and I'll hand it to the agent to start" in question, t.delegations, said,
-                    "Handed to the agent by the Slack bridge" in (t.comments or [("", "")])[0][1])
+                    "Handed to the agent by the tech lead" in (t.comments or [("", "")])[0][1])
         check("ho-start-asks-then-hands-a-ready-ticket-to-the-agent-on-a-yes",
               outcome(case_started),
               (True, True, [("uuid-6", "agent-1")],

@@ -19,6 +19,11 @@ team, whose tickets are never work either.
     python3 scripts/pipeline_queue_setup.py run --dry-run        # read it first: it changes nothing
     python3 scripts/pipeline_queue_setup.py run                  # stops at each card; do it, then run it again
 
+**The one command runs this for you** (`python3 scripts/pipeline_install.py`, step 3e) when this Mac has a `queue.conf`.
+It runs the dry run and shows it. If a row says `WOULD-CHANGE` it asks, then runs `run` on a yes. If only a card is left
+(loading the jobs is yours) it asks nothing and the end list says "waiting on you". With no `queue.conf` the queue reads
+"off on this Mac". This is how the usage job gets its settings and job file after a merge.
+
 Good: `DRY RUN: nothing was changed`, and each row says `ALREADY-DONE` or `WOULD-CHANGE`.
 Not that: `Your conf has N problem(s)`. Each line names a key, never its value. Three placeholders are refused until you
 edit them. `UNKNOWN` means it could not look, which is not a pass.

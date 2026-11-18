@@ -1,0 +1,113 @@
+name: Hooks change guard
+
+# The label gate for an app project, in a workflow of its own (KIT-788). It was the last job of
+# the app CI template, which runs from the pull request's own checkout, so a PR that rewrote the
+# gate turned its own check green. The job name is unchanged ("Hooks change guard"), so the
+# required status check is the same context. The kit's own copy of this idea, which also reads
+# `delivery.json` and the grader script, is `.github/workflows/hooks-change-guard.yml` (KIT-668);
+# bootstrap replaces it with this file (BOOTSTRAP-PROMPT.md step 4).
+#
+# WHERE THE JUDGE COMES FROM. The gate runs on `pull_request_target`, so GitHub takes this file
+# from the DEFAULT BRANCH, never from the pull request. The job checks out the default branch,
+# fetches the PR's head commit as data for the diff, and runs only what this file says. Nothing the
+# PR wrote is on disk, none of it runs, the token can only read, and no secret is used. So a PR
+# that edits this workflow cannot change how it is itself judged.
+#
+# A PR that edits THIS file also runs its own copy, on `pull_request` (the paths filter below).
+# That is how a change to the gate is judged at all before it lands, since the default branch's
+# copy has no way to judge its own replacement. That copy cannot turn the check green alone: the
+# default branch's run reports under the same name, and GitHub blocks a merge while any run of a
+# required check is red. The kit measured that rule on 17 Nov 2026 (GitHub does not document it),
+# and `docs/OPERATIONS.md` of the kit says how to re-measure it.
+#
+# WHAT IT NEEDS. From 2 Dec 2026 GitHub blocks `pull_request_target` in PUBLIC repositories unless
+# an Actions policy allows it. Without that allow this job never runs, the required check never
+# reports, and no PR can merge: it fails closed. A private repository needs nothing. The owner
+# makes the allow once, for this one file, with the kit's `scripts/pipeline_gate_policy.py`
+# (`python3 scripts/pipeline_gate_policy.py run`; it shows the call and waits for one typed yes).
+#
+# Server-side backstop for hook self-protection (docs/SECURITY.md). The local PreToolUse guard
+# constrains only sessions that run the hook — a PR authored anywhere else (another clone, the
+# GitHub web UI, an @claude workflow) never meets it. So a PR that changes the guard machinery
+# (.claude/hooks/** or .claude/settings*.json), the CI workflows that gate the PR
+# (.github/workflows/**), or the secret scan's own rules and scanner (.secretlintrc*, any
+# .secretlintignore*, scripts/check_secret_scan.py), must not land unnoticed: it has to carry an
+# explicit `hooks-change` label. `--no-renames` lists a renamed file's old path too, so moving a
+# guarded file away is gated like deleting it.
+# Operational notes (learned in production):
+#   - the `hooks-change` label must EXIST in your repo before this job's first run can pass on a
+#     guarded PR — one-time setup:
+#       gh label create hooks-change --color D93F0B \
+#         --description 'Acknowledges a PR that intentionally edits the Claude hook guard machinery'
+#   - adding/removing the label re-runs the check via the labeled/unlabeled trigger types below;
+#     if a run ever wedges, an empty commit gives a clean re-run;
+#   - the label is a person's acknowledgement, not a lock: it becomes a real gate only once branch
+#     protection requires a review (required_approving_review_count >= 1, owner-set in the GitHub
+#     UI) so a human actually sees it. PR-only — a push to main has no label context;
+#   - no job-level `if:` and no `concurrency`: a skipped job reports success, and the default
+#     branch's run must always report.
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+    paths:
+      - .github/workflows/hooks-change-guard.yml
+
+permissions:
+  contents: read
+
+jobs:
+  hooks-change-guard:
+    name: Hooks change guard
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      # The default branch, never the PR's head or merge commit.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+
+      - name: Require the 'hooks-change' label to edit hook/settings files
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ' ') }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          case "$EVENT_NAME" in
+            pull_request_target|pull_request) ;;
+            *) echo "::error::the label gate judges pull requests, not a $EVENT_NAME event"; exit 1 ;;
+          esac
+          if ! printf '%s' "$HEAD_SHA" | grep -Eqx '[0-9a-f]{40}'; then
+            echo "::error::the event names no head commit, so nothing can be judged"
+            exit 1
+          fi
+          # The PR's head commit, as GitHub's event names it, fetched as data for the diff.
+          # It is never put on disk, and nothing in it runs.
+          if ! git fetch --quiet --no-tags origin "$HEAD_SHA" || ! git cat-file -e "$HEAD_SHA^{commit}"; then
+            echo "::error::cannot fetch the head commit $HEAD_SHA, so nothing can be judged"
+            exit 1
+          fi
+          # Against the default branch, never the base the PR names: its author could have
+          # pushed that base, and retargeting a PR re-runs nothing.
+          # -z: names come raw; quoted, a name with a non-ASCII character matched no pattern.
+          SENSITIVE=$(git diff -z --no-renames --name-only "origin/${DEFAULT_BRANCH}...${HEAD_SHA}" | { grep --null-data -E '^\.claude/(hooks/|settings[^/]*\.json$)|^\.github/workflows/|^\.secretlintrc|(^|/)\.secretlintignore|^scripts/check_secret_scan\.py$' || [ $? -eq 1 ]; } | tr '\0' '\n')
+          if [ -z "$SENSITIVE" ]; then
+            echo "No security-hook files changed — nothing to gate."
+            exit 0
+          fi
+          echo "This PR modifies security-critical hook/settings files:"
+          printf '  %s\n' $SENSITIVE
+          for label in $LABELS; do
+            if [ "$label" = "hooks-change" ]; then
+              echo "OK: 'hooks-change' label present — change acknowledged."
+              exit 0
+            fi
+          done
+          echo "::error::This PR changes .claude/hooks/**, .claude/settings*.json, .github/workflows/** or the secret scan's rules or scanner (.secretlintrc*, .secretlintignore*, scripts/check_secret_scan.py) — guard machinery whose edits must be reviewed, not silent. Add the 'hooks-change' label to acknowledge, then this check re-runs."
+          exit 1

@@ -268,7 +268,7 @@ whenever `status` looks better than the machine feels.
 (`CK-1` — applying a protected label and merging are a human's signal by design, so the
 installer checks and prints, and has no code path to either); read the dry-run count before
 anything is switched on (`CK-5` — the first real pass opens a ticket per eligible PR, and
-only you know whether that number is the one you meant); read your conflict waker's dry-run
+only you know whether that number is the one you meant; change REVIEW_REPOS, MANAGED_TEAM_KEYS or RUNNER_LANE_REPOS after signing and it asks again); read your conflict waker's dry-run
 count (`CK-8` — Step 6; it does not appear with `CONFLICT_WAKER_CONF=off`); name the ticket
 the heartbeat monitor comments on (`CK-9` — it does not appear once `HEARTBEAT_MONITOR_TICKET`
 names one or says `off`); read the catch-up poller's first count before it is installed
@@ -2706,6 +2706,23 @@ folder above. npm's cache, `~/.npm`, stays closed: `npm run` does not need it.
 - Not held: your GitHub login. The push needs it, so any command in the session can ask git
   for it. The measured table is in
   `docs/adr/2026-11-18-the-conflict-fix-session-reads-only-what-it-needs.md`.
+
+**Is the sandbox still on? (KIT-829)** The walls were measured by hand once, and a Claude Code
+update could change how the sandbox setting is read. So one short check proves them again. It
+starts one session on the small model, the way the waker starts a fix session. A write outside
+its worktree must be refused by the sandbox, and a write inside must land. It plants a fake
+secret outside the worktree too. The settings above deny that folder, so a read of it must be
+refused. Where the settings deny no named folder there (its temp folder is Claude Code's own,
+say), the answer says that no read was judged. Each run costs a few cents.
+
+- `run` and `verify` run it, from the waker's own clone, as the `sandbox` step.
+- The health watch runs it after every Claude Code update and once a day, where
+  `CONFLICT_WAKER_STATE_DIR` is set (the `waker-sandbox` kind). While it is not `held`, it runs
+  again each pass.
+- Its three answers: `held`; `failed`, which names the Claude Code version; and `could not be
+  measured`, which is never a pass.
+- On `failed`, stop the waker until a version holds again: `launchctl bootout gui/$(id -u)/<LABEL>`.
+  Run the check by hand: `python3 scripts/pr_conflict.py sandbox-check`.
 
 **Is it running?** Read the heartbeat, not the log:
 

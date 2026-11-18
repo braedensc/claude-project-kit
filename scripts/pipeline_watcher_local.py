@@ -32,11 +32,17 @@ THE MONITORS.  Ten, in a fixed order. Each ends in one of four states, and the f
   approval-rate the validator's ledger (KIT-546): every pull request merged into a watched
                 repository's default branch needs an `approved` row for its head, unless the owner
                 merged it himself; an approval still unmerged a day later; the day's approvals
-                against the watcher's own limit; and each urgent escalation, which is how the
-                validator's urgent page reaches the owner. GitHub's merges and the ledger, read
-                through its own reader.                                                   second-hand
-  guard-blocks, egress, outside-files
-                OFF, each with its reason: a producer does not exist yet.
+                against the watcher's own limit; a run of approvals in a row longer than its own
+                limit (KIT-518); and each urgent escalation, which is how the validator's urgent
+                page reaches the owner. GitHub's merges and the ledger, read through its own
+                reader.                                                                   second-hand
+  outside-files a pull request that changes files its ticket does not name or imply (KIT-831), and
+                any pull request that changes a guarded path, by the Hooks change guard's own list
+                (KIT-518). The PR's file list from GitHub, the files and areas the ticket's text
+                names, from the tracker. A ticket that names none is "could not judge", never clear.
+                                                                                          first-hand
+  guard-blocks, egress
+                OFF, each with its reason: a producer does not exist yet (KIT-848, KIT-849).
 
 THE FOUR STATES (contract section 13).
   clear    it asked, read the answer, and found nothing at page or pause. `said` says what it asked
@@ -80,9 +86,11 @@ environment, by the name the config gives; it is never printed or written.
 
 TO RUN FROM A COPY (KIT-517 does this properly): the files it needs are this one,
 scripts/pipeline_watcher_tracker.py, scripts/pipeline_hold.py, scripts/pipeline_validator_ledger.py,
-scripts/check_schemas.py, scripts/jsonschema_mini.py and schemas/pipeline-watcher.schema.json.
+scripts/check_grader_paths.py, scripts/check_schemas.py, scripts/jsonschema_mini.py and
+schemas/pipeline-watcher.schema.json.
 """
 import argparse
+import base64
 import calendar
 import hashlib
 import json
@@ -99,6 +107,7 @@ import http.client
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
+import check_grader_paths as grader_paths  # noqa: E402  (the Hooks change guard's own list: KIT-518)
 import check_schemas  # noqa: E402  (the one definition of "conforms", contract section 12)
 import pipeline_hold  # noqa: E402  (the hold, contract section 20: the watcher's one power)
 import pipeline_watcher_tracker as tracker_reader  # noqa: E402  (the one POST: a fixed read-only query)
@@ -120,13 +129,13 @@ MONITORS = ("spend", "runs", "labels", "markers", "injection", "tracker-text", "
             "egress", "outside-files", "approval-rate")
 KIND = {"spend": "second-hand", "runs": "second-hand", "labels": "first-hand",
         "markers": "first-hand", "injection": "first-hand", "tracker-text": "first-hand",
+        "outside-files": "first-hand",
         # The merges are GitHub's, but whoever writes the ledger could add a row that hides one:
         # it can only under-report, so it is second-hand (KIT-546).
         "approval-rate": "second-hand"}
 OFF_BY_DESIGN = {
-    "guard-blocks": "no producer: nothing records a guard block yet (KIT-11)",
-    "egress": "no producer: the proxy's refusal line is unconfirmed (KIT-88)",
-    "outside-files": "needs each ticket's declared files (KIT-518)",
+    "guard-blocks": "no producer: nothing records a guard block yet (KIT-11); its monitor is KIT-848",
+    "egress": "no producer: the proxy's refusal line is unconfirmed (KIT-88); its monitor is KIT-849",
 }
 
 DEFAULT_STATUS_FILE = "~/.watcher/watcher-status.json"
@@ -138,7 +147,8 @@ DEFAULT_PROTECTED_PREFIXES = ("agent:", "blocked:", "provenance:")
 BOT_LOGIN = "github-actions[bot]"       # scripts/pr_conflict.py's BOT_LOGIN: the workflow bot
 # A GitHub App's bot login, as a trusted_bots entry: Stage E's own app (KIT-578).
 TRUSTED_BOT_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}\[bot\]\Z")
-LIMIT_KEYS = ("day_usd", "piece_usd", "day_runs", "piece_runs", "day_approvals")
+LIMIT_KEYS = ("day_usd", "piece_usd", "day_runs", "piece_runs", "day_approvals", "approvals_in_a_row")
+WHOLE_LIMITS = ("day_runs", "piece_runs", "day_approvals", "approvals_in_a_row")
 APPROVAL_STALE_SECONDS = 86400          # an approval with no merge, newer row or close a day later
 APPROVAL_FOLLOW_SECONDS = 7 * 86400     # how far back an approval is followed to its merge
 RATE_WINDOW_SECONDS = 86400             # the approvals counted against day_approvals
@@ -194,8 +204,9 @@ CONFIG_KEYS = {
                              "dispatcher's agent. Empty turns tracker-text off, since every marker "
                              "would look forged",
     "limits": "the watcher's OWN limits, set by the owner (a decision, ADR D5): day_usd, "
-              "piece_usd, day_runs, piece_runs, and day_approvals (the validator's approvals in "
-              "24 hours, a runaway's limit). A monitor with none of its limits is off",
+              "piece_usd, day_runs, piece_runs, day_approvals (the validator's approvals in "
+              "24 hours, a runaway's limit) and approvals_in_a_row (its decisions in a row that were "
+              "all approvals, also a runaway's). A monitor with none of its limits is off",
     "validator_ledger": "optional: the validator's ledger (contract section 24), an absolute path "
                         "this account can read. With `repos`, it turns approval-rate on: every "
                         "merge checked against it. Empty: approval-rate is off",
@@ -251,11 +262,12 @@ class ConfigError(Exception):
 
 class SourceError(Exception):
     """A source could not answer. `whole` says it is down for the rest of the pass (no network,
-    a refused key, a rate limit), not just this one question."""
+    a refused key, a rate limit), not just this one question. `code` is GitHub's HTTP status, when
+    it gave one: only a 404 may mean a file is not there."""
 
-    def __init__(self, message, whole=True):
+    def __init__(self, message, whole=True, code=None):
         Exception.__init__(self, message)
-        self.whole = whole
+        self.whole, self.code = whole, code
 
 
 # --------------------------------------------------------------------------- #
@@ -509,7 +521,7 @@ def validate_config(raw):
         if key not in limits_raw:
             continue
         v = limits_raw[key]
-        whole = key.endswith(("_runs", "_approvals"))
+        whole = key in WHOLE_LIMITS
         if _number(v) is None or v <= 0 or (whole and not isinstance(v, int)):
             errors.append("limit %r must be a positive %s" % (
                 key, "whole number" if whole else "number"))
@@ -580,11 +592,13 @@ def which_on(cfg):
     gh = None if cfg["repos"] else "no repository is named in `repos`"
     for m in ("labels", "markers", "injection"):
         off[m] = gh
-    off["tracker-text"] = (
+    off["tracker-text"] = off["outside-files"] = (
         "no linear_key_env is named" if not cfg["linear_key_env"] else
         "no tracker_teams are named" if not cfg["tracker_teams"] else
         "no tracker_trusted_users are named: without them every marker would look forged"
         if not cfg["tracker_trusted_users"] else None)
+    # outside-files reads GitHub and the tracker both, so it needs both's settings.
+    off["outside-files"] = gh or off["outside-files"]
     off["approval-rate"] = (
         "no validator_ledger is named" if not cfg["validator_ledger"] else
         "no repository is named in `repos`, so no merge could be checked" if not cfg["repos"]
@@ -633,7 +647,7 @@ def github_get(path, token, timeout=30):
         if limited:
             raise SourceError("GitHub's rate limit is spent (HTTP %d)" % exc.code)
         raise SourceError("GitHub answered HTTP %d" % exc.code,
-                          whole=exc.code not in (403, 404, 410, 422))
+                          whole=exc.code not in (403, 404, 410, 422), code=exc.code)
 
 
 class GitHub(object):
@@ -668,7 +682,7 @@ class GitHub(object):
         except SourceError as exc:
             if exc.whole:
                 self.stopped = str(exc)
-            raise SourceError(str(exc), whole=False)
+            raise SourceError(str(exc), whole=False, code=exc.code)
         st["answered"] += 1
         st["read_at"] = _iso(self.now())
         self.cache[path] = answer
@@ -1274,6 +1288,8 @@ def monitor_approvals(cfg, gh, now):
     pause, naming who merged it from GitHub's own `merged_by`, unless that login is the owner's. An
     approval still open a day later is a page, and so is each urgent escalation, which is how the
     validator's urgent page reaches the owner. The day's approvals over `day_approvals` is a pause.
+    A run of approvals longer than `approvals_in_a_row` is a page (KIT-518): every one of them passed
+    the validator's code limits, so nothing got past those; the run says it has stopped saying no.
     A ledger or a merge list that cannot be read is never clear."""
     name, found, incomplete, since = "approval-rate", [], [], _since(cfg, now)
     last = previous_pass(cfg)
@@ -1372,6 +1388,19 @@ def monitor_approvals(cfg, gh, now):
     limit = cfg["limits"].get("day_approvals")
     if limit and day > limit:
         found.append(finding(PAUSE, "approval-rate", _today(now), value=day, limit=limit))
+    # The run: the validator's newest decisions, back to the last one that was not an approval. Its
+    # first approval names it, so a run that grows is one finding, and a new run is a new one.
+    in_a_row = 0
+    for row in reversed(rows):
+        if row["kind"] != "approved":
+            break
+        in_a_row += 1
+    run_limit = cfg["limits"].get("approvals_in_a_row")
+    newest = _epoch(rows[-1]["at"]) if rows else None
+    if run_limit and in_a_row > run_limit and newest is not None and since <= newest <= now:
+        first = rows[-in_a_row]
+        found.append(finding(PAGE, "approvals-in-a-row", REF_BAD_RE.sub("?", first["ref"])[:200],
+                             at=first["at"], value=in_a_row, limit=run_limit))
     urgent = 0
     for row in rows:
         at = _epoch(row["at"])
@@ -1380,14 +1409,258 @@ def monitor_approvals(cfg, gh, now):
             found.append(finding(PAGE, "urgent-escalation", REF_BAD_RE.sub("?", row["ref"])[:200],
                                  at=row["at"]))
     asked, answered, read_at = gh.feed_stats("merges")
-    said = ("read %d ledger row(s) and %d merge(s) into the default branch of %d repositor%s since %s: "
-            "%d approved, %d the owner's, %d without an approval; %d approval(s) a day old and "
-            "unmerged; %d approval(s) in 24 hours (%s); %d urgent escalation(s)"
-            % (len(rows), merged, len(cfg["repos"]), "y" if len(cfg["repos"]) == 1 else "ies",
+    # Short, so the whole line fits the 300 characters a said line holds.
+    said = ("read %d ledger row(s) and %d merge(s) into %d default branch(es) since %s: "
+            "%d approved, %d the owner's, %d without an approval; approvals: %d a day old, "
+            "unmerged; %d in 24 hours (%s); %d in a row (%s); %d urgent escalation(s)"
+            % (len(rows), merged, len(cfg["repos"]),
                _iso(since), with_row, owners_own, sum(1 for f in found
                                                      if f["what"] == "merge-without-approval"),
-               stale, day, "limit %d" % limit if limit else "no day_approvals limit set", urgent))
+               stale, day, "limit %d" % limit if limit else "no limit set",
+               in_a_row, "limit %d" % run_limit if run_limit else "no limit set",
+               urgent))
     return judged(name, found, said, _gaps(incomplete), asked + 1, answered + 1, read_at)
+
+
+# --------------------------------------------------------------------------- #
+# Work outside a ticket's files (KIT-831), and guarded paths (KIT-518)
+# --------------------------------------------------------------------------- #
+BRANCH_TICKET_RE = re.compile(r"^[a-z]+/([a-z][a-z0-9]{0,9}-[0-9]{1,7})(?:-|\Z)")
+SCOPE_WORD_RE = re.compile(r"^[A-Za-z0-9_.*/-]{1,200}\Z")
+SCOPE_EXT_RE = re.compile(r"^[^/]*(?:[A-Za-z0-9_-]{2}|\*)\.[A-Za-z][A-Za-z0-9]{0,4}\Z")
+SCOPE_SPLIT_RE = re.compile(r"[\s`\"'(),;:<>\[\]]+")
+SAFE_PATH_RE = re.compile(r"^[A-Za-z0-9_.:/#-]{1,120}\Z")
+OUTSIDE_ALLOWANCE = 3         # up to this many files outside the named ones is recorded, not paged
+OUTSIDE_NAMED = 5             # files named in findings, per pull request
+MAX_SCOPE_TOKENS = 200
+FILES_PAGE_LIMIT = 3000       # GitHub lists no more than this many files of one pull request
+MAX_RISK_PATHS = 200          # riskPaths patterns read from one repository's delivery.json
+
+
+def scope_tokens(text):
+    """The files and areas a ticket's text names: words that hold a `/` or end in a file extension,
+    with no `..`, no leading `/` and no web link. Words are read, never run, and capped. A sentence's
+    full stop is dropped from the end only: a leading dot is part of a path such as `.github/`."""
+    found = []
+    for raw in SCOPE_SPLIT_RE.split(text[:SCAN_CAP] if isinstance(text, str) else ""):
+        word = raw.rstrip(".")
+        if word.startswith("./"):
+            word = word[2:]
+        if (not word or not SCOPE_WORD_RE.match(word) or ".." in word or word.startswith("/")
+                or "//" in word or not ("/" in word or SCOPE_EXT_RE.match(word))):
+            continue
+        if word not in found:
+            found.append(word)
+        if len(found) >= MAX_SCOPE_TOKENS:
+            break
+    return found
+
+
+def _companions(stem):
+    return (stem, "test_" + stem, stem + "_test")
+
+
+def _glob_re(token):
+    return re.compile("^" + "".join(".*" if c == "*" else re.escape(c) for c in token) + r"\Z")
+
+
+def named_by(path, tokens):
+    """Whether the ticket's scope covers a changed file: the file itself, anything under a named
+    folder, a glob, a bare file name, or a test or doc kept beside a named file: same folder, same stem,
+    or the stem with a `test_` prefix or `_test` suffix."""
+    folder = path.rsplit("/", 1)[0] if "/" in path else ""
+    stem = path.rsplit("/", 1)[-1].split(".")[0]
+    for t in tokens:
+        if "*" in t:
+            if _glob_re(t).match(path):
+                return True
+        elif "/" not in t:
+            if path.rsplit("/", 1)[-1] == t:
+                return True
+        elif t.endswith("/"):
+            if path.startswith(t):
+                return True
+        elif path == t or path.startswith(t + "/"):
+            return True
+        elif (folder and t.rsplit("/", 1)[0] == folder and "." in t.rsplit("/", 1)[-1]
+              and stem in _companions(t.rsplit("/", 1)[-1].split(".")[0])):
+            return True
+    return False
+
+
+def names_guarded(path, tokens):
+    """Whether a ticket names a GUARDED file closely enough to count: its exact path, or a glob whose
+    folder is written out in full, holds no `*`, and is the file's own folder, with `*` inside the one
+    file name. A bare name, a folder, a companion, or a glob such as `*.yml` or `**/*.py` never names
+    guard machinery: a branch can claim any ticket, and words that loose are too easy to borrow."""
+    folder, _sep, name = path.rpartition("/")
+    for t in tokens:
+        if t == path:
+            return True
+        t_folder, _sep, t_name = t.rpartition("/")
+        if ("*" in t_name and t_folder and "*" not in t_folder and t_folder == folder and re.match(
+                "^" + "[^/]*".join(re.escape(x) for x in t_name.split("*")) + r"\Z", name)):
+            return True
+    return False
+
+
+def _pr_files(gh, repo, number, max_pages):
+    """(file names, why not). The names are what was read, even when the list was cut short."""
+    files = []
+    for n in range(1, max_pages + 1):
+        try:
+            batch = gh.ask("files", "/repos/%s/pulls/%d/files?per_page=%d&page=%d"
+                           % (repo, number, PAGE_SIZE, n))
+        except SourceError as exc:
+            return files, _line(str(exc), 80)
+        if not isinstance(batch, list):
+            return files, "GitHub's answer held no list"
+        for f in batch:
+            if not isinstance(f, dict) or not isinstance(f.get("filename"), str):
+                return files, "a file entry named no file"
+            files.append(f["filename"])
+            if isinstance(f.get("previous_filename"), str):
+                files.append(f["previous_filename"])
+        if len(batch) < PAGE_SIZE:
+            return files, ("as many files as GitHub lists, so some may be missing"
+                           if len(files) >= FILES_PAGE_LIMIT else None)
+    return files, "the list ran past max_pages"
+
+
+def guard_list(gh, repo):
+    """(patterns, why not whole, absent): the Hooks change guard's list for one repository, built as its
+    gate builds it (scripts/check_grader_paths.py). The kit's FLOOR, imported, so it is the same list;
+    and the `autonomy.riskPaths` of the repository's own delivery.json on its default branch, by one
+    GET. A 404 is no delivery.json, the floor alone, as it is for the gate; `absent` says so, and the
+    monitor counts it aloud, since a token that cannot see the file may get the same 404. One that
+    cannot be read or does not parse leaves the floor, and says so: never a whole list."""
+    globs, why, absent = list(grader_paths.FLOOR), None, False
+    try:
+        doc = gh.ask("files", "/repos/%s/contents/%s" % (repo, grader_paths.DELIVERY_FILE))
+        if not isinstance(doc, dict) or doc.get("encoding") != "base64" or not isinstance(
+                doc.get("content"), str):
+            raise ValueError("no content")
+        risk = (json.loads(base64.b64decode(doc["content"]).decode("utf-8")).get("autonomy")
+                or {}).get("riskPaths") or []
+        if not isinstance(risk, list):
+            raise ValueError("not a list")
+        risk = [g.strip() for g in risk if isinstance(g, str) and g.strip()]
+        if len(risk) > MAX_RISK_PATHS:
+            why = "its delivery.json lists more than %d riskPaths, and only the first %d were checked" % (
+                MAX_RISK_PATHS, MAX_RISK_PATHS)
+        globs += risk[:MAX_RISK_PATHS]
+    except SourceError as exc:
+        absent = exc.code == 404
+        if not absent:
+            why = "its riskPaths could not be read (%s), so only the kit's floor was checked" % _line(
+                str(exc), 80)
+    except (ValueError, TypeError, AttributeError, RecursionError):
+        why = "its delivery.json does not parse, so only the kit's floor was checked"
+    return [re.compile(grader_paths.glob_to_re(g)) for g in globs], why, absent
+
+
+def _nameable(ref, paths):
+    """The paths a finding may name after its ref: safe characters only, and short enough."""
+    return [x for x in paths if SAFE_PATH_RE.match(x) and len(ref) + len(x) < 190][:OUTSIDE_NAMED]
+
+
+def monitor_outside_files(cfg, gh, tr, now):
+    """Each pull request updated inside the lookback: its changed files against the files and areas
+    its ticket names, and against the Hooks change guard's list (KIT-518). The ticket is the one the
+    branch name claims, and a branch is the worker's word, so this is a tripwire. A pull request that
+    names no ticket, a ticket that names nothing or was not written by a trusted user, and a file list
+    that could not be read all say so: none of them is clear. Every pull request's files are read,
+    with a ticket or without, because a guarded path can hide in any of them: a guarded file its
+    ticket does not name exactly (`names_guarded`) is a page, whatever the count."""
+    name, found, incomplete, since = "outside-files", [], [], _since(cfg, now)
+    trusted, teams = set(cfg["tracker_trusted_users"]), set(cfg["tracker_teams"])
+    try:
+        issues, _unused = tr.ask("tracker", "text")
+    except SourceError as exc:
+        return blind(name, _line(str(exc)), *tr.feed_stats("tracker"))
+    by_ident = dict((i["identifier"], i) for i in issues
+                    if isinstance(i, dict) and isinstance(i.get("identifier"), str))
+    judged_n = unjudged = untied = read_n = floor_only = 0
+    for repo in cfg["repos"]:
+        pulls, complete, why = read_pages(
+            gh, "pulls", lambda n, r=repo: ("/repos/%s/pulls?state=all&sort=updated&direction=desc"
+                                            "&per_page=%d&page=%d" % (r, PAGE_SIZE, n)),
+            cfg["max_pages"],
+            stop=lambda batch: (_epoch((batch[-1] or {}).get("updated_at")) or since + 1) < since
+            if batch and isinstance(batch[-1], dict) else False)
+        if not complete:
+            incomplete.append((repo, why))
+        guard = None                # the guard's list, read once, when a pull request first needs it
+        for p in pulls:
+            at, number = _epoch(p.get("updated_at")), p.get("number")
+            if at is None or at < since:
+                continue
+            if not isinstance(number, int) or isinstance(number, bool) or number < 1:
+                incomplete.append((repo, "a pull request named no number"))
+                continue
+            ref, url = _ref(repo, number), _url(repo, "pull", number)
+            user = p.get("user") if isinstance(p.get("user"), dict) else {}
+            who, when = user.get("login"), p.get("updated_at")
+            head = p.get("head") if isinstance(p.get("head"), dict) else {}
+            m = BRANCH_TICKET_RE.match(head.get("ref").lower()) if isinstance(head.get("ref"), str) else None
+            ident = m.group(1).upper() if m else None
+            tokens = None               # the files and areas a trusted ticket names, or None
+            if ident is None or ident.split("-")[0] not in teams:
+                found.append(finding(RECORD, "no-scope", ref, actor=who, at=when, url=url))
+                untied += 1             # not a dispatched piece: its files are read only for guarded paths
+            elif by_ident.get(ident) is None:
+                incomplete.append((repo, "a pull request names a ticket the tracker's newest page did not hold"))
+            else:
+                ticket = by_ident[ident]
+                made = ticket.get("creator") if isinstance(ticket.get("creator"), dict) else {}
+                words = scope_tokens("%s\n%s" % (
+                    ticket.get("title") if isinstance(ticket.get("title"), str) else "",
+                    ticket.get("description") if isinstance(ticket.get("description"), str) else ""))
+                if made.get("id") in trusted and words:
+                    tokens = words
+                else:
+                    found.append(finding(RECORD, "no-scope", ref, actor=who, at=when, url=url))
+                    unjudged += 1
+            files, cut = _pr_files(gh, repo, number, cfg["max_pages"])
+            if cut:
+                incomplete.append((repo, "the files of %s were not all read: %s" % (ref, cut)))
+            if not files:
+                continue
+            read_n += 1
+            if guard is None:
+                guard, guard_why, absent = guard_list(gh, repo)
+                if guard_why:
+                    incomplete.append((repo, guard_why))
+                floor_only += 1 if absent else 0
+            guarded = sorted(set(f for f in files if any(rx.match(f) for rx in guard)))
+            loose = [f for f in guarded if not (tokens and names_guarded(f, tokens))]
+            if guarded:
+                found.append(finding(PAGE if loose else RECORD, "guarded-path", ref, actor=who, at=when,
+                                     url=url, count=len(guarded)))
+            for path in _nameable(ref, loose):
+                found.append(finding(PAGE, "guarded-file", "%s:%s" % (ref, path), actor=who, at=when, url=url))
+            if tokens is None:
+                continue
+            judged_n += 1
+            outside = sorted(set(f for f in files if not named_by(f, tokens)))
+            if not outside:
+                continue
+            level = PAGE if len(outside) > OUTSIDE_ALLOWANCE else RECORD
+            found.append(finding(level, "outside-files", ref, actor=who, at=when, url=url, count=len(outside)))
+            for path in _nameable(ref, outside):
+                found.append(finding(level, "outside-file", "%s:%s" % (ref, path), actor=who, at=when, url=url))
+    if judged_n == 0 and unjudged:
+        incomplete.append(("all", "no pull request could be judged: none named a ticket that names files or "
+                                  "areas, so nothing was compared"))
+    asked, answered, read_at = gh.feed_stats("pulls", "files")
+    # Short, so the whole line fits the 300 characters a said line holds.
+    said = ("read the files of %d pull request(s) in %d repo(s) since %s: %d judged against a ticket, "
+            "with %d changed files outside it; %d could not be judged (no trusted scope), %d named no "
+            "ticket; %d guarded file(s) changed; %d repo(s) with no delivery.json (floor only)"
+            % (read_n, len(cfg["repos"]), _iso(since), judged_n,
+               sum(f["count"] for f in found if f["what"] == "outside-files"), unjudged, untied,
+               sum(f["count"] for f in found if f["what"] == "guarded-path"), floor_only))
+    return judged(name, found, said, _gaps(incomplete), asked, answered, read_at)
 
 
 # --------------------------------------------------------------------------- #
@@ -1436,7 +1709,7 @@ def build(cfg, environ=None, gh=None, now=None, clock=None, tracker=None):
     off = which_on(cfg)
     results = []
     token = token_why = None
-    if any(off[m] is None for m in ("labels", "markers", "injection", "approval-rate")):
+    if any(off[m] is None for m in ("labels", "markers", "injection", "approval-rate", "outside-files")):
         token, token_why = credential(environ, cfg["github_token_env"])
     # No credential means no GitHub, whatever transport a caller stood in for it.
     get = None if not token else (gh if gh is not None else (lambda path: github_get(path, token)))
@@ -1444,7 +1717,7 @@ def build(cfg, environ=None, gh=None, now=None, clock=None, tracker=None):
     # The tracker has its own key and its own counter. No credential means no tracker, whatever
     # transport a caller stood in for it.
     tkey = tkey_why = None
-    if off["tracker-text"] is None:
+    if off["tracker-text"] is None or off["outside-files"] is None:
         tkey, tkey_why = credential(environ, cfg["linear_key_env"])
 
     def tracker_get(_path):
@@ -1464,6 +1737,7 @@ def build(cfg, environ=None, gh=None, now=None, clock=None, tracker=None):
                "markers": lambda: monitor_markers(cfg, github, started),
                "injection": lambda: monitor_injection(cfg, github, started),
                "tracker-text": lambda: monitor_tracker_text(cfg, tracker_gh, started),
+               "outside-files": lambda: monitor_outside_files(cfg, github, tracker_gh, started),
                "approval-rate": lambda: monitor_approvals(cfg, github, started)}
     for name in MONITORS:
         if off[name] is not None:
@@ -1740,7 +2014,7 @@ def selftest():
                     if isinstance(answer, Exception):
                         raise answer
                     return answer(path) if callable(answer) else answer
-            raise SourceError("GitHub answered HTTP 404", whole=False)
+            raise SourceError("GitHub answered HTTP 404", whole=False, code=404)
 
     R = "acme/app"
     EV, CM, PL = ("/repos/%s/issues/events" % R, "/repos/%s/issues/comments" % R,
@@ -1926,7 +2200,7 @@ def selftest():
             on = [m for m in doc["monitors"] if m["state"] != OFF]
             check("rules file %s: every monitor that is on is blind, by name, exit 4" % label,
                   (code, doc["result"], len(on), all(m["state"] == BLIND and why in m["reason"]
-                                                      for m in on)), (EXIT_BLIND, "blind", 7, True))
+                                                      for m in on)), (EXIT_BLIND, "blind", 8, True))
             if os.path.islink(cfg_path):
                 os.unlink(cfg_path)
         # An unsafe rules file also names where the output goes: it may replace only a file this
@@ -2433,6 +2707,231 @@ def selftest():
               ('method="POST"' in open(os.path.abspath(__file__), encoding="utf-8").read().split(
                   "\n# SELFTEST: " + "nothing below", 1)[0].split('"""', 2)[2]), False)
 
+        # -- KIT-831: outside-files, a pull request's files against what its ticket names ---------------------------------------
+        def opr(n, ref="feat/kit-1-x", minutes=5):
+            return {"number": n, "updated_at": ago(minutes), "user": {"login": "the-owner", "type": "User"},
+                    "head": {"ref": ref}}
+
+        def files_of(names):
+            return [x if isinstance(x, dict) else {"filename": x} for x in names]
+
+        last_gh = []
+
+        def go_o(issues, pulls, files, environ=None, contents=None, **over):
+            """files: {pull number: list of names | an exception}. contents: GitHub's answer for the
+            repository's delivery.json, or None for a 404. A path no case named is a 404."""
+            answers = {}
+            for num, names in files.items():
+                answers["/repos/%s/pulls/%d/files" % (R, num)] = (
+                    names if isinstance(names, Exception) else files_of(names))
+            if contents is not None:
+                answers["/repos/%s/contents/delivery.json" % R] = contents
+            answers.update({EV: [], CM: [], PL: list(pulls)})
+            over = dict({"linear_key_env": "WL", "tracker_teams": ["KIT"],
+                         "tracker_trusted_users": [OWNER_ID, AGENT_ID]}, **over)
+            put(cfg_path, raw_cfg(**over))
+            last_gh[:] = [FakeGH(answers)]
+            code = run(cfg_path, environ=TENV if environ is None else environ, gh=last_gh[0],
+                       tracker=tk(issues), now=lambda: NOW, clock=lambda: 0.0, say=[].append)
+            return code, mon(written(), "outside-files")
+
+        SCOPED = tissue("KIT-1", desc="Change `scripts/foo.py` and the docs/ folder; see PIPELINE-CONTRACT.md "
+                                      "and scripts/lib/*.py, and e.g. nothing else.")
+        code, m = go_o([SCOPED], [opr(7)], {7: ["scripts/foo.py", "docs/a/b.md", "PIPELINE-CONTRACT.md",
+                                                 "scripts/lib/x.py", "scripts/test_foo.py", "docs/x.md"]})
+        check("outside-files: files inside what the ticket names, beside it, or by glob are clear, and it says so",
+              (m["state"], m["kind"], m["findings"]), (CLEAR, "first-hand", []))
+        ok("outside-files: ...it says how many pull requests it read", "files of 1 pull request" in m["said"], m["said"])
+        code, m = go_o([SCOPED], [opr(7)], {7: ["scripts/foo.py", "src/a.py", "src/b.py", "src/c.py", "src/d.py"]})
+        check("outside-files: more than three files outside is a page, and names the files",
+              (m["state"], [(f["what"], f["level"], f["count"]) for f in m["findings"]][:1],
+               sorted(f["ref"] for f in m["findings"] if f["what"] == "outside-file")),
+              (FLAGGED, [("outside-files", PAGE, 4)],
+               ["%s#7:src/%s.py" % (R, x) for x in "abcd"]))
+        code, m = go_o([SCOPED], [opr(7)], {7: ["scripts/foo.py", "src/a.py", "src/b.py"]})
+        check("outside-files: a few files outside are recorded, not paged",
+              (m["state"], [f["level"] for f in m["findings"]]), (CLEAR, [RECORD, RECORD, RECORD]))
+        code, m = go_o([SCOPED], [opr(7)], {7: ["scripts/foo.py"] + ["x y/%d.py" % i for i in range(5)]})
+        check("outside-files: a file name outside the safe characters is counted, never named",
+              (m["state"], [(f["what"], f["count"]) for f in m["findings"]]), (FLAGGED, [("outside-files", 5)]))
+        code, m = go_o([SCOPED], [opr(7)], {7: [{"filename": "scripts/foo.py", "previous_filename": "src/old.py"}]})
+        check("outside-files: a rename's old path counts too, and is named",
+              [(f["what"], f["ref"]) for f in m["findings"] if f["what"] == "outside-file"],
+              [("outside-file", "%s#7:src/old.py" % R)])
+        code, m = go_o([SCOPED], [opr(7)], {7: [{"nofile": 1}]})
+        check("outside-files: a file entry that names no file is blind, never clear", m["state"], BLIND)
+        code, m = go_o([tissue("KIT-1", desc="Only *.md files")], [opr(7)], {7: ["docs/a.md", "src/b.py"]})
+        check("outside-files: a bare glob such as *.md is a scope word",
+              (m["state"], [(f["what"], f["level"], f["count"]) for f in m["findings"]][:1]),
+              (CLEAR, [("outside-files", RECORD, 1)]))
+        code, m = go_o([SCOPED], [opr(7)], {7: ["scripts/foo.py", "scripts/other.py"]})
+        check("outside-files: another file in a named file's folder is outside, but its test is not",
+              (sorted(f["ref"] for f in m["findings"] if f["what"] == "outside-file")),
+              ["%s#7:scripts/other.py" % R])
+        code, m = go_o([SCOPED], [opr(7)], {7: ["scripts/foo.py", "scripts/test_foo.py", "scripts/foo_test.py"]})
+        check("outside-files: ...a test_ or _test companion is named", (m["state"], m["findings"]), (CLEAR, []))
+        code, m = go_o([SCOPED], [opr(7, "docs/readme-tweak"), opr(8, "dependabot/npm/x")],
+                       {7: ["README.md"], 8: ["package.json"]})
+        check("outside-files: pull requests that name no ticket are recorded, and with no guarded file they "
+              "never blind the monitor",
+              (m["state"], [f["what"] for f in m["findings"]], "2 named no ticket" in m["said"]),
+              (CLEAR, ["no-scope", "no-scope"], True))
+        code, m = go_o([SCOPED], [opr(7)], {7: ["scripts/foo.py"] + ["src/%d.py" % i for i in range(4)]})
+        ok("outside-files: the summary counts files, not pull requests", "4 changed files outside" in m["said"], m["said"])
+        put(cfg_path, raw_cfg(linear_key_env="WL", tracker_teams=["KIT"], tracker_trusted_users=[OWNER_ID]))
+        def tracker_down(token):
+            raise tracker_reader.TrackerError("could not reach the tracker")
+        code = run(cfg_path, environ=TENV, gh=FakeGH({EV: [], CM: [], PL: []}), tracker=tracker_down,
+                   now=lambda: NOW, clock=lambda: 0.0, say=[].append)
+        m = mon(written(), "outside-files")
+        check("outside-files: a failed tracker read is blind and reports the tracker's counts, not GitHub's",
+              (m["state"], m["asked"], m["answered"]), (BLIND, 1, 0))
+        BARE = tissue("KIT-1", desc="Make the watcher better somehow.")
+        code, m = go_o([BARE], [opr(7)], {7: ["src/a.py"]})
+        check("outside-files: a ticket that names no files is could-not-judge, and with nothing else judged it is blind",
+              (m["state"], [(f["what"], f["level"]) for f in m["findings"]]), (BLIND, [("no-scope", RECORD)]))
+        code, m = go_o([BARE, tissue("KIT-2", desc="Edit scripts/bar.py")], [opr(7), opr(8, "fix/kit-2-y")],
+                       {7: ["src/a.py"], 8: ["scripts/bar.py"]})
+        check("outside-files: ...beside a pull request that was judged it is a record, and the monitor is clear",
+              (m["state"], [f["what"] for f in m["findings"]]), (CLEAR, ["no-scope"]))
+        ok("outside-files: ...and it counts the one it could not judge", "1 could not be judged" in m["said"], m["said"])
+        code, m = go_o([tissue("KIT-1", desc="Edit scripts/foo.py", creator=STRANGER)], [opr(7)], {7: ["src/a.py"]})
+        check("outside-files: a scope written by a stranger is not trusted: could-not-judge",
+              (m["state"], [f["what"] for f in m["findings"]]), (BLIND, ["no-scope"]))
+        code, m = go_o([SCOPED], [opr(7, "my-branch")], {7: ["src/a.py"]})
+        check("outside-files: a pull request that names no ticket is a record, and says so",
+              (m["state"], [f["what"] for f in m["findings"]], "1 named no ticket" in m["said"]),
+              (CLEAR, ["no-scope"], True))
+        code, m = go_o([SCOPED], [opr(7, "feat/other-5-x")], {7: ["src/a.py"]})
+        check("outside-files: a ticket of another team is not looked up",
+              (m["state"], [f["what"] for f in m["findings"]]), (CLEAR, ["no-scope"]))
+        code, m = go_o([SCOPED], [opr(7, "feat/kit-9-x")], {7: ["src/a.py"]})
+        check("outside-files: a ticket the tracker page did not hold is blind, never clear",
+              (m["state"], "newest page" in m["reason"]), (BLIND, True))
+        code, m = go_o([SCOPED], [opr(7)], {7: SourceError("GitHub answered HTTP 500", whole=False)})
+        check("outside-files: a pull request whose files could not be read is blind, never clear",
+              (m["state"], "KIT" not in m["reason"], "could not be read" in m["reason"] or "not all read" in m["reason"]),
+              (BLIND, True, True))
+        code, m = go_o([SCOPED], [opr(7), opr(8)], {7: SourceError("GitHub answered HTTP 500", whole=False),
+                                                     8: ["src/a.py"] * 1 + ["src/%d.py" % i for i in range(4)]})
+        check("outside-files: one unreadable pull request does not hide a flagged one",
+              (m["state"], "could not be read" in m["reason"] or "not all read" in m["reason"]), (FLAGGED, True))
+        code, m = go_o([SCOPED], [opr(7, minutes=60 * 40)], {})
+        check("outside-files: a pull request not updated within the lookback is not read",
+              (m["state"], m["findings"]), (CLEAR, []))
+        code, m = go_o([SCOPED], [opr(7)], {7: ["src/a.py"]}, environ=dict(ENV))
+        check("outside-files: no tracker key in the environment is blind, never clear", m["state"], BLIND)
+        for label, over in (("no linear_key_env", {"linear_key_env": ""}), ("no tracker_teams", {"tracker_teams": []}),
+                            ("no repos", {"repos": []})):
+            put(cfg_path, raw_cfg(**dict({"linear_key_env": "WL", "tracker_teams": ["KIT"],
+                                          "tracker_trusted_users": [OWNER_ID]}, **over)))
+            code = run(cfg_path, environ=TENV, gh=FakeGH({EV: [], CM: [], PL: []}), tracker=tk(),
+                       now=lambda: NOW, clock=lambda: 0.0, say=[].append)
+            m = mon(written(), "outside-files")
+            check("outside-files: %s is off, with its reason" % label, (m["state"], bool(m["reason"])), (OFF, True))
+        check("outside-files: scope words are files and areas, never a link or a path out of the repository",
+              scope_tokens("see https://x.io/a/b and ../etc/passwd and /abs/p.py and `docs/` and foo.py, e.g."),
+              ["docs/", "foo.py"])
+        check("outside-files: a path that starts with a dot keeps it, and a leading ./ is dropped",
+              scope_tokens("Edit .github/workflows/ci.yml and ./docs/a.md, then .claude/hooks/x.py."),
+              [".github/workflows/ci.yml", "docs/a.md", ".claude/hooks/x.py"])
+        check("outside-files: the glob, bare name, folder and sibling rules",
+              [named_by(p, ["scripts/*.py"]) for p in ("scripts/a.py", "scripts/a/b.py", "docs/a.py")]
+              + [named_by("a/b/NOTES.md", ["NOTES.md"]), named_by("docs/z.md", ["docs/"]),
+                 named_by("docs", ["docs/"]), named_by("src/b.py", ["src/a.py"]), named_by("srcx/b.py", ["src/"])],
+              [True, True, False, True, True, False, False, False])
+
+        # -- KIT-518: guarded paths, by the Hooks change guard's own list -------------------------------------------------------
+        def blob(doc):
+            raw = doc if isinstance(doc, bytes) else json.dumps(doc).encode("utf-8")
+            return {"type": "file", "encoding": "base64", "content": base64.b64encode(raw).decode("ascii")}
+
+        def guarded_of(m):
+            return sorted((f["what"], f["level"], f["ref"], f["count"]) for f in m["findings"]
+                          if f["what"].startswith("guarded"))
+
+        code, m = go_o([SCOPED], [opr(7)], {7: ["scripts/foo.py", ".github/workflows/ci.yml"]})
+        check("guarded: a guarded file its ticket does not name is a page, whatever the count, and is named",
+              (m["state"], guarded_of(m)),
+              (FLAGGED, [("guarded-file", PAGE, "%s#7:.github/workflows/ci.yml" % R, 1),
+                         ("guarded-path", PAGE, "%s#7" % R, 1)]))
+        ok("guarded: ...and it says how many guarded files changed", "1 guarded file(s) changed" in m["said"], m["said"])
+        code, m = go_o([tissue("KIT-1", desc="Edit scripts/pipeline_x.py only")], [opr(7)], {7: ["scripts/pipeline_x.py"]})
+        check("guarded: a guarded file its ticket names is recorded, never paged",
+              (m["state"], guarded_of(m)), (CLEAR, [("guarded-path", RECORD, "%s#7" % R, 1)]))
+        code, m = go_o([tissue("KIT-1", desc="Edit the CI in .github/workflows/*.yml")], [opr(7)],
+                       {7: [".github/workflows/ci.yml"]})
+        check("guarded: ...and so is one a glob names in its own folder, written out in full",
+              (m["state"], guarded_of(m)), (CLEAR, [("guarded-path", RECORD, "%s#7" % R, 1)]))
+        for words, path in (("Tidy ci.yml", ".github/workflows/ci.yml"), ("Every *.yml file", ".github/workflows/ci.yml"),
+                            ("All of **/*.py", "scripts/pipeline_x.py"), ("The scripts/ folder", "scripts/pipeline_x.py"),
+                            ("See scripts/*/x.py", "scripts/pipeline_x.py"), ("And .claude/", ".claude/settings.json")):
+            code, m = go_o([tissue("KIT-1", desc=words)], [opr(7)], {7: [path]})
+            check("guarded: a ticket that says %r does not name %s, so it is still a page" % (words, path),
+                  (m["state"], [(w, lv) for w, lv, _r, _c in guarded_of(m)]),
+                  (FLAGGED, [("guarded-file", PAGE), ("guarded-path", PAGE)]))
+        check("guarded: the exact path, or a glob in the file's own folder, written out; nothing looser",
+              [names_guarded(p, t) for p, t in (
+                  ("scripts/pipeline_x.py", ["scripts/pipeline_x.py"]), ("scripts/pipeline_x.py", ["scripts/pipeline_*.py"]),
+                  ("delivery.json", ["delivery.json"]), ("scripts/pipeline_x.py", ["pipeline_x.py"]),
+                  ("scripts/pipeline_x.py", ["scripts/"]), ("scripts/a/pipeline_x.py", ["scripts/*.py"]),
+                  ("scripts/pipeline_x.py", ["*/pipeline_x.py"]), ("scripts/pipeline_x.py", ["scripts/test_pipeline_x.py"]))],
+              [True, True, True, False, False, False, False, False])
+        code, m = go_o([SCOPED], [opr(7, "my-branch")], {7: ["src/a.py", ".claude/hooks/pre-tool-use.py"]})
+        check("guarded: a pull request that names no ticket and changes a guarded path is a page",
+              (m["state"], [w for w, _l, _r, _c in guarded_of(m)]), (FLAGGED, ["guarded-file", "guarded-path"]))
+        code, m = go_o([BARE], [opr(7)], {7: ["scripts/check_x.py"]})
+        check("guarded: a ticket that names nothing still has its guarded paths paged, and flagged beats blind",
+              (m["state"], [w for w, _l, _r, _c in guarded_of(m)], "could be judged" in m["reason"]),
+              (FLAGGED, ["guarded-file", "guarded-path"], True))
+        code, m = go_o([tissue("KIT-1", desc="Edit scripts/pipeline_x.py", creator=STRANGER)], [opr(7)],
+                       {7: ["scripts/pipeline_x.py"]})
+        check("guarded: a stranger's ticket that names a guarded file does not make it named",
+              (m["state"], [(w, lv) for w, lv, _r, _c in guarded_of(m)]),
+              (FLAGGED, [("guarded-file", PAGE), ("guarded-path", PAGE)]))
+        code, m = go_o([SCOPED], [opr(7, "feat/kit-9-x")], {7: ["delivery.json"]})
+        check("guarded: a ticket the tracker's page did not hold is still checked, and its gap is said",
+              (m["state"], [w for w, _l, _r, _c in guarded_of(m)], "newest page" in m["reason"]),
+              (FLAGGED, ["guarded-file", "guarded-path"], True))
+        code, m = go_o([SCOPED], [opr(7, "my-branch")],
+                       {7: [{"filename": "docs/ci.yml", "previous_filename": ".github/workflows/ci.yml"}]})
+        check("guarded: a guarded file moved away counts by its old path",
+              [r for w, _l, r, _c in guarded_of(m) if w == "guarded-file"], ["%s#7:.github/workflows/ci.yml" % R])
+        RISK = blob({"autonomy": {"riskPaths": ["src/billing/**", " ", 7]}})
+        code, m = go_o([SCOPED], [opr(7, "my-branch"), opr(8, "other-branch")],
+                       {7: ["src/billing/pay.py"], 8: ["src/a.py"]}, contents=RISK)
+        check("guarded: the repository's own riskPaths, from its delivery.json, are guarded too",
+              (m["state"], guarded_of(m)),
+              (FLAGGED, [("guarded-file", PAGE, "%s#7:src/billing/pay.py" % R, 1), ("guarded-path", PAGE, "%s#7" % R, 1)]))
+        check("guarded: ...read by one GET of that file on the default branch, once per repository",
+              ([p for p in last_gh[0].paths if "/contents/" in p], "0 repo(s) with no delivery.json" in m["said"]),
+              (["/repos/%s/contents/delivery.json" % R], True))
+        code, m = go_o([SCOPED], [opr(7, "my-branch")], {7: ["src/billing/pay.py"]})
+        check("guarded: ...and with no delivery.json the floor alone is checked, and the said line counts it",
+              (m["state"], guarded_of(m), m["reason"], "1 repo(s) with no delivery.json (floor only)" in m["said"]),
+              (CLEAR, [], "", True))
+        for label, contents, needle in (
+                ("a delivery.json that does not parse", blob(b"{not json"), "does not parse"),
+                ("riskPaths that are not a list", blob({"autonomy": {"riskPaths": "src/**"}}), "does not parse"),
+                ("riskPaths GitHub would not give, for any reason but a 404",
+                 SourceError("GitHub answered HTTP 403", whole=False, code=403), "riskPaths could not be read"),
+                ("more riskPaths than it reads", blob({"autonomy": {"riskPaths": ["p%d/" % i for i in range(201)]}}),
+                 "only the first 200")):
+            code, m = go_o([SCOPED], [opr(7, "my-branch")], {7: ["src/a.py"]}, contents=contents)
+            check("guarded: %s leaves the floor, and the monitor is blind, never clear" % label,
+                  (m["state"], needle in m["reason"]), (BLIND, True))
+        code, m = go_o([SCOPED], [opr(7, "my-branch")], {7: SourceError("GitHub answered HTTP 500", whole=False)})
+        check("guarded: a pull request with no ticket whose files could not be read is blind, never clear",
+              (m["state"], "not all read" in m["reason"]), (BLIND, True))
+        floor, why, absent = guard_list(GitHub(FakeGH({}), None, 9, lambda: False, lambda: NOW), R)
+        check("guarded: the floor is the Hooks change guard's own list",
+              (len(floor), why, absent, [any(rx.match(p) for rx in floor) for p in (
+                  ".claude/hooks/pre-tool-use.py", ".claude/settings.local.json", ".github/workflows/ci.yml",
+                  "scripts/check_grader_paths.py", "scripts/pipeline_hold.py", "scripts/secret_shapes.py",
+                  "delivery.json", "a/b/.secretlintignore", "src/a.py", "docs/WATCHER.md", "scripts/foo.py",
+                  "scripts/telemetry_block.py")]),
+              (len(grader_paths.FLOOR), None, True, [True] * 8 + [False] * 4))
+
         # -- KIT-517: the watcher checks its own files against the manifest, every pass ------------------------------------------
         inst = os.path.join(tmp, "install")
         for sub in ("scripts", "schemas", "etc"):
@@ -2534,7 +3033,7 @@ def selftest():
         check("install: a mismatch makes every monitor that could be on blind, by name, and the pass exit 4",
               (code_i, len(on_i), all(m["state"] == BLIND and "do not match" in m["reason"] and
                                       "scripts/check_schemas.py" in m["reason"] for m in on_i)),
-              (EXIT_BLIND, 7, True))
+              (EXIT_BLIND, 8, True))
         check("install: ...and it is said, loud, in the pass's own output",
               any("do not match" in line for line in said_i), True)
         try:
@@ -2997,7 +3496,7 @@ def selftest():
               [(f["what"], f["value"], f["limit"]) for f in m["findings"]], [("approval-rate", 3, 2)])
         check("...and within it, nothing", approvals(vgh(), limits={"day_approvals": 3})["findings"], [])
         check("...and with no limit set the rate is said, never judged",
-              ("no day_approvals limit set" in approvals(vgh())["said"],
+              ("in 24 hours (no limit set)" in approvals(vgh())["said"],
                approvals(vgh())["findings"]), (True, []))
         ledger_of((vrow("merge", "acme/app#40", H[14], "escalated-urgent", layers={
                       "hard_limits": "pass", "evidence": "pass", "agent": "fail"}), 60),
@@ -3009,6 +3508,35 @@ def selftest():
         check("each urgent escalation inside the lookback is a page: the validator's urgent route",
               whats(m), [(PAGE, "urgent-escalation", "KIT-9", None),
                          (PAGE, "urgent-escalation", "acme/app#40", None)])
+
+        # KIT-518: a run of approvals in a row, longer than the watcher's own limit.
+        NO_AGENT = {"layers": {"hard_limits": "pass", "evidence": "fail", "agent": "not-run"}, "agent_says": None}
+
+        ledger_of((vrow("merge", "acme/app#50", H[16], "sent-back", **NO_AGENT), 300),
+                  (vrow("plan", "KIT-3", None, "approved"), 200),
+                  (vrow("piece", "KIT-4", None, "approved"), 100),
+                  (vrow("merge", "acme/app#51", H[17], "approved"), 50))
+        m = approvals(vgh(), limits={"approvals_in_a_row": 2})
+        check("a run of approvals longer than its limit is a page, named by its first approval, with the figures",
+              (m["state"], [(f["level"], f["what"], f["ref"], f["value"], f["limit"], f["at"]) for f in m["findings"]]),
+              (FLAGGED, [(PAGE, "approvals-in-a-row", "KIT-3", 3, 2, ago(200))]))
+        ok("...and the said line counts the run against its limit", "3 in a row (limit 2)" in m["said"], m["said"])
+        check("...a run as long as its limit is not one", approvals(vgh(), limits={"approvals_in_a_row": 3})["findings"], [])
+        m = approvals(vgh())
+        check("...with no limit set the run is said, never judged",
+              ("3 in a row (no limit set)" in m["said"], m["findings"]), (True, []))
+        ledger_of((vrow("plan", "KIT-3", None, "approved"), 200),
+                  (vrow("piece", "KIT-4", None, "held", **NO_AGENT), 150),
+                  (vrow("piece", "KIT-5", None, "approved"), 100),
+                  (vrow("merge", "acme/app#51", H[17], "approved"), 50))
+        m = approvals(vgh(), limits={"approvals_in_a_row": 2})
+        check("...a hold, a send-back or an escalation ends a run, and the next one counts from there",
+              (m["findings"], "2 in a row" in m["said"]), ([], True))
+        ledger_of((vrow("plan", "KIT-3", None, "approved"), 60 * 30),
+                  (vrow("piece", "KIT-4", None, "approved"), 60 * 29),
+                  (vrow("piece", "KIT-5", None, "approved"), 60 * 28))
+        check("...a run whose newest approval is older than the lookback is not flagged again",
+              approvals(vgh(), limits={"approvals_in_a_row": 2})["findings"], [])
 
         # A watcher that was down longer than its lookback reads back to its last pass.
         with open(status_path, encoding="utf-8") as fh:
@@ -3073,8 +3601,21 @@ def selftest():
               ([], FLAGGED, "second-hand", [("approval-rate", "merge-without-approval", "acme/app#14")]))
         if os.path.exists(hold2):
             os.unlink(hold2)
+        # End to end: a run of approvals conforms, is a page, and holds nothing.
+        ledger_of((vrow("plan", "KIT-3", None, "approved"), 60), (vrow("piece", "KIT-4", None, "approved"), 50),
+                  (vrow("piece", "KIT-5", None, "approved"), 40))
+        hold3 = os.path.join(tmp, "holdfolder", "hold-518.json")
+        code, said_ = go(gh=vgh(), usage=usage_doc(), validator_ledger=vpath, owner_logins=["the-owner"],
+                         hold_file=hold3, limits=dict(raw_cfg()["limits"], approvals_in_a_row=2))
+        doc = written()
+        check("end to end: a run of approvals conforms, is a page, and holds nothing",
+              (check_schemas.document_problems(doc, SCHEMA_NAME),
+               [(f["what"], f["level"]) for f in mon(doc, "approval-rate")["findings"]], os.path.exists(hold3)),
+              ([], [("approvals-in-a-row", PAGE)], False))
         for label, over, want in (
                 ("day_approvals that is not whole", {"limits": {"day_approvals": 2.5}}, "day_approvals"),
+                ("approvals_in_a_row that is not whole", {"limits": {"approvals_in_a_row": 2.5}},
+                 "approvals_in_a_row"),
                 ("an owner login that is not one", {"owner_logins": ["not a login"]}, "owner_logins"),
                 ("a relative ledger path", {"validator_ledger": "ledger.json"}, "validator_ledger")):
             try:

@@ -105,7 +105,7 @@ One JSON file. `python3 scripts/pipeline_sweep.py --example-config` prints every
 | `session_root` | `/tmp/claude-<uid>` | Claude Code's temp folder for the account. |
 | `temp_dir` | the account's own | The account's `TMPDIR`. On macOS it asks `getconf DARWIN_USER_TEMP_DIR`. |
 | `look_record_dir` | none | The look tool's `record_dir`. Its own folder: never the worktree folder or the dispatcher's home. Empty sweeps no look folder. |
-| `heartbeat_file` | none | An absolute file the sweep writes after each real pass (schema, time, exit), so the health watch can say the sweep stopped (KIT-689). Name the same file as `SWEEP_HEARTBEAT_FILE` in `update.conf`. Empty: none is written, and the watch reads the sweep as off. |
+| `heartbeat_file` | none | An absolute file the sweep writes after each real pass (schema, time, exit), so the health watch can say the sweep stopped (KIT-689). The sweep's installer sets it to `heartbeat.json` beside `sweep.json`. The health watch cannot read the role account's folder, so name this file as `SWEEP_HEARTBEAT` in `watcher.conf`: the watcher's copier copies it, and the one command sets `SWEEP_HEARTBEAT_FILE` in `update.conf` to the copy (KIT-782). Empty: none is written, and the watch reads the sweep as off. |
 
 Folders are absolute, real paths. A path through a symlink, or a top-level folder such as
 `/opt`, is a config error.

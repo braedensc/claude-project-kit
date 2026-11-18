@@ -36,6 +36,7 @@ ALLOWED = (
     ("scripts/check_direct_checks.py", "yaml", "parses the tracked YAML for --json-yaml; CI installs PyYAML, and an ImportError is reported as could-not-check"),
     ("scripts/check_runner_pin.py", "yaml", "parses workflows as YAML, not by pattern; says COULD NOT CHECK without it"),
     ("scripts/check_workflow_calls.py", "yaml", "parses workflows as YAML; CI installs PyYAML"),
+    ("scripts/check_template_label_gate.py", "yaml", "parses the label gate template as YAML; CI installs PyYAML"),
     ("scripts/check_agent_trigger_author.py", "yaml", "parses workflows as YAML; CI installs PyYAML"),
     ("scripts/check_label_gate.py", "yaml", "parses the label gate's workflow as YAML; says COULD NOT CHECK without it"),
     ("scripts/pipeline_safe_outputs_probe.py", "yaml", "reads a workflow as YAML in the probe; an ImportError is handled"),

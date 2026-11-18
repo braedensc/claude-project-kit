@@ -35,6 +35,7 @@ WHAT IT NEVER DOES (asserted in --selftest): write a file, start a process of it
 answer.
 """
 import argparse
+import collections.abc
 import json
 import os
 import re
@@ -108,7 +109,8 @@ def credential(cfg, environ):
         return None, None, "the config's app_id is not a positive whole number"
     if not isinstance(env, str) or not ENV_NAME_RE.fullmatch(env):
         return None, None, "the config's key_file_env is not the name of an environment variable"
-    path = environ.get(env) if isinstance(environ, dict) else None
+    # A mapping, not only a dict: the process's own environment (os.environ) is one (KIT-539).
+    path = environ.get(env) if isinstance(environ, collections.abc.Mapping) else None
     if not isinstance(path, str) or not path.strip():
         return None, None, "$%s is unset: it names the validator app's key file" % env
     if not os.path.isabs(path) or any(ord(c) < 32 for c in path):
@@ -339,6 +341,25 @@ def selftest():
                   post(env=env)["why"],
                   "nothing posted: $VALIDATOR_APP_KEY_FILE is unset: it names the validator "
                   "app's key file")
+        # The process's own environment is a mapping, never a dict (os.environ): the job that posts
+        # passes it, and the key file it names is read from it (KIT-539).
+        import collections.abc
+
+        class Environ(collections.abc.Mapping):
+            def __init__(self, d):
+                self._d = dict(d)
+
+            def __getitem__(self, k):
+                return self._d[k]
+
+            def __iter__(self):
+                return iter(self._d)
+
+            def __len__(self):
+                return len(self._d)
+        check("credential: an environment that is a mapping, as os.environ is, is read",
+              (credential(CFG, Environ(ENV)), post(env=Environ(ENV))["result"]),
+              ((42, key, None), POSTED))
 
         # 6. A post that fails holds, in words: never a quiet pass.
         refused = dict(GOOD)
