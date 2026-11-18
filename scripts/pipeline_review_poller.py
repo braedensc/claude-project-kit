@@ -218,7 +218,11 @@ REVIEW TICKETS ON THE WORK TEAMS, AND WHY THEIR ROUTING IS CHECKED (KIT-597)
       on the ticket's first session. The note is posted before the session's runner starts;
       the EARLIEST routing-shaped thought counts, because a model could imitate a later one;
     - a note naming any other setup, a route other than the tag or label, or NO NOTE within
-      the wait is a misroute. Evidence first: the repository's own stop record, and the idea
+      the wait is a misroute. A wrong note never waits. THE WAIT GROWS WITH THE QUEUE
+      (KIT-795): the plain wait, plus a minute for each of this poller's review tickets in
+      flight when this one was filed, up to fifteen minutes, because a busy dispatcher posts
+      its notes later. A pass sleeps only through the plain wait; later passes check the
+      rest, as "not routed yet". Evidence first: the repository's own stop record, and the idea
       gate's stop file when none stands there (so planning stops too). Then the review ticket
       is cancelled (that stops its session and removes its working copy), and the owner is
       paged with the planner's own `needs-human-routing` mark, which the notifier trusts
@@ -431,6 +435,14 @@ MODE_WORK_TEAMS = "work-teams"          # each coding ticket's own team, routing
 # setup hook runs (the note comes after it). The planner job's own numbers.
 DEFAULT_ROUTING_WAIT_SECONDS = 120
 SETUP_HOOK_WAIT_SECONDS = 330
+# KIT-795: and longer while the dispatcher is busy with earlier review tickets. On 17 Nov a
+# burst of review tickets met ten running reviews; one note came late, the plain wait read
+# it as a misroute, and every review paused for six hours. So each of this poller's review
+# tickets still in flight when a ticket is filed (its routing not yet confirmed, or its
+# review not yet collected) adds this much to that ticket's wait, up to the longest wait.
+# A pass still sleeps only through the plain wait; a longer one is checked on later passes.
+ROUTING_WAIT_PER_TICKET_SECONDS = 60
+ROUTING_WAIT_LONGEST_SECONDS = 900
 ROUTING_POLL_SECONDS = 5
 # A routing check stops this long before the run's own timeout; the next pass finishes it.
 ROUTING_PASS_MARGIN_SECONDS = 60
@@ -606,8 +618,10 @@ CONFIG_KEYS = {
     "dispatcher_version_url": "work teams: the dispatcher's own /version route, "
                               "http://127.0.0.1:<port>/version; reviews pause on any other version",
     "routing_wait_seconds": "work teams, optional: how long the dispatcher's routing note may take "
-                            "after filing (default %d, %d while a setup hook runs)"
-                            % (DEFAULT_ROUTING_WAIT_SECONDS, SETUP_HOOK_WAIT_SECONDS),
+                            "after filing (default %d, %d while a setup hook runs), and %d more "
+                            "for each review ticket still in flight when it was filed, up to %d"
+                            % (DEFAULT_ROUTING_WAIT_SECONDS, SETUP_HOOK_WAIT_SECONDS,
+                               ROUTING_WAIT_PER_TICKET_SECONDS, ROUTING_WAIT_LONGEST_SECONDS),
     "collect_timeout_seconds": "optional: how long a review ticket may stay unanswered",
     "run_timeout_seconds": "optional: wall clock for ONE run before it is cut off (exit 4)",
     "state_keep_days": "optional: whole days a closed or merged PR's files stay under state_dir before the pass that wrote them removes them (default 30; 0 keeps them for ever)",
@@ -3660,9 +3674,37 @@ def _setup_hook_running(acts):
     return False
 
 
+def review_tickets_in_flight(seen, key):
+    """How many of this poller's OTHER review tickets are in flight: filed and not yet
+    collected, so their routing is still unconfirmed or their review still runs. The
+    dispatcher is busy with each one, whatever its repository, and each can delay a new
+    ticket's routing note (KIT-795)."""
+    return sum(1 for k, r in (seen or {}).items()
+               if k != key and isinstance(r, dict) and r.get("status") == "pending"
+               and r.get("review_ticket_id"))
+
+
+def routing_wait_seconds(cfg, routing, setup=False):
+    """How long one review ticket's routing note may take after filing. The plain wait, plus
+    ROUTING_WAIT_PER_TICKET_SECONDS for each review ticket in flight when it was filed, up to
+    ROUTING_WAIT_LONGEST_SECONDS; at least SETUP_HOOK_WAIT_SECONDS while a setup hook runs.
+    A ticket filed before KIT-795 has no count, so it keeps the plain wait."""
+    plain = cfg["routing_wait_seconds"]
+    ahead = (routing or {}).get("in_flight")
+    if type(ahead) is not int or ahead < 0:
+        ahead = 0
+    wait = min(plain + ROUTING_WAIT_PER_TICKET_SECONDS * ahead,
+               max(plain, ROUTING_WAIT_LONGEST_SECONDS))
+    return max(wait, SETUP_HOOK_WAIT_SECONDS) if setup else wait
+
+
 def check_review_routing(cfg, record, sessions, api_key, now):
-    """("ok" | "wrong" | "pending", evidence) for one review ticket, from the EARLIEST
-    routing-shaped thought on its first session. "pending" only while the wait lasts."""
+    """("ok" | "wrong" | "pending" | "queued", evidence) for one review ticket, from the
+    EARLIEST routing-shaped thought on its first session. A note naming any other setup is
+    "wrong" at once. With no note yet: "pending" inside the plain wait (the pass sleeps on
+    it), "queued" past it but inside the ticket's own longer wait (not routed yet, because
+    the dispatcher is busy with earlier review tickets; later passes check it again), and
+    "wrong" once its own wait is out (KIT-795)."""
     routing = record.get("routing") or {}
     created = _parse_iso(record.get("created_at"))
     created_epoch = created.timestamp() if created else now
@@ -3686,19 +3728,24 @@ def check_review_routing(cfg, record, sessions, api_key, now):
             ok, reason = machine.routing_verdict(body, routing.get("entry"), "a review ticket")
             evidence["reason"] = reason
             return ("ok" if ok else "wrong"), evidence
-    limit = SETUP_HOOK_WAIT_SECONDS if setup else cfg["routing_wait_seconds"]
-    if now - created_epoch >= limit:
-        evidence.update(checked_at=_now_iso(), reason=(
-            "no routing note from the dispatcher within %d seconds%s"
-            % (limit, "" if sessions else ", and no session at all")))
+    plain, limit = routing_wait_seconds(cfg, None, setup), routing_wait_seconds(cfg, routing, setup)
+    waited = now - created_epoch
+    if waited >= limit:
+        evidence.update(checked_at=_now_iso(), wait_seconds=limit, reason=(
+            "no routing note from the dispatcher within %d seconds%s%s"
+            % (limit, "" if sessions else ", and no session at all",
+               (", the longer wait for a ticket filed while %d other review ticket(s) were in "
+                "flight" % routing["in_flight"]) if limit > plain else "")))
         return "wrong", evidence
-    return "pending", evidence
+    return ("pending" if waited < plain else "queued"), evidence
 
 
 def settle_routings(cfg, seen, api_key, dry_run, result):
     """Check the routing of every review ticket still waiting for it, together, until each
-    has a verdict or the pass's own deadline is near. A check left pending is finished first
-    on the next pass. Work teams only."""
+    has a verdict, or until the only ones left are past the plain wait (the dispatcher is
+    busy with earlier review tickets: later passes check them again, so a pass sleeps no
+    longer than it did before KIT-795), or until the pass's own deadline is near. A check
+    left waiting is finished first on the next pass. Work teams only."""
     if cfg.get("mode") != MODE_WORK_TEAMS:
         return
     clock = cfg.get("_clock") or _Clock
@@ -3707,6 +3754,9 @@ def settle_routings(cfg, seen, api_key, dry_run, result):
         deadline = clock.monotonic() + SETUP_HOOK_WAIT_SECONDS + ROUTING_POLL_SECONDS
     pending = [(k, r) for k, r in sorted(seen.items())
                if (r.get("routing") or {}).get("verdict") == "pending" and r.get("review_ticket_id")]
+    # The heartbeat's count is the review tickets still waiting when the pass ends, so each
+    # call sets it afresh rather than adding to the earlier call's.
+    result.routing_waiting, unread = len(pending), 0
     while pending:
         try:
             sessions = sessions_by_issue([r["review_ticket_id"] for _k, r in pending], api_key)
@@ -3715,7 +3765,7 @@ def settle_routings(cfg, seen, api_key, dry_run, result):
                 "next pass, and nothing is collected meanwhile" % (len(pending), exc))
             result.errors += 1
             return
-        still = []
+        still, fresh = [], False
         for key, record in pending:
             try:
                 verdict, evidence = check_review_routing(
@@ -3724,6 +3774,7 @@ def settle_routings(cfg, seen, api_key, dry_run, result):
                 log("FAIL: the routing of %s could not be read (%s); checked again next pass"
                     % (record.get("review_ticket"), exc))
                 result.errors += 1
+                unread += 1
                 continue
             if verdict == "ok":
                 record["routing"] = dict(record["routing"], **dict(evidence, verdict="ok"))
@@ -3735,13 +3786,16 @@ def settle_routings(cfg, seen, api_key, dry_run, result):
                 trip_misroute(cfg, seen, key, record, evidence, api_key, dry_run, result)
             else:
                 still.append((key, record))
+                fresh = fresh or verdict == "pending"
         pending = still
+        result.routing_waiting = len(pending) + unread
         if not pending:
             break
-        if clock.monotonic() + ROUTING_POLL_SECONDS > deadline:
-            result.routing_waiting += len(pending)
-            log("NOTE: %d review ticket(s) still wait for their routing note; the next pass "
-                "finishes the check, and nothing is collected meanwhile" % len(pending))
+        if not fresh or clock.monotonic() + ROUTING_POLL_SECONDS > deadline:
+            log("NOTE: %d review ticket(s) still wait for their routing note%s; the next pass "
+                "checks again, and nothing is collected meanwhile"
+                % (len(pending), "" if fresh else ", each behind earlier review tickets and "
+                   "inside its own longer wait"))
             break
         clock.sleep(ROUTING_POLL_SECONDS)
 
@@ -4617,7 +4671,10 @@ def scan_pr(cfg, owner_repo, pr, seen, linear_key, dry_run, result, rereview=Non
                 "(%s); discovery may read its session as coding work until it is"
                 % (issue.get("identifier"), exc))
             result.errors += 1
-        record["routing"] = {"verdict": "pending", "entry": review_entry_name(owner_repo)}
+        # KIT-795: how many review tickets were in flight when this one was filed sets how long
+        # its routing note may take. Counted before this record is written, so never itself.
+        record["routing"] = {"verdict": "pending", "entry": review_entry_name(owner_repo),
+                             "in_flight": review_tickets_in_flight(seen, key)}
     record.update(status="pending", basis=basis, review_ticket_id=issue.get("id"),
                   review_ticket=issue.get("identifier"), review_ticket_url=issue.get("url") or "",
                   reused=bool(reused), body_sha256=body_sha256(body),
@@ -5680,7 +5737,12 @@ def _selftest_work_teams(check, basis, diff):
                   (EXIT_OK, "pending", 1))
             check("work teams: an unconfirmed review is never collected",
                   (collect(c, False), "waits for its routing" in sys.stdout.getvalue()), (EXIT_OK, True))
-            clock.sleep(DEFAULT_ROUTING_WAIT_SECONDS + 5)
+            # KIT-795: two reviews were still in flight when it was filed, so its own wait is
+            # longer than the plain one, and only past it is a missing note a misroute.
+            check("work teams: a ticket records the review tickets in flight when it was filed",
+                  ((rec.get("routing") or {}).get("in_flight"), routing_wait_seconds(c, rec.get("routing"))),
+                  (2, DEFAULT_ROUTING_WAIT_SECONDS + 2 * ROUTING_WAIT_PER_TICKET_SECONDS))
+            clock.sleep(routing_wait_seconds(c, rec.get("routing")) + 5)
             c["_deadline"] = clock.m + 600
             c.pop("_workspace_resolved", None)
             code = scan(c, False)
@@ -5886,6 +5948,168 @@ def _selftest_work_teams(check, basis, diff):
                   (code5, len(fake5.created),
                    [(n, "reviews are paused for o/r" in body) for n, body, _repo in posted]),
                   (EXIT_ERROR, 0, [(52, True)]))
+
+            # KIT-795: a burst of review tickets. On 17 Nov about 25 were filed within an hour,
+            # and one routing note was late while ten reviews still ran. The plain wait read
+            # it as a misroute and paused every review for six hours. Here the dispatcher is
+            # busy: each note comes 50 s after the one before, by the pass's own clock.
+            def iso(t):
+                return datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+            class Busy(WFake):
+                """A dispatcher busy with earlier review tickets. `plan` holds, per ticket in
+                filing order, (seconds after filing, routing note or None for never). An
+                activity shows only once the clock reaches its time."""
+                def __init__(self, clock, plan):
+                    WFake.__init__(self)
+                    self.clock, self.plan = clock, list(plan)
+                    self.dispatch = self.route
+
+                def route(self, _issue):
+                    delay, body = self.plan.pop(0)
+                    acts = [thought("On it.", iso(self.clock.t))]
+                    if body is not None:
+                        acts.append(thought(body, iso(self.clock.t + delay)))
+                    return acts
+
+                def __call__(self, query, variables, api_key):
+                    if re.search(r"\bReviewRouting\b", query):
+                        shown = [a for a in self.routing.get(variables["id"]) or []
+                                 if _parse_iso(a["createdAt"]).timestamp() <= self.clock.t]
+                        return {"agentSession": {"id": variables["id"], "activities": {
+                            "nodes": shown, "pageInfo": {"hasNextPage": False, "endCursor": None}}}}
+                    return WFake.__call__(self, query, variables, api_key)
+
+            def busy_cfg(name):
+                cb = dict(c, state_dir=os.path.join(tmp, "state-" + name),
+                          shared_stop_file=os.path.join(tmp, "a-" + name, "state", "stop.json"))
+                os.makedirs(cb["state_dir"])
+                return cb
+
+            real_now_iso = _now_iso
+
+            def busy_pass(cb, linear, clock):
+                # Filing times on the pass's own clock too, so a wait is measured on one clock.
+                globals()["linear_graphql"], globals()["_now_iso"] = linear, lambda: iso(clock.t)
+                cb["_clock"], cb["_deadline"] = clock, clock.m + 600
+                for k in ("_workspace_resolved", "_route_labels", "_counts"):
+                    cb.pop(k, None)
+                try:
+                    return scan(cb, False)
+                finally:
+                    globals()["linear_graphql"], globals()["_now_iso"] = fake, real_now_iso
+
+            def busy_state(cb, numbers):
+                seen_b = load_seen(seen_path(cb["state_dir"]))
+                return [((seen_b.get(pr_key("o/r", n)) or {}).get("routing") or {}).get("verdict")
+                        for n in numbers]
+
+            ok_note = note("reviews-r")
+            c6, clock6 = busy_cfg("burst"), Clock()
+            busy6 = Busy(clock6, [(50 * k, ok_note) for k in (1, 2, 3, 4, 5)])
+            open_prs[:] = [pr(n) for n in (61, 62, 63, 64)]
+            started = clock6.m
+            code6 = busy_pass(c6, busy6, clock6)
+            check("burst: notes later than the plain wait read as not routed yet, never a misroute",
+                  (code6, busy_state(c6, (61, 62, 63, 64)), (c6.get("_counts") or {}).get("routing_waiting"),
+                   busy6.comments, load_review_stops(c6["state_dir"]),
+                   machine.read_stop(c6["shared_stop_file"])),
+                  (EXIT_OK, ["ok", "ok", "pending", "pending"], 2, [], {}, None))
+            check("burst: a pass still sleeps no longer than the plain wait",
+                  clock6.m - started <= DEFAULT_ROUTING_WAIT_SECONDS + ROUTING_POLL_SECONDS, True)
+            clock6.sleep(40)                      # about 160 s after filing: the third note is in
+            code6b = busy_pass(c6, busy6, clock6)
+            clock6.sleep(45)                      # about 210 s: the fourth
+            code6c = busy_pass(c6, busy6, clock6)
+            check("burst: each later pass confirms the notes that came, with no pause",
+                  (code6b, code6c, busy_state(c6, (61, 62, 63, 64)),
+                   (c6.get("_counts") or {}).get("routing_waiting"), busy6.comments,
+                   load_review_stops(c6["state_dir"])),
+                  (EXIT_OK, EXIT_OK, ["ok"] * 4, 0, [], {}))
+            # The 21:30 shape: four reviews still run (confirmed, not yet collected) when a new
+            # ticket is filed, and its note comes after the plain wait. Not a misroute either.
+            open_prs[:] = [pr(65)]
+            code6d = busy_pass(c6, busy6, clock6)
+            clock6.sleep(140)                     # about 260 s after filing: its note is in
+            code6e = busy_pass(c6, busy6, clock6)
+            check("burst: a ticket filed while earlier reviews still run waits longer too",
+                  (code6d, code6e, busy_state(c6, (65,)), busy6.comments,
+                   load_review_stops(c6["state_dir"])),
+                  (EXIT_OK, EXIT_OK, ["ok"], [], {}))
+
+            # A note naming another setup still pauses at once, inside its own longer wait.
+            c7, clock7 = busy_cfg("wrong"), Clock()
+            busy7 = Busy(clock7, [(50, ok_note), (100, note("r", "Team routing")), (150, ok_note)])
+            open_prs[:] = [pr(n) for n in (71, 72, 73)]
+            started = clock7.m
+            code7 = busy_pass(c7, busy7, clock7)
+            rec72 = load_seen(seen_path(c7["state_dir"])).get(pr_key("o/r", 72)) or {}
+            check("burst: a note naming another setup pauses at once, before its own wait is out",
+                  (code7, rec72.get("status"), (rec72.get("routing") or {}).get("reason"),
+                   sorted(load_review_stops(c7["state_dir"])),
+                   [cm.get("issueId") for cm in busy7.comments],
+                   clock7.m - started < routing_wait_seconds(c7, rec72.get("routing"))),
+                  (EXIT_ERROR, MISROUTED_STATUS, "the routing note names 'r', not 'reviews-r'",
+                   ["o/r"], [rec72.get("review_ticket_id")], True))
+
+            # A note that never comes waits out that ticket's own wait, and only then pauses.
+            c8, clock8 = busy_cfg("never"), Clock()
+            busy8 = Busy(clock8, [(50, ok_note), (100, ok_note), (0, None)])
+            open_prs[:] = [pr(n) for n in (81, 82, 83)]
+            code8 = busy_pass(c8, busy8, clock8)
+            rec83 = load_seen(seen_path(c8["state_dir"])).get(pr_key("o/r", 83)) or {}
+            wait83 = DEFAULT_ROUTING_WAIT_SECONDS + 2 * ROUTING_WAIT_PER_TICKET_SECONDS
+            clock8.sleep(_parse_iso(rec83["created_at"]).timestamp() + wait83 - 5 - clock8.t)
+            code8b = busy_pass(c8, busy8, clock8)
+            before = (code8b, busy_state(c8, (83,)), load_review_stops(c8["state_dir"]), list(busy8.comments))
+            clock8.sleep(10)
+            code8c = busy_pass(c8, busy8, clock8)
+            rec83 = load_seen(seen_path(c8["state_dir"])).get(pr_key("o/r", 83)) or {}
+            check("burst: a note that never comes waits out its own wait, then pauses",
+                  (code8, before, code8c, rec83.get("status"),
+                   (rec83.get("routing") or {}).get("reason"), sorted(load_review_stops(c8["state_dir"]))),
+                  (EXIT_OK, (EXIT_OK, ["pending"], {}, []), EXIT_ERROR, MISROUTED_STATUS,
+                   "no routing note from the dispatcher within %d seconds, the longer wait for a "
+                   "ticket filed while 2 other review ticket(s) were in flight" % wait83, ["o/r"]))
+
+            # The wait's own rules: 60 s more per review ticket in flight, up to the longest
+            # wait; a ticket filed before KIT-795 (no count) or with a count that is not a
+            # count keeps the plain wait; a setup hook's longer wait still holds.
+            check("burst: the wait grows by a fixed step per ticket in flight, up to the longest wait",
+                  [routing_wait_seconds(c, r) for r in (
+                      None, {}, {"in_flight": 0}, {"in_flight": 1}, {"in_flight": 3},
+                      {"in_flight": 13}, {"in_flight": 14}, {"in_flight": 500},
+                      {"in_flight": -2}, {"in_flight": True}, {"in_flight": "9"}, {"in_flight": 2.5})],
+                  [120, 120, 120, 180, 300, 900, 900, 900, 120, 120, 120, 120])
+            check("burst: a setup hook keeps its own longer wait, and a long queue can pass it",
+                  [routing_wait_seconds(c, {"in_flight": n}, setup=True) for n in (0, 3, 5, 40)],
+                  [SETUP_HOOK_WAIT_SECONDS, SETUP_HOOK_WAIT_SECONDS, 420, ROUTING_WAIT_LONGEST_SECONDS])
+            check("burst: the longest wait is never shorter than a plain wait set high",
+                  routing_wait_seconds(dict(c, routing_wait_seconds=600), {"in_flight": 50}),
+                  max(600, ROUTING_WAIT_LONGEST_SECONDS))
+
+            def queued(acts, age, ahead):
+                lf = WFake()
+                lf.routing["s-x"] = acts
+                globals()["linear_graphql"] = lf
+                try:
+                    v, ev = check_review_routing(
+                        dict(c), {"review_ticket": "KIT-901", "created_at": T0,
+                                  "routing": {"entry": "reviews-r", "in_flight": ahead}},
+                        [{"id": "s-x"}], "x", t0 + age)
+                finally:
+                    globals()["linear_graphql"] = fake
+                return v, ev.get("reason") or ""
+
+            check("burst: with no note, pending inside the plain wait, queued past it inside the "
+                  "ticket's own wait, a misroute at its end; at most the longest wait",
+                  [queued([], age, ahead)[0] for age, ahead in (
+                      (119, 3), (120, 3), (299, 3), (300, 3), (899, 500), (900, 500), (120, 0))],
+                  ["pending", "queued", "queued", "wrong", "queued", "wrong", "wrong"])
+            check("burst: a wrong note is a misroute at once, whatever the queue",
+                  queued([thought(note("r", "Team routing"))], 5, 13)[0], "wrong")
+            check("burst: a right note past the plain wait, inside its own wait, is confirmed",
+                  queued([thought(note("reviews-r"))], 400, 13)[0], "ok")
     finally:
         sys.stdout, sys.stderr = real_out, real_err
         for k, v in saved.items():

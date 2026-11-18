@@ -674,8 +674,15 @@ wrote. On a separate Reviews team the same failure landed in a read-only reviewe
 - Right after filing, in the same pass, the poller reads the dispatcher's routing note on
   the ticket's first session. Only the earliest one counts: a model could imitate a later
   one. It must name `reviews-<name>` alone, by the tag or the label.
-- It waits up to `routing_wait_seconds` (default 120), or 330 seconds while a setup hook
-  runs. A check the pass had no time for is finished first on the next pass.
+- It waits `routing_wait_seconds` (default 120) when no other review ticket is in flight.
+  Each review ticket still in flight when this one was filed adds 60 seconds, up to 900
+  (15 minutes). In flight means filed and not yet collected. While a setup hook runs, the
+  wait is at least 330 seconds. The record keeps the count as `routing.in_flight`.
+- Why it grows (KIT-795): on 17 Nov a burst of review tickets met ten running reviews. One
+  note came late, the plain wait read it as a misroute, and every review paused for six hours.
+- A pass sleeps on a note only through the plain wait. A ticket past it, inside its own
+  wait, is "not routed yet": later passes check it again, and the heartbeat counts it in
+  `routing_waiting`. A check the pass had no time for is finished first on the next pass.
 - Only a confirmed review is collected. Until then the ticket's answer is never published.
 
 **When the note is wrong, or never comes:**
