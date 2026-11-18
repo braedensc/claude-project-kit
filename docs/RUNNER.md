@@ -152,7 +152,9 @@ The files sit behind the `hooks-change` label: a change to one changes what a se
   checks that neither a file tool nor Bash can write it.
 - **A kind without Bash** runs inside our own macOS sandbox, written for the run. It may write only
   the program's home and the run's temp folder. It may not read the store, the pins or the key,
-  apart from its own inputs and its own pin.
+  apart from its own inputs and its own pin. The folders on the way to those may be looked at by
+  their metadata alone, never listed: the program checks each folder on a path before it reads a
+  file there, and on 18 Nov 2026 it refused its own settings file when it could not.
 - **The kit's guard on every tool call,** from the engine's own folder (below).
 - **A short environment,** exactly its kind's names: the path (the program's own folder first),
   a home, a temp folder, the language, the sign-in token, and two switches.
@@ -220,9 +222,29 @@ python3 scripts/pipeline_runner_probe.py run --claude <the role's claude> --out 
 
 | Its rows | Must |
 | --- | --- |
-| Walls: its tools are only its kind's; nothing in the workspace loads; no read outside, of the store, the pins, the key or another session's transcript; the guard refuses a `.env` read and write; no write outside, nor into the sessions' home, by a file tool or Bash; Bash reaches no unlisted host and sees no key | PASS |
+| Walls: its tools are only its kind's; nothing in the workspace loads; no read outside, of the store, the pins, the key or another session's transcript; the guard refuses a `.env` read and write; no write outside, nor into the sessions' home, by a file tool or Bash; Bash reaches no unlisted host and no inbox socket; every name in Bash's environment that looks like a key is proven useless in the same run | PASS |
 | Work: the instructions arrive; reads, searches and writes inside work; Bash writes its workspace and temp folder; `git status` and a commit; a listed host is reached | WORKS, or the lane cannot move |
-| Facts: whether the code host's command-line tool gets through TLS in the sandbox, and whether the program reads a `.env` in its working folder | recorded |
+| Facts: whether the code host's command-line tool, Python and git each get through TLS in the sandbox, and whether the program reads a `.env` in its working folder | recorded |
+
+**What else is in Bash's environment.** The program and its built-in sandbox add names the runner
+does not give and cannot take away. Two of them look like keys, and neither is taken on trust:
+
+- `CLAUDE_CODE_MESSAGING_TOKEN`, with `CLAUDE_CODE_MESSAGING_SOCKET`: the program's cross-session
+  inbox, a Unix socket that takes messages into a session. The built-in sandbox blocks every Unix
+  socket, so the probe has Bash try that socket, and the token counts as useless only when it is
+  refused. Never set `sandbox.network.allowUnixSockets` or `allowAllUnixSockets` for a session.
+- `CLOUDSDK_PROXY_PASSWORD`, with the rest of the `*_PROXY` family: the sandbox's own credential for
+  its local proxy, which reaches only the listed hosts. It counts as useless only when that proxy
+  refuses an unlisted host in the same run.
+
+Any other name that looks like a key fails the row, and so does the sign-in token, which the
+program keeps from Bash (`bash-token` says whether it did).
+
+**No kind needs `gh` in a session.** `gh` fails TLS inside the built-in sandbox (`x509: OSStatus
+-26276`, measured 18 Nov 2026): the sandbox keeps the system's trust service from it, and the fix is
+not a wider network. When coding sessions move (KIT-645), they push with git and open a pull request
+through the kit's plain HTTPS fallback, `scripts/gh_fallback.py`. The probe measures the TLS of both,
+so the `gh` row stays information.
 
 Before any session, the probe asks the program for its version and its help. If the help lacks an
 option the command line uses, the probe stops and names it: a program that meets an unknown option

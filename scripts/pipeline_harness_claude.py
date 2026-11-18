@@ -246,6 +246,17 @@ def _sb(path):
     return '"%s"' % path                  # run_problems() keeps quotes and backslashes out
 
 
+def _on_the_way(item, folder):
+    """The folders from `folder` down to `item`'s parent, when `item` sits inside `folder`."""
+    if not item.startswith(folder.rstrip("/") + "/"):
+        return []
+    out, cur = [folder], os.path.dirname(item)
+    while cur != folder and cur.startswith(folder.rstrip("/") + "/"):
+        out.append(cur)
+        cur = os.path.dirname(cur)
+    return sorted(out)
+
+
 def profile(spec, run):
     """Our own sandbox for a kind without Bash, as profile text (KIT-630 row r5a). The last
     matching rule wins, so each exception comes after what it is an exception to."""
@@ -254,6 +265,13 @@ def profile(spec, run):
     inputs = ["  (subpath %s)" % _sb(run["run_dir"])]
     if run.get("pin"):
         inputs.append("  (literal %s)" % _sb(run["pin"]))
+    # The program checks each folder on a path before it reads a file there, and refuses a file
+    # whose path it cannot check (the probe, 18 Nov 2026). So the folders between a wall and the
+    # run's own inputs may be looked at, by their metadata only: their entries cannot be listed.
+    way = []
+    for item in [run["run_dir"]] + ([run["pin"]] if run.get("pin") else []):
+        for folder in (run["store"], run["pins"]):
+            way += [f for f in _on_the_way(item, folder) if f not in way]
     return "\n".join([
         "(version 1)",
         "; Our own sandbox around one %s session (KIT-704). The runner wrote it for this run, from" % spec["kind"],
@@ -272,7 +290,12 @@ def profile(spec, run):
     ] + walled[:-1] + [walled[-1] + ")",
         "; ...apart from reading this run's own inputs and its own pin, which the program and its guard read.",
         "(allow file-read*",
-    ] + inputs[:-1] + [inputs[-1] + ")", ""])
+    ] + inputs[:-1] + [inputs[-1] + ")"]
+        + ([
+            "; ...and the folders on the way to them, by their metadata alone: the program checks each one.",
+            "(allow file-read-metadata",
+        ] + ["  (literal %s)" % _sb(f) for f in way[:-1]] + ["  (literal %s))" % _sb(way[-1])] if way else [])
+        + [""])
 
 
 def command(spec, run, output="json"):
@@ -493,6 +516,12 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                                "network": {"allowedDomains": ["github.com", "api.github.com"]},
                                "filesystem": {"denyRead": deny_paths}}
         expect("%s: its settings file, exactly" % name, got, want)
+        # The program's own list of settings that weaken its sandbox. A Unix socket allowed would let
+        # Bash reach the program's cross-session inbox, which takes messages into a session.
+        weakening = ("allowUnixSockets", "allowAllUnixSockets", "allowLocalBinding", "allowMachLookup",
+                     "enableWeakerNestedSandbox", "enableWeakerNetworkIsolation", "allowAppleEvents")
+        expect("%s: no setting that weakens the sandbox" % name,
+               [k for k in weakening if k in json.dumps(got)], [])
         expect("%s: no file tool may write anywhere in the sessions' shared home, nor read its transcripts" % name,
                [r for r in got["permissions"]["deny"] if P["home"] in r],
                ["Read(/%s/.claude/**)" % P["home"], "Read(/%s/.claude.json)" % P["home"],
@@ -544,10 +573,14 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
     expect("the profile allows by default, then walls off writes and the four places",
            [ln for ln in text.splitlines() if ln.startswith("(")],
            ["(version 1)", "(allow default)", "(deny file-write*)", "(allow file-write*",
-            "(deny file-read* file-write*", "(allow file-read*"])
-    expect("the profile names each place exactly once",
+            "(deny file-read* file-write*", "(allow file-read*", "(allow file-read-metadata"])
+    expect("the profile names each place once, and the store and the pins again for their metadata alone",
            [text.count('"%s"' % p) for p in (P["store"], P["pins"], key, rdir, pin, P["home"], run["tmp"])],
-           [1, 1, 1, 1, 1, 1, 1])
+           [2, 2, 1, 1, 1, 1, 1])
+    expect("…exactly the folders between a wall and the run's own inputs, by metadata",
+           re.findall(r'\(literal "([^"]+)"\)', text.split("(allow file-read-metadata")[1]
+                      if "(allow file-read-metadata" in text else ""),
+           [P["store"], os.path.join(P["store"], "runs"), P["pins"]])
     if os.path.exists(SANDBOX_EXEC) and sys.platform == "darwin":
         for d in (rdir, run["tmp"], os.path.join(P["store"], "runs", "run-2")):
             os.makedirs(d)
@@ -567,18 +600,33 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                   "for name, path in json.loads(sys.argv[2]).items():\n"
                   "    try:\n        open(path, 'w').write('x'); out['write ' + name] = True\n"
                   "    except OSError:\n        out['write ' + name] = False\n"
+                  # The program checks every folder on a path before it reads a file there (it
+                  # refused its own settings file on 18 Nov when one could not be checked).
+                  "import os\n"
+                  "for name, path in json.loads(sys.argv[3]).items():\n"
+                  "    parts, ok = path.split('/')[1:], True\n"
+                  "    for i in range(1, len(parts) + 1):\n"
+                  "        try:\n            os.lstat('/' + '/'.join(parts[:i]))\n"
+                  "        except OSError:\n            ok = False\n"
+                  "    out['every folder on the path to ' + name] = ok\n"
+                  "try:\n    os.listdir(sys.argv[4]); out['list the store'] = True\n"
+                  "except OSError:\n    out['list the store'] = False\n"
                   "print(json.dumps(out, sort_keys=True))\n")
         writes = {"home": os.path.join(P["home"], "state.json"), "tmp": os.path.join(run["tmp"], "t"),
                   "workspace": os.path.join(ws, "made.txt"), "outside": os.path.join(P["outside"], "made.txt"),
                   "store": os.path.join(rdir, "made.txt"), "engine": os.path.join(P["engine"], "made.txt")}
         r = subprocess.run([SANDBOX_EXEC, "-f", os.path.join(rdir, "sandbox.sb"), PYTHON, "-I", "-c", script,
-                            json.dumps(files), json.dumps(writes)], capture_output=True, text=True, timeout=60)
+                            json.dumps(files), json.dumps(writes),
+                            json.dumps({"own-input": files["own-input"], "own-pin": pin}), P["store"]],
+                           capture_output=True, text=True, timeout=60)
         got = json.loads(r.stdout or "{}") if r.returncode == 0 else {"exit": r.returncode, "err": r.stderr[-300:]}
         expect("inside our own sandbox, for real: its inputs, its pin and the workspace are read; the store's other "
                "runs, other pins and the key are not; only its home and temp folder are written", got,
                {"own-input": True, "own-pin": True, "inside": True, "other-run": False, "other-pin": False,
                 "key": False, "write home": True, "write tmp": True, "write workspace": False,
-                "write outside": False, "write store": False, "write engine": False})
+                "write outside": False, "write store": False, "write engine": False,
+                "every folder on the path to own-input": True, "every folder on the path to own-pin": True,
+                "list the store": False})
     else:
         print("  (skipped: the live profile check needs %s on a Mac)" % SANDBOX_EXEC)
 
