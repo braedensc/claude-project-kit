@@ -7,6 +7,7 @@
   "model": "sonnet",
   "token_env": "CLAUDE_WRITER_OAUTH_TOKEN",
   "linear_key_file": "~/.pipeline-runner/tracker-key",
+  "push_token_file": "~/.pipeline-runner/push-token",
   "owner_user_ids": ["<the owner's tracker user id>"],
   "dispatcher_user_ids": ["<the old dispatcher's own tracker user id>"],
   "poll_seconds": 5,

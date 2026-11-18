@@ -16,7 +16,10 @@ WHAT IT BUILDS, for one run of one kind (scripts/pipeline_session_kinds.py), and
     profile()      for a kind without Bash, our own macOS sandbox around the whole program
                    (row r5a): no write but the program's own home and the run's temp folder, and no
                    read of the store, the pins or a key
-    environment()  exactly the kind's environment names, each from one fixed source here
+    environment()  exactly the kind's environment names, each from one fixed source here. The push
+                   token (KIT-886) reaches a kind only under a name its data lists: code, fix and
+                   conflict. git gets it through a helper given in the same environment, for
+                   github.com alone, after every stored helper is cleared
     workspace_problems()  a dotenv file in the workspace that names a variable the program reads
 
 A second harness would be a second file like this one, reading the same kind data. This one knows
@@ -30,7 +33,9 @@ file tool is denied the runner's store, the pins and each key file. In the sessi
 no file tool may write anywhere, and none may read the program's own state (its `.claude` folder
 and `.claude.json`, which hold every session's transcript). Bash's deny-read list names every
 place denied to Read; why the rest of the home stays readable is in walls(). git in a session
-reads no global config at all (GIT_CONFIG_GLOBAL is /dev/null).
+reads no global config at all (GIT_CONFIG_GLOBAL is /dev/null). In a kind that holds the push token
+(KIT-886), git's helpers from every other config are cleared, and one helper, by environment, hands
+git the token for github.com alone. Each key file, the push token's among them, is walled whole.
 
 WHAT IT NEVER WRITES.  A mode that skips the checks (`bypassPermissions`, `acceptEdits`,
 `--dangerously-skip-permissions`), `--add-dir`, a permission-prompt tool, or a file tool by bare
@@ -65,7 +70,20 @@ ENV_SOURCES = {"PATH": "path", "HOME": "home", "TMPDIR": "tmp", "LANG": "lang",
                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
                # git reads no global config at all: a file in the sessions' shared home is never
                # git's config, whoever wrote it there
-               "GIT_CONFIG_GLOBAL": "devnull"}
+               "GIT_CONFIG_GLOBAL": "devnull",
+               # KIT-886: the push token, which the runner reads from its own file, and git's helper
+               # for it as git's own config by environment: first every stored helper cleared (the
+               # system's keychain helper among them), then one that hands git the token for
+               # github.com alone. So no command line ever holds the token.
+               kinds_data.PUSH_TOKEN_ENV: "push", "GIT_CONFIG_COUNT": "git-count",
+               "GIT_CONFIG_KEY_0": "git-key-0", "GIT_CONFIG_VALUE_0": "git-value-0",
+               "GIT_CONFIG_KEY_1": "git-key-1", "GIT_CONFIG_VALUE_1": "git-value-1"}
+# git's helper: it reads what git writes to it, then answers a `get` with the token from its own
+# environment. It answers nothing else, and git asks it about github.com alone.
+GIT_PUSH_HOST = "https://github.com"
+GIT_PUSH_HELPER = ('!f() { cat >/dev/null; if test "$1" = get; then echo username=x-access-token; '
+                   'echo "password=$%s"; fi; }; f' % kinds_data.PUSH_TOKEN_ENV)
+GIT_PUSH_CONFIG = (("credential.helper", ""), ("credential.%s.helper" % GIT_PUSH_HOST, GIT_PUSH_HELPER))
 # The program applies a Read rule to these, so they are allowed by Read's own rule.
 COVERED_BY_READ = ("Grep", "Glob")
 FILE_RULE_TOOLS = ("Read", "Edit", "Write")         # the tools every wall is denied to, by rule
@@ -349,10 +367,18 @@ def search_path(claude_bin):
     return ":".join(out)
 
 
-def environment(spec, run, token):
-    """Exactly the kind's names, each from its one source here."""
+def environment(spec, run, token, push=None):
+    """Exactly the kind's names, each from its one source here. `push` is the push token (KIT-886).
+    It reaches the program only under a name the kind's data lists, so a kind that lists none never
+    gets it, whatever is offered. A kind that lists it and is offered none is a ValueError: it would
+    start a session that cannot push."""
+    if kinds_data.PUSH_TOKEN_ENV in spec["env"] and not push:
+        raise ValueError("a %s session needs the push token, and none was given" % spec.get("kind", "?"))
     src = {"path": search_path(run["claude_bin"]), "home": run["home"], "tmp": run["tmp"],
-           "lang": voice.DEFAULT_LANG, "token": token, "1": "1", "devnull": os.devnull}
+           "lang": voice.DEFAULT_LANG, "token": token, "1": "1", "devnull": os.devnull,
+           "push": push or "", "git-count": str(len(GIT_PUSH_CONFIG))}
+    for i, (key, value) in enumerate(GIT_PUSH_CONFIG):
+        src["git-key-%d" % i], src["git-value-%d" % i] = key, value
     return dict((name, src[ENV_SOURCES[name]]) for name in spec["env"])
 
 
@@ -407,6 +433,7 @@ def selftest():
 
 def _selftest():  # noqa: C901  (one battery, read top to bottom)
     import json
+    import shutil
     import subprocess
     import tempfile
     failures, counted = [], [0]
@@ -531,17 +558,84 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
     expect("the adapter adds no tool server of its own", mcp(kinds["code"], run), {"mcpServers": {}})
 
     # ---- the environment -------------------------------------------------- #
+    push = "fake-push-token-for-the-selftest"           # never a real token: nothing here reads one
     for name in sorted(kinds):
-        env = environment(kinds[name], run, "a-token")
+        env = environment(kinds[name], run, "a-token", push=push)
         expect("%s: its environment is exactly its kind's names" % name, sorted(env), sorted(kinds[name]["env"]))
         expect("%s: no API key, proxy or base address can be among them" % name,
                [k for k in env if PROGRAM_VARS.match(k) and k not in ENV_SOURCES], [])
-    env = environment(kinds["code"], run, "a-token")
+    env = environment(kinds["code"], run, "a-token", push=push)
     expect("the environment's values", (env["HOME"], env["TMPDIR"], env[voice.CHILD_TOKEN_VAR],
                                          env["PATH"].split(":")[0]), (P["home"], run["tmp"], "a-token", "/opt/x/bin"))
     expect("every kind with Bash runs git with no global config, so nothing in the shared home is git's config",
-           sorted(k for k in kinds if environment(kinds[k], run, "t").get("GIT_CONFIG_GLOBAL") == os.devnull),
+           sorted(k for k in kinds if environment(kinds[k], run, "t", push=push).get("GIT_CONFIG_GLOBAL")
+                  == os.devnull),
            sorted(k for k in kinds if "Bash" in kinds[k]["tools"]))
+    # KIT-886: the push token, offered to every kind, reaches code, fix and conflict alone.
+    held = dict((k, environment(kinds[k], run, "t", push=push)) for k in sorted(kinds))
+    expect("offered to every kind, the push token reaches code, fix and conflict, under its one name",
+           sorted((k, e[kinds_data.PUSH_TOKEN_ENV]) for k, e in held.items() if kinds_data.PUSH_TOKEN_ENV in e),
+           [("code", push), ("conflict", push), ("fix", push)])
+    expect("…and review, plan and acceptance get none of its names, nor git's helper",
+           [(k, n) for k, e in sorted(held.items()) if k in ("review", "plan", "acceptance")
+            for n in kinds_data.PUSH_ENV if n in e], [])
+    expect("…nor any value that holds it",
+           [k for k, e in sorted(held.items()) if k in ("review", "plan", "acceptance")
+            and any(push in v for v in e.values())], [])
+    try:
+        environment(kinds["fix"], run, "t")
+        said = "no error"
+    except ValueError as exc:
+        said = str(exc)
+    expect("a kind that holds the push token, offered none, is said: it never starts unable to push",
+           said, "a fix session needs the push token, and none was given")
+    sandboxes = dict((k, settings(kinds[k], run).get("sandbox") or {}) for k in held)
+    expect("a kind that holds it runs Bash inside the built-in sandbox, held to its host list (KIT-886)",
+           sorted((k, (sandboxes[k].get("network") or {}).get("allowedDomains"),
+                   sandboxes[k].get("allowUnsandboxedCommands")) for k in held
+                  if kinds_data.PUSH_TOKEN_ENV in held[k]),
+           [(k, run["hosts"], False) for k in ("code", "conflict", "fix")])
+    expect("the token is in nothing the adapter writes to a file: settings, tool servers, profile, command line",
+           [k for k in sorted(kinds) if push in json.dumps([settings(kinds[k], run), mcp(kinds[k], run),
+                                                            command(kinds[k], run), profile(kinds[k], run)])], [])
+
+    # git's helper for it, run by git itself (KIT-886). A stored helper is planted in a repository of
+    # the test's own, as the runner's clone could hold one. git's system config, where a keychain
+    # helper often sits, is never read, and a password that is not one of the two made up here is
+    # never shown: no real keychain or token can reach this test's words.
+    gdir = os.path.join(tmp, "git-helper")
+    if shutil.which("git", path=held["code"]["PATH"]):
+        subprocess.run(["git", "init", "--quiet", gdir], env={"PATH": held["code"]["PATH"], "HOME": tmp,
+                                                            "GIT_CONFIG_NOSYSTEM": "1",
+                                                            "GIT_CONFIG_GLOBAL": os.devnull},
+                       check=True, capture_output=True, timeout=60)
+        with open(os.path.join(gdir, ".git", "config"), "a") as fh:
+            fh.write('[credential]\n\thelper = "!f() { cat >/dev/null; echo username=stored; '
+                     'echo password=from-a-stored-helper; }; f"\n')
+
+        def fill(env, host):
+            """What git's helpers hand git for `host`, as its username and password lines."""
+            r = subprocess.run(["git", "credential", "fill"], input="protocol=https\nhost=%s\n\n" % host,
+                               env=dict(env, GIT_CONFIG_NOSYSTEM="1", GIT_TERMINAL_PROMPT="0"), cwd=gdir,
+                               capture_output=True, text=True, timeout=60)
+            known = ("password=" + push, "password=from-a-stored-helper")
+            return [ln if not ln.startswith("password=") or ln in known else "password=<not one made up here>"
+                    for ln in r.stdout.splitlines() if ln.startswith(("username=", "password="))]
+
+        no_reset = dict(held["code"], GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0=GIT_PUSH_CONFIG[1][0],
+                        GIT_CONFIG_VALUE_0=GIT_PUSH_CONFIG[1][1])
+        expect("git's helper hands a push kind's git the push token, for github.com, and the repository's "
+               "stored helper is never asked", fill(held["code"], "github.com"),
+               ["username=x-access-token", "password=" + push])
+        expect("…and nothing for a host that is not github.com", fill(held["code"], "example.org"), [])
+        expect("…while without the clearing, the stored helper is asked first and its answer wins: why a push "
+               "kind clears every helper", fill(no_reset, "github.com"),
+               ["username=stored", "password=from-a-stored-helper"])
+        expect("…and a kind without the push token gets the stored helper's answer: why the probe asks the "
+               "acceptance kind's git", fill(held["acceptance"], "github.com"),
+               ["username=stored", "password=from-a-stored-helper"])
+    else:
+        print("  (skipped: git's helper needs git)")
     expect("a name with no source is said, never passed",
            check(dict(kinds["code"], env=kinds["code"]["env"] + ["ANTHROPIC_API_KEY"])),
            ["code: env: ANTHROPIC_API_KEY has no source in the claude adapter, so it is never passed"])

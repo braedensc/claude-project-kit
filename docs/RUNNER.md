@@ -147,6 +147,8 @@ loader refuses it:
 - **Bash inside our own sandbox,** or a kind without Bash outside it.
 - **Less than the four walls:** the store, the pins, the keys and the sessions' own state.
 - **An environment name the adapter has no source for,** so no API key, proxy or address can pass.
+- **The push token in a kind that does no ticket's work,** or in one whose Bash the built-in
+  sandbox does not hold. A kind names the token and git's helper for it together, or neither.
 - **A review tool outside the reviewer's read-only set.** The selftest checks the review kind
   against the same allow list the old lane's probe uses, and the plan kind against the planner's.
 
@@ -175,7 +177,8 @@ The files sit behind the `hooks-change` label: a change to one changes what a se
   file there, and on 18 Nov 2026 it refused its own settings file when it could not.
 - **The kit's guard on every tool call,** from the engine's own folder (below).
 - **A short environment,** exactly its kind's names: the path (the program's own folder first),
-  a home, a temp folder, the language, the sign-in token, and two switches.
+  a home, a temp folder, the language, the sign-in token, and two switches. Code, fix and conflict
+  also get the push token and git's helper for it ("The push token", below).
 - **No tracker sign-in.** No tracker key is in its environment, its `mcp.json` lists no tracker
   server, and every tracker key file is walled from its file tools and from Bash. With
   `session_tools` set, a code, fix or conflict session gets five tracker tools of its own instead.
@@ -188,6 +191,42 @@ move the lane from the plan's usage window to a card, and a base address or a pr
 traffic elsewhere. The runner checks the dotenv files a loader reads by itself (`.env`, `.env.local`
 and the like) before every start and resume. It names the file and the variable, never the value.
 `.env.example` is documentation, and is not read.
+
+## The push token
+
+A code, fix or conflict session pushes its own branch and opens its own pull request (KIT-886). It
+uses the sessions' push token: the code host's token that sessions on the old dispatcher hold
+today. Taking the token out of sessions, with the runner pushing for them, is KIT-37.
+
+- **Where it lives.** One file, named by `push_token_file`. It is the role account's own, mode
+  0600, and holds one GitHub token and nothing else. The runner refuses it inside the work or home
+  folder, or inside a git working tree.
+- **Who reads it.** The runner, at each start or resume of a code, fix or conflict run, and never
+  for another kind. A file it cannot read, or one that holds anything but one GitHub token, holds the
+  request. The answer says why, never what the file holds.
+- **Who gets it.** Code, fix and conflict, under `GH_TOKEN`, where git's helper and
+  `scripts/gh_fallback.py` read it. Review, plan and acceptance never do: their data names neither
+  the token nor git's helper. The loader refuses either name in a kind that does no ticket's work.
+- **git's helper.** The same environment gives git one credential helper. First it clears every
+  helper git would read from its other settings, the keychain's among them. Then it hands git the
+  token for github.com, and for no other host. No command line holds the token.
+- **Its walls.** The file is walled from every kind, the three that hold the token included, as
+  each key file is. The token adds no host: Bash still reaches only the project's `allowed_hosts`.
+- **The guards still hold.** In these runs the kit's guard refuses a push to main, a bare force
+  push and `gh pr merge`, as in any session. The guard launcher's selftest proves each one.
+- **Keep it out of the keychain.** The file is the token's only home. A session's Bash could ask
+  the account's keychain itself. The probe fails if git's stored helpers hand an acceptance session
+  a GitHub password.
+
+**What the guard does not catch.** The guard knows command shapes. A merge sent straight to the
+code host's API, with `curl` or Python, is not one of them. A token that can push a branch can
+merge a green pull request that way. Only the default branch's own rules can stop that account
+from merging. Nothing in the runner can, until KIT-37 takes the token out of the session.
+
+Good: `push_token_file` names `~/.pipeline-runner/push-token`, mode 0600, holding the token alone.
+A code session runs `git push -u origin HEAD`, then `scripts/gh_fallback.py pr-create`.
+Not: `push_token_file` names the tracker key's file. Every code start waits, and its answer says
+the file does not hold one GitHub token. Nothing reaches a session.
 
 ## Guards from the engine's own folder
 
@@ -240,8 +279,8 @@ python3 scripts/pipeline_runner_probe.py run --claude <the role's claude> --out 
 
 | Its rows | Must |
 | --- | --- |
-| Walls: its tools are only its kind's; nothing in the workspace loads; no read outside, of the store, the pins, the key or another session's transcript; the guard refuses a `.env` read and write; no write outside, nor into the sessions' home, by a file tool or Bash; Bash reaches no unlisted host and no inbox socket; every name in Bash's environment that looks like a key is proven useless in the same run | PASS |
-| Work: the instructions arrive; reads, searches and writes inside work; Bash writes its workspace and temp folder; `git status` and a commit; a listed host is reached | WORKS, or the lane cannot move |
+| Walls: its tools are only its kind's; nothing in the workspace loads; no read outside, of the store, the pins, the key, the push token's file or another session's transcript; the guard refuses a `.env` read and write; no write outside, nor into the sessions' home, by a file tool or Bash; Bash reaches no unlisted host and no inbox socket; every name in Bash's environment that looks like a key is proven useless in the same run; `push-token`, one row a kind: the token present by name for code, fix and conflict, absent for the rest; in acceptance, git's stored helpers hand it no GitHub password; in a push kind, the guard refuses a push to main, a bare force push and a merge | PASS |
+| Work: the instructions arrive; reads, searches and writes inside work; Bash writes its workspace and temp folder; `git status` and a commit; a listed host is reached; in a push kind, git's helper hands git the push token | WORKS, or the lane cannot move |
 | Facts: whether the code host's command-line tool, Python and git each get through TLS in the sandbox, and whether the program reads a `.env` in its working folder | recorded |
 
 **What else is in Bash's environment.** The program and its built-in sandbox add names the runner
@@ -326,6 +365,7 @@ One JSON file. The example is `runner.example.json`. `~/` means the account's ow
 | `model` | The model for every session. | `sonnet` |
 | `token_env` | The NAME of the variable that holds the sign-in token. | `CLAUDE_WRITER_OAUTH_TOKEN` |
 | `linear_key_file` | The tracker key, in a file of this account's, mode 0600. | required |
+| `push_token_file` | The sessions' push token: one GitHub token, in a file of this account's, mode 0600, outside the work and home folders and every git working tree. See "The push token". No code, fix or conflict lane may be on without it. | none |
 | `owner_user_ids` | The owner's tracker user ids. Only his moves approve. | required |
 | `dispatcher_user_ids` | The old dispatcher's own users. Never an approver. | required |
 | `poll_seconds` | Time between passes. | `5` |
@@ -393,6 +433,7 @@ Each refusal says why, in the request's answer (`<store_dir>/taken/<id>.json`).
 | the project has no committed delivery.json | The project is not set up for the pipeline. |
 | `<name>` is not set | The sign-in token's variable is missing from the job's environment. |
 | the tracker could not be read | Nothing to do: the request waits, and the next pass tries again. |
+| the push token file could not be read, can be read by others, or does not hold one GitHub token | Fix the file `push_token_file` names: this account's, mode 0600, one GitHub token. The request waits and starts on a later pass. |
 | the machine is below its floor | Free disk or memory. The request waits; it starts when there is room. |
 | the workspace's `.env` names a variable the program reads | Take the variable out of that file, or out of the project's committed copy. |
 | the engine's folder could be changed by this account | The runner runs from its own copy of the kit, owned by root. The request waits until it does. |
@@ -408,6 +449,9 @@ The runner refuses to start from inside a Claude session, or as root.
   as an error result or as the last line of its errors. The tech lead's turn relies on the same
   words. The selftest's stand-in prints them. One live check is owed.
 - That one sign-in serves the runner and the tech lead together (KIT-629).
+- That a real push signs in with the push token from inside the built-in sandbox. The adapter's
+  selftest runs git's own `git credential fill` against its helper, and the probe asks it as the
+  role account. The first live run (KIT-882) pushes for real, after the owner re-runs the probe.
 - Each kind's walls as the role account: the probe above has not been run live yet. Until it
   passes, no real session goes through the runner. It also measures what is still open here: that
   sandboxed Bash may write its temp folder, that a commit works in a workspace whose git folder sits

@@ -2334,6 +2334,14 @@
           "default_name": null,
           "what": "A file of the account's own that holds the session writer's tracker key, which a session's own tools comment with. Never the owner's key.",
           "ends": "never"
+        },
+        {
+          "key": "push_token_file",
+          "default_name": null,
+          "what": "A file of the account's own that holds the sessions' push token: the code host's token that code, fix and conflict sessions push their branch and open their pull request with. No other kind of session gets it.",
+          "ends": "set-when-made",
+          "clock": "runner-push-token",
+          "date_from": "The expiry date on the code host's token settings page, chosen when the token was made."
         }
       ],
       "jobs": [

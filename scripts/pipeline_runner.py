@@ -64,9 +64,19 @@ own macOS sandbox, sandbox-exec with a profile written for the run (r5a; the two
 combined, r5b). Each tool call goes through the kit's guard, from the engine's own folder, by a
 launcher that refuses when it cannot tell which folder it guards (scripts/pipeline_runner_guard.py).
 Its environment is exactly the kind's names: PATH, HOME, TMPDIR, LANG, the sign-in token under the
-one name the program reads, and two switches. A workspace whose dotenv files name a variable the
+one name the program reads, and two switches; for code, fix and conflict, the push token and git's
+helper for it too (below). A workspace whose dotenv files name a variable the
 program reads (an API key, a base address, a proxy) is refused before the program runs. Nothing
 starts while the engine's folder, the kinds' data or the guard could be changed by this account.
+
+THE PUSH TOKEN (KIT-886).  A code, fix or conflict session pushes its branch and opens its pull
+request with the sessions' push token: the code host's token, in the file `push_token_file` names.
+The runner reads it at each start or resume of those kinds, and only of those: this account's file,
+mode 0600, no link, holding one GitHub token. A file it cannot read, or one that holds anything else,
+holds the request in words that never quote it. The token goes into the session's environment under
+the one name its kind's data lists (GH_TOKEN), with git's helper for it; review, plan and acceptance
+list neither, so none ever gets it. The file is walled from every kind, as each key file is. A code,
+fix or conflict lane that is on needs the setting.
 
 NO TRACKER SIGN-IN (KIT-706, scripts/pipeline_session_tools.py).  No session holds a tracker key:
 none is in its environment, its mcp.json lists no tracker server, and every tracker key file is
@@ -181,6 +191,7 @@ DEFAULTS = {
     "model": "sonnet",
     "token_env": voice.DEFAULTS["writer_token_env"],
     "linear_key_file": None,
+    "push_token_file": None,
     "owner_user_ids": None,
     "dispatcher_user_ids": None,
     "poll_seconds": 5,
@@ -200,6 +211,12 @@ HOST_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{
 STATE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}\Z")
 SUBTYPE_RE = re.compile(r"^[a-z_]{1,40}\Z")
 _PATTERN_CHARS = re.compile(r"[*?\[\]{}!\\]")       # a permission rule would match more than it
+# KIT-886. The one name the sessions' push token goes under, from the kinds' own data; and what its
+# file must hold: one GitHub token (a classic, app or fine-grained one), so a file named by mistake
+# (the tracker key, the sign-in token) is never handed to a session's Bash.
+PUSH_TOKEN_ENV = kinds_data.PUSH_TOKEN_ENV
+PUSH_TOKEN_RE = re.compile(r"^(gh[pousr]_[A-Za-z0-9]{20,251}|github_pat_[A-Za-z0-9_]{20,244})\Z")
+PUSH_TOKEN_MAX = 1024
 GIT_TIMEOUT = 300
 CLEAR_TRIES, CLEAR_PAUSE = 20, 0.05                 # an ending run is killed again until clear
 INSTRUCTIONS_MAX = 200 << 10                        # the project's CLAUDE.md, read from its base
@@ -266,6 +283,11 @@ def load_config(raw):
         bad.append("model: not a model name")
     if not (isinstance(cfg["token_env"], str) and voice._ENV_NAME_RE.match(cfg["token_env"])):
         bad.append("token_env: must be the NAME of an environment variable")
+    if cfg["push_token_file"] is not None:          # KIT-886: absent is off
+        v = resolve(cfg["push_token_file"])
+        if not (isinstance(v, str) and os.path.isabs(v) and "\0" not in v):
+            bad.append("push_token_file: must be an absolute path (~/ is this account's home)")
+        cfg["push_token_file"] = v
     for key in ("owner_user_ids", "dispatcher_user_ids"):
         v = cfg[key]
         if not (isinstance(v, list) and v and all(isinstance(x, str) and pool.ID_RE.match(x)
@@ -300,7 +322,18 @@ def load_config(raw):
         p, problems = load_project(projects[key])
         bad += ["projects.%s.%s" % (key, x) for x in problems]
         cfg["projects"][key] = p
+    # KIT-886: a lane whose kind holds the push token (code, fix, conflict) needs the token's file.
+    pushing = [k for k in store.KINDS if PUSH_TOKEN_ENV in (KINDS.get(k) or {}).get("env", ())
+               and any(p and p["lanes"].get(k) for p in cfg["projects"].values())]
+    if pushing and cfg["push_token_file"] is None:
+        bad.append("push_token_file: a %s lane that is on needs it: a %s session pushes its branch with "
+                   "the token in it" % (pushing[0], pushing[0]))
     if not bad:
+        push = cfg["push_token_file"]
+        if push and any(_inside(push, cfg[k]) for k in ("work_dir", "session_home")):
+            bad.append("push_token_file: is in the work or home folder, where a session can write")
+        elif push and store.inside_git_worktree(_nearest(os.path.dirname(push))):
+            bad.append("push_token_file: is inside a git working tree, where it could be committed")
         if set(cfg["owner_user_ids"]) & set(cfg["dispatcher_user_ids"]):
             bad.append("owner_user_ids: lists the dispatcher's own user, which never approves")
         folders = ("store_dir", "work_dir", "session_home")
@@ -720,14 +753,53 @@ def build_rules(kind, ticket, instructions, tools=()):
     return text
 
 
+def read_push_token(path):
+    """(token, "") or (None, why): the sessions' push token, from the file `push_token_file` names
+    (KIT-886). Opened once, never through a link, and judged on that descriptor, as the tracker key
+    is: this account's, mode 0600, one GitHub token. The file's text is never in a why."""
+    if not path:
+        return None, "the runner's settings name no push_token_file, so the session could not push"
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            return None, "the push token file is a link, which is never read"
+        return None, "the push token file could not be read (%s)" % type(exc).__name__
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return None, "the push token file is not a regular file"
+        if st.st_uid != os.getuid():
+            return None, "the push token file belongs to another account"
+        if st.st_mode & 0o077:
+            return None, "the push token file can be read by others: it must be mode 0600"
+        if st.st_size > PUSH_TOKEN_MAX:
+            return None, "the push token file is too large to hold one token"
+        raw = os.read(fd, PUSH_TOKEN_MAX + 1)
+    except OSError as exc:
+        return None, "the push token file could not be read (%s)" % type(exc).__name__
+    finally:
+        os.close(fd)
+    try:
+        token = raw.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        token = ""
+    if not PUSH_TOKEN_RE.match(token):
+        return None, "the push token file does not hold one GitHub token"
+    return token, ""
+
+
 def session_run(cfg, proj, workspace, rdir, tmpdir, pins, pin, session_id, resume, budget,
                 extra_allowed=None):
     """One run's facts, as the adapter reads them. Every folder by its real path, so each rule
-    names the place itself. `keys` are the files no session may read: the runner's tracker key and,
-    with `session_tools` set, the session writer's key (KIT-706). No tracker sign-in reaches a
-    session; only its own tools' server, outside its walls, reads the writer's key."""
+    names the place itself. `keys` are the files no session may read: the runner's tracker key,
+    with `session_tools` set the session writer's key (KIT-706), and with `push_token_file` set the
+    push token's file (KIT-886), walled from every kind, the three that hold the token included.
+    No tracker sign-in reaches a session; only its own tools' server, outside its walls, reads the
+    writer's key."""
     keys = []
-    for k in [cfg["linear_key_file"]] + session_tools.key_files(cfg.get("session_tools")):
+    push = [cfg["push_token_file"]] if cfg.get("push_token_file") else []
+    for k in [cfg["linear_key_file"]] + session_tools.key_files(cfg.get("session_tools")) + push:
         if os.path.realpath(k) not in keys:
             keys.append(os.path.realpath(k))
     return {"claude_bin": cfg["claude_bin"], "model": cfg["model"], "workspace": workspace,
@@ -754,9 +826,10 @@ def run_tmp(cfg, run_id):
     return os.path.join(cfg["work_dir"], ".tmp", run_id)
 
 
-def child_env(kind, run, token):
-    """Exactly what the program sees, and nothing more: the kind's own environment names."""
-    return harness.environment(KINDS[kind], run, token)
+def child_env(kind, run, token, push=None):
+    """Exactly what the program sees, and nothing more: the kind's own environment names. The push
+    token reaches only a kind whose data names it: code, fix and conflict (KIT-886)."""
+    return harness.environment(KINDS[kind], run, token, push)
 
 
 # --------------------------------------------------------------------------- #
@@ -1379,6 +1452,13 @@ class Runner(object):
             return "refused", None, "%s is not set, so no session can sign in" % cfg["token_env"]
         if voice.foreign_credential(token):
             return "refused", None, "%s does not hold a claude setup-token token" % cfg["token_env"]
+        # KIT-886: the push token, read only for a kind whose data names it, before anything is made.
+        # A file that cannot be read now may be fixed: the request waits.
+        push = None
+        if PUSH_TOKEN_ENV in KINDS[kind]["env"]:
+            push, why = read_push_token(cfg["push_token_file"])
+            if push is None:
+                return "held", None, why
         runs = self.runs()
         if runs is None:
             return "held", None, "the runs could not be read"
@@ -1507,7 +1587,7 @@ class Runner(object):
                    started_at=iso(now))
         store.write_run(self.store_dir(), rec)
         try:
-            proc = spawn(rdir, child_env(kind, run, token))
+            proc = spawn(rdir, child_env(kind, run, token, push))
         except OSError as exc:
             remove_pin(ppath, run_id)
             self.undo(proj, made, branch)
@@ -1670,7 +1750,11 @@ with out as fh:
                          "pid": os.getpid(), "tmpdir": os.environ.get("TMPDIR"),
                          "tmp_ready": os.path.isdir(os.environ.get("TMPDIR") or "/nonexistent"),
                          "pin_seen": os.path.exists(os.path.join(%(pins)r, key + ".json")),
-                         "key_read": can_read(%(key)r), "wrote_beside_itself": record.startswith(HERE)}) + "\n")
+                         "key_read": can_read(%(key)r), "push_read": can_read(%(push)r),
+                         # KIT-886: the push token it was given, as a short hash, never the token
+                         "push": hashlib.sha256(os.environ["GH_TOKEN"].encode()).hexdigest()[:16]
+                                 if "GH_TOKEN" in os.environ else None,
+                         "wrote_beside_itself": record.startswith(HERE)}) + "\n")
 # The conversations it has, as the program keeps its own: beside its record, so inside our own
 # sandbox (where it may write only its home) they are in its home.
 known = os.path.join(os.path.dirname(record), "sessions", sid)
@@ -1777,6 +1861,7 @@ def selftest():
 
 
 def _selftest():  # noqa: C901  (one battery, read top to bottom)
+    import hashlib
     import shlex
     import tempfile
     failures, cleanup, counted, victims = [], [], [0], []
@@ -1827,10 +1912,17 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
     sh("git", "clone", "--quiet", origin, repo)
     bindir = os.path.join(tmp, "bin")
     os.makedirs(bindir)
+    # KIT-886: the sessions' push token, an obviously fake one, in a file of its own, mode 0600.
+    push_file = os.path.join(tmp, "push-token")
+    fake_push = "gh" + "p_" + "FAKEPUSHTOKENFORTHESELFTEST" + "0" * 9
+    with open(push_file, "w") as fh:
+        fh.write(fake_push + "\n")
+    os.chmod(push_file, 0o600)
+    push_seen = hashlib.sha256(fake_push.encode()).hexdigest()[:16]     # as the stand-in records it
     claude = os.path.join(bindir, "claude")
     with open(claude, "w") as fh:
         fh.write(STANDIN % {"python": sys.executable, "pins": pins, "key": os.path.join(tmp, "key"),
-                            "said": SAID_TEXT, "long": store.OUTPUT_MAX})
+                            "push": push_file, "said": SAID_TEXT, "long": store.OUTPUT_MAX})
     with open(os.path.join(tmp, "key"), "w") as fh:
         fh.write("a-test-key\n")
     os.chmod(claude, 0o755)
@@ -1847,6 +1939,7 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                                 "approval_states": {"code": ["st-ready"], "review": ["st-ready"],
                                                     "plan": ["st-plan"], "acceptance": ["st-ready"]},
                                 "lanes": dict.fromkeys(store.KINDS, True)}}}
+    raw["push_token_file"] = push_file                # KIT-886: a code, fix or conflict lane needs it
     environ = {"RUNNER_TEST_TOKEN": "a-test-token"}
     keys = pool.HISTORY_KEYS
 
@@ -1899,6 +1992,7 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
     ticket("ENG-41", "Review a change", [move("owner-1", "st-ready")])
     ticket("ENG-42", "A committed dotenv file", [move("owner-1", "st-ready")])
     ticket("ENG-40", "Check a plan", [move("owner-1", "st-ready")])       # KIT-858
+    ticket("ENG-44", "Its push token cannot be read", [move("owner-1", "st-ready")])   # KIT-886
     ticket("ENG-43", "A folder is in the way", [move("owner-1", "st-ready")])
 
     class Tracker(object):
@@ -1964,6 +2058,32 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                  "work_dir: holds a pattern character, so a rule for it would not be exact")):
             _, got = load_config(dict(raw, **change))
             expect("settings: %s is refused" % name, got[:1], [want])
+        # KIT-886: the push token's file, named by a setting, never where a session can write.
+        only = {"repo": repo, "approval_states": {"code": ["st-ready"]}, "lanes": {"conflict": True}}
+        for name, change, want in (
+                ("a code lane on with no push token file", {"push_token_file": None},
+                 "push_token_file: a code lane that is on needs it: a code session pushes its branch with "
+                 "the token in it"),
+                ("a conflict lane on with none", {"push_token_file": None, "projects": {"app": only}},
+                 "push_token_file: a conflict lane that is on needs it: a conflict session pushes its "
+                 "branch with the token in it"),
+                ("a push token file by a relative path", {"push_token_file": "push-token"},
+                 "push_token_file: must be an absolute path (~/ is this account's home)"),
+                ("a push token file in the work folder", {"push_token_file": os.path.join(tmp, "state", "work", "t")},
+                 "push_token_file: is in the work or home folder, where a session can write"),
+                ("a push token file in the sessions' home",
+                 {"push_token_file": os.path.join(tmp, "state", "home", "t")},
+                 "push_token_file: is in the work or home folder, where a session can write"),
+                ("a push token file in a git working tree", {"push_token_file": os.path.join(repo, "push-token")},
+                 "push_token_file: is inside a git working tree, where it could be committed")):
+            _, got = load_config(dict(raw, **change))
+            expect("settings: %s is refused" % name, got[:1], [want])
+        readers, got = load_config(dict(raw, push_token_file=None, projects={"app": {
+            "repo": repo, "approval_states": {"review": ["st-ready"], "plan": ["st-plan"],
+                                              "acceptance": ["st-ready"]},
+            "lanes": {"review": True, "plan": True, "acceptance": True}}}))
+        expect("settings: with no push token file, review, plan and acceptance lanes load: none holds it",
+               (got, (readers or {}).get("push_token_file")), ([], None))
 
         # ---- a lane that is off (KIT-866): refused in words, nothing made or read ---- #
         lanes_store = os.path.join(tmp, "state", "store-lanes")
@@ -2074,25 +2194,31 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
             "--permission-prompts", "none", "--append-system-prompt-file",
             os.path.join(rdir1, "rules.md"), "--max-turns", "25", "--max-budget-usd", "2"])
         settings = _load(os.path.join(rdir1, "settings.json"))
-        walls = [sdir, pins, os.path.join(tmp, "key"), os.path.join(cfg["session_home"], ".claude"),
+        walls = [sdir, pins, os.path.join(tmp, "key"), push_file, os.path.join(cfg["session_home"], ".claude"),
                  os.path.join(cfg["session_home"], ".claude.json")]
         expect("a kind with Bash gets the built-in sandbox, with a deny-read list: the store, the pins, "
-               "the tracker key and the sessions' own state",
+               "the tracker key, the push token's file and the sessions' own state",
                (settings["sandbox"]["enabled"], settings["sandbox"]["allowUnsandboxedCommands"],
                 settings["sandbox"]["filesystem"]["denyRead"]),
                (True, False, walls))
         expect("…and every file tool is denied each of them",
                [r for r in settings["permissions"]["deny"] if r.startswith("Read(")],
                ["Read(/%s/**)" % sdir, "Read(/%s/**)" % pins, "Read(/%s)" % os.path.join(tmp, "key"),
+                "Read(/%s)" % push_file,
                 "Read(/%s/.claude/**)" % cfg["session_home"], "Read(/%s/.claude.json)" % cfg["session_home"]])
         expect("…and no file tool may write anywhere in the sessions' shared home: the store, the pins and "
-               "the key are walled whole, the home by its writes",
+               "the keys are walled whole, the home by its writes",
                ([r for r in settings["permissions"]["deny"] if r.startswith("Edit(")],
                 [r for r in settings["permissions"]["deny"] if r.startswith("Write(")]),
                (["Edit(/%s/**)" % sdir, "Edit(/%s/**)" % pins, "Edit(/%s)" % os.path.join(tmp, "key"),
-                 "Edit(/%s/**)" % cfg["session_home"]],
+                 "Edit(/%s)" % push_file, "Edit(/%s/**)" % cfg["session_home"]],
                 ["Write(/%s/**)" % sdir, "Write(/%s/**)" % pins, "Write(/%s)" % os.path.join(tmp, "key"),
-                 "Write(/%s/**)" % cfg["session_home"]]))
+                 "Write(/%s)" % push_file, "Write(/%s/**)" % cfg["session_home"]]))
+        expect("KIT-886: the push token adds no host: a code session's Bash reaches its project's hosts alone",
+               settings["sandbox"]["network"]["allowedDomains"], cfg["projects"]["app"]["allowed_hosts"])
+        expect("…and its value is in none of the run's files, nor its command line",
+               [n for n in sorted(os.listdir(rdir1)) if os.path.isfile(os.path.join(rdir1, n))
+                and fake_push in open(os.path.join(rdir1, n), errors="replace").read()], [])
         expect("each tool call goes through the kit's guard, from the engine's own folder, told its workspace",
                shlex.split(settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]),
                ["/usr/bin/env", "-u", "DEVELOPER_DIR", "/usr/bin/python3", "-I",
@@ -2124,7 +2250,8 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                [k for k in first["env"] if k not in ("__CF_USER_TEXT_ENCODING", "PWD", "SHLVL", "_")],
                sorted(["PATH", "HOME", "TMPDIR", "LANG", "CLAUDE_CODE_OAUTH_TOKEN",
                        "DISABLE_AUTOUPDATER", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
-                       "GIT_CONFIG_GLOBAL"]))
+                       "GIT_CONFIG_GLOBAL"] + list(kinds_data.PUSH_ENV)))
+        expect("KIT-886: a code session holds the push token, as read from its file", first["push"], push_seen)
         expect("its temp folder is its own, there while it runs, and outside every wall",
                (first["tmp_ready"], [w for w in (sdir, pins, cfg["session_home"], ws1)
                                      if _inside(first["tmpdir"], w)]), (True, []))
@@ -2210,6 +2337,7 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                second["prompt"].count("</untrusted-request-data>"), 1)
         expect("a resume gets its text alone: its session has the ticket already (KIT-858)",
                "<untrusted-ticket-data>" in second["prompt"], False)
+        expect("KIT-886: the fix resume holds the push token too", second["push"], push_seen)
 
         # ---- the session's own tracker tools (KIT-706) --------------------- #
         writer_key = os.path.join(tmp, "writer.key")
@@ -2249,12 +2377,12 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                  for k in (cfg["linear_key_file"], writer_key) for t in ("Read", "Edit", "Write")],
                 [k in tsettings["sandbox"]["filesystem"]["denyRead"] for k in (cfg["linear_key_file"], writer_key)]),
                ([True] * 6, [True, True]))
-        expect("session_tools: the session's environment holds no tracker key or token",
+        expect("session_tools: the session's environment holds no tracker key or tracker token",
                [k for k in _calls(calls)[-1]["env"] if k not in ("__CF_USER_TEXT_ENCODING", "PWD",
                                                                  "SHLVL", "_")],
                sorted(["PATH", "HOME", "TMPDIR", "LANG", "CLAUDE_CODE_OAUTH_TOKEN",
                        "DISABLE_AUTOUPDATER", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
-                       "GIT_CONFIG_GLOBAL"]))
+                       "GIT_CONFIG_GLOBAL"] + list(kinds_data.PUSH_ENV)))
         expect("session_tools: the session is told its five tools by name, since no skill loads",
                all(t in open(os.path.join(rdir_t, "rules.md")).read() for t in session_tools.ALLOWED), True)
         rq = store.ask(sdir, "review", "start", "review", "app", "ENG-1")
@@ -2270,6 +2398,63 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                     [a for a in _load(os.path.join(rdir_r, "launch.json"))["argv"]
                      if a in session_tools.ALLOWED]),
                    ({"mcpServers": {}}, False, []))
+
+        # ---- the push token's file (KIT-886) ------------------------------------ #
+        expect("the push token is read from its file", read_push_token(push_file), (fake_push, ""))
+        pdir = os.path.join(tmp, "push-cases")
+        os.makedirs(pdir)
+
+        def push_case(name, text=None, mode=0o600, link=None):
+            path = os.path.join(pdir, name)
+            if link:
+                os.symlink(link, path)
+            elif text is not None:
+                with open(path, "w") as fh:
+                    fh.write(text)
+                os.chmod(path, mode)
+            return read_push_token(path)
+
+        fine = "github" + "_pat_" + "FAKE0" * 6
+        expect("…and so is a fine-grained one", push_case("fine", fine + "\n"), (fine, ""))
+        for what, got, want in (
+                ("no file", push_case("none"), "the push token file could not be read (FileNotFoundError)"),
+                ("a link, even to the real file", push_case("link", link=push_file),
+                 "the push token file is a link, which is never read"),
+                ("a file others can read", push_case("open", fake_push, 0o644),
+                 "the push token file can be read by others: it must be mode 0600"),
+                ("the tracker key's file, named by mistake", push_case("tracker", "lin" + "_api_" + "x" * 40),
+                 "the push token file does not hold one GitHub token"),
+                ("two tokens", push_case("two", fake_push + "\n" + fake_push),
+                 "the push token file does not hold one GitHub token"),
+                ("a folder", read_push_token(pdir), "the push token file is not a regular file"),
+                ("a file too large for one token", push_case("big", "x" * 2048),
+                 "the push token file is too large to hold one token"),
+                ("no setting", read_push_token(None),
+                 "the runner's settings name no push_token_file, so the session could not push")):
+            expect("the push token file: %s is refused, in words that never quote it" % what, got, (None, want))
+        noread = Runner(dict(cfg, push_token_file=os.path.join(pdir, "open")), tracker, environ=environ,
+                        git_env=genv, say=said.append, room=roomy, engine=safe)
+        rq = store.ask(sdir, "queue", "start", "code", "app", "ENG-44")
+        out = noread.pass_once()
+        expect("a code start whose push token cannot be read waits, says why, and makes nothing",
+               (rq in out["waiting"], noread.waits.get(rq), os.path.exists(workspace_path(cfg, "code", "ENG-44"))),
+               (True, "the push token file can be read by others: it must be mode 0600", False))
+        os.unlink(os.path.join(sdir, "requests", rq + ".json"))
+        rq = store.ask(sdir, "review", "start", "review", "app", "ENG-44")
+        noread.pass_once()
+        ans44 = store.answer(sdir, rq) or {}
+        expect("…while a review of the same ticket starts: no review ever reads it", ans44.get("ok"), True)
+        if ans44.get("ok"):
+            _wait(lambda: noread.pass_once() and store.read_run(sdir, ans44["run"])["state"] not in store.LIVE, 20)
+            rdir44 = store.run_dir(sdir, ans44["run"])
+            homecalls = os.path.join(cfg["session_home"], "calls.jsonl")
+            seen44 = [c for c in _calls(calls) + (_calls(homecalls) if os.path.exists(homecalls) else [])
+                      if c.get("cwd") == workspace_path(cfg, "review", "ENG-44")]
+            expect("…and the review session gets none of the push token's names, nor the token",
+                   [([n for n in kinds_data.PUSH_ENV if n in c["env"]], c["push"]) for c in seen44], [([], None)])
+            with open(os.path.join(rdir44, "sandbox.sb")) as fh:
+                expect("…while its own sandbox walls the push token's file off, as every key file",
+                       '(literal "%s")' % os.path.join(pdir, "open") in fh.read(), True)
 
         # ---- a start's text, the final message, a fresh workspace (KIT-858) ----- #
         def fenced(prompt, tag):
@@ -2638,15 +2823,18 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                (["/usr/bin/sandbox-exec", "-f", os.path.join(rdir41, "sandbox.sb")], "Read,Grep,Glob", False))
         with open(os.path.join(rdir41, "sandbox.sb")) as fh:
             profile41 = fh.read()
-        expect("…whose profile walls off the store, the pins and the key, and names the run's own inputs and pin",
-               [p for p in (sdir, pins, os.path.join(tmp, "key"), rdir41, store.read_run(sdir, run41)["pin"])
-                if '"%s"' % p not in profile41], [])
+        expect("…whose profile walls off the store, the pins, the key and the push token's file, and names the "
+               "run's own inputs and pin",
+               [p for p in (sdir, pins, os.path.join(tmp, "key"), push_file, rdir41,
+                            store.read_run(sdir, run41)["pin"]) if '"%s"' % p not in profile41], [])
         _wait(lambda: runner.pass_once() and store.read_run(sdir, run41)["state"] not in store.LIVE, 20)
         if sys.platform == "darwin" and os.path.exists(harness.SANDBOX_EXEC):
             seen = [c for c in _calls(os.path.join(cfg["session_home"], "calls.jsonl")) if c["cwd"] == ws41]
             expect("inside our own sandbox, for real: the program saw its own pin, could not read the key, and "
                    "could write only its home", [(c["pin_seen"], c["key_read"], c["wrote_beside_itself"])
                                                  for c in seen], [(True, False, False)])
+            expect("…nor the push token's file, and it was given no push token (KIT-886)",
+                   [(c["push_read"], c["push"]) for c in seen], [(False, None)])
             expect("…and the run ended with the program's own result", store.read_run(sdir, run41)["cost_usd"],
                    0.0125)
         else:
