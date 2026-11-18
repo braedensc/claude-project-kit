@@ -270,7 +270,7 @@ npm run test:install         # the one command (scripts/pipeline_install.py): sk
                              #   Stage E after a yes, then Stage A; refused under a model
 npm run test:parts           # every part listed once (pipeline-parts.json): owners, needs, cards, docs/PARTS.md
 npm run test:chat-lane-setup # chat-lane composer: owner's grant, fence keeps defaults, verify agent-refused
-npm run test:model-switch    # the tech lead's model switch (KIT-385): the pair alone or no
+npm run test:model-switch    # the dispatcher's chat-model switch (KIT-385): the pair alone or no
                              #   go, every open pipeline ticket on the default tagged first
                              #   (the dispatcher's own rule), one yes, the pair read back
 npm run test:bridge          # Slack bridge (KIT-221): Slack-verified sender, its own question,
@@ -407,10 +407,16 @@ npm run test:acceptance-setup  # the acceptance installer (KIT-326): the browser
 npm run test:union           # union check: green alone + red together, bisected, report-only
 npm run test:hooks-path      # core.hooksPath pinned absolute: a worktree runs the pre-commit hook (KIT-420)
 npm run test:runner-pin       # no workflow on a moving -latest runner image (KIT-429)
+npm run test:ci-covers      # every package.json test:* script has a CI step outside the leak sweeps (KIT-620)
+npm run lint:ci-covers      # …and the same check over this repo
 npm run test:stdlib-only    # the kit's Python imports only the standard library, bar a named list (KIT-652)
 npm run lint:stdlib-only    # …and the same check over this repo's tracked .py files
 npm run test:pr-base         # PR-base gate: a PR's base must be a base branch; an unknown
                              #   event or missing value FAILS, main() itself is exercised
+npm run test:label-gate      # the label gate runs the default branch's workflow and code on
+                             #   pull_request_target, never the PR's: one closed reason per rule (KIT-668)
+npm run test:gate-policy     # the owner's Actions policy that lets the gate run after 2 Dec 2026:
+                             #   check, show, one typed yes, one POST, read back; refused under a model
 npm run test:alert-pages     # alert templates page a person (ALERT_PAGE_TO, else a user
                              #   owner) or fail their run; runs each copy under node
 npm run lint:secrets    # secretlint over every tracked file, read as git stores it

@@ -664,7 +664,10 @@ Stop hook between them:
    them; a PR authored in another clone or the web UI never meets one. The job runs
    the gate script from the default branch's tip for the same reason it reads config
    there — a head that can rewrite the gate grades its own homework, and a base the
-   PR names could be a branch its author pushed (KIT-410).
+   PR names could be a branch its author pushed (KIT-410). The workflow itself runs
+   on `pull_request_target`, so GitHub takes it from the default branch too, and a PR
+   that edits it cannot change how it is judged (KIT-668; what that needs from the
+   owner before 2 Dec 2026 is in `docs/SECURITY.md`).
 
 Plus two **standing watchers**, because every layer above samples a moment and a PR
 can break after that moment, when nobody is in a session:
