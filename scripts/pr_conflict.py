@@ -152,7 +152,10 @@ MARKERS (the whole producer/consumer contract)
   with a digit in it. Anything else in the attribute is the default.
 
   Bot markers count only from the Actions bot, so the budget cannot be reset by a
-  comment. Waker markers count only from a writer, and only when posted after the
+  comment. Nor by deleting or editing one (KIT-671): the monitor puts the label on once
+  per episode, and GitHub keeps each of those `labeled` events whatever becomes of the
+  comments, so attempts are also counted from them (`fix_attempts`). The count can only
+  rise. Waker markers count only from a writer, and only when posted after the
   episode opened, so an ack cannot be pre-posted for a future episode. A waker
   marker can never grant anything: an ack only moves the deadline (bounded), and a
   result only ends the wait — whether the conflict is gone is read from GitHub's
@@ -341,6 +344,7 @@ def episode_state(comments):
 
     return {
         "requests": sum(1 for m in marks if m["kind"] == "request"),
+        "pages": sum(1 for m in marks if m["kind"] == "page"),
         "opened": len(opened),
         "latest": latest,
         "episode": n,
@@ -348,6 +352,30 @@ def episode_state(comments):
         "ack": (of("ack") or [None])[0],
         "result": (of("result") or [None])[-1],
     }
+
+
+def bot_label_episodes(events):
+    """How many episodes the Actions bot opened on this PR, read from GitHub's own record (KIT-671).
+    The monitor puts `conflict` on a PR once per episode, as its last write. Each time it does,
+    GitHub keeps a `labeled` event naming the bot, and no comment delete or edit touches that."""
+    count = 0
+    for e in events or ():
+        if not isinstance(e, dict):
+            continue
+        actor = e.get("actor") if isinstance(e.get("actor"), dict) else {}
+        label = e.get("label") if isinstance(e.get("label"), dict) else {}
+        if (e.get("event") == "labeled" and label.get("name") == LABEL
+                and actor.get("login") == BOT_LOGIN and actor.get("type") == "Bot"):
+            count += 1
+    return count
+
+
+def fix_attempts(state, episodes):
+    """The automated fix requests this PR has had, as a number no deleted or edited comment can
+    lower (KIT-671): the requests its comments show, or the episodes the label's events show less
+    the pages its comments show, whichever is more. A deleted page comment can only raise it, and
+    so can an episode labelled before the markers began: both count as spent, never as fresh."""
+    return max(state["requests"], episodes - state["pages"])
 
 
 def decide_ongoing(state, now):
@@ -471,6 +499,17 @@ class Gh:
             if len(batch) < 100:
                 return out
         raise CouldNotTell(f"#{number} has more than {MAX_COMMENT_PAGES * 100} comments")
+
+    def issue_events(self, number):
+        """The PR's issue events: GitHub's own record, which no comment delete or edit touches."""
+        out = []
+        for page in range(1, MAX_COMMENT_PAGES + 1):
+            batch = self._api("GET", f"repos/{self.owner}/{self.name}/issues/{number}/events"
+                                     f"?per_page=100&page={page}") or []
+            out += batch
+            if len(batch) < 100:
+                return out
+        raise CouldNotTell(f"#{number} has more than {MAX_COMMENT_PAGES * 100} events")
 
     def ensure_label(self):
         description = f"Merge conflicts with {self.default_branch} (auto-managed by pr-conflict-monitor)"
@@ -692,14 +731,23 @@ def monitor(gh, now, sleep=time.sleep, dry_run=False, summary=print, page_to=(),
         tally["conflicted"] += 1
         state = episode_state(gh.comments(n))
         if not labeled:
-            episode = state["opened"] + 1
+            # THE COUNT A DELETED COMMENT CANNOT LOWER (KIT-671). Comments can be deleted or edited by
+            # anyone with write access; the label's events cannot. So the budget is read from both,
+            # and so is the next episode's number, which must never reuse one still on the PR.
+            episodes = bot_label_episodes(gh.issue_events(n))
+            attempts = fix_attempts(state, episodes)
+            if episodes > state["requests"] + state["pages"]:
+                print(f"::warning::#{n}: the bot labelled {episodes} episode(s), and only "
+                      f"{state['requests'] + state['pages']} of its request or page comments are still there "
+                      "(deleted, edited, or older than the markers). Counted as spent, never as fresh.")
+            episode = max(state["opened"], state["episode"], episodes) + 1
             stacked = not pr["isCrossRepository"] and is_stacked(pr, gh)
             # THE LABEL IS THE LAST WRITE (KIT-167). It is the dedupe key: a labelled PR with no marker
             # is read, further down, as one the pre-marker monitor already paged. Set first, a comment
             # that failed (a 502, a rate limit) left the PR labelled and silent for the whole episode.
             # Set last, a failure anywhere above leaves it unlabelled and the next run asks again; the
             # one cost is a repeated request or page when only the label call fails.
-            if pr["isCrossRepository"] or stacked or state["requests"] >= budget:
+            if pr["isCrossRepository"] or stacked or attempts >= budget:
                 reason = "fork" if pr["isCrossRepository"] else ("stacked" if stacked else "budget")
                 recipients = page_recipients(pr, gh, page_to)
                 comment(n, page_body(pr, episode, reason, base_of(pr, gh), recipients, budget,
@@ -709,7 +757,7 @@ def monitor(gh, now, sleep=time.sleep, dry_run=False, summary=print, page_to=(),
                 tally["paged"].append(n)
                 print(f"#{n}: CONFLICTING — paged ({reason}), episode {episode}")
             else:
-                comment(n, request_body(pr, episode, state["requests"] + 1, base_of(pr, gh), budget))
+                comment(n, request_body(pr, episode, attempts + 1, base_of(pr, gh), budget))
                 add_label(n)
                 tally["requested"].append(n)
                 print(f"#{n}: CONFLICTING — fix requested, episode {episode}")
@@ -1236,9 +1284,10 @@ class FakeGh:
     owner, name = "acme", "widgets"
 
     def __init__(self, prs=(), comments=None, closed=(), mergeable_after="MERGEABLE",
-                 default_branch="main", owner_type="Organization"):
+                 default_branch="main", owner_type="Organization", events=None):
         self.prs = [dict(p) for p in prs]
         self._comments = comments or {}
+        self._events = events or {}   # GitHub's issue events: a label the bot adds is one (KIT-671)
         self.closed = list(closed)
         self.writes = []
         self.mergeable_after = mergeable_after
@@ -1253,17 +1302,26 @@ class FakeGh:
     def comments(self, n):
         return list(self._comments.get(n, []))
 
+    def issue_events(self, n):
+        return list(self._events.get(n, []))
+
+    def _event(self, n, kind):
+        self._events.setdefault(n, []).append({"event": kind, "label": {"name": LABEL},
+                                               "actor": {"login": BOT_LOGIN, "type": "Bot"}})
+
     def ensure_label(self):
         self.writes.append(("ensure_label",))
 
     def add_label(self, n):
         self.writes.append(("add_label", n))
+        self._event(n, "labeled")
         for p in self.prs:   # kept across runs, as GitHub keeps it (KIT-167 review)
             if p["number"] == n and LABEL not in p["labels"]:
                 p["labels"] = p["labels"] + [LABEL]
 
     def remove_label(self, n):
         self.writes.append(("remove_label", n))
+        self._event(n, "unlabeled")
         for p in self.prs:
             if p["number"] == n:
                 p["labels"] = [x for x in p["labels"] if x != LABEL]
@@ -1586,6 +1644,60 @@ def selftest():
         except Exception as exc:   # noqa: BLE001
             expect(False, f"limit_attrs({bad!r}) must refuse it with a ValueError, not {exc!r}")
 
+    # 2h. A SPENT BUDGET STAYS SPENT (KIT-671). Anyone with write access can delete or edit the bot's
+    #     request comments; the count of attempts must not drop with them, and the next conflict pages.
+    def spent_then(tamper, n=31):
+        g = FakeGh([_pr(n)])
+        with contextlib.redirect_stdout(io.StringIO()):
+            for _ in range(MAX_FIX_REQUESTS):
+                for merge_state in ("CONFLICTING", "MERGEABLE"):
+                    g.prs[0]["mergeable"] = merge_state
+                    run_monitor(g)
+            tamper(g._comments.setdefault(n, []))
+            g.prs[0]["mergeable"] = "CONFLICTING"
+            g.writes.clear()
+            run_monitor(g)
+        return [w[2].split("\n", 1)[0] for w in g.writes if w[0] == "comment"]
+    for how, tamper in (("deleted", lambda cs: cs.clear()),
+                        ("edited", lambda cs: [c.update(body="edited\n" + c["body"]) for c in cs]),
+                        ("one deleted", lambda cs: cs.pop(0))):
+        firsts = spent_then(tamper)
+        expect(firsts == [marker("page", MAX_FIX_REQUESTS + 1, reason="budget")],
+               f"a spent budget must stay spent when its request comments are {how}: {firsts}")
+    # Only the bot's own `labeled: conflict` events count: a person's label, another label, an
+    # unlabel, another app, or the bot's login on a user account counts nothing.
+    bot = {"login": BOT_LOGIN, "type": "Bot"}
+    noise = [{"event": "labeled", "label": {"name": LABEL}, "actor": {"login": "someone", "type": "User"}},
+             {"event": "labeled", "label": {"name": "bug"}, "actor": bot},
+             {"event": "unlabeled", "label": {"name": LABEL}, "actor": bot},
+             {"event": "labeled", "label": {"name": LABEL}, "actor": {"login": "other-app[bot]", "type": "Bot"}},
+             {"event": "labeled", "label": {"name": LABEL}, "actor": {"login": BOT_LOGIN, "type": "User"}},
+             {"event": "commented"}, {}, None, "labeled"]
+    expect(bot_label_episodes(noise) == 0
+           and bot_label_episodes(noise + [{"event": "labeled", "label": {"name": LABEL}, "actor": bot}] * 2) == 2,
+           "only the Actions bot's own conflict labels count as episodes")
+    # A deleted page comment, or an episode labelled before the markers began, can only raise the count.
+    st0 = episode_state([_bot(marker("request", 1), 30), _bot(marker("page", 2, reason="stacked"), 20)])
+    expect(fix_attempts(st0, 2) == 1 and fix_attempts(st0, 4) == 3
+           and fix_attempts(episode_state([]), 3) == 3 and fix_attempts(st0, 0) == 1,
+           "attempts: the comments' requests, or the episodes less the pages, whichever is more")
+    # The run says when the bot's comments are fewer than its episodes, and pages rather than ask.
+    gh = FakeGh([_pr(32)], events={32: [{"event": "labeled", "label": {"name": LABEL}, "actor": bot}] * 3})
+    out32 = io.StringIO()
+    with contextlib.redirect_stdout(out32):
+        rc32, _ = run_monitor(gh)
+    expect(rc32 == 0 and [w[2].split("\n", 1)[0] for w in gh.writes if w[0] == "comment"]
+           == [marker("page", 4, reason="budget")] and "only 0 of its request or page comments" in out32.getvalue(),
+           f"episodes with no comment left are spent, and said: {gh.writes} {out32.getvalue()[-300:]}")
+    # A budget not spent still asks, and counts the attempt the events show (one deleted request).
+    gh = FakeGh([_pr(33)], {33: [_bot(marker("request", 2), 30)]},
+                events={33: [{"event": "labeled", "label": {"name": LABEL}, "actor": bot}] * 2})
+    with contextlib.redirect_stdout(io.StringIO()):
+        run_monitor(gh)
+    req33 = [w[2] for w in gh.writes if w[0] == "comment"]
+    expect(req33 and req33[0].startswith(marker("request", 3)) and "attempt 3 of 3" in req33[0],
+           f"the next request counts every attempt the events show: {req33[:1]}")
+
     # 3. a fork is paged, never requested.
     gh = FakeGh([_pr(3, fork=True)])
     run_monitor(gh)
@@ -1744,6 +1856,17 @@ def selftest():
     real.assign(5, ["acme/on-call"])
     expect([json.loads(i) for _c, i in seen30] == [{"assignees": ["alice"]}],
            f"assign must carry people only, and skip a call with none: {seen30}")
+    # …and reads a PR's issue events page by page, from the events endpoint (KIT-671).
+    seen_ev = []
+
+    def rec_ev(cmd, cwd=None, input=None, timeout=None):
+        seen_ev.append(cmd[4])
+        page = int(cmd[4].rsplit("page=", 1)[1])
+        return subprocess.CompletedProcess(cmd, 0, json.dumps([{"event": "labeled"}] * (100 if page == 1 else 3)), "")
+    evs = Gh("acme/widgets", runner=rec_ev).issue_events(9)
+    expect(len(evs) == 103 and seen_ev == ["repos/acme/widgets/issues/9/events?per_page=100&page=1",
+                                           "repos/acme/widgets/issues/9/events?per_page=100&page=2"],
+           f"the events are read whole, page by page: {seen_ev}")
     empty = Gh("acme/widgets", runner=lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, "{}", ""))
     try:
         empty.default_branch
