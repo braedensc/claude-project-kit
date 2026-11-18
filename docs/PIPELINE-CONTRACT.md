@@ -3240,31 +3240,49 @@ workspace and its branch. Off (`enabled` false), the runner takes no request and
 | --- | --- | --- |
 | `schema` | `"pipeline-runner-run/1"` | |
 | `run` | `run-` and 32 hex characters | The pin's `dispatch_id` (§3). |
-| `request` | request id, or null | Null for the runner's own resume. |
-| `caller` | a caller, or `runner` | `runner` only for the resume after an interruption. |
+| `request` | request id, or null | Null for the runner's own resume or fresh start. |
+| `caller` | a caller, or `runner` | `runner` only for the resume after an interruption, and the fresh start after a lost session. |
 | `kind`, `project`, `ticket` | as in the request | |
-| `resumes` | run id, or null | The run this one resumed. |
-| `started_for` | `request` \| `interrupted` | |
-| `approved_by`, `approved_at`, `how` | user id; time or null; `move` \| `creation` \| `resumed-run` | Who approved, as the check found it. |
-| `session_id` | UUID | Given to the program at the start, kept by a resume. |
+| `resumes` | run id, or null | The run this one resumed, or carries on afresh. |
+| `started_for` | `request` \| `interrupted` \| `session-gone` | `session-gone`: the fresh start after a resume found its session gone. |
+| `approved_by`, `approved_at`, `how` | user id; time or null; `move` \| `creation` \| `resumed-run` \| `fresh-session` | Who approved, as the check found it. |
+| `session_id` | UUID | Given to the program at the start, kept by a resume. A fresh start gets a new one. |
+| `gone_session` | UUID, or null | The session a fresh start could not resume. Set on a fresh start, and only there. |
 | `workspace`, `branch` | absolute path; branch name | `<work_dir>/<kind>/<TICKET>`, on one fixed pattern. |
 | `pin` | absolute path, or null | The run's pin, removed when it ends. |
 | `pid` | number, or null | The wrapper's process, and its process group. |
 | `state` | `running` \| `stopping` \| `ended` \| `stopped` \| `interrupted` \| `failed` | |
 | `started_at`, `ended_at`, `seconds` | time; time or null; number or null | |
 | `exit` | whole number, or null | The program's exit code. Null when it left none. |
-| `reason` | `ended` \| `stopped` \| `interrupted` \| `could-not-start` \| `limit:time` \| `limit:memory` \| `limit:disk`, or null | Null while it runs. A run being stopped at a limit already carries that limit, in state `stopping`. |
+| `reason` | `ended` \| `stopped` \| `interrupted` \| `could-not-start` \| `session-gone` \| `limit:time` \| `limit:memory` \| `limit:disk`, or null | Null while it runs. A run being stopped at a limit already carries that limit, in state `stopping`. |
 | `why` | one line of at most 300 characters, or null | In the runner's own fixed words, never the program's. |
 | `cost_usd`, `turns` | number or null; whole number or null | When the program gives them. Never zero for "not given". |
 | `stop_asked_at` | time, or null | When a stop was asked. |
-| `auto_resume` | `pending` \| `started` \| `refused`, or null | For an interrupted run. |
-| `resumed_by` | run id, or null | The run that resumed it. |
+| `auto_resume` | `pending` \| `started` \| `refused`, or null | For an interrupted run, or a resume whose session was gone: the runner's own next start of it. |
+| `resumed_by` | run id, or null | The run that resumed it, or carried it on afresh. |
 
 **A run that died is resumed once.** A run whose process is gone with no result and no exit is
 `interrupted`, once whatever is left of its process group has been killed. The runner resumes it
 once, as itself, with fixed words. A run that is itself that resume is never resumed again. A run
 whose wrapper never started is `failed` with `could-not-start`, and is never resumed. A lock only
 the wrapper holds says whether a run is alive: the session is never given it.
+
+**A resume whose session is gone starts afresh once (KIT-764).** The program may no longer have the
+conversation a resume names. Then it says so: an error result after no turn, whose text says no
+conversation was found, or no result and those words as the last line of its errors. The tech
+lead's turn reads the same words. That run ends with reason `session-gone`, and the runner starts
+one fresh session, as itself, on its next pass. The fresh start uses the same workspace and branch
+and a new `session_id`. Its prompt holds the ticket and the text of the request whose work it
+carries on, each fenced. That text is read back from `taken/`, past any resume the runner made of
+its own, so a fix that was cut short and then lost keeps its own words. Its record says
+`started_for: "session-gone"`, `how: "fresh-session"` and `resumes` (the run that failed), and
+`gone_session` names the lost session. **Once per request.** Only a resume can end
+`session-gone`. If the runs back to its request already hold a fresh start, no second one is made.
+That happens when a fresh start was interrupted before its session was saved and then resumed. No
+fresh start is made either when those runs cannot all be read. Either way the record's `why`
+says so. A resume that fails any other way ends with its own reason and is never retried. The
+words come from the program's own output. A session that printed them itself would gain one
+fresh start of the same request, and never a second.
 
 **Its limits (KIT-643).** Each run is held to a wall-clock limit, a memory limit for its whole
 process tree and a disk limit for its own folders, from the runner's `limits` settings. Past one,
