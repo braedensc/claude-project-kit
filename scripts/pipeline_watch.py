@@ -38,6 +38,12 @@ WHAT IT CHECKS, one KIND each (a kind is what an alert is about):
   conflict-waker  the owner's conflict waker, where CONFLICT_WAKER_STATE_DIR names its state
               directory: its heartbeat an hour old, a problem, or none, two passes running.
               Slack only, through the status file: it opens no GitHub issue (KIT-339)
+  waker-sandbox  where CONFLICT_WAKER_STATE_DIR is set: one short session on the small model,
+              started the way the waker starts one, must find a write outside its worktree
+              refused by Claude Code's sandbox, a write inside landing, and a read outside
+              refused wherever the settings deny it (KIT-829). After every
+              Claude Code update and once a day; again each pass while it was not held. Failed
+              fires at once; a check that cannot run is unknown. Slack only, like conflict-waker
   watcher-page  the watcher's urgent page job (KIT-549), where WATCHER_PAGE_HEARTBEAT_FILE names its
               page-heartbeat.json: older than WATCHER_PAGE_MAX_AGE_MINUTES, unreadable, in another
               shape, missing, or reporting that a page could not be sent (and by which route), two
@@ -127,13 +133,13 @@ OK, FIRING, UNKNOWN = "ok", "firing", "unknown"
 STATUS_SCHEMA = "pipeline-health-status/1"
 STATE_SCHEMA = "pipeline-health-watch-state/1"
 KINDS = ("hooks", "updates", "release", "dispatcher", "front-door", "disk", "temp",
-         "conflict-waker", "watcher-page", "push-connection", "notifier", "monitor", "credentials",
-         "memory", "burn")
+         "conflict-waker", "waker-sandbox", "watcher-page", "push-connection", "notifier", "monitor",
+         "credentials", "memory", "burn")
 # Read here for the heartbeat monitor, which cannot (KIT-339): the conflict waker is the
 # owner's LaunchAgent, and its heartbeat sits in the owner's home. It reaches Slack through
 # the status file alone. It opens no GitHub issue: the alert workflow knows a fixed list of
 # kinds, and a deployed copy that does not know this one would fail every send.
-SLACK_ONLY_KINDS = ("conflict-waker", "watcher-page", "push-connection", "memory", "burn")
+SLACK_ONLY_KINDS = ("conflict-waker", "waker-sandbox", "watcher-page", "push-connection", "memory", "burn")
 WAKER_SCHEMA = "pr-conflict-waker-heartbeat/1"
 # The watcher's page job (KIT-519) writes this beat. A page that could not be sent shows in it as
 # `could-not-page` and the routes that failed, and nothing else reads it (KIT-549). The route names
@@ -148,6 +154,12 @@ PUSH_STALE_SECONDS = 600
 PUSH_HEARD_SECONDS = 300
 # The waker runs every 300 s, and a pass can run up to its 40-minute session timeout.
 WAKER_STALE_SECONDS = 3600
+# The waker's sandbox, proved by one short session (KIT-829). Held, it is measured again after a
+# Claude Code update or a day on; any other answer is measured again on the next pass.
+SANDBOX_KIND = "waker-sandbox"
+SANDBOX_RESULTS = ("held", "failed", "could not be measured")   # pr_conflict.SANDBOX_* — pinned in the selftest
+SANDBOX_EVERY = 20 * 3600
+SANDBOX_TIMEOUT = 420
 # The notifier and the heartbeat monitor (KIT-286): the two clerks that page about everything
 # else, which nothing else pages about. Each runs every few minutes, so an hour without a
 # heartbeat is far past a late pass. Read from the file the conf names, where this account can
@@ -734,6 +746,57 @@ def check_conflict_waker(env, conf, state):
     return finding("conflict-waker", UNKNOWN, "%s this pass; one more and it fires" % problem)
 
 
+def sandbox_answer(text):
+    """The sandbox check's answer (scripts/pr_conflict.py sandbox-check --json) from its output:
+    the last line that is one of its answers, or None. Anything else is no answer."""
+    for line in reversed((text or "").strip().splitlines()):
+        try:
+            doc = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(doc, dict) and doc.get("result") in SANDBOX_RESULTS:
+            return doc
+    return None
+
+
+def check_waker_sandbox(env, conf, state):
+    """The conflict waker's fix session is still held by Claude Code's sandbox (KIT-829), where
+    CONFLICT_WAKER_STATE_DIR names the waker. One short session on the small model, started the
+    way the waker starts one, proves a write outside its worktree is refused and a write inside
+    lands: after every Claude Code update, and once a day. A failure fires at once, without a
+    second pass: a fix session that is not held is a wall that is gone, not a blip."""
+    if not conf.get("CONFLICT_WAKER_STATE_DIR"):
+        return finding(SANDBOX_KIND, OK, "CONFLICT_WAKER_STATE_DIR is not set: no conflict waker's sandbox "
+                                         "is checked on this machine")
+    got = env.runner.read(["claude", "--version"], timeout=60)
+    version = got.out.strip().splitlines()[0].strip() if got.ok and got.out.strip() else ""
+    if not version:
+        return finding(SANDBOX_KIND, UNKNOWN, "could not be measured: `claude --version` did not answer on "
+                                              "this job's PATH, so no session could be started")
+    now, cached = _now(env), state.get("sandbox") or {}
+    if (cached.get("result") == "held" and cached.get("version") == version
+            and isinstance(cached.get("at"), (int, float)) and now - cached["at"] < SANDBOX_EVERY):
+        return finding(SANDBOX_KIND, OK, "held on Claude Code %s, measured %s" % (version, _iso(cached["at"])))
+    res = env.runner.read([sys.executable, os.path.join(HERE, "pr_conflict.py"), "sandbox-check",
+                           "--claude-bin", "claude", "--json"], timeout=SANDBOX_TIMEOUT)
+    doc = sandbox_answer(res.out)
+    if doc is None:
+        state.pop("sandbox", None)
+        return finding(SANDBOX_KIND, UNKNOWN, "could not be measured: the check gave no answer (exit %s): %s"
+                       % (res.rc, ((res.err or "") + (res.out or "")).strip()[-200:]))
+    seen = str(doc.get("version") or version)
+    detail = str(doc.get("detail") or "")[:300]
+    state["sandbox"] = {"at": now, "version": seen, "result": doc["result"]}
+    if doc["result"] == "held":
+        return finding(SANDBOX_KIND, OK, "held on Claude Code %s: %s" % (seen, detail))
+    if doc["result"] == "failed":
+        return finding(SANDBOX_KIND, FIRING, (
+            "Claude Code %s does NOT hold the conflict waker's fix session: %s. A fix session would run "
+            "outside its walls. Stop the waker until a version holds it again: `launchctl bootout "
+            "gui/$(id -u)/<its label>`. Check: `python3 scripts/pr_conflict.py sandbox-check`." % (seen, detail)))
+    return finding(SANDBOX_KIND, UNKNOWN, "could not be measured on Claude Code %s: %s" % (seen, detail))
+
+
 def _page_problem(path, now, max_age):
     """What is wrong with the watcher's page job's heartbeat at `path`, or None when it is checking
     in and its last pass sent every page. Fields only: the words are ours."""
@@ -980,7 +1043,8 @@ def run_pass(env, conf, dry_run=False):
     findings = [check_hooks(env, conf), check_updates(env, conf, state),
                 check_release(env, conf), check_dispatcher(env, conf, state),
                 check_front_door(env, conf, state), check_disk(env, conf), check_temp(env, conf),
-                check_conflict_waker(env, conf, state), check_watcher_page(env, conf, state),
+                check_conflict_waker(env, conf, state), check_waker_sandbox(env, conf, state),
+                check_watcher_page(env, conf, state),
                 check_push_connection(env, conf, state), check_credentials(env, conf),
                 check_memory(env, conf, state), check_burn(env, conf)]
     findings += [check_clerk(env, conf, state, kind) for kind in CLERKS]
@@ -1066,7 +1130,7 @@ def agent_plist(conf, python, kit, path_env, home):
 
 def _path_env():
     dirs = []
-    for tool in ("brew", "gh", "npm", "git"):
+    for tool in ("brew", "gh", "npm", "git", "claude"):     # claude: the waker's sandbox check (KIT-829)
         found = shutil.which(tool)
         if found and os.path.dirname(found) not in dirs:
             dirs.append(os.path.dirname(found))
@@ -1514,9 +1578,13 @@ def selftest():
                 return se.Result(rc, "", "" if rc == 0 else self.err)
             return FakeGitHub._exec(self, argv, stdin, timeout, cwd)
 
+    HELD_LINE = json.dumps({"result": "held", "version": "2.1.287 (Claude Code)", "cost_usd": 0.04,
+                            "detail": "a write outside the worktree was refused by the sandbox"}) + "\n"
+
     def make_env(home, version="0.2.73", latest="0.2.73", door=200, net=200, free_gb=100,
                  gh=(), now=T, answer="yes", environ=None, runner=None):
-        table = [("npm view cyrus-ai version", 0, latest + "\n")] + list(gh)
+        table = [("npm view cyrus-ai version", 0, latest + "\n")] + list(gh) + [
+            ("claude --version", 0, "2.1.287 (Claude Code)\n"), ("pr_conflict.py sandbox-check", 0, HELD_LINE)]
         env = pu.Env(runner=runner(table) if runner else FakeGitHub(table),
                      http=lambda url: {"cyrus_cli_version": version} if version and url.endswith("/version") else None,
                      sleep=lambda s: None, ask=lambda q: answer,
@@ -2046,6 +2114,74 @@ def selftest():
                                KIT_CHECKOUT=kit))
         check("…its firing reaches the status file the monitor reads, and no GitHub issue",
               (json.load(open(wk_status))["firing"], env.runner.writes), (["conflict-waker"], []))
+
+        # -- the waker's sandbox (KIT-829): off unless the waker is named; held is measured again after
+        #    a Claude Code update or a day on, and anything else on the next pass; failed fires at
+        #    once and reaches Slack through the status file alone; could-not-run is never ok ---------
+        def sandbox_env(answer, version_line="2.1.287 (Claude Code)\n", version_rc=0):
+            env_ = make_env(home)
+            env_.runner.answers = [a for a in env_.runner.answers
+                                   if a[0] not in ("claude --version", "pr_conflict.py sandbox-check")] + [
+                ("claude --version", version_rc, version_line), ("pr_conflict.py sandbox-check", answer[0], answer[1])]
+            sb_ran = []
+            real = env_.runner.read
+
+            def counted(argv, **kw):
+                if "sandbox-check" in argv:
+                    sb_ran.append(list(argv))
+                return real(argv, **kw)
+            env_.runner.read = counted
+            return env_, sb_ran
+        import pr_conflict as prc
+        check("the watch reads the check's three answers by the same words",
+              SANDBOX_RESULTS, (prc.SANDBOX_HELD, prc.SANDBOX_FAILED, prc.SANDBOX_UNMEASURED))
+        env, sb_ran = sandbox_env((0, HELD_LINE))
+        check("the waker's sandbox is said off where CONFLICT_WAKER_STATE_DIR is not set, and nothing runs",
+              (check_waker_sandbox(env, conf(), {})["summary"].split(":")[0], sb_ran),
+              ("CONFLICT_WAKER_STATE_DIR is not set", []))
+        cs, st_s = conf(CONFLICT_WAKER_STATE_DIR=wk_dir), {}
+        first = check_waker_sandbox(env, cs, st_s)
+        check("held is ok, says the version, and sb_ran the kit's own check with the job's claude",
+              (first["state"], "held on Claude Code 2.1.287" in first["summary"], len(sb_ran),
+               sb_ran[0][1:] if sb_ran else None),
+              (OK, True, 1, [os.path.join(HERE, "pr_conflict.py"), "sandbox-check", "--claude-bin", "claude", "--json"]))
+        again = check_waker_sandbox(env, cs, st_s)
+        env.now = lambda: T + SANDBOX_EVERY + 60
+        later = check_waker_sandbox(env, cs, st_s)
+        check("held is not measured again the same day, and is a day on",
+              (again["state"], "measured" in again["summary"], len(sb_ran), later["state"]), (OK, True, 2, OK))
+        env.now = lambda: T
+        env.runner.answers = [a if a[0] != "claude --version" else ("claude --version", 0, "2.2.0 (Claude Code)\n")
+                              for a in env.runner.answers]
+        check_waker_sandbox(env, cs, st_s)
+        check("…and is measured again after a Claude Code update", len(sb_ran), 3)
+        failed_line = json.dumps({"result": "failed", "version": "2.2.0 (Claude Code)",
+                                  "detail": "a write outside the worktree landed: the sandbox did not refuse it"})
+        env, sb_ran = sandbox_env((1, failed_line + "\n"))
+        st_f = {}
+        bad = [check_waker_sandbox(env, cs, st_f) for _ in range(2)]
+        check("failed fires on its first pass, naming the version, and is measured again on the next",
+              ([b["state"] for b in bad], "Claude Code 2.2.0 (Claude Code) does NOT hold" in bad[0]["summary"],
+               "landed" in bad[0]["summary"], len(sb_ran)), ([FIRING, FIRING], True, True, 2))
+        for name, answer, vrc in (("could not be measured", (4, json.dumps({"result": "could not be measured",
+                                                                            "detail": "never sb_ran"}) + "\n"), 0),
+                                  ("no answer", (1, "Traceback\n"), 0), ("another word", (0, '{"result": "ok"}\n'), 0),
+                                  ("no claude", (0, HELD_LINE), 1)):
+            env, sb_ran = sandbox_env(answer, version_rc=vrc)
+            st_u = {}
+            two = [check_waker_sandbox(env, cs, st_u)["state"] for _ in range(2)]
+            check("%s is unknown, never ok, and never cached as held" % name,
+                  (two, (st_u.get("sandbox") or {}).get("result") == "held"), ([UNKNOWN, UNKNOWN], False))
+        sb_home = os.path.join(home, "sandbox-pass")
+        os.makedirs(sb_home)
+        sb_status = os.path.join(home, "sandbox-status.json")
+        env = make_env(sb_home, gh=gh_ok(T))
+        env.runner.answers = [a if a[0] != "pr_conflict.py sandbox-check" else (a[0], 1, failed_line + "\n")
+                              for a in env.runner.answers]
+        waker_beat(result="idle", at=_iso(T - 60), finished_at=_iso(T - 60))
+        code = run_pass(env, conf(CONFLICT_WAKER_STATE_DIR=wk_dir, HEALTH_STATUS_FILE=sb_status, KIT_CHECKOUT=kit))
+        check("…its firing reaches the status file the monitor reads, and no GitHub issue",
+              (code, json.load(open(sb_status))["firing"], env.runner.writes), (EX_FIRING, ["waker-sandbox"], []))
 
         # -- the watcher's page job (KIT-549): off unless its heartbeat is named; a stale, silent,
         #    unreadable, foreign or failing one fires on the second bad pass; it names the route that

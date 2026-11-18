@@ -80,7 +80,11 @@ exact words. Its file tools reach only its worktree, and its commands run in Cla
 Code's sandbox (scripts/pr_conflict.py, THE FIX SESSION'S WALLS). The dry run prints that
 list, and CK-W1 signs it with the count. Preflight puts each check's program folder on the
 job's PATH, because nothing from your settings reaches the session. It also refuses an
-SSH origin: git cannot use SSH inside the sandbox on macOS.
+SSH origin: git cannot use SSH inside the sandbox on macOS. The `sandbox` step proves the
+walls still hold before CK-W1 is read: one short session on the small model, from the job's
+own clone, must find a write outside its worktree refused and a write inside landing, and a
+read outside refused wherever the settings deny it (KIT-829). It costs a few cents, in `run`
+and `verify` alike.
 """
 import argparse
 import json
@@ -755,6 +759,51 @@ def step_dry_run(ctx, apply_it):
     return True, "dry run ran (would wake %s) and the count is signed off" % m.group(1)
 
 
+def sandbox_answer(text):
+    """The sandbox check's answer from its `--json` output: the last line that is one, or None."""
+    for line in reversed((text or "").strip().splitlines()):
+        try:
+            doc = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(doc, dict) and doc.get("result") in prc.SANDBOX_EXIT:
+            return doc
+    return None
+
+
+def step_sandbox(ctx, apply_it):
+    """KIT-829: one short session on the small model, started from the job's own clone the way
+    the waker starts a fix session. A write outside its worktree must be refused by the sandbox,
+    and a write inside must land. It runs in `run`, `run --dry-run` and `verify` alike, before
+    CK-W1 is read, and costs a few cents: a wall measured once by hand could be gone after any
+    Claude Code update."""
+    if ctx.code_state != "level":
+        if not apply_it:
+            return False, "waits on the `code` step: there is no current clone to run the check from"
+        raise SetupError("the waker's code is not in place (%s), so its sandbox cannot be checked" % ctx.code_state)
+    script = os.path.join(ctx.code_dir, "scripts", "pr_conflict.py")
+    res = ctx.runner.read([ctx.python_bin or "python3", script, "sandbox-check", "--claude-bin",
+                           ctx.claude_bin or "claude", "--json"], timeout=prc.SANDBOX_CHECK_TIMEOUT_S + 60)
+    doc = sandbox_answer(res.out)
+    by_hand = "python3 %s sandbox-check --claude-bin %s" % (script, ctx.claude_bin or "claude")
+    if doc is None:
+        if "invalid choice" in (res.err or "") + (res.out or ""):
+            raise Unknown("the job's clone has no `sandbox-check` yet, so the sandbox could not be measured",
+                          "merge the change that ships it (KIT-829), then run `run`")
+        raise Unknown("the sandbox could not be measured: the check gave no answer (exit %s): %s"
+                      % (res.rc, ((res.err or "") + (res.out or "")).strip()[-300:]), "run it by hand: " + by_hand)
+    version, detail = doc.get("version") or "(unknown)", str(doc.get("detail") or "")
+    if doc["result"] == prc.SANDBOX_HELD:
+        return True, "Claude Code %s holds a fix session: %s" % (version, detail)
+    if doc["result"] == prc.SANDBOX_FAILED:
+        raise SetupError("Claude Code %s does NOT hold a fix session to its worktree: %s. A fix session would "
+                         "run outside its walls. Keep the waker off until a version holds it again:\n"
+                         "    launchctl bootout %s/%s\n  Re-check:  %s"
+                         % (version, detail, ctx.domain, ctx.conf["LABEL"], by_hand))
+    raise Unknown("the sandbox could not be measured on Claude Code %s: %s" % (version, detail),
+                  "run it by hand and read why: " + by_hand)
+
+
 def read_heartbeat(ctx):
     """(doc, why_not). Read as you, out of your own home."""
     got = ctx.runner.read(["cat", os.path.join(ctx.state_dir, "heartbeat.json")])
@@ -905,6 +954,7 @@ STEPS = (
     ("preflight", "you, launchd, claude, gh and each checkout", step_preflight),
     ("code", "the clone the job execs, level with origin", step_code),
     ("agent", "the LaunchAgent plist, rendered and installed", step_agent),
+    ("sandbox", "one short session: Claude Code still holds a fix session to its worktree", step_sandbox),
     ("dry-run", "the waker's own dry run, read before it is on", step_dry_run),
     ("enable", "load the job and see its heartbeat", step_enable),
 )
@@ -1105,10 +1155,16 @@ def _settled_answers(ctx, heartbeat_age=30, loaded=True, beat_extra=None):
         ("code rev-parse FETCH_HEAD", 0, HEAD + "\n"),
         ("code cat-file -e FETCH_HEAD:scripts/", 0, ""),
         ("cat /Users/you/Library/LaunchAgents/local.pr-conflict-waker.plist", 0, render_plist(ctx)),
+        ("pr_conflict.py sandbox-check", 0, SANDBOX_HELD_LINE),
         ("pr_conflict.py wake", 0, dry_run_text("asked: …; pending 1 · would wake [7] · declined none")),
         ("heartbeat.json", 0, json.dumps(beat)),
     ]
     return answers
+
+
+SANDBOX_HELD_LINE = json.dumps({"result": "held", "version": "2.1.287 (Claude Code)", "cost_usd": 0.04,
+                                "detail": "a write outside the worktree was refused by the sandbox "
+                                          "(Operation not permitted), and a write inside it landed"}) + "\n"
 
 
 def dry_run_text(tail, ctx=None):
@@ -1267,6 +1323,55 @@ def _selftest_body():
     rows, _ = quiet(lambda: measure(c, apply_it=False, keep_going=True))
     got = [(o, "predates KIT-676" in d) for s, o, d, _e in rows if s == "dry-run"]
     expect("dry-run-without-walls-fails", got == [(FAILED, True)], str(rows))
+
+    # 5b. KIT-829: the sandbox step runs the job's own clone's check with the job's own python and
+    #     claude, before the dry run is read. Held passes and says the version; failed is FAILED
+    #     with the command that keeps the waker off; anything else is UNKNOWN, never a pass.
+    def sandbox_rows(answer):
+        c, f = _fake_ctx()
+        f.answers = [a for a in _settled_answers(c) if a[0] != "pr_conflict.py sandbox-check"] + [
+            ("pr_conflict.py sandbox-check", answer[0], answer[1])]
+        rows, _ = quiet(lambda: measure(c, apply_it=False, keep_going=True))
+        return dict((s, (o, d)) for s, o, d, _e in rows), [s for s, _o, _d, _e in rows]
+    got, order = sandbox_rows((0, SANDBOX_HELD_LINE))
+    expect("sandbox-held", got.get("sandbox") == (ALREADY_DONE, "Claude Code 2.1.287 (Claude Code) holds a fix "
+                                                  "session: a write outside the worktree was refused by the sandbox "
+                                                  "(Operation not permitted), and a write inside it landed")
+           and order.index("sandbox") < order.index("dry-run"), "%s %s" % (got.get("sandbox"), order))
+    failed_line = json.dumps({"result": "failed", "version": "2.1.300 (Claude Code)",
+                              "detail": "a write outside the worktree landed: the sandbox did not refuse it"})
+    got, _o = sandbox_rows((1, failed_line + "\n"))
+    expect("sandbox-failed", got.get("sandbox", ("", ""))[0] == FAILED
+           and "Claude Code 2.1.300 (Claude Code) does NOT hold" in got["sandbox"][1]
+           and "landed" in got["sandbox"][1] and "launchctl bootout gui/501/local.pr-conflict-waker" in got["sandbox"][1],
+           str(got.get("sandbox")))
+    for name, answer in (("unmeasured", (4, json.dumps({"result": "could not be measured", "version": None,
+                                                        "detail": "the session never ran `sh outside.sh`"}) + "\n")),
+                         ("no-answer", (1, "Traceback (most recent call last):\n  boom\n")),
+                         ("not-json-held", (0, "held\n")),
+                         ("other-word", (0, json.dumps({"result": "ok", "detail": "x"}) + "\n")),
+                         ("old-clone", (2, "pr_conflict.py: error: argument cmd: invalid choice: 'sandbox-check'\n"))):
+        got, _o = sandbox_rows(answer)
+        expect("sandbox-%s" % name, got.get("sandbox", ("", ""))[0] == UNKNOWN
+               and (name != "old-clone" or "has no `sandbox-check` yet" in got["sandbox"][1]), str(got.get("sandbox")))
+    c, f = _fake_ctx()
+    f.answers = _settled_answers(c)
+    quiet(lambda: measure(c, apply_it=False, keep_going=True))
+    c.code_state = "behind"
+    expect("sandbox-waits-on-code", step_sandbox(c, False)[0] is False
+           and "waits on the `code` step" in step_sandbox(c, False)[1], "a clone that is not level is never checked")
+    c.code_state = "level"
+    seen = []
+    real_read = f.read
+
+    def spy(argv, **kw):
+        seen.append(list(argv))
+        return real_read(argv, **kw)
+    f.read = spy
+    step_sandbox(c, False)
+    expect("sandbox-argv", seen and seen[-1] == [c.python_bin, os.path.join(c.code_dir, "scripts", "pr_conflict.py"),
+                                                 "sandbox-check", "--claude-bin", c.claude_bin, "--json"],
+           "the check runs the job's own clone, python and claude: %s" % seen[-1:])
 
     # 6. enable: stale heartbeat on a loaded job is UNKNOWN (NOT RUNNING); not loaded is
     #    WOULD-CHANGE under verify; an apply bootstraps into the GUI domain and waits for a beat.

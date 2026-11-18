@@ -2619,6 +2619,22 @@ none of your settings. It may run only the git and gh steps of its prompt and yo
   no check, and pushes with only CI to test it.
 - Not: `CLAUDE_ARGS`. It is gone, and a conf that still sets it is refused by name.
 
+**Is the sandbox still on? (KIT-829)** The walls were measured by hand once, and a Claude Code
+update could change how the sandbox setting is read. So one short check proves them again. It
+starts one session on the small model, the way the waker starts a fix session. A write outside
+its worktree must be refused by the sandbox, and a write inside must land. Where the settings
+deny reads outside the worktree, a read of a planted fake there must be refused too. Each run
+costs a few cents.
+
+- `run` and `verify` run it, from the waker's own clone, as the `sandbox` step.
+- The health watch runs it after every Claude Code update and once a day, where
+  `CONFLICT_WAKER_STATE_DIR` is set (the `waker-sandbox` kind). While it is not `held`, it runs
+  again each pass.
+- Its three answers: `held`; `failed`, which names the Claude Code version; and `could not be
+  measured`, which is never a pass.
+- On `failed`, stop the waker until a version holds again: `launchctl bootout gui/$(id -u)/<LABEL>`.
+  Run the check by hand: `python3 scripts/pr_conflict.py sandbox-check`.
+
 **Is it running?** Read the heartbeat, not the log:
 
 ```sh

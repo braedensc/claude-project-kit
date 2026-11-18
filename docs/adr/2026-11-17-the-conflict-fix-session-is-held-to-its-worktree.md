@@ -78,8 +78,9 @@ below was allowed by an exact rule. A refusal is therefore the sandbox's, and it
 
 ## Verified
 
-- The table above, measured once by hand. Nothing in the kit re-runs it yet, so a Claude Code
-  update could change a row unseen.
+- The table above, measured once by hand. KIT-829 re-runs its first row: the installer's
+  `verify` and the health watch start one short session that must find a write outside the
+  worktree refused and a write inside landing. The other rows are not re-run.
 - `npm run test:conflict` case 31 pins the command line, the settings key by key, and the named
   list. It also checks that every command the prompt names is allowed, and that the dry run
   prints the same list.

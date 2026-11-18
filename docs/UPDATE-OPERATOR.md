@@ -161,6 +161,7 @@ KIT-214, broke every desktop session's guards for six days and told no one.
 | `disk` | free space on `/` is under `DISK_FLOOR_GB` |
 | `temp` | your account's temp space holds more than `TEMP_CEILING_GB` (default 10): Claude Code's per-session scratch, `/tmp/claude-<uid>`, and your own `TMPDIR`, together. The alert names the three largest folders. A session's scratch folder is safe to remove once that session has ended, and a restart clears both. A count that cannot run, or runs past 60 seconds under the line, is `UNKNOWN`. Added 2026-11-04 (KIT-461): on 4 Nov the scratch held 49.5 GB before the disk ran out |
 | `conflict-waker` | the conflict waker's heartbeat, in `CONFLICT_WAKER_STATE_DIR`, has not changed for an hour, reports `problems` or `error`, or was never written, for two passes. Empty: no waker is watched, and every pass says so. It reaches Slack only, never GitHub (KIT-339) |
+| `waker-sandbox` | Claude Code no longer holds the conflict waker's fix session (KIT-829). Where `CONFLICT_WAKER_STATE_DIR` is set, one short session on the small model, started the way the waker starts one, must have a write outside its worktree refused by the sandbox and a write inside land, and, where the settings deny reads outside the worktree, a read of a planted fake there refused. It runs after every Claude Code update and once a day, and again each pass while its last answer was not `held`. Each run costs a few cents. A failure fires at once, naming the version. A check that cannot run is `UNKNOWN`, never ok. The job looks for `claude` on its own PATH, so run `install` again once after this kind arrived. It reaches Slack only, never GitHub |
 | `watcher-page` | the watcher's page job's heartbeat, in `WATCHER_PAGE_HEARTBEAT_FILE`, is older than `WATCHER_PAGE_MAX_AGE_MINUTES` (default 120), unreadable, in another shape or missing, or says a page could not be sent and by which route, for two passes. Empty: it is not watched, and every pass says so. It reaches Slack only, never GitHub (KIT-549) |
 | `push-connection` | the bridge's push-connection job's heartbeat, in `PUSH_HEARTBEAT_FILE` (KIT-561, only with `PUSH_MODE=yes` in bridge.conf), is older than ten minutes, unreadable, in another shape or missing, says the job is not connected to Slack, or shows nothing heard from Slack for five minutes, for two passes. Empty: it is not watched, and every pass says so. It reaches Slack only, never GitHub: the bridge's once-a-minute pass still answers a DM, only not at once |
 | `credentials` | a date you wrote in `CREDENTIAL_EXPIRIES` is within `CREDENTIAL_WARN_DAYS` (default 30) of today, or past. Empty: no dates are watched, and every pass says so. Upkeep like `updates`: a GitHub issue, never a Slack page (KIT-579) |
@@ -239,9 +240,9 @@ clears an alert.
   reaches Slack, and every pass says its GitHub send failed.
 - **Slack:** each pass writes `HEALTH_STATUS_FILE`, world-readable, for the heartbeat
   monitor to read and page through the notifier. Only outage kinds page: `hooks`,
-  `dispatcher`, `front-door`, `disk`, `temp`, `conflict-waker`, `notifier`, `monitor`. `conflict-waker` opens no
-  GitHub issue: the alert workflow knows a fixed list of kinds, and the monitor watches the
-  waker for Slack because its own account cannot read your home. `updates` and `release` are upkeep. They open their
+  `dispatcher`, `front-door`, `disk`, `temp`, `conflict-waker`, `waker-sandbox`, `notifier`, `monitor`.
+  `conflict-waker` and `waker-sandbox` open no GitHub issue: the alert workflow knows a fixed list of
+  kinds, and the monitor watches the waker for Slack because its own account cannot read your home. `updates` and `release` are upkeep. They open their
   GitHub issue but never reach Slack, so a Slack ping always means something is broken. The
   status file lists them under `advisory` (owner decision, 2026-10-27, KIT-264).
 - Either one empty is OFF, and every pass says so.
