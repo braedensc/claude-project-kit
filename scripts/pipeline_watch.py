@@ -65,7 +65,7 @@ WHAT IT CHECKS, one KIND each (a kind is what an alert is about):
               reach, and a dead monitor cannot page about the others.
   queue, morning, sweep  the queue's pass in the bridge, the morning job and the sweep (KIT-689), where
               QUEUE_HEARTBEAT_FILE, MORNING_HEARTBEAT_FILE and SWEEP_HEARTBEAT_FILE name the small
-              file each writes after a pass: older than an hour (three for the sweep), unreadable, in
+              file each writes after a pass: older than the limit in <KIND>_HEARTBEAT_MAX_AGE_MINUTES, unreadable, in
               another shape or missing, two passes running. Empty: that job is off here, not
               watched, and every pass says so. Slack only, through the status file.
 A last kind, `watch-job` — this job itself stopped — cannot be reported by the job. The
@@ -168,7 +168,9 @@ CLERK_STALE_SECONDS = 3600
 # The queue, the morning job and the sweep (KIT-689): each writes a small heartbeat after a pass,
 # and the watch says one stopped, in fixed words. A job off by design has no file named here, and
 # reads as "not watched". Slack only through the status file. Alive and current is all that is
-# judged: what a pass found is that job's own to page. (conf key, schema, label, effect, stale).
+# judged: what a pass found is that job's own to page. (conf key, schema, label, effect, default
+# stale seconds). The owner sets the limit with <KIND>_HEARTBEAT_MAX_AGE_MINUTES, because each job's
+# own interval can be set longer than the default (a sweep every six hours is allowed).
 JOB_BEATS = {
     "queue": ("QUEUE_HEARTBEAT_FILE", "pipeline-queue-heartbeat/1", "queue",
               "No new work is started by itself.", 3600),
@@ -873,6 +875,9 @@ def check_job_beat(env, conf, state, kind):
     said off where it is not. Debounced like the clerks: on a wake from sleep this hourly pass can
     run before the job's first."""
     key, schema, label, effect, stale = JOB_BEATS[kind]
+    minutes = str(conf.get(kind.upper() + "_HEARTBEAT_MAX_AGE_MINUTES") or "")
+    if minutes.isdigit() and int(minutes) > 0:
+        stale = int(minutes) * 60
     path = conf.get(key)
     if not path:
         return finding(kind, OK, "%s is not set: the %s is off here, not watched" % (key, label))
@@ -2252,6 +2257,14 @@ def selftest():
                   [(n, UNKNOWN, FIRING) for n in ("stale", "another shape", "no time",
                                                   "never written")])
         job_beat("sweep", age=JOB_BEATS["queue"][4] + 600)
+        job_beat("morning", age=7200)
+        check("KIT-689: a *_HEARTBEAT_MAX_AGE_MINUTES longer than the default keeps a slow job ok, and "
+              "a shorter one fires it sooner",
+              (check_job_beat(env, conf(MORNING_HEARTBEAT_FILE=jb_paths["morning"],
+                                        MORNING_HEARTBEAT_MAX_AGE_MINUTES="240"), {}, "morning")["state"],
+               check_job_beat(env, conf(MORNING_HEARTBEAT_FILE=jb_paths["morning"],
+                                        MORNING_HEARTBEAT_MAX_AGE_MINUTES="30"), {}, "morning")["state"]),
+              (OK, UNKNOWN))
         check("the sweep, which runs hourly, is not stale at two hours; the queue is",
               (check_job_beat(env, conf(SWEEP_HEARTBEAT_FILE=jb_paths["sweep"]), {}, "sweep")["state"],
                _clerk_problem("queue", jb_paths["sweep"], JOB_BEATS["sweep"][1], T,
