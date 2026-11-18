@@ -6143,13 +6143,13 @@ def selftest():
                   (bounce_markers([body_of("ticketComment")], "o/r", 41), "delivered via runner" in buf.getvalue()),
                   ([1], True))
             view = ledger_view(ledger_path(tmp), "o/r", 41)
-            sent = _parse_iso(view["last_spent"]["at"])
+            sent = _parse_iso((view["last_spent"] or {}).get("at"))
             check("KIT-765 the no-push page fires from the same ledger, head and clock",
                   (blocked_signal(last_spent=view["last_spent"], delivered_bounces=view["delivered_bounces"],
                                   blocked_row=view["blocked"], head_sha="aaaa1111",
                                   now=sent + timedelta(seconds=DEFAULT_BLOCKED_AFTER_SECONDS + 60),
-                                  blocked_after_seconds=DEFAULT_BLOCKED_AFTER_SECONDS) or {}).get("bounce_no"),
-                  1)
+                                  blocked_after_seconds=DEFAULT_BLOCKED_AFTER_SECONDS) or {}).get("bounce_no")
+                  if sent else None, 1)
             world["pr"] = dict(open_pr, headRefOid="bbbb2222")
             calls.clear()
             with contextlib.redirect_stdout(io.StringIO()):
