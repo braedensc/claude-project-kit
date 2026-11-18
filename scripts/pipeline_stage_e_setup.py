@@ -227,6 +227,7 @@ from pipeline_dispatch_local import AGENT_ENV_MARKERS  # noqa: E402
 # Stage E's own GitHub app (KIT-578). The `github-app` step proves it with the same helper the
 # review poller posts with, so the two cannot disagree about what the app is.
 import pipeline_github_app as gha  # noqa: E402
+import pipeline_pass_lock as pass_lock  # noqa: E402  (one run at a time — KIT-681)
 # What the review lane shares with the idea gate: the routing sign-off and the stop file,
 # by their place under the role account's home (KIT-599).
 import pipeline_machine_tickets as machine  # noqa: E402
@@ -244,6 +245,9 @@ EX_UNKNOWN = 4
 # on purpose: "give me your password" and "your install is broken" are opposite
 # problems and sharing a number would make the first look like the second.
 EX_NOPRIV = 5
+# Another run of this installer holds its lock, so NOTHING was attempted (KIT-681). Its own code, as
+# 5 is: "someone else is running" is not "your install is broken", and a rerun later is the answer.
+EX_BUSY = 6
 EX_BLOCKED = 10
 
 # Step outcomes. DONE and ALREADY_DONE both exit 0 and are never printed the
@@ -447,6 +451,8 @@ REQUIRED_SCRIPTS = ("pipeline_review_poller.py", "pipeline_bounce_local.py",
                     # The runner's store, where the bounce driver asks the runner for a fix on the
                     # runner lane (KIT-765), and the usage kinds its own battery checks.
                     "pipeline_runner_store.py", "pipeline_usage_runs.py",
+                    # The one lock a pass of the review poller and the bounce driver takes (KIT-681).
+                    "pipeline_pass_lock.py",
                     # Their `--selftest` runs inside one run folder it removes (KIT-450).
                     "scratch_run.py")
 
@@ -9167,8 +9173,32 @@ def _selftest_body():
     # -- 5. §13: every outcome has its OWN exit code ------------------------
     cases += 1
     expect("exit-codes-distinct", len({EX_OK, EX_FAILED, EX_USAGE, EX_REFUSED,
-                                       EX_UNKNOWN, EX_NOPRIV, EX_BLOCKED}) == 7,
+                                       EX_UNKNOWN, EX_NOPRIV, EX_BLOCKED, EX_BUSY}) == 8,
            "two outcomes share an exit code")
+    # KIT-681: a second run at once is told so, with its own code, and changes nothing; a dry run, which
+    # changes nothing, runs beside the first.
+    import io as _io
+    import tempfile as _tf
+    with _tf.TemporaryDirectory() as busy_tmp:
+        busy_state = os.path.join(busy_tmp, "state")
+        busy_held = pass_lock.take(busy_state, "stage-e-setup")
+        busy_out, busy_real = _io.StringIO(), sys.stdout
+        sys.stdout = busy_out
+        busy_markers = globals()["agent_env_markers_present"]
+        globals()["agent_env_markers_present"] = lambda env=None: []     # a session runs this too: reach the lock
+        try:
+            busy_rc = main(["run", "--conf", os.path.join(busy_tmp, "none.conf"), "--state", busy_state])
+            attest_rc = main(["attest", "x", "--state", busy_state])
+        finally:
+            globals()["agent_env_markers_present"] = busy_markers
+            sys.stdout = busy_real
+        expect("a second run at once exits busy", busy_rc == EX_BUSY, repr(busy_rc))
+        expect("a second attest at once exits busy", attest_rc == EX_BUSY, repr(attest_rc))
+        expect("...and says it is already running", "already running" in busy_out.getvalue(),
+               busy_out.getvalue())
+        expect("...and wrote no state", not os.path.exists(os.path.join(busy_state, "state.json")))
+        pass_lock.release(busy_held)
+        expect("the lock is free once the first run ends", pass_lock.take(busy_state, "stage-e-setup") is not None)
     expect("exit-codes-distinct", EX_NOPRIV not in (EX_OK, EX_UNKNOWN, EX_BLOCKED),
            "`no administrator access` shares a code with nothing-to-do, could-not-measure "
            "or drifted — the three §13 says must never arrive as the same red")
@@ -18905,6 +18935,26 @@ def main(argv=None):
     except Refusal as exc:
         say(str(exc))
         return EX_REFUSED
+    # KIT-681: one run at a time. Everything below changes the machine or its state file; a second run
+    # started beside it would change them twice. A read-only command takes no lock.
+    held = None
+    if args.command == "attest" or (args.command == "run" and not args.dry_run):
+        try:
+            held = pass_lock.take(os.path.expanduser(args.state), "stage-e-setup")
+        except OSError as exc:
+            say("FAILED: the run lock could not be taken (%s). Nothing was changed." % exc)
+            return EX_FAILED
+        if held is None:
+            say(pass_lock.BUSY_SAYS % "this installer" + " (exit %d). Wait for it, then run the same command again."
+                % EX_BUSY)
+            return EX_BUSY
+    try:
+        return _main_locked(args)
+    finally:
+        pass_lock.release(held)
+
+
+def _main_locked(args):
     state = State(args.state)
     try:
         if args.command == "attest":

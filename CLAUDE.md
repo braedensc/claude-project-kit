@@ -256,6 +256,7 @@ npm run test:notifier        # human-action notifier: marks table, the three §1
 npm run test:heartbeat-monitor  # the job that READS the three heartbeats: one comment
                              #   per incident, the sleep blind spot, §13 exit codes
 npm run test:notifier-setup  # notifier installer (KIT-116): conf-all-errors, agent-refused, no secret in output
+npm run test:pass-lock       # the one lock a pass of the review poller, notifier, bounce driver, queue starter and Stage E installer takes: a second at once does nothing and says so (KIT-681)
 npm run test:root-guard      # every installer refuses to run as root with one shared message, and changes nothing (KIT-693)
 npm run test:stage-e-setup   # Stage E installer: conf errors all-at-once, idempotency, no
                              #   Reviews team (labels on the work teams, a drain gate, KIT-599),
