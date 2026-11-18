@@ -457,10 +457,11 @@ and the approvals are their own pieces.
 | The agent escalates | `escalated` | It waits for you, with the agent's reason. |
 | The agent believes the dev session is compromised | `escalated-urgent` | It waits for you, marked urgent, and the watcher pages you. |
 | A limit or the evidence holds it for good | `held`, with closed words such as `risk-path` | It waits for you. |
-| The agent could not answer | `held`, with a word such as `run-timeout` | It waits for you. |
+| The agent gave an answer that could not be used | `held`, with a word such as `answer-not-two-lines` | It waits for you. |
 
 **A hold that settles by itself writes nothing.** Checks still running, a review not in yet, the
-working window closed, a fact it could not read: it waits, and a later pass judges again. A pull
+working window closed, a fact it could not read, an agent run that failed before it judged (a
+timeout, a CLI that would not start): it waits, and a later pass judges again. A pull
 request's head gets one verdict, so a wait never spends it. Good: no row while checks run. Not
 that: a `held` row for a check still running, which would leave that head unable to be approved.
 
@@ -484,10 +485,12 @@ plain words and the reply that clears it: `approve <plan>` for a plan, `start <p
 piece. A pull request is yours to merge or close on GitHub. A later piece puts these in the
 stand-up. The agent's own words are shown apart, as its words, never as the report's.
 
-**An urgent one pages you through the watcher,** which reads the ledger on its own account. Until
-the watcher's validator monitor is on, the validator says it could not page, and the blocker is
-still there. Good: `could not page: the watcher's approval-rate monitor is not on, so nothing reads
-the ledger yet`. Not that: taking an urgent escalation as paged because it was written down.
+**An urgent one pages you through the watcher,** which reads the ledger on its own account. The
+validator sends nothing itself, so it never assumes a page. It says `paged` only once the watcher's
+status shows that escalation flagged, `not paged yet` until then, and `could not page` while the
+watcher is stale, unreadable, off or blind. The blocker stands either way. Good: `not paged yet:
+the watcher has not flagged this urgent escalation, so it stays your blocker until it does`. Not
+that: taking an urgent escalation as paged because it was written down.
 
 **Your `Validator` check.** Stage E's bounce driver never treats a red `Validator` check as
 something the dev session must fix, whatever your list of checks that wait on a person says. Its

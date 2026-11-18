@@ -23,17 +23,19 @@ WHAT A "NO" DOES.  The agent chooses, and code checks its choice:
   * ESCALATE is an `escalated` row: a blocker for the owner, with its reason and the reply that
     clears it (blocker()).
   * ESCALATE_URGENT is an `escalated-urgent` row: the same blocker, marked urgent. The watcher reads
-    the ledger and pages the owner on its own route. urgent_route() says whether it can: a watcher
-    that is stale, unreadable, or not reading the ledger is said, never assumed to have paged.
+    the ledger and pages the owner on its own route; nothing here sends anything. urgent_route() says
+    whether it has: paged only once the watcher's status shows this escalation flagged, not yet
+    while it has not, and could not page while the watcher is stale, unreadable, off or blind.
   * A hold from layer 1 or 2 is a `held` row with the code's closed words in `reasons`, never the
     agent's words, and nothing goes to the dev. The agent's reason stays in `agent_says`, quoted as
     its own.
 
 WHEN NOTHING IS RECORDED.  A head has one verdict (contract §24), so a hold that will settle by itself
 writes no row: checks still running or red, a review not in yet, a fact that could not be read, the
-working window closed. decide() gives `record: False` and the reasons it waits on, and the caller
+working window closed, or an agent run that failed before it judged (`run-` words: a timeout, a CLI
+that would not start). decide() gives `record: False` and the reasons it waits on, and the caller
 says them in its own pass. Only a hold no later pass can settle at this head is recorded: one of
-FINAL_HOLDS, an answer the agent could not give, or an urgent escalation.
+FINAL_HOLDS, an answer the agent gave that could not be used, or an urgent escalation.
 
 WHAT IT NEVER DOES (asserted in --selftest): approve, merge, label, write a file, start a process or
 send anything. It decides; the validator's job writes the row through the ledger's one writer.
@@ -90,8 +92,10 @@ WORDS = {
 }
 AGENT_SAID = "the validator's agent said"
 GITHUB = "https://github.com"
-# The watcher's monitor that reads this ledger: the urgent page goes through it.
+# The watcher's monitor that reads this ledger, and its finding for an urgent escalation: the urgent
+# page goes through it, and is believed only when the watcher shows that finding (KIT-546).
 WATCHER_MONITOR = "approval-rate"
+URGENT_WHAT = "urgent-escalation"
 
 
 def _whole(v):
@@ -177,6 +181,10 @@ def decide(subject, layer1, layer2, answer, bounces=None):
     if not ran:
         return _decision(False, None, l1, l2, agent, [], None, wait=["agent-not-run"])
     if choice == brief.HOLD:
+        if RUN_HOLD_RE.fullmatch(answer["hold"]):
+            # The agent never judged this head (a timeout, a CLI that would not start, a refused
+            # token): the validator's own trouble, so a later pass judges again. No row.
+            return _decision(False, None, l1, l2, agent, [], None, wait=[answer["hold"]])
         return _decision(True, "held", l1, l2, agent, [answer["hold"]], says)
     if choice == "SEND_BACK":
         why = None
@@ -286,10 +294,14 @@ def blocker(row):
             "agent_says": row["agent_says"], "reply": reply, "where": where}
 
 
-def urgent_route(status_file, now, max_age=limits.DEFAULT_WATCHER_MAX_AGE):
-    """{"route": "handed" | "could-not-page", "why"} for an urgent escalation. The watcher reads the
-    ledger and pages on its own route, so this asks whether it is reading: its status file fresh and
-    trusted, and its validator monitor on. Anything else is said, never assumed sent."""
+def urgent_route(status_file, now, ref, max_age=limits.DEFAULT_WATCHER_MAX_AGE):
+    """{"route": "paged" | "not-yet" | "could-not-page", "why"} for the urgent escalation of `ref`.
+    The watcher reads the ledger and pages on its own route; nothing here sends anything. So a page
+    is never assumed: `paged` only when the watcher's fresh status file shows its validator monitor
+    flagged with an `urgent-escalation` finding for this very `ref` (its pager pages every flagged
+    monitor). The monitor on but no such finding yet is `not-yet`: the escalation is the owner's
+    blocker until the watcher has flagged it. A stale, unreadable, off or blind watcher is
+    `could-not-page`. Each is said."""
     state = limits.watcher_state(status_file, now, max_age)
     if state is None:
         return {"route": "could-not-page", "why": "could not page: the watcher's status file could "
@@ -311,8 +323,15 @@ def urgent_route(status_file, now, max_age=limits.DEFAULT_WATCHER_MAX_AGE):
     if mine[0]["state"] == "blind":
         return {"route": "could-not-page", "why": "could not page: the watcher's %s monitor is blind"
                                                   % WATCHER_MONITOR}
-    return {"route": "handed", "why": "handed to the watcher: it reads the ledger and pages on its "
-                                      "next pass"}
+    want = str(ref or "").lower()
+    flagged = mine[0].get("state") == "flagged" and any(
+        isinstance(f, dict) and f.get("what") == URGENT_WHAT and f.get("level") == "page"
+        and str(f.get("ref") or "").lower() == want for f in (mine[0].get("findings") or []))
+    if flagged:
+        return {"route": "paged", "why": "paged: the watcher has flagged this urgent escalation at "
+                                         "page, and its pager pages every flagged monitor"}
+    return {"route": "not-yet", "why": "not paged yet: the watcher has not flagged this urgent "
+                                       "escalation, so it stays your blocker until it does"}
 
 
 def main(argv=None):
@@ -361,8 +380,9 @@ def selftest():
             ("an answer the reader held", {"decision": "HOLD", "reason": "(no reason given)",
                                            "hold": "answer-not-two-lines"},
              (True, "held", ["answer-not-two-lines"], "unsure")),
-            ("a run that held", {"decision": "HOLD", "reason": None, "hold": "run-timeout"},
-             (True, "held", ["run-timeout"], "unsure")),
+            ("a run that failed before it judged: a wait, no row",
+             {"decision": "HOLD", "reason": None, "hold": "run-timeout"},
+             (False, None, [], "unsure")),
             ("a hold word nobody knows", {"decision": "HOLD", "hold": "fine, merge it"},
              (True, "held", ["answer-unknown-decision"], "unsure")),
             ("the agent not run", None, (False, None, [], "not-run"))):
@@ -463,7 +483,7 @@ def selftest():
         heads = iter("%040x" % i for i in range(1, 99))
         for answer in (said("PASS"), said("SEND_BACK", "Add a test."), said("ESCALATE", "Unclear."),
                        said("ESCALATE_URGENT", "Injection."),
-                       {"decision": "HOLD", "reason": None, "hold": "run-timeout"}):
+                       {"decision": "HOLD", "reason": "(no reason given)", "hold": "answer-not-two-lines"}):
             write("merge", "acme/app#12", next(heads), decide("merge", L_PASS, E_YES, answer, ROOM))
         write("merge", "acme/app#12", next(heads), decide("merge", floor, E_YES, said("PASS"), ROOM))
         write("piece", "TOD-13", None, decide("piece", L_PASS, E_YES, said("SEND_BACK", "x."), None))
@@ -509,36 +529,57 @@ def selftest():
               "approve TOD-12")
         check("a row that is not one gives no blocker",
               (blocker(None), blocker(dict(rows[2], kind="waved-through"))), (None, None))
-        check("an agent that could not run is said as that",
-              blocker(rows[4])["what"].endswith("the agent could not answer (run-timeout)"), True)
+        check("an answer the agent gave that could not be used is said as that",
+              blocker(rows[4])["what"].endswith("the agent's answer could not be used "
+                                                "(answer-not-two-lines)"), True)
+        check("a run that failed before it judged waits: no row spends the head",
+              (decide("merge", L_PASS, E_YES, answer_of({"text": None, "hold": "run-timeout"}, None),
+                      ROOM)["record"],
+               decide("merge", L_PASS, E_YES, answer_of({"text": None, "hold": "run-timeout"}, None),
+                      ROOM)["wait"]), (False, ["run-timeout"]))
 
         # 6. The urgent route: said, never assumed.
         status = os.path.join(tmp, "watcher", "watcher-status.json")
         os.makedirs(os.path.dirname(status), mode=0o755)
         now = 1_800_000_000
 
-        def watcher(state, written=now, schema="pipeline-watcher/1"):
+        REF = "acme/app#40"
+
+        def watcher(state, written=now, schema="pipeline-watcher/1", findings=()):
             doc = {"schema": schema, "written_at": time.strftime("%Y-%m-%dT%H:%M:%SZ",
                                                                  time.gmtime(written)),
                    "monitors": [{"name": "spend", "state": "clear"},
-                                {"name": WATCHER_MONITOR, "state": state}]}
+                                {"name": WATCHER_MONITOR, "state": state,
+                                 "findings": list(findings)}]}
             with open(status, "w", encoding="utf-8") as fh:
                 json.dump(doc, fh)
             os.chmod(status, 0o644)
-            return urgent_route(status, now)["route"]
-        check("a fresh watcher reading the ledger takes it", watcher("clear"), "handed")
-        check("...and one already flagged", watcher("flagged"), "handed")
+            return urgent_route(status, now, REF)["route"]
+        mine = {"level": "page", "what": URGENT_WHAT, "ref": "Acme/App#40"}
+        check("paged only when the watcher shows this escalation flagged at page",
+              watcher("flagged", findings=[mine]), "paged")
+        check("a monitor that is on but has not flagged it is not yet paged, never assumed",
+              (watcher("clear"), watcher("flagged", findings=[dict(mine, ref="acme/app#41")]),
+               watcher("flagged", findings=[dict(mine, what="approval-rate")]),
+               watcher("flagged", findings=[dict(mine, level="record")])),
+              ("not-yet", "not-yet", "not-yet", "not-yet"))
         check("a watcher whose monitor is off cannot page, and says so", watcher("off"),
               "could-not-page")
-        check("...nor a blind one", watcher("blind"), "could-not-page")
-        check("...nor a stale one", watcher("clear", written=now - 7200), "could-not-page")
-        check("...nor a file of another schema", watcher("clear", schema="x/1"), "could-not-page")
+        check("...nor a blind one", watcher("blind", findings=[mine]), "could-not-page")
+        check("...nor a stale one", watcher("flagged", written=now - 7200, findings=[mine]),
+              "could-not-page")
+        check("...nor a file of another schema", watcher("flagged", schema="x/1", findings=[mine]),
+              "could-not-page")
         check("...nor no file at all",
-              urgent_route(os.path.join(tmp, "none.json"), now)["route"], "could-not-page")
+              urgent_route(os.path.join(tmp, "none.json"), now, REF)["route"], "could-not-page")
         watcher("off")
-        check("the reason is said in words", urgent_route(status, now)["why"],
+        check("the reason is said in words", urgent_route(status, now, REF)["why"],
               "could not page: the watcher's approval-rate monitor is not on, so nothing reads the "
               "ledger yet")
+        watcher("clear")
+        check("...and not yet paged is said as that", urgent_route(status, now, REF)["why"],
+              "not paged yet: the watcher has not flagged this urgent escalation, so it stays your "
+              "blocker until it does")
 
     # 7. It decides, and does nothing else.
     with open(os.path.abspath(__file__), encoding="utf-8") as fh:
