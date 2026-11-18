@@ -1556,7 +1556,7 @@ def review_facts(owner_repo, pr, ticket_id, basis, threshold, diff, withheld=Non
     carries no routing directive: no dispatcher reads it, and the count is checked. `title`
     is the review's own name, its heading: which pull request, and which part or re-review."""
     number = pr["number"]
-    title = _one_line(pr.get("title") or "")
+    pr_title = _one_line(pr.get("title") or "")
     branch = _one_line(pr.get("headRefName") or "")
     ac = [_one_line(s) for s in basis.get("acceptance_criteria") or []]
     oos = [_one_line(s) for s in basis.get("out_of_scope") or []]
@@ -1569,7 +1569,7 @@ def review_facts(owner_repo, pr, ticket_id, basis, threshold, diff, withheld=Non
         "## The pull request",
         "",
         pr_marker(owner_repo, number),
-        "- PR title: %s" % (title or "_(none)_"),
+        "- PR title: %s" % (pr_title or "_(none)_"),
         "- Head branch: `%s`" % branch,
         "- Original ticket: **%s** (the ticket whose work this PR claims to complete)" % ticket_id,
         "",
@@ -1594,18 +1594,18 @@ def review_facts(owner_repo, pr, ticket_id, basis, threshold, diff, withheld=Non
     lines += ["</untrusted-ticket-data>", "", "## Severity threshold", "", "- `%s`" % threshold, ""]
     if withheld:
         listing = "\n".join(_one_line(path) or "(unnamed)" for path in withheld)
-        lines += ["## WITHHELD: %d file(s) or piece(s) of this change were left out" % len(withheld),
+        lines += ["## PART OF THIS CHANGE WAS WITHHELD: %d file(s) or piece(s) were left out" % len(withheld),
                   "", "%s shown=%d withheld=%d" % (WITHHELD_MARK, len(split_diff_by_file(diff))
                                                    if shown_count is None else shown_count,
                                                    len(withheld)),
                   "", _code_fence_for(listing), listing, _code_fence_for(listing), ""]
     if pieces:
         listing = "\n".join(_norm_name(name) for name in pieces)
-        lines += ["## SHOWN IN PIECES", "", _code_fence_for(listing), listing,
+        lines += ["## SOME FILES ARE SHOWN IN PIECES", "", _code_fence_for(listing), listing,
                   _code_fence_for(listing), ""]
     if notices:
         listing = "\n".join(line for notice in notices for line in _notice_lines(notice))
-        lines += ["## FILES DELETED WHOLE", "", _code_fence_for(listing), listing,
+        lines += ["## FILES DELETED WHOLE — SHOWN AS A NOTICE", "", _code_fence_for(listing), listing,
                   _code_fence_for(listing), ""]
     lines += ["## The diff", "", "<untrusted-diff>", fence + "diff", safe_diff.rstrip("\n"), fence,
               "</untrusted-diff>", ""]
@@ -4633,6 +4633,42 @@ def runner_tier(label):
     return "guarded" if (label or {}).get("guarded") else "standard"
 
 
+def runner_review_id(owner_repo, number, title, head):
+    """The request id of one review: its repository, pull request, title and head (KIT-644).
+
+    THE RUNNER'S STORE IS THE AUTHORITY, as the tracker is on the old lane. The seen-set is a
+    cache: lost, it re-selects every pull request. The same review then has the same id, and the
+    store already holds a request under it, waiting or answered, so it is read and never asked
+    again. A re-review, a part and a retry each have a title of their own, so each is its own
+    review; a review of another head is another review."""
+    seed = "%s#%d|%s|%s" % (str(owner_repo).lower(), int(number), title, head or "")
+    return "rq-" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:32]
+
+
+def runner_review_asked(store_dir, request_id):
+    """True when the runner's store holds this request, waiting or answered."""
+    return any(os.path.lexists(os.path.join(store_dir, folder, request_id + ".json"))
+               for folder in ("requests", "taken"))
+
+
+def runner_review_request(store_dir, request_id):
+    """A request the runner's store holds, waiting or answered, as it was asked: None when it
+    cannot be read, which the caller treats as "could not", never as "none"."""
+    for folder in ("requests", "taken"):
+        path = os.path.join(store_dir, folder, request_id + ".json")
+        if not os.path.lexists(path):
+            continue
+        try:
+            doc = runner_store.read_json(path)
+        except runner_store.StoreError:
+            return None
+        if folder == "taken":
+            doc = doc.get("request") if isinstance(doc, dict) else None
+        ok = isinstance(doc, dict) and isinstance(doc.get("text"), str)
+        return doc if ok else None
+    return None
+
+
 def ask_runner_review(runner, ticket_id, text, tier):
     """Write the review's one start request into the runner's store, under the id this job
     recorded first, so a crash between the two never buys a second paid review."""
@@ -4816,6 +4852,8 @@ def collect_runner_entry(cfg, key, record, seen, linear_key, dry_run, result):
     if not out or out.get("text") is None:
         return declined("the review %s ended without a final message" % see)
     if out.get("is_error"):
+        # The program's own words stay in the owner's log, as the dispatcher's do on the old lane.
+        log("review %s for %s#%d ended in an error: %s" % (see, owner_repo, number, (out.get("text") or "")[:300]))
         return declined("the review %s ended in an error (%s)" % (see, out.get("subtype") or "no subtype"))
     # Tamper check: the request the runner took holds the facts this job wrote, whole.
     taken = runner_store.taken_request(store_dir, rid)
@@ -4924,13 +4962,28 @@ def prepare_review(cfg, owner_repo, pr, ticket_id, linear_key, dry_run, rereview
                           title=named)
     label = review_label(cfg, owner_repo, number, diff)     # the WHOLE diff, never the fitted one
     if runner is not None:
-        # No ticket: no team, no routing label, no record of review tickets and no dedup search.
-        # This job's own record is what keeps a review asked once (scan_pr writes it first).
+        # No ticket: no team, no routing label and no record of review tickets. The runner's
+        # store answers the dedup question by the review's own id, before anything is asked.
         if len(body) > runner_store.REVIEW_TEXT_MAX:
             return "decline", ("the review's facts are %d characters, over the %d the runner's "
                                "request holds: lower diff_cap_chars to cut it into parts"
                                % (len(body), runner_store.REVIEW_TEXT_MAX)), basis
-        return "ask", runner, basis, body, partial, label
+        rid = runner_review_id(owner_repo, number, named, pr.get("headRefOid") or "")
+        if not runner_review_asked(runner["store_dir"], rid):
+            return "ask", runner, basis, body, partial, label, rid, False
+        # The store's own text decides the coverage and the hash, as the tracker's body does on
+        # the old lane: it is what the reviewer reads.
+        stored = runner_review_request(runner["store_dir"], rid)
+        if stored is None:
+            return "retry", ("the runner's store holds this review's request, but it could not be "
+                             "read"), rid, basis
+        # The tier it was asked under is the reviewer it got, never this pass's choice (KIT-418).
+        guarded = stored.get("tier") == "guarded"
+        label = {"id": cfg["model_label_id_guarded"] if guarded else cfg["model_label_id"],
+                 "name": (cfg.get("model_label_name_guarded") if guarded
+                          else cfg.get("model_label_name")) or "", "guarded": guarded}
+        return ("ask", runner, basis, stored["text"], partial_from_body(stored["text"]), label, rid,
+                True)
     title = review_title(number, ticket_id, rereview)
     team_id = route_label = None
     if cfg.get("mode") == MODE_WORK_TEAMS:
@@ -5067,15 +5120,24 @@ def scan_pr(cfg, owner_repo, pr, seen, linear_key, dry_run, result, rereview=Non
         # KIT-644: one start request to our own runner. Recorded under the id this job chose
         # BEFORE it is written, so a crash between the two never buys a second paid review: the
         # next pass reads the store for that id, and finds the request, its answer, or neither.
-        runner, basis, text, partial, label = decision[1:6]
+        runner, basis, text, partial, label, rid, reused = decision[1:8]
         if partial:
             record["partial"] = partial
         record["review_label"] = {"name": label["name"], "guarded": label["guarded"]}
         record.update(status="pending", basis=basis, lane=RUNNER_LANE, review_ticket=None,
-                      review_ticket_id=None, reused=False, body_sha256=body_sha256(text),
+                      review_ticket_id=None, reused=reused, body_sha256=body_sha256(text),
                       runner={"store_dir": runner["store_dir"], "project": runner["project"],
-                              "request": runner_store.new_request_id(), "tier": runner_tier(label),
-                              "asked": False})
+                              "request": rid, "tier": runner_tier(label), "asked": reused})
+        if reused:
+            # The store already holds this very review, asked by a pass whose record was lost:
+            # read, never asked again. Its own text is what the tamper check holds it to.
+            if not dry_run:
+                persist(cfg, seen, key, record, dry_run)
+                spend_request("runner request reused")
+            print("REUSED existing review request %s for %s#%d (%s)%s"
+                  % (rid, owner_repo, number, ticket_id, " [dry-run — nothing written]" if dry_run else ""))
+            result.created += 1
+            return
         if dry_run:
             print("[dry-run] would ask the runner for a %sreview run of %s#%d (%s), %d chars, %s — "
                   "nothing written" % ("RE-" if rereview is not None else "", owner_repo, number,
@@ -5690,6 +5752,7 @@ class _FakeLinear:
         self.lane = lane or getattr(self, "lane", None) or "old"
         self.store_dir = getattr(self, "store_dir", None)     # the runner lane's store, kept
         self.stops = []           # the runner lane's stop requests: (run, ticket)
+        self.usage = True         # the runner lane's run says its model and tokens
         if self.store_dir:
             self.runner_reset()
         self.issues = {}          # id -> {identifier, title, description, state}
@@ -5835,8 +5898,27 @@ class _FakeLinear:
         """What the n-th review is named by on this lane: its ticket, or its run."""
         return "REV-%d" % n if self.lane == "old" else self.run_of(n)
 
+    def handle(self, record):
+        """The `rev-uuid-N` a seen record's review answers to, on either lane."""
+        if self.lane == "old":
+            return record.get("review_ticket_id")
+        asked = (record.get("runner") or {}).get("request")
+        return next((i for i, issue in self.issues.items() if issue.get("request") == asked), None)
+
     def _runner_respond(self, issue_id, body, kind, status):
-        n = int(issue_id.rsplit("-", 1)[1])
+        if status == "stale":          # a session that ended with no answer leaves no message
+            return self.runner_answer(issue_id, output=None)
+        return self.runner_answer(issue_id, output=(kind == "response", body))
+
+    def runner_answer(self, issue_id, output=(True, ""), ok=True, why="", state="ended",
+                      reason="ended"):
+        """Answer the review `issue_id` names as our own runner would: refuse it in words (`ok`
+        false), or start its run and leave it `state` for `reason`, with `output` its final
+        message, (answered, text), or none. A review never asked is not answered, as on the old
+        lane."""
+        n = int(str(issue_id).rsplit("-", 1)[-1]) if str(issue_id).rsplit("-", 1)[-1].isdigit() else 0
+        if not 0 < n <= len(self.created):
+            return
         ask = self.created[n - 1]
         rid, run_id, now = ask["request"], self.run_of(n), time.time()
         with open(os.path.join(self.store_dir, "requests", rid + ".json"), encoding="utf-8") as fh:
@@ -5844,23 +5926,44 @@ class _FakeLinear:
         if self.tamper:
             doc = dict(doc, text=(doc.get("text") or "") + self.tamper)
         at = runner_store.iso(now)
+        if not ok:
+            runner_store.settle(self.store_dir, rid, doc, False, None, why, now)
+            return
+        live = state in runner_store.LIVE
         rec = dict.fromkeys(runner_store.RUN_KEYS)
         rec.update(schema=runner_store.RUN_SCHEMA, run=run_id, request=rid, caller=doc["caller"],
                    kind=doc["kind"], project=doc["project"], ticket=doc["ticket"],
                    started_for="request", approved_by="owner-1", approved_at=at, how="move",
                    session_id="00000000-0000-4000-8000-%012x" % n,
                    workspace="/work/review/%s" % doc["ticket"],
-                   branch="chore/%s-review" % doc["ticket"].lower(), state="ended", started_at=at,
-                   ended_at=at, seconds=60.0, exit=0, reason="ended", why="", cost_usd=0.25, turns=6)
+                   branch="chore/%s-review" % doc["ticket"].lower(), state=state, started_at=at,
+                   ended_at=None if live else at, seconds=None if live else 60.0,
+                   exit=None if live else 0, reason=None if live else reason,
+                   why=None if live or reason == "ended" else "stopped at its limit",
+                   cost_usd=None if live else 0.25, turns=None if live else 6)
         runner_store.write_run(self.store_dir, rec)
-        if status != "stale":         # a session that ended with no answer leaves no message
-            runner_store.write_output(self.store_dir, run_id, kind != "response",
-                                      "success" if kind == "response" else "error_during_execution",
-                                      body, now, model="claude-sonnet-test", tokens=1234)
+        if output is not None and not live:
+            answered, text = output
+            runner_store.write_output(self.store_dir, run_id, not answered,
+                                      "success" if answered else "error_during_execution",
+                                      text, now, model="claude-sonnet-test" if self.usage else None,
+                                      tokens=1234 if self.usage else None)
         runner_store.settle(self.store_dir, rid, doc, True, run_id, "", now)
 
-    def respond(self, issue_id, body, kind="response", status="complete"):
-        if self.lane == "runner":
+    def runner_end(self, n, output=(True, "")):
+        """End the n-th review's run, which was left running."""
+        rec = runner_store.read_run(self.store_dir, self.run_of(n))
+        now = runner_store.iso(time.time())
+        rec.update(state="ended", ended_at=now, seconds=60.0, exit=0, reason="ended")
+        runner_store.write_run(self.store_dir, rec)
+        runner_store.write_output(self.store_dir, rec["run"], not output[0],
+                                  "success" if output[0] else "error_during_execution", output[1],
+                                  time.time())
+
+    def respond(self, issue_id, body, kind="response", status="complete", via=None):
+        """Answer a review as its lane's reviewer would: `via` names the lane, when a case answers
+        a review filed on the other one (a review finishes on the lane it started on)."""
+        if (via or self.lane) == "runner":
             return self._runner_respond(issue_id, body, kind, status)
         sid = "sess-%s" % issue_id
         self.sessions[issue_id] = [{"id": sid, "status": status, "createdAt": "2026-09-06T00:00:00Z",
@@ -6687,7 +6790,7 @@ def _planner_constant(name):
 
 
 # KIT-644: the lanes the end-to-end cases run on, in order.
-E2E_LANES = ("old",)
+E2E_LANES = ("old", "runner")
 
 
 def e2e_cfg(cfg, lane, root):
@@ -6739,12 +6842,21 @@ def selftest():
     # KIT-644: the end-to-end cases (section 6 on) run once per lane. `check` notes each
     # case's name under the lane it ran on, and `only` names a case one lane alone has, so
     # a lane that runs fewer cases than the other fails (lane_count_problems).
-    LANE = {"now": None}
+    LANE, ALONE = {"now": None}, {"now": None}
     ran, lane_only = {}, {}
 
+    def alone(which):
+        """From here until alone(None), every case is `which` lane's alone: there it is checked and
+        named as that lane's, and on another lane its code runs and nothing is checked."""
+        ALONE["now"] = which
+
     def check(name, got, want):
+        if ALONE["now"] and LANE["now"] is not None and ALONE["now"] != LANE["now"]:
+            return
         if LANE["now"] is not None:
             ran.setdefault(LANE["now"], []).append(name)
+            if ALONE["now"]:
+                lane_only.setdefault(LANE["now"], []).append(name)
         if got != want:
             failures.append("%s%s: got %r, want %r" % ("[%s lane] " % LANE["now"] if LANE["now"] else "",
                                                      name, got, want))
@@ -7189,7 +7301,13 @@ def selftest():
           ("starts with" in CRITERIA_SHAPE, "trailing colon" in CRITERIA_SHAPE), (True, False))
 
     # 3c. KIT-644: a review run on our own runner is given the facts alone, as its request's
-    #     text. Every instruction reaches it as its rules, from pipeline_review_brief.
+    #     text. Every instruction reaches it as its rules, from pipeline_review_brief, whose own
+    #     cases run here: it is this battery's, as both lanes' review words are this job's.
+    real_out_644, sys.stdout = sys.stdout, io.StringIO()
+    try:
+        check("KIT-644 the review brief's own cases pass", brief.selftest(), 0)
+    finally:
+        sys.stdout = real_out_644
     facts = review_facts("o/r", fixture[4], "KIT-5", basis, "high", diff)
     told = (OUTPUT_SHAPE, REVIEW_ONLY_PREAMBLE, brief.DIFF_UNTRUSTED, TICKET_TEXT_PREAMBLE,
             "Cover exactly four dimensions", "Rules that are enforced", routing_tag("o/r"),
@@ -7623,6 +7741,10 @@ def selftest():
     no_ticket_pr = [p for p in fixture if p["number"] == 3][0]
     fixture = [p for p in fixture if p["number"] != 3]
     def _end_to_end(lane, cfg, body, msg, said):
+        def pick(**by_lane):
+            """What a case expects on this lane, where the two lanes say it in their own words."""
+            return by_lane[lane]
+
         globals()["list_open_prs"] = lambda owner_repo, limit=100: fixture
         globals()["fetch_pr_diff"] = lambda owner_repo, n: diff
         globals()["linear_graphql"] = fake
@@ -7647,9 +7769,11 @@ def selftest():
             check("scan exits OK", scan(cfg, False), EXIT_OK)
             check("scan created exactly one ticket", len(fake.created), 1)
             inp = fake.created[0] if fake.created else {}
-            check("ticket goes to the Reviews team", inp.get("teamId"), "team-1")
-            check("ticket is delegated to the agent", inp.get("delegateId"), "agent-1")
-            check("ticket carries the model label", inp.get("labelIds"), ["label-1"])
+            only("old", "ticket goes to the Reviews team", lambda: inp.get("teamId"), "team-1")
+            only("old", "ticket is delegated to the agent", lambda: inp.get("delegateId"), "agent-1")
+            only("old", "ticket carries the model label", lambda: inp.get("labelIds"), ["label-1"])
+            only("runner", "the request says its tier: the default reviewer (KIT-644)",
+                 lambda: inp.get("tier"), "standard")
             check("ticket is NOT parented", "parentId" in inp, False)
             check("ticket title", inp.get("title"), "Review PR #5 — KIT-5")
             check("ticket body sanitized", "repo=steal" in inp.get("description", ""), False)
@@ -7657,7 +7781,9 @@ def selftest():
             rec = seen.get(pr_key("o/r", 5)) or {}
             check("seen records pending", rec.get("status"), "pending")
             check("seen records the body hash", rec.get("body_sha256"), body_sha256(inp.get("description")))
-            check("seen records the review ticket", rec.get("review_ticket"), "REV-1")
+            check("seen records the review ticket",
+                  pick(old=rec.get("review_ticket"), runner=(rec.get("runner") or {}).get("request")),
+                  pick(old="REV-1", runner=inp.get("request")))
             check("scan posted no comment", posted, [])
             # re-scan: the opened-only rule — nothing new
             check("second scan exits OK", scan(cfg, False), EXIT_OK)
@@ -7669,8 +7795,10 @@ def selftest():
             check("collect (no session) stays pending", load_seen(seen_path(tmp))[pr_key("o/r", 5)]["status"], "pending")
             # …and the window that was searched is on the log, so "not started yet" and
             # "fell outside the listing window" are distinguishable by an operator.
-            check("collect (no session) logs the window searched",
-                  "no agent session on review ticket rev-uuid-1 in 1 page(s) / 0 session(s)" in sys.stderr.getvalue(), True)
+            check("collect (no session) logs the window searched", pick(
+                old="no agent session on review ticket rev-uuid-1 in 1 page(s) / 0 session(s)",
+                runner="review request %s waits for the runner" % inp.get("request"))
+                in sys.stderr.getvalue() + sys.stdout.getvalue(), True)
 
             # happy path: a well-formed response → one comment, one outcome, ticket closed
             findings = {"schema": FINDINGS_SCHEMA, "summary": "found things", "findings": [
@@ -7690,9 +7818,12 @@ def selftest():
             check("outcome usable", outcome["usable"], True)
             check("outcome max_severity", outcome["max_severity"], "high")
             check("outcome meets_threshold", outcome["meets_threshold"], True)
-            check("outcome names the review ticket", outcome["review_ticket"], "REV-1")
+            check("outcome names the review ticket", outcome["review_ticket"], fake.name(1))
             check("outcome names the pr", outcome["pr"], 5)
-            check("review ticket closed exactly once", fake.updated, [("rev-uuid-1", {"stateId": "done-1"})])
+            only("old", "review ticket closed exactly once", lambda: fake.updated,
+                 [("rev-uuid-1", {"stateId": "done-1"})])
+            only("runner", "no ticket to close: nothing is moved in the tracker (KIT-644)",
+                 lambda: fake.updated, [])
             check("telemetry emitted once", len(telemetry), 1)
             check("seen records collected", load_seen(seen_path(tmp))[pr_key("o/r", 5)]["status"], "collected")
             # a third collect has nothing pending — a real answer, not a failure
@@ -7772,8 +7903,8 @@ def selftest():
             check("the re-review's title is distinct from the first review's",
                   [i["title"] for i in fake.created],
                   ["Review PR #7 — KIT-7", "Review PR #7 — KIT-7 (re-review after bounce 1)"])
-            check("the re-review ticket is delegated and still not parented",
-                  (created(1, "delegateId"), created(1, "parentId") is not None), ("agent-1", False))
+            only("old", "the re-review ticket is delegated and still not parented",
+                 lambda: (created(1, "delegateId"), created(1, "parentId") is not None), ("agent-1", False))
             check("the request is spent once the ticket exists", os.path.exists(path1), False)
             check("the record is pending again",
                   load_seen(seen_path(tmp))[pr_key("o/r", 7)]["status"], "pending")
@@ -7787,11 +7918,11 @@ def selftest():
             check("the re-review posts its own SECOND comment", len(posted), 2)
             check("both comments go to the same PR, neither edits the other",
                   [(p[0], p[2]) for p in posted], [(7, "o/r"), (7, "o/r")])
-            check("each review ticket was closed exactly once", sorted(fake.updated),
-                  [("rev-uuid-1", {"stateId": "done-1"}), ("rev-uuid-2", {"stateId": "done-1"})])
+            only("old", "each review ticket was closed exactly once", lambda: sorted(fake.updated),
+                 [("rev-uuid-1", {"stateId": "done-1"}), ("rev-uuid-2", {"stateId": "done-1"})])
             second = json.load(open(outcome_path(tmp, "o/r", 7)))
             check("the new outcome judges the NEW head", second["head_sha"], "bbbb2222")
-            check("the new outcome names the new review ticket", second["review_ticket"], "REV-2")
+            check("the new outcome names the new review ticket", second["review_ticket"], fake.name(2))
             check("the new outcome postdates the first", second["at"] >= first["at"], True)
             check("still exactly one outcome file for the PR",
                   sorted(os.listdir(os.path.join(tmp, "outcomes"))),
@@ -7882,14 +8013,14 @@ def selftest():
             c = dict(cfg, state_dir=tmp)
             check("setup: the first review is pending", (scan(c, False), len(fake.created)), (EXIT_OK, 1))
             live = load_seen(seen_path(tmp))[pr_key("o/r", 7)]
-            check("setup: it points at a live ticket", (live["status"], live["review_ticket_id"]),
+            check("setup: it points at a live ticket", (live["status"], fake.handle(live)),
                   ("pending", "rev-uuid-1"))
             path = request_after_bounce(tmp, 1, "aaaa1111")
             head["sha"] = "bbbb2222"
             check("a mid-flight record is NOT re-marked", (scan(c, False), len(fake.created)), (EXIT_OK, 1))
             still = load_seen(seen_path(tmp))[pr_key("o/r", 7)]
             check("…its review ticket is not orphaned",
-                  (still["status"], still.get("review_ticket_id")), ("pending", "rev-uuid-1"))
+                  (still["status"], fake.handle(still)), ("pending", "rev-uuid-1"))
             check("…and the request is left for when it settles", os.path.exists(path), True)
             # Once it settles, the same request is honoured — deferred, not dropped.
             fake.respond("rev-uuid-1", "```json\n%s\n```" % json.dumps(one_high))
@@ -7958,9 +8089,9 @@ def selftest():
                   (scan(c, False), len(fake.created), os.path.exists(path)), (EXIT_OK, 2, False))
             check("…under a title no bounce's re-review can collide with",
                   fake.created[1]["title"], "Review PR #7 — KIT-7 (re-review 1 after the head moved)")
-            check("…delegated like any other review ticket, and still not parented",
-                  (fake.created[1].get("delegateId"), "parentId" in fake.created[1]),
-                  ("agent-1", False))
+            only("old", "…delegated like any other review ticket, and still not parented",
+                 lambda: (fake.created[1].get("delegateId"), "parentId" in fake.created[1]),
+                 ("agent-1", False))
             check("…and a further pass finds nothing: one request, one review",
                   (scan(c, False), len(fake.created)), (EXIT_OK, 2))
             # THE POINT, read back through the bounce driver's own reader: what the refresh
@@ -7996,7 +8127,7 @@ def selftest():
             check("malformed → declined exit", collect(c, False), EXIT_DECLINED)
             check("malformed → one NOT-reviewed comment", len(posted) == 1 and "was NOT reviewed" in posted[0][1], True)
             check("malformed → outcome unusable", json.load(open(outcome_path(tmp, "o/r", 5)))["usable"], False)
-            check("malformed → ticket still closed", len(fake.updated), 1)
+            only("old", "malformed → ticket still closed", lambda: len(fake.updated), 1)
             check("malformed → seen declined", load_seen(seen_path(tmp))[pr_key("o/r", 5)]["status"], "declined")
             # The publisher's reason quotes the reviewer's own field values ("Critical");
             # the PR gets fixed text and the quoted values stay in the owner's log.
@@ -8144,7 +8275,9 @@ def selftest():
             c = fresh_state(tmp)
             fake.respond("rev-uuid-1", "ENOENT /srv/dispatcher/home/.config/x", kind="error", status="error")
             check("error activity → declined exit", collect(c, False), EXIT_DECLINED)
-            check("error activity → reason", "reported an error — see review ticket REV-1" in (posted[0][1] if posted else ""), True)
+            check("error activity → reason", pick(
+                old="reported an error — see review ticket REV-1",
+                runner="ended in an error (error_during_execution)") in (posted[0][1] if posted else ""), True)
             check("error activity → dispatcher text NOT posted", "/srv/dispatcher" in (posted[0][1] if posted else "x"), False)
             check("error activity → dispatcher text logged", "/srv/dispatcher" in sys.stderr.getvalue(), True)
 
@@ -8153,7 +8286,9 @@ def selftest():
             fake.respond("rev-uuid-1", "", kind="response", status="stale")
             fake.activities["sess-rev-uuid-1"] = []      # no response activity at all
             check("finished-without-response → declined exit", collect(c, False), EXIT_DECLINED)
-            check("finished-without-response → reason", "without posting a response" in (posted[0][1] if posted else ""), True)
+            check("finished-without-response → reason", pick(
+                old="without posting a response", runner="ended without a final message")
+                in (posted[0][1] if posted else ""), True)
 
         with tempfile.TemporaryDirectory() as tmp:   # timeout → decline (reviewer_outcome cancelled)
             c = fresh_state(tmp)
@@ -8320,7 +8455,7 @@ def selftest():
                 check("KIT-138 a reused ticket's coverage comes from the body the reviewer read",
                       (rec143.get("reused"), (rec143.get("partial") or {}).get("withheld")),
                       (True, ["src/big_one.py", "src/big_two.py"]))
-                fake.respond(rec143["review_ticket_id"],
+                fake.respond(fake.handle(rec143),
                              "```json\n%s\n```" % json.dumps(clean138))
                 collect(c, False)
                 out143 = json.load(open(outcome_path(tmp, "o/r", 5)))
@@ -8350,11 +8485,11 @@ def selftest():
                 sent = (fake.created[0] if fake.created else {}).get("description", "")
                 page = "You are the reviewer.\n{{issue_description}}\nAnswer in json."
                 prompt = routing.js_replace(page, "{{issue_description}}", sent)
-                check("KIT-614 through the dispatcher's template, every $ sequence in the diff "
-                      "reads as written",
-                      (line614 in prompt, prompt.count("You are the reviewer."),
-                       prompt.count("Answer in json."), "{{issue_description}}" in prompt),
-                      (True, 1, 1, False))
+                only("old", "KIT-614 through the dispatcher's template, every $ sequence in the diff "
+                     "reads as written",
+                     lambda: (line614 in prompt, prompt.count("You are the reviewer."),
+                              prompt.count("Answer in json."), "{{issue_description}}" in prompt),
+                     (True, 1, 1, False))
                 check("KIT-614 …the record's hash is of the text sent",
                       (load_seen(seen_path(tmp)).get(pr_key("o/r", 5)) or {}).get("body_sha256"),
                       body_sha256(sent))
@@ -8495,7 +8630,7 @@ def selftest():
             check("publish retry → it is the review", "Stage E review" in (posted[0][1] if posted else ""), True)
             check("publish retry → status collected", load_seen(seen_path(tmp))[pr_key("o/r", 5)]["status"], "collected")
             check("publish retry → outcome written once", os.path.exists(outcome_path(tmp, "o/r", 5)), True)
-            check("publish retry → ticket closed once", len(fake.updated), 1)
+            only("old", "publish retry → ticket closed once", lambda: len(fake.updated), 1)
             check("publish retry → telemetry once", len(telemetry), 1)
             check("publish retry → verdict dropped from the seen-set", "verdict" in load_seen(seen_path(tmp))[pr_key("o/r", 5)], False)
             check("publish retry → nothing left to collect", collect(c, False), EXIT_OK)
@@ -8520,6 +8655,7 @@ def selftest():
             check("decline retry → outcome unusable", json.load(open(outcome_path(tmp, "o/r", 5)))["usable"], False)
             check("decline retry → no issueUpdate (no review ticket exists)", fake.updated, [])
 
+        alone("old")                                 # KIT-644: a review ticket's close, below
         with tempfile.TemporaryDirectory() as tmp:   # close fails → close-pending (exit 1) → next pass closes ONCE
             c = fresh_state(tmp)
             fake.respond("rev-uuid-1", "```json\n%s\n```" % json.dumps(findings))
@@ -8556,6 +8692,7 @@ def selftest():
             check("permanent close failure → no issueUpdate landed", fake.updated, [])
             check("permanent close failure → terminal: next pass is clean", collect(c, False), EXIT_OK)
             fake.fail_close = False
+        alone(None)
 
         with tempfile.TemporaryDirectory() as tmp:   # pending record with NO review ticket id → a decline, not a silent skip (§13)
             fake.__init__()
@@ -8646,7 +8783,8 @@ def selftest():
             check("collect with #6 crashing → #5 durable as collected", seen[pr_key("o/r", 5)]["status"], "collected")
             check("collect with #6 crashing → #6 still pending, fault counted",
                   (seen[pr_key("o/r", 6)]["status"], seen[pr_key("o/r", 6)].get("faults")), ("pending", 1))
-            check("collect with #6 crashing → #5 closed once", fake.updated, [("rev-uuid-1", {"stateId": "done-1"})])
+            only("old", "collect with #6 crashing → #5 closed once", lambda: fake.updated,
+                 [("rev-uuid-1", {"stateId": "done-1"})])
             check("collect with #6 crashing pass 2 → error exit", collect(c, False), EXIT_ERROR)
             check("collect with #6 crashing pass 2 → no second comment on #5", [p[0] for p in posted], [5])
             check("collect with #6 crashing pass 3 → bounded: declined exit", collect(c, False), EXIT_DECLINED)
@@ -8719,7 +8857,7 @@ def selftest():
                 check("secret → the token is NOT in the seen-set", fake_token in seen_text, False)
                 rec = load_seen(seen_path(tmp))[pr_key("o/r", 5)]
                 check("secret → record declined + withheld", (rec["status"], rec.get("withheld")), ("declined", True))
-                check("secret → review ticket still closed", len(fake.updated), 1)
+                only("old", "secret → review ticket still closed", lambda: len(fake.updated), 1)
                 check("secret → telemetry once", len(telemetry), 1)
                 check("secret → terminal", collect(c, False), EXIT_OK)
                 check("secret → still one comment", len(sent), 1)
@@ -9725,8 +9863,8 @@ def selftest():
             run_command(c, "scan", False)
             globals()["list_open_prs"] = lambda owner_repo, limit=100: headed
             cleared = json.load(open(heartbeat_path(root))).get("counts")
-            check("KIT-481 a review close that gave up is counted in the heartbeat until it is "
-                  "closed", (gave_up, cleared), ({"close_gave_up": 1}, {"close_gave_up": 0}))
+            only("old", "KIT-481 a review close that gave up is counted in the heartbeat until it is "
+                 "closed", lambda: (gave_up, cleared), ({"close_gave_up": 1}, {"close_gave_up": 0}))
             fake.fail_close = False
 
         globals()["list_open_prs"] = lambda owner_repo, limit=100: fixture
@@ -9744,18 +9882,29 @@ def selftest():
             check("state lost → the existing review ticket is REUSED, not duplicated",
                   [i.get("title") for i in fake.created].count("Review PR #5 — KIT-5"), 1)
             rec = load_seen(seen_path(tmp))[pr_key("o/r", 5)]
-            check("state lost → the record points at the existing ticket", rec["review_ticket"], "REV-1")
+            only("old", "state lost → the record points at the existing ticket",
+                 lambda: rec["review_ticket"], "REV-1")
+            only("runner", "state lost → the record names the existing request, which the runner's "
+                 "store holds (KIT-644)", lambda: (rec.get("runner") or {}).get("request"),
+                 fake.created[0].get("request") if fake.created else "no request")
             check("state lost → the reuse is recorded", rec.get("reused"), True)
-            check("state lost → said so on stdout", "REUSED existing review ticket REV-1" in sys.stdout.getvalue(), True)
+            check("state lost → said so on stdout", pick(
+                old="REUSED existing review ticket REV-1",
+                runner="REUSED existing review request %s" % (fake.created[0].get("request") if fake.created else "?"))
+                in sys.stdout.getvalue(), True)
             check("state lost → the hash is the one LINEAR holds, not our fresh render",
-                  rec["stored_sha256"], body_sha256(fake.issues["rev-uuid-1"]["description"]))
-            # A ticket that merely shares a title is not ours: the marker must confirm it.
-            fake.issues["rev-uuid-1"]["description"] = "someone rewrote this by hand"
-            os.remove(seen_path(tmp))
-            check("title match without the marker → not reused", scan(c, False), EXIT_OK)
-            check("title match without the marker → a real ticket is created",
-                  [i.get("title") for i in fake.created].count("Review PR #5 — KIT-5"), 2)
+                  rec.get(pick(old="stored_sha256", runner="body_sha256")),
+                  body_sha256(fake.issues["rev-uuid-1"]["description"]))
+            if lane == "old":
+                # A ticket that merely shares a title is not ours: the marker must confirm it. The
+                # runner lane's request is found by its id alone, which no one else writes.
+                fake.issues["rev-uuid-1"]["description"] = "someone rewrote this by hand"
+                os.remove(seen_path(tmp))
+            only("old", "title match without the marker → not reused", lambda: scan(c, False), EXIT_OK)
+            only("old", "title match without the marker → a real ticket is created",
+                 lambda: [i.get("title") for i in fake.created].count("Review PR #5 — KIT-5"), 2)
 
+        alone("old")                                 # KIT-644: the tracker's dedup search, below
         with tempfile.TemporaryDirectory() as tmp:   # the search FAILING is never "nothing there"
             fake.__init__()
             posted.clear()
@@ -9768,6 +9917,7 @@ def selftest():
             check("dedup search failure → status retry", load_seen(seen_path(tmp))[pr_key("o/r", 5)]["status"], "retry")
             check("dedup search failure → nothing posted", posted, [])
             globals()["find_existing_review_ticket"] = real_find
+        alone(None)
 
         # 7m. KIT-442: a decline is tried again once the PR or its ticket changes, under a
         #     title of its own, never on its own, and never because a ticket could not be
@@ -10041,10 +10191,13 @@ def selftest():
         clean_doc = {"schema": FINDINGS_SCHEMA, "summary": "clean", "findings": []}
 
         def label_for(diff_text, c=gcfg):
-            """The labelIds on the one review ticket prepare_review files for PR #5."""
+            """The labelIds on the one review ticket prepare_review files for PR #5. On the runner
+            lane, the label the same choice names, whose `guarded` the request's tier follows."""
             fake.__init__()
             globals()["fetch_pr_diff"] = lambda owner_repo, n: diff_text
-            prepare_review(c, "o/r", pr5, "KIT-5", "x", False)
+            got = prepare_review(c, "o/r", pr5, "KIT-5", "x", False)
+            if lane == "runner":
+                return [got[5]["id"]] if got and got[0] == "ask" else None
             return fake.created[0].get("labelIds") if fake.created else None
 
         check("KIT-418 a PR touching only docs gets the default label",
@@ -10078,10 +10231,12 @@ def selftest():
         # never with this pass's choice (Stage E's review of #268).
         fake.__init__()
         globals()["fetch_pr_diff"] = lambda owner_repo, n: touching("scripts/check_ticket_dor.py")
-        prepare_review(unset, "o/r", pr5, "KIT-5", "x", False)          # filed under the default
+        first = prepare_review(unset, "o/r", pr5, "KIT-5", "x", False)  # filed under the default
+        if lane == "runner":            # the runner lane asks in scan_pr: ask it here, as it would
+            ask_runner_review(dict(first[1], request=first[6]), "KIT-5", first[3], runner_tier(first[5]))
         again = prepare_review(gcfg, "o/r", pr5, "KIT-5", "x", False)   # the key set since
         check("KIT-418 a reused ticket is credited with the label it was filed under",
-              (again[4], again[6] if len(again) > 6 else None),
+              (again[pick(old=4, runner=7)], again[pick(old=6, runner=5)] if len(again) > 6 else None),
               (True, {"id": "label-1", "name": "haiku", "guarded": False}))
         globals()["fetch_pr_diff"] = lambda owner_repo, n: diff
 
@@ -10125,9 +10280,11 @@ def selftest():
             collect(dict(c, session_log_root=logs), False)
             body = posted[0][1] if posted else ""
             check("KIT-418 the comment names the reviewer's model and its token count",
-                  ("`claude-sonnet-4-5`" in body, "48,213 tokens" in body), (True, True))
+                  (pick(old="`claude-sonnet-4-5`", runner="`claude-sonnet-test`") in body,
+                   pick(old="48,213 tokens", runner="1,234 tokens") in body), (True, True))
         with tempfile.TemporaryDirectory() as tmp:
             c = fresh_state(tmp)
+            fake.usage = False          # the runner lane's run said neither its model nor its tokens
             fake.respond("rev-uuid-1", "```json\n%s\n```" % json.dumps(clean_doc))
             collect(dict(c, session_log_root=""), False)
             body = posted[0][1] if posted else ""
@@ -10146,6 +10303,9 @@ def selftest():
             check("KIT-418 the record keeps the label its review was filed under",
                   ((load_seen(seen_path(tmp)).get(pr_key("o/r", 5)) or {}).get("review_label")
                    or {}).get("name"), "sonnet")
+            only("runner", "KIT-644 a guarded change asks the runner for the stronger reviewer",
+                 lambda: ((load_seen(seen_path(tmp)).get(pr_key("o/r", 5)) or {}).get("runner") or {})
+                 .get("tier"), "guarded")
             fake.respond("rev-uuid-1", "```json\n%s\n```" % json.dumps(clean_doc))
             collect(c, False)
             check("KIT-418 a guarded review's comment says why it got the stronger label",
@@ -10180,6 +10340,80 @@ def selftest():
         check("KIT-418 the base read: absent is none, globs trimmed, a failure is never none",
               base_read, {"absent": [], "listed": ["app/**"], "none": [], "outage": "refused",
                           "garbage": "refused", "not a list": "refused"})
+
+        # 7s. KIT-644: what the runner lane alone has. Its runner refuses, stops a run at a limit,
+        #     or is still going at the timeout; a request recorded and never written; the runner's
+        #     settings unreadable; and a review filed on the old lane that finishes there.
+        if lane == "runner":
+            alone("runner")
+            with tempfile.TemporaryDirectory() as tmp:          # refused, in the runner's words
+                c = fresh_state(tmp)
+                why644 = ("KIT-5 was not coded by a code run of this runner's, so no approval is "
+                          "recorded for its review")
+                fake.runner_answer("rev-uuid-1", ok=False, why=why644)
+                check("KIT-644 a review the runner refused → declined", collect(c, False), EXIT_DECLINED)
+                check("KIT-644 …one NOT-reviewed comment, in the runner's own words",
+                      (len(posted), "was NOT reviewed" in (posted[0][1] if posted else ""),
+                       "the runner refused to start the review: " + why644 in (posted[0][1] if posted else "")),
+                      (1, True, True))
+                check("KIT-644 …and its outcome is unusable",
+                      json.load(open(outcome_path(tmp, "o/r", 5)))["usable"], False)
+            with tempfile.TemporaryDirectory() as tmp:          # a run stopped at its limit
+                c = fresh_state(tmp)
+                fake.runner_answer("rev-uuid-1", output=None, state="stopped", reason="limit:time")
+                check("KIT-644 a review run stopped at a limit → declined, saying so",
+                      (collect(c, False), "it stopped (limit:time)" in (posted[0][1] if posted else "")),
+                      (EXIT_DECLINED, True))
+            with tempfile.TemporaryDirectory() as tmp:          # still going: waits, then asked to stop
+                c = fresh_state(tmp)
+                fake.runner_answer("rev-uuid-1", state="running")
+                check("KIT-644 a review run still going → it waits, and nothing is posted",
+                      (collect(c, False), posted), (EXIT_OK, []))
+                seen644 = load_seen(seen_path(tmp))
+                seen644[pr_key("o/r", 5)]["created_at"] = "2020-01-01T00:00:00Z"
+                save_seen(seen_path(tmp), seen644)
+                check("KIT-644 …past the timeout → declined, and its run is asked to stop",
+                      (collect(c, False), [r for r, _t in fake.stops],
+                       "asked to stop" in (posted[0][1] if posted else "")),
+                      (EXIT_DECLINED, [fake.run_of(1)], True))
+            with tempfile.TemporaryDirectory() as tmp:          # recorded, never written
+                c = fresh_state(tmp)
+                rid644 = fake.created[0]["request"]
+                os.unlink(os.path.join(fake.store_dir, "requests", rid644 + ".json"))
+                seen644 = load_seen(seen_path(tmp))
+                seen644[pr_key("o/r", 5)]["runner"]["asked"] = False
+                save_seen(seen_path(tmp), seen644)
+                collect(c, False)
+                check("KIT-644 a request recorded and never written → the PR is selected again, and "
+                      "nothing is posted", (load_seen(seen_path(tmp))[pr_key("o/r", 5)]["status"], posted),
+                      ("retry", []))
+                scan(c, False)
+                check("KIT-644 …and asked again under the same id, once",
+                      ([a["request"] for a in fake.created], runner_review_asked(fake.store_dir, rid644)),
+                      ([rid644, rid644], True))
+            with tempfile.TemporaryDirectory() as tmp:          # settings unread; a lane switched
+                fake.__init__()
+                posted.clear()
+                save_seen(seen_path(tmp), dict(seen0))
+                lanes644 = globals()["runner_review_lanes"]
+                globals()["runner_review_lanes"] = lambda c, git=None: (
+                    {}, "the runner's settings at /x could not be read (JSONDecodeError)")
+                c = dict(cfg, state_dir=tmp)
+                check("KIT-644 runner settings that cannot be read → nothing filed or asked, on either "
+                      "lane, and the log says why",
+                      (scan(c, False), fake.created, posted,
+                       "could not be read (JSONDecodeError)" in sys.stderr.getvalue()),
+                      (EXIT_ERROR, [], [], True))
+                globals()["runner_review_lanes"] = lambda c, git=None: ({}, "")
+                scan(c, False)                                    # the lane off: a review ticket
+                globals()["runner_review_lanes"] = lanes644       # …and on again
+                filed = [i.get("teamId") for i in fake.created]
+                fake.respond("rev-uuid-1", "```json\n%s\n```" % json.dumps(clean_doc), via="old")
+                check("KIT-644 a review filed on the old lane finishes there when the lane is switched on",
+                      (filed, scan(c, False), collect(c, False), len(posted), fake.updated,
+                       load_seen(seen_path(tmp))[pr_key("o/r", 5)]["status"]),
+                      (["team-1"], EXIT_OK, EXIT_OK, 1, [("rev-uuid-1", {"stateId": "done-1"})], "collected"))
+            alone(None)
 
         # 8. Telemetry absence is said, never silent — with the real emit_telemetry and no module.
         globals()["emit_telemetry"] = saved["emit_telemetry"]
@@ -10393,7 +10627,10 @@ def selftest():
                     every = _EveryRepo({"o/r": {"project": "app", "store_dir": fake.store_dir,
                                                 "enabled": True}})
                     globals()["runner_review_lanes"] = lambda c, git=None: (every, "")
-                _end_to_end(lane, e2e_cfg(cfg, lane, lane_root), body, msg, said)
+                lane_cfg = e2e_cfg(cfg, lane, lane_root)
+                if lane == "runner":
+                    lane_cfg["_runner_lanes"] = every     # a case that calls prepare_review alone
+                _end_to_end(lane, lane_cfg, body, msg, said)
             finally:
                 sys.stdout, sys.stderr = real_out, real_err
                 globals().update(saved)
@@ -10407,6 +10644,10 @@ def selftest():
                 LANE["now"] = None
     fixture = e2e_fixture
     failures.extend(lane_count_problems(ran, lane_only, E2E_LANES))
+    both = len(ran.get(E2E_LANES[0]) or []) - len(lane_only.get(E2E_LANES[0]) or [])
+    print("KIT-644 end-to-end: %d case(s) on every lane (%s); %s"
+          % (both, ", ".join(E2E_LANES), "; ".join("%d the %s lane's alone" % (len(lane_only.get(k) or []), k)
+                                                    for k in E2E_LANES)))
 
     # 9. latest_reviewer_output picks the NEWEST response/error, ignores thoughts.
     sess = {"activities": {"nodes": [
