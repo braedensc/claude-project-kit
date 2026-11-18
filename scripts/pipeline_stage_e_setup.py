@@ -5689,13 +5689,23 @@ DRY_RUN_NOTE = "dry-run-count-settings"
 ATTESTATIONS_BOUND_TO_DRY_RUN = frozenset(("A-DRY-RUN",))
 
 
-def dry_run_fingerprint(conf):
-    """sha256 of the settings the count depends on; a list in any order is one list."""
+def _dry_run_shape(conf):
     shape = {}
     for key in DRY_RUN_COUNT_SETTINGS:
         shape[key] = sorted(x.upper() if key == "MANAGED_TEAM_KEYS" else x
                             for x in split_list((conf or {}).get(key, "") or ""))
-    return hashlib.sha256(json.dumps(shape, sort_keys=True).encode("utf-8")).hexdigest()
+    return shape
+
+
+def dry_run_fingerprint(conf):
+    """sha256 of the settings the count depends on; a list in any order is one list."""
+    return hashlib.sha256(json.dumps(_dry_run_shape(conf), sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def dry_run_parts(conf):
+    """One short sha256 per setting, so a sign-off can say WHICH setting changed."""
+    return dict((k, hashlib.sha256(json.dumps(v).encode("utf-8")).hexdigest()[:16])
+                for k, v in _dry_run_shape(conf).items())
 
 
 def dry_run_signoff_holds(state, conf):
@@ -5711,8 +5721,10 @@ def dry_run_signoff_holds(state, conf):
                        "binding: read the count above and sign it once more"
                        % signed.get("at", "undated"))
     if bound != dry_run_fingerprint(conf):
+        now, then = dry_run_parts(conf), signed.get("dry_run_parts") or {}
+        names = [k for k in DRY_RUN_COUNT_SETTINGS if now.get(k) != then.get(k)]
         return False, ("%s changed since the count was signed (%s): read the count above and "
-                       "sign it again" % (" or ".join(DRY_RUN_COUNT_SETTINGS), signed.get("at", "undated")))
+                       "sign it again" % (" and ".join(names), signed.get("at", "undated")))
     return True, None
 
 
@@ -6255,8 +6267,14 @@ def paused_only_for_the_probe(said):
 def step_dry_run(ctx, apply_it):
     """Every component's own dry run, shape-checked. This is what CK-5 reads."""
     r, notes = ctx.runner, []
-    ctx.state.data.setdefault("notes", {})[DRY_RUN_NOTE] = {
-        "sha256": dry_run_fingerprint(ctx.conf), "settings": list(DRY_RUN_COUNT_SETTINGS)}
+    # RECORDED ONLY ON AN APPLY PASS (Stage E's review of KIT-790). The count below comes from
+    # the poller config already on the machine, and only an apply pass has just written it from
+    # this conf (the `configs` step runs first). A `verify` after a conf edit counts the old
+    # config, and a note taken from the new conf would sign that old count as the new one's.
+    if apply_it:
+        ctx.state.data.setdefault("notes", {})[DRY_RUN_NOTE] = {
+            "sha256": dry_run_fingerprint(ctx.conf), "parts": dry_run_parts(ctx.conf),
+            "settings": list(DRY_RUN_COUNT_SETTINGS)}
     env = 'set -a; . %s/env; set +a; ' % ctx.stage_home
     poller = r.as_role(ctx.account,
                        env + "/usr/bin/python3 %s/kit/scripts/pipeline_review_poller.py "
@@ -8654,12 +8672,14 @@ def cmd_attest(state, aid, initials, note):
         bound["entries_sha256"] = shape
     if aid in ATTESTATIONS_BOUND_TO_DRY_RUN:
         # A SIGN-OFF OF THE COUNT NAMES THE SETTINGS THE COUNT WAS MADE FROM (KIT-790).
-        shape = ((state.data.get("notes") or {}).get(DRY_RUN_NOTE) or {}).get("sha256")
-        if not shape:
+        note_ = (state.data.get("notes") or {}).get(DRY_RUN_NOTE) or {}
+        if not note_.get("sha256"):
             raise SetupError(
                 "%s records that you read the dry-run count, and no count is recorded yet.\n"
-                "  Run `verify` (or `run`) until the dry-run step has counted, then sign." % aid)
-        bound["dry_run_sha256"] = shape
+                "  Run `run` until the dry-run step has counted (a `verify` counts the config "
+                "already on the machine, so it records nothing), then sign." % aid)
+        bound["dry_run_sha256"] = note_["sha256"]
+        bound["dry_run_parts"] = note_.get("parts") or {}
     state.attest(aid, initials.lower(), note or "", **bound)
     state.save()
     say("recorded: %s  %s  %s  %s" % (aid, initials.lower(), now_iso(), note or ""))
@@ -10430,7 +10450,7 @@ def _selftest_body():
         except SetupError:
             expect("dry-run-bound", not st_nn.attested("A-DRY-RUN"), "recorded anyway")
         st_b = State(tempfile.mkdtemp(prefix="stage-e-attest-dry-bound."))
-        st_b.data["notes"][DRY_RUN_NOTE] = {"sha256": dry_run_fingerprint(base)}
+        st_b.data["notes"][DRY_RUN_NOTE] = {"sha256": dry_run_fingerprint(base), "parts": dry_run_parts(base)}
         _quiet(lambda: cmd_attest(st_b, "A-DRY-RUN", "BC", "count read: 1"))
         expect("dry-run-bound", dry_run_signoff_holds(st_b, base) == (True, None),
                "a sign-off does not hold for the settings it was made against")
@@ -10441,8 +10461,10 @@ def _selftest_body():
                "the selftest and DRY_RUN_COUNT_SETTINGS name different settings")
         for key in DRY_RUN_COUNT_SETTINGS:
             held, why = dry_run_signoff_holds(st_b, dict(base, **{key: changed[key]}))
-            expect("dry-run-bound", not held and key in (why or ""),
-                   "changing %s did not ask again (%s)" % (key, why))
+            others = [k for k in DRY_RUN_COUNT_SETTINGS if k != key]
+            expect("dry-run-bound", not held and key in (why or "")
+                   and not any(k in (why or "") for k in others),
+                   "changing %s did not ask again, or named the wrong setting (%s)" % (key, why))
         for key in ("POLL_INTERVAL_SECONDS", "SEVERITY_THRESHOLD", "DIFF_CAP_CHARS"):
             expect("dry-run-bound",
                    dry_run_signoff_holds(st_b, dict(base, **{key: "zz"})) == (True, None),
@@ -10459,7 +10481,7 @@ def _selftest_body():
         held, why = dry_run_signoff_holds(st_old, base)
         expect("dry-run-bound", not held and "predates" in (why or ""),
                "a sign-off from before the binding still counted: %s" % (why,))
-        st_old.data["notes"][DRY_RUN_NOTE] = {"sha256": dry_run_fingerprint(base)}
+        st_old.data["notes"][DRY_RUN_NOTE] = {"sha256": dry_run_fingerprint(base), "parts": dry_run_parts(base)}
         _quiet(lambda: cmd_attest(st_old, "A-DRY-RUN", "BC", "count read: 1"))
         expect("dry-run-bound", dry_run_signoff_holds(st_old, base) == (True, None),
                "signing once more did not bind it")
@@ -12187,7 +12209,16 @@ def _selftest_body():
     ctxD1.conf = dict(ctxD1.conf, POLL_INTERVAL_SECONDS="999")
     rowD1b, _pD1b = _quiet(lambda: _dry_run_row(ctxD1))
     expect("dry-run-bound", isinstance(rowD1b, tuple), "an unrelated setting asked again: %r" % (rowD1b,))
+    # A pass that applies nothing counts the config on the machine, not this conf, so it
+    # records no new fingerprint: a note taken from an edited conf would sign the old count.
+    noteD1 = dict(ctxD1.state.data["notes"].get(DRY_RUN_NOTE) or {})
     ctxD1.conf = dict(ctxD1.conf, REVIEW_REPOS="example-org/kit, example-org/app")
+    try:
+        _quiet(lambda: step_dry_run(ctxD1, apply_it=False))
+    except (SetupError, Unknown, Blocked):
+        pass
+    expect("dry-run-bound", ctxD1.state.data["notes"].get(DRY_RUN_NOTE, {}) == noteD1,
+           "a pass that applied nothing recorded a count note from the edited conf")
     rowD1c, _pD1c = _quiet(lambda: _dry_run_row(ctxD1))
     expect("dry-run-bound", isinstance(rowD1c, Blocked) and rowD1c.card_id == "CK-5"
            and "REVIEW_REPOS" in rowD1c.extra, "a changed REVIEW_REPOS did not stop at CK-5: %r" % (rowD1c,))
