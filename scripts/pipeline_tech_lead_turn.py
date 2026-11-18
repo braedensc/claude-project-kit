@@ -26,7 +26,8 @@ THE RUN.  The command line, from the CLI's own reference (checked 5 Nov):
   --append-system-prompt-file the tech lead's rules
   --max-turns, --max-budget-usd  a runaway's limits
 `--permission-prompt-tool` is not used: it answers a prompt during the turn, and the owner's
-yes can come hours later. The prompt goes on stdin, never in the command line.
+yes can come hours later. The prompt goes on stdin, never in the command line. The line is built
+by the runner's one builder (scripts/pipeline_harness_claude.py, KIT-708), in its order.
 
 ITS OWN FOLDERS.  Resuming needs the CLI's session files to outlive a turn, so the turn has a
 folder of its own under the bridge's state_dir: a HOME for the CLI, an empty working folder, and
@@ -91,6 +92,7 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 import pipeline_voice as voice  # noqa: E402  (the writer's own token, model and refusal rules)
+import pipeline_harness_claude as harness  # noqa: E402  (KIT-708: the runner's one command-line builder)
 import pipeline_tech_lead_tools as tools  # noqa: E402  (the tools the turn is allowed)
 import pipeline_spend_ledger as spend_ledger  # noqa: E402  (KIT-687: what a spend row is built from)
 
@@ -300,23 +302,19 @@ def read_allows(tcfg):
     return ["Read(/%s)" % p for p in read_paths(tcfg)]
 
 
-STREAM_FLAGS = ["--output-format", "stream-json", "--verbose", "--include-partial-messages"]
+STREAM_FLAGS = harness.OUTPUTS["stream-partial"]
 
 
 def build_argv(s, tcfg, mcp_path, rules_path, session_id, resume, stream=False):
-    """The one command line. The prompt is not in it: that goes on stdin. `stream` swaps the
+    """The one command line, built by the runner's own builder (KIT-708): the turn's own flags and
+    values, in the builder's order. The prompt is not in it: that goes on stdin. `stream` swaps the
     output format for the CLI's stream (KIT-565) and changes nothing else."""
     allowed = [TOOL_PREFIX + spec["name"] for spec in tools.tool_specs(tcfg)] + read_allows(tcfg)
-    return ([s["turn_bin"], "-p", "--model", s["turn_model"]]
-            + (STREAM_FLAGS if stream else ["--output-format", "json"])
-            + ["--resume" if resume else "--session-id", session_id,
-             "--mcp-config", mcp_path, "--strict-mcp-config",
-             "--tools", "Read", "--allowedTools"] + allowed
-            + ["--permission-mode", "dontAsk", "--permission-prompts", "none",
-               "--setting-sources", "",
-               "--append-system-prompt-file", rules_path,
-               "--max-turns", str(s["turn_max_turns"]),
-               "--max-budget-usd", str(s["turn_max_budget_usd"])])
+    return harness.line(s["turn_bin"], s["turn_model"], output="stream-partial" if stream else "json",
+                        session_id=session_id, resume=resume, setting_sources="", strict_mcp=True,
+                        mcp_config=mcp_path, tools=["Read"], allowed=allowed, permission_mode="dontAsk",
+                        permission_prompts="none", append_system_prompt_file=rules_path,
+                        max_turns=str(s["turn_max_turns"]), max_budget_usd=str(s["turn_max_budget_usd"]))
 
 
 def child_env(home, tmp, token):
@@ -1065,15 +1063,24 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
     mcp, rules = os.path.join(fld["files"], "mcp.json"), os.path.join(fld["files"], "rules.md")
     reads = ["Read(/%s)" % p for p in (
         [status] + [os.path.join(docs, n) for n, _w in tools.KIT_GUIDES] + [dayplan])]
+    # The turn's own flags and values, in the runner's one builder's order (KIT-708).
     want = (["/opt/bin/claude", "-p", "--model", "sonnet", "--output-format", "json",
-             "--session-id", SID, "--mcp-config", mcp, "--strict-mcp-config", "--tools", "Read",
-             "--allowedTools"]
+             "--session-id", SID, "--setting-sources", "", "--strict-mcp-config", "--mcp-config", mcp,
+             "--tools", "Read", "--allowedTools"]
             + ["mcp__techlead__" + n for n in ("where_things_stand", "ticket", "search_tickets",
                                                "guide", "pipeline_file", "reach")] + reads
             + ["--permission-mode", "dontAsk", "--permission-prompts", "none",
-               "--setting-sources", "", "--append-system-prompt-file", rules,
-               "--max-turns", "20", "--max-budget-usd", "2"])
+               "--append-system-prompt-file", rules, "--max-turns", "20", "--max-budget-usd", "2"])
     expect("argv: the exact command line, a new session", c["cmd"], want)
+    real_line, seen_line = harness.line, []
+    harness.line = lambda *a, **k: seen_line.append(k.get("output")) or ["from the runner's builder"]
+    try:
+        built = [build_argv(settings(cfg)[0], tools.load_config(tconf)[0], mcp, rules, SID, False,
+                            stream=st) for st in (False, True)]
+    finally:
+        harness.line = real_line
+    expect("argv: the line comes from the runner's own builder, in either output (KIT-708)",
+           (built, seen_line), ([["from the runner's builder"]] * 2, ["json", "stream-partial"]))
     expect("argv: the prompt is on stdin, never in the command line",
            ("where are we?" in " ".join(c["cmd"]), c["input"]),
            (False, "<member-message>\nwhere are we?\n</member-message>\n"))
