@@ -389,7 +389,8 @@ npm run test:runner-store    # the runner's store (KIT-642): requests and run re
                              #   walls, each caller for its own kinds; unreadable runs are None
 npm run test:runner          # the runner (KIT-642): start, resume, stop and a restart against a
                              #   stand-in; the owner's approval from the history; the pin; the one
-                             #   command line; a run that died resumed once; leaves nothing behind
+                             #   command line; a run that died resumed once; a lane that is off for
+                             #   its project refused in words (KIT-866); leaves nothing behind
 npm run test:runner-limits   # the runner's limits (KIT-643): stand-ins that grow without bound
                              #   in memory (a child that left the group too) and on disk stopped
                              #   with their whole tree; the floor; each incident told once

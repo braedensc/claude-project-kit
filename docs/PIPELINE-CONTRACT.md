@@ -3259,6 +3259,13 @@ did not answer, git could not fetch, or the watcher's hold (§20) is set. Everyt
 `ok: false` with the reason in words. A start refused after its workspace was made removes the
 workspace and its branch. Off (`enabled` false), the runner takes no request and resumes nothing.
 
+**Each project's lanes (KIT-866).** A project's `lanes` say, for each kind, whether the runner takes
+it for that project. Absent is off. A start or resume for a lane that is off, the runner's own
+included, is refused with "the <kind> lane is off for project <key>", before anything is made or
+read: a request's answer says `ok: false`, and an interrupted run's record says `auto_resume:
+refused`. A stop is always taken. A lane runs only when the caller's own switch and the runner's lane
+are both on.
+
 ### A run record
 
 `runs/<run>/run.json`. Only the runner writes it, whole, through `write_run()`.
