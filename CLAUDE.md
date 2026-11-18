@@ -355,6 +355,8 @@ npm run test:validator-limits  # the validator's hard limits (KIT-538): pass or 
                              #   each fact from its owner's reader; the floor is never a switch
 npm run test:validator-run   # the validator agent's run (KIT-537): one tool-less CLI call, its argv and
                              #   environment pinned, a failure a hold in fixed words, only its job starts it
+npm run test:validator-merge  # the merge path (KIT-539): GitHub's own auto-merge on one pull request at a
+                             #   time, the next updated and judged again; never merges, approves or labels
 npm run test:day-planner     # the day planner (KIT-439): ticket text fenced as data in its brief, one
                              #   answer block read, every pick checked, a failing one dropped with a reason
 npm run test:morning         # the morning job (KIT-446): once a day inside the window, one tool-less call,
