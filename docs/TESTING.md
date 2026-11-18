@@ -387,9 +387,10 @@ without them looks configured until the first guarded PR or the first alert.
 
 `npm run check:repo-setup` reads the repository (GET calls through `gh api`, creating nothing)
 and names each missing label and each missing page-recipient variable, with the command for you
-to run. A page variable counts as missing only when the repository owner is an organization;
-for a person it says "fine" and why. Reading Actions variables needs admin rights on the
-repository: without them it says COULD NOT CHECK and exits 2, never a pass. CI cannot run it
+to run. A page variable counts as missing only when the repository owner is an organization, and
+then it counts as present at the repository or the organization level; for a person it says
+"not required" and why, and reads no variables. Reading Actions variables needs admin rights on
+the repository: without them it says COULD NOT CHECK and exits 2, never a pass. CI cannot run it
 (the job's token cannot read variables), so the owner runs it after setting up a repository, a
 copy of the kit included. The tables of names are at the top of `scripts/check_repo_setup.py`;
 its selftest (`npm run test:repo-setup`) uses a stub GitHub and checks that each name is still

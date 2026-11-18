@@ -67,33 +67,45 @@ class Reader:
         text = self._get("repos/%s/actions/variables?per_page=30" % self.repo, ".variables[].name")
         return None if text is None else set(text.split("\n")) - {""}
 
+    def org_variables(self):
+        """Variables the organization shares with this repository (the `vars` context reads them too)."""
+        text = self._get("repos/%s/actions/organization-variables?per_page=30" % self.repo, ".variables[].name")
+        return None if text is None else set(text.split("\n")) - {""}
+
     def owner_type(self):
         text = self._get("repos/%s" % self.repo, ".owner.type")
         return None if text is None else text.strip()
 
 
 def judge(reader):
-    """(exit code, lines) from whatever the reader returns."""
-    labels, variables, owner = reader.labels(), reader.variables(), reader.owner_type()
-    unread = [n for n, v in (("labels", labels), ("Actions variables (needs admin rights)", variables),
-                             ("who owns the repository", owner)) if v is None]
+    """(exit code, lines) from whatever the reader returns. Variables are read only when the owner
+    is an organization, the one case where one is required; there a name counts as present at the
+    repository level or at the organization level, and an unreadable level is could-not-check."""
+    labels, owner = reader.labels(), reader.owner_type()
+    unread = [n for n, v in (("labels", labels), ("who owns the repository", owner)) if v is None]
+    variables, org_vars = set(), set()
+    if owner == "Organization":
+        variables, org_vars = reader.variables(), reader.org_variables()
+        unread += [n for n, v in (("Actions variables (needs admin rights)", variables),
+                                  ("the organization's Actions variables", org_vars)) if v is None]
     if unread:
         return 2, ["COULD NOT CHECK: could not read %s; this is not a pass" % ", ".join(unread)]
+    have = {l.lower() for l in labels}              # GitHub label names are case-insensitive
     lines, missing = [], False
     for name, (colour, why, _where) in sorted(LABELS.items()):
-        if name not in labels:
+        if name.lower() not in have:
             missing = True
             lines.append("MISSING label %s\n  create: gh label create %s --color %s --description %s"
                          % (name, name, colour, shlex.quote(why)))
     for name, (what, _where) in sorted(PAGE_VARIABLES.items()):
-        if name in variables:
-            continue
         if owner == "Organization":
-            missing = True
-            lines.append("MISSING variable %s (%s; the owner is an organization, which an @mention does not notify)\n"
-                         "  create: gh variable set %s --body <login[,login]>" % (name, what, name))
+            if name not in variables and name not in org_vars:
+                missing = True
+                lines.append("MISSING variable %s (%s; the owner is an organization, which an @mention does not notify)\n"
+                             "  create: gh variable set %s --body <login[,login]>   (or set it once for the organization)"
+                             % (name, what, name))
         else:
-            lines.append("not set: variable %s (%s): fine, the owner is a person and is paged instead" % (name, what))
+            lines.append("not required: variable %s (%s): the owner is a person and is paged instead" % (name, what))
     if not missing:
         lines.append("OK: every label and required variable is present")
     return (1 if missing else 0), lines
@@ -129,14 +141,17 @@ def main(argv):
 class Stub:
     """A stand-in GitHub: what each read returns (None = could not read)."""
 
-    def __init__(self, labels, variables, owner):
-        self._l, self._v, self._o = labels, variables, owner
+    def __init__(self, labels, variables, owner, org=()):
+        self._l, self._v, self._o, self._org = labels, variables, owner, (None if org is None else set(org))
 
     def labels(self):
         return self._l
 
     def variables(self):
         return self._v
+
+    def org_variables(self):
+        return self._org
 
     def owner_type(self):
         return self._o
@@ -165,15 +180,25 @@ def selftest():
            (code, "MISSING variable ALERT_PAGE_TO" in text, "gh variable set ALERT_PAGE_TO" in text), (1, True, True))
     code, lines = judge(Stub(all_labels, set(), "User"))
     expect("an unset page variable on a person-owned repo is fine, and said so",
-           (code, any("not set: variable ALERT_PAGE_TO" in l for l in lines)), (0, True))
+           (code, any("not required: variable ALERT_PAGE_TO" in l for l in lines)), (0, True))
     code, lines = judge(Stub(set(), set(), "Organization"))
     expect("everything missing lists every name", (code, sum(l.startswith("MISSING") for l in lines)),
            (1, len(LABELS) + len(PAGE_VARIABLES)))
-    for label, stub in (("labels", Stub(None, all_vars, "User")), ("variables", Stub(all_labels, None, "User")),
+    for label, stub in (("labels", Stub(None, all_vars, "User")), ("variables", Stub(all_labels, None, "Organization")),
+                        ("organization variables", Stub(all_labels, all_vars, "Organization", org=None)),
                         ("owner", Stub(all_labels, all_vars, None))):
         code, lines = judge(stub)
         expect("an unreadable %s is could-not-check, never a pass" % label,
                (code, lines[0].startswith("COULD NOT CHECK")), (2, True))
+    # the review of KIT-692
+    code, lines = judge(Stub(all_labels, set(), "Organization", org=all_vars))
+    expect("a page variable set only at organization level counts as present", (code, len(lines)), (0, 1))
+    code, lines = judge(Stub(all_labels, {"ALERT_PAGE_TO"}, "Organization", org={"PR_CONFLICT_PAGE_TO"}))
+    expect("one at each level, both present", code, 0)
+    code, lines = judge(Stub(all_labels, None, "User"))
+    expect("a person-owned repo is judged without reading variables (no admin rights needed)", code, 0)
+    code, lines = judge(Stub({"Hooks-Change", "CONFLICT"}, all_vars, "User"))
+    expect("label names compare case-insensitively", (code, len(lines)), (0, len(PAGE_VARIABLES) + 1))
     # the data cannot rot: each name is still in the file that relies on it
     for name, (_c, _d, where) in LABELS.items():
         with open(os.path.join(ROOT, where), encoding="utf-8") as f:
