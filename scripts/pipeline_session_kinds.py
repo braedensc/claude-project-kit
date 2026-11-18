@@ -20,8 +20,10 @@ Each file says what a session of that kind is given and what walls it runs behin
                   (by its name: only Bash, which the built-in sandbox holds). No file tool is
                   ever allowed by name: in KIT-630's live run a file tool allowed by name read
                   and wrote outside the workspace (row r4a)
-    deny          the places every file tool is refused, and Bash may not read: the runner's
-                  store, the pins, the keys and the sessions' own state. Every kind lists all four
+    deny          the places walled off from every file tool and from Bash's reads: the runner's
+                  store, the pins and the keys, whole; and the sessions' shared home, where no
+                  file tool may write and none may read the program's own state (the adapter
+                  says how). Every kind lists all four
     wall          "built-in-sandbox" for a kind with Bash: the program's own sandbox holds
                   Bash (rows r3, r3b) and rules hold the file tools (rows r4b to r4d).
                   "own-sandbox" for a kind without Bash: our own macOS sandbox holds the whole

@@ -25,10 +25,11 @@ THE RULES IT WRITES.  Each file tool is allowed by the workspace's path, as `Rea
 never by its bare name (row r4a: a bare name reached outside, sandbox or not; row r4d: by path,
 the outside was refused with no deny rule). Grep and Glob need no rule of their own: the program
 applies a Read rule to them. Bash is allowed by its name; the built-in sandbox holds it. Every
-file tool is denied the runner's store, the pins, each key file and the program's own state in
-the sessions' home (its `.claude` folder and `.claude.json`, which hold every session's
-transcript). Bash's deny-read list names the same places. The rest of that home stays readable,
-so git and other tools find their own settings there.
+file tool is denied the runner's store, the pins and each key file. In the sessions' shared home,
+no file tool may write anywhere, and none may read the program's own state (its `.claude` folder
+and `.claude.json`, which hold every session's transcript). Bash's deny-read list names every
+place denied to Read; why the rest of the home stays readable is in walls(). git in a session
+reads no global config at all (GIT_CONFIG_GLOBAL is /dev/null).
 
 WHAT IT NEVER WRITES.  A mode that skips the checks (`bypassPermissions`, `acceptEdits`,
 `--dangerously-skip-permissions`), `--add-dir`, a permission-prompt tool, or a file tool by bare
@@ -60,7 +61,10 @@ GUARD_TIMEOUT = 10
 # key, a second token, a proxy or another address has no source here, so no kind can name one.
 ENV_SOURCES = {"PATH": "path", "HOME": "home", "TMPDIR": "tmp", "LANG": "lang",
                voice.CHILD_TOKEN_VAR: "token", "DISABLE_AUTOUPDATER": "1",
-               "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"}
+               "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+               # git reads no global config at all: a file in the sessions' shared home is never
+               # git's config, whoever wrote it there
+               "GIT_CONFIG_GLOBAL": "devnull"}
 # The program applies a Read rule to these, so they are allowed by Read's own rule.
 COVERED_BY_READ = ("Grep", "Glob")
 FILE_RULE_TOOLS = ("Read", "Edit", "Write")         # the tools every wall is denied to, by rule
@@ -152,18 +156,30 @@ def _file(tool, path):
 
 
 def walls(spec, run):
-    """[(path, is_folder)] for every place the kind denies, in its data's order."""
+    """[(path, is_folder, tools)] for every place the kind denies, in its data's order: the tools
+    each is denied to. Bash may not read a place whose tools include Read.
+
+    The sessions' shared home is walled in two parts. Writes are denied on the whole of it, so
+    no session leaves a file there for the next. Reads are denied on the program's own state:
+    its `.claude` folder and `.claude.json`, which hold every session's transcript. Reads of the
+    rest stay open, on purpose. The program makes each Read deny rule part of Bash's deny-read
+    list too (measured 12 Oct 2026, KIT-256). git stops when a read of its global config is
+    refused, rather than missing, so a Read deny on the whole home would stop Bash's git. The
+    home holds nothing of the account's own (docs/RUNNER.md, "Settings"), and with writes
+    denied nothing else lands there."""
+    rwx = FILE_RULE_TOOLS
     out = []
     for place in spec["deny"]:
         if place == "store":
-            out.append((run["store"], True))
+            out.append((run["store"], True, rwx))
         elif place == "pins":
-            out.append((run["pins"], True))
+            out.append((run["pins"], True, rwx))
         elif place == "keys":
-            out += [(k, False) for k in run["keys"]]
+            out += [(k, False, rwx) for k in run["keys"]]
         elif place == "home":
-            out += [(os.path.join(run["home"], ".claude"), True),
-                    (os.path.join(run["home"], ".claude.json"), False)]
+            out += [(os.path.join(run["home"], ".claude"), True, ("Read",)),
+                    (os.path.join(run["home"], ".claude.json"), False, ("Read",)),
+                    (run["home"], True, ("Edit", "Write"))]
     return out
 
 
@@ -181,7 +197,12 @@ def allowed(spec, run):
 
 def denied(spec, run):
     return [(_tree if folder else _file)(tool, path)
-            for path, folder in walls(spec, run) for tool in FILE_RULE_TOOLS]
+            for path, folder, tools in walls(spec, run) for tool in tools]
+
+
+def deny_read(spec, run):
+    """Bash's deny-read list: every place denied to Read."""
+    return [path for path, _folder, tools in walls(spec, run) if "Read" in tools]
 
 
 def hosts(spec, run):
@@ -208,7 +229,7 @@ def settings(spec, run):
         doc["sandbox"] = {"enabled": True, "failIfUnavailable": True,
                           "allowUnsandboxedCommands": False,
                           "network": {"allowedDomains": hosts(spec, run)},
-                          "filesystem": {"denyRead": [p for p, _folder in walls(spec, run)]}}
+                          "filesystem": {"denyRead": deny_read(spec, run)}}
     return doc
 
 
@@ -280,7 +301,7 @@ def search_path(claude_bin):
 def environment(spec, run, token):
     """Exactly the kind's names, each from its one source here."""
     src = {"path": search_path(run["claude_bin"]), "home": run["home"], "tmp": run["tmp"],
-           "lang": voice.DEFAULT_LANG, "token": token, "1": "1"}
+           "lang": voice.DEFAULT_LANG, "token": token, "1": "1", "devnull": os.devnull}
     return dict((name, src[ENV_SOURCES[name]]) for name in spec["env"])
 
 
@@ -423,9 +444,11 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
 
     # ---- the settings file ------------------------------------------------ #
     deny_paths = [P["store"], P["pins"], key, P["home"] + "/.claude", P["home"] + "/.claude.json"]
-    deny_rules = []
-    for path, folder in zip(deny_paths, (True, True, False, True, False)):
-        deny_rules += [("%s(/%s/**)" if folder else "%s(/%s)") % (t, path) for t in ("Read", "Edit", "Write")]
+    deny_rules = (["%s(/%s/**)" % (t, P["store"]) for t in ("Read", "Edit", "Write")]
+                  + ["%s(/%s/**)" % (t, P["pins"]) for t in ("Read", "Edit", "Write")]
+                  + ["%s(/%s)" % (t, key) for t in ("Read", "Edit", "Write")]
+                  + ["Read(/%s/.claude/**)" % P["home"], "Read(/%s/.claude.json)" % P["home"],
+                     "Edit(/%s/**)" % P["home"], "Write(/%s/**)" % P["home"]])
     guard = ("/usr/bin/env -u DEVELOPER_DIR /usr/bin/python3 -I %s/scripts/pipeline_runner_guard.py "
              "--workspace %s --hook pre-tool-use" % (P["engine"], ws))
     hooks = {"PreToolUse": [{"matcher": ".*", "hooks": [{"type": "command", "command": guard, "timeout": 10}]}]}
@@ -437,6 +460,10 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                                "network": {"allowedDomains": ["github.com", "api.github.com"]},
                                "filesystem": {"denyRead": deny_paths}}
         expect("%s: its settings file, exactly" % name, got, want)
+        expect("%s: no file tool may write anywhere in the sessions' shared home, nor read its transcripts" % name,
+               [r for r in got["permissions"]["deny"] if P["home"] in r],
+               ["Read(/%s/.claude/**)" % P["home"], "Read(/%s/.claude.json)" % P["home"],
+                "Edit(/%s/**)" % P["home"], "Write(/%s/**)" % P["home"]])
     expect("a path with a space is quoted for the hook's shell",
            shlex.split(guard_command(dict(run, workspace="/w s/ENG-1"), "pre-tool-use"))[7], "/w s/ENG-1")
     expect("no tool server is offered yet", mcp(kinds["code"], run), {"mcpServers": {}})
@@ -450,6 +477,9 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
     env = environment(kinds["code"], run, "a-token")
     expect("the environment's values", (env["HOME"], env["TMPDIR"], env[voice.CHILD_TOKEN_VAR],
                                          env["PATH"].split(":")[0]), (P["home"], run["tmp"], "a-token", "/opt/x/bin"))
+    expect("every kind with Bash runs git with no global config, so nothing in the shared home is git's config",
+           sorted(k for k in kinds if environment(kinds[k], run, "t").get("GIT_CONFIG_GLOBAL") == os.devnull),
+           sorted(k for k in kinds if "Bash" in kinds[k]["tools"]))
     expect("a name with no source is said, never passed",
            check(dict(kinds["code"], env=kinds["code"]["env"] + ["ANTHROPIC_API_KEY"])),
            ["code: env: ANTHROPIC_API_KEY has no source in the claude adapter, so it is never passed"])
