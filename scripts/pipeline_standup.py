@@ -59,6 +59,13 @@ plain line saying so, never a zero.  With both off the messages are exactly what
 ROOM FOR MVP 2.  Its "Needs your OK today" items join the asks through ASK_SOURCES, each with
 how much of today's plan it holds up. "Today's plan" goes first in MORNING_SECTIONS.
 
+THE VALIDATOR (KIT-545).  With `validator_ledger_file` set, its ledger (contract §24) is read by
+the ledger's own reader, with no model between. Each approval since the last rundown is one line
+in code's words, after the stand-up whoever wrote it; each escalation and hold that still waits is
+a blocker in the ledger's own words, an urgent one first and marked urgent. The agent's reason is
+only its own marked line and never in the facts. A ledger that cannot be read is said, never as
+none. The sprint recap lists the week's decisions from the same reader (validator_view).
+
 OFF BY DEFAULT: no settings file, or "on": false, and nothing is ever due.
 
 EXIT CODES of `run` and `preview` (contract §13):
@@ -87,6 +94,7 @@ import pipeline_sprint_review as sprint_review  # noqa: E402  (KIT-576: the spri
 import pipeline_sprint_changes as sprint_changes  # noqa: E402  (KIT-577: the changes it proposes)
 import pipeline_queue_settings as queue_settings  # noqa: E402  (KIT-700: each queue setting changed)
 import pipeline_status_local as status_job  # noqa: E402
+import pipeline_validator_ledger as vledger  # noqa: E402  (KIT-545: the validator's record)
 
 EXIT_OK, EXIT_FAILED, EXIT_USAGE, EXIT_PARTIAL = 0, 1, 2, 3
 
@@ -132,6 +140,10 @@ DEFAULTS = {
     # optional override that names them instead, and is normally [].
     "repos": [],
     "planner_config": "~/.stage-a/poller.json",
+    # KIT-545: the validator's ledger (contract section 24). "" is off. Set, both messages say each
+    # approval since the last one, each escalation and hold is a blocker, and the sprint recap lists
+    # the week's decisions. A ledger that cannot be read is said, never shown as none.
+    "validator_ledger_file": "",
     # The status job writes every 15 minutes, so a file older than this is old news.
     "stale_after_minutes": 60,
     # A rundown is due from its time until this much later; after that it is missed.
@@ -204,7 +216,7 @@ def validate_settings(raw, path="(settings)"):
                         % (s["sprint_review_config"],))
     elif s["sprint_review_config"] and s["sprint"] is not True:
         problems.append("'sprint_review_config' needs 'sprint': the review covers the plan's week")
-    for key in ("day_plan_file", "usage_file"):
+    for key in ("day_plan_file", "usage_file", "validator_ledger_file"):
         if not isinstance(s[key], str) or (
                 s[key] and not os.path.isabs(os.path.expanduser(s[key]))):
             problems.append("'%s' must be an absolute path (~/ is allowed), or \"\" for off: %r"
@@ -486,17 +498,20 @@ class Ask(object):
     reply can. `key` is what it is about, a ticket or `owner/name#N`, so two sources naming
     the same thing say it once. MVP 2's day plan adds its "needs your OK" items as Asks.
     `kind` is which of NEED_KINDS it is, and `ticket`/`title` the ticket it names when it
-    names one: the stand-up's short version and its facts count them by kind (KIT-718)."""
+    names one: the stand-up's short version and its facts count them by kind (KIT-718).
+    `said` is the validator's agent's own line, already marked as its words (KIT-545): the
+    full list shows it under the ask, and the facts never carry it."""
 
     def __init__(self, what, holds_up, reply="", where="", key="", kind="", ticket="",
-                 title=""):
+                 title="", said="", subject="", why=""):
         self.what, self.holds_up, self.reply, self.where = what, holds_up, reply, where
         self.key, self.kind, self.ticket, self.title = key, kind, ticket, title
+        self.said, self.subject, self.why = said, subject, why
 
     def line(self):
         act = ("To clear it, reply `%s`." % self.reply) if self.reply else self.where
         held = (". It holds up %s." % self.holds_up) if self.holds_up else "."
-        return "%s%s %s" % (self.what, held, act)
+        return "%s%s %s%s" % (self.what, held, act, ("\n   " + self.said) if self.said else "")
 
 
 def _closed(item):
@@ -659,9 +674,200 @@ def merges_from_day_plan(status, settings, now):
     return _day_plan_needs(status, ("merge",))
 
 
+# --------------------------------------------------------------------------- #
+# The validator's record (KIT-545)
+# --------------------------------------------------------------------------- #
+# The validator's ledger (contract section 24), read by its own reader with no model between:
+# each approval since the last rundown is one line in code's words, each escalation and each hold
+# the validator cannot settle is a blocker with its reason and the reply that clears it, and the
+# agent's reason is only ever its own marked line. Off ("" for validator_ledger_file) or no ledger
+# yet, nothing here says a word. A ledger that cannot be read or trusted is said, never as none.
+VALIDATOR_UNREAD = "The validator's record could not be read, so no approval is claimed"
+_VALIDATOR_UNREAD_WHY = {vledger.MALFORMED: "it is not a record this version reads",
+                         vledger.UNTRUSTED: "it sits where a session could have written it"}
+VALIDATOR_KINDS = ("validator-urgent", "validator")
+APPROVED_WHY = "Its hard limits, its evidence and its agent all passed."
+# What the facts call the validator's blockers (facts_of), urgent first.
+VALIDATOR_URGENT_NEEDS = ("urgent: things the validator escalated to you, believing a dev "
+                          "session may be compromised")
+VALIDATOR_NEEDS = "things the validator held for you"
+
+
+def validator_view(settings, teams=None, repos=None):
+    """The validator's record as the stand-up reads it. None when it reads none: the setting is
+    off, or there is no ledger yet (nothing decided). Else {"rows", "unread"}: the rows about
+    this project, oldest first (a plan's or a piece's team in `teams`, a pull request's
+    repository in `repos`; either None keeps every one), and unread None; or rows None and
+    `unread` the line that says the ledger could not be read or trusted, never an empty list."""
+    path = settings.get("validator_ledger_file") or ""
+    if not path:
+        return None
+    got = vledger.read(os.path.expanduser(path))
+    if got["rows"] is None:
+        return {"rows": None, "unread": "%s: %s." % (
+            VALIDATOR_UNREAD, _VALIDATOR_UNREAD_WHY.get(got["state"], "it could not be opened"))}
+    if got["state"] == vledger.ABSENT:
+        return None
+    teams_kept = set(str(t).upper() for t in teams) if teams is not None else None
+    repos_kept = set(str(r).lower() for r in repos) if repos is not None else None
+    rows = [row for row in got["rows"] if (
+        (repos_kept is None or row["ref"].split("#", 1)[0].lower() in repos_kept)
+        if row["subject"] == "merge" else
+        (teams_kept is None or row["ref"].split("-", 1)[0].upper() in teams_kept))]
+    return {"rows": rows, "unread": None}
+
+
+def _validator_rows(status):
+    return (status.get("_validator") or {}).get("rows") or []
+
+
+def _status_item(status, row):
+    """(plan, piece, pull request) a ledger row is about, as the status file holds them, each
+    None where it holds none. A merge's pull request comes with the piece and plan it is for."""
+    want = row["ref"].lower() if row["subject"] == "merge" else row["ref"]
+    for plan in status.get("plans") or []:
+        if row["subject"] == "plan" and plan.get("id") == want:
+            return plan, None, None
+        for piece in plan.get("pieces") or []:
+            if row["subject"] == "piece" and piece.get("id") == want:
+                return plan, piece, None
+            for pr in piece.get("prs") or []:
+                if row["subject"] == "merge" and _pr_key(pr) == want:
+                    return plan, piece, pr
+    for pr in status.get("other_pull_requests") or []:
+        if row["subject"] == "merge" and _pr_key(pr) == want:
+            return None, None, pr
+    return None, None, None
+
+
+def _still_waits(row, found):
+    """True while the status file shows the thing a blocker row is about still waiting on the
+    owner: a plan not yet approved, a piece not yet started, a pull request open at the head the
+    row judged (a later push is judged again). One the file does not hold is not said."""
+    plan, piece, pr = found
+    if row["subject"] == "plan":
+        return plan is not None and not _closed(plan) and _awaits_approval(plan)
+    if row["subject"] == "piece":
+        return (piece is not None and not _closed(piece) and not piece.get("started_at")
+                and piece.get("state_type") != "started")
+    return (pr is not None and pr.get("state") == "open"
+            and (not pr.get("head_sha") or row["head"].startswith(pr["head_sha"])))
+
+
+def agent_line(says):
+    """The validator's agent's reason as its own marked line, or "" when it said nothing. Its
+    words are made plain: no link stays a link, and no markup is left in them."""
+    if not says:
+        return ""
+    import pipeline_bridge_tech_lead as lead   # the bridge's own link judge (KIT-343)
+    plain = lead.plain_links(status_job.clean_title(says, vledger.SAYS_MAX), ())[0]
+    return '%s%s: "%s"' % (vledger.AGENT_SAID[0].upper(), vledger.AGENT_SAID[1:], plain)
+
+
+def blockers_from_validator(status, settings, now):
+    """Each escalation, and each hold the validator cannot settle, that still waits on the owner
+    (KIT-545): the latest row for each plan, piece or pull request, while the status file shows
+    it waiting. Its reason, the reply that clears it (or where to act) and the urgent mark are
+    the ledger's own words (blocker()); the agent's reason is only its marked line."""
+    latest = {}
+    for row in _validator_rows(status):
+        latest[(row["subject"], row["ref"].lower())] = row
+    out = []
+    for row in sorted(latest.values(), key=lambda r: (r["kind"] != "escalated-urgent", r["at"])):
+        said = vledger.blocker(row)
+        found = _status_item(status, row)
+        if said is None or not _still_waits(row, found):
+            continue
+        plan, piece, _pr = found
+        if row["subject"] == "plan":
+            held, ticket, title = ("its %s" % _count(len(plan.get("pieces") or []), "piece"),
+                                   plan["id"], plan.get("title") or "")
+        elif row["subject"] == "piece":
+            held, ticket, title = _plan_progress(plan), piece["id"], piece.get("title") or ""
+        else:
+            held = ("its merge, and so %s" % _plan_progress(plan)) if plan else ""
+            ticket, title = (piece["id"], piece.get("title") or "") if piece else ("", "")
+        out.append(Ask(said["what"], held, reply=said["reply"], where=said["where"],
+                       key=said["key"], kind=VALIDATOR_KINDS[0 if said["urgent"] else 1],
+                       ticket=ticket, title=title, said=agent_line(said["agent_says"]),
+                       subject=row["subject"],
+                       why="; ".join(vledger.reason_words(row["reasons"]))))
+    return out
+
+
+def _approved_line(row, status, full=False):
+    """One approval in code's words (KIT-545): "approved and merged by the validator: the
+    ticket, and why". A merge is "merged" only when the status file shows its pull request
+    merged at the head the validator approved. The posted text names a pull request by its
+    piece's ticket, or by its repository when the status file holds no plan for it; the full
+    list adds its number."""
+    plan, piece, pr = _status_item(status, row)
+    title = lambda item: (", %s" % item["title"]) if item and item.get("title") else ""  # noqa: E731
+    if row["subject"] == "plan":
+        return "Approved by the validator: plan %s%s. %s" % (row["ref"], title(plan), APPROVED_WHY)
+    if row["subject"] == "piece":
+        return "Approved to start by the validator: %s%s. %s" % (row["ref"], title(piece),
+                                                                  APPROVED_WHY)
+    repo, number = row["ref"].split("#", 1)
+    if full:
+        name = "pull request #%s in %s%s" % (number, repo, (", for %s%s" % (
+            piece["id"], title(piece))) if piece else "")
+    elif piece is not None:
+        name = "the pull request for %s%s" % (piece["id"], title(piece))
+    else:
+        name = "a pull request in %s" % repo
+    state = (pr or {}).get("state")
+    if state == "merged" and pr.get("head_sha") and row["head"].startswith(pr["head_sha"]):
+        lead = "Approved and merged by the validator"
+    elif state == "open":
+        lead = "Approved by the validator, not merged yet"
+    else:
+        lead = "Approved for merge by the validator"
+    return "%s: %s. %s" % (lead, name, APPROVED_WHY)
+
+
+def _approved_since(status, kind, now, since):
+    """The approval rows in the rundown's window: since the last morning (after it) for the
+    morning, since midnight for the afternoon, as the rest of each message counts."""
+    out = []
+    for row in _validator_rows(status):
+        at = _parse(row["at"])
+        if row["kind"] == "approved" and at is not None and (
+                since <= at <= now if kind == "afternoon" else since < at <= now):
+            out.append(row)
+    return out
+
+
+def validator_block(status, kind, now, since):
+    """What code says of the validator after the stand-up, whoever wrote it (KIT-545): each
+    approval since the last rundown, one line in code's words, with the agent's reason as its
+    own marked line under it. "" with none, or with the validator off."""
+    rows = _approved_since(status, kind, now, since)
+    lines = []
+    for row in rows[:MAX_LINES]:
+        said = agent_line(row["agent_says"])
+        lines += [_approved_line(row, status)] + (["   " + said] if said else [])
+    if len(rows) > MAX_LINES:
+        lines.append("And %d more approvals by the validator." % (len(rows) - MAX_LINES))
+    return "\n".join(lines)
+
+
+def _validator_events(status):
+    """Each approval as an event of the full list's done part: (when, kind, words)."""
+    out = []
+    for row in _validator_rows(status):
+        at = _parse(row["at"])
+        if row["kind"] == "approved" and at is not None:
+            said = agent_line(row["agent_says"])
+            out.append((at, "validator-approved", _approved_line(row, status, full=True)
+                        + (("\n  " + said) if said else "")))
+    return out
+
+
 # Where the asks come from, in order. Blockers are the only asks: each says the reply that
-# clears it. What waits on the owner's merge is said after them.
-ASK_SOURCES = [blockers_from_status, blockers_from_day_plan]
+# clears it. What waits on the owner's merge is said after them. The validator's come first,
+# so its reason is the one said for a plan, piece or pull request another source also names.
+ASK_SOURCES = [blockers_from_validator, blockers_from_status, blockers_from_day_plan]
 WAITING_SOURCES = [waiting_from_status, merges_from_day_plan]
 
 
@@ -712,6 +918,7 @@ def _events(status):
                 out.extend(_reviewed(pr, "for %s" % piece["id"]))
     for pr in status.get("other_pull_requests") or []:
         out.extend(_reviewed(pr, "in %s" % pr.get("repo")))
+    out.extend(_validator_events(status))     # KIT-545: each approval by the validator
     out.sort(key=lambda e: e[0])
     return out
 
@@ -769,7 +976,8 @@ def _pr_words(pr):
 # KIT-483: each part of a stand-up is always there. A part with nothing in it is a title with
 # no lines, which says so in words: the owner's first live morning (5 Nov) collapsed to one
 # count line, and read as if nothing had been looked at.
-DONE_KINDS = ("merged", "finished", "plan-finished", "canceled", "reviewed")
+DONE_KINDS = ("merged", "finished", "plan-finished", "canceled", "reviewed",
+              "validator-approved")
 SHIPPED_KINDS = ("merged", "finished", "plan-finished")
 NOTHING_PLANNED_IN_FLIGHT = ("Nothing from a plan is in flight or queued for today; work started "
                              "by hand doesn't show up here until it opens a pull request.")
@@ -839,7 +1047,8 @@ def section_today(status, now, since):
 
 def section_shipped(status, now, since):
     lines = ["%s %s" % (_hm(at, now), words) for at, kind, words in _events(status)
-             if kind in ("merged", "plan-finished") and since <= at <= now]
+             if kind in ("merged", "plan-finished", "validator-approved")
+             and since <= at <= now]
     return ("Shipped today:", _capped(lines)) if lines else ("Nothing shipped today.", [])
 
 
@@ -1369,12 +1578,20 @@ def facts_of(kind, status, now, since, asks, merges):
     if moving:
         nxt["pull_requests_moving_through_checks_and_review"] = moving
     needs = []
+    # KIT-545: an urgent escalation by the validator goes first, then the merges, then what else
+    # the validator held for the owner. Never the agent's words: only code's closed reasons.
+    urgent = [a for a in asks if a.kind == VALIDATOR_KINDS[0]]
+    if urgent:
+        needs.append(_validator_need(urgent, VALIDATOR_URGENT_NEEDS))
     if merges:
         batch = {"what": "pull requests ready for your merge", "pull_requests": len(merges)}
         signs = sum(1 for a in merges if a.kind == "sign-off")
         if signs:
             batch["waiting_on_your_sign_off_first"] = signs
         needs.append(batch)
+    held_for_you = [a for a in asks if a.kind == VALIDATOR_KINDS[1]]
+    if held_for_you:
+        needs.append(_validator_need(held_for_you, VALIDATOR_NEEDS))
     for kind_, what, key in NEED_KINDS:
         these = [a for a in asks if a.kind == kind_]
         if these and key:
@@ -1383,7 +1600,8 @@ def facts_of(kind, status, now, since, asks, merges):
         elif these:
             needs.append({"what": what, "pull_requests": len(these)})
     # An ask of a kind not named above (one a later ASK_SOURCES adds) is counted, never dropped.
-    other = [a for a in asks if a.kind not in [k for k, _w, _key in NEED_KINDS]]
+    other = [a for a in asks if a.kind not in [k for k, _w, _key in NEED_KINDS]
+             + list(VALIDATOR_KINDS)]
     if other:
         needs.append({"what": OTHER_NEEDS, "things": len(other)})
     facts = {"stand_up": kind, "window": window, "happened": happened, "next": nxt,
@@ -1462,9 +1680,63 @@ def _named(items, one, many, count_words):
     return "%s %s." % (count_words % len(items), many)
 
 
+_VALIDATOR_IS = {"plan": "plan", "piece": "piece", "merge": "pull request"}
+
+
+def _validator_need(asks, what):
+    """The facts for the validator's blockers of one kind (KIT-545): each by its ticket when one
+    names it (a pull request by its piece's), with code's reasons in plain words. No pull request
+    number, no link, and never the agent's words."""
+    items = []
+    for a in asks:
+        item = {"is": _VALIDATOR_IS.get(a.subject, "thing")}
+        if a.ticket:
+            item["ticket"] = a.ticket
+            if a.title:
+                item["title"] = a.title
+        if a.why:
+            item["why"] = a.why
+        items.append(item)
+    need = {"what": what, "things": len(items), "items": items}
+    if what == VALIDATOR_URGENT_NEEDS:
+        need["urgent"] = True
+    return need
+
+
+def _validator_need_line(item):
+    """One line for the validator's blockers of one kind: one by name with its reason, two by
+    ticket, more by count. An urgent one says so first."""
+    items, urgent = item["items"], item.get("urgent") is True
+
+    def name(it, short=False):
+        ticket = it.get("ticket")
+        if short:
+            return ticket or ("a %s" % it["is"])
+        base = ("%s, %s," % (ticket, it["title"]) if it.get("title") else ticket) if ticket else ""
+        if it["is"] == "plan":
+            return "plan " + base
+        if it["is"] == "pull request":
+            return ("the pull request for " + base) if ticket else "a pull request outside any plan"
+        return base or "a %s" % it["is"]
+    done = ("escalated to you by the validator, which believes %s dev session may be "
+            "compromised" % ("the" if len(items) == 1 else "a")) if urgent else (
+        "held for you by the validator")
+    if len(items) == 1:
+        why = (": %s" % items[0]["why"]) if items[0].get("why") and not urgent else ""
+        line = "%s was %s%s." % (name(items[0]), done, why)
+    elif len(items) == 2:
+        line = "%s and %s were %s." % (name(items[0], True), name(items[1], True), done)
+    else:
+        line = "%d things were %s." % (len(items), done)
+    line = line[0].upper() + line[1:]
+    return ("Urgent: " + line) if urgent else line
+
+
 def _need_line(item):
     n = item.get("pull_requests")
     what = item["what"]
+    if what in (VALIDATOR_URGENT_NEEDS, VALIDATOR_NEEDS):
+        return _validator_need_line(item)
     if what == "pull requests ready for your merge":
         hand = "sign-off and merge" if item.get("waiting_on_your_sign_off_first") else "merge"
         if n == 1:
@@ -1576,8 +1848,8 @@ def check_words(text, facts, repos=()):
     would mean reading the sentence. `repos` are the repositories the status file lists: one
     the facts do not list (more than one project in play) may not be named. It must also keep
     the shape: no time of day, no line telling him what to type, at most SAID_MAX_LINES lines
-    and SAID_MAX_WORDS words, a part on what needs him whenever something does, and at most
-    NEEDS_SAID items listed under it. The links and the telling lines are judged by the
+    and SAID_MAX_WORDS words, a part on what needs him whenever something does, at most
+    NEEDS_SAID items listed under it, and the word urgent when the facts mark one (KIT-545). The links and the telling lines are judged by the
     bridge's own judges, so a link is whatever Slack would make one."""
     import pipeline_bridge_tech_lead as lead   # the bridge's judges; imported here, not above
     text = (text or "").strip()
@@ -1627,6 +1899,10 @@ def check_words(text, facts, repos=()):
         return "it ran past %d words" % SAID_MAX_WORDS
     if facts.get("needs_you") and not _SAID_NEEDS_RE.search(text):
         return "it left out what needs him"
+    # KIT-545: an urgent escalation by the validator is marked urgent, whoever words it.
+    if any(isinstance(n, dict) and n.get("urgent") is True for n in facts.get("needs_you") or ()) \
+            and not re.search(r"\burgent", text, re.IGNORECASE):
+        return "it left out that one is urgent"
     for i, line in enumerate(lines):
         if not _SAID_NEEDS_RE.search(line):
             continue
@@ -1657,7 +1933,8 @@ Code checks your words before they are posted, and posts its own short version i
 break any of these: at most %(lines)d lines and about 120 words; no links or web addresses; no
 pull request numbers; a ticket only if the facts name it; every number one the facts hold, never
 added up, worked out or guessed; no times of day or dates; no repository named unless the facts
-list more than one; no command for them to type. Use only these facts, and look nothing up. If
+list more than one; no command for them to type; anything the facts mark urgent said as urgent.
+Use only these facts, and look nothing up. If
 one thing that needs them has a single right next step for one ticket, you may call that tool:
 the pipeline asks them after your stand-up, and only their yes does anything.
 """
@@ -1697,25 +1974,34 @@ def compose(kind, now, settings, record=None, teams=None):
     now = _local(now)
     greeting = "Good morning." if kind == "morning" else "Afternoon wrap."
     status, problem = read_status(settings, now)
-    if status is None:
-        plain = _slack_safe("%s There's no stand-up this %s: %s. I won't pass on old news." % (
-            greeting, kind, problem))
-        return {"kind": kind, "text": plain, "plain": plain, "full": plain, "facts": None,
-                "after": "", "by": "code", "why": None, "cost_usd": None, "problem": problem,
-                "status_written_at": None, "repos_in_file": []}
-    # Every repository the file lists, this project's or not: the tech lead may name one only
-    # when the facts do (check_words).
-    in_file = sorted(set(str(pr.get("repo")).lower() for pr in _all_prs(status) if pr.get("repo")))
     if teams is not None:
         repos, unknown = project_repos(settings, teams)
     else:
         repos, unknown = (settings.get("repos") or None), None
+    since = _since(kind, now, record)
+    # KIT-545: the validator's record, read by its own reader. Its approvals come from the
+    # ledger, not the status file, so a rundown with no news still says them.
+    validator = validator_view(settings, teams, repos)
+    unread = [validator["unread"]] if validator and validator["unread"] else []
+    if status is None:
+        plain = _slack_safe("%s There's no stand-up this %s: %s. I won't pass on old news." % (
+            greeting, kind, problem))
+        after = "".join("\n\n" + _slack_safe(x) for x in unread + [validator_block(
+            {"_validator": validator}, kind, now, since)] if x)
+        return {"kind": kind, "text": plain + after, "plain": plain + after,
+                "full": plain + after, "facts": None, "after": after, "by": "code", "why": None,
+                "cost_usd": None, "problem": problem, "status_written_at": None,
+                "repos_in_file": []}
+    # Every repository the file lists, this project's or not: the tech lead may name one only
+    # when the facts do (check_words).
+    in_file = sorted(set(str(pr.get("repo")).lower() for pr in _all_prs(status) if pr.get("repo")))
     status = scoped(status, repos, teams)
     written = _parse(status["written_at"])
     lead = ["%s Here's %s, from the status file written at %s." % (
         greeting, "today's stand-up" if kind == "morning" else "what happened today",
         _hm(written, now))]
     notes, blind = source_notes(status, now)
+    notes = notes + unread
     lead.extend(notes)
     sprint_line = sprint_text(settings, now) if settings.get("sprint") else None
     if sprint_line:
@@ -1729,10 +2015,13 @@ def compose(kind, now, settings, record=None, teams=None):
         if unknown else notes) or None,
               "status_written_at": status["written_at"], "facts": None, "after": "",
               "by": "code", "why": None, "cost_usd": None, "repos_in_file": in_file}
+    status = dict(status, _validator=validator)
     if blind:
-        full = _slack_safe("\n\n".join(lead))
+        approved = validator_block(status, kind, now, since)
+        full = _slack_safe("\n\n".join(lead + ([approved] if approved else [])))
         short = _slack_safe("\n\n".join(["%s %s" % (greeting, " ".join(notes))]
-                                         + ([sprint_line] if sprint_line else [])))
+                                         + ([sprint_line] if sprint_line else [])
+                                         + ([approved] if approved else [])))
         result.update(text=short, plain=short, full=full)
         return result
     # KIT-483: a report, not a request. Blockers are the only asks, each with the reply that
@@ -1746,10 +2035,11 @@ def compose(kind, now, settings, record=None, teams=None):
                                             for i, a in enumerate(asks, 1))) if asks else (
         "No blockers. Nothing needs you.")
     merges = gather(WAITING_SOURCES, status, settings, now)
+    held_refs = set(a.key for a in asks if a.kind in VALIDATOR_KINDS)
+    merges = [m for m in merges if m.key not in held_refs]
     merges_block = ("Waiting on your merge:\n" + "\n".join(
         "%d. %s" % (i, a.line()) for i, a in enumerate(merges, 1))) if merges else (
         "Nothing is waiting on your merge.")
-    since = _since(kind, now, record)
     funcs = MORNING_SECTIONS if kind == "morning" else AFTERNOON_SECTIONS
     sections = [s for s in (f(status, now, since) for f in funcs) if s]
     narrative = "\n\n".join(title + "".join("\n- " + line for line in lines)
@@ -1772,8 +2062,10 @@ def compose(kind, now, settings, record=None, teams=None):
     facts = facts_of(kind, status, now, since, asks, merges)
     caveat = None if unknown else _coverage_caveat(status)
     # `machine` holds the machine's line and the queue settings' (KIT-700), each when it has one.
-    after = "".join("\n\n" + _slack_safe(x) for x in notes + [caveat, sprint_line, spend, room,
-                                                               clone] + machine if x)
+    # KIT-545: the validator's approvals since the last rundown, built by code from its ledger.
+    after = "".join("\n\n" + _slack_safe(x) for x in notes + [
+        caveat, validator_block(status, kind, now, since), sprint_line, spend, room,
+        clone] + machine if x)
     text = _slack_safe(short_body(kind, facts)) + after
     result.update(text=text, plain=text, full=full, facts=facts, after=after)
     return result
@@ -1944,7 +2236,10 @@ def _sprint_review_core(p, http=None, environ=None):
         if waiting:
             text = sprints[sid]["text"]
         else:
-            text, entry = sprint_review.run_review(cfg, view, usage, now, http, environ, left)
+            # KIT-545: the week's decisions by the validator, from the stand-up's own reader.
+            text, entry = sprint_review.run_review(
+                cfg, view, usage, now, http, environ, left,
+                validator_view(settings, p.cfg.get("team_keys"), cfg["repos"]))
             sprints[sid] = dict(entry, posted=False, text=text)
             sprint_review.save_record(cfg, sprints)
     except (sprint_review.ReviewError, OSError) as exc:
@@ -2379,6 +2674,188 @@ def _fx_status(now, plans, written_ago=5, sources=None):
             "result": "ok" if whole else "partial", "error": None,
             "lookback_hours": 72, "sources": src, "counts": counts, "plans": plans,
             "findings": [], "firing": []}
+
+
+def _cases_validator(check, tmp, now, ago, record, put, settings_with):
+    """KIT-545: the stand-up reads the validator's ledger (contract section 24) by its own reader,
+    with no model between. The rows are written by the ledger's one writer."""
+    folder = os.path.join(tmp, "validator")
+    path = os.path.join(folder, "ledger.json")
+    epoch = lambda **kw: (now - timedelta(**kw)).timestamp()  # noqa: E731
+    passed = {"hard_limits": "pass", "evidence": "pass", "agent": "pass"}
+    size = {"max_changed_lines": 400, "max_files": 20}
+
+    def row(subject, ref, kind, head=None, reasons=(), says=None, layers=None):
+        if layers is None:
+            layers = passed if kind == "approved" else (
+                {"hard_limits": "fail", "evidence": "not-run", "agent": "not-run"} if reasons
+                else dict(passed, agent="fail"))
+        return {"subject": subject, "ref": ref, "head": head, "kind": kind, "layers": layers,
+                "settings_on": ["approve-plans", "approve-pieces", "approve-merges"],
+                "size_limits": size, "reasons": list(reasons), "agent_says": says}
+    A, B, C = "a" * 40, "b" * 40, "c" * 40
+    link_says = "The diff does what the criteria ask; see https://evil.example/steal for more."
+    urgent_says = "It edits a hook nobody asked for."
+    for at, r in (
+            # An approval before the last morning: not said again.
+            (epoch(days=3), row("piece", "KIT-611", "approved", says="Old news.")),
+            (epoch(hours=21), row("piece", "KIT-612", "approved")),
+            (epoch(hours=6), row("merge", "example-org/kit#614", "held", head=B,
+                                 reasons=["risk-path"])),       # its head moved: no blocker
+            (epoch(hours=5), row("plan", "KIT-600", "held", reasons=["provenance-not-owner"])),
+            (epoch(hours=4), row("merge", "example-org/kit#611", "approved", head=A,
+                                 says=link_says)),
+            (epoch(hours=3), row("merge", "example-org/kit#614", "sent-back", head=C,
+                                 says="Add a test.")),
+            (epoch(hours=3), row("piece", "TOD-9", "held", reasons=["risk-path"])),
+            (epoch(hours=2), row("merge", "example-org/kit#612", "escalated-urgent", head=A,
+                                 says=urgent_says)),
+            (epoch(hours=1), row("piece", "KIT-613", "held",
+                                 reasons=["provenance-later-generation"]))):
+        vledger.append(path, r, lambda at=at: at)
+    plans = [
+        _fx_plan("KIT-600", "Login plan", "backlog", created=ago(hours=30), pieces=[
+            _fx_piece("KIT-601", "First piece", "backlog")]),
+        _fx_plan("KIT-610", "Running plan", "started", created=ago(days=2), pieces=[
+            _fx_piece("KIT-611", "Merged piece", "completed", started=ago(days=1),
+                      completed=ago(hours=3), prs=[_fx_pr(611, "merged", ago(hours=20),
+                                                          ago(hours=3))]),
+            _fx_piece("KIT-612", "Open piece", started=ago(hours=20),
+                      prs=[_fx_pr(612, opened=ago(hours=19))]),
+            _fx_piece("KIT-613", "Waiting piece", "unstarted"),
+            _fx_piece("KIT-614", "Moved piece", started=ago(hours=20),
+                      prs=[_fx_pr(614, opened=ago(hours=19), checks="pending")])])]
+    put(_fx_status(now, plans))
+    s_off, s_on = settings_with(), settings_with(validator_ledger_file=path)
+    on = compose("morning", now, s_on, record)
+    text, full, facts = on["text"], on["full"], on["facts"]
+
+    # 1. Each approval since the last morning: one line in code's words, the agent's apart.
+    merged = ("Approved and merged by the validator: the pull request for KIT-611, Merged piece. "
+              "Its hard limits, its evidence and its agent all passed.")
+    started = ("Approved to start by the validator: KIT-612, Open piece. Its hard limits, its "
+               "evidence and its agent all passed.")
+    check("validator-each-approval-since-the-last-morning-is-one-line-in-codes-words",
+          merged in text and started in text and "Old news" not in text
+          and text.count("Approved") == 2 and text.index(started) < text.index(merged), text)
+    check("validator-the-agents-words-are-only-their-own-marked-line-and-no-link-stays-a-link",
+          '\n   The validator\'s agent said: "The diff does what the criteria ask; see '
+          'https[:]//evil[.]example/steal for more."' in text and "https://evil" not in text
+          and "https://evil" not in full and text.count("criteria ask") == 1
+          and urgent_says[:20] not in text, text)
+    check("validator-the-full-list-says-each-approval-in-its-done-part-with-the-number",
+          "Approved and merged by the validator: pull request #611 in example-org/kit, for "
+          "KIT-611, Merged piece." in full[full.find("Done since"):full.find("Blockers:")]
+          and "Old news" not in full, full[:900])
+    # 2. Each escalation and hold that still waits: a blocker, with its reason and its reply.
+    blocks = full[full.find("Blockers:"):full.find("Waiting on your merge:")]
+    check("validator-each-hold-is-a-blocker-with-its-reason-and-the-reply-that-clears-it",
+          "Plan KIT-600 was held by the validator: the idea was not yours. It holds up its 1 "
+          "piece. To clear it, reply `approve KIT-600`." in blocks
+          and "KIT-613 was held by the validator: it is agent-filed work past its first "
+          "generation. It holds up plan KIT-610 (1 of 4 pieces done). To clear it, reply "
+          "`start KIT-613`." in blocks
+          and "Plan KIT-600, Login plan, waits for your approval" not in full, blocks)
+    check("validator-an-urgent-escalation-is-marked-urgent-with-the-agents-line-under-it",
+          blocks.startswith("Blockers:\n1. Urgent: Pull request #612 in example-org/kit was "
+                            "sent to you by the validator, urgently. It believes the dev "
+                            "session may be compromised. It holds up its merge")
+          and "It's yours to merge or close: https://github.com/example-org/kit/pull/612\n"
+              "   The validator's agent said: \"%s\"" % urgent_says in blocks, blocks)
+    check("validator-a-moved-head-a-send-back-and-another-projects-piece-are-no-blockers",
+          "#614" not in blocks and "TOD-9" not in full and "Add a test" not in full, blocks)
+    check("validator-a-pull-request-it-holds-is-said-once-not-in-the-merge-batch",
+          "#612" not in full[full.find("Waiting on your merge:"):], full[-500:])
+    check("validator-the-facts-name-them-urgent-first-with-codes-reasons-only",
+          facts["needs_you"] == [
+              {"what": VALIDATOR_URGENT_NEEDS, "things": 1, "urgent": True,
+               "items": [{"is": "pull request", "ticket": "KIT-612", "title": "Open piece"}]},
+              {"what": VALIDATOR_NEEDS, "things": 2, "items": [
+                  {"is": "plan", "ticket": "KIT-600", "title": "Login plan",
+                   "why": "the idea was not yours"},
+                  {"is": "piece", "ticket": "KIT-613", "title": "Waiting piece",
+                   "why": "it is agent-filed work past its first generation"}]}]
+          and "agent said" not in json.dumps(facts) and "nobody asked" not in json.dumps(facts)
+          and "approved" not in json.dumps(facts).lower(), json.dumps(facts["needs_you"]))
+    check("validator-the-posted-needs-name-them-urgent-first",
+          "Needs you:\n%s Urgent: The pull request for KIT-612, Open piece, was escalated to you "
+          "by the validator, which believes the dev session may be compromised.\n%s KIT-600 and "
+          "KIT-613 were held for you by the validator.\n" % (BULLET, BULLET) in text, text)
+    one = {"what": VALIDATOR_NEEDS, "things": 1, "items": [
+        {"is": "plan", "ticket": "KIT-600", "title": "Login plan",
+         "why": "the idea was not yours"}]}
+    check("validator-one-held-thing-is-named-with-its-reason",
+          (_need_line(one), _need_line(dict(one, items=[{"is": "pull request",
+                                                         "why": "it may delete data"}]))),
+          ("Plan KIT-600, Login plan, was held for you by the validator: the idea was not "
+           "yours.", "A pull request outside any plan was held for you by the validator: it "
+           "may delete data."))
+    # 3. Whoever words the stand-up, an urgent one is said as urgent.
+    lead_words = ("Morning! A quiet night here.\nNeeds you:\n%s the pull request for KIT-612 and "
+                  "two more things the validator held.\nWant the details? Just ask." % BULLET)
+    check("validator-the-tech-leads-words-must-say-urgent-when-one-is",
+          (check_words(lead_words, facts), check_words(lead_words.replace(
+              "the pull request", "urgent: the pull request"), facts)),
+          ("it left out that one is urgent", ""))
+    check("validator-the-prompt-asks-for-it", "anything the facts mark urgent said as urgent"
+          in standup_prompt("morning", facts))
+    # 4. The afternoon counts approvals since midnight, as it counts the rest.
+    put(_fx_status(now.replace(hour=15, minute=5), plans))
+    afternoon = compose("afternoon", now.replace(hour=15, minute=5), s_on, record)
+    put(_fx_status(now, plans))
+    check("validator-the-afternoon-says-the-days-approvals",
+          merged in afternoon["text"] and started not in afternoon["text"], afternoon["text"])
+    # 5. A ledger that cannot be read or trusted is said, never shown as none.
+    with open(path, encoding="utf-8") as fh:
+        good = fh.read()
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("{not json")
+    bad = compose("morning", now, s_on, record)
+    os.chmod(folder, 0o777)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(good)
+    open_ = compose("morning", now, s_on, record)
+    os.chmod(folder, 0o755)
+    for label, got, why in (("unreadable", bad, "it is not a record this version reads"),
+                            ("untrusted", open_, "it sits where a session could have written it")):
+        line = "The validator's record could not be read, so no approval is claimed: %s." % why
+        check("validator-an-%s-ledger-is-said-in-words-never-as-none" % label,
+              line in got["text"] and line in got["full"] and line in (got["problem"] or "")
+              and "Approved" not in got["text"]
+              and VALIDATOR_NEEDS not in json.dumps(got["facts"]),
+              got["text"])
+    # 6. No status file: the approvals still come from the ledger, and are said.
+    put_missing = dict(s_on, status_file=os.path.join(tmp, "no-status-here.json"))
+    none = compose("morning", now, put_missing, record)
+    check("validator-a-rundown-with-no-news-still-says-the-approvals",
+          "There's no stand-up this morning" in none["text"]
+          and "Approved and merged" not in none["text"]
+          and "Approved for merge by the validator: a pull request in example-org/kit. Its "
+          "hard limits" in none["text"] and none["text"].endswith(none["after"]), none["text"])
+    # 7. A project's own: another team's and another repository's rows are left out.
+    view = validator_view(s_on, teams=["KIT"], repos=["example-org/site"])
+    check("validator-a-stand-up-reads-its-own-projects-rows-only",
+          sorted(set(r["ref"] for r in view["rows"])) == ["KIT-600", "KIT-611", "KIT-612",
+                                                         "KIT-613"]
+          and validator_view(s_on, repos=[])["rows"] == [r for r in vledger.read(path)["rows"]
+                                                         if r["subject"] != "merge"], view)
+    # 8. Off, and no ledger yet: the stand-up is what it was.
+    absent = settings_with(validator_ledger_file=os.path.join(tmp, "no-ledger", "ledger.json"))
+    off, empty = compose("morning", now, s_off, record), compose("morning", now, absent, record)
+    check("validator-off-or-no-ledger-changes-nothing",
+          DEFAULTS["validator_ledger_file"] == "" and validator_view(s_off) is None
+          and validator_view(absent) is None
+          and (off["text"], off["full"], off["facts"]) == (empty["text"], empty["full"],
+                                                          empty["facts"])
+          and "validator" not in off["text"].lower() + off["full"].lower()
+          and "Plan KIT-600, Login plan, waits for your approval" in off["full"], off["text"])
+    try:
+        validate_settings({"schema": SETTINGS_SCHEMA, "validator_ledger_file": "ledger.json"})
+        said = ""
+    except StandupError as exc:
+        said = str(exc)
+    check("validator-the-ledger-setting-must-be-absolute",
+          "'validator_ledger_file' must be an absolute path" in said, said)
 
 
 def cases_bridge(kit):
@@ -3311,6 +3788,11 @@ def _selftest():
           {"what": OTHER_NEEDS, "things": 1} in odd["facts"]["needs_you"]
           and "1 other thing holds work until you act." in odd["text"], odd["text"])
     put(_fx_status(now, plans))
+
+    # --- KIT-545: the validator's record. Each approval since the last one is a line in code's
+    # words, each escalation and hold a blocker, urgent marked; the agent's words only as their
+    # own marked line; an unreadable ledger said, never as none; off, nothing changes. ---
+    _cases_validator(check, tmp, now, ago, record, put, settings_with)
 
     # --- the afternoon: shipped, started and finished, then still waiting ---
     later = at(15, 5)
@@ -4521,7 +5003,7 @@ def _selftest():
         status_job.STATUS_SCHEMA, status_job.DEFAULT_STATUS_FILE))
     check("room-for-mvp-2", (ASK_SOURCES, WAITING_SOURCES, MORNING_SECTIONS,
                              AFTERNOON_SECTIONS) == (
-        [blockers_from_status, blockers_from_day_plan],
+        [blockers_from_validator, blockers_from_status, blockers_from_day_plan],
         [waiting_from_status, merges_from_day_plan], [section_done, section_today],
         [section_shipped, section_started_finished]))
     # The command line, end to end: preview prints the plain rundown and changes nothing; run

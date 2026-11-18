@@ -190,6 +190,12 @@ TURN_BIN=/opt/homebrew/bin/claude
 # time, the stand-up writes a recap of the week as a Linear document and sends ONE message that links it. Built by
 # code from the usage file, GitHub and your weekly budget. Needs STANDUP_SPRINT=yes. Empty: off.
 #STANDUP_SPRINT_REVIEW_CONFIG=
+# The validator's ledger (KIT-545, the file the validator writes its decisions to). This account must be able to
+# read it. Both messages then say each approval since the last stand-up as one line, in code's words; each escalation
+# and each hold the validator can't settle is a blocker, an urgent one marked urgent; and the sprint review lists the
+# week's decisions. The agent's own reason appears only as its own marked line. A ledger that cannot be read is said
+# ("no approval is claimed"), never shown as none. Empty: off, and nothing changes.
+#STANDUP_VALIDATOR_LEDGER=
 # A link in the tech lead's answer stays a link in your DM only when it goes to
 # one of these hosts, or under one, judged by where it really goes, never by its
 # words. Any other reaches your DM as plain text, its dots and colons in square

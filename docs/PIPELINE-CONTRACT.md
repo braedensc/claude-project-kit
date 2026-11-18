@@ -3048,7 +3048,9 @@ Each is `pass`, `fail`, `unsure` or `not-run`. `unsure` holds, as `fail` does. `
 
 ### Who reads it
 
-Stage E's bounce driver reads a `sent-back` row for a pull request at its current head, when its config names the ledger (`validator_ledger_file`, KIT-542). It re-prompts the dev session from its own ledger and budget. The stand-up, the recap and the watcher read the ledger in their own pieces.
+Stage E's bounce driver reads a `sent-back` row for a pull request at its current head, when its config names the ledger (`validator_ledger_file`, KIT-542). It re-prompts the dev session from its own ledger and budget.
+
+The stand-up reads it when its settings name it (`validator_ledger_file`, KIT-545), with `read()` and no model between. Each `approved` row since the last rundown is one line in code's words. The latest row for each plan, piece or pull request that is an escalation or a hold, while the status file shows it still waiting, is a blocker in the ledger's own words (`blocker()`), an urgent one first and marked urgent. The agent's reason is only its own marked line, with links made plain, and never in the facts the tech lead's turn reads. A ledger `read()` gives no rows for is said ("no approval is claimed"), never shown as none. Absent, or the setting empty, nothing is said. The sprint recap lists the period's rows from the same reader. The watcher reads the ledger in its own piece.
 
 ---
 

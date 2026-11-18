@@ -13,7 +13,9 @@ has come, the stand-up calls this module. It reads four things and no model:
     Stage E's review comment on each said (how many findings, of what kind);
   - the weekly budget the owner set, for the cost against the plan;
   - the health watch's state file (optional, KIT-602): the week's lowest free memory and most swap, for the machine and
-    the budget section, which also draws the burn against the reset from the usage file's days.
+    the budget section, which also draws the burn against the reset from the usage file's days;
+  - the validator's ledger (optional, KIT-545), by the stand-up's own reader: the week's approvals, send-backs,
+    escalations and holds, each in code's words, with the agent's reason only as its own marked line.
 It then writes the recap as a Linear document and posts ONE message to the owner's DM that links it.
 
 NEVER SILENT.  If the document cannot be written, the message says so and names a copy saved on this machine. If the
@@ -45,6 +47,7 @@ import pipeline_bridge_transport as transport  # noqa: E402  (its HTTP call refu
 import pipeline_sprint as sprint  # noqa: E402
 import pipeline_sprint_changes as changes  # noqa: E402  (KIT-577: the small changes it proposes)
 import pipeline_status_local as status_job  # noqa: E402
+import pipeline_validator_ledger as vledger  # noqa: E402  (KIT-545: the validator's rows, in its own words)
 
 CONFIG_SCHEMA = "pipeline-sprint-review-config/1"
 RECORD_SCHEMA = "pipeline-sprint-review-record/1"
@@ -469,7 +472,70 @@ def machine_section(health, why, usage, budget, since, until, tz=None):
     return lines
 
 
-def build(view, usage, budget, pulls, partial, reviews, shots, now, machine=None, proposed=None):
+# --------------------------------------------------------------------------- #
+# The validator's decisions (KIT-545)
+# --------------------------------------------------------------------------- #
+_VALIDATOR_DID = {"approved": "approved", "sent-back": "sent back", "escalated": "escalated",
+                  "escalated-urgent": "escalated", "held": "held"}
+
+
+def validator_week(validator, since, until):
+    """The stand-up's view of the validator's record (pipeline_standup.validator_view) cut to the sprint's period:
+    None when it reads none (off, or no ledger yet), {"rows": the period's rows, oldest first}, or {"rows": None,
+    "unread": the line that says so} for a ledger that cannot be read or trusted, never an empty list."""
+    if validator is None:
+        return None
+    if validator.get("rows") is None:
+        return {"rows": None, "unread": validator.get("unread")}
+    return {"rows": [r for r in validator["rows"] if _parse(r["at"]) and since <= _parse(r["at"]) < until]}
+
+
+def _validator_row_line(row, tz=None):
+    """One decision in code's words: what it was about, what the validator did, and code's reasons for a no."""
+    day = _parse(row["at"]).astimezone(tz).strftime("%a %d %b")
+    what = {"plan": "plan %s" % row["ref"], "piece": "the start of %s" % row["ref"],
+            "merge": "the merge of %s" % row["ref"]}[row["subject"]]
+    kind = row["kind"]
+    if kind == "approved":
+        return "- %s: approved %s. Its hard limits, its evidence and its agent all passed." % (day, what)
+    to = {"sent-back": " to its dev session", "escalated": " to you", "held": " for you",
+          "escalated-urgent": " to you, urgently: it believes the dev session may be compromised"}[kind]
+    words = vledger.reason_words(row["reasons"])
+    return "- %s: %s %s%s%s." % (day, _VALIDATOR_DID[kind], what, to,
+                                 ("%s %s" % (";" if kind == "escalated-urgent" else ":", "; ".join(words)))
+                                 if words else "")
+
+
+def validator_counts(week):
+    """{approved, sent_back, escalated, urgent, held} for the period: urgent ones are counted among the escalated."""
+    kinds = [r["kind"] for r in week.get("rows") or ()]
+    return {"approved": kinds.count("approved"), "sent_back": kinds.count("sent-back"),
+            "escalated": kinds.count("escalated") + kinds.count("escalated-urgent"),
+            "urgent": kinds.count("escalated-urgent"), "held": kinds.count("held")}
+
+
+def validator_section(week, tz=None):
+    """The recap's part on the validator: every decision of the period, oldest first, each one line in code's words,
+    and the agent's reason only as its own marked line under it, as inline code so nothing in it is a link or markup.
+    A ledger that cannot be read is said, never shown as none."""
+    if week.get("rows") is None:
+        return [week.get("unread") or "The validator's record could not be read, so no approval is claimed."]
+    rows = week["rows"]
+    if not rows:
+        return ["The validator decided nothing in this period."]
+    counts = validator_counts(week)
+    lines = ["From the validator's record, built by code: %d approved, %d sent back, %d escalated (%d urgently) "
+             "and %d held." % (counts["approved"], counts["sent_back"], counts["escalated"], counts["urgent"],
+                               counts["held"]), ""]
+    for row in rows:
+        lines.append(_validator_row_line(row, tz))
+        if row["agent_says"]:
+            lines.append("  - %s%s: `%s`" % (vledger.AGENT_SAID[0].upper(), vledger.AGENT_SAID[1:],
+                                             status_job.clean_title(row["agent_says"], vledger.SAYS_MAX)))
+    return lines
+
+
+def build(view, usage, budget, pulls, partial, reviews, shots, now, machine=None, proposed=None, validator=None):
     """(title, markdown, facts). `facts` are the numbers the DM message states."""
     since, until = view["starts_at"], view["resets_at"]
     local = lambda d: d.astimezone().strftime("%a %d %b")      # noqa: E731
@@ -490,7 +556,8 @@ def build(view, usage, budget, pulls, partial, reviews, shots, now, machine=None
         lines.append("Not complete: %s." % why)
     lines += ["", "## What merged on its own", "",
               ("%d of %d merged with auto-merge on: %s." % (len(own), len(pulls), ", ".join("%s#%d" % (p["repo"], p["number"]) for p in own))
-               if own else "None merged on its own.") if pulls else "Nothing merged, so nothing merged on its own.",
+               if own else "None merged on its own.") if pulls else "Nothing merged, so nothing merged on its own."] + (
+                  ["", "## What the validator decided", ""] + validator_section(validator) if validator is not None else []) + [
               "", "## What it cost", ""] + cost_lines + (
                   ["", "## The machine and the budget", ""] + machine if machine is not None else []) + [
               "", "## What the reviews taught", ""]
@@ -514,7 +581,10 @@ def build(view, usage, budget, pulls, partial, reviews, shots, now, machine=None
                  if proposed is not None else "This recap proposes nothing and changes nothing.")]
     facts = {"title": title, "pulls": len(pulls), "own": len(own), "spent": spent, "budget": budget,
              "reviewed": reviewed, "flagged": flagged, "partial": bool(partial),
-             "changes": len(proposed[0]["proposals"]) if proposed and proposed[0] else 0}
+             "changes": len(proposed[0]["proposals"]) if proposed and proposed[0] else 0,
+             "validator": None if validator is None else (
+                 {"unread": validator_section(validator)[0]} if validator.get("rows") is None
+                 else validator_counts(validator))}
     return title, "\n".join(lines) + "\n", facts
 
 
@@ -584,6 +654,12 @@ def message(facts, url, local_path, failure):
         parts.append("Stage E raised findings on %d of the %d it reviewed." % (facts["flagged"], facts["reviewed"]))
     if facts["partial"]:
         parts.append("Some of it could not be read in full, and the review says where.")
+    said = facts.get("validator")
+    if said is not None and said.get("unread"):
+        parts.append(said["unread"])
+    elif said is not None:
+        parts.append("The validator approved %d, sent back %d, escalated %d (%d urgently) and held %d." % (
+            said["approved"], said["sent_back"], said["escalated"], said["urgent"], said["held"]))
     if facts.get("changes"):
         parts.append("%d configuration change%s proposed. Each follows as a message of its own; none changes anything "
                      "without your exact reply." % (facts["changes"], " is" if facts["changes"] == 1 else "s are"))
@@ -611,9 +687,10 @@ def propose_changes(cfg, view, usage, now, pulls, partial):
     return doc, None
 
 
-def run_review(cfg, view, usage, now, http=None, environ=None, seconds=None):
+def run_review(cfg, view, usage, now, http=None, environ=None, seconds=None, validator=None):
     """Builds and writes the review, and returns (message text, record entry). The caller records BEFORE posting.
-    A failure to write the document is the message; a failure to read GitHub is in the document."""
+    A failure to write the document is the message; a failure to read GitHub is in the document. `validator` is the
+    stand-up's view of the validator's ledger (KIT-545), None when it reads none."""
     since, until = view["starts_at"], view["resets_at"]
     half = GATHER_SECONDS if seconds is None else max(5, min(GATHER_SECONDS, int((seconds - 15) / 2)))
     try:
@@ -628,7 +705,8 @@ def run_review(cfg, view, usage, now, http=None, environ=None, seconds=None):
     health, why = read_health(cfg)
     title, markdown, facts = build(view, usage, cfg["weekly_budget_usd"], pulls, partial, reviews,
                                    kept_screenshots(cfg, since, until), now,
-                                   machine_section(health, why, usage, cfg["weekly_budget_usd"], since, until), proposed)
+                                   machine_section(health, why, usage, cfg["weekly_budget_usd"], since, until), proposed,
+                                   validator_week(validator, since, until))
     local_path = save_local(cfg, view, markdown)
     try:
         url, failure = write_document(cfg, title, markdown, http, environ), None
@@ -799,6 +877,52 @@ def _selftest():
         _t, md0, facts0 = build(view, usage, 100, [], [], ({}, 0, 0, 0), [], at(17, 15))
         check("a sprint with nothing merged says so in words", ("No pull request merged in this period." in md0, "None merged on its own." in md0
                                                                 or "Nothing merged, so nothing merged on its own." in md0), (True, True))
+        # the validator's decisions (KIT-545): by the stand-up's own reader, each in code's words, the agent's apart
+        import pipeline_standup as standup      # here, not at the top: the stand-up imports this module
+        lpath = os.path.join(tmp, "validator", "ledger.json")
+        layers = lambda kind: ({"hard_limits": "pass", "evidence": "pass", "agent": "pass"} if kind == "approved"  # noqa: E731
+                               else {"hard_limits": "fail", "evidence": "not-run", "agent": "not-run"} if kind == "held"
+                               else {"hard_limits": "pass", "evidence": "pass", "agent": "fail"})
+        for when, subject, ref, kind, reasons, says in (
+                ("2026-11-09T12:00:00Z", "merge", "acme/app#1", "approved", [], "Before the sprint."),
+                ("2026-11-12T12:00:00Z", "merge", "acme/app#2", "approved", [], "It does what the criteria ask; see `make clean` <b>here</b>."),
+                ("2026-11-13T12:00:00Z", "merge", "acme/app#3", "sent-back", [], "Add a test."),
+                ("2026-11-14T12:00:00Z", "piece", "KIT-9", "held", ["risk-path"], None),
+                ("2026-11-15T12:00:00Z", "merge", "acme/app#4", "escalated", ["send-back-budget-spent"], "Still no test."),
+                ("2026-11-16T12:00:00Z", "plan", "KIT-8", "escalated-urgent", [], "A hook edit nobody asked for."),
+                ("2026-11-16T13:00:00Z", "merge", "other/repo#5", "approved", [], "Another project's.")):
+            vledger.append(lpath, {"subject": subject, "ref": ref, "head": ("a" * 40) if subject == "merge" else None, "kind": kind,
+                                   "layers": layers(kind), "settings_on": ["approve-plans", "approve-pieces", "approve-merges"],
+                                   "size_limits": {"max_changed_lines": 400, "max_files": 20}, "reasons": reasons,
+                                   "agent_says": says}, lambda when=when: _parse(when).timestamp())
+        seen = standup.validator_view({"validator_ledger_file": lpath}, teams=["KIT"], repos=cfg["repos"])
+        _t, md_v, facts_v = build(view, usage, 100, [], [], ({}, 0, 0, 0), [], at(17, 15), validator=validator_week(seen, since, until))
+        part = md_v[md_v.find("## What the validator decided"):md_v.find("## What it cost")]
+        check("the recap lists the week's approvals, send-backs, escalations and holds, each in code's words", [
+            "From the validator's record, built by code: 1 approved, 1 sent back, 2 escalated (1 urgently) and 1 held." in part,
+            "- Thu 12 Nov: approved the merge of acme/app#2. Its hard limits, its evidence and its agent all passed." in part,
+            "- Fri 13 Nov: sent back the merge of acme/app#3 to its dev session." in part,
+            "- Sat 14 Nov: held the start of KIT-9 for you: it changes the safety system or a risk path." in part,
+            "- Sun 15 Nov: escalated the merge of acme/app#4 to you: its send-backs are used up." in part,
+            "- Mon 16 Nov: escalated plan KIT-8 to you, urgently: it believes the dev session may be compromised." in part,
+            "acme/app#1" in part, "other/repo#5" in part], [True] * 6 + [False, False])
+        check("...and the agent's words only as their own marked line, as inline code with nothing in it to break out", [
+            "  - The validator's agent said: `It does what the criteria ask; see make clean b here /b .`" in part,
+            part.count("agent said") == 4, "<b>" in md_v, "Before the sprint" in part], [True, True, False, False])
+        check("...and the message counts them", ("The validator approved 1, sent back 1, escalated 2 (1 urgently) and held 1."
+                                                 in message(facts_v, "https://linear.app/x", "/l", None)), True)
+        unread = {"rows": None, "unread": "The validator's record could not be read, so no approval is claimed: it is not a record this "
+                                          "version reads."}
+        _t, md_u, facts_u = build(view, usage, 100, [], [], ({}, 0, 0, 0), [], at(17, 15), validator=validator_week(unread, since, until))
+        check("a ledger that cannot be read is said in the recap and the message, never as none",
+              (unread["unread"] in md_u, "decided nothing" in md_u, unread["unread"] in message(facts_u, "https://linear.app/x", "/l", None)),
+              (True, False, True))
+        _t, md_e, _f = build(view, usage, 100, [], [], ({}, 0, 0, 0), [], at(17, 15), validator=validator_week({"rows": []}, since, until))
+        check("a read ledger with nothing in the period says so", "The validator decided nothing in this period." in md_e, True)
+        check("with the validator off, or no ledger yet, the recap and the message are what they were",
+              ("validator" in md0.lower(), facts0["validator"], validator_week(None, since, until),
+               standup.validator_view({"validator_ledger_file": os.path.join(tmp, "none", "l.json")}),
+               "validator" in message(facts0, "https://linear.app/x", "/l", None).lower()), (False, None, None, None, False))
         # the machine and the budget (KIT-602)
         hpath = os.path.join(tmp, "watch-state.json")
 

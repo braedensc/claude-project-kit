@@ -25,7 +25,9 @@ It has three short parts, at most 10 lines and about 120 words:
    line: "A batch of 8 pull requests is ready for your sign-off and merge." Then what holds work
    up: a plan waiting for approval, a piece stuck on a question, a conflict the automatic fix gave
    up on, a pull request that fails only together with the others, and the day plan's own items.
-   One or two plans or pieces are named by ticket. Past three items, the third line gives the total.
+   With the validator's record read, what it held or escalated for you is here too, and an urgent
+   escalation comes first (below). One or two plans or pieces are named by ticket. Past three items,
+   the third line gives the total.
 
 It ends with "Want the details? Just ask." An empty part says so in words.
 
@@ -58,12 +60,44 @@ leave the short version, which code builds from the same facts.
 **After either one**, code adds a plain line for each thing it could not read:
 
 - a source the status job could not read whole: Linear, GitHub or the review records;
+- the validator's record, when it is set and cannot be read (below);
 - pull requests the status file may not hold, because it could not list every repository, names
   none, or is from before KIT-487.
 
-The lines below on the kit copy, the sprint, the spend, the queue's room and the machine come after
-those, each only when it is on and has something to say. The full list, every event, blocker and
-merge with its link (KIT-483's rundown), is never posted. `preview --full` prints it.
+The lines below on the validator's approvals, the kit copy, the sprint, the spend, the queue's room
+and the machine come after those, each only when it is on and has something to say. The full list,
+every event, blocker and merge with its link (KIT-483's rundown), is never posted. `preview --full`
+prints it.
+
+**The validator's record (KIT-545).** When `STANDUP_VALIDATOR_LEDGER` names the validator's ledger
+(contract §24), the stand-up reads it with the ledger's own reader. No model is in between:
+
+- **Each approval since the last rundown is one line**, after the stand-up, in code's words. A
+  merge says *merged* only when the status file shows the pull request merged at the head the
+  validator approved.
+- **The agent's reason is its own marked line** under it, with every link made plain text. It is
+  never in the facts the tech lead's turn reads, so it is never said in the report's own voice.
+- **Each escalation, and each hold the validator can't settle, is a blocker** under *Needs you*,
+  while the status file shows it still waiting: a plan not yet approved, a piece not started, a
+  pull request open at the head the validator judged. The full list gives its reason and the reply
+  that clears it: `approve <plan>` or `start <piece>`. A pull request is yours to merge or close.
+- **An urgent escalation comes first, marked urgent**, whoever words the stand-up: words from the
+  tech lead's turn that leave it out are not used.
+- **A ledger that can't be read or trusted is said**, and no approval is claimed. It is never shown
+  as none.
+
+Good:
+
+> Approved and merged by the validator: the pull request for TOD-12, Dark mode toggle. Its hard
+> limits, its evidence and its agent all passed.
+>    The validator's agent said: "The diff does what the criteria ask."
+
+*The validator's record could not be read, so no approval is claimed: it is not a record this
+version reads.*
+
+Not that: a quiet stand-up when the record could not be read, or the agent's reason said as the
+stand-up's own words. With the setting empty, or no ledger yet, the messages are what they were.
+The account the bridge runs as must be able to read the ledger (`docs/VALIDATOR-OPERATOR.md`).
 
 **The spend (KIT-471).** Only in the afternoon, and only when `STANDUP_DAY_PLAN_FILE` or
 `STANDUP_USAGE_FILE` is set (below). One line from today's day plan, which is written once each
@@ -145,10 +179,17 @@ names the review's config. Code builds the recap and the message from three thin
   comment on each said (how many findings, of which kind);
 - the weekly budget you set in the config, for the cost against the plan;
 - the health watch's state file (`~/.pipeline-update/watch-state.json` of the account that runs the watch), when the
-  config names it (KIT-602): the week's lowest free memory and most swap.
+  config names it (KIT-602): the week's lowest free memory and most swap;
+- the validator's ledger, when `STANDUP_VALIDATOR_LEDGER` names it (KIT-545), by the stand-up's own reader.
 
 The document has six parts: what shipped, what merged on its own, what it cost against the plan, **the machine and the
 budget**, what the reviews taught, and the screenshots the acceptance check kept (listed by name, not uploaded).
+
+With the validator's ledger named, a seventh part follows what merged on its own: **what the validator decided**. It
+counts the week's approvals, send-backs, escalations (the urgent ones among them) and holds, then lists each, oldest
+first, one line in code's words with code's reasons. The agent's reason is its own marked line under it, as inline code,
+so nothing in it is a link. The message counts them in one line. A ledger that cannot be read is said in both places,
+never as none, and a week with no decision says so.
 
 *The machine and the budget* says the week's lowest free memory and most swap, each with its day, and how many days
 the watch recorded (days are the watch's own, in UTC). Under it, a table of each day's spend, the running total, and
@@ -324,6 +365,7 @@ settings with no `bridge.conf` key below always take their defaults.
 | `STANDUP_SPRINT_PLAN_FILE` | `sprint_plan_file` | empty: off | The sprint plan file (KIT-575): the queue's `SPRINT_PLAN_FILE`, the same path. The stand-up sends a waiting proposal to your DM once. Needs `STANDUP_SPRINT=yes`. |
 | `STANDUP_SPRINT_REVIEW_CONFIG` | `sprint_review_config` | empty: off | The sprint review's config file (KIT-576, below). Needs `STANDUP_SPRINT=yes`. |
 | `STANDUP_HEALTH_FILE` | `health_file` | empty: off | The health watch's status file (its `HEALTH_STATUS_FILE`, `docs/UPDATE-OPERATOR.md`). Set, both messages add the machine-and-budget line below when something is off. |
+| `STANDUP_VALIDATOR_LEDGER` | `validator_ledger_file` | empty: off | The validator's ledger (KIT-545, contract §24), as an absolute path the bridge's account can read. Set, both messages say the validator's approvals and blockers, and the sprint review lists its week (above). |
 | none: always the default | `late_by_minutes` | `180` | How late a rundown may still go out. |
 | none: always the default | `stale_after_minutes` | `60` | A status file older than this is old news. The status job writes every 15 minutes. |
 | none: always the default | `record_file` | `~/.stage-e/state/standup-record.json` | The record below. |
