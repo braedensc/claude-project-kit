@@ -49,8 +49,8 @@ name: PR conflict monitor
 # mergeability never settles fails the run (contract §13).
 #
 # Requires scripts/pr_conflict.py and what it imports — scripts/pipeline_dispatch_local.py,
-# scripts/pipeline_labels.py, scripts/pipeline_agent_env.py, scripts/jsonschema_mini.py — at the default branch (all
-# ship with the kit). The script asks GitHub for each PR's base and the repository's
+# scripts/pipeline_labels.py, scripts/pipeline_agent_env.py, scripts/jsonschema_mini.py,
+# scripts/pipeline_spend_ledger.py — at the default branch (all ship with the kit). The script asks GitHub for each PR's base and the repository's
 # default branch, so the comments name yours; only the `push:` trigger below names
 # `main` — change it if yours is not. Zero new secrets. Scheduled runs only fire
 # from the default branch; use workflow_dispatch to test.

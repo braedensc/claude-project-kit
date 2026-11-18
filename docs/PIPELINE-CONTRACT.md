@@ -2297,8 +2297,9 @@ and its calls, unpriced calls, dollars, models and billing in the lookback's day
 calls counted, and **no figure: null, never zero**, and `result` is `partial`. A `partly-read`
 ledger makes it `partial` too: some of its lines were not rows, and only the rows it read are
 counted. A ledger not written yet, in a folder that exists, is `read` with no calls, unless its
-mark says a call lost its row (§30). A missing folder's reason names the config key to check. No
-caller writes its ledger yet (KIT-687 adds them), so the config's defaults leave every ledger off.
+mark says a call lost its row (§30). A missing folder's reason names the config key to check. Each
+caller writes its own ledger (KIT-687), so the config's defaults read the three in the role
+account's home, each where its writer puts it, and leave the waker's off.
 
 The fixed lines are `Stage E bounce`, `Stage E conflict fix` and `Catch-up`, as the bounce driver
 and the catch-up job write them; the selftest reads their source to keep this true. The kind of
@@ -2584,7 +2585,7 @@ that shows.
 | `stage_e_state_dir` | `~/.stage-e/state` | Stage E's state folder. An empty string turns the `ledger` source off. |
 | `stage_a_state_dir` | `~/.stage-a/state` | The idea gate's state folder. An empty string turns the `planner` source off. |
 | `judge_file` | empty: off | The watcher judge's `judge-calls.json` (KIT-569): each call's time and dollars, no words. Empty turns the judge's cost off, and the file's `judge` says `off`. |
-| `spend_ledgers` | every one off | For each caller, its spend ledger's path (§30, KIT-844), where its job writes it: `morning` `~/.stage-e/queue/morning-spend.jsonl`, `standup` `~/.stage-e/state/standup-spend.jsonl`, `tech_lead` `~/.stage-e/state/tech-lead-spend.jsonl`. An empty path, or a caller left out, turns its ledger off. No caller writes its ledger yet: KIT-687 adds the writers and names the three role-account ledgers by default. Until then each is off, since a ledger nothing writes would read as no calls. The waker's ledger is in the owner's home, which the role account cannot read, so it is named only where this account can read it. A path inside a git working tree is a config error. |
+| `spend_ledgers` | the three in the role account's home; the waker's off | For each caller, its spend ledger's path (§30, KIT-844), where its job writes it. The defaults are where each writer puts its ledger with its own defaults (KIT-687), and the selftest pins each: `morning` `~/.stage-e/queue/morning-spend.jsonl`, `standup` `~/.stage-e/state/standup-spend.jsonl`, `tech_lead` `~/.stage-e/state/tech-lead-spend.jsonl`. The queue's installer names them from its own paths: the morning job's beside the day plan, and the stand-up's and the tech lead's beside the bridge's state file, or none when that record is off. An empty path turns a ledger off, and a caller left out takes its default. The waker's ledger is in the owner's home, which the role account cannot read, so it is off unless named where this account can read it. A path inside a git working tree is a config error. |
 | `reviews_team_key` | empty | Optional (KIT-596): the key of an old separate Reviews team, such as `REV`. A review on a work team is told by the review poller's record, and a record that cannot be read is said in the Stage E source. |
 | `out` | `~/.stage-e/usage/usage.json` | Where the file is written, outside every git working tree. |
 | `lookback_days` | 8 | How many local dates the file covers, from 1 to 31. |
@@ -3520,6 +3521,14 @@ time. No prompt, reply or error text reaches a row.
 call as unpriced. So is a zero total from a call that did not end in success, as §17 reads a
 crash's zeroed total. A token count the CLI's output did not give is null.
 
+**A row is its own call's cost.** For a resumed session the CLI's `total_cost_usd` is the session's
+running total, while its `usage` is that run's own (measured 18 Nov 2026 on Claude Code 2.1.287:
+a resumed call's total was the first call's total plus its own usage priced, exactly). So a caller
+that resumes a session records each run's own share: its total less the same session's previous
+total, through `own_costs()`. A smaller total is a session begun again, so its whole total is its
+own. A resumed run whose session's earlier total the caller does not know has a null cost, never
+its running total. The tech lead's DM conversation keeps its newest total for that (KIT-687).
+
 ### Where each ledger lives
 
 Each ledger is a JSON Lines file in its caller's own state folder, outside every git working tree:
@@ -3532,11 +3541,29 @@ one row per line, oldest first, only ever added to, mode 644.
 | `tech_lead` | `tech-lead-spend.jsonl`, in the bridge's state folder | `~/.stage-e/state/` |
 | `conflict_waker` | `conflict-waker-spend.jsonl`, in the waker's state folder | `~/.pr-conflict-waker/state/`, in the owner's home |
 
-The first three are in the role account's home, where the usage job runs. The waker runs as a
-person, so its ledger is in that person's home, which the role account cannot read: the usage job
-leaves it off unless its config names it. **No caller writes its ledger yet.** KIT-687 adds the
-writers, and with them names the three role-account ledgers in the usage job's defaults. Until then
-every ledger is off there, since a ledger nothing writes would read as no calls.
+The first three are in the role account's home, where the usage job runs, and its defaults read
+them: each default is where that ledger's writer puts it with its own defaults, and the usage job's
+selftest pins each to its writer's, so none is a guess (KIT-687). The waker runs as a person, so its
+ledger is in that person's home, which the role account cannot read: the usage job leaves it off
+unless its config names it.
+
+### Who writes each ledger
+
+Each caller adds one row for each run of the CLI it started, a run that timed out included, after
+that run ends (KIT-687). A run that never started (the CLI could not be run) adds none.
+
+| Caller | Its writer | Model | Billing | Cost |
+|---|---|---|---|---|
+| `morning` | the morning job's one planner call (`scripts/pipeline_morning.py`) | the output's, else `planner_model` | `plan` | the CLI's; unknown after a timeout |
+| `standup` | the stand-up's turn, in the bridge (`scripts/pipeline_bridge_tech_lead.py`) | the output's, else `turn_model` | `plan` | the CLI's; unknown after a timeout |
+| `tech_lead` | a DM's turn and a plan note's turn, in the bridge | the output's, else `turn_model` | `plan` | the CLI's; for a resumed DM conversation, the run's share of its running total; unknown after a timeout |
+| `conflict_waker` | each fix session the waker starts (`scripts/pr_conflict.py wake`) | `--model`, or null | `unknown` | unknown: the session prints text, not JSON |
+
+The morning job and the turns send only a `claude setup-token` token, so their calls draw on the
+plan. A turn that has to begin a conversation again runs the CLI twice, and so adds two rows. A
+turn keeps only what a row is built from of each run's output (`kept_output()`), never its reply.
+A row that cannot be written is said in the caller's own log and never fails the call: its time
+goes in the ledger's mark, so the usage job says the call was not counted.
 
 ### A row
 
@@ -3553,7 +3580,7 @@ every ledger is off there, since a ledger nothing writes would read as no calls.
 | `at` | time | When the call ended, in UTC to the second. `append()` stamps it; a caller cannot. |
 | `caller` | `morning` \| `standup` \| `tech_lead` \| `conflict_waker` | Who made the call. A ledger holds its own caller's rows only. |
 | `model` | string \| null | The model that carried the call: of the models the CLI's `modelUsage` names, the one it gives the most cost. `other` for a name that is not a plain one. With no such output, the model the caller asked for, or null when it asked for none. |
-| `usd` | number \| null | The CLI's own estimate of the call's cost at API prices, its `total_cost_usd`, to a millionth of a dollar. Null when the caller could not read it: no JSON output, or a call that ended in an error with no total. |
+| `usd` | number \| null | The CLI's own estimate of the call's cost at API prices, from its `total_cost_usd`, to a millionth of a dollar: for a resumed session, that total less the session's previous total (above). Null when the caller could not read it: no JSON output, a call that ended in an error with no total, or a resumed session whose earlier total is not known. |
 | `tokens` | object | `input`, `output`, `cache_read` and `cache_write`: the CLI's `usage` figures `input_tokens`, `output_tokens`, `cache_read_input_tokens` and `cache_creation_input_tokens`. Each is null when the output did not give it. |
 | `run_id` | string \| null | The CLI's `session_id` for the call, when its output gave one. |
 | `billing` | `plan` \| `key` \| `unknown` | How the call was paid for, from the credential the caller handed the CLI. `plan`: a `claude setup-token` token and no key, so the call draws on the plan's usage windows. `key`: an API key, billed by the token. `unknown`: the CLI ran under a sign-in the caller did not choose, as a fix session on a person's machine does. |
