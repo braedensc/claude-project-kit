@@ -548,6 +548,12 @@ class Io(object):
         import pipeline_ask
         return pipeline_ask.missing_values(update_conf, bridge_conf, self.kit, self.today())
 
+    def level_settings(self, update_conf, watcher_conf):
+        """The health check's heartbeat lines that differ from the watcher's copies: a read that changes nothing
+        (pipeline_ask.level_settings)."""
+        import pipeline_ask
+        return pipeline_ask.level_settings(update_conf, watcher_conf)
+
     def write_settings(self, changes):
         """Write what the person typed and the consent page listed, and read it back. None when
         all of it is written, else why not, naming the file (pipeline_ask.write_answers)."""
@@ -2059,6 +2065,7 @@ def main(argv=None, io=None):
     parser.add_argument("--update-conf", default=os.path.join(KIT, "update.conf"),
                         help=argparse.SUPPRESS)
     parser.add_argument("--bridge-conf", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--watcher-conf", default=os.path.join(KIT, "watcher.conf"), help=argparse.SUPPRESS)
     parser.add_argument("--settings-places", default=DEFAULT_PLACES, help=argparse.SUPPRESS)
     parser.add_argument("--selftest", action="store_true")
     args = parser.parse_args(argv)
@@ -2140,6 +2147,7 @@ def main(argv=None, io=None):
         try:
             writes = step_ask(io, os.path.abspath(args.update_conf),
                               os.path.abspath(args.bridge_conf))
+            writes += io.level_settings(os.path.abspath(args.update_conf), os.path.abspath(args.watcher_conf))
         except KeyboardInterrupt:
             code = stop(io, "interrupted while asking, so nothing was changed. Run it again when "
                             "you are ready.", EX_BLOCKED)
@@ -2347,6 +2355,12 @@ class FakeIo(Io):
     def missing_values(self, update_conf, bridge_conf):
         self.asked_files.append((update_conf, bridge_conf))
         return self.questions
+
+    heartbeat_changes = ()
+
+    def level_settings(self, update_conf, watcher_conf):
+        self.level_files = (update_conf, watcher_conf)
+        return list(self.heartbeat_changes)
 
     def write_settings(self, changes):
         self.events.append("settings")

@@ -24,6 +24,7 @@ inherits from the template, and bootstrap leaves it where it is.
 | Template | Activates to | What it is |
 |---|---|---|
 | `workflows/ci.yml` | `.github/workflows/ci.yml` (replacing the kit's own) | App CI: secret-scan + forbidden paths, lint, typecheck, test, non-required e2e smoke |
+| `workflows/hooks-change-guard.yml` | `.github/workflows/hooks-change-guard.yml` (replacing the kit's own) | The label gate ("Hooks change guard"): a PR that edits guard machinery needs the `hooks-change` label. Runs on `pull_request_target`, so the default branch's copy judges every PR and a PR cannot turn its own gate green (KIT-788). **A public project needs one Actions policy allow for it from 2 Dec 2026** (see below) |
 | `workflows/deploy-on-green.yml` | `.github/workflows/deploy-on-green.yml` | Deploy-on-green: `workflow_run` gate → migrate → deploy, tree-derived targets + all-function smoke, with every production lesson inline |
 | `workflows/pipeline-failure-alert.yml` | `.github/workflows/pipeline-failure-alert.yml` | `workflow_run` failed, timed-out or cancelled run on the default branch (or a scheduled run; a cancelled run a newer run replaced is skipped) → one deduped issue, @mention+assign a person (email + phone push; see *Who an alert pages* below); post-merge failures are otherwise silent |
 | `workflows/pipeline-alert.yml` | `.github/workflows/pipeline-alert.yml` of a **private** repo (e.g. an ops repo) — never a public one; delete it from the project unless the project repo is private | Pipeline health alert, dispatched by `scripts/pipeline_watch.py run`: one deduped issue per kind of problem, opened by github-actions[bot] on `firing` (so the @mention reaches you) and closed on `ok`. The summary is capped, fenced and cannot @mention anyone |
@@ -64,11 +65,21 @@ Activation (done by the bootstrap session, not by hand):
 
 ```bash
 git rm .github/workflows/ci.yml           # the kit's own CI yields to the app CI first
+git rm .github/workflows/hooks-change-guard.yml   # ...and the kit's own label gate to the template's
 git mv templates/workflows/*.yml .github/workflows/
 git rm -r templates/                      # one-way: this README goes too
 # then: fill the {{…}} tokens (see PLACEHOLDERS.md) and adapt the fenced
 # STACK-SPECIFIC sections.
 ```
+
+**A public project's Actions policy (KIT-788).** The label gate runs on `pull_request_target`.
+From 2 Dec 2026 GitHub blocks that event in public repositories unless an Actions policy allows
+it. Without the allow the gate never runs, its required check never reports, and no PR can
+merge: it fails closed, not open. A private repository needs nothing. The owner makes the allow
+once, for the one file, with the kit's `scripts/pipeline_gate_policy.py` (`python3
+scripts/pipeline_gate_policy.py run`: it shows the call, waits for one typed yes, and reads the
+policy back). Keep that script when you remove `templates/`; it lives in `scripts/`. Do not
+move the gate back into `ci.yml`: `python3 scripts/check_template_label_gate.py` fails if you do.
 
 **Activation check — one minute, once.** After the first PR that exercises them, open
 the Actions tab and confirm each activated workflow has a run **that produced jobs**. A

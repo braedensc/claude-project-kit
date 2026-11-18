@@ -425,12 +425,12 @@ class AnswersMixin(object):
         self.tracker.move(issue["id"], state_id)
         self.state["acted_at"].append(self.now)
         when = iso(ts_float(msg.get("ts")))
-        body = ("Moved to %s by the Slack bridge for **%s** (Slack user %s), who said yes in "
+        body = ("Moved to %s by the tech lead for **%s** (Slack user %s), who said yes in "
                 "Slack at %s." % (self.cfg["plan_it_state"], name, msg["user"], when))
         if q.get("direct"):
             # ACT-4: the member's own ask, acted on after the stop window, with no question asked.
-            body = ("Moved to %s by the Slack bridge for **%s** (Slack user %s), who asked for "
-                    "it in Slack at %s, with no question asked: the bridge said what it would "
+            body = ("Moved to %s by the tech lead for **%s** (Slack user %s), who asked for "
+                    "it in Slack at %s, with no question asked: the tech lead said what it would "
                     "do and waited %d seconds for a stop first."
                     % (self.cfg["plan_it_state"], name, msg["user"], when, q["grace"]))
         owed = ""

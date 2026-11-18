@@ -127,6 +127,13 @@ CAN_DO = {
                      "Nothing new starts until you clear the hold.",
     "urgent-escalation": "The validator believes a dev session may be compromised. Look at that change "
                          "before anything else.",
+    # KIT-518: a run of approvals, and a guarded path its ticket does not name.
+    "approvals-in-a-row": "The validator has said yes to every decision in a row, past your limit. Look at what "
+                          "it approved. If it should have said no to one, turn that setting off.",
+    "guarded-path": "That pull request changes guard machinery, CI or a risk path its ticket does not name. "
+                    "Read the change before anyone labels it hooks-change.",
+    "guarded-file": "That pull request changes guard machinery, CI or a risk path its ticket does not name. "
+                    "Read the change before anyone labels it hooks-change.",
 }
 CLEAR_HOLD = "To let new starts begin again, clear the hold in your terminal: scripts/pipeline_hold.py clear."
 

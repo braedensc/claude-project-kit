@@ -18,13 +18,13 @@ its job are KIT-517. The way it pauses the system is KIT-515, and its urgent pag
 | `labels` | `hooks-change`, or an `agent:`, `blocked:` or `provenance:` label, applied or removed by a login not on its list. | GitHub's issue events |
 | `markers` | A pipeline marker on a comment's first line from an author its readers would refuse. The workflow bot's own comments are always real. | GitHub's comments |
 | `injection` | Shapes that try to steer an AI reading the text: closing the kit's fence, "ignore the previous instructions", a system-role tag, a request to print a secret, and characters a reader can't see. | GitHub's comments and pull requests |
-
 | `tracker-text` | The same shapes in ticket and comment text, and a pipeline marker on a comment's first line from an author who is not trusted. The tracker's newest 100 tickets and 100 comments. | The tracker, by one fixed read-only query |
-| `outside-files` | A pull request that changes files its ticket does not name. More than three files outside is a `page`; one to three is a `record`. | GitHub's pull request file lists, and the tracker |
-| `approval-rate` | Every merge against the validator's approvals: a merge with no approval that you did not make, an approval still unmerged a day later, too many approvals in a day, and the validator's urgent escalations. | GitHub's merges and the validator's ledger |
+| `outside-files` | A pull request that changes files its ticket does not name. More than three files outside is a `page`; one to three is a `record`. A guarded path its ticket does not name is a `page`, whatever the count. | GitHub's pull request file lists, the tracker, and each repository's `delivery.json` |
+| `approval-rate` | Every merge against the validator's approvals: a merge with no approval that you did not make, an approval still unmerged a day later, too many approvals in a day, too many in a row, and the validator's urgent escalations. | GitHub's merges and the validator's ledger |
 
 **What `outside-files` counts as named (KIT-831).** The files and areas a ticket names are the path-like words in
-its title and description: a word with a `/` or a file extension, such as `scripts/foo.py`, `docs/` or `*.md`. A
+its title and description: a word with a `/` or a file extension, such as `scripts/foo.py`,
+`.github/workflows/ci.yml`, `docs/` or `*.md`. A
 changed file is named if it is one of them, is under a named folder, matches a named glob, has a named bare file
 name, or is a test companion of a named file (same folder, with the same name, a `test_` prefix or a `_test`
 suffix). The ticket is the one the pull request's branch name claims, and a branch is the worker's own word, so
@@ -36,8 +36,39 @@ Good: `no-scope` at `record` on a pull request whose ticket names no files, with
 requests that were judged. Not that: a pull request nobody could judge counted as clean. When no ticketed pull
 request could be judged the monitor is `blind`.
 
+**Nothing else records a ticket's files.** The day planner gives each lane a footprint, but only for that one
+pass: the day plan file keeps no footprint. So the paths in the ticket's own text are the footprint.
+
+**Guarded paths (KIT-518).** `outside-files` reads the changed files of every pull request in the lookback, with or
+without a ticket, and checks each one against the Hooks change guard's own list. That list is `FLOOR` in
+`scripts/check_grader_paths.py`, which the watcher imports, plus the `autonomy.riskPaths` in each repository's own
+`delivery.json` on its default branch.
+
+| It finds | Level | What it means |
+|---|---|---|
+| `guarded-path` | `page` | A pull request changes a guarded file its ticket does not name. This includes a pull request with no ticket, and one whose ticket names nothing or was written by a stranger. `count` is how many guarded files it changes. Up to five `guarded-file` findings name the files that are not named. |
+| `guarded-path` | `record` | Every guarded file it changes is one its ticket names. It is said, never paged. |
+
+**A guarded file is named only exactly.** The ticket must give its exact path, or a glob in the file's own folder,
+written out in full, such as `.github/workflows/*.yml`. A bare name (`ci.yml`), a folder (`scripts/`) or a looser
+glob (`*.yml`, `**/*.py`) never names one. A branch can claim any ticket, so words that loose are too easy to borrow.
+
+- A guarded file moved away counts by its old path.
+- No `delivery.json` means the floor alone, as it does for the guard. `said` counts the repositories read that way,
+  because a token that cannot see the file can get the same 404.
+- A `delivery.json` it cannot read, or whose `riskPaths` do not parse, makes the monitor `blind`, with the reason. So
+  does a file list it cannot read, with or without a ticket. Any of these is never `clear`.
+- The watcher's GitHub token must be able to read each repository's contents, as well as its issues and pull
+  requests.
+- Each pull request in the lookback costs at least one GitHub request. If a busy day makes the monitor blind with
+  the cap's reason, raise `max_requests`.
+
+Good: `guarded-path` at `page` on a pull request whose ticket is about `src/` and which also changes
+`.github/workflows/ci.yml`. Not that: a pull request with no ticket that changes `.claude/hooks/` and is passed over
+because it names no ticket.
+
 Two more are listed as `off`, each with its reason, until something writes their signal: guard blocks
-and egress refusals (KIT-518). The file always says how many monitors
+(KIT-848) and egress refusals (KIT-849). The file always says how many monitors
 are on.
 
 ### The validator's monitor: `approval-rate`
@@ -50,8 +81,14 @@ validator's ledger through the ledger's own reader, and GitHub's merges with its
 |---|---|---|
 | `merge-without-approval` | `pause` | A pull request merged into a watched repository's default branch with no `approved` row for its head, and not by you. New starts are held. |
 | `approval-rate` | `pause` | More approvals in 24 hours than your `day_approvals`. New starts are held. |
+| `approvals-in-a-row` | `page` | The validator's newest decisions were all approvals, more in a row than your `approvals_in_a_row`, and the newest is inside the lookback. A hold, a send-back or an escalation ends a run. |
 | `approval-without-merge` | `page` | The validator approved a pull request a day ago, and it is still open, with nothing newer about it. |
 | `urgent-escalation` | `page` | The validator believes a dev session may be compromised. This is how its urgent escalation reaches you. |
+
+**A run of approvals is a page, not a pause.** Each approval in it passed the validator's code limits, so nothing
+got past them. A long run means the validator has stopped saying no, and you should look. The day's rate is the
+limit that holds new starts. The run is named by its first approval, so a run that grows pages you once. Without
+`approvals_in_a_row` the run is counted and said, never judged.
 
 **Who merged it** comes from GitHub's own record of the merge, never from the pull request. Your own
 merges need no approval: list your GitHub logins in `owner_logins`. A merge whose merger GitHub will not
@@ -111,8 +148,8 @@ readers ignored. `record`: noted, never paged. Nothing acts on the level yet.
    account, or sits in a writable folder is not trusted, and nothing in it is obeyed, not even
    `"on": false`. Every monitor is blind, by name, and the pass exits 4.
    With no file at all the watcher is off, and says so.
-3. Give it a read-only GitHub token in the environment variable your rules name. It never reads a
-   token from the rules file.
+3. Give it a read-only GitHub token in the environment variable your rules name. It reads issues, pull
+   requests and contents. It never reads a token from the rules file.
 4. Try it. This reads everything and writes nothing:
    ```bash
    python3 scripts/pipeline_watcher_local.py run --config /path/to/watcher.json --dry-run
@@ -134,7 +171,7 @@ problem at once.
 | `hold_file` | Where the hold is written when a monitor flags something at level `pause`. Empty: the watcher only reports. |
 | `usage_copy_status` | The status file of the read-only copier (KIT-573) that makes `usage_file`. With it, the usage file counts only if that status is fresh, says the copy was made and carries the copy's hash. The installer sets it when you name a `USAGE_FILE`. Empty: the usage file is read as it is. |
 | `install_manifest` | The manifest of its own installed files (KIT-517). Every pass checks them against it; a mismatch makes every monitor blind. Empty: its files are not checked. The installer sets it. |
-| `limits` | `day_usd`, `piece_usd`, `day_runs`, `piece_runs`, and `day_approvals`: the validator's approvals in 24 hours, set as a runaway's limit, not a normal day's. A monitor with none of its limits is off: the limits are the owner's decision. `approval-rate` is the exception: without `day_approvals` it still checks every merge, and says the rate is not judged. |
+| `limits` | `day_usd`, `piece_usd`, `day_runs`, `piece_runs`, `day_approvals` and `approvals_in_a_row`. `day_approvals` is the validator's approvals in 24 hours, and `approvals_in_a_row` is its decisions in a row that were all approvals. Set both as a runaway's limits, not a normal day's. A monitor with none of its limits is off: the limits are the owner's decision. `approval-rate` is the exception: without its two limits it still checks every merge, and says the rate and the run are not judged. The installer's `LIMIT_DAY_APPROVALS` and `LIMIT_APPROVALS_IN_A_ROW` set them. |
 | `validator_ledger` | The validator's ledger, an absolute path this account can read. With `repos`, it turns `approval-rate` on. Empty: `approval-rate` is off. The installer's `VALIDATOR_LEDGER` sets it. |
 | `owner_logins` | Your own GitHub logins. A merge by one of them needs no validator approval. The installer's `OWNER_LOGINS` sets it. |
 | `trusted_actors` | GitHub logins that may apply or remove a protected label. |
@@ -250,6 +287,14 @@ visible: the copy ages and the monitors go blind.
 own file. The usage job is still the workers' account's own reader of its own logs. The copy only stops a worker from
 editing what the watcher reads. A worker who owns the source's folder can still replace the file with another file
 that account owns; the check is that the file is the workers' own, not that it is honest.
+
+**The three job heartbeats (KIT-782).** The same copier also copies the queue's, the morning job's and the sweep's
+heartbeat files, each named in `watcher.conf` (`QUEUE_HEARTBEAT`, `MORNING_HEARTBEAT`, `SWEEP_HEARTBEAT`; empty means that
+job is off here). Each is refused for the same reasons as the usage file (a link, a file of another account, more than 64 KB)
+and its old copy removed, so the health watch sees it missing and says the job has not checked in, never that it is well.
+The copies are `queue-heartbeat.json`, `morning-heartbeat.json` and `sweep-heartbeat.json` in `INSTALL_DIR/copy/`. The health
+watch reads them; the one command sets the matching lines in `update.conf` (docs/UPDATE-OPERATOR.md). With only heartbeats and no
+`USAGE_FILE`, the copier still runs and the watcher's rules name no usage file.
 
 Two more limits: the copier has a plain-file check but does not read the content (the watcher judges that), and clearing
 `USAGE_FILE` later does not remove the copier's job. Remove it by hand.
