@@ -1,6 +1,6 @@
 # A conflict fix runs where the worktree lives — GitHub keeps the clock
 
-**Date:** 2026-09-15 · **Status:** Accepted · **Amended by:** [The conflict waker is supervised, and a conflict goes to the lane that owns the session](2026-09-15-conflict-waker-supervised-and-routed-by-owner.md) — the waker is an installed LaunchAgent, not a person-run loop; it takes only local sessions' worktrees; a dispatcher's PR goes to the bounce driver; the template runs the same monitor
+**Date:** 2026-09-15 · **Status:** Accepted · **Amended by:** [The conflict waker is supervised, and a conflict goes to the lane that owns the session](2026-09-15-conflict-waker-supervised-and-routed-by-owner.md) — the waker is an installed LaunchAgent, not a person-run loop; it takes only local sessions' worktrees; a dispatcher's PR goes to the bounce driver; the template runs the same monitor · **Amended by:** [The conflict fix session is held to its worktree](2026-11-17-the-conflict-fix-session-is-held-to-its-worktree.md) (KIT-676) — the session no longer runs under the repo's hooks; it loads no settings and runs only named commands in Claude Code's sandbox
 
 ## Context
 

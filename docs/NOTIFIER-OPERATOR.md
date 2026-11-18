@@ -545,6 +545,12 @@ python3 scripts/pipeline_notifier_setup.py run             # the only command th
 do, it prints a numbered card and exits 10. Do that one thing. Run the same command again.
 It checks your work and carries on.
 
+**The one command runs this for you** (`python3 scripts/pipeline_install.py`, step 3c) when this
+Mac has a `notifier.conf`. It runs `run --dry-run` and shows it. If a step would change something
+it asks, then runs `run` on a yes: that is how a new setting reaches the job after a merge. If
+only a card is left, it asks nothing and the end list says "waiting on you". With no
+`notifier.conf` the notifier reads "off on this Mac".
+
 | Command | What it is |
 |---|---|
 | `run` | do everything possible; stop at the first card |
@@ -976,6 +982,32 @@ A paused job has no heartbeat row to read: `enable` stops at "not loaded", BLOCK
 
 Run this installer first and preflight is FAILED, naming each file the clone does not
 share. It stops there, before it changes anything: run the two again in the order above.
+
+---
+
+## How many tickets it reads (KIT-680)
+
+The notifier reads each team's tickets 50 at a time, newest update first, and keeps going
+until it reaches a ticket not updated in the last 14 days. A mark lands on a ticket that was
+just updated, so older tickets need no read. If a team has more than 500 tickets updated in
+that window, the read is a FAILURE: the pass says "more than 500 tickets" and exits with the
+error code. It does not cut the list quietly.
+
+Good: `FAIL: could not read 1 of 2 team(s): PROD: team PROD has more than 500 tickets updated
+in the last 14 days`.
+Not that: a pass that says `nothing to do` while ticket 51 held a mark.
+
+Other fixed list sizes found in the readers (nothing was changed for these; each is a ceiling
+that a very busy ticket or team could pass without a word):
+
+| Reader | Size | Past it |
+|---|---|---|
+| Notifier, comments per ticket | `lookback_comments` | the ticket is flagged "comment window saturated" |
+| Bridge tracker, comments per ticket | 100, not paged | older comments are not read |
+| Bridge tracker, a ticket's history | 50 a page, paged | all read |
+| Acceptance run, comments per ticket | 50, not paged | older comments are not read |
+| Finding poller, team labels and states | 250 and 100, not paged | a label or state past them is not found |
+| Catch-up poller, webhooks | 50, not paged | a webhook past them is not seen (being removed) |
 
 ---
 

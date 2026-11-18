@@ -9,7 +9,8 @@ Design: docs/adr/2026-11-05-the-validator-approves-inside-limits-that-code-enfor
     judge(facts, head, review_login, ...)         the rules alone, over facts already read
 
     python3 scripts/pipeline_validator_evidence.py check --repo OWNER/NAME --pr N --head SHA \\
-        --settings-file PATH --last-piece no [--acceptance passed] [--bar medium] [--own-check NAME]
+        --settings-file PATH --last-piece no [--acceptance passed] [--bar medium]
+        [--own-check NAME --own-app ID]
     python3 scripts/pipeline_validator_evidence.py --selftest
 
 WHAT IT ANSWERS.  `yes` or `no` for one pull request at one head, with closed reasons. Never text from
@@ -20,9 +21,13 @@ THE RULES, each one tested. Every one says `no` when it cannot tell.
     (head-moved): a push makes the evidence for the old head count for nothing.
   * Checks. Every check on the head is terminal and green (SUCCESS, NEUTRAL or SKIPPED), and every check
     the base branch requires has run on it. A check is known by its workflow and its name, so a
-    same-named job elsewhere cannot stand in for it. A re-run counts once, its latest, and a run not
-    yet finished makes it pending. No check at all, no required check configured, or a list that
-    cannot be read is `no`.
+    same-named job elsewhere cannot stand in for it. A required check counts only from the GitHub App
+    the rule names (KIT-678): a same-named check from another app, or a commit status, is not it, and
+    the answer is `no` (check-missing). A rule that names no app takes it from any source; one whose
+    app is there but cannot be read as an app id is `no` (required-checks-unknown). A re-run
+    counts once, its latest, and a run not yet finished makes it pending. No check at all, no
+    required check configured, or a list that cannot be read is `no`. The validator's own check is
+    set aside only when its own app posted it; one of that name from any other app is judged.
   * Stage E's review. Read only from comments by Stage E's own bot login, which the validator's
     settings name (`stage_e_login`, contract §23) and nothing in this code does. A comment counts
     only when its author is exactly that login and a bot. GitHub's GraphQL names a bot without the
@@ -87,11 +92,11 @@ QUERY = (
     "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){"
     "pullRequest(number:$number){state isDraft headRefOid baseRefName mergeable mergeStateStatus "
     "author{__typename login} "
-    "baseRef{branchProtectionRule{requiredStatusCheckContexts}} "
+    "baseRef{branchProtectionRule{requiredStatusChecks{context app{databaseId}}}} "
     "commits(last:1){nodes{commit{oid statusCheckRollup{contexts(first:100){totalCount "
     "pageInfo{hasNextPage} nodes{__typename "
     "... on CheckRun{name status conclusion startedAt isRequired(pullRequestNumber:$number) "
-    "checkSuite{app{slug} workflowRun{workflow{name}}}} "
+    "checkSuite{app{slug databaseId} workflowRun{workflow{name}}}} "
     "... on StatusContext{context state createdAt isRequired(pullRequestNumber:$number)}}}}}}} "
     "comments(last:100){totalCount nodes{author{__typename login} body createdAt lastEditedAt}}}}}")
 
@@ -208,11 +213,26 @@ def review_reasons(comments, head, login, bar, pr_author=None):
     return out
 
 
-def judge(facts, head, review_login, bar, last_piece, acceptance, own_check=None):
+def requirement(entry):
+    """One required check as (name, app id or None), from a `required` entry: a [name, app] pair as
+    `read_facts()` gives it, or a bare name, which any source satisfies. None when it is neither,
+    and when its app is there but is no app id: that is unreadable, never "any source"."""
+    if isinstance(entry, str):
+        return entry, None
+    if isinstance(entry, (list, tuple)) and len(entry) == 2 and isinstance(entry[0], str):
+        if entry[1] is None:
+            return entry[0], None
+        return (entry[0], app_id(entry[1])) if app_id(entry[1]) else None
+    return None
+
+
+def judge(facts, head, review_login, bar, last_piece, acceptance, own_check=None, own_app=None):
     """{"verdict": "yes"|"no", "head", "reasons"} for the pull request `facts` describe, at `head`.
     `facts` is what `read_facts()` returns. `review_login` is Stage E's bot login, as
     `trusted_login()` gives it from the settings. `last_piece` is True, False, or None for not
-    known; `acceptance` is the plan's recorded acceptance result for that last piece, or None."""
+    known; `acceptance` is the plan's recorded acceptance result for that last piece, or None.
+    `own_check` and `own_app` are the validator's own check's name and its app's id: that check is
+    set aside only when that app posted it, and without `own_app` nothing is (KIT-678)."""
     reasons = []
     if not isinstance(head, str) or not SHA_RE.fullmatch(head):
         reasons.append("head-moved")
@@ -221,10 +241,13 @@ def judge(facts, head, review_login, bar, last_piece, acceptance, own_check=None
     if facts.get("head") != head or facts.get("rollup_head") != head:
         reasons.append("head-moved")
     checks, required = facts.get("checks"), facts.get("required")
+    own = (own_check, app_id(own_app)) if isinstance(own_check, str) and app_id(own_app) else None
     if checks is None:
         reasons.append("checks-unreadable")
     else:
-        mine = [c for c in checks if c.get("name") != own_check]
+        # A check is the validator's own only when its own app posted it. A same-named check from
+        # any other app is judged like every other check (KIT-678).
+        mine = [c for c in checks if not (own and (c.get("name"), c.get("app")) == own)]
         states = latest_checks(mine)
         if not states:
             reasons.append("checks-none")
@@ -232,14 +255,20 @@ def judge(facts, head, review_login, bar, last_piece, acceptance, own_check=None
             reasons.append("check-pending")
         if "failed" in states.values():
             reasons.append("check-failed")
-        if required is None:
+        needed = ([requirement(r) for r in required] if isinstance(required, (list, tuple))
+                  else None)
+        if needed is None or None in needed:
             reasons.append("required-checks-unknown")
         else:
-            needed = (set(required) | set(c.get("name") for c in checks if c.get("required")))
-            needed.discard(own_check)
+            needed = set(needed) | set((c.get("name"), None) for c in checks if c.get("required"))
+            if own:
+                needed = set((n, a) for n, a in needed if not (n == own[0] and a in (None, own[1])))
             if not needed:
                 reasons.append("required-checks-none")
-            if needed - set(name for _group, name in states):
+            # A required check is present only when a check of that name came from the app the
+            # rule names; a rule that names none takes it from any source (KIT-678).
+            if any(not any(c.get("name") == n and (a is None or c.get("app") == a) for c in mine)
+                   for n, a in needed):
                 reasons.append("check-missing")
     reasons += review_reasons(facts.get("comments"), head, review_login, bar,
                               facts.get("pr_author"))
@@ -318,26 +347,45 @@ def read_facts(owner_repo, number, run=_gh):
     return facts
 
 
+def app_id(value):
+    """A GitHub App's numeric id, or None. Takes an app node (`{"databaseId": n}`) or the number a
+    ruleset gives (`integration_id`). Anything that is not a whole number above 0 is None: no app."""
+    if isinstance(value, dict):
+        value = value.get("databaseId")
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
 def _context(node):
     if node.get("__typename") == "StatusContext":
         state = node.get("state")
+        # A commit status names no app in what this reads, so it never stands for a check the
+        # rules bind to an app (KIT-678): "app" is None.
         return {"name": node.get("context"), "at": node.get("createdAt"), "group": "status",
                 "status": "IN_PROGRESS" if state in PENDING_STATES else "COMPLETED",
                 "conclusion": "SUCCESS" if state == "SUCCESS" else state,
-                "required": node.get("isRequired") is True}
+                "required": node.get("isRequired") is True, "app": None}
     suite = node.get("checkSuite") or {}
     group = "%s/%s" % ((suite.get("app") or {}).get("slug") or "?",
                        (((suite.get("workflowRun") or {}).get("workflow")) or {}).get("name") or "?")
     return {"name": node.get("name"), "at": node.get("startedAt"), "status": node.get("status"),
             "conclusion": node.get("conclusion"), "group": group,
-            "required": node.get("isRequired") is True}
+            "required": node.get("isRequired") is True, "app": app_id(suite.get("app"))}
 
 
 def _required(pr, owner_repo, base, run):
-    """The base branch's required check names: its protection rule and its rulesets, or None
-    when either could not be read."""
+    """The base branch's required checks: its protection rule and its rulesets, as sorted
+    [name, app] pairs, or None when either could not be read. `app` is the id of the one GitHub App
+    the rule takes the check from, and None where the rule takes it from any source (KIT-678).
+    Only an app that is absent or null means any source. One that is there but is no app id (a
+    node with no id, `true`, a negative number, text) makes the whole list unreadable: a reading
+    that cannot tell which app may post a check never widens it to every app."""
     rule = (pr.get("baseRef") or {}).get("branchProtectionRule")
-    names = set((rule or {}).get("requiredStatusCheckContexts") or [])
+    pairs = set()
+    for c in ((rule or {}).get("requiredStatusChecks") or []):
+        if isinstance(c, dict) and isinstance(c.get("context"), str):
+            if c.get("app") is not None and app_id(c.get("app")) is None:
+                return None
+            pairs.add((c["context"], app_id(c.get("app"))))
     if not base:
         return None
     from urllib.parse import quote
@@ -352,21 +400,26 @@ def _required(pr, owner_repo, base, run):
         if isinstance(r, dict) and r.get("type") == "required_status_checks":
             for c in ((r.get("parameters") or {}).get("required_status_checks") or []):
                 if isinstance(c, dict) and isinstance(c.get("context"), str):
-                    names.add(c["context"])
-    return sorted(names)
+                    integration = c.get("integration_id")    # REST gives a number, never a node
+                    if integration is not None and (isinstance(integration, dict)
+                                                    or app_id(integration) is None):
+                        return None
+                    pairs.add((c["context"], app_id(c.get("integration_id"))))
+    return [[name, app] for name, app in sorted(pairs, key=lambda p: (p[0], p[1] or 0))]
 
 
 def evidence_for(owner_repo, number, head, settings, bar, last_piece, acceptance,
-                 own_check=None, run=_gh):
+                 own_check=None, own_app=None, run=_gh):
     """THE ONE FUNCTION: layer 2's answer for pull request `number` at `head`, read from the
     platform now. `settings` is what the validator's settings `load()` returned: Stage E's login
-    comes from there and nowhere else. {"verdict": "yes"|"no", "head", "reasons"}: closed words,
-    never its text."""
+    comes from there and nowhere else. `own_app` is the validator's own app's id, from the config
+    its check is posted with (pipeline_validator_check). {"verdict": "yes"|"no", "head",
+    "reasons"}: closed words, never its text."""
     if (not isinstance(owner_repo, str) or not REPO_RE.fullmatch(owner_repo)
             or isinstance(number, bool) or not isinstance(number, int) or number < 1):
         return {"verdict": "no", "head": head, "reasons": ["pr-not-open"]}
     return judge(read_facts(owner_repo, number, run), head, trusted_login(settings), bar,
-                 last_piece, acceptance, own_check)
+                 last_piece, acceptance, own_check, own_app)
 
 
 def main(argv=None):
@@ -383,6 +436,8 @@ def main(argv=None):
     p.add_argument("--last-piece", choices=("yes", "no"), required=True)
     p.add_argument("--acceptance", default=None)
     p.add_argument("--own-check", default=None)
+    p.add_argument("--own-app", type=int, default=None,
+                   help="the validator's own app id; its check is set aside only when that app posted it")
     args = ap.parse_args(argv)
     if args.selftest:
         from scratch_run import contained
@@ -392,8 +447,13 @@ def main(argv=None):
         if not os.path.isabs(path):
             print("COULD NOT RUN: --settings-file must be an absolute path, or start with ~/.")
             return 2
+        if (args.own_check is None) != (args.own_app is None) or (args.own_app is not None
+                                                                   and not app_id(args.own_app)):
+            print("COULD NOT RUN: --own-check and --own-app go together, and --own-app is the "
+                  "validator's app id, a whole number above 0.")
+            return 2
         got = evidence_for(args.repo, args.pr, args.head, load_settings(path), args.bar,
-                           args.last_piece == "yes", args.acceptance, args.own_check)
+                           args.last_piece == "yes", args.acceptance, args.own_check, args.own_app)
         print(json.dumps(got))
         return 0 if got["verdict"] == "yes" else 1
     ap.print_help()
@@ -438,24 +498,27 @@ def selftest():
         return {"author": author, "author_type": author_type, "body": body,
                 "created_at": "2026-11-10T22:00:00Z", "edited": edited}
 
+    # App ids: GitHub Actions' own, another app that may reuse a name, and the validator's app.
+    GHA, OTHER, VAPP = 15368, 999, 4242
+
     def chk(name, conclusion="SUCCESS", status="COMPLETED", at="2026-11-10T21:00:00Z",
-            required=False, group="github-actions/CI"):
+            required=False, group="github-actions/CI", app=GHA):
         return {"name": name, "status": status, "conclusion": conclusion, "at": at,
-                "required": required, "group": group}
+                "required": required, "group": group, "app": None if group == "status" else app}
 
     good = {"state": "OPEN", "draft": False, "head": H, "rollup_head": H, "base": "main",
             "pr_author": "a-session",
             "mergeable": "MERGEABLE", "merge_state": "BLOCKED",
             "checks": [chk("Kit checks", required=True), chk("Provenance scan", required=True),
                        chk("PR base")],
-            "required": ["Kit checks", "Provenance scan"],
+            "required": [["Kit checks", GHA], ["Provenance scan", GHA]],
             "comments": [{"author": "someone", "author_type": "User", "body": "Looks fine to me.",
                           "created_at": "x", "edited": False}, review()]}
 
     def run(facts=None, head=H, login=LOGIN, bar="medium", last_piece=False,
-            acceptance=None, own_check=None):
+            acceptance=None, own_check=None, own_app=None):
         return judge(good if facts is None else facts, head, login, bar, last_piece,
-                     acceptance, own_check)
+                     acceptance, own_check, own_app)
 
     def with_(**over):
         f = copy.deepcopy(good)
@@ -527,11 +590,64 @@ def selftest():
           run(with_(required=[], checks=[chk("Kit checks", required=True)]))["reasons"], [])
     check("checks: ...and is missed when it has not run",
           run(with_(required=["Kit checks", "Hooks change guard"]))["reasons"], ["check-missing"])
+    # 2b. A required check is bound to the app that must post it (KIT-678). A same-named check from
+    #     another app, or a commit status, does not stand in for it; a rule naming no app takes any.
+    impostor = [chk("Kit checks", required=True, app=OTHER, group="other-app/CI"),
+                chk("Provenance scan", required=True)]
+    check("checks: a same-named check from another app is not the required one",
+          run(with_(checks=impostor))["reasons"], ["check-missing"])
+    check("checks: ...nor is a commit status of that name",
+          run(with_(checks=[chk("Kit checks", required=True, group="status"),
+                            chk("Provenance scan", required=True)]))["reasons"], ["check-missing"])
+    check("checks: the required one beside a same-named green one from another app is yes",
+          run(with_(checks=good["checks"] + [chk("Kit checks", app=OTHER, group="other-app/CI")]))[
+              "reasons"], [])
+    check("checks: ...and a same-named one from another app that failed is still judged",
+          run(with_(checks=good["checks"] + [chk("Kit checks", "FAILURE", app=OTHER,
+                                                 group="other-app/CI")]))["reasons"], ["check-failed"])
+    check("checks: a rule that names no app takes the check from any source",
+          run(with_(required=[["Kit checks", None], "Provenance scan"], checks=impostor))["reasons"], [])
+    check("checks: a required entry that is neither a name nor a [name, app] pair is unknown, never met",
+          run(with_(required=good["required"] + [{"context": "Kit checks"}]))["reasons"],
+          ["required-checks-unknown"])
+    check("checks: a [name, app] pair whose app is there but is no app id is unknown, never any source",
+          [run(with_(required=[["Kit checks", bad], ["Provenance scan", GHA]], checks=impostor))["reasons"]
+           for bad in ("15368", True, -1, 0)], [["required-checks-unknown"]] * 4)
+
+    # 2c. The validator's own check is set aside only when the validator's app posted it (KIT-678).
+    own_queued = chk("Validator", status="QUEUED", conclusion=None, required=True, app=VAPP,
+                     group="acme-validator/?")
     check("checks: the validator's own check is not its own evidence",
-          run(with_(checks=good["checks"] + [chk("Validator", status="QUEUED", conclusion=None,
-                                                 required=True)],
-                    required=good["required"] + ["Validator"]), own_check="Validator")["reasons"],
-          [])
+          run(with_(checks=good["checks"] + [own_queued],
+                    required=good["required"] + [["Validator", VAPP]]),
+              own_check="Validator", own_app=VAPP)["reasons"], [])
+    check("checks: a check named like the validator's own, from another app, is judged: pending",
+          run(with_(checks=good["checks"] + [dict(own_queued, app=OTHER, group="other-app/CI")]),
+              own_check="Validator", own_app=VAPP)["reasons"], ["check-pending"])
+    check("checks: ...and failed",
+          run(with_(checks=good["checks"] + [chk("Validator", "FAILURE", app=OTHER,
+                                                 group="other-app/CI")]),
+              own_check="Validator", own_app=VAPP)["reasons"], ["check-failed"])
+    check("checks: a required check named like the validator's own but bound to another app is needed",
+          run(with_(required=good["required"] + [["Validator", OTHER]]),
+              own_check="Validator", own_app=VAPP)["reasons"], ["check-missing"])
+    check("checks: without the validator's app id nothing is set aside, so its own check is judged",
+          run(with_(checks=good["checks"] + [own_queued],
+                    required=good["required"] + [["Validator", VAPP]]),
+              own_check="Validator")["reasons"], ["check-pending"])
+    import contextlib
+    import io
+    cli = ["check", "--repo", "acme/app", "--pr", "12", "--head", H, "--settings-file",
+           "/nonexistent/validator-settings.json", "--last-piece", "no"]
+    for label, extra in (("--own-check without --own-app", ["--own-check", "Validator"]),
+                         ("--own-app without --own-check", ["--own-app", str(VAPP)]),
+                         ("an --own-app that is no app id", ["--own-check", "Validator", "--own-app", "0"])):
+        said = io.StringIO()
+        with contextlib.redirect_stdout(said):
+            rc = main(cli + extra)
+        check("cli: %s cannot run, and reads nothing" % label,
+              (rc, said.getvalue().startswith("COULD NOT RUN: --own-check and --own-app go together")),
+              (2, True))
 
     # 3. Stage E's review, at this exact head, every state of the coverage marker.
     for label, comments, want in (
@@ -678,14 +794,20 @@ def selftest():
         "state": "OPEN", "isDraft": False, "headRefOid": H, "baseRefName": "main",
         "mergeable": "MERGEABLE", "mergeStateStatus": "BLOCKED",
         "author": {"__typename": "User", "login": "a-session"},
-        "baseRef": {"branchProtectionRule": {"requiredStatusCheckContexts": ["Kit checks"]}},
+        "baseRef": {"branchProtectionRule": {"requiredStatusChecks": [
+            {"context": "Kit checks", "app": {"databaseId": GHA}}]}},
         "commits": {"nodes": [{"commit": {"oid": H, "statusCheckRollup": {"contexts": {
-            "totalCount": 3, "pageInfo": {"hasNextPage": False}, "nodes": [
+            "totalCount": 4, "pageInfo": {"hasNextPage": False}, "nodes": [
                 {"__typename": "CheckRun", "name": "Kit checks", "status": "COMPLETED",
                  "conclusion": "SUCCESS", "startedAt": "2026-11-10T21:00:00Z", "isRequired": True,
-                 "checkSuite": {"app": {"slug": "github-actions"}, "workflowRun": {"workflow": {"name": "CI"}}}},
+                 "checkSuite": {"app": {"slug": "github-actions", "databaseId": GHA},
+                                "workflowRun": {"workflow": {"name": "CI"}}}},
                 {"__typename": "CheckRun", "name": "Provenance scan", "status": "COMPLETED",
                  "conclusion": "SUCCESS", "startedAt": "2026-11-10T21:00:00Z", "isRequired": True,
+                 "checkSuite": {"app": {"slug": "github-actions", "databaseId": GHA},
+                                "workflowRun": {"workflow": {"name": "CI"}}}},
+                {"__typename": "CheckRun", "name": "Lint", "status": "COMPLETED",
+                 "conclusion": "SUCCESS", "startedAt": "2026-11-10T21:00:00Z", "isRequired": False,
                  "checkSuite": None},
                 {"__typename": "StatusContext", "context": "legacy/ci", "state": "SUCCESS",
                  "createdAt": "2026-11-10T21:00:00Z", "isRequired": False}]}}}}]},
@@ -693,7 +815,7 @@ def selftest():
             "author": {"__typename": "Bot", "login": "acme-stage-e"}, "body": review()["body"],
             "createdAt": "2026-11-10T22:00:00Z", "lastEditedAt": None}]}}}}}
     rules = [{"type": "required_status_checks", "parameters": {"required_status_checks": [
-        {"context": "Provenance scan", "integration_id": 1}]}}, {"type": "deletion"}]
+        {"context": "Provenance scan", "integration_id": GHA}]}}, {"type": "deletion"}]
     calls = []
 
     def stub(answers):
@@ -706,19 +828,58 @@ def selftest():
     facts = read_facts("acme/app", 12, stub({"graphql": gql, "rules": rules}))
     check("read: the facts as judge() takes them",
           (facts["head"], facts["rollup_head"], facts["required"], facts["pr_author"],
-           [(c["name"], c["group"], _check_state(c), c["required"]) for c in facts["checks"]],
+           [(c["name"], c["group"], _check_state(c), c["required"], c["app"]) for c in facts["checks"]],
            [(c["author"], c["author_type"], c["edited"]) for c in facts["comments"]]),
-          (H, H, ["Kit checks", "Provenance scan"], "a-session",
-           [("Kit checks", "github-actions/CI", "green", True),
-            ("Provenance scan", "?/?", "green", True), ("legacy/ci", "status", "green", False)],
+          (H, H, [["Kit checks", GHA], ["Provenance scan", GHA]], "a-session",
+           [("Kit checks", "github-actions/CI", "green", True, GHA),
+            ("Provenance scan", "github-actions/CI", "green", True, GHA),
+            ("Lint", "?/?", "green", False, None), ("legacy/ci", "status", "green", False, None)],
            [(LOGIN, "Bot", False)]))
-    check("read: the query asks who wrote each comment and which workflow ran each check",
+    check("read: the query asks who wrote each comment, which app and workflow ran each check, and "
+          "which app each required check must come from",
           (QUERY.count("author{__typename login}"),
-           "checkSuite{app{slug} workflowRun{workflow{name}}}" in QUERY), (2, True))
+           "checkSuite{app{slug databaseId} workflowRun{workflow{name}}}" in QUERY,
+           "requiredStatusChecks{context app{databaseId}}" in QUERY), (2, True, True))
     check("read: two reads only, a query and a GET, and no mutation anywhere",
           ([c[:2] for c in calls], "mutation" in QUERY.lower(),
            any("-X" in c or "--method" in c for c in calls)),
           ([["api", "graphql"], ["api", "repos/acme/app/rules/branches/main"]], False, False))
+    unbound = copy.deepcopy(gql)
+    unbound["data"]["repository"]["pullRequest"]["baseRef"]["branchProtectionRule"][
+        "requiredStatusChecks"] = [{"context": "Kit checks", "app": None}]
+    some_rules = [{"type": "required_status_checks", "parameters": {"required_status_checks": [
+        {"context": "Provenance scan"}, {"context": "Bound", "integration_id": 7},
+        {"context": "Null", "integration_id": None}]}}]
+    check("read: each required check comes back with the app its rule names; an absent or null app "
+          "means any source",
+          read_facts("acme/app", 12, stub({"graphql": unbound, "rules": some_rules}))["required"],
+          [["Bound", 7], ["Kit checks", None], ["Null", None], ["Provenance scan", None]])
+
+    def with_integration(bad):
+        return [{"type": "required_status_checks", "parameters": {"required_status_checks": [
+            {"context": "Provenance scan", "integration_id": GHA}, {"context": "Odd", "integration_id": bad}]}}]
+    check("read: an app id that is there but is no app id makes the list unreadable, never any source",
+          [read_facts("acme/app", 12, stub({"graphql": gql, "rules": with_integration(bad)}))["required"]
+           for bad in (True, -3, 0, "15368", 1.5, {"databaseId": GHA})], [None] * 6)
+    nodes = []
+    for node in ({}, {"databaseId": None}, {"databaseId": "15368"}, {"slug": "github-actions"}):
+        odd = copy.deepcopy(gql)
+        odd["data"]["repository"]["pullRequest"]["baseRef"]["branchProtectionRule"][
+            "requiredStatusChecks"] = [{"context": "Kit checks", "app": node}]
+        nodes.append(read_facts("acme/app", 12, stub({"graphql": odd, "rules": rules}))["required"])
+    check("read: a protection rule's app node with no readable id makes the list unreadable",
+          nodes, [None] * 4)
+    check("read then judge: a malformed app id says required-checks-unknown",
+          evidence_for("acme/app", 12, H, SETTINGS, "medium", False, None,
+                       run=stub({"graphql": gql, "rules": with_integration(-3)}))["reasons"],
+          ["required-checks-unknown"])
+    forged = copy.deepcopy(gql)
+    forged["data"]["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"]["statusCheckRollup"][
+        "contexts"]["nodes"][0]["checkSuite"] = {"app": {"slug": "other-app", "databaseId": OTHER},
+                                                 "workflowRun": {"workflow": {"name": "CI"}}}
+    check("read then judge: a required check that another app posted is missing",
+          evidence_for("acme/app", 12, H, SETTINGS, "medium", False, None,
+                       run=stub({"graphql": forged, "rules": rules}))["reasons"], ["check-missing"])
     check("read then judge: yes",
           evidence_for("acme/app", 12, H, SETTINGS, "medium", False, None,
                        run=stub({"graphql": gql, "rules": rules}))["verdict"], "yes")

@@ -3000,11 +3000,11 @@ The validator's record of every decision, one row each (KIT-535). The stand-up, 
 
 **One verdict per head.** A row for a head is never changed afterwards, and a second row for the same head is refused. A later push is a new head, and a new row. A plan or a piece has no head, so it may be decided again.
 
-**An approval is whole.** It needs all three layers to pass and its own switch on. Only an approval has all three pass.
+**An approval is whole.** It needs all three layers to pass, its own switch on and no reason to hold. Only an approval has all three pass.
 
 **No approval from a ledger that cannot be trusted.** `read()` gives the rows. A ledger that cannot be read, does not validate, gives a key twice, is larger than 16 MiB on disk, or that a session could have written gives no rows: `None`, never an empty list, with the reason in words. A session could have written one inside a git working tree, a link, one writable by group or other, or one in or under a folder others can write without the sticky bit. Absent is an empty ledger: nothing has been decided.
 
-**Fields only.** No ticket, comment or pull request text, except `agent_says`: the agent's reason, one plain line of at most 300 characters, marked as the agent's words. It has no line break, control character or character a reader cannot see: every character is judged by its Unicode category, so format characters such as bidi controls, the soft hyphen and the tag characters are refused. A reader that shows it quotes it as the agent's, and never acts on it.
+**Fields only.** No ticket, comment or pull request text, except `agent_says`: the agent's reason, one plain line of at most 300 characters, marked as the agent's words. `reasons` are closed words, so a hold's code reasons are never the agent's words (KIT-542). It has no line break, control character or character a reader cannot see: every character is judged by its Unicode category, so format characters such as bidi controls, the soft hyphen and the tag characters are refused. A reader that shows it quotes it as the agent's, and never acts on it.
 
 **Whose file it is.** The validator's, under the user's own login, outside every git working tree. Mode 644, so the watcher can read it from its own account.
 
@@ -3012,7 +3012,7 @@ The validator's record of every decision, one row each (KIT-535). The stand-up, 
 
 | Field | Type | Notes |
 |---|---|---|
-| `schema` | `"pipeline-validator-ledger/1"` | A reader that does not know the value gives no rows. |
+| `schema` | `"pipeline-validator-ledger/2"` | A reader that does not know the value gives no rows. The first version, `/1`, from before `reasons`, is not read; nothing ever wrote one. |
 | `rows` | row[] | One per decision, oldest first. Only ever added to. |
 
 ### A row
@@ -3027,6 +3027,7 @@ The validator's record of every decision, one row each (KIT-535). The stand-up, 
 | `layers` | layers | Each layer's verdict. |
 | `settings_on` | switch[] | The validator's switches that were on, each once: `approve-plans`, `approve-pieces`, `approve-merges`, `allow-credentials`, `allow-billing-and-accounts`, `allow-production-deploy`, `allow-deleting-data`. |
 | `size_limits` | size limits | The size limits in force. |
+| `reasons` | closed word[] | Why code held, escalated or sent back, each once and at most 40: the hard limits' reasons, the evidence's, the agent's hold, or the send-back's own (`send-back-budget-spent`, `send-back-budget-unknown`, `send-back-no-session`). Each is lower-case letters, digits and hyphens. Empty for an approval, and for a decision that was the agent's alone. |
 | `agent_says` | text, or null | The agent's reason, in its own words. Null when it said nothing, and always null when it did not run. |
 
 ### Layers
@@ -3048,7 +3049,7 @@ Each is `pass`, `fail`, `unsure` or `not-run`. `unsure` holds, as `fail` does. `
 
 ### Who reads it
 
-The watcher's `approval-rate` monitor (§19, KIT-546), through `read()`: every merge against the `approved` rows, an approval still unmerged a day later, the day's approvals, and each urgent escalation. The validator's own pieces write rows, and the stand-up and the recap read them, each in its own piece.
+Stage E's bounce driver reads a `sent-back` row for a pull request at its current head, when its config names the ledger (`validator_ledger_file`, KIT-542). It re-prompts the dev session from its own ledger and budget. The watcher's `approval-rate` monitor (§19, KIT-546) reads it through `read()`: every merge against the `approved` rows, an approval still unmerged a day later, the day's approvals, and each urgent escalation. The stand-up and the recap read the ledger in their own pieces.
 
 ---
 
@@ -3184,6 +3185,7 @@ session nobody approved.
 <store>/requests/<id>.json     a request that waits
 <store>/taken/<id>.json        a request the runner acted on, with its answer
 <store>/runs/<run>/run.json    the run's record
+<store>/trees/<run>.json       the processes the runner remembered of the run (KIT-739)
 ```
 
 ### A request
@@ -3240,25 +3242,26 @@ workspace and its branch. Off (`enabled` false), the runner takes no request and
 | --- | --- | --- |
 | `schema` | `"pipeline-runner-run/1"` | |
 | `run` | `run-` and 32 hex characters | The pin's `dispatch_id` (§3). |
-| `request` | request id, or null | Null for the runner's own resume. |
-| `caller` | a caller, or `runner` | `runner` only for the resume after an interruption. |
+| `request` | request id, or null | Null for the runner's own resume or fresh start. |
+| `caller` | a caller, or `runner` | `runner` only for the resume after an interruption, and the fresh start after a lost session. |
 | `kind`, `project`, `ticket` | as in the request | |
-| `resumes` | run id, or null | The run this one resumed. |
-| `started_for` | `request` \| `interrupted` | |
-| `approved_by`, `approved_at`, `how` | user id; time or null; `move` \| `creation` \| `resumed-run` | Who approved, as the check found it. |
-| `session_id` | UUID | Given to the program at the start, kept by a resume. |
+| `resumes` | run id, or null | The run this one resumed, or carries on afresh. |
+| `started_for` | `request` \| `interrupted` \| `session-gone` | `session-gone`: the fresh start after a resume found its session gone. |
+| `approved_by`, `approved_at`, `how` | user id; time or null; `move` \| `creation` \| `resumed-run` \| `fresh-session` | Who approved, as the check found it. |
+| `session_id` | UUID | Given to the program at the start, kept by a resume. A fresh start gets a new one. |
+| `gone_session` | UUID, or null | The session a fresh start could not resume. Set on a fresh start, and only there. |
 | `workspace`, `branch` | absolute path; branch name | `<work_dir>/<kind>/<TICKET>`, on one fixed pattern. |
 | `pin` | absolute path, or null | The run's pin, removed when it ends. |
 | `pid` | number, or null | The wrapper's process, and its process group. |
 | `state` | `running` \| `stopping` \| `ended` \| `stopped` \| `interrupted` \| `failed` | |
 | `started_at`, `ended_at`, `seconds` | time; time or null; number or null | |
 | `exit` | whole number, or null | The program's exit code. Null when it left none. |
-| `reason` | `ended` \| `stopped` \| `interrupted` \| `could-not-start` \| `limit:time` \| `limit:memory` \| `limit:disk`, or null | Null while it runs. A run being stopped at a limit already carries that limit, in state `stopping`. |
+| `reason` | `ended` \| `stopped` \| `interrupted` \| `could-not-start` \| `session-gone` \| `limit:time` \| `limit:memory` \| `limit:disk`, or null | Null while it runs. A run being stopped at a limit already carries that limit, in state `stopping`. |
 | `why` | one line of at most 300 characters, or null | In the runner's own fixed words, never the program's. |
 | `cost_usd`, `turns` | number or null; whole number or null | When the program gives them. Never zero for "not given". |
 | `stop_asked_at` | time, or null | When a stop was asked. |
-| `auto_resume` | `pending` \| `started` \| `refused`, or null | For an interrupted run. |
-| `resumed_by` | run id, or null | The run that resumed it. |
+| `auto_resume` | `pending` \| `started` \| `refused`, or null | For an interrupted run, or a resume whose session was gone: the runner's own next start of it. |
+| `resumed_by` | run id, or null | The run that resumed it, or carried it on afresh. |
 
 **A run that died is resumed once.** A run whose process is gone with no result and no exit is
 `interrupted`, once whatever is left of its process group has been killed. The runner resumes it
@@ -3266,11 +3269,39 @@ once, as itself, with fixed words. A run that is itself that resume is never res
 whose wrapper never started is `failed` with `could-not-start`, and is never resumed. A lock only
 the wrapper holds says whether a run is alive: the session is never given it.
 
+**A resume whose session is gone starts afresh once (KIT-764).** The program may no longer have the
+conversation a resume names. Then it says so: an error result after no turn, whose text says no
+conversation was found, or no result and those words as the last line of its errors. The tech
+lead's turn reads the same words. That run ends with reason `session-gone`, and the runner starts
+one fresh session, as itself, on its next pass. The fresh start uses the same workspace and branch
+and a new `session_id`. Its prompt holds the ticket and the text of the request whose work it
+carries on, each fenced. That text is read back from `taken/`, past any resume the runner made of
+its own, so a fix that was cut short and then lost keeps its own words. Its record says
+`started_for: "session-gone"`, `how: "fresh-session"` and `resumes` (the run that failed), and
+`gone_session` names the lost session. **Once per request.** Only a resume can end
+`session-gone`. If the runs back to its request already hold a fresh start, no second one is made.
+That happens when a fresh start was interrupted before its session was saved and then resumed. No
+fresh start is made either when those runs cannot all be read. Either way the record's `why`
+says so. A resume that fails any other way ends with its own reason and is never retried. The
+words come from the program's own output. A session that printed them itself would gain one
+fresh start of the same request, and never a second.
+
 **Its limits (KIT-643).** Each run is held to a wall-clock limit, a memory limit for its whole
 process tree and a disk limit for its own folders, from the runner's `limits` settings. Past one,
 its tree is stopped and the record says `stopped` with that `limit:` reason. Below the machine's floor
 no new session starts. Each incident is recorded once, in plain words, in `<store>/incidents.json`
 (`{"schema": "pipeline-runner-incidents/1", "open", "told"}`), which the runner alone writes.
+
+**What is left of a run (KIT-739).** A run is finished only once its lock is free, its process group
+is empty and no process it remembered is alive. The runner kills what is left, and again until
+nothing is. It remembers each process it saw in the run's tree, with its start time, in
+`<store>/trees/<run>.json`: `{"schema": "pipeline-runner-tree/1", "method", "resolution", "leader",
+"procs", "dropped"}`. The runner alone writes it, and never reads a process from the run's folder.
+`leader` is the wrapper, noted when it starts, so a group number a later process took is never
+signalled. `procs` holds `[pid, start]` pairs, first seen first. Each look drops the ones that are
+gone. `method` is how start times were read: `sysctl` to the microsecond on macOS, `proc` in clock
+ticks on Linux, or `ps` to the second, and `resolution` says which. More than 4096 alive at once
+keeps the newest, counts the rest in `dropped`, and stops the run at `limit:memory`.
 
 **How to read it.** `read_runs()` gives every record, oldest first, and says `read`, `partly-read`
 (a record it could not read is named) or `could-not-read`. Then the runs are `None`, never an empty

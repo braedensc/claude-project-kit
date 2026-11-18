@@ -1163,8 +1163,8 @@ CONF_KEYS = set(CONF_REQUIRED) | set(CONF_DEFAULTS) | set(CONF_OPTIONAL)
 # `compose` and `verify` name the lines to take out. Any other unknown key is still refused.
 RETIRED_CONF_KEYS = {
     "CHAT_RULES": "the chat bot's rules are gone",
-    "BRIDGE_DM_QUESTIONS": "the bridge passes no question to a chat bot",
-    "BRIDGE_WAKES": "the bridge wakes no chat bot",
+    "BRIDGE_DM_QUESTIONS": "the tech lead passes no question to a chat bot",
+    "BRIDGE_WAKES": "the tech lead wakes no chat bot",
     "IDEA_TEAM_KEYS": "only the chat bot's rules named the teams",
     "HEALTH_STATUS_FILE": "only the chat bot's rules named the health watch's file",
 }
@@ -1367,7 +1367,7 @@ def load_conf(path):
 # compose
 # --------------------------------------------------------------------------- #
 # KIT-492: what compose and verify both say.
-CUTOVER_NOTE = ("SINCE THE CUTOVER (KIT-492): the tech lead answers in the bridge's own DM, not "
+CUTOVER_NOTE = ("SINCE THE CUTOVER (KIT-492): the tech lead answers in its own DM, not "
                 "here, and the dispatcher keeps dev sessions only. Keep this lane off: card "
                 "CK-C6 turns it off. The fences, the grant and the port block stay.")
 
@@ -1930,7 +1930,7 @@ def status_allow_add(conf, facts):
 KIT_DOCS_DEFAULT = "~/.stage-e/kit/docs"
 # KIT-469: each part of the pipeline, and the guide that says how it works.
 KIT_GUIDES = (
-    ("BRIDGE-OPERATOR.md", "the bridge: the one chat, the commands a member types, and the "
+    ("BRIDGE-OPERATOR.md", "the tech lead: the one chat, the commands a member types, and the "
                            "stand-up"),
     ("CHAT-LANE-OPERATOR.md", "the dispatcher's own chat lane, which stays off since the "
                               "cutover"),
@@ -2360,7 +2360,7 @@ CARDS = {
                % CHAT_APP_NAME,
                "renamed it. Its bot is @%s. Not the notifier's app, and not the"
                % CHAT_BOT_NAME,
-               "bridge's.",
+               "tech lead's.",
                "Under OAuth & Permissions -> Scopes -> Bot Token Scopes, click Add an",
                "OAuth Scope and pick groups:read.",
                "Slack then shows a banner asking you to reinstall the app. Click it,",
@@ -2382,7 +2382,7 @@ CARDS = {
                  "reacts to and answers a mention in the private channel"),
         "not": ("a banner in the app's settings still asking you to reinstall: the new "
                 "scope counts only after the reinstall; or groups:read added to the "
-                "notifier's or the bridge's app instead of the chat lane's"),
+                "notifier's or the tech lead's app instead of the chat lane's"),
     },
 }
 
@@ -7366,7 +7366,7 @@ def _selftest_body():
     flat_c7 = " ".join(c7.split())
     c7_steps = ("open the chat lane's app: %s, unless you renamed it" % CHAT_APP_NAME,
                 "Its bot is @%s." % CHAT_BOT_NAME,
-                "Not the notifier's app, and not the bridge's.",
+                "Not the notifier's app, and not the tech lead's.",
                 "Bot Token Scopes, click Add an OAuth Scope and pick groups:read",
                 "reinstall the app",
                 "app_mentions:read, chat:write, groups:history, groups:read, reactions:write",
@@ -7387,7 +7387,8 @@ def _selftest_body():
            and "groups:read" in c7card["good"] and "answers" in c7card["good"],
            c7card["good"])
     expect("card-c7-not-the-notifiers-app", "notifier" in c7card["not"]
-           and "bridge" in c7card["not"] and "reinstall" in c7card["not"], c7card["not"])
+           and "tech lead" in c7card["not"] and "bridge" not in c7card["not"]
+           and "reinstall" in c7card["not"], c7card["not"])
 
     # KIT-287: the operator docs say what this file does, where the owner reads them. The
     # update guide warns before the upgrade; the chat-lane guide's scope table is piece 6's,
