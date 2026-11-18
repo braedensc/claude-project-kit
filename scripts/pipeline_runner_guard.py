@@ -25,11 +25,11 @@ said. It refuses the call (exit 2, which blocks it) when:
     the program would read a crash as "go ahead".
 
 THE ENGINE'S FOLDER.  engine_problems() names each place a session's walls come from that the
-account the sessions run as could change: the engine's folder and every folder above it, its
-scripts, its kinds' data and its guards. A file or folder that account owns, a link, or one that
-other accounts may write (a folder with the sticky bit excepted) is a problem. The runner starts
-no session while there is one. On this Mac the engine is a root-owned copy of the kit, made by the
-runner's installer when a lane moves.
+account the sessions run as could change: the engine's folder and every folder above it, and every
+level of its scripts, its kinds' data, its guards and its sandbox profiles. A file or folder that
+account owns, a link, or one that other accounts may write (a folder above the engine with the
+sticky bit excepted) is a problem. The runner starts no session while there is one. On this Mac
+the engine is a root-owned copy of the kit, made by the runner's installer when a lane moves.
 
 Standard library only.
 """
@@ -47,8 +47,10 @@ HOOKS = {"pre-tool-use": "pre-tool-use.py"}
 PYTHON = "/usr/bin/python3"
 TIMEOUT = 8                          # under the hook's own 10 s, so this refusal is the one heard
 PAYLOAD_MAX = 64 << 20
-ENGINE_PARTS = ("scripts", "session-kinds", os.path.join(".claude", "hooks"))
+ENGINE_PARTS = ("scripts", "session-kinds", os.path.join(".claude", "hooks"),
+                os.path.join("templates", "sandbox"))
 SAID_MAX = 3
+LOOK_MAX = 20000                     # entries looked at in the engine's parts; past it, a problem
 
 
 def blocked(words):
@@ -158,10 +160,15 @@ def engine_problems(root=None, uid=None):
     for part in ENGINE_PARTS:
         folder = os.path.join(root, part)
         looks.append((folder, False))
-        try:
-            looks += [(os.path.join(folder, n), False) for n in sorted(os.listdir(folder))]
-        except OSError:
-            pass                            # said below, when the folder itself is looked at
+        # Every level: a writable file one folder down (a __pycache__ the runner imports from, say)
+        # is as open as one at the top. A link is looked at, never followed.
+        for top, dirs, names in os.walk(folder, followlinks=False):
+            dirs.sort()
+            looks += [(os.path.join(top, n), False) for n in sorted(dirs) + sorted(names)]
+            if len(looks) > LOOK_MAX:
+                break
+    if len(looks) > LOOK_MAX:
+        return ["the engine's folder holds more than %d entries, too many to check" % LOOK_MAX]
     found = []
     for path, above in looks:
         try:
@@ -334,6 +341,24 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
            engine_problems(engine, uid=other),
            ["%s may be written by other accounts" % os.path.join(engine, "session-kinds", "code.json")])
     os.chmod(os.path.join(engine, "session-kinds", "code.json"), 0o644)
+    cache = os.path.join(engine, "scripts", "__pycache__")
+    os.makedirs(cache)
+    with open(os.path.join(cache, "pipeline_runner.cpython-39.pyc"), "w") as fh:
+        fh.write("x")
+    os.chmod(cache, 0o755)
+    os.chmod(os.path.join(cache, "pipeline_runner.cpython-39.pyc"), 0o666)
+    expect("a file one folder down, which the runner may import, is looked at too",
+           engine_problems(engine, uid=other),
+           ["%s may be written by other accounts" % os.path.join(cache, "pipeline_runner.cpython-39.pyc")])
+    os.chmod(os.path.join(cache, "pipeline_runner.cpython-39.pyc"), 0o644)
+    profile = os.path.join(engine, "templates", "sandbox", "look.sb")
+    os.makedirs(os.path.dirname(profile), exist_ok=True)
+    with open(profile, "w") as fh:
+        fh.write("(version 1)\n")
+    os.chmod(profile, 0o666)
+    expect("…and so are the sandbox profiles",
+           engine_problems(engine, uid=other), ["%s may be written by other accounts" % profile])
+    os.chmod(profile, 0o644)
     os.symlink(os.path.join(tmp, "elsewhere.py"), os.path.join(engine, "scripts", "pipeline_harness_claude.py"))
     expect("a link in the engine's folder is a problem",
            engine_problems(engine, uid=other),

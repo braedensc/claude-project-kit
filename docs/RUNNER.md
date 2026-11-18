@@ -149,8 +149,8 @@ kinds' data, the adapter and the kit's guard. On this Mac that copy is root-owne
 cannot change its own guard.
 
 - **The runner checks it.** No session starts while this account could change the engine's
-  folder, a folder above it, its scripts, its kinds' data or its guards. The request waits, and the
-  runner says why once.
+  folder or a folder above it. The same goes for anything at any level of its scripts, its kinds'
+  data, its guards or its sandbox profiles. The request waits, and the runner says why once.
 - **The guard is told its folder.** The kit's guard finds its project from `CLAUDE_PROJECT_DIR`,
   and without it from its own file's folder. Run from the engine, that is the wrong checkout, and a
   branch check outside a repository lets an edit through. So a small launcher,
@@ -171,7 +171,7 @@ cannot change its own guard.
 | r4a | A file tool allowed by its bare name reads and writes outside, sandbox or not | No kind allows a file tool by name |
 | r4b to r4d | Allowed by the workspace's path only, the outside is refused with no deny rule | Every file tool is allowed by the workspace's path, and denied the walls too |
 | r5a | Our own macOS sandbox around the program holds the file tools | Review and plan run inside it |
-| **r5b, FAIL** | Inside both sandboxes Bash does not start (`sandbox_apply: Operation not permitted`) | **The answer is a rule, in the data:** a kind with Bash has the built-in sandbox and rules for its file tools; a kind without Bash has our own sandbox. The loader refuses any other pairing. The acceptance kind keeps Bash, because its look tool starts its own sandbox, which could not start inside ours |
+| **r5b, FAIL** | Inside both sandboxes Bash does not start (`sandbox_apply: Operation not permitted`) | **The answer is a rule, in the data:** a kind with Bash has the built-in sandbox and rules for its file tools; a kind without Bash has our own sandbox. The loader refuses any other pairing. The acceptance kind keeps Bash and the built-in sandbox: its look tool is a tool server, which the program starts outside Bash's sandbox, so the tool can start a sandbox of its own. Inside ours it could not |
 | **r3c, not measured** | The control with no sandbox: the model declined the commands | **A gap that proves nothing either way.** Row r4a wrote to the same folder, so r3's refused write was the sandbox's. No kind runs Bash with no sandbox |
 
 What the program itself does, outside its tools, is held by our own sandbox only for review and
@@ -272,3 +272,6 @@ The runner refuses to start from inside a Claude session, or as root.
   in the runner's clone, and whether the code host's command-line tool gets through TLS.
 - That our own sandbox lets the real program run for a review or plan session. The selftest runs
   the profile on a Mac with a stand-in. The probe runs the real program in it.
+- That the acceptance kind's look tool can start its own sandbox in an acceptance session. It is
+  a tool server, started outside Bash's sandbox, so nothing should nest. It joins that kind with
+  the acceptance lane (KIT-708), and the probe gains a row for it then.

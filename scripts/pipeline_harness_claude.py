@@ -91,6 +91,17 @@ def _exact(path):
             and ".." not in path.split("/") and path == os.path.normpath(path))
 
 
+def _path_problem(path, real=True):
+    """Why `path` cannot be named by a rule or a profile, or ''. A walled place must be its own
+    real path: the system matches real paths, so a rule naming a path through a link (macOS's /tmp
+    and /var are links to /private) would match nothing, and its wall would stand open."""
+    if not _exact(path):
+        return "not an exact absolute path"
+    if real and os.path.realpath(path) != path:
+        return "goes through a link, so a rule naming it would match nothing"
+    return ""
+
+
 def check(spec):
     """What this adapter cannot build of a kind's data, in words. The data's own rules are the
     data module's; these are this program's."""
@@ -111,13 +122,21 @@ def check(spec):
 
 
 def run_problems(run):
-    """What is wrong with one run's facts: every path exact and absolute, every key file too."""
-    bad = ["%s: not an exact absolute path" % k for k in RUN_PATHS if not _exact(run.get(k))]
-    if run.get("pin") and not _exact(run["pin"]):
-        bad.append("pin: not an exact absolute path")
+    """What is wrong with one run's facts: every path exact and absolute, and every place a rule
+    or the profile names its own real path. The program's path and the engine's may go through a
+    link: no wall names either."""
+    bad = []
+    for k in RUN_PATHS:
+        why = _path_problem(run.get(k), real=k not in ("claude_bin", "engine"))
+        if why:
+            bad.append("%s: %s" % (k, why))
+    if run.get("pin"):
+        why = _path_problem(run["pin"])
+        if why:
+            bad.append("pin: %s" % why)
     keys = run.get("keys")
-    if not (isinstance(keys, list) and keys and all(_exact(k) for k in keys)):
-        bad.append("keys: a list of exact absolute paths, at least the tracker key")
+    if not (isinstance(keys, list) and keys and all(not _path_problem(k) for k in keys)):
+        bad.append("keys: a list of exact real paths, at least the tracker key")
     if not all(isinstance(t, str) and t and not _BAD_PATH.search(t) and " " not in t
                for t in run.get("extra_allowed") or []):
         bad.append("extra_allowed: exact tool names only")
@@ -349,9 +368,20 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
             ("a quote a profile could close on", {"home": P["home"] + '"x'}, ["home: not an exact absolute path"]),
             ("a relative path", {"pins": "pins"}, ["pins: not an exact absolute path"]),
             ("a parent step", {"run_dir": P["store"] + "/../x"}, ["run_dir: not an exact absolute path"]),
-            ("no key file", {"keys": []}, ["keys: a list of exact absolute paths, at least the tracker key"]),
+            ("no key file", {"keys": []}, ["keys: a list of exact real paths, at least the tracker key"]),
             ("an added tool that is a pattern", {"extra_allowed": ["mcp__x__*"]}, ["extra_allowed: exact tool names only"])):
         expect("refused: %s" % what, run_problems(dict(run, **change)), want)
+    os.symlink(P["store"], os.path.join(tmp, "store-link"))
+    os.symlink(tmp, os.path.join(P["outside"], "via"))
+    expect("refused: a walled place named through a link, which no rule would match",
+           run_problems(dict(run, store=os.path.join(tmp, "store-link"))),
+           ["store: goes through a link, so a rule naming it would match nothing"])
+    expect("refused: a key file named through a link to its folder",
+           run_problems(dict(run, keys=[os.path.join(P["outside"], "via", "tracker-key")])),
+           ["keys: a list of exact real paths, at least the tracker key"])
+    expect("…while the program and the engine may sit behind a link: no wall names them",
+           run_problems(dict(run, claude_bin=os.path.join(P["outside"], "via", "claude"),
+                             engine=os.path.join(P["outside"], "via", "engine"))), [])
 
     # ---- the full command line, pinned for every kind ----------------------- #
     common = ["--setting-sources", "", "--strict-mcp-config",
@@ -379,12 +409,6 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
         expect("%s: no file tool allowed by its bare name" % name,
                [a for a in argv[argv.index("--allowedTools") + 1:argv.index("--permission-mode")]
                 if a in kinds_data.TOOL_CLASS and kinds_data.TOOL_CLASS[a] == "file"], [])
-    expect("the code line is the runner's line before the kinds became data",
-           want_argv["code"][:6] + want_argv["code"][8:],
-           ["/opt/x/bin/claude", "-p", "--model", "sonnet", "--output-format", "json",
-            "--setting-sources", "", "--strict-mcp-config", "--mcp-config", rdir + "/mcp.json",
-            "--settings", rdir + "/settings.json", "--tools", "Bash,Read,Edit,Write", "--allowedTools",
-            "Bash", "Read(/%s/**)" % ws, "Edit(/%s/**)" % ws, "Write(/%s/**)" % ws] + tail)
     resumed = command(kinds["fix"], dict(run, resume=True))
     expect("a resume names the session to resume, and nothing else changes",
            (resumed[6:8], resumed[:6] + resumed[8:] == want_argv["fix"][:6] + want_argv["fix"][8:]),
