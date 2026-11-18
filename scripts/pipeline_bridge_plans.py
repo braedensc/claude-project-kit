@@ -625,7 +625,7 @@ def quoted(words):
 def answer_block(name, uid, when, words):
     """What a yes adds to the end of a plan's description (KIT-334): who answered, when, and
     their words, quoted under a rule, so they read as theirs and not the planner's."""
-    return ("\n\n---\n\n**Answer from %s (Slack user %s), %s, through the tech lead:**\n\n%s"
+    return ("\n\n---\n\n**Answer from %s (Slack user %s), %s, through the Slack bridge:**\n\n%s"
             % (name, uid, when, quoted(words)))
 
 
@@ -1132,7 +1132,7 @@ def followup_description(epic, notes, name, uid, when, pieces=()):
     cleaner: this ticket is filed as the owner, and the dispatcher reads routing tags out
     of a description once someone hands it over."""
     lines = ["Review notes left on the pieces of %s “%s” when every piece was finished. Filed "
-             "by the tech lead for **%s** (Slack user %s), who said yes in Slack at %s. "
+             "by the Slack bridge for **%s** (Slack user %s), who said yes in Slack at %s. "
              "Nothing starts on this ticket until someone hands it over."
              % (epic.get("identifier") or "?", _relayed(epic.get("title"), 120),
                 _relayed(name, 120) or uid, uid, when), ""]

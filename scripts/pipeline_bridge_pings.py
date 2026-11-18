@@ -174,7 +174,7 @@ class PingsMixin(object):
         # The name is the member's own to set: the same cleaner as the answer, so a routing
         # tag or a bounce marker in it reaches the session inert.
         name = notify.clean_relay_text(self.name_of(uid)) or uid
-        body = ("This is an answer from **%s** (Slack user %s), passed on by the tech lead "
+        body = ("This is an answer from **%s** (Slack user %s), passed on by the Slack bridge "
                 "from %s; they sent it at %s.\n\n%s"
                 % (name, uid, "their DM with it" if channel in self.dm_channels
                    else "the pings channel", iso(ts_float(sent_ts)), text))
