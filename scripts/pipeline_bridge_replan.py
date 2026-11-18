@@ -1628,6 +1628,22 @@ def cases_replan(kit):
                   {"identifier": "prod-6", "description": "Make it dark."},
                   {"identifier": "not an id", "description": ""}, {}, None)]),
               ["PROD-6", None, "PROD-6", None, None, None])
+        # Stage E on #644: a ticket with a machine ticket's marks that is not the planner's own
+        # run is never read as an idea of the owner's, so the validator's origin check fails
+        # closed on it: a planning ticket whose trigger line was edited away, one marked only by
+        # its routing label, and a review ticket.
+        untriggered = "\n".join(ln for ln in run_text("PROD-6", "T1").splitlines()
+                                if not ln.startswith(poller.TRIGGER_PREFIX))
+        check("receipt-idea-reads-no-machine-ticket-but-the-planner's-own-run-as-an-idea",
+              outcome(lambda: [receipt_idea(n, OWNER) for n in (
+                  {"identifier": "PROD-50", "description": untriggered, "creator": {"id": OWNER}},
+                  {"identifier": "PROD-51", "description": "Make it dark.",
+                   "labels": {"nodes": [{"name": poller.machine.PLANNING_PREFIX + "prod"}]}},
+                  {"identifier": "PROD-52", "description": "[repo=%sapp]\n\nReview it."
+                   % poller.machine.REVIEW_PREFIX},
+                  {"identifier": "PROD-53", "description": "Make it dark.",
+                   "labels": {"nodes": [{"name": poller.machine.REVIEW_PREFIX + "app"}]}})]),
+              [None, None, None, None])
         # The real issue read carries the parent a piece is read back by; the fake's issues
         # always have one, so only this pin sees the query lose it.
         check("rp1-the-issue-read-carries-the-parent-a-piece-is-read-back-by",

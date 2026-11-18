@@ -846,6 +846,15 @@ def selftest():
                         "TOD-5": stage_e.BounceError("down")}}, "origin"),
                     ("a planning run read with a timeout", {"tickets_over": {
                         "TOD-5": TimeoutError("timed out")}}, "origin"),
+                    # Stage E on #644: a planning ticket that lost its trigger line is no run of
+                    # the planner's, and never reads as the owner's idea (KIT-705), even with
+                    # every mark an idea of his carries.
+                    ("a planning run whose trigger line was edited away", {"tickets_over": {
+                        "TOD-5": dict(run_ticket, labels={"nodes": [{"name": "provenance:human"}]},
+                                      description="\n".join(
+                                          ln for ln in run_ticket["description"].splitlines()
+                                          if not ln.startswith("Planning-run trigger:")))}},
+                     "origin"),
                     ("a ticket under a plan the idea gate did not file", {"tickets_over": {
                         "TOD-13": issue("TOD-13", labels=(), parent=dict(PLAN, labels={"nodes": []}))}},
                      "origin"),

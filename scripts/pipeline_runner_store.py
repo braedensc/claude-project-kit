@@ -478,9 +478,10 @@ def asked(store, caller, kind, since=None):
     back (KIT-705): {"asked": [{"id", "request", "answer"}], "unread": n}, oldest first. `answer`
     is None while it waits. `since` (seconds) passes over requests asked before it, judged first
     by each file's time, which is never earlier than its asking, so a long-lived store is not
-    read whole each time. A file that cannot be read, or holds no well-formed request of this
-    caller's, is counted in `unread`, never passed over in silence. StoreError when a folder
-    cannot be listed: "could not read" is never "none asked" (contract section 13)."""
+    read whole each time. A file that cannot be read, or holds no well-formed request, is counted
+    in `unread`, never passed over in silence. `unread` is store-wide: such a file cannot say whose
+    it is, so every caller's read counts it, and each caller says how it judges one. StoreError
+    when a folder cannot be listed: "could not read" is never "none asked" (contract section 13)."""
     if caller not in CALLERS or kind not in CALLERS[caller]:
         raise ValueError("the %s job asks for no %s session" % (caller, kind))
     found, unread = {}, set()
@@ -823,6 +824,8 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
     got = asked(mine, "planner", "plan")
     expect("a file it cannot read, or that holds no request, is counted, never passed over in silence",
            (len(got["asked"]), got["unread"]), (2, 2))
+    expect("…by every caller's read: such a file cannot say whose it is, so `unread` is store-wide",
+           asked(mine, "queue", "code")["unread"], 2)
     expect("a caller asks only for its own kinds", refused(lambda: asked(mine, "planner", "code")),
            "the planner job asks for no code session")
     os.chmod(os.path.join(mine, "taken"), 0o777)

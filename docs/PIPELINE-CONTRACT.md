@@ -3328,8 +3328,9 @@ workspace and its branch. Off (`enabled` false), the runner takes no request and
 
 **A caller reads back its own requests (KIT-705).** `asked(store, caller, kind, since)` gives every
 request one caller made for one of its kinds, waiting or answered, oldest first, each with its answer
-once it has one. A file it cannot read is counted in `unread`, never passed over, and a folder it
-cannot list is an error, never "none asked" (§13). `withdraw(store, id)` takes back a request the
+once it has one. A file it cannot read is counted in `unread`, never passed over. That count is
+store-wide, since such a file cannot say whose it is: the planner counts each one as a run
+against its day's cap. A folder it cannot list is an error, never "none asked" (§13). `withdraw(store, id)` takes back a request the
 runner has not taken: true when it was waiting, false when it was taken or was never there. A runner
 that read it a moment before may still act on it, so the caller reads its answer afterwards, and
 stops a run that started anyway.

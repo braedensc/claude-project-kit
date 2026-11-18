@@ -839,37 +839,117 @@ def resolve_team(cfg, linear, row):
 # --------------------------------------------------------------------------- #
 # Our own runner's lane (KIT-705) — which repositories plan on it, read every pass
 # --------------------------------------------------------------------------- #
-def _runner_module():
-    """(the runner's own module, why): loaded only when its settings are named, so its own
-    loader judges them exactly as the runner does."""
+# Only the fields of the runner's settings this job needs are read, each by the runner's own rule
+# for it (scripts/pipeline_runner.py, load_config and load_project), and named by its key as the
+# runner names it. This job never loads the runner's code: every job that loads this module would
+# load all it imports too (the Stage E installer's SIBLING_JOBS). The runner judges its whole file
+# before it answers anything, so settings it refuses leave a request waiting, and this job's own
+# time-out takes the request back and says so.
+RUNNER_BASE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}\Z")      # the runner's BASE_RE
+RUNNER_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}\Z")      # its user ids and state ids
+RUNNER_GIT_PATH = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+RUNNER_GIT_TIMEOUT_SECONDS = 120
+
+
+def account_path(path):
+    """`~/` is this account's home from the account database, never $HOME, as the runner reads
+    its own settings."""
+    if isinstance(path, str) and (path == "~" or path.startswith("~/")):
+        import pwd
+        return os.path.join(pwd.getpwuid(os.getuid()).pw_dir, path[2:])
+    return path
+
+
+def runner_git(argv):
+    """git as the runner runs it to read a committed file: the account's own setup, from /,
+    never asking for anything."""
+    env = {"PATH": RUNNER_GIT_PATH, "HOME": account_path("~"), "LANG": "en_US.UTF-8",
+           "GIT_TERMINAL_PROMPT": "0"}
     try:
-        import pipeline_runner
-    except (ImportError, SystemExit) as exc:       # its own import refuses with SystemExit
-        return None, "the runner's own code could not be loaded (%s)" % type(exc).__name__
-    return pipeline_runner, ""
+        return subprocess.run(argv, env=env, cwd="/", capture_output=True, text=True,
+                              timeout=RUNNER_GIT_TIMEOUT_SECONDS)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return subprocess.CompletedProcess(argv, -1, "", type(exc).__name__)
 
 
-def runner_delivery(runner, proj):
-    """(doc, why): the committed delivery.json of one of the runner's projects, from the runner's
-    own clone, read as the runner reads it (git show, the account's own git setup, no fetch)."""
-    def git(argv):
-        try:
-            return subprocess.run(argv, env=runner.git_env_default(), cwd="/",
-                                  capture_output=True, text=True, timeout=120)
-        except (OSError, subprocess.SubprocessError) as exc:
-            return subprocess.CompletedProcess(argv, -1, "", type(exc).__name__)
-    text = runner.committed_file(git, proj["repo"], proj["base"], "delivery.json")
-    if text is None:
+def runner_delivery(proj, git=None):
+    """(doc, why): the committed delivery.json of one of the runner's projects, on origin/<base>
+    in the runner's own clone, the file the runner reads before every start. No fetch."""
+    shown = (git or runner_git)(["git", "-C", proj["repo"], "show",
+                                 "origin/%s:delivery.json" % proj["base"]])
+    if shown.returncode != 0:
         return None, "its committed delivery.json could not be read from its clone"
     try:
-        return json.loads(text), ""
+        return json.loads(shown.stdout), ""
     except ValueError:
         return None, "its committed delivery.json is not JSON"
 
 
+def runner_settings(path):
+    """(fields, problems): what this job reads of the runner's settings, each field by the
+    runner's own rule for it. `fields` holds `enabled`, `store_dir`, `owners` and, per project,
+    its clone (`repo`), `base`, whether its plan lane is on (`plan`) and its approved states for a
+    plan run (`states`). A problem names its key as the runner does; any problem reads as none."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except (OSError, ValueError, RecursionError) as exc:
+        return None, ["the settings file could not be read (%s)" % type(exc).__name__]
+    if not isinstance(raw, dict):
+        return None, ["the settings are not an object"]
+    bad = []
+    enabled = raw.get("enabled", False)
+    if not isinstance(enabled, bool):
+        bad.append("enabled: must be true or false")
+    store_dir = account_path(raw.get("store_dir"))
+    if not (isinstance(store_dir, str) and os.path.isabs(store_dir) and "\0" not in store_dir):
+        bad.append("store_dir: must be an absolute path (~/ is this account's home)")
+    owners = raw.get("owner_user_ids")
+    if not (isinstance(owners, list) and owners
+            and all(isinstance(x, str) and RUNNER_ID_RE.match(x) for x in owners)):
+        bad.append("owner_user_ids: needs a list of tracker user ids")
+    projects, out = raw.get("projects"), {}
+    if not (isinstance(projects, dict) and projects):
+        bad.append("projects: needs at least one project")
+        projects = {}
+    for key in sorted(projects, key=repr):
+        if not (isinstance(key, str) and runner_store.PROJECT_RE.match(key)):
+            bad.append("projects: %s is not a project key" % repr(key)[:40])
+            continue
+        proj = projects[key]
+        if not isinstance(proj, dict):
+            bad.append("projects.%s.not an object" % key)
+            continue
+        lanes = {} if proj.get("lanes") is None else proj["lanes"]      # absent is every lane off
+        if not (isinstance(lanes, dict) and all(k in runner_store.KINDS and isinstance(v, bool)
+                                                for k, v in lanes.items())):
+            bad.append("projects.%s.lanes: needs, for each kind of session (%s), true or false"
+                       % (key, ", ".join(runner_store.KINDS)))
+            continue
+        states = {} if proj.get("approval_states") is None else proj["approval_states"]
+        if not (isinstance(states, dict) and all(k in runner_store.STARTS for k in states)
+                and all(isinstance(v, list) and v and all(isinstance(s, str) and RUNNER_ID_RE.match(s)
+                                                          for s in v) for v in states.values())):
+            bad.append("projects.%s.approval_states: needs, for each kind it starts (%s), a list "
+                       "of state ids" % (key, ", ".join(runner_store.STARTS)))
+            continue
+        plan = lanes.get("plan") is True
+        repo, base = account_path(proj.get("repo")), proj.get("base", "main")
+        if not (isinstance(repo, str) and os.path.isabs(repo)):
+            bad.append("projects.%s.repo: must be the absolute path of the runner's own clone" % key)
+        if not (isinstance(base, str) and RUNNER_BASE_RE.match(base) and ".." not in base):
+            bad.append("projects.%s.base: not a branch name" % key)
+        if plan and not states.get("plan"):
+            bad.append("projects.%s.approval_states: a lane that is on needs its approved states "
+                       "(plan)" % key)
+        out[key] = {"repo": repo, "base": base, "plan": plan, "states": list(states.get("plan") or [])}
+    return {"enabled": enabled is True, "store_dir": store_dir, "projects": out,
+            "owners": list(owners) if isinstance(owners, list) else []}, bad
+
+
 def runner_lanes(cfg, read_delivery=None):
     """Which repositories plan on our own runner this pass (KIT-705), from the runner's own
-    settings, read with the runner's own loader:
+    settings, each field read by the runner's own rule (runner_settings):
 
       {"state": "none" | "read" | "could-not-read", "why", "path", "store_dir", "enabled",
        "owners", "repos": {owner/repo, lower case: {"project", "states"}}}
@@ -884,18 +964,14 @@ def runner_lanes(cfg, read_delivery=None):
            "owners": [], "repos": {}}
     if not path:
         return out
-    runner, why = _runner_module()
-    if runner is None:
-        return dict(out, state="could-not-read", why=why)
-    rcfg, problems = runner.load_file(path)
+    rcfg, problems = runner_settings(path)
     if problems:
         return dict(out, state="could-not-read",
                     why="the runner's settings at %s have %d problem(s), the first: %s"
                     % (path, len(problems), problems[0]))
-    out.update(store_dir=rcfg["store_dir"], enabled=bool(rcfg["enabled"]),
-               owners=list(rcfg["owner_user_ids"]))
-    reader = read_delivery or (lambda proj: runner_delivery(runner, proj))
-    for key in sorted(k for k, p in rcfg["projects"].items() if p["lanes"].get("plan")):
+    out.update(store_dir=rcfg["store_dir"], enabled=rcfg["enabled"], owners=rcfg["owners"])
+    reader = read_delivery or runner_delivery
+    for key in sorted(k for k, p in rcfg["projects"].items() if p["plan"]):
         proj = rcfg["projects"][key]
         try:
             doc, why = reader(proj)
@@ -914,8 +990,7 @@ def runner_lanes(cfg, read_delivery=None):
             return dict(out, state="could-not-read", repos={},
                         why="the runner's projects %s and %s both name %s, so which one plans it "
                         "is not known" % (out["repos"][repo.lower()]["project"], key, repo))
-        out["repos"][repo.lower()] = {"project": key,
-                                      "states": list(proj["approval_states"].get("plan") or [])}
+        out["repos"][repo.lower()] = {"project": key, "states": list(proj["states"])}
     out["state"] = "read"
     return out
 
@@ -950,8 +1025,10 @@ def lanes_in_use(teams):
 def runner_starts(lanes, clock, day=None):
     """(first runs, re-runs): the planner's plan starts our own runner holds for one UTC day,
     counted from its store (KIT-705), so the caps hold when this job's own record is lost. A start
-    the runner refused is no run. One it cannot read counts as a first run, never as none. None
-    when no store is in use. PollerError when the store cannot be read."""
+    the runner refused is no run. A request file of that day that cannot be read counts as one
+    first run, never as none: it cannot say whose it is, so another caller's counts too
+    (runner_store.asked). It takes one run from the day's cap and stops nothing else. None when
+    no store is in use. PollerError when the store cannot be read."""
     if lanes.get("state") != "read" or not lanes.get("store_dir"):
         return None
     day = day or clock.day()
@@ -4912,12 +4989,15 @@ def selftest():
               ['rec["run_ticket_id"]'])
         # KIT-705: the runner lane's only writes to the runner's store are its own requests, a
         # plan start or a stop, and taking back one it asked for; everything else only reads.
+        # Every ask is one of the two written out, so one whose words are variables fails here
+        # (Stage E on #644).
         check("the-runner-store-is-written-only-by-asking-for-a-plan-run-and-taking-one-back",
               (sorted(set(re.findall(r"runner_store\.(\w+)\(", body_src))),
+               len(re.findall(r"runner_store\.ask\b", body_src)),
                [m.group(1) for m in re.finditer(
                    r'runner_store\.ask\(\s*\w+(?:\["\w+"\])?,\s*("planner", "(?:start|stop)", '
                    r'"plan")', body_src)]),
-              (["answer", "ask", "asked", "read_run", "run_output", "walls", "withdraw"],
+              (["answer", "ask", "asked", "read_run", "run_output", "walls", "withdraw"], 2,
                ['"planner", "start", "plan"', '"planner", "stop", "plan"']))
         check("helper-selftest", machine.selftest(), 0)
         check("routing-helper-selftest", routing.selftest_cases()[1], [])
@@ -8216,6 +8296,54 @@ def selftest():
                        [r for r in said["runner"] if words in r] != [],
                        [r for r in said["ticket"] if words in r]),
                       (EXIT_ERROR, [([IDEA_PREFIX + "WEB-513"], "ticket")], True, []))
+            # This job reads the runner's settings without the runner's code, which every job that
+            # loads this module would load too. So each field it reads is held to the runner's own
+            # loader: the same values from a good file, and the runner's own words for a fault.
+            import pipeline_runner as runner_own
+            good = runner_settings_for("parity")
+            mine, mine_bad = runner_settings(good)
+            theirs, theirs_bad = runner_own.load_file(good)
+            check("the-runner's-settings-are-read-as-the-runner-reads-them",
+                  (mine_bad, mine["enabled"], mine["store_dir"], mine["owners"],
+                   sorted((k, p["repo"], p["base"], p["plan"], p["states"])
+                          for k, p in mine["projects"].items())),
+                  (theirs_bad, theirs["enabled"], theirs["store_dir"], theirs["owner_user_ids"],
+                   sorted((k, p["repo"], p["base"], p["lanes"]["plan"],
+                           p["approval_states"].get("plan") or [])
+                          for k, p in theirs["projects"].items())))
+            with open(good, encoding="utf-8") as fh:
+                whole = json.load(fh)
+
+            def faulty(change):
+                doc = json.loads(json.dumps(whole))
+                change(doc)
+                path = os.path.join(tmp, "parity", "fault.json")
+                with open(path, "w", encoding="utf-8") as fh:
+                    json.dump(doc, fh)
+                return path
+
+            def project(**over):
+                return lambda doc: doc["projects"]["product"].update(over)
+            for label, change in (
+                    ("enabled", lambda doc: doc.update(enabled="yes")),
+                    ("store-relative", lambda doc: doc.update(store_dir="store")),
+                    ("no-owners", lambda doc: doc.update(owner_user_ids=[])),
+                    ("an-owner-not-an-id", lambda doc: doc.update(owner_user_ids=["a b"])),
+                    ("no-projects", lambda doc: doc.update(projects={})),
+                    ("a-project-key", lambda doc: doc["projects"].update({"Bad Key": {}})),
+                    ("a-project-not-an-object", lambda doc: doc["projects"].update(product="x")),
+                    ("lanes-not-true-or-false", project(lanes={"plan": "yes"})),
+                    ("a-lane-no-kind", project(lanes={"planning": True})),
+                    ("states-empty", project(approval_states={"plan": []})),
+                    ("states-for-no-start", project(approval_states={"fix": ["s"]})),
+                    ("plan-on-with-no-states", project(approval_states=None)),
+                    ("repo-relative", project(repo="clones/product")),
+                    ("base-climbs", project(base="../main"))):
+                path = faulty(change)
+                mine_bad = runner_settings(path)[1]
+                theirs_bad = runner_own.load_file(path)[1]
+                check("a-fault-in-the-runner's-settings-is-the-runner's-own-words:%s" % label,
+                      (bool(mine_bad), [p for p in mine_bad if p not in theirs_bad]), (True, []))
 
         def runner_cases_endings():
             # Every way a run can end on our own runner, read from its store, mapped onto the
@@ -8381,6 +8509,20 @@ def selftest():
                       "w") as fh:
                 fh.write("{ not json")
             check("a-request-it-cannot-read-counts-as-a-run", runner_starts(lanes_c, f.clock), (3, 0))
+            # Such a file cannot say whose it is, so one another caller left counts too. It takes
+            # one run from the day's cap and stops nothing else; another caller's readable request
+            # takes none (Stage E on #644).
+            f = FakeLinear(FakeClock())
+            for n_ in (536, 537, 538):
+                f.add_idea(n_)
+            c = cfg_for("runner-caps-anyone's", max_new_runs=10, max_runs_per_day=3)
+            store_f = runner_of(c, f).store
+            real_ask(store_f, "queue", "start", "code", "product", "PROD-1", now=f.clock.time())
+            with open(os.path.join(store_f, "requests", "rq-" + "e" * 32 + ".json"), "w") as fh:
+                fh.write("{ not json")
+            _code, s = one_pass(c, f)
+            check("an-unreadable-request-of-anyone's-takes-one-run-from-the-cap-and-stops-nothing-else",
+                  (len(runs(f)), s["waiting_daily_cap"], s["planning_blocked"]), (2, 1, 0))
             f = FakeLinear(FakeClock())
             f.add_idea(535)
             c = cfg_for("runner-caps-refused")
