@@ -1,6 +1,6 @@
 # The settings folder: type a value once
 
-*Written 2026-11-18 (KIT-853, KIT-854). Script: `scripts/pipeline_settings.py`.*
+*Written 2026-11-18 (KIT-853, KIT-854, KIT-855). Script: `scripts/pipeline_settings.py`.*
 
 Each part of the pipeline reads its own settings file: `stage-e.conf`, `bridge.conf`, `queue.conf`
 and eight more. Many of them repeat the same values: the pipeline's account, the dispatcher, the
@@ -17,7 +17,8 @@ file that needs it.
 `~/Library/Application Support/claude-pipeline/settings`. It is yours, private, and never in a
 repository. `--settings-dir`, or the `PIPELINE_SETTINGS_DIR` variable, moves it.
 
-It holds one file, `machine.conf`, in three kinds of section:
+It holds `machine.conf`, one file per project in `projects/` (below), and `written.json`, the record
+of what was last written (see "A hand edit"). `machine.conf` has three kinds of section:
 
 | Section | What goes there |
 | --- | --- |
@@ -94,6 +95,8 @@ python3 scripts/pipeline_settings.py check           # read-only: the rules belo
 python3 scripts/pipeline_settings.py write           # show every change, write nothing
 python3 scripts/pipeline_settings.py write --apply   # write them, and read each file back
 python3 scripts/pipeline_settings.py where           # where the folder, the part files and the places are
+python3 scripts/pipeline_settings.py export --to ~/Desktop/settings.txt      # one plain file, for a new Mac
+python3 scripts/pipeline_settings.py import --from ~/Desktop/settings.txt    # on the new Mac: show it first
 ```
 
 - **`write` shows before it writes.** Each change is listed: the file, the key, the value now and the
@@ -105,9 +108,51 @@ python3 scripts/pipeline_settings.py where           # where the folder, the par
   one is written, so one changed file stops them all. Only a failure part way through the writing
   itself, such as a full disk, can leave some files written. The output then names each file,
   written or not.
-- **`init`, `gather --apply` and `write --apply` refuse inside a Claude session,** and as root. Run
-  them in your own terminal. `check`, `where`, `map`, and `gather` and `write` without `--apply`,
-  only read.
+- **`init`, `gather --apply`, `import --apply`, `export` and `write --apply` refuse inside a Claude
+  session,** and as root. Run them in your own terminal. `check`, `where`, `map`, and `gather`,
+  `import` and `write` without `--apply`, only read.
+
+---
+
+## A hand edit
+
+`write --apply` keeps a record beside `machine.conf`, `written.json`: what the folder last gave each
+part file. When you then change one of those keys in a part file by hand, the next `write` finds it.
+
+- **It is shown with both values,** the file's and the folder's, and nothing is written.
+- **`write --apply` asks which wins,** one hand edit at a time. Type `file` or `folder`. Anything else
+  writes nothing.
+- **`folder`** puts the folder's value back in the file.
+- **`file`** keeps the file's value, and puts it in that part's own section of `machine.conf`. A
+  shared value still reaches the other files.
+- **A file's value shaped like a secret is never taken,** and neither is a key the file no longer sets.
+  Only `folder` can win then.
+- **With no record yet,** such as the first write, a difference is the folder's own change, shown
+  with both values as usual.
+
+---
+
+## A new Mac
+
+```
+python3 scripts/pipeline_settings.py export --to ~/Desktop/settings.txt   # on the old Mac
+python3 scripts/pipeline_settings.py import --from settings.txt           # on the new Mac: shows it
+python3 scripts/pipeline_settings.py import --from settings.txt --apply   # then writes it, after your yes
+```
+
+- **The export is one plain file:** `machine.conf` and each project's file, each under a
+  `=== <path>` line, and which part files were on the old Mac. Read it before you copy it.
+- **It never holds a secret, or the record.** `check` must pass first, so nothing shaped like a key
+  leaves the folder. Keys are stored again on the new Mac, by each part's own installer.
+- **It never writes over a file that is there, or inside a git repository.**
+- **`import` shows the folder the file makes, and writes nothing.** It says which part files were on
+  the old Mac and are not here yet, and any place it names that is not on this Mac, such as an
+  old `PARTS_DIR`.
+- **`import --apply` asks for a typed `yes`,** and writes the folder whole or not at all. It writes
+  only into a folder with no settings yet. It refuses a file that holds a secret, names a file that
+  is not a setting, or holds anything `check` would refuse.
+- **It never writes a part file.** Copy the example of each part you want on this Mac, such as
+  `cp stage-e.conf.example stage-e.conf`, then run `write`.
 
 ---
 
@@ -131,9 +176,5 @@ python3 scripts/pipeline_settings.py where           # where the folder, the par
 
 ## What is not here yet
 
-- **Hand edits.** When you change a key by hand in a part file, and the folder also holds that key,
-  `write` shows the difference and `--apply` puts the folder's value back. Make the change in the
-  folder instead.
-- **Export and import** for a new Mac.
 - **The places are not read from here yet.** The one command still takes `--consent-record`, and each
   part still names its own state and env files. `where` says so for each.
