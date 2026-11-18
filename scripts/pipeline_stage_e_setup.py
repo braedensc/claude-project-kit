@@ -436,6 +436,8 @@ REQUIRED_SCRIPTS = ("pipeline_review_poller.py", "pipeline_bounce_local.py",
                     "pipeline_catchup_poller.py", "pipeline_review_local.py",
                     "pipeline_review_basis.py", "pipeline_telemetry_local.py", "pipeline_criteria_snapshot.py",
                     "gh_fallback.py", "pr_conflict.py", "pipeline_dispatch_local.py",
+                    # The one list of agent-environment markers the dispatcher imports (KIT-690).
+                    "pipeline_agent_env.py",
                     "pipeline_labels.py", "check_schemas.py", "check_ticket_dor.py",
                     "check_grader_paths.py",
                     "jsonschema_mini.py", "telemetry_block.py", "telemetry_scrape.py",
@@ -449,8 +451,10 @@ REQUIRED_SCRIPTS = ("pipeline_review_poller.py", "pipeline_bounce_local.py",
                     # The validator's ledger, whose send-backs the bounce driver reads (KIT-542).
                     "pipeline_validator_ledger.py",
                     # The runner's store, where the bounce driver asks the runner for a fix on the
-                    # runner lane (KIT-765), and the usage kinds its own battery checks.
+                    # runner lane (KIT-765), and the usage kinds its own battery checks, with the
+                    # spend ledgers' one reader the usage runs import (KIT-844).
                     "pipeline_runner_store.py", "pipeline_usage_runs.py",
+                    "pipeline_spend_ledger.py",
                     # The one lock a pass of the review poller and the bounce driver takes (KIT-681).
                     "pipeline_pass_lock.py",
                     # Their `--selftest` runs inside one run folder it removes (KIT-450).

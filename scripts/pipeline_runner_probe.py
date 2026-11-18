@@ -63,7 +63,7 @@ try:
     import pipeline_harness_claude as harness
     import pipeline_runner_guard as guard_launcher
     import pipeline_voice as voice
-    from pipeline_dispatch_local import AGENT_ENV_MARKERS
+    from pipeline_agent_env import AGENT_ENV_MARKERS
 except ImportError as exc:  # a packaging accident, never a state to run in
     sys.exit("FAIL: %s. The probe uses the runner's own code and keeps no copy." % exc)
 

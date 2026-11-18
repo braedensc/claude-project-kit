@@ -67,7 +67,7 @@ The other installers check less:
 | Installer | Checks | Where |
 | --- | --- | --- |
 | Idea gate | The account exists and its home reads | `scripts/pipeline_stage_a_setup.py:2200` |
-| Notifier | Home is a plain path; the role's kit copy matches yours; Python runs as the role | `scripts/pipeline_notifier_setup.py:1732` |
+| Notifier | Home is a plain path; the role's kit copy matches yours; Python runs as the role | `scripts/pipeline_notifier_setup.py:1919` |
 | Queue | Home reads; clone and env file read as the role | `scripts/pipeline_queue_setup.py:482` |
 | Sweep | Home reads | `scripts/pipeline_sweep_setup.py:241` |
 | Watcher | Makes its own account; refuses one with a login shell | `scripts/pipeline_watcher_setup.py:475` |

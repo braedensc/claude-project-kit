@@ -14,8 +14,11 @@ The formats it reads and writes: `docs/PIPELINE-CONTRACT.md` section 28, and sec
 - **Nothing installs it yet.** Its installer comes with the first lane that moves.
 - **No real session goes through it yet.** Its selftest runs it against a stand-in program.
 
-Each kind of session is data now, behind walls KIT-630 measured (KIT-704). Two things still come
-before any lane moves: the probe of each kind's walls, run live as the role account, and a
+A lane runs through the runner only when both switches are on: the caller's own (the job that asks)
+and the runner's lane for that project. Either one off is the way back.
+
+Each kind of session is data now, behind walls the probe proved live for every kind, as the role
+account, on 18 Nov 2026: 95 of 95 (KIT-704). One thing still comes before any lane moves: a
 root-owned copy of the kit for the runner to run from. Its installer makes that copy.
 
 ## What it does
@@ -316,9 +319,21 @@ One JSON file. The example is `runner.example.json`. `~/` means the account's ow
 | `hold` | The watcher's hold file (contract section 20). Set, nothing starts. | none |
 | `limits` | `wall_minutes`, `memory_mb`, `disk_mb`, `check_seconds` (how often trees and folders are measured) and `room` (the floor). See "Its limits". | above |
 | `session_tools` | `key_file`, the session writer's tracker key, and `writer_user_id`, the user it must belong to, never an owner. See "The session's own tracker tools". Absent, no session gets tracker tools. | none |
-| `projects` | Each project: `repo` (the runner's own clone), `base`, `approval_states` per kind, `allowed_hosts`. | required |
+| `projects` | Each project: `repo` (the runner's own clone), `base`, `lanes`, `approval_states` per kind, `allowed_hosts`. | required |
 
 The four folders must not sit inside one another.
+
+**Each project's lanes.** `lanes` holds `true` or `false` for each kind of session: `code`, `fix`,
+`conflict`, `review`, `plan` and `acceptance`. A kind left out is off, and so is a project with no
+`lanes`. The runner refuses a start or resume for a lane that is off, before it makes or reads
+anything, and says so in the request's answer. Its own resume of an interrupted run on such a lane
+is refused too, and the run's record says `auto_resume: refused`. A stop is always taken. A lane that
+is on needs its approved states in `approval_states`: `fix` and `conflict` use the `code` states.
+`enabled` stays the runner's own switch: off, it takes nothing, whatever the lanes say.
+
+Good: `"lanes": {"review": true}` for the drill repository. Only reviews of it go through the runner.
+Not: a review request for a project whose `review` lane is off. It is refused: "the review lane is
+off for project app".
 
 ## Checking it
 

@@ -255,7 +255,8 @@ npm run test:notifier        # human-action notifier: marks table, the three §1
                              #   as a pass when it could not check (KIT-555)
 npm run test:heartbeat-monitor  # the job that READS the three heartbeats: one comment
                              #   per incident, the sleep blind spot, §13 exit codes
-npm run test:notifier-setup  # notifier installer (KIT-116): conf-all-errors, agent-refused, no secret in output
+npm run test:notifier-setup  # notifier installer (KIT-116): conf-all-errors, agent-refused, no secret in output;
+                             #   `check` rows, `apply` answers through a pipe, the first-pass ceiling (KIT-850)
 npm run test:pass-lock       # the one lock a pass of the review poller, notifier, bounce driver, queue starter and Stage E installer takes: a second at once does nothing and says so (KIT-681)
 npm run test:root-guard      # every installer refuses to run as root with one shared message, and changes nothing (KIT-693)
 npm run test:stage-e-setup   # Stage E installer: conf errors all-at-once, idempotency, no
@@ -385,6 +386,9 @@ npm run test:usage-runs      # the usage runs (KIT-422): the dispatcher's logs r
 npm run test:usage           # the usage job (KIT-422): the runs counted into one file of spend;
                              #   the week unknown not guessed, a source it could not read said,
                              #   a file that does not conform never written
+npm run test:spend-ledger    # the spend ledgers (KIT-844): one row per model call no dispatcher
+                             #   log records; one writer, one reader; a ledger it cannot read
+                             #   gives no calls, never zero; an unknown cost is null
 npm run test:queue-pool      # the queue's pool (KIT-433): who may start without the owner, by actor
                              #   in the history; a history it cannot read is held and said
 npm run test:queue-read      # the queue's reader (KIT-445): the tracker and three records, one inputs file;
@@ -403,7 +407,8 @@ npm run test:runner-store    # the runner's store (KIT-642): requests and run re
                              #   walls, each caller for its own kinds; unreadable runs are None
 npm run test:runner          # the runner (KIT-642): start, resume, stop and a restart against a
                              #   stand-in; the owner's approval from the history; the pin; the one
-                             #   command line; a run that died resumed once; leaves nothing behind
+                             #   command line; a run that died resumed once; a lane that is off for
+                             #   its project refused in words (KIT-866); leaves nothing behind
 npm run test:runner-limits   # the runner's limits (KIT-643): stand-ins that grow without bound
                              #   in memory (a child that left the group too) and on disk stopped
                              #   with their whole tree; the floor; each incident told once
@@ -455,6 +460,8 @@ npm run test:machine-tickets # with test:routing-tags and test:sync-kit, three s
 npm run test:scratch-run     # the batteries' temp helper: one folder per run, gone on a
                              #   pass, a failure, Ctrl-C or a SIGTERM (KIT-450)
 npm run test:temp-leaks      # the leak check's own selftest
+npm run test:agent-env       # the one list of agent-environment markers (KIT-690): the hook's and the probe's copies equal it,
+                             #   no other copy under scripts/, each refusal pinned per marker
 npm run test:cleanup-probe   # the cleanup probe (KIT-468): a snapshot of the role account's areas names and sizes
                              #   only; `compare` says what a run left behind, and never calls unread areas clean
 npm run check:temp-leaks     # every battery once, one at a time, in its own empty TMPDIR;

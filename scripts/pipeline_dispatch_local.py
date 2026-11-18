@@ -101,6 +101,7 @@ from datetime import datetime, timedelta, timezone
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import jsonschema_mini as jsm  # noqa: E402
 from pipeline_labels import resolve_label_keys  # noqa: E402
+from pipeline_agent_env import AGENT_ENV_MARKERS  # noqa: E402,F401  (one list; re-exported, importers keep working)
 
 DELIVERY_FILE = "delivery.json"
 DELIVERY_VERSION = 1
@@ -120,8 +121,7 @@ CONFIG_REFS = ("origin/main", "origin/master", "main", "master")
 # a model is driving, and a session placing its own binding is the whole thing
 # §3 forbids. No override flag: an escape hatch documented in --help is not a
 # refusal, and the honest bypass (scrubbing the variable) at least shows up in
-# the transcript.
-AGENT_ENV_MARKERS = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_PROJECT_DIR", "AI_AGENT")
+# the transcript. The list itself lives in scripts/pipeline_agent_env.py (KIT-690).
 
 BRANCH_NAME_RE = re.compile(r"^(feat|fix|chore|refactor|docs)/[a-z0-9][a-z0-9-]*$")
 TICKET_ID_RE = re.compile(r"^([A-Z][A-Z0-9]*)-([0-9]+)$")

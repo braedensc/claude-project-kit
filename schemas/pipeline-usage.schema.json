@@ -2,12 +2,12 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/braedensc/claude-project-kit/schemas/pipeline-usage.schema.json",
   "title": "Pipeline usage file",
-  "description": "The machine-readable definition of docs/PIPELINE-CONTRACT.md §17 — the one file the usage job (scripts/pipeline_usage_local.py) writes each pass: what the pipeline spent per local day, and since the plan's weekly reset by kind of work and by piece; how long its sessions ran; Anthropic's newest word on each usage window; how each session signed in; the runs that never reached the model, and the runs the plan's limit cut off. All of it is read from the dispatcher's own session logs. A later queue reads it to decide when new work may start; nothing reads it to approve or merge (KIT-422).",
+  "description": "The machine-readable definition of docs/PIPELINE-CONTRACT.md §17 — the one file the usage job (scripts/pipeline_usage_local.py) writes each pass: what the pipeline spent per local day, and since the plan's weekly reset by kind of work and by piece; how long its sessions ran; Anthropic's newest word on each usage window; how each session signed in; the runs that never reached the model, and the runs the plan's limit cut off. All of it is read from the dispatcher's own session logs, and from the spend ledgers of the calls no log records (§30). A later queue reads it to decide when new work may start; nothing reads it to approve or merge (KIT-422).",
   "$comment": "FIELDS ONLY. Every value is a number, a ticket id, a model name that matches a strict pattern, a word from a closed list, a date, or a time to the second in UTC. No prompt, reply, comment or ticket title reaches this file. A figure that could not be read is null or absent, never zero: a reader says \"I couldn't check\" for a source that is not `read`.",
 
   "type": "object",
-  "required": ["schema", "written_at", "started_at", "result", "error", "sources", "judge", "week", "days",
-               "pieces", "status", "sign_in", "never_reached_model", "limit_stops", "limit_stops_over_cap"],
+  "required": ["schema", "written_at", "started_at", "result", "error", "sources", "judge", "spend", "week",
+               "days", "pieces", "status", "sign_in", "never_reached_model", "limit_stops", "limit_stops_over_cap"],
   "additionalProperties": false,
 
   "properties": {
@@ -45,6 +45,18 @@
     "judge": {
       "$ref": "#/$defs/judge_note",
       "description": "The judge's own record of what each call cost, and whether it was read (§17, KIT-569)."
+    },
+    "spend": {
+      "type": "object",
+      "required": ["morning", "standup", "tech_lead", "conflict_waker"],
+      "additionalProperties": false,
+      "description": "The spend ledgers (§30, KIT-844): one entry per caller that keeps one, saying whether its ledger was read, and its calls in the lookback's days. A ledger that is off or could not be read has no figures: null, never zero.",
+      "properties": {
+        "morning": {"$ref": "#/$defs/spend_ledger", "description": "The morning job's planner call. Its calls are the `morning` kind."},
+        "standup": {"$ref": "#/$defs/spend_ledger", "description": "The stand-up's turn. Its calls are the `standup` kind."},
+        "tech_lead": {"$ref": "#/$defs/spend_ledger", "description": "The tech lead's turns, for a DM or a plan note. Its calls count as `tech_lead`."},
+        "conflict_waker": {"$ref": "#/$defs/spend_ledger", "description": "The fix sessions the conflict waker starts on a person's machine. Its calls count as `conflict_fix`."}
+      }
     },
     "week": {"$ref": "#/$defs/week"},
     "days": {
@@ -193,9 +205,9 @@
     },
     "kind_totals": {
       "type": "object",
-      "required": ["tech_lead", "review", "planner", "coding", "bounce_fix", "conflict_fix", "catch_up", "other_later", "judge"],
+      "required": ["tech_lead", "review", "planner", "coding", "bounce_fix", "conflict_fix", "catch_up", "other_later", "judge", "morning", "standup"],
       "additionalProperties": false,
-      "description": "Runs and spend for each kind of work. Every kind is always present, with zeros for a kind that did not run. `judge` is the watcher's judge (KIT-569): each model call it made, counted from its own record, not from the dispatcher's logs.",
+      "description": "Runs and spend for each kind of work. Every kind is always present, with zeros for a kind that did not run. `judge` is the watcher's judge (KIT-569): each model call it made, counted from its own record, not from the dispatcher's logs. `morning` and `standup` are the morning job's and the stand-up's calls, counted from their spend ledgers (§30, KIT-844), as are the tech lead's turns in `tech_lead` and the conflict waker's fixes in `conflict_fix`.",
       "properties": {
         "tech_lead": {"$ref": "#/$defs/kind_total"},
         "review": {"$ref": "#/$defs/kind_total"},
@@ -205,7 +217,9 @@
         "conflict_fix": {"$ref": "#/$defs/kind_total"},
         "catch_up": {"$ref": "#/$defs/kind_total"},
         "other_later": {"$ref": "#/$defs/kind_total"},
-        "judge": {"$ref": "#/$defs/kind_total"}
+        "judge": {"$ref": "#/$defs/kind_total"},
+        "morning": {"$ref": "#/$defs/kind_total"},
+        "standup": {"$ref": "#/$defs/kind_total"}
       }
     },
     "judge_note": {
@@ -218,12 +232,42 @@
         "reason": {"$ref": "#/$defs/line_or_null"}
       }
     },
+    "spend_ledger": {
+      "type": "object",
+      "required": ["state", "reason", "calls", "unpriced", "usd", "models", "billing"],
+      "additionalProperties": false,
+      "description": "One spend ledger (§30): whether it was read, through the ledgers' one reader, and its calls in the lookback's days. When `state` is `could-not-read` or `off`, every figure is null: unknown, never zero.",
+      "properties": {
+        "state": {
+          "enum": ["read", "partly-read", "could-not-read", "off"],
+          "description": "`read`: every line is a row of the ledger; a ledger not written yet, in a folder that exists, is read with no calls. `partly-read`: some lines were not rows, or its end did not reach back to the lookback; the rows it read are counted. `could-not-read`: no row could be trusted, so none is counted. `off`: the config names no ledger for it."
+        },
+        "reason": {"$ref": "#/$defs/line_or_null", "description": "Why it was not read whole, in the job's own words; null when it was, or when it is off."},
+        "calls": {"$ref": "#/$defs/count_or_null", "description": "Its calls in the lookback's days, priced or not."},
+        "unpriced": {"$ref": "#/$defs/count_or_null", "description": "Its calls whose cost the caller could not read: counted in `calls`, never in `usd`."},
+        "usd": {"$ref": "#/$defs/usd_or_null", "description": "The sum of its priced calls."},
+        "models": {
+          "oneOf": [
+            {"type": "object", "maxProperties": 64, "propertyNames": {"$ref": "#/$defs/model"}, "additionalProperties": {"$ref": "#/$defs/count"}},
+            {"type": "null"}
+          ],
+          "description": "Its calls by the model that carried them. A call that named no model is left out, so the counts can fall short of `calls`."
+        },
+        "billing": {
+          "oneOf": [
+            {"type": "object", "propertyNames": {"enum": ["plan", "key", "unknown"]}, "additionalProperties": {"$ref": "#/$defs/count"}},
+            {"type": "null"}
+          ],
+          "description": "Its calls by how they were paid for: `plan`, `key` or `unknown` (§30)."
+        }
+      }
+    },
     "model_usd": {
       "type": "object",
       "maxProperties": 64,
       "propertyNames": {"$ref": "#/$defs/model"},
       "additionalProperties": {"$ref": "#/$defs/usd"},
-      "description": "Spend by the model that ran it. It can fall short of the total when a result named no model. At most 64: past that the job folds the cheapest into `other`, so the spend still adds up."
+      "description": "Spend by the model that ran it, from the dispatcher's logs and the spend ledgers. It can fall short of the total when a result or a call named no model. At most 64: past that the job folds the cheapest into `other`, so the spend still adds up."
     },
     "week": {
       "type": "object",

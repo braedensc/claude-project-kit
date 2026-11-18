@@ -78,8 +78,8 @@ NAMED_INSTALLERS = (
 # The only arguments a check or apply may carry. The one command will run these with the
 # owner's password session, so the list is closed: a new word is a reviewed change here.
 ALLOWED_ARGS = frozenset({
-    "run", "verify", "status", "check", "install", "review", "update", "dispatcher", "merge",
-    "push", "--dry-run", "--apply", "--conf", "--json",
+    "run", "verify", "status", "check", "apply", "install", "review", "update", "dispatcher",
+    "merge", "push", "--dry-run", "--apply", "--conf", "--json",
     "stage-e.conf", "stage-a.conf", "notifier.conf", "bridge.conf", "chat-lane.conf",
     "conflict-waker.conf", "queue.conf", "sweep.conf", "watcher.conf", "update.conf",
     "acceptance.conf",
@@ -607,10 +607,23 @@ def render(doc):
         "## What is not proven",
         "",
         "- The list was checked against the kit's code, not against a running machine. No ticket yet.",
-        "- No part has a first-pass ceiling yet: every `ceiling` is empty. No ticket yet.",
+        ceiling_line(parts),
         "",
     ]
     return "\n".join(out)
+
+
+def ceiling_line(parts):
+    """The page's line on first-pass ceilings, read from the list: never a sentence that outlives
+    the first part to declare one (KIT-850)."""
+    capped = [p for p in parts if p.get("ceiling") is not None]
+    if not capped:
+        return "- No part has a first-pass ceiling yet: every `ceiling` is empty. No ticket yet."
+    return ("- First-pass ceilings are declared for %d of %d parts: %s. Above its ceiling a part is "
+            "installed and left off. The rest have none yet; each comes with its installer's own "
+            "change (KIT-655)."
+            % (len(capped), len(parts),
+               "; ".join("%s, %d" % (p["name"], p["ceiling"]) for p in capped)))
 
 
 def rule_page(doc, root):
@@ -942,6 +955,19 @@ def selftest():
     expect("page: render names every part", all(p["name"] in page for p in good["parts"]), True)
     expect("page: render lists a part with no lesson", "No lesson yet" in page and "(`beta`)" in page, True)
     expect("page: render is the same twice", render(good), page)
+    # ceilings (KIT-850): the page's line is read from the list, never a sentence that outlives it
+    capped = copy.deepcopy(good)
+    a(capped).update(ceiling=5)
+    page5 = render(capped)
+    expect("page: with no ceiling anywhere, the page says none is declared",
+           "No part has a first-pass ceiling yet" in page, True)
+    expect("page: a part with a ceiling is named with its number, and the none-yet line is gone",
+           ("Something it does for you, 5" in page5, "No part has a first-pass ceiling yet" in page5),
+           (True, False))
+    fails("schema: a ceiling below zero fails", lambda d: a(d).update(ceiling=-1), "schema:")
+    fails("schema: a ceiling that is not a whole number fails", lambda d: a(d).update(ceiling="5"),
+          "schema:")
+    expect("a part with a whole-number ceiling passes every rule", run(lambda d: a(d).update(ceiling=5)), [])
 
     # The kit's own list passes, and owns every installer that exists today.
     try:
@@ -962,6 +988,13 @@ def selftest():
               if any(s in line for line in rule_owners([p for p in kit_parts if s not in p["scripts"]], KIT))]
     expect("removing any installer's row from the kit's list fails (%d installers)" % len(installers),
            (len(installers) >= 15, caught), (True, installers))
+    # KIT-850: the notifier's installer switches its job on itself, so its part declares the
+    # ceiling it is held to, as a whole number, and its job is the installer's to load.
+    notifier = [p for p in kit_parts if p.get("installer") == "scripts/pipeline_notifier_setup.py"]
+    expect("the kit's notifier part declares a whole-number first-pass ceiling, and its installer "
+           "loads its job (KIT-850)",
+           [(isinstance(p.get("ceiling"), int) and not isinstance(p.get("ceiling"), bool),
+             [j["loaded_by"] for j in p["jobs"]]) for p in notifier], [(True, ["installer"])])
 
     print("%s: %d failure(s)" % ("FAIL" if failures else "OK", len(failures)))
     return 1 if failures else 0

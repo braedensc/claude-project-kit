@@ -31,6 +31,7 @@ exists to prevent.
 | [Acceptance check request](#26-acceptance-check-request) | a comment on the plan's epic | the Slack bridge, on the owner's yes | the acceptance poller's live pass |
 | [Acceptance second look](#27-acceptance-second-look) | the acceptance session's answer, in its own thread | the acceptance session, asked by the live pass | the acceptance poller's live pass |
 | [Run record](#28-run-record) | the runner's own store, outside every worktree | requests: five pipeline jobs; records: the runner | the runner; the usage job, when a lane moves |
+| [Spend ledgers](#30-spend-ledgers) | each caller's own state folder, outside every worktree | the four callers whose model calls no dispatcher log records, by one writer function | the usage job, by one reader function |
 
 > **§8 onwards are appended rather than slotted in beside their topical neighbours.**
 > These section numbers are cited by name from `.claude/hooks/session-start.py`, the
@@ -2215,7 +2216,8 @@ write, and writes nothing. `--print` also prints the document.
 One file says what the pipeline spent: the dollars each local day, the dollars since the plan's
 weekly reset by kind of work and by piece, how long its sessions ran, Anthropic's newest word on
 each usage window, how each session signed in, the runs that never reached the model, and
-the runs the plan's limit cut off (KIT-422, KIT-470). The usage job, `scripts/pipeline_usage_local.py`, writes it each pass. It runs with
+the runs the plan's limit cut off (KIT-422, KIT-470). It also counts the model calls no dispatcher
+log records, from their callers' spend ledgers (§30, KIT-844). The usage job, `scripts/pipeline_usage_local.py`, writes it each pass. It runs with
 no AI, no network and no credential, as the role account, like the status job. It reads files
 and writes one file. It starts nothing and stops nothing. Machine-readable:
 `schemas/pipeline-usage.schema.json`. The job checks its document against that schema before it
@@ -2255,14 +2257,16 @@ A run is the first of these that fits:
 
 | Kind | A run is this when | Told from |
 |---|---|---|
-| `tech_lead` | its folder starts with `slack-` | the folder |
+| `tech_lead` | its folder starts with `slack-`; or it is a call in the tech lead's spend ledger: a turn for a DM or a plan note (§30) | the folder, or the ledger |
 | `review` | its ticket is in the review poller's own record (`<stage_e_state_dir>/review-tickets.json`), or, for an old Reviews team, its folder starts with `reviews_team_key` and a `-` (KIT-596) | `record`, or the folder |
 | `planner` | its folder is a planning run's ticket in the idea gate's record | the idea gate's record |
 | `coding` | it is the first run in its folder, by the log file names: an older log outside the window still counts as the first | the file names |
-| `bounce_fix`, `conflict_fix` | it starts from 60 seconds before to 30 minutes after a `delivered` (or `conflict-delivered`) ledger row for that ticket; failing that, its first prompt carries the bounce driver's fixed line for a bounce (or a conflict fix) | the ledger, then the prompt |
+| `bounce_fix`, `conflict_fix` | it starts from 60 seconds before to 30 minutes after a `delivered` (or `conflict-delivered`) ledger row for that ticket; failing that, its first prompt carries the bounce driver's fixed line for a bounce (or a conflict fix). A call in the conflict waker's spend ledger is a `conflict_fix` too (§30) | the ledger, then the prompt; or the spend ledger |
 | `catch_up` | its first prompt carries the catch-up job's fixed line | the prompt |
 | `other_later` | any other later run: a person's reply, or a mention | nothing marks it |
 | `judge` | not a dispatcher run at all: a model call the watcher's judge made (KIT-569) | the judge's calls file, `judge-calls.json` (`judge_file`) |
+| `morning` | not a dispatcher run: the morning job's planner call (KIT-844) | its spend ledger (§30) |
+| `standup` | not a dispatcher run: the stand-up's turn (KIT-844) | its spend ledger (§30) |
 
 **The judge's calls (KIT-569).** The dispatcher's logs hold no judge call, so the judge keeps its own record: each call's time and
 cost, fields only. When the usage job's config names it (`judge_file`), every call counts as one run of kind `judge`, in the local
@@ -2275,6 +2279,26 @@ the job knows, or held a call row it does not know. Then **no call is counted, a
 The record is `{"schema": "pipeline-watcher-judge-calls/1", "calls": [{"at": "<UTC, to the second>", "usd": <dollars, 0 or more, or null when
 the call could not be priced>}, ...], ...}`. A call row holds those two keys and no others; a null cost counts as an unpriced run,
 never as zero dollars. More than 20000 rows, or a record over 4 MiB, is `could-not-read`.
+
+**The spend ledgers (KIT-844).** Four callers start the claude CLI themselves, and no dispatcher log
+holds their calls: the morning job's planner call, the stand-up's turn, the tech lead's turns and the
+conflict waker's fix sessions. Each keeps its own spend ledger, one row per call (§30), and the job
+reads every ledger its config names (`spend_ledgers`) through the ledgers' one reader. A call counts
+as one run of its caller's kind, as a judge call does: in the local day it ended, and in the week from
+the plan's reset. Its dollars are in the day's and the week's `usd`, and under its model in
+`by_model`. A call whose cost is unknown is unpriced: counted in `runs` and `unpriced`, never in
+`usd`. A call has no length, so it adds nothing to `seconds`, and no ticket, so it is never a piece.
+The tech lead's turns count as `tech_lead` and the waker's fixes as `conflict_fix`, the work those
+kinds already name. The morning job's and the stand-up's calls are kinds of their own.
+
+The top-level `spend` names each ledger, with what was read: its state, why it was not read whole,
+and its calls, unpriced calls, dollars, models and billing in the lookback's days. A ledger that is
+`could-not-read` (its folder is missing, this account may not read it, or no line is a row) has no
+calls counted, and **no figure: null, never zero**, and `result` is `partial`. A `partly-read`
+ledger makes it `partial` too: some of its lines were not rows, and only the rows it read are
+counted. A ledger not written yet, in a folder that exists, is `read` with no calls, unless its
+mark says a call lost its row (§30). A missing folder's reason names the config key to check. No
+caller writes its ledger yet (KIT-687 adds them), so the config's defaults leave every ledger off.
 
 The fixed lines are `Stage E bounce`, `Stage E conflict fix` and `Catch-up`, as the bounce driver
 and the catch-up job write them; the selftest reads their source to keep this true. The kind of
@@ -2356,36 +2380,49 @@ Words from the closed lists and numbers only: nothing a run said is kept.
     "planner": {"state": "read", "asked": 1, "answered": 1, "reason": null, "read_at": "2026-11-03T18:04:59Z"}
   },
   "judge": {"state": "read", "reason": null},
+  "spend": {
+    "morning": {"state": "read", "reason": null, "calls": 4, "unpriced": 0, "usd": 0.6,
+                "models": {"claude-sonnet-5-5": 4}, "billing": {"plan": 4}},
+    "standup": {"state": "read", "reason": null, "calls": 8, "unpriced": 1, "usd": 0.4,
+                "models": {"claude-sonnet-5-5": 7}, "billing": {"plan": 8}},
+    "tech_lead": {"state": "read", "reason": null, "calls": 20, "unpriced": 0, "usd": 3.1,
+                  "models": {"claude-sonnet-5-5": 20}, "billing": {"plan": 20}},
+    "conflict_waker": {"state": "off", "reason": null, "calls": null, "unpriced": null, "usd": null,
+                       "models": null, "billing": null}
+  },
   "week": {
     "known": true,
     "starts_at": "2026-10-30T09:00:00Z",
     "resets_at": "2026-11-06T09:00:00Z",
-    "usd": 41.337,
-    "runs": 130,
-    "unpriced": 2,
+    "usd": 42.337,
+    "runs": 142,
+    "unpriced": 3,
     "seconds": 51234,
     "by_kind": {
       "tech_lead": {"runs": 20, "usd": 3.1}, "review": {"runs": 18, "usd": 6.5},
       "planner": {"runs": 4, "usd": 2.4}, "coding": {"runs": 52, "usd": 21.3},
       "bounce_fix": {"runs": 14, "usd": 4.2}, "conflict_fix": {"runs": 3, "usd": 0.9},
       "catch_up": {"runs": 1, "usd": 0.15}, "other_later": {"runs": 18, "usd": 2.787},
-      "judge": {"runs": 0, "usd": 0}
+      "judge": {"runs": 0, "usd": 0}, "morning": {"runs": 4, "usd": 0.6},
+      "standup": {"runs": 8, "usd": 0.4}
     },
-    "by_model": {"claude-opus-5-5": 30.2, "claude-sonnet-5-5": 11.137}
+    "by_model": {"claude-opus-5-5": 30.2, "claude-sonnet-5-5": 12.137}
   },
   "days": [
-    {"date": "2026-11-02", "usd": 9.5, "runs": 31, "unpriced": 0, "seconds": 11800, "by_kind": {
+    {"date": "2026-11-02", "usd": 9.75, "runs": 34, "unpriced": 1, "seconds": 11800, "by_kind": {
       "tech_lead": {"runs": 4, "usd": 0.8}, "review": {"runs": 5, "usd": 1.9},
       "planner": {"runs": 1, "usd": 0.6}, "coding": {"runs": 10, "usd": 4.1},
       "bounce_fix": {"runs": 4, "usd": 1.2}, "conflict_fix": {"runs": 1, "usd": 0.3},
       "catch_up": {"runs": 0, "usd": 0}, "other_later": {"runs": 6, "usd": 0.6},
-      "judge": {"runs": 0, "usd": 0}}},
-    {"date": "2026-11-03", "usd": 7.25, "runs": 24, "unpriced": 2, "seconds": 9100, "by_kind": {
+      "judge": {"runs": 0, "usd": 0}, "morning": {"runs": 1, "usd": 0.15},
+      "standup": {"runs": 2, "usd": 0.1}}},
+    {"date": "2026-11-03", "usd": 7.45, "runs": 26, "unpriced": 2, "seconds": 9100, "by_kind": {
       "tech_lead": {"runs": 6, "usd": 0.9}, "review": {"runs": 4, "usd": 1.4},
       "planner": {"runs": 0, "usd": 0}, "coding": {"runs": 9, "usd": 3.55},
       "bounce_fix": {"runs": 2, "usd": 0.5}, "conflict_fix": {"runs": 0, "usd": 0},
       "catch_up": {"runs": 1, "usd": 0.15}, "other_later": {"runs": 2, "usd": 0.75},
-      "judge": {"runs": 0, "usd": 0}}}
+      "judge": {"runs": 0, "usd": 0}, "morning": {"runs": 1, "usd": 0.15},
+      "standup": {"runs": 1, "usd": 0.05}}}
   ],
   "pieces": [
     {"id": "ENG-301", "kind": "coding", "usd": 7.25, "runs": 6, "last_at": "2026-11-03T16:40:12Z"},
@@ -2412,7 +2449,10 @@ Words from the closed lists and numbers only: nothing a run said is kept.
 
 The example leaves out six of the lookback's eight days, and five of the week's pieces, for
 room. The ledger's review record that could not be read makes the pass `partial`. Two runs
-signed in with a key, and one of them was a chat, so one is listed.
+signed in with a key, and one of them was a chat, so one is listed. Three spend ledgers were
+read, and every call in them falls inside the week, so each ledger's figures are its kind's for the
+week: the tech lead's 20 runs are all its turns. One stand-up call, on 2 November, could not be
+priced and named no model: it is one of the week's three unpriced runs. The waker's ledger is off.
 
 ### The file
 
@@ -2421,9 +2461,10 @@ signed in with a key, and one of them was a chat, so one is listed.
 | `schema` | `"pipeline-usage/1"` | A reader that does not know the value refuses the file. |
 | `written_at` | time | When this pass wrote it. Its age is the answer to "how old is this?". |
 | `started_at` | time | When this pass began reading. |
-| `result` | `ok` \| `partial` \| `failed` | `ok`: every source that is on was read whole. `partial`: at least one was not (exit 3), and `sources` says which and why. `failed`: the logs could not be read, no source could be, or the pass stopped on an error (exit 1). |
-| `error` | string \| null | Null, unless the pass stopped on an unexpected error: then one line with the error's class and where it came from, and every source that is on is `could-not-read`. |
+| `result` | `ok` \| `partial` \| `failed` | `ok`: every source that is on was read whole. `partial`: at least one was not (exit 3), and `sources`, `judge` or `spend` says which and why. `failed`: the logs could not be read, no source could be, or the pass stopped on an error (exit 1). |
+| `error` | string \| null | Null, unless the pass stopped on an unexpected error: then one line with the error's class and where it came from, and every source that is on is `could-not-read`, as is every spend ledger the config names. |
 | `sources` | object | `logs`, `ledger` and `planner`, each a source below. |
+| `spend` | object | `morning`, `standup`, `tech_lead` and `conflict_waker`, each a spend ledger below (KIT-844). |
 | `week` | object | Since the plan's weekly reset, below. |
 | `days` | day[] | One for each local date in the lookback, oldest first. Empty when the logs could not be read. |
 | `pieces` | piece[] | At most 1000, the costliest first. Empty when the week is unknown. |
@@ -2447,6 +2488,22 @@ A reader says "I couldn't check" for a source that is not `read`. It never guess
 folder that does not exist is `could-not-read` and says which config key to check, or to set to
 an empty string to turn the source off.
 
+### A spend ledger
+
+What the job read of one caller's spend ledger (§30), and its calls in the lookback's days.
+
+| Field | Type | Notes |
+|---|---|---|
+| `state` | `read` \| `partly-read` \| `could-not-read` \| `off` | `read`: every line is a row of the ledger, and a ledger not written yet, in a folder that exists, is read with no calls. `partly-read`: some lines were not rows, or its end did not reach back to the lookback; the rows it read are counted. `could-not-read`: no row could be trusted, so none is counted. `off`: `spend_ledgers` names no ledger for it. |
+| `reason` | string \| null | Why it was not read whole, in the job's own words, never a line of the ledger. Null when it was, or when it is off. |
+| `calls` | integer \| null | Its calls in the lookback's days, priced or not. |
+| `unpriced` | integer \| null | Its calls whose cost the caller could not read: counted in `calls`, never in `usd`. |
+| `usd` | number \| null | The sum of its priced calls. |
+| `models` | object \| null | Its calls by the model that carried them, at most 64. A call that named no model is left out, so the counts can fall short of `calls`. |
+| `billing` | object \| null | Its calls by how they were paid for: `plan`, `key` or `unknown` (§30). |
+
+When `state` is `could-not-read` or `off`, every figure is null: the calls are unknown, never zero.
+
 ### The week
 
 | Field | Type | Notes |
@@ -2459,7 +2516,7 @@ an empty string to turn the source off.
 | `unpriced` | integer \| null | Runs with no usable total, counted in `runs` and never in `usd`. |
 | `seconds` | integer \| null | How long the week's sessions ran, summed over runs. |
 | `by_kind` | object \| null | Runs and spend for each kind in the table above. Every kind is present, with zeros for one that did not run. |
-| `by_model` | object \| null | Spend by the model that ran it, from `modelUsage`. It can fall short of `usd` when a result named no model. At most 64 models: past that the cheapest are folded into `other`, and the spend still adds up. |
+| `by_model` | object \| null | Spend by the model that ran it, from `modelUsage`, and from the spend ledgers' rows. It can fall short of `usd` when a result or a call named no model. At most 64 models: past that the cheapest are folded into `other`, and the spend still adds up. |
 
 ### A day
 
@@ -2527,6 +2584,7 @@ that shows.
 | `stage_e_state_dir` | `~/.stage-e/state` | Stage E's state folder. An empty string turns the `ledger` source off. |
 | `stage_a_state_dir` | `~/.stage-a/state` | The idea gate's state folder. An empty string turns the `planner` source off. |
 | `judge_file` | empty: off | The watcher judge's `judge-calls.json` (KIT-569): each call's time and dollars, no words. Empty turns the judge's cost off, and the file's `judge` says `off`. |
+| `spend_ledgers` | every one off | For each caller, its spend ledger's path (§30, KIT-844), where its job writes it: `morning` `~/.stage-e/queue/morning-spend.jsonl`, `standup` `~/.stage-e/state/standup-spend.jsonl`, `tech_lead` `~/.stage-e/state/tech-lead-spend.jsonl`. An empty path, or a caller left out, turns its ledger off. No caller writes its ledger yet: KIT-687 adds the writers and names the three role-account ledgers by default. Until then each is off, since a ledger nothing writes would read as no calls. The waker's ledger is in the owner's home, which the role account cannot read, so it is named only where this account can read it. A path inside a git working tree is a config error. |
 | `reviews_team_key` | empty | Optional (KIT-596): the key of an old separate Reviews team, such as `REV`. A review on a work team is told by the review poller's record, and a record that cannot be read is said in the Stage E source. |
 | `out` | `~/.stage-e/usage/usage.json` | Where the file is written, outside every git working tree. |
 | `lookback_days` | 8 | How many local dates the file covers, from 1 to 31. |
@@ -2543,7 +2601,7 @@ where, and a file that stops being written is stale.
 | Exit | Meaning |
 |---|---|
 | 0 | Every source that is on was read whole, and the file was written. |
-| 3 | The file was written, and at least one source was not read whole. It names which. |
+| 3 | The file was written, and at least one source, the judge's record or a spend ledger was not read whole. It names which. |
 | 1 | The logs could not be read, no source that is on could be, the pass crashed, or the file could not be written or did not conform. A file that did not conform is not written at all. |
 | 2 | Usage or config: nothing was read or written. |
 
@@ -3261,6 +3319,13 @@ did not answer, git could not fetch, or the watcher's hold (§20) is set. Everyt
 `ok: false` with the reason in words. A start refused after its workspace was made removes the
 workspace and its branch. Off (`enabled` false), the runner takes no request and resumes nothing.
 
+**Each project's lanes (KIT-866).** A project's `lanes` say, for each kind, whether the runner takes
+it for that project. Absent is off. A start or resume for a lane that is off, the runner's own
+included, is refused with "the <kind> lane is off for project <key>", before anything is made or
+read: a request's answer says `ok: false`, and an interrupted run's record says `auto_resume:
+refused`. A stop is always taken. A lane runs only when the caller's own switch and the runner's lane
+are both on.
+
 ### A run record
 
 `runs/<run>/run.json`. Only the runner writes it, whole, through `write_run()`.
@@ -3403,3 +3468,101 @@ never read as no change. The stand-up names each row written since the last stan
 first line, `# The queue installer's copy of queue.conf (KIT-700). Base: DAY_STOP=… LANES_PER_REPO=… PLANNED_LOAD=…`.
 The write path changes one setting's line in that copy. At the next install, a setting the copy changed from its base
 is written into the owner's queue.conf, unless the owner's own value also moved from the base; then the owner's stays.
+
+---
+
+## 30. Spend ledgers
+
+Some model calls leave no dispatcher log, so the usage file (§17) could not count them: the morning
+job's planner call, the stand-up's turn, the tech lead's turns and the conflict waker's fix sessions
+(KIT-687). Each of those callers keeps its own small ledger, one row per call, and the usage job
+reads every ledger beside the dispatcher's logs (KIT-844). Machine-readable:
+`schemas/pipeline-spend-ledger.schema.json`, which is one row.
+
+**One writer, one reader.** `scripts/pipeline_spend_ledger.py` holds both. `row_from_result()`
+builds a row from the CLI's JSON output. `append()` adds it, and nothing else writes a ledger.
+`read()` is the one reader, and the usage job reads every ledger through it.
+
+**Append-only, one line at a time.** `append()` stamps the row's time, checks the row, and adds
+it as one line at the ledger's end, in one write, never through a link. A last line that a crash
+left without its line break gets one first, so the torn row stays one bad line and the new row
+stays whole.
+
+**A lost row is never read as no call.** When the row is not one, or the ledger cannot be written,
+`append()` raises, and first adds the call's time as one line to a mark beside the ledger,
+`<ledger>.failed`. The reader counts each time in the mark from the time asked for: the ledger is
+then `partly-read`, or `could-not-read` when no row could be trusted. A folder that takes no write
+at all (a full disk, say) cannot hold the mark either, and then the caller's own output is the
+only word (Stage E on #622).
+
+**Fields only.** Numbers, closed words, a model name that matches §17's pattern, a session id and a
+time. No prompt, reply or error text reaches a row.
+
+**Unknown is never zero.** A cost the caller could not read is null, and the usage job counts the
+call as unpriced. So is a zero total from a call that did not end in success, as §17 reads a
+crash's zeroed total. A token count the CLI's output did not give is null.
+
+### Where each ledger lives
+
+Each ledger is a JSON Lines file in its caller's own state folder, outside every git working tree:
+one row per line, oldest first, only ever added to, mode 644.
+
+| Caller | Its ledger | Where, by default |
+|---|---|---|
+| `morning` | `morning-spend.jsonl`, beside the day plan | `~/.stage-e/queue/` |
+| `standup` | `standup-spend.jsonl`, in the bridge's state folder | `~/.stage-e/state/` |
+| `tech_lead` | `tech-lead-spend.jsonl`, in the bridge's state folder | `~/.stage-e/state/` |
+| `conflict_waker` | `conflict-waker-spend.jsonl`, in the waker's state folder | `~/.pr-conflict-waker/state/`, in the owner's home |
+
+The first three are in the role account's home, where the usage job runs. The waker runs as a
+person, so its ledger is in that person's home, which the role account cannot read: the usage job
+leaves it off unless its config names it. **No caller writes its ledger yet.** KIT-687 adds the
+writers, and with them names the three role-account ledgers in the usage job's defaults. Until then
+every ledger is off there, since a ledger nothing writes would read as no calls.
+
+### A row
+
+```json
+{"schema": "pipeline-spend-ledger/1", "at": "2026-11-18T09:12:03Z", "caller": "morning",
+ "model": "claude-sonnet-5-5", "usd": 0.041235,
+ "tokens": {"input": 1200, "output": 340, "cache_read": 8000, "cache_write": 0},
+ "run_id": "0b6c3e1e-1d2f-4a5b-8c9d-0e1f2a3b4c5d", "billing": "plan"}
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `schema` | `"pipeline-spend-ledger/1"` | On every row. A row with any other value is left out. |
+| `at` | time | When the call ended, in UTC to the second. `append()` stamps it; a caller cannot. |
+| `caller` | `morning` \| `standup` \| `tech_lead` \| `conflict_waker` | Who made the call. A ledger holds its own caller's rows only. |
+| `model` | string \| null | The model that carried the call: of the models the CLI's `modelUsage` names, the one it gives the most cost. `other` for a name that is not a plain one. With no such output, the model the caller asked for, or null when it asked for none. |
+| `usd` | number \| null | The CLI's own estimate of the call's cost at API prices, its `total_cost_usd`, to a millionth of a dollar. Null when the caller could not read it: no JSON output, or a call that ended in an error with no total. |
+| `tokens` | object | `input`, `output`, `cache_read` and `cache_write`: the CLI's `usage` figures `input_tokens`, `output_tokens`, `cache_read_input_tokens` and `cache_creation_input_tokens`. Each is null when the output did not give it. |
+| `run_id` | string \| null | The CLI's `session_id` for the call, when its output gave one. |
+| `billing` | `plan` \| `key` \| `unknown` | How the call was paid for, from the credential the caller handed the CLI. `plan`: a `claude setup-token` token and no key, so the call draws on the plan's usage windows. `key`: an API key, billed by the token. `unknown`: the CLI ran under a sign-in the caller did not choose, as a fix session on a person's machine does. |
+
+### How the reader reads
+
+`read()` gives a ledger's calls from a time on, oldest first, and a note: its state, and why, in
+fixed words. It never quotes a line of the ledger.
+
+| State | When |
+|---|---|
+| `off` | No path is named. |
+| `read` | Every line is a row of this ledger, and its mark records no failed call from the time asked for. A ledger not written yet, in a folder that exists, is read: no call yet. |
+| `partly-read` | Some lines are not rows of this ledger, its mark records a failed call, or its end does not reach back to the time asked for. The rows it read are given. |
+| `could-not-read` | Its folder is missing, this account may not read it, it is a link or not a regular file, it is inside a git working tree (where a session could write rows), or no row could be trusted. No calls are given at all, never an empty list, so nothing can count it as zero. |
+
+A line is left out when it is longer than 2 KiB, is not JSON, is not a row, or is another caller's
+row. Rows are appended in time order, so a bad line that comes before the first row from the time
+asked for, and before a row older than that time, is older still: it does not make the read
+partial, and a row a crash tore months ago does not mark the ledger forever. A bad line after a row
+from the time asked for always counts, even when a row stamped older follows it: that only says the
+clock went back (Stage E on #622). Past 4 MiB only the ledger's end is read, which holds over ten
+thousand rows. The same holds for the mark.
+
+### Who reads it
+
+The usage job, through `read()`, for each ledger its `spend_ledgers` config names. Each call counts
+as one run of its caller's kind, in the local day it ended and in the week: `morning` and `standup`
+are kinds of their own, a turn of the tech lead's counts as `tech_lead`, and a fix of the waker's
+as `conflict_fix`. The usage file's `spend` says what was read of each ledger (§17).

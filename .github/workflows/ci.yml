@@ -224,6 +224,10 @@ jobs:
       - name: Local dispatcher selftest (contract §2, §3)
         run: python3 scripts/pipeline_dispatch_local.py --selftest
 
+      # The one list of agent-environment markers: copies pinned, refusals pinned (KIT-690).
+      - name: Agent-environment markers selftest (KIT-690)
+        run: python3 scripts/pipeline_agent_env.py --selftest
+
       # The autonomy gates and the telemetry pipeline. Same posture as the two
       # above: inert in this repo (no delivery.json, no store), so the selftests
       # are what has teeth. Each asserts its own contract rows against synthetic
@@ -452,6 +456,12 @@ jobs:
       # conform is never written, and no message text reaches the file or its output.
       - name: Stage E usage job selftest (the week, exit codes, refusals, fields only)
         run: python3 scripts/pipeline_usage_local.py --selftest
+      # The spend ledgers (KIT-844, contract §30): one row per model call that no dispatcher log
+      # records, one writer and one reader. Offline, in a temp folder only: a row from the CLI's
+      # output keeps no word of its text, an unknown cost is null and never zero, a ledger that
+      # cannot be read gives no calls at all, and the hand rules agree with the schema.
+      - name: Spend ledger selftest (one row per call, one writer, one reader, unknown never zero)
+        run: python3 scripts/pipeline_spend_ledger.py --selftest
       # The queue's pool (KIT-433, MVP 2 part 2a): which tickets may start without the owner. A
       # pure function, so the selftest stands in for everything it is given: the owner by actor
       # in the history, never the dispatcher's user; a history or record it cannot read held and

@@ -42,7 +42,8 @@ credential_shape, scrub = ns.credential_shape, ns.scrub
 _s = lambda text: scrub(text, ())      # noqa: E731  (everything printed passes through the notifier's scrub)
 DEFAULT_CONF = "sweep.conf"
 SWEEP_SCRIPT = "pipeline_sweep.py"
-REQUIRED_SCRIPTS = (SWEEP_SCRIPT, "scratch_run.py")
+# pipeline_agent_env.py: the sweep imports its list of agent-environment markers (KIT-690).
+REQUIRED_SCRIPTS = (SWEEP_SCRIPT, "scratch_run.py", "pipeline_agent_env.py")
 SELFTESTS = (SWEEP_SCRIPT,)
 DRY_OK = (0, 4)                  # the sweep's own: 0 ran, 4 ran and left something it could not judge
 
