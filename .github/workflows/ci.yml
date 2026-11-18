@@ -116,6 +116,14 @@ jobs:
           python3 -m pip install --quiet pyyaml
           python3 scripts/check_agent_trigger_author.py --selftest
           python3 scripts/check_agent_trigger_author.py
+      # KIT-668. The label gate runs the default branch's workflow and code, never the PR's.
+      - name: Label gate check (the gate runs from the default branch)
+        run: |
+          python3 -m pip install --quiet pyyaml
+          python3 scripts/check_label_gate.py --selftest
+          python3 scripts/check_label_gate.py
+      - name: Label gate policy selftest (the owner's allow for pull_request_target)
+        run: python3 scripts/pipeline_gate_policy.py --selftest
 
       # KIT-652. The kit's Python imports only the standard library, bar a short named list,
       # because its jobs and hooks run on a Python with nothing added to it.
@@ -414,6 +422,12 @@ jobs:
       # the kit that owns it; the safety-system floor is never a switch; closed words only.
       - name: Validator limits selftest (pass or closed reasons; what it cannot tell fails)
         run: python3 scripts/pipeline_validator_limits.py --selftest
+      # What the validator's no does (KIT-542). Offline: one case per answer, the send-back budget's
+      # edge (the last send-back, then an escalation), a layer 1 or 2 hold carried as closed words
+      # and never the agent's, a wait that writes no row, the blocker's reply, and an urgent page
+      # that is said when the watcher cannot take it.
+      - name: Validator route selftest (send back on Stage E's budget; escalate; holds in closed words)
+        run: python3 scripts/pipeline_validator_route.py --selftest
       # The usage runs (KIT-422, contract §17): the dispatcher's logs, and the Stage E and
       # idea-gate records beside them, read into runs. Offline, reading only, in a temp folder:
       # a run's spend is its share of its session's running totals, a crash is unpriced and
@@ -636,7 +650,7 @@ jobs:
         run: |
           python3 scripts/pipeline_bridge_tracker.py --selftest
           python3 scripts/pipeline_bridge_config.py --selftest
-          npm run --silent test:bridge-requests
+          python3 scripts/pipeline_bridge_requests.py --selftest
           python3 scripts/pipeline_bridge_answers.py --selftest
           python3 scripts/pipeline_bridge_replan.py --selftest
           python3 scripts/pipeline_bridge_plans.py --selftest
@@ -791,6 +805,18 @@ jobs:
           python3 scripts/pipeline_machine_tickets.py --selftest
           python3 scripts/pipeline_routing_tags.py --selftest
           python3 .claude/skills/sync-kit/compare.py --selftest
+          python3 scripts/pipeline_acceptance_run.py --selftest
+          python3 scripts/pipeline_acceptance_setup.py --selftest
+          python3 scripts/pipeline_runner_store.py --selftest
+          python3 scripts/pipeline_runner.py --selftest
+          python3 scripts/pipeline_runner_limits.py --selftest
+
+      # KIT-620. Every package.json test:* script needs a step above, or an entry with a reason
+      # in the check's allow list. The leak sweeps do not count.
+      - name: CI covers every test script (a battery cannot silently stop blocking merges)
+        run: |
+          python3 scripts/check_ci_covers_tests.py --selftest
+          python3 scripts/check_ci_covers_tests.py
 
       - name: Dashboard selftest (self-contained page, one summary object)
         run: python3 scripts/telemetry_dashboard.py --selftest
