@@ -1600,7 +1600,7 @@ class PlansMixin(object):
                    kind="approve-already")
             return
         if by_validator:
-            waits = self.validator_waits(epic, validator)
+            waits = self.validator_waits(epic, validator, q.get("asked_at"))
             if waits:
                 self.say("  validator: %s: %s, so its approval does nothing" % (q["ticket"], waits))
                 return
@@ -1703,35 +1703,43 @@ class PlansMixin(object):
             return None, got["why"]
         return got["rows"], ""
 
-    def owners_idea(self, ticket):
-        """(True, "") when the plan's idea is one the owner filed himself, by the parts of the
-        queue pool's rule the bridge can read: his key filed it, it carries `provenance:human`,
-        and it has no parent. Found as a re-plan finds it (plan_idea). Else (False, why). A plan
-        from an idea an agent filed never counts as the validator's to approve (KIT-544): the
-        validator's own limits hold it, and this holds it again."""
-        idea, why = self.plan_idea({"ticket": ticket})
-        if idea is None:
-            return False, why
+    def owners_idea(self, idea):
+        """Nothing ("") when the plan's idea is one the owner filed himself, by the parts of the
+        queue pool's rule the bridge can read: his key filed it, it carries `provenance:human`, and
+        it has no parent. Else why not, in words. A plan from an idea an agent filed never counts as
+        the validator's to approve (KIT-544): the validator's own limits hold it, and this holds
+        it again."""
         ident = idea.get("identifier") or "?"
         if (idea.get("creator") or {}).get("id") != self.cfg["owner_user_id"]:
-            return False, "its idea %s was not filed with your key" % ident
+            return "its idea %s was not filed with your key" % ident
         if HUMAN_LABEL not in label_names(idea):
-            return False, "its idea %s does not carry `%s`" % (ident, HUMAN_LABEL)
+            return "its idea %s does not carry `%s`" % (ident, HUMAN_LABEL)
         if (idea.get("parent") or {}).get("id"):
-            return False, "its idea %s has a parent ticket" % ident
-        return True, ""
+            return "its idea %s has a parent ticket" % ident
+        return ""
 
-    def validator_waits(self, epic, at):
-        """Why the validator's approval, recorded at `at` (seconds), does not count for this plan
-        now, or "": the plan changed after the validator read it, so it waits for a new decision;
-        or its idea is not one the owner filed, which never counts."""
+    def validator_waits(self, epic, at, asked_at):
+        """Why the validator's approval, recorded at `at` (seconds), does not answer the question
+        asked at `asked_at` for this plan now, or "". Its idea, found as a re-plan finds it
+        (plan_idea), must be one the owner filed: otherwise it never counts. And it must be about
+        the plan as it stands and as he was asked about it: newer than the plan's, every piece's
+        and its idea's last change, and than the question. Any of those later waits for a new
+        decision (Stage E on #638: a piece taken out of the plan, which may date no ticket left
+        in it, shows against the question's own pieces, as for his yes)."""
+        idea, why = self.plan_idea({"ticket": epic["identifier"]})
+        why = why if idea is None else self.owners_idea(idea)
+        if why:
+            return "%s, which only you can approve" % why
         last = plan_last_change(epic)
-        if last is None:
+        idea_at = starter.pool.epoch(idea.get("updatedAt"))
+        if last is None or idea_at is None:
             return "the plan's last change is not dated, so its approval cannot be matched to it"
-        if at <= last:
-            return "the plan changed after the validator read it, so it waits for a new decision"
-        ok, why = self.owners_idea(epic["identifier"])
-        return "" if ok else "%s, which only you can approve" % why
+        if at <= max(last, idea_at):
+            return ("the plan or its idea changed after the validator read them, so it waits for "
+                    "a new decision")
+        if not isinstance(asked_at, (int, float)) or at <= asked_at:
+            return "the validator decided before I asked you, so it waits for a new decision"
+        return ""
 
     def validator_approvals(self):
         """KIT-544: with the validator's plans switch on, its `approved` row answers an open approve
@@ -8290,7 +8298,7 @@ def cases_validator(kit):
                 "description": run_text("PROD-6", "T1")}
             t.issues["PROD-50"]["description"] += "\n\nPlan id: PROD-60/abc"
             t.issues["PROD-6"].update(creator={"id": OWNER}, labels=["provenance:human"],
-                                      parent=None)
+                                      parent=None, updatedAt="2025-10-09T08:00:00.000Z")
             t.issues["PROD-6"].update(idea or {})
             for ident in ("PROD-50", "PROD-51", "PROD-52"):
                 t.issues[ident]["updatedAt"] = "2025-10-09T08:00:00.000Z"   # filed before it
@@ -8400,12 +8408,30 @@ def cases_validator(kit):
             t.issues["PROD-52"]["updatedAt"] = iso(now + 500)       # after the validator read it
             code, out = run(c, s, t, at=now + 1000)
             first = (list(t.moves), record(c), status_of(c),
-                     "changed after the validator read it" in out)
+                     "changed after the validator read them" in out)
             vledger.append(lpath, ROW, lambda: now + 1200)         # it judged the plan again
             run(c, s, t, at=now + 1500)
             check("validator-an-approval-older-than-the-plans-last-change-waits-for-a-new-one",
                   (first, t.moves, (record(c) or {}).get("approved_by")),
                   (([], None, [OPEN], True), [("uuid-50", "st-todo")], starter.pool.VALIDATOR))
+            # Stage E on #638: its idea is part of what it judged, and a decision made before you
+            # were asked is not its answer to the question.
+            for name, setup, when, why in (
+                    ("val-idea-changed",
+                     lambda t_: t_.issues["PROD-6"].update(updatedAt=iso(now + 500)), now + 100,
+                     "the plan or its idea changed after the validator read them"),
+                    ("val-before-asked", None, now - 100, "the validator decided before I asked you")):
+                c, s, t, root, lpath = vworld(name)
+                if setup:
+                    setup(t)
+                vledger.append(lpath, ROW, lambda when=when: when)
+                code, out = run(c, s, t, at=now + 1000)
+                first = (list(t.moves), record(c), status_of(c), why in out)
+                vledger.append(lpath, ROW, lambda: now + 1200)     # it judged the plan again
+                run(c, s, t, at=now + 1500)
+                check("validator-%s-waits-for-a-new-decision-then-approves" % name,
+                      (first, t.moves, (record(c) or {}).get("approved_by")),
+                      (([], None, [OPEN], True), [("uuid-50", "st-todo")], starter.pool.VALIDATOR))
             c, s, t, root, lpath = vworld("val-newest")
             decide(lpath, ROW, HELD)
             run(c, s, t, at=now + 1000)

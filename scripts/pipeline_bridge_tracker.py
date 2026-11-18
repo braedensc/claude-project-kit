@@ -47,7 +47,7 @@ Q_VIEWER = "query BridgeViewer { viewer { id } }"
 Q_ISSUE = """
 query BridgeIssue($id: String!) {
   issue(id: $id) {
-    id identifier title description createdAt url
+    id identifier title description createdAt updatedAt url
     state { id name type }
     team { key }
     labels(first: 50) { nodes { name } }
@@ -611,6 +611,9 @@ def cases_errors(kit):
             # validator's approval is about the plan as it stands.
             check("wiring-the-epic-read-dates-the-epics-and-each-pieces-last-change",
                   [part.count("updatedAt") for part in Q_EPIC.split("children(", 1)], [1, 1])
+            # ...and a ticket's own read dates it too: a plan's idea is part of what the validator
+            # judged (Stage E on #638).
+            check("wiring-a-tickets-read-dates-its-last-change", Q_ISSUE.count("updatedAt"), 1)
             check("wiring-epic-children-and-blockers",
                   ([k["identifier"] for k in ep["children"]["nodes"]],
                    [b["identifier"] for b, _s in blockers_of(ep["children"]["nodes"][1])]),

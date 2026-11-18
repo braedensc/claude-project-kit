@@ -34,15 +34,17 @@ ONE PASS, in order. Each step says what it did, or which nothing.
          At most one agent run per pass. The plan is read again after the agent answers: one whose
          text, pieces or idea changed meanwhile gets no row, and a later pass judges it as it stands.
 
-ITS LAST CHANGE.  The newest `updatedAt` of the plan and of its pieces, as the facts read them. A row
-is stamped with the time the plan was read, before the agent ran, so a row newer than the plan's last
-change is about the plan as it stands: any change made after the read makes it stale. The bridge
-acts on a row by the same rule.
+ITS LAST CHANGE.  The newest `updatedAt` of the plan, of its pieces and of its idea, as the facts
+read them. A row is stamped with the moment before the plan's last read: for the agent's decision,
+the read again after the run, and for a hold, the one read. Any change after that moment is caught
+by that read, or dated after the row. So a row newer than the plan's last change, and than its open
+question, is about the plan as it stands and as the owner was asked about it. The bridge acts on a
+row by the same rule.
 
 HOW A PLAN IS APPROVED.  Never here. The bridge approves it on its next pass
 (scripts/pipeline_bridge_plans.py, validator_approvals): its own open question, an `approved` row
-newer than the plan's last change, the plans switch still on, the plan's idea the owner's, and every
-check his own `yes` gets. It records the validator as the one who approved, never the owner. With the
+newer than the plan's last change and than that question, the plans switch still on, the plan's
+idea the owner's, and every check his own `yes` gets. It records the validator as the one who approved, never the owner. With the
 switch off, or the settings unreadable, his `approve` decides, as before.
 
 WHAT IT NEVER DOES (asserted in --selftest): approve, edit or start a plan, file a ticket, write to the
@@ -180,9 +182,10 @@ def run_pass(cfg, host, now=None, dry=False, say=print, clock=time.time):
         l2 = {"verdict": "yes", "reasons": []}      # the bridge's own open question: only you wait
         decision = route.decide("plan", l1, l2, None, None)
         latest, last = _latest(rows, plan), doc.get("last_change")
-        # A row about the plan as it stands: stamped after its last change.
+        # A row about the plan as it stands, and as you were asked about it: stamped after its
+        # last change and after the question (Stage E on #638).
         fresh = (latest is not None and last is not None
-                 and (pool.epoch(latest["at"]) or 0) > last)
+                 and (pool.epoch(latest["at"]) or 0) > max(last, asked[plan]))
         if decision["record"]:
             if fresh and (latest["kind"], latest["reasons"]) == (decision["kind"], decision["reasons"]):
                 say("  %s: still held for you (already recorded, unchanged since)." % plan)
@@ -210,6 +213,10 @@ def run_pass(cfg, host, now=None, dry=False, say=print, clock=time.time):
             say("  [dry-run] %s passes the hard limits: would run the agent on it." % plan)
             return EXIT_OK
         ran = host.run_agent(built)
+        # The row's time: the moment before the plan is read again. A change after it is caught by
+        # that read, or dated after the row; and a stand-up held while the agent ran still finds
+        # the row new (Stage E on #638).
+        judged_at = clock()
         again = host.facts(plan, now)
         if (again.get("brief") != doc.get("brief") or again.get("last_change") != last
                 or (again.get("limits") or {}).get("paths") != doc["limits"].get("paths")
@@ -224,7 +231,7 @@ def run_pass(cfg, host, now=None, dry=False, say=print, clock=time.time):
                 % (plan, "; ".join(decision["wait"])))
             return EXIT_OK
         say("  %s: the validator %s it." % (plan, KINDS.get(decision["kind"], decision["kind"])))
-        failed |= not _record(cfg, plan, decision, settings, dry, say, read_at)
+        failed |= not _record(cfg, plan, decision, settings, dry, say, judged_at)
         say("The pass ends: one agent run per pass.")
         return EXIT_FAILED if failed else EXIT_OK
     say("Nothing approved: no plan passes yet.")
@@ -232,8 +239,8 @@ def run_pass(cfg, host, now=None, dry=False, say=print, clock=time.time):
 
 
 def _record(cfg, plan, decision, settings, dry, say, read_at):
-    """The decision's row, stamped with the time the plan was read: a change after that makes it
-    stale (ITS LAST CHANGE)."""
+    """The decision's row, stamped `read_at`: the moment before the plan's last read. A change
+    after that makes it stale (ITS LAST CHANGE)."""
     row = route.row_for("plan", plan, None, decision, settings)
     if row is None:
         return True
@@ -288,11 +295,12 @@ class _FakeHost(object):
         self.agent_cfg, self.environ = agent_cfg, environ
         self.stub, self.log, self.during, self.unread = vrun.Stub(), [], None, None
         self.plans = {}              # plan -> {"paths", "origin", "state", "changed", "text", "idea"}
+        self.asked = {}              # plan -> when its open question was first asked, if not long ago
 
     def waiting(self):
         if self.unread:
             raise facts.Unread(self.unread)
-        return dict((p, 1_700_000_000.0) for p in self.plans)
+        return dict((p, self.asked.get(p, 1_700_000_000.0)) for p in self.plans)
 
     def facts(self, plan, now):
         p = dict({"paths": ["src/app.py"], "origin": "owner", "state": "backlog",
@@ -422,15 +430,19 @@ def selftest():
               ("<untrusted-criteria>\nIdea TOD-4: Build it" in given,
                "<untrusted-ticket>\nPlan TOD-10: Build it" in given), (True, True))
         row = (ledger.read(ledger_path)["rows"] or [{}])[0]
-        check("...its row is the validator's: subject plan, no head, its switch on, the plan's "
-              "read time",
+        check("...its row is the validator's: subject plan, no head, its switch on, and the moment "
+              "before the plan was read again after the run (Stage E on #638)",
               (row.get("subject"), row.get("head"), row.get("settings_on"), row.get("at")),
-              ("plan", None, ["approve-plans"], pool.iso(NOW + 1)))
+              ("plan", None, ["approve-plans"], pool.iso(NOW + 2)))
         code, said = go(host)
         check("...an approved plan unchanged since waits for the bridge: no second run, and the next "
               "plan is judged",
               (kinds(), host.log, "TOD-10: approved already" in said),
               ([("TOD-10", "approved", []), ("TOD-20", "approved", [])], ["agent", "agent"], True))
+        host.asked["TOD-10"] = tick[0] + 1           # you were asked again, after its decision
+        code, said = go(host)
+        check("...but a decision older than the plan's open question is not its answer: judged again",
+              (kinds()[2:], host.log), ([("TOD-10", "approved", [])], ["agent"] * 3))
 
         # 3. The provenance rule: an idea not certified as the owner's is never approved, whatever
         #    the switches, and no agent is run on it.

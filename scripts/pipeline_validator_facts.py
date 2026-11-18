@@ -25,8 +25,9 @@ THE SHAPE.  One document for every item. Each consumer reads its own part, and l
   ticket, plan, idea   the tracker ids it followed, or None
   state     a plan's own state type, as the tracker gives it (`backlog` until it is approved);
             None for the other kinds, or when it was not read
-  last_change   a plan's newest change, as the tracker dates it: the newest `updatedAt` of the plan
-            and of every piece, in seconds; None for the other kinds, or when one was not read
+  last_change   a plan's newest change, as the tracker dates it: the newest `updatedAt` of the plan,
+            of every piece and of its idea, in seconds; None for the other kinds, or when one of
+            them was not read
   unread    {fact: why}: every fact it could not read, by name, in fixed words
 
 UNREAD IS NEVER CLEAR (contract section 13).  A fact it could not read is None in its place and named in
@@ -107,8 +108,9 @@ DEFAULTS = {
 }
 PATH_KEYS = ("queue_config", "stage_e_ledger", "snapshot_dir", "acceptance_ledger", "watcher_status",
              "hold_file")
-ISSUE_QUERY = ("query($id: String!) { issue(id: $id) { id identifier title description creator { id } "
-               "team { key } labels(first: 20) { nodes { name } } parent { id identifier description "
+ISSUE_QUERY = ("query($id: String!) { issue(id: $id) { id identifier title description updatedAt "
+               "creator { id } team { key } labels(first: 20) { nodes { name } } "
+               "parent { id identifier description "
                "creator { id } labels(first: 20) { nodes { name } } "
                "children(first: %d) { nodes { identifier state { type } } "
                "pageInfo { hasNextPage } } } } }" % MAX_CHILDREN)
@@ -667,6 +669,7 @@ def for_plan(cfg, ident, now, run=None):
         state = (node.get("state") or {}).get("type") if isinstance(node.get("state"), dict) else None
         doc["state"] = state if isinstance(state, str) else None
         got = _read(doc, "origin", lambda: _origin(cfg, ident, node, is_plan=True))
+        idea = None
         if got:
             doc["limits"]["origin"], _plan, idea = got
             doc["idea"] = idea.get("identifier")
@@ -689,7 +692,8 @@ def for_plan(cfg, ident, now, run=None):
                                            _raise("the text of plan %s or a piece could not be read"
                                                   % ident))
             doc["brief"]["ticket"] = _read(doc, "ticket", lambda: plan_text(node, kids))
-            times = [pool.epoch(t.get("updatedAt")) for t in [node] + kids]
+            # The idea too: the agent judges the plan against it (Stage E on #638).
+            times = [pool.epoch(t.get("updatedAt")) for t in [node] + kids + [idea or {}]]
             doc["last_change"] = None if None in times else max(times)
         doc["limits"]["risk_paths"] = _read(doc, "risk_paths", lambda: _risk_of(cfg, run, node, "plan"))
     else:
@@ -1071,7 +1075,7 @@ def selftest():
             KIDS = (("TOD-11", "Write `src/parse.py`.", "2026-11-18T11:00:00.000Z"),
                     ("TOD-12", None, "2026-11-18T09:00:00.000Z"))
             IDEA = dict(issue("TOD-4", description="Parse the logs, and nothing more."),
-                        title="Log  parser")
+                        title="Log  parser", updatedAt="2026-11-18T08:00:00.000Z")
 
             def plan_with(node=None, idea=None, cfg_over=None):
                 tickets.clear()
@@ -1122,6 +1126,11 @@ def selftest():
             got = plan_with(node=plan_doc((("TOD-11", "x", None),)))
             check("a plan with a piece whose last change is not dated has no newest change",
                   (got["last_change"], got["brief"]["ticket"] is not None), (None, True))
+            check("a plan's newest change counts its idea: the agent judges the plan against it "
+                  "(Stage E on #638), and an idea not dated leaves it unknown",
+                  [plan_with(idea=dict(IDEA, updatedAt=at))["last_change"]
+                   for at in ("2026-11-18T12:30:00.000Z", None)],
+                  [pool.epoch("2026-11-18T12:30:00Z"), None])
             check("a plan someone approved, started or closed says its own state",
                   [plan_with(node=plan_doc(KIDS, state=s))["state"] for s in ("unstarted", "canceled")],
                   ["unstarted", "canceled"])

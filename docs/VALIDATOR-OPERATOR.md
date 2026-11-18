@@ -765,8 +765,9 @@ asked about is not judged. Nor is one that has left the backlog.
 | A plan it already decided, unchanged since | No second run. The plans after it get their turn. |
 | A plan edited while the agent judged it | Nothing written. A later pass judges it as it stands. |
 
-At most one agent run per pass. A row carries the time the plan was read, before the agent ran.
-A plan changed after that time needs a new decision.
+At most one agent run per pass. A row carries the moment before the plan's last read: after the
+agent's run, it is read once more. A change to the plan, its pieces or its idea after that moment
+needs a new decision, and so does a question asked after it.
 
 **The agent's brief.** Your idea's own text, and the plan with every piece as written. Each sits in
 its own fence, marked as data. The question is whether the plan asks for what your idea asks, and
@@ -778,7 +779,8 @@ when all of these hold:
 
 - the plans switch is still on, in the settings the queue's reader names
   (`reader.validator_settings_file`), and the ledger it names can be trusted;
-- the plan has not changed since the validator read it;
+- the plan, its pieces and its idea have not changed since the validator read them, and it
+  decided after you were asked;
 - its idea is yours: filed with your key, marked `provenance:human`, with no parent;
 - every check your own `yes` gets passes.
 
