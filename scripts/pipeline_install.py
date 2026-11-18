@@ -62,6 +62,18 @@ WHAT IT DOES, IN ORDER
      printed no table, or ended with any other code, is never "up to date". A `run` that ends
      on a card stops the command in Manual and is carried past in Automatic. With no
      `notifier.conf` the part is "off on this Mac" and nothing runs.
+  3d. The Slack bridge and the stand-up (`scripts/pipeline_bridge_setup.py`), when this Mac has a
+     `bridge.conf` (`--bridge-conf` names another). It runs `install`, the installer's compare
+     without `--apply`: the job's config, its job file and the stand-up's settings file against
+     what `bridge.conf` composes. Exit 0 means they are level; exit 10 means one would be
+     written, so it asks, then runs `install --apply` on a yes. The stand-up's switch is one of
+     those files, so the same step covers it. After either, it reads the installer's `verify`
+     once for what only a person can do (the job is loaded, a token): 0 is "up to date" or
+     "updated", 10 is "waiting on you" (the idea gate is not held back), anything else is
+     never "up to date". A declined update reads "waiting on you". A `install --apply` that ends
+     on a card stops the command in Manual and is carried past in Automatic. With no
+     `bridge.conf` the part is "off on this Mac" and nothing runs. Instant replies keep their
+     own check at the end.
   4. The idea gate (`scripts/pipeline_stage_a_setup.py run`). On a first run it writes
      its own settings from what the review installer's settings already say. Then it
      works through its steps, asking before each one that changes something a person
@@ -182,6 +194,7 @@ SKILLS = os.path.join(HERE, "sync_user_skills.py")
 STAGE_E = os.path.join(HERE, "pipeline_stage_e_setup.py")
 STAGE_A = os.path.join(HERE, "pipeline_stage_a_setup.py")
 SWEEP_SETUP = os.path.join(HERE, "pipeline_sweep_setup.py")
+BRIDGE_SETUP = os.path.join(HERE, "pipeline_bridge_setup.py")
 NOTIFIER_SETUP = os.path.join(HERE, "pipeline_notifier_setup.py")
 
 # What each installer's exit code means, in a sentence a person can act on. The codes are
@@ -803,6 +816,13 @@ def step_sweep(io, conf, rep):
     return stop(io, "the sweep's installer stopped with exit %d. The lines above say why." % code, code)
 
 
+# What an installer's compare says when it would write something, as opposed to a block only a person
+# can clear (which running it again cannot). The selftest pins the line against the installer's source.
+def has_work(text, line):
+    """True when the compare printed `line`, the installer's own words for "I would write"."""
+    return line in (text or "")
+
+
 # What an installer that prints the Stage E step table says: a row whose outcome is WOULD-CHANGE
 # is work its `run` would do; a row that is only a card is work for a person, which running it
 # again cannot clear. The notifier installer prints this table; this file's selftest pins the
@@ -827,7 +847,42 @@ JOB_STEPS = (
      "look": ["run", "--dry-run"], "apply": ["run"],
      "note": "It writes the notifier's settings and its job file as the role account; it "
              "never loads the job."},
+    {"key": "bridge", "number": "3d", "title": "The Slack bridge and the stand-up",
+     "noun": "The bridge", "conf": "bridge.conf", "script": BRIDGE_SETUP,
+     # `install` without --apply compares the job's config, its plist and the stand-up's settings
+     # file with what bridge.conf composes. It exits 10 for two different things: it would write
+     # something (and prints `work_line`), or a block only a person can clear, before any write.
+     # `verify` is read afterwards for what only a person can do.
+     "work_line": "DRY RUN: nothing was written",
+     "look": ["install"], "apply": ["install", "--apply"], "then": ["verify"],
+     "note": "It writes the bridge's config, its job file and the stand-up's settings file as the "
+             "role account; it never loads the job."},
 )
+
+
+def job_done(io, spec, base, conf, rep, updated):
+    """The settings are level. What is left for a person is read once from the installer's own
+    check (`then`); with none, this is the outcome. None to carry on, or an exit code."""
+    key, noun = spec["key"], spec["noun"]
+    if not spec.get("then"):
+        rep.note(key, OUT_UPDATED if updated else OUT_OK)
+        return None
+    code, _out = io.run_seen(base + spec["then"] + ["--conf", conf])
+    if io.interrupted:
+        rep.note(key, OUT_UNMEASURED, "interrupted during its check")
+        return stop(io, INTERRUPTED % (noun + "'s check"), code or EX_BLOCKED)
+    if code == 0:
+        rep.note(key, OUT_UPDATED if updated else OUT_OK)
+        return None
+    if code == EX_BLOCKED:
+        io.say("")
+        io.say("%s's settings are level; what is left is for you, named above." % noun)
+        rep.note(key, OUT_WAITING, "updated; a card is still yours" if updated
+                 else "a card is still yours", card_only=True)
+        return None
+    rep.note_code(key, code, "its check")
+    return stop(io, "%s's check stopped with exit %d. The lines above say why." % (noun, code),
+                code)
 
 
 def step_job(io, spec, files, rep):
@@ -847,14 +902,13 @@ def step_job(io, spec, files, rep):
         return stop(io, INTERRUPTED % (noun + "'s check"), code or EX_BLOCKED)
     if code == 0:
         io.say("")
-        io.say("%s is up to date. Nothing to do." % noun)
-        rep.note(key, OUT_OK)
-        return None
+        io.say("%s's settings are up to date. Nothing to change." % noun)
+        return job_done(io, spec, base, conf, rep, False)
     if code != EX_BLOCKED:
         rep.note_code(key, code, "its check")
         return stop(io, "%s's check stopped with exit %d. The lines above say why."
                     % (noun, code), code)
-    if not would_change(out):
+    if not (has_work(out, spec["work_line"]) if spec.get("work_line") else would_change(out)):
         io.say("")
         io.say("%s has nothing to change; what is left is for you, named above." % noun)
         rep.note(key, OUT_WAITING, "a card is still yours", card_only=True)
@@ -871,10 +925,9 @@ def step_job(io, spec, files, rep):
         return stop(io, INTERRUPTED % (noun + "'s installer"), code or EX_BLOCKED)
     io.say("")
     if code == 0:
-        io.say("%s is up to date." % noun)
-        rep.note(key, OUT_UPDATED)
+        io.say("%s's settings are up to date." % noun)
         rep.asked.add(key)
-        return None
+        return job_done(io, spec, base, conf, rep, True)
     rep.note_code(key, code, "its installer")
     if code == EX_BLOCKED and io.auto:
         io.say("%s waits for you at the card above. Carrying on; come back to it." % noun)
@@ -1289,6 +1342,7 @@ def step_write_settings(io, writes):
 # check script, never from a list of part ids, so a new part is picked up from the list.
 STEP_OF_SCRIPT = {"sync_user_skills.py": "skills", "pipeline_stage_e_setup.py": "stage_e",
                   "pipeline_sweep_setup.py": "sweep", "pipeline_stage_a_setup.py": "stage_a",
+                  "pipeline_bridge_setup.py": "bridge",
                   "pipeline_notifier_setup.py": "notifier"}
 
 
@@ -1302,6 +1356,8 @@ def step_of(part):
     base = os.path.basename(check["script"])
     if base == "pipeline_stage_e_setup.py" and (check.get("args") or [])[:1] != ["verify"]:
         return None
+    if base == "pipeline_bridge_setup.py" and ((part.get("apply") or {}).get("args") or [])[:1] != ["install"]:
+        return None            # instant replies (`push`) keep their own check at the end
     return STEP_OF_SCRIPT.get(base)
 
 
@@ -1675,6 +1731,7 @@ def look_only(io, args):
     files = {"stage-a.conf": os.path.abspath(args.conf),
              "stage-e.conf": os.path.abspath(args.stage_e_conf),
              "sweep.conf": os.path.abspath(args.sweep_conf),
+             "bridge.conf": os.path.abspath(args.bridge_conf),
              "notifier.conf": os.path.abspath(args.notifier_conf)}
     rep, parts, unreadable = Report(), [], None
     try:
@@ -1777,6 +1834,7 @@ def main(argv=None, io=None):
     files = {"stage-a.conf": os.path.abspath(args.conf),
              "stage-e.conf": os.path.abspath(args.stage_e_conf),
              "sweep.conf": os.path.abspath(args.sweep_conf),
+             "bridge.conf": os.path.abspath(args.bridge_conf),
              "notifier.conf": os.path.abspath(args.notifier_conf)}
     rep = Report()
     parts, unreadable = [], None
@@ -2443,6 +2501,8 @@ def selftest():
     base = ["--conf", a_conf, "--stage-e-conf", se_conf, "--sweep-conf", sweep_conf]
     healthy = {"sync_user_skills.py": 0, "pipeline_stage_e_setup.py verify": 0,
                "pipeline_stage_a_setup.py run": 0,
+               "pipeline_bridge_setup.py install": 0,         # asked only where bridge.conf is present
+               "pipeline_bridge_setup.py verify": 0,
                "pipeline_notifier_setup.py run --dry-run": 0}      # asked only where notifier.conf is present
 
     def go(codes=None, answers=(), argv=None, **kw):
@@ -2778,6 +2838,102 @@ def selftest():
         sys.stdout = real_out
     check("run-seen-passes-a-line-on-while-the-child-is-still-running", got, (0, "early\nlate\n"))
     os.unlink(notifier_conf)
+
+    # 6d. THE BRIDGE AND THE STAND-UP (KIT-584): `install` compares, a question only when it would write, `install
+    #     --apply` on a yes, then `verify` once for what a person must do. Unmeasured is never up to date.
+    import inspect
+    import pipeline_bridge_setup as bridge_setup
+    bridge_conf = os.path.join(tmp, "bridge.conf")                # absent: the bridge is off
+    look, apply_, verify = ("pipeline_bridge_setup.py install", "pipeline_bridge_setup.py install --apply",
+                            "pipeline_bridge_setup.py verify")
+    spec = [sp for sp in JOB_STEPS if sp["key"] == "bridge"][0]
+    parts_by_id = dict((pt["id"], pt) for pt in Io().parts())
+    check("bridge-step-uses-the-parts-list-commands",
+          (spec["apply"], parts_by_id["tech-lead"]["apply"]["args"][:2], spec["then"],
+           parts_by_id["tech-lead"]["check"]["args"][:1], step_of(parts_by_id["tech-lead"]),
+           step_of(parts_by_id["instant-replies"])),
+          (["install", "--apply"], ["install", "--apply"], ["verify"], ["verify"], "bridge", None))
+    install_source = inspect.getsource(bridge_setup.cmd_install)
+    check("bridge-install-writes-the-standup-file-so-the-step-covers-it",
+          ("standup_needs_writing(conf, facts)" in install_source, "write_standup(conf, runner)" in install_source),
+          (True, True))
+
+    check("bridge-pin-the-work-line-is-the-installers-own",
+          spec["work_line"] in install_source, True)
+    would = "To write: config.\n" + spec["work_line"] + ". Run it again with --apply.\n"
+    blocked = "BLOCKED: the env file holds no tracker key under X. Run `token` first.\n"
+
+    def bridge(codes=None, answers=(), interrupt=(), seen=None, **kw):
+        io = FakeIo(codes=dict(healthy, **(codes or {})), answers=answers, **kw)
+        io.seen_out = {look: would} if seen is None else dict(seen)
+        io.interrupt_on = set(interrupt or ())
+        return main(base + ["--bridge-conf", bridge_conf], io=io), io
+
+    def bout(io):
+        return [(r["outcome"], r["detail"]) for r in io.records if r["id"] == "tech-lead"]
+
+    code, io = bridge()
+    check("bridge-no-conf-is-off-and-not-run",
+          (code, [k for k in io.ran if "bridge" in k], bout(io)),
+          (EX_OK, [], [(OUT_OFF, "no bridge.conf in %s" % tmp)]))
+    with open(bridge_conf, "w") as fh:
+        fh.write("APP_NAME=x\n")
+    code, io = bridge()
+    check("bridge-level-and-verified-is-up-to-date-and-asks-nothing",
+          (code, io.ran.count(apply_), io.asked, [k for k in io.ran if "bridge" in k], bout(io)),
+          (EX_OK, 0, [], [look, verify], [(OUT_OK, "")]))
+    code, io = bridge({look: 10, apply_: 0}, answers=[True])
+    check("bridge-would-write-asked-then-applied-then-verified-updated",
+          (code, [k for k in io.ran if "bridge" in k or "stage_a" in k], len(io.asked), bout(io)),
+          (EX_OK, [look, apply_, verify, "pipeline_stage_a_setup.py run"], 1, [(OUT_UPDATED, "")]))
+    code, io = bridge({look: 10}, seen={look: blocked})
+    check("bridge-a-blocked-compare-asks-nothing-is-waiting-and-carries-on",
+          (code, io.asked, apply_ in io.ran, "pipeline_stage_a_setup.py run" in io.ran, bout(io)),
+          (EX_BLOCKED, [], False, True, [(OUT_WAITING, "a card is still yours")]))
+    code, io = bridge({look: 10}, seen={look: ""})
+    check("bridge-a-compare-that-printed-nothing-is-never-up-to-date-and-asks-nothing",
+          (code, io.asked, bout(io)), (EX_BLOCKED, [], [(OUT_WAITING, "a card is still yours")]))
+    code, io = bridge({look: 10}, answers=[False])
+    check("bridge-declined-is-waiting-and-writes-nothing",
+          (code, io.ran.count(apply_), "pipeline_stage_a_setup.py run" in io.ran, bout(io)),
+          (EX_BLOCKED, 0, True, [(OUT_WAITING, "behind; you did not update it")]))
+    code, io = bridge({verify: 10})
+    check("bridge-level-but-a-card-is-left-is-waiting-and-carries-on",
+          (code, io.asked, "pipeline_stage_a_setup.py run" in io.ran, bout(io)),
+          (EX_BLOCKED, [], True, [(OUT_WAITING, "a card is still yours")]))
+    code, io = bridge({look: 10, apply_: 0, verify: 10}, answers=[True])
+    check("bridge-updated-with-a-card-left-says-both",
+          (code, bout(io)), (EX_BLOCKED, [(OUT_WAITING, "updated; a card is still yours")]))
+    for rc in (1, 2, 3, 4, 5, 77):
+        code, io = bridge({look: rc})
+        check("bridge-compare-exit-%d-stops-never-current" % rc,
+              (code, "pipeline_stage_a_setup.py run" in io.ran, verify in io.ran, bout(io)[0][0] != OUT_OK),
+              (rc, False, False, True))
+    for rc in (1, 4, 77):
+        code, io = bridge({verify: rc})
+        check("bridge-verify-exit-%d-stops-unmeasured" % rc,
+              (code, "pipeline_stage_a_setup.py run" in io.ran, [o for o, _d in bout(io)]),
+              (rc, False, [OUT_UNMEASURED]))
+    code, io = bridge({look: 10, apply_: 10}, answers=[True])
+    check("bridge-apply-ending-on-a-blocked-card-stops-in-manual-and-never-verifies",
+          (code, "pipeline_stage_a_setup.py run" in io.ran, verify in io.ran, [o for o, _d in bout(io)]),
+          (EX_BLOCKED, False, False, [OUT_WAITING]))
+    code, io = bridge({look: 10, apply_: 10}, answers=[True], typed=["1", "yes"])
+    check("bridge-apply-ending-on-a-blocked-card-is-carried-past-in-automatic",
+          (code, "pipeline_stage_a_setup.py run" in io.ran, [o for o, _d in bout(io)]),
+          (EX_BLOCKED, True, [OUT_WAITING]))
+    for rc in (1, 4):
+        code, io = bridge({look: 10, apply_: rc}, answers=[True])
+        check("bridge-apply-exit-%d-stops-unmeasured" % rc,
+              (code, "pipeline_stage_a_setup.py run" in io.ran, [o for o, _d in bout(io)]),
+              (rc, False, [OUT_UNMEASURED]))
+    code, io = bridge({}, interrupt={look})
+    check("bridge-ctrl-c-in-its-compare-stops-the-run",
+          (code, "pipeline_stage_a_setup.py run" in io.ran), (EX_BLOCKED, False))
+    code, io = bridge({}, interrupt={verify})
+    check("bridge-ctrl-c-in-its-verify-stops-the-run",
+          (code, "pipeline_stage_a_setup.py run" in io.ran), (EX_BLOCKED, False))
+    os.unlink(bridge_conf)
 
     # 7. CTRL-C REACHES THE INSTALLER AND ITS CLEAN-UP RUNS TO THE END. Real processes:
     #    a terminal's Ctrl-C goes to the whole process group, and a wrapper that did not
@@ -3124,7 +3280,7 @@ def selftest():
     check("lines-steps-are-found-from-the-list",
           (keys["one-command"], keys["skills"], keys["cleanup"], keys["idea-gate"],
            set(k for k in keys.values() if k) == set(["checkout", "skills", "stage_e",
-                                                      "sweep", "stage_a", "notifier"]),
+                                                      "sweep", "stage_a", "bridge", "notifier"]),
            all(keys[pt["id"]] == "stage_e" for pt in real
                if pt["check"] and pt["check"]["script"].endswith("pipeline_stage_e_setup.py"))),
           ("checkout", "skills", "sweep", "stage_a", True, True))

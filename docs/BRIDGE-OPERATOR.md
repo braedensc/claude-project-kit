@@ -188,6 +188,12 @@ The first prints what it would write. The second writes the job's config, as the
 account, and its LaunchDaemon file, as root. It never starts the job. The job is installed
 turned off, so a restart before Step 5 does not start it either.
 
+**After a merge, the one command does this for you** (`python3 scripts/pipeline_install.py`,
+step 3d) when this Mac has a `bridge.conf`. It runs the first command above. If something would
+be written (a new `bridge.conf` key, the job's config, or the stand-up's switch and its settings
+file), it asks, then runs the second on a yes. It then reads `verify` once for what only you can
+do, such as loading the job. With no `bridge.conf` the bridge reads "off on this Mac".
+
 Good: `wrote …/bridge.json` and `wrote /Library/LaunchDaemons/<label>.plist (installed
 turned off, not loaded)`, then card CK-B2.
 Not that: `UNKNOWN: the home of … could not be read`. The role account is missing or locked.
