@@ -1420,12 +1420,24 @@ class Runner(object):
         return ""
 
     def stop(self, doc):
-        """(ok, run, why). The group gets SIGTERM now, and SIGKILL past the grace."""
+        """(ok, run, why). The group gets SIGTERM now, and SIGKILL past the grace. A stop follows the
+        run on through the runner's own resumes of it (KIT-644): their newest run is stopped in its
+        place, and a resume still to come is called off. A run some caller asked for is never one
+        of those: a stop reaches only the run it names and the runner's own continuations of it."""
         rec = store.read_run(self.store_dir(), doc["run"])
         if rec is None:
             return False, None, "there is no such run to stop"
         if (rec["ticket"], rec["project"], rec["kind"]) != (doc["ticket"], doc["project"], doc["kind"]):
             return False, rec["run"], "the run is not this ticket's %s run" % doc["kind"]
+        for _ in range(50):
+            nxt = store.read_run(self.store_dir(), rec["resumed_by"]) if rec["resumed_by"] else None
+            if nxt is None or nxt["caller"] != "runner":
+                break
+            rec = nxt
+        if rec["state"] not in store.LIVE and rec["auto_resume"] == "pending":
+            rec["auto_resume"] = "refused"
+            store.write_run(self.store_dir(), rec)
+            return True, rec["run"], "its resume is called off"
         if rec["state"] not in store.LIVE:
             return False, rec["run"], "the run has ended already"
         if rec["state"] == store.RUNNING:
@@ -2831,6 +2843,34 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
         expect("a withdrawal that comes while the runner judges the request is refused, and the "
                "request is answered", (racing, (store.answer(sdir, rq_r) or {}).get("why")),
                ([False], "judged while held"))
+        def chained(n, **fields):
+            rec = code_record(n, "ENG-1", kind=store.REVIEW)
+            rec.update(fields)
+            store.write_run(sdir, rec)
+            return rec
+
+        held = chained(70, state="interrupted", reason="interrupted", why="it was interrupted",
+                       auto_resume="pending", seconds=None, exit=None)
+        stopped = runner.stop({"run": held["run"], "ticket": "ENG-1", "project": "app",
+                               "kind": store.REVIEW})
+        expect("a stop of a run the runner is still to resume calls the resume off",
+               (stopped, store.read_run(sdir, held["run"])["auto_resume"]),
+               ((True, held["run"], "its resume is called off"), "refused"))
+        gone = chained(71, state="interrupted", reason="interrupted", why="it was interrupted",
+                       auto_resume="started", resumed_by="run-%032x" % (0x644000 + 72),
+                       seconds=None, exit=None)
+        later = chained(72, caller="runner", started_for="interrupted", resumes=gone["run"],
+                        how="resumed-run", state="interrupted", reason="interrupted",
+                        why="it was interrupted", auto_resume="pending", seconds=None, exit=None)
+        expect("...and follows the runner's own resumes to the newest run, whose resume it calls off",
+               runner.stop({"run": gone["run"], "ticket": "ENG-1", "project": "app",
+                            "kind": store.REVIEW}), (True, later["run"], "its resume is called off"))
+        theirs = chained(73, state="ended", resumed_by="run-%032x" % (0x644000 + 74))
+        chained(74, caller=store.REVIEW, request="rq-" + "8" * 32, resumes=theirs["run"],
+                how="resumed-run")
+        expect("...but never into a run some caller asked for",
+               runner.stop({"run": theirs["run"], "ticket": "ENG-1", "project": "app",
+                            "kind": store.REVIEW}), (False, theirs["run"], "the run has ended already"))
         store.write_run(sdir, code_record(41, "ENG-41"))         # ENG-41's review below follows it
 
         # ---- each kind as data, behind its own walls (KIT-704) ------------------ #

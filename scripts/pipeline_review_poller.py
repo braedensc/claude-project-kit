@@ -4701,12 +4701,14 @@ def runner_review_state(store_dir, request_id):
       ("ended", record)    its last run has ended
       ("unread", why)      a file the answer needs could not be read: "could not", never "none"
     """
+    # The waiting file first, then the answer: the runner writes its answer before it removes the
+    # waiting file, so a request answered between the two reads is never read as missing.
+    waiting = os.path.lexists(os.path.join(store_dir, "requests", request_id + ".json"))
     try:
         ans = runner_store.answer(store_dir, request_id)
     except (runner_store.StoreError, ValueError, OSError) as exc:
         return "unread", "the runner's answer could not be read (%s)" % exc
     if ans is None:
-        waiting = os.path.lexists(os.path.join(store_dir, "requests", request_id + ".json"))
         return ("waiting" if waiting else "missing"), None
     if not ans.get("ok") or not ans.get("run"):
         return "refused", str(ans.get("why") or "")
@@ -4822,12 +4824,15 @@ def collect_runner_entry(cfg, key, record, seen, linear_key, dry_run, result):
         return
     if state == "waiting":
         if timed_out:
-            if runner_store.withdraw(store_dir, rid):
+            if dry_run:
+                print("[dry-run] review request %s timed out waiting for the runner: it would be "
+                      "withdrawn — nothing written" % rid)
+            if dry_run or runner_store.withdraw(store_dir, rid):
                 return declined("timed out waiting for the runner to take the review request (%ds); "
                                 "it was withdrawn, so no review will run" % int(age),
                                 reviewer_outcome="cancelled")
-            log("NOTE: review request %s was taken by the runner as it timed out; its run is read "
-                "next pass" % rid)
+            log("NOTE: review request %s is being answered by the runner as it timed out; its run "
+                "is read next pass" % rid)
         print("collect %s: review request %s waits for the runner (%ds old)" % (key, rid, int(age)))
         result.waiting += 1
         return
@@ -4837,14 +4842,21 @@ def collect_runner_entry(cfg, key, record, seen, linear_key, dry_run, result):
     rec, see = got, "run %s" % got["run"]
     if state in ("running", "resuming"):
         if timed_out:
-            if state == "running":
+            # A stop reaches the run and any resume the runner still has to make of it, so nothing
+            # is left to run for a review this pass declines. What happened is what the PR is told.
+            if dry_run:
+                print("[dry-run] review %s timed out: it would be asked to stop — nothing written" % see)
+                stopped = "it was asked to stop"
+            else:
                 try:
                     runner_store.ask(store_dir, runner_store.REVIEW, "stop", runner_store.REVIEW,
                                      runner.get("project"), record["ticket_id"], run=rec["run"])
+                    stopped = "it was asked to stop"
                 except (ValueError, OSError) as exc:
-                    log("FAIL: review run %s could not be asked to stop: %s" % (rec["run"], exc))
-            return declined("timed out waiting for the reviewer (%ds, no answer from %s); it was "
-                            "asked to stop" % (int(age), see), reviewer_outcome="cancelled")
+                    log("FAIL: review %s could not be asked to stop: %s" % (see, exc))
+                    stopped = ("asking it to stop failed, so it may still run (see the poller log)")
+            return declined("timed out waiting for the reviewer (%ds, no answer from %s); %s"
+                            % (int(age), see, stopped), reviewer_outcome="cancelled")
         print("collect %s: review %s still %s (%ds old) — nothing to publish yet"
               % (key, see, state, int(age)))
         result.waiting += 1
@@ -5926,7 +5938,7 @@ class _FakeLinear:
         return self.runner_answer(issue_id, output=(kind == "response", body))
 
     def runner_answer(self, issue_id, output=(True, ""), ok=True, why="", state="ended",
-                      reason="ended"):
+                      reason="ended", auto_resume=None):
         """Answer the review `issue_id` names as our own runner would: refuse it in words (`ok`
         false), or start its run and leave it `state` for `reason`, with `output` its final
         message, (answered, text), or none. A review never asked is not answered, as on the old
@@ -5955,7 +5967,8 @@ class _FakeLinear:
                    ended_at=None if live else at, seconds=None if live else 60.0,
                    exit=None if live else 0, reason=None if live else reason,
                    why=None if live or reason == "ended" else "stopped at its limit",
-                   cost_usd=None if live else 0.25, turns=None if live else 6)
+                   cost_usd=None if live else 0.25, turns=None if live else 6,
+                   auto_resume=auto_resume)
         runner_store.write_run(self.store_dir, rec)
         if output is not None and not live:
             answered, text = output
@@ -10391,6 +10404,51 @@ def selftest():
                       (collect(c, False), [r for r, _t in fake.stops],
                        "asked to stop" in (posted[0][1] if posted else "")),
                       (EXIT_DECLINED, [fake.run_of(1)], True))
+            with tempfile.TemporaryDirectory() as tmp:          # interrupted, to be resumed
+                c = fresh_state(tmp)
+                fake.runner_answer("rev-uuid-1", output=None, state="interrupted", reason="interrupted",
+                                   auto_resume="pending")
+                check("KIT-644 a review run the runner is to resume → it waits, and nothing is posted",
+                      (collect(c, False), posted), (EXIT_OK, []))
+                seen644 = load_seen(seen_path(tmp))
+                seen644[pr_key("o/r", 5)]["created_at"] = "2020-01-01T00:00:00Z"
+                save_seen(seen_path(tmp), seen644)
+                check("KIT-644 …past the timeout → declined, and the run its resume follows is asked to "
+                      "stop, which calls the resume off",
+                      (collect(c, False), [r for r, _t in fake.stops],
+                       "it was asked to stop" in (posted[0][1] if posted else "")),
+                      (EXIT_DECLINED, [fake.run_of(1)], True))
+            for label, setup in (("waiting for the runner", lambda: None),
+                                 ("still running", lambda: fake.runner_answer("rev-uuid-1", state="running"))):
+                with tempfile.TemporaryDirectory() as tmp:      # a dry run past the timeout
+                    c = fresh_state(tmp)
+                    setup()
+                    seen644 = load_seen(seen_path(tmp))
+                    seen644[pr_key("o/r", 5)]["created_at"] = "2020-01-01T00:00:00Z"
+                    save_seen(seen_path(tmp), seen644)
+                    before = sorted(os.listdir(os.path.join(fake.store_dir, "requests")))
+                    collect(c, True)
+                    check("KIT-644 a dry run past the timeout, %s, writes nothing to the runner's store"
+                          % label, (sorted(os.listdir(os.path.join(fake.store_dir, "requests"))) == before,
+                                    fake.stops, [p for p in posted if not p[-1]],
+                                    load_seen(seen_path(tmp))[pr_key("o/r", 5)]["status"]),
+                          (True, [], [], "pending"))
+            with tempfile.TemporaryDirectory() as tmp:          # answered between two reads
+                c = fresh_state(tmp)
+                rid644 = fake.created[0]["request"]
+                real_answer = runner_store.answer
+
+                def answered_meanwhile(store_dir, request_id):
+                    fake.runner_answer("rev-uuid-1", state="running")    # the runner settles it now
+                    return None                                         # …just after this read
+                runner_store.answer = answered_meanwhile
+                try:
+                    state644 = runner_review_state(fake.store_dir, rid644)
+                finally:
+                    runner_store.answer = real_answer
+                check("KIT-644 a request the runner answers between the two reads is never read as "
+                      "missing", (state644[0], runner_review_state(fake.store_dir, rid644)[0]),
+                      ("waiting", "running"))
             with tempfile.TemporaryDirectory() as tmp:          # recorded, never written
                 c = fresh_state(tmp)
                 rid644 = fake.created[0]["request"]

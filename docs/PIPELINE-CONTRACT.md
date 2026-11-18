@@ -3329,7 +3329,9 @@ text, whoever wrote it, reaches the session only fenced as data.
 "ok", "run", "why"}}`. A request the runner cannot judge now waits, and is not answered: the tracker
 did not answer, git could not fetch, or the watcher's hold (§20) is set. Everything else is answered
 `ok: false` with the reason in words. A start refused after its workspace was made removes the
-workspace and its branch. Off (`enabled` false), the runner takes no request and resumes nothing.
+workspace and its branch. A stop follows the run it names on through the runner's own resumes of
+it: their newest run is stopped, and a resume still to come is called off, its record saying
+`auto_resume: refused` (KIT-644). It never reaches a run that a caller asked for. Off (`enabled` false), the runner takes no request and resumes nothing.
 
 **Each project's lanes (KIT-866).** A project's `lanes` say, for each kind, whether the runner takes
 it for that project. Absent is off. A start or resume for a lane that is off, the runner's own

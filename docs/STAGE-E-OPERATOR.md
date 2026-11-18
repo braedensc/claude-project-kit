@@ -768,7 +768,8 @@ Each of these is a loud "NOT reviewed", never a quiet one:
 - the run stopped at a limit, failed, or ended with no final message;
 - its answer carries no `pipeline-review/1` block, says `blocked`, or starts `WRONG REPOSITORY:`;
 - nothing came back within `collect_timeout_seconds`. A request still waiting is withdrawn, and
-  a run still going is asked to stop.
+  a run still going, or one the runner is still to resume, is asked to stop. A dry run writes
+  nothing to the runner's store: it says what it would do.
 
 What this lane skips: the review ticket, the routing label and its check, the version gate, the
 tracker's dedup search, and the ticket's close. The routing probe's pause does not hold a
