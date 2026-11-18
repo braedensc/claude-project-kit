@@ -32,7 +32,7 @@ THE STEPS, IN ORDER — each reports exactly one outcome from the Stage E vocabu
                  clone's HEAD may differ; the files the notifier runs may not
     slack-app    CK-N1: a Slack app for the notifier alone, and a PRIVATE channel. With
                  DM_USER_IDS set there is neither (KIT-296): pages go to each person's
-                 direct message through the Slack bridge's app, and this row passes with a note
+                 direct message through the tech lead's Slack app, and this row passes with a note
     credentials  the Slack token in the role account's env file — its shape measured in that
                  account's shell, its value never read into this process. With WRITER=yes
                  (KIT-297), the writer's token by name only: the Slack bridge installer's
@@ -521,8 +521,8 @@ def validate_conf(values, invoking_user=None):
     conf = dict(CONF_DEFAULTS)
     conf.update(values)
     errors = []
-    # KIT-296: direct messages in place of the channel, through the Slack bridge's app. The
-    # token is then the bridge's, so the channel-mode default name, which every copy of the
+    # KIT-296: direct messages in place of the channel, through the tech lead's Slack app. The
+    # token is then the tech lead's, so the channel-mode default name, which every copy of the
     # example spells out, stands for the bridge's name here.
     dms = split_list(conf.get("DM_USER_IDS"))
     if dms and conf.get("CHAT_TOKEN_ENV") == CONF_DEFAULTS["CHAT_TOKEN_ENV"]:
@@ -674,7 +674,7 @@ def validate_conf(values, invoking_user=None):
                           "(KIT-177)")
         if conf.get("BRIDGE_PINGS") == "yes":
             errors.append("REPLY_RELAY=yes and BRIDGE_PINGS=yes are both on: two jobs would "
-                          "answer the same ping. The Slack bridge replaces the relay: turn "
+                          "answer the same ping. The tech lead replaces the relay: turn "
                           "REPLY_RELAY off")
         if split_list(conf.get("DM_USER_IDS")):
             errors.append("REPLY_RELAY=yes and DM_USER_IDS are both set: the relay reads a "
@@ -686,7 +686,7 @@ def validate_conf(values, invoking_user=None):
         errors.append("REPLAN_IN_DM must be yes or no, got %r" % conf.get("REPLAN_IN_DM"))
     elif conf.get("REPLAN_IN_DM") == "yes" and not split_list(conf.get("DM_USER_IDS")):
         errors.append("REPLAN_IN_DM=yes needs DM_USER_IDS: the replan line goes only in direct "
-                      "messages, where the Slack bridge reads it")
+                      "messages, where the tech lead reads it")
     # The notifier's own member-id rule, imported: each id goes inside `<@…>` in a page.
     mentions = split_list(conf.get("MENTION_CHAT_USER_IDS"))
     for member in mentions:
@@ -1213,11 +1213,11 @@ CARDS = {
                "",
                "DIRECT MESSAGES INSTEAD (KIT-296): set DM_USER_IDS in notifier.conf to your",
                "Slack member id, and skip every step above. Pages then go to your direct",
-               "messages through the Slack bridge's app, which its card CK-B1 makes. That",
+               "messages through the tech lead's Slack app, which its card CK-B1 makes. That",
                "app needs chat:write and im:write. Leave CHAT_CHANNEL_ID empty. The token is",
-               "then the bridge's, " + BRIDGE_CHAT_TOKEN_ENV + ", unless CHAT_TOKEN_ENV names",
+               "then the tech lead's, " + BRIDGE_CHAT_TOKEN_ENV + ", unless CHAT_TOKEN_ENV names",
                "another. There is nothing to sign: the slack-app step passes on its own.",
-               "Set the bridge's own DM_USER_IDS to the same ids (KIT-295 or later). Before",
+               "Set the tech lead's own DM_USER_IDS to the same ids (KIT-295 or later). Before",
                "you archive the old channel, take it out of CHANNEL_IDS in bridge.conf."],
         "good": "a private channel holding you and the notifier's bot, invisible to a second account",
         "attest": A_PRIVATE,
@@ -1239,7 +1239,7 @@ CARDS = {
                "session. Never under the dispatcher's state root.",
                "",
                "THE WRITER (KIT-297), only with WRITER=yes: its token, ${WRITER_TOKEN_ENV},",
-               "is not asked for here. The Slack bridge installer's writer-token step writes",
+               "is not asked for here. The tech lead installer's writer-token step writes",
                "it into the same env file, for both jobs:",
                "    python3 scripts/pipeline_bridge_setup.py writer-token",
                "This installer checks only that its name is in the file."],
@@ -1419,7 +1419,7 @@ def _card_values(conf, flags=""):
     values["SELF"] = _self_path()
     # KIT-177: with the reply relay on, the app also reads the channel's threads.
     # KIT-568: the app that needs files:write is the one whose token the notifier posts with.
-    values["SCOPE_APP"] = ("the Slack bridge's app (its card CK-B1)" if split_list(values.get("DM_USER_IDS"))
+    values["SCOPE_APP"] = ("the tech lead's Slack app (its card CK-B1)" if split_list(values.get("DM_USER_IDS"))
                            else "the notifier's own app (card CK-N1)")
     values["RELAY_SCOPE"] = ("add chat:write and groups:history (REPLY_RELAY=yes reads the "
                              "channel's threads). Only those two."
@@ -1866,20 +1866,20 @@ def step_slack_app(ctx, apply_it):
     dms = split_list(ctx.conf.get("DM_USER_IDS"))
     if dms:
         # KIT-296: no app and no channel of the notifier's own to sign for. The pages go
-        # through the Slack bridge's app, to each person's direct message, so CK-N1's
+        # through the tech lead's Slack app, to each person's direct message, so CK-N1's
         # private-channel sign-off does not apply.
-        notes = ["Pages go to the direct messages of %s, through the Slack bridge's app. The "
-                 "bridge's card CK-B1 makes that app, and it needs chat:write and im:write. "
+        notes = ["Pages go to the direct messages of %s, through the tech lead's Slack app. The "
+                 "tech lead's card CK-B1 makes that app, and it needs chat:write and im:write. "
                  "There is no channel, so there is no private-channel sign-off. Set the "
-                 "bridge's own DM_USER_IDS to the same ids (KIT-295 or later). The notifier's "
+                 "tech lead's own DM_USER_IDS to the same ids (KIT-295 or later). The notifier's "
                  "own app can be retired. Archive the old channel only once CHANNEL_IDS in "
                  "bridge.conf no longer lists it." % ", ".join(dms)]
         if ctx.conf["CHAT_TOKEN_ENV"] != BRIDGE_CHAT_TOKEN_ENV:
-            notes.append("CHAT_TOKEN_ENV is %s, not the bridge's own %s. The pages go through "
-                         "the bridge's app, so this should name the bridge's token. Leave it "
-                         "only if your bridge stores its token under that name."
+            notes.append("CHAT_TOKEN_ENV is %s, not the tech lead's own %s. The pages go through "
+                         "the tech lead's app, so this should name the tech lead's token. Leave it "
+                         "only if your tech lead stores its token under that name."
                          % (ctx.conf["CHAT_TOKEN_ENV"], BRIDGE_CHAT_TOKEN_ENV))
-        return True, ("DM mode: pages go through the Slack bridge's app (its card CK-B1); no "
+        return True, ("DM mode: pages go through the tech lead's Slack app (its card CK-B1); no "
                       "channel to sign for"), notes
     rec = (ctx.state.data.get("attestations") or {}).get(A_PRIVATE)
     if not rec:
@@ -2054,13 +2054,13 @@ def step_credentials(ctx, apply_it):
     if conf.get("WRITER") == "yes":
         if facts.get("writer") != "set":
             raise SetupError(
-                "WRITER=yes, but %s is not in %s. The writer's token is the Slack bridge "
+                "WRITER=yes, but %s is not in %s. The writer's token is the tech lead "
                 "installer's to write, for both jobs, which share that file. Run its "
                 "writer-token step, `python3 scripts/pipeline_bridge_setup.py writer-token`, "
                 "then run this again. This installer never asks for it and never writes it."
                 % (conf["WRITER_TOKEN_ENV"], conf["ENV_FILE"] if facts["exists"]
                    else conf["ENV_FILE"] + " (there is no such file)"))
-        notes.append("%s, the writer's token, is in %s by name. The bridge installer wrote it; "
+        notes.append("%s, the writer's token, is in %s by name. The tech lead installer wrote it; "
                      "its value was not read." % (conf["WRITER_TOKEN_ENV"], conf["ENV_FILE"]))
     if facts.get("chat") == "ok":
         if conf.get("PAGE_IMAGES") == "yes":
@@ -2091,7 +2091,7 @@ def step_credentials(ctx, apply_it):
     say("  file, which is copied unscrubbed into every session; never under the dispatcher's")
     say("  state root, where session readability is unmeasured. Nothing is echoed or kept here.")
     # KIT-296: in DM mode the token is the Slack bridge app's, which the pages go through.
-    whose = ("the Slack bridge app's bot token" if split_list(conf.get("DM_USER_IDS"))
+    whose = ("the tech lead's Slack app's bot token" if split_list(conf.get("DM_USER_IDS"))
              else "the notifier's OWN bot token")
     val = (ctx.token_reader("  paste %s — %s, xoxb-... (hidden): " % (chat_env, whose))
            or "").strip()
@@ -3556,16 +3556,16 @@ def handover_lines(ctx):
           "its only tracker write: %s, added on the marks that name them (KIT-116)"
           % " and ".join(LABEL_KEYS)]
     if file_dms:
-        on.append("pages: by direct message to %s, through the Slack bridge's app. Each post "
-                  "is recorded in notifier-dm-posts.json for the bridge (KIT-296)"
+        on.append("pages: by direct message to %s, through the tech lead's Slack app. Each post "
+                  "is recorded in notifier-dm-posts.json for the tech lead (KIT-296)"
                   % ", ".join(file_dms))
     replan_off = []
     if file_dms and file_doc.get("replan_in_dm") is True:
         on.append("replan line: a planning page in those messages ends with the `replan` "
-                  "request to send, for the Slack bridge to act on (KIT-338, KIT-321)")
+                  "request to send, for the tech lead to act on (KIT-338, KIT-321)")
     elif file_dms:
         replan_off = ["replan line: a planning page in direct messages points at the ticket. "
-                      "Set REPLAN_IN_DM=yes once the Slack bridge acts (ACT=yes) (KIT-338, "
+                      "Set REPLAN_IN_DM=yes once the tech lead acts (ACT=yes) (KIT-338, "
                       "KIT-321)"]
     if conf.get("REPLY_RELAY") == "yes":
         on.append("replies: the reply relay is ON. A reply from %s under an agent:blocked ping "
@@ -3574,12 +3574,12 @@ def handover_lines(ctx):
         off = []
     elif conf.get("BRIDGE_PINGS") == "yes":
         on.append("replies: the notifier's own relay stays off. It records each agent:blocked "
-                  "ping for the Slack bridge, which passes a member's reply under it to the "
+                  "ping for the tech lead, which passes a member's reply under it to the "
                   "session's own thread (KIT-224)")
         off = []
     else:
         off = ["replies: no component reads the channel, so a reply there reaches nobody; "
-               "answer in the tracker (KIT-118). The Slack bridge can answer them once "
+               "answer in the tracker (KIT-118). The tech lead can answer them once "
                "BRIDGE_PINGS=yes (KIT-224)"]
     off += replan_off
     unproven = ["what a session can reach with the dispatcher's own Slack token, and the "
@@ -3748,7 +3748,7 @@ def _banner(ctx, title):
     say("  job           system/%s (%s) — never loaded by this installer" % (conf["JOB_LABEL"], plist_path(conf)))
     dms = split_list(conf.get("DM_USER_IDS"))
     if dms:
-        say("  pages to      the direct messages of %s at %s, through the Slack bridge's app"
+        say("  pages to      the direct messages of %s at %s, through the tech lead's Slack app"
             % (", ".join(dms), conf["CHAT_API_BASE"]))
     else:
         say("  channel       %s at %s" % (conf["CHAT_CHANNEL_ID"], conf["CHAT_API_BASE"]))
@@ -4175,7 +4175,7 @@ def _selftest_body():
        "mentions compose as before (KIT-283)",
        _cbe + _cbm == [] and compose_config(_cbc, {}, ["a-1"]).get("mention_chat_user_ids")
        == ["U0SYNTH0001"], _cbe + _cbm)
-    # KIT-296: pages to direct messages, through the Slack bridge's app. No case here asserts,
+    # KIT-296: pages to direct messages, through the tech lead's Slack app. No case here asserts,
     # so a refusal is data and a missing name is a named failure, never a stopped battery.
     _dm_text = good_text.replace("CHAT_CHANNEL_ID=C0SYNTHETIC1\n", "")
 

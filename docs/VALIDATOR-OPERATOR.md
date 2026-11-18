@@ -135,13 +135,17 @@ decide come next. The format is contract §24; the code is `scripts/pipeline_val
 | The decision | `approved`, `sent-back`, `escalated`, `escalated-urgent` or `held` |
 | Each layer's verdict | hard limits `pass`, evidence `pass`, agent `pass` |
 | Which switches were on, and the size limits | `approve-merges`; 400 lines, 20 files |
+| Why, when it held, escalated or sent back | closed words, such as `risk-path` or `send-back-budget-spent` |
 | The agent's reason, in its own words | `The diff does what the criteria ask, and nothing else.` |
 
 **One verdict per head.** A row is never changed. A new push to a pull request is a new head,
 and gets a new row.
 
-**An approval is whole.** All three layers passed, and its own switch was on. A row that says
-otherwise is refused, and nothing is written.
+**An approval is whole.** All three layers passed, its own switch was on, and code gave no
+reason to hold. A row that says otherwise is refused, and nothing is written.
+
+**Code's reasons are closed words.** A hold from the limits or the evidence says why in code's
+own words, never the agent's. The agent's reason is kept apart, as its words.
 
 **The agent's words are quoted, never obeyed.** Its reason is one line of at most 300 characters,
 with nothing hidden in it. It is the only text in the ledger.
@@ -310,7 +314,7 @@ pull request. The code is `scripts/pipeline_validator_evidence.py`.
 | What | `yes` means | Some reasons for `no` |
 |---|---|---|
 | The head | GitHub's head is that exact commit. A push makes old evidence count for nothing. | `head-moved` |
-| Checks | Every check is finished and green, and every check the branch requires has run. A check is known by its workflow and name. | `check-pending`, `check-failed`, `check-missing` |
+| Checks | Every check is finished and green, and every check the branch requires has run. A check is known by its workflow and name. A required check counts only from the app your branch rules name as its source; one of the same name from another app is not it. | `check-pending`, `check-failed`, `check-missing` |
 | Stage E's review | A full review of this exact head, never edited, from Stage E's own bot login, named in your settings. | `review-login-unset`, `review-login-shared`, `review-missing`, `review-stale`, `review-partial`, `review-declined`, `review-edited` |
 | Its findings | Nothing at or above the bar. The bar is `medium` unless set. | `review-finding-at-bar`, `review-unreadable` |
 | Acceptance | For a plan's last piece, the acceptance check passed. | `acceptance-none`, `acceptance-not-passed` |
@@ -482,3 +486,56 @@ and its selftest checks that no other script names it.
 
 Good: the validator's own job, started by your scheduler, as you. Not that: a session running the
 agent to see what it would say.
+
+## 7. What a no does
+
+When the validator does not approve, code decides what happens next, from the agent's answer and
+the layers. The code is `scripts/pipeline_validator_route.py`. Nothing calls it yet: the merge path
+and the approvals are their own pieces.
+
+| What happened | What it records | What happens next |
+|---|---|---|
+| The agent sends it back, and Stage E has send-backs left | `sent-back` | Stage E re-prompts the dev session, from the same budget a review's send-back uses. |
+| The agent sends it back, and none are left | `escalated`, `send-back-budget-spent` | It waits for you. |
+| The agent sends back a plan or a piece | `escalated`, `send-back-no-session` | It waits for you: there is no dev session yet. |
+| The agent escalates | `escalated` | It waits for you, with the agent's reason. |
+| The agent believes the dev session is compromised | `escalated-urgent` | It waits for you, marked urgent, and the watcher pages you. |
+| A limit or the evidence holds it for good | `held`, with closed words such as `risk-path` | It waits for you. |
+| The agent gave an answer that could not be used | `held`, with a word such as `answer-not-two-lines` | It waits for you. |
+
+**A hold that settles by itself writes nothing.** Checks still running, a review not in yet, the
+working window closed, a fact it could not read, an agent run that failed before it judged (a
+timeout, a CLI that would not start): it waits, and a later pass judges again. A pull
+request's head gets one verdict, so a wait never spends it. Good: no row while checks run. Not
+that: a `held` row for a check still running, which would leave that head unable to be approved.
+
+**A send-back goes through Stage E.** The validator never re-prompts anyone itself. It writes the
+`sent-back` row, and Stage E's bounce driver re-prompts the session that opened the pull request,
+from its own ledger. So a send-back counts against the bounce budget Stage E already keeps: there
+is no second count. The agent's reason reaches the session as one line marked as its words, inside
+the re-prompt's data fence, never as an order. One row buys one re-prompt. The session's next push
+is a new head, reviewed and judged again from the start.
+
+To turn it on, add the ledger's absolute path to the bounce driver's config as
+`validator_ledger_file` (`docs/STAGE-E-OPERATOR.md`). The driver must be able to read the file. A
+path it cannot read stops it, said on each pull request, rather than missing a send-back quietly.
+
+Good: `validator_ledger_file` names the ledger, and a send-back arrives in the session's thread.
+Not that: no `validator_ledger_file`. Then a `sent-back` row waits, and nothing re-prompts the
+session.
+
+**What you see.** Each escalation and each hold that waits for you is a blocker, with its reason in
+plain words and the reply that clears it: `approve <plan>` for a plan, `start <piece>` for a
+piece. A pull request is yours to merge or close on GitHub. A later piece puts these in the
+stand-up. The agent's own words are shown apart, as its words, never as the report's.
+
+**An urgent one pages you through the watcher,** which reads the ledger on its own account. The
+validator sends nothing itself, so it never assumes a page. It says `paged` only once the watcher's
+status shows that escalation flagged, `not paged yet` until then, and `could not page` while the
+watcher is stale, unreadable, off or blind. The blocker stands either way. Good: `not paged yet:
+the watcher has not flagged this urgent escalation, so it stays your blocker until it does`. Not
+that: taking an urgent escalation as paged because it was written down.
+
+**Your `Validator` check.** Stage E's bounce driver never treats a red `Validator` check as
+something the dev session must fix, whatever your list of checks that wait on a person says. Its
+verdict is the validator's: a send-back has its own path, and an escalation or a hold is yours.

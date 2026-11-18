@@ -6,12 +6,33 @@ name: Hooks change guard
 # label event runs only this, so a label turns the check green in seconds. The job name is
 # unchanged, so the required status check "Hooks change guard" is the same context.
 #
-# Nothing else about the gate moved: it judges the PR against the default branch's tip, runs the
-# default branch's copy of scripts/check_grader_paths.py, and reads who applied the label.
+# WHERE THE JUDGE COMES FROM (KIT-668). The gate runs on `pull_request_target`, so GitHub takes
+# this file from the DEFAULT BRANCH, never from the pull request. The job checks out the default
+# branch, fetches the PR's head commit as data for the diff, and runs only the default branch's
+# gate script. Nothing the PR wrote is on disk, none of it runs, and the token can only read. So a
+# PR that edits this workflow or the gate script cannot change how it is itself judged.
+#
+# A PR that edits THIS file also runs its own copy, on `pull_request` (the paths filter below).
+# That is how the PR that moved the gate here was judged at all, since the default branch's copy
+# then had no `pull_request_target`. It also lets a change to the gate run before it lands. That
+# copy cannot turn the check green alone. The default branch's run reports on the same commit,
+# and GitHub blocks a merge while any run of a required check is red: a later green run of the
+# same name does not hide it. GitHub does not document that rule. It was measured on a probe
+# pull request on 17 Nov 2026, so scripts/check_label_gate.py pins this file's shape, and
+# docs/OPERATIONS.md ("What is not proven") says how to re-measure it.
+#
+# WHAT IT NEEDS. From 2 Dec 2026 GitHub blocks `pull_request_target` in public repositories
+# unless an Actions policy allows it. Without that allow this job never runs, the required check
+# never reports, and no PR can merge: it fails closed. The owner makes the allow, for this one
+# file, with `python3 scripts/pipeline_gate_policy.py run`.
 
 on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
   pull_request:
     types: [opened, synchronize, reopened, labeled, unlabeled]
+    paths:
+      - .github/workflows/hooks-change-guard.yml
 
 permissions:
   contents: read
@@ -41,20 +62,16 @@ jobs:
   #   - adding/removing the label re-runs the check via the labeled/unlabeled
   #     trigger types of this workflow; if a run ever wedges, an empty commit gives a
   #     clean re-run;
-  #   - this flag only becomes a real gate once branch protection requires a
-  #     review (required_approving_review_count >= 1, owner-set in the GitHub
-  #     UI) so a human actually sees it. PR-only — a push to main has no label
-  #     context;
-  #   - HEAD CONTEXT: this job runs from the PR's own checkout, so a PR can edit
-  #     the workflow and the script that gate it. The default-branch reads above close
-  #     the config half of that hole, not the code half. The property "a green
-  #     check can never be produced by the code under review" needs
-  #     `pull_request_target` (base-ref workflow) PLUS a required review —
-  #     owner-set, and deliberately not claimed until both are in place.
+  #   - the label is a person's acknowledgement. The script checks WHO applied it,
+  #     which tells a person from an agent only when the agent has an identity of its
+  #     own. Under one shared credential a person sees the change only where branch
+  #     protection requires an approving review (owner-set, not set here). PR-only —
+  #     a push to main has no label context;
+  #   - no job-level `if:` and no `concurrency`: a skipped job reports success, and
+  #     the default branch's run must always report.
   hooks-change-guard:
     name: Hooks change guard
     runs-on: ubuntu-24.04
-    if: github.event_name == 'pull_request'
     # `issues: read` is what lets the job ask WHO applied the label (the PR
     # events API). Without it the applier is unknowable and the gate fails closed.
     permissions:
@@ -62,12 +79,15 @@ jobs:
       issues: read
       pull-requests: read
     steps:
+      # The default branch, never the PR's head or merge commit.
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
 
       - name: Require the 'hooks-change' label to edit grader paths
         env:
+          EVENT_NAME: ${{ github.event_name }}
           LABELS: ${{ join(github.event.pull_request.labels.*.name, ' ') }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -76,6 +96,14 @@ jobs:
           PR_AUTHOR_TYPE: ${{ github.event.pull_request.user.type }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          case "$EVENT_NAME" in
+            pull_request_target|pull_request) ;;
+            *) echo "::error::the label gate judges pull requests, not a $EVENT_NAME event"; exit 1 ;;
+          esac
+          if ! printf '%s' "$HEAD_SHA" | grep -Eqx '[0-9a-f]{40}'; then
+            echo "::error::the event names no head commit, so nothing can be judged"
+            exit 1
+          fi
           # Judge the PR against the default branch's tip, never the base it names:
           # that base could be a branch its author pushed, with its own gate or a shorter
           # riskPaths, and retargeting a PR re-runs nothing (KIT-410). The gate, the diff
@@ -85,14 +113,20 @@ jobs:
             exit 1
           fi
           export BASE_SHA
+          # The PR's head commit, as GitHub's event names it, fetched as data for the diff.
+          # It is never put on disk, and nothing in it runs.
+          if ! git fetch --quiet --no-tags origin "$HEAD_SHA" || ! git cat-file -e "$HEAD_SHA^{commit}"; then
+            echo "::error::cannot fetch the head commit $HEAD_SHA, so nothing can be judged"
+            exit 1
+          fi
           # Run the default branch's revision of the gate, never the PR's own copy. A head
-          # that can rewrite FLOOR — or delete the identity check below it — is
-          # grading its own homework; this is the same rule the script already
-          # applies to delivery.json, extended to the script itself. The fallback
-          # covers only the commit that first introduces the file.
+          # that can rewrite FLOOR — or delete the identity check below it — is grading its
+          # own homework; this is the same rule the script already applies to delivery.json,
+          # extended to the script itself. There is no fallback: a default branch without the
+          # gate cannot judge anything, so the check fails closed.
           gate="$RUNNER_TEMP/check_grader_paths.py"
-          if ! git show "$BASE_SHA:scripts/check_grader_paths.py" > "$gate" 2>/dev/null; then
-            echo "::notice::base has no grader script yet — using the head copy"
-            cp scripts/check_grader_paths.py "$gate"
+          if ! git show "$BASE_SHA:scripts/check_grader_paths.py" > "$gate"; then
+            echo "::error::the default branch has no gate script, so nothing can be judged"
+            exit 1
           fi
           python3 "$gate"

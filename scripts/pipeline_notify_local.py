@@ -2148,7 +2148,7 @@ HEALTH_JOB_WORDS = {
     "bounce-driver": ("bounce driver", "review findings are not sent back for a fix"),
     "finding-poller": ("finding poller", "follow-up tickets a dev asks for are not filed"),
     "notifier": ("notifier", "pages like this one may not reach you"),
-    "bridge": ("bridge", "your direct messages go quiet: no asks are read and no stand-up is sent"),
+    "bridge": ("tech lead", "your direct messages go quiet: no asks are read and no stand-up is sent"),
     "catch-up": ("catch-up poller", "a hand-over the dispatcher missed is not sent again"),
     "health-watch": ("health watch", "something outside the daemons needs a look, or is not "
                                      "being checked"),
@@ -3248,7 +3248,7 @@ class ChatClient:
             if error == "missing_scope":
                 raise ChatDMScopeError(
                     "I could not open a direct message with %s: the chat token is missing a "
-                    "scope (needed: %s; provided: %s). The Slack bridge's app needs im:write "
+                    "scope (needed: %s; provided: %s). The tech lead's Slack app needs im:write "
                     "to page a person directly. Add it to that app and reinstall the app. No "
                     "page reached that person"
                     % (user_id, doc.get("needed") or "im:write",

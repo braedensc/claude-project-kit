@@ -29,6 +29,16 @@ WHAT IT MEASURES, AND ONLY THAT.
   The machine: the queue's own reader (read_room): three system totals, nothing per app.
 A tree it cannot measure is said, once, and not stopped: a session is never killed because ps failed.
 
+WHAT IT REMEMBERS (KIT-739).  Each process seen in a run's tree is remembered with its start time,
+so one that leaves the tree, or outlives its parent, is still killed when the run ends. The start
+time tells a process from a later one that reused its number. It is read at the finest resolution
+the system offers: from the kernel's own process record on macOS (to the microsecond), from /proc
+on Linux (in clock ticks), and from `ps lstart` (to the second) only where neither is there. The
+record names the one it used. Each look drops the processes that are gone, so a long run's churn
+never fills it. More than REMEMBER_MAX alive at once is a runaway: the newest are kept, and the run
+is past its memory limit, in words that name the cap. The runner keeps the record in its own store,
+never in the run's folder, which the run's own processes write (scripts/pipeline_runner.py).
+
 TELLING THE OWNER.  Each incident is recorded once, in plain words, in the runner's incidents file:
 a run stopped at a limit, a tree it could not measure, or the floor holding new starts. The same
 incident is never recorded twice. A floor incident ends when there is room again; the next one is
@@ -42,6 +52,7 @@ import os
 import re
 import signal
 import stat
+import struct
 import subprocess
 import sys
 import time
@@ -60,16 +71,20 @@ FLOORS = {"wall_minutes": 10, "memory_mb": 512, "disk_mb": 512}
 CEILINGS = {"wall_minutes": 7 * 24 * 60, "memory_mb": 1 << 20, "disk_mb": 1 << 24}
 MAX_ENTRIES = 500000          # more files than this in one run's folders counts as past its limit
 MAX_TREE = 512                # a tree of more processes than this counts as past its memory limit
-REMEMBER_MAX = 4096           # processes remembered for one run, with their start times
+REMEMBER_MAX = 4096           # a run's processes remembered alive at once; more counts as past its memory limit
 TIMEOUT = 10                  # seconds, for each fixed command
 PGREP, PS = "pgrep", "ps"
 INCIDENTS_SCHEMA = "pipeline-runner-incidents/1"
+TREE_SCHEMA = "pipeline-runner-tree/1"
+# How a process's start time is read, finest first, and what each one resolves.
+RESOLUTION = {"sysctl": "microsecond", "proc": "clock tick", "ps": "second"}
 KEPT = 200                    # incidents kept in the file, newest last
 WORDS = {
     "limit:time": "it ran for %(minutes)d minutes, past its limit of %(limit)d",
     "limit:memory": "its processes held %(mb)d MB of memory, past its limit of %(limit)d MB",
     "limit:disk": "its folders held %(mb)d MB, past its limit of %(limit)d MB",
     "tree": "its process tree passed %(n)d processes, past its limit",
+    "remember": "more than %(n)d of its processes were alive at once, past its limit",
 }
 
 
@@ -142,15 +157,83 @@ def tree(pgid, run=None):
     return walk(pgid, run)[0]
 
 
-def snapshot(pids, run=None):
-    """{pid: start time} for these processes, as ps gives it. The start time tells a process from
-    a later one that reused its number."""
-    if not pids:
-        return {}
+# --------------------------------------------------------------------------- #
+# Start times, at the finest resolution the system offers (KIT-739)
+# --------------------------------------------------------------------------- #
+_SYSCTL = []                  # the kernel's sysctl call, found once
+_KINFO_MAX = 4096             # room for one struct kinfo_proc (648 bytes on 64-bit macOS)
+_METHOD = []                  # the finest method this system offers, found once
+
+
+def _sysctl_call():
+    """libc's sysctl, with its C types, or None where it cannot be loaded."""
+    if not _SYSCTL:
+        try:
+            import ctypes
+            import ctypes.util
+            fn = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True).sysctl
+            fn.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_uint, ctypes.c_void_p,
+                           ctypes.POINTER(ctypes.c_size_t), ctypes.c_void_p, ctypes.c_size_t]
+            fn.restype = ctypes.c_int
+            _SYSCTL.append(fn)
+        except (ImportError, OSError, AttributeError, TypeError):
+            _SYSCTL.append(None)
+    return _SYSCTL[0]
+
+
+def _sysctl_starts(pids):
+    """{pid: "seconds.microseconds"} from the kernel's own record of each process (macOS: sysctl
+    CTL_KERN.KERN_PROC.KERN_PROC_PID). That record is a struct kinfo_proc, and its first member,
+    kp_proc.p_un.__p_starttime, is the start time as a timeval. A process that is gone is left
+    out. None when the call is not there or fails: nothing it said is then trusted."""
+    fn = _sysctl_call()
+    if fn is None:
+        return None
+    import ctypes
+    buf = ctypes.create_string_buffer(_KINFO_MAX)
+    got = {}
+    for pid in pids:
+        mib = (ctypes.c_int * 4)(1, 14, 1, int(pid))      # CTL_KERN, KERN_PROC, KERN_PROC_PID
+        size = ctypes.c_size_t(_KINFO_MAX)
+        if fn(mib, 4, buf, ctypes.byref(size), None, 0) != 0:
+            return None
+        if size.value < 16:                           # 0: no such process
+            continue
+        sec, usec = struct.unpack_from("=qi", buf, 0)
+        if sec <= 0 or not 0 <= usec < 1000000:
+            return None
+        got[str(pid)] = "%d.%06d" % (sec, usec)
+    return got
+
+
+def _proc_starts(pids):
+    """{pid: clock ticks since boot} from /proc/<pid>/stat (Linux): field 22. The command's name,
+    field 2, may hold spaces and parentheses, so the fields are counted after its last ')'. A
+    process that is gone is left out. None when /proc is not there or a line cannot be read."""
+    if not os.path.isdir("/proc/self"):
+        return None
+    got = {}
+    for pid in pids:
+        try:
+            with open("/proc/%d/stat" % int(pid), "rb") as fh:
+                data = fh.read()
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except OSError:
+            return None
+        rest = data[data.rfind(b")") + 1:].split()
+        if len(rest) < 20 or not rest[19].isdigit():
+            return None
+        got[str(pid)] = rest[19].decode("ascii")      # field 22, counted from field 3
+    return got
+
+
+def _ps_starts(pids, run=None):
+    """{pid: start} as `ps lstart` prints it: to the second. None when ps could not run."""
     run = run or run_command
     code, out = run([PS, "-o", "pid=,lstart=", "-p", ",".join(str(p) for p in pids)])
     if code is None:
-        return {}
+        return None
     got = {}
     for line in out.splitlines():
         parts = line.split(None, 1)
@@ -159,22 +242,144 @@ def snapshot(pids, run=None):
     return got
 
 
-def kill_remembered(remembered, run=None, kill=None):
-    """SIGKILL each remembered process that is still the same process: the same pid with the same
-    start time. A process that left the tree, or outlived its parent, is still found this way.
-    Returns how many were sent the signal."""
-    if not isinstance(remembered, dict) or not remembered:
-        return 0
+def start_method():
+    """The finest way this system offers to read a start time, found once by reading this
+    process's own: "sysctl" on macOS, "proc" on Linux, else "ps" (to the second)."""
+    if not _METHOD:
+        me = str(os.getpid())
+        tries = (("sysctl", _sysctl_starts),) if sys.platform == "darwin" else ()
+        tries += (("proc", _proc_starts),)
+        _METHOD.append(next((name for name, read in tries if (read([os.getpid()]) or {}).get(me)),
+                            "ps"))
+    return _METHOD[0]
+
+
+def start_times(pids, method=None, run=None):
+    """{pid: start} for the processes that are there, read by `method` (the finest this system
+    offers when None); None when they could not be read. Compare two starts only when they were
+    read by the same method."""
+    pids = sorted(set(int(p) for p in pids if str(p).isdigit() and int(p) > 0))
+    if not pids:
+        return {}
+    method = method or start_method()
+    if method == "sysctl":
+        return _sysctl_starts(pids)
+    if method == "proc":
+        return _proc_starts(pids)
+    return _ps_starts(pids, run)
+
+
+# --------------------------------------------------------------------------- #
+# The remembered tree: what of a run is killed when it ends (KIT-739)
+# --------------------------------------------------------------------------- #
+def new_record(method=None):
+    """An empty record of a run's tree. `leader` is the run's wrapper, whose number is its process
+    group's; `procs` its processes seen alive, each [pid, start], first seen first."""
+    method = method or start_method()
+    return {"schema": TREE_SCHEMA, "method": method, "resolution": RESOLUTION[method],
+            "leader": None, "procs": [], "dropped": 0}
+
+
+def _entry(v):
+    return (isinstance(v, list) and len(v) == 2 and all(isinstance(x, str) for x in v)
+            and v[0].isdigit() and int(v[0]) > 1 and 0 < len(v[1]) <= 64)
+
+
+def record_problems(doc):
+    """What is wrong with a tree record's shape, in words: empty when it is one."""
+    if not (isinstance(doc, dict) and doc.get("schema") == TREE_SCHEMA):
+        return ["the record is not a %s" % TREE_SCHEMA]
+    if doc.get("method") not in RESOLUTION or doc.get("resolution") != RESOLUTION.get(doc.get("method")):
+        return ["the record names no way of reading start times"]
+    if not (doc.get("leader") is None or _entry(doc["leader"])):
+        return ["the record's leader is not a process"]
+    procs = doc.get("procs")
+    if not (isinstance(procs, list) and len(procs) <= REMEMBER_MAX and all(_entry(p) for p in procs)):
+        return ["the record's processes are not a list of processes"]
+    if not (isinstance(doc.get("dropped"), int) and not isinstance(doc["dropped"], bool)
+            and doc["dropped"] >= 0):
+        return ["the record's count of dropped processes is not one"]
+    return []
+
+
+def remember(record, pids, read=None):
+    """(record, over, unread): `pids`, the run's tree as just seen, added to its record.
+
+    Each look first drops the remembered processes that are gone, or whose number now belongs
+    to a process that started at another time, so a long run's churn never fills the record.
+    More than REMEMBER_MAX alive at once is a runaway: the newest are kept, the rest are counted
+    in `dropped`, and `over` is (limit:memory, words naming the cap). It is never silent.
+    `unread` is True when the start times could not be read: then nothing is dropped and
+    nothing added. `read` stands in for start_times in tests."""
+    record = record if record is not None and not record_problems(record) else new_record()
+    read = read or (lambda p: start_times(p, record["method"]))
+    known = [list(p) for p in record["procs"]]
+    asked = set(int(p) for p, _ in known) | set(int(p) for p in pids
+                                                if str(p).isdigit() and int(p) > 1)
+    now = read(sorted(asked)) if asked else {}
+    if now is None:
+        return record, None, True
+    kept = [p for p in known if now.get(p[0]) == p[1]]
+    have = set(p[0] for p in kept)
+    for pid in sorted(set(str(p) for p in pids if str(p).isdigit() and int(p) > 1)):
+        if pid in now and pid not in have:
+            kept.append([pid, now[pid]])
+            have.add(pid)
+    over = None
+    if len(kept) > REMEMBER_MAX:
+        cut = len(kept) - REMEMBER_MAX
+        record["dropped"] += cut
+        kept = kept[cut:]
+        over = ("limit:memory", WORDS["remember"] % {"n": REMEMBER_MAX})
+    record["procs"] = kept
+    return record, over, False
+
+
+def remembered_alive(record, read=None):
+    """The remembered processes that are still the same process: the same pid with the same
+    start time. None when their start times could not be read."""
+    if not record or record_problems(record) or not record["procs"]:
+        return []
+    read = read or (lambda p: start_times(p, record["method"]))
+    now = read([int(p) for p, _ in record["procs"]])
+    if now is None:
+        return None
+    return [int(p) for p, s in record["procs"] if now.get(p) == s]
+
+
+def kill_remembered(record, read=None, kill=None):
+    """SIGKILL each remembered process that is still the same process. A process that left the
+    tree, or outlived its parent, is still found this way, and a later process that reused a
+    number never is. Returns how many were sent the signal; None when their start times could
+    not be read, and then nothing is sent."""
+    alive = remembered_alive(record, read)
+    if alive is None:
+        return None
     kill = kill or os.kill
     sent = 0
-    for pid, start in snapshot([int(p) for p in remembered if str(p).isdigit()], run).items():
-        if remembered.get(pid) == start and int(pid) > 1:
+    for pid in alive:
+        if pid > 1 and pid != os.getpid():
             try:
-                kill(int(pid), signal.SIGKILL)
+                kill(pid, signal.SIGKILL)
                 sent += 1
             except (ProcessLookupError, PermissionError):
                 pass
     return sent
+
+
+def leader_is_gone_or_same(record, pid, read=None):
+    """False only when the run's group number `pid` is now a later process's: a process holds
+    that number and started at another time than the run's leader. Then the run's own group is
+    long gone, and a signal to that group would reach a stranger. True otherwise, and True when
+    nothing was recorded to tell them apart."""
+    leader = (record or {}).get("leader") if not record_problems(record or {}) else None
+    if not (leader and isinstance(pid, int) and leader[0] == str(pid)):
+        return True
+    read = read or (lambda p: start_times(p, record["method"]))
+    now = read([pid])
+    if now is None:
+        return True
+    return now.get(str(pid)) in (None, leader[1])
 
 
 def resident_kb(pids, run=None):
@@ -463,13 +668,66 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
         expect("a tree of more processes than the cap is past its memory limit, however small",
                got["over"], ("limit:memory", "its process tree passed 512 processes, past its limit"))
 
+        # ---- what it remembers (KIT-739) ------------------------------------ #
+        method = start_method()
+        want = {"darwin": "sysctl"}.get(sys.platform, "proc" if sys.platform.startswith("linux") else "ps")
+        expect("start times are read the finest way this system offers", method, want)
+        mine = start_times([os.getpid()])
+        expect("…and this process's own is read that way, finer than a second where it can be",
+               (sorted(mine), "." in mine[str(os.getpid())] if method == "sysctl" else True),
+               ([str(os.getpid())], True))
+        expect("the record names its resolution", (new_record()["method"], new_record()["resolution"]),
+               (method, RESOLUTION[method]))
+        expect("…and says so when one second is all there is",
+               new_record("ps")["resolution"], "second")
+
         def ps_starts(argv):
             return 0, "100 Thu Nov 12 22:00:00 2026\n300 Thu Nov 12 22:05:00 2026\n"
+        expect("ps's start times, to the second, when it is the only way",
+               start_times([100, 300], "ps", ps_starts),
+               {"100": "Thu Nov 12 22:00:00 2026", "300": "Thu Nov 12 22:05:00 2026"})
+        alive = {"100": "1.000001", "300": "2.000002"}
+
+        def reader(p):
+            return dict((k, v) for k, v in alive.items() if int(k) in p)
+        rec = dict(new_record("sysctl"), procs=[["100", "1.000001"], ["300", "9.000009"]])
         sent = []
         expect("a remembered process is killed only while it is the same process",
-               (kill_remembered({"100": "Thu Nov 12 22:00:00 2026", "300": "Wed Nov 11 09:00:00 2026"},
-                                ps_starts, lambda pid, sig: sent.append((pid, sig))), sent),
+               (kill_remembered(rec, reader, lambda pid, sig: sent.append((pid, sig))), sent),
                (1, [(100, signal.SIGKILL)]))
+        expect("…and nothing is killed when the start times cannot be read",
+               kill_remembered(rec, lambda p: None, lambda pid, sig: sent.append(pid)), None)
+        rec, over, unread = remember(dict(new_record("sysctl"), procs=[["100", "1.000001"],
+                                                                       ["300", "9.000009"]]),
+                                     [100, 300, 400], reader)
+        expect("a look drops a process that is gone and one whose number a later process took, "
+               "and adds the new", (rec["procs"], over, unread),
+               ([["100", "1.000001"], ["300", "2.000002"]], None, False))
+        expect("start times it cannot read change nothing, and say so",
+               remember(dict(rec), [100, 999], lambda p: None)[1:], (None, True))
+        real_max = globals()["REMEMBER_MAX"]
+        globals()["REMEMBER_MAX"] = 3
+        try:
+            alive.update({"501": "5.1", "502": "5.2", "503": "5.3"})
+            rec, over, _ = remember(rec, [100, 300, 501, 502, 503], reader)
+            expect("past the cap the newest are kept, the rest counted, and the run is past its "
+                   "memory limit, in words that name the cap",
+                   ([p[0] for p in rec["procs"]], rec["dropped"], over),
+                   (["501", "502", "503"], 2,
+                    ("limit:memory", "more than 3 of its processes were alive at once, past its limit")))
+            expect("…and the record that holds them is still one", record_problems(rec), [])
+        finally:
+            globals()["REMEMBER_MAX"] = real_max
+        expect("a record that is not one is never read as one",
+               (record_problems({"300": "Thu Nov 12 22:05:00 2026"})[:1],
+                record_problems(dict(rec, procs=[["1", "x"]]))[:1]),
+               (["the record is not a pipeline-runner-tree/1"],
+                ["the record's processes are not a list of processes"]))
+        expect("the run's group is signalled while its leader is gone or the same",
+               (leader_is_gone_or_same(dict(rec, leader=["100", "1.000001"]), 100, reader),
+                leader_is_gone_or_same(dict(rec, leader=["700", "7.0"]), 700, reader)), (True, True))
+        expect("…and never once its number belongs to a process that started later",
+               leader_is_gone_or_same(dict(rec, leader=["300", "9.000009"]), 300, reader), False)
         got = check_run(small, 100, time.time(), [], time.time(), run=lambda a: (None, ""))
         expect("a tree it cannot measure is said, and not stopped",
                (got["over"], got["unmeasured"]), (None, "its processes could not be measured"))
@@ -498,12 +756,18 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
         expect("a broken record never hides a new incident", tell(path, "run-1:limit:memory", "w", 3000.0), True)
         expect("the incidents file is owner-only", stat.S_IMODE(os.stat(path).st_mode), 0o600)
     finally:
+        # Again until nothing is left: a kill can miss a process its group's leader is forking
+        # at that instant (measured on CI, 12 Nov).
         for p in groups:
-            signal_tree(p.pid, tree(p.pid) or [], signal.SIGKILL)
-            try:
-                p.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                pass
+            end = time.time() + 10
+            while time.time() < end:
+                signal_tree(p.pid, tree(p.pid) or [], signal.SIGKILL)
+                try:
+                    p.wait(timeout=0.2)
+                except subprocess.TimeoutExpired:
+                    continue
+                if not tree(p.pid):
+                    break
     if failures:
         print("FAIL: pipeline_runner_limits selftest")
         for f in failures:
