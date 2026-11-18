@@ -304,6 +304,47 @@ def run_tree(argv, timeout, **kw):
     return subprocess.CompletedProcess(argv, proc.returncode, out, err)
 
 
+PS_ARGV = ("ps", "-ax", "-o", "pid=,command=")
+
+
+def process_listing(argv=PS_ARGV):
+    """(lines, None) — this machine's processes — or (None, why) when it will not list them.
+    Claude Code's sandbox refuses `ps` outright (KIT-785). A refusal is never an empty list:
+    that would read as "no process left behind", a pass nobody checked."""
+    try:
+        r = subprocess.run(list(argv), capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, "the process list could not be read (%s: %s)" % (type(exc).__name__, exc)
+    if r.returncode != 0:
+        return None, "the process list could not be read (ps exited %d: %s)" % (
+            r.returncode, (r.stderr or "").strip()[-160:])
+    return r.stdout.splitlines(), None
+
+
+def hung_scanner_verdict(rc, said, took, listing, why_not, hang_mark):
+    """The KIT-424 case's verdict, as (word, failed, detail). Whether the hung stand-in was left
+    running needs the process list. Where it cannot be read (KIT-785) that part is NOT CHECKED,
+    said with the reason: never a PASS, and what could be checked still fails the case."""
+    timed_out = rc == 124 and "TIMED OUT after 8 s" in said and took < 40
+    if listing is None:
+        if not timed_out:
+            return "FAIL", True, (f" — rc={rc} took={took:.0f}s said={said.strip()[-200:]!r}; "
+                                  f"and {why_not}")
+        return "NOT CHECKED", False, (f" — it failed by name in {took:.0f}s, but whether it left a "
+                                      f"process running was not checked: {why_not}")
+    left = [ln.split()[0] for ln in listing if ln.rstrip().endswith(hang_mark)]
+    if timed_out and not left:
+        return "PASS", False, ""
+    return "FAIL", True, f" — rc={rc} took={took:.0f}s left_running={left} said={said.strip()[-200:]!r}"
+
+
+def summary_line(total, failures, not_checked):
+    """The battery's last line. A case this machine could not check is neither passed nor failed:
+    it is named, and left out of the passed count (KIT-785)."""
+    return (f"\n{total - failures - len(not_checked)}/{total} cases passed"
+            + ("; NOT CHECKED here: " + "; ".join(not_checked) if not_checked else ""))
+
+
 def _say(name, ok, detail=""):
     print(f"[{'PASS' if ok else 'FAIL'}] {name}{detail}")
     return 0 if ok else 1
@@ -3361,6 +3402,7 @@ def main():
 
     failures = 0
     seq_ran = 0
+    not_checked = []   # cases this machine could not check: never counted as passed (KIT-785)
     for name, payload, expect_block, hook_path, *rest in cases:
         env = rest[0] if rest else None          # rest = (env,) or (env, cwd)
         cwd = rest[1] if len(rest) > 1 else None
@@ -4409,19 +4451,44 @@ def main():
     print(f"[{'PASS' if ok2 else 'FAIL'}] pre-commit (KIT-424): {name2}"
           + ("" if ok2 else f" — gave_up={gave_up} took={took2:.0f}s"))
     failures += 0 if ok2 else 1
-    listing = subprocess.run(["ps", "-ax", "-o", "pid=,command="], capture_output=True, text=True).stdout
-    left = [ln.split()[0] for ln in listing.splitlines() if ln.rstrip().endswith(HANG_MARK)]
-    ok = rc == 124 and "TIMED OUT after 8 s" in said and took < 40 and not left
-    listing2 = subprocess.run(["ps", "-ax", "-o", "pid=,command="], capture_output=True, text=True).stdout
-    escaped = [ln.split()[0] for ln in listing2.splitlines()
-               if ln.rstrip().endswith("sleep " + str(int(HANG_SECONDS) + 1))]
-    if escaped:
-        subprocess.run(["kill", "-9", *escaped], capture_output=True)   # the one that left its group
-    if left:
-        subprocess.run(["kill", "-9", *left], capture_output=True)   # this run's own stand-in
-    print(f"[{'PASS' if ok else 'FAIL'}] pre-commit (KIT-424): {name}"
-          + ("" if ok else f" — rc={rc} took={took:.0f}s left_running={left} said={said.strip()[-200:]!r}"))
-    failures += 0 if ok else 1
+    # Where the process list cannot be read (a sandbox refuses `ps`, KIT-785), the case says NOT
+    # CHECKED for the one thing it needs the list for, and nothing is killed: there is no pid to name.
+    listing, why_not = process_listing()
+    word, failed, detail = hung_scanner_verdict(rc, said, took, listing, why_not, HANG_MARK)
+    if listing is not None:
+        left = [ln.split()[0] for ln in listing if ln.rstrip().endswith(HANG_MARK)]
+        listing2, _why = process_listing()
+        escaped = [ln.split()[0] for ln in (listing2 or [])
+                   if ln.rstrip().endswith("sleep " + str(int(HANG_SECONDS) + 1))]
+        if escaped:
+            subprocess.run(["kill", "-9", *escaped], capture_output=True)   # the one that left its group
+        if left:
+            subprocess.run(["kill", "-9", *left], capture_output=True)   # this run's own stand-in
+    print(f"[{word}] pre-commit (KIT-424): {name}{detail}")
+    failures += 1 if failed else 0
+    if word == "NOT CHECKED":
+        not_checked.append("pre-commit (KIT-424): " + name)
+    # KIT-785, pinned: a refused process list is NOT CHECKED, never a pass, and a case that failed
+    # what it could check still fails. A refusal is no list at all, never an empty one.
+    seq_ran += 1
+    name3 = "a process list this machine refuses is NOT CHECKED, never a pass (KIT-785)"
+    _starting(name3)
+    bad_ps = process_listing(("/nonexistent/ps-kit-785",))
+    false_ps = process_listing(("false",))
+    verdicts = [hung_scanner_verdict(124, "TIMED OUT after 8 s", 9, None, "ps refused", HANG_MARK),
+                hung_scanner_verdict(0, "", 50, None, "ps refused", HANG_MARK),
+                hung_scanner_verdict(124, "TIMED OUT after 8 s", 9, ["123 " + HANG_MARK], None, HANG_MARK),
+                hung_scanner_verdict(124, "TIMED OUT after 8 s", 9, ["1 /sbin/launchd"], None, HANG_MARK)]
+    ok3 = (bad_ps[0] is None and "could not be read" in (bad_ps[1] or "")
+           and false_ps[0] is None and "exited" in (false_ps[1] or "")
+           and [v[:2] for v in verdicts] == [("NOT CHECKED", False), ("FAIL", True), ("FAIL", True),
+                                             ("PASS", False)]
+           and "ps refused" in verdicts[0][2] and "not checked" in verdicts[0][2]
+           and summary_line(10, 1, ["x"]) == "\n8/10 cases passed; NOT CHECKED here: x"
+           and summary_line(10, 0, []) == "\n10/10 cases passed")
+    print(f"[{'PASS' if ok3 else 'FAIL'}] pre-commit (KIT-424, KIT-785): {name3}"
+          + ("" if ok3 else f" — listings {bad_ps!r} {false_ps!r}, verdicts {verdicts!r}"))
+    failures += 0 if ok3 else 1
     for r in _PRECOMMIT_TMP:
         shutil.rmtree(r, ignore_errors=True)
 
@@ -4499,7 +4566,7 @@ def main():
     # printed "134/134 cases passed" for 138 checks, and a nonsense ratio when red.
     total = (len(cases) + len(stop_cases) + len(reason_cases)
              + len(stop_reason_cases) + seq_ran)
-    print(f"\n{total - failures}/{total} cases passed")
+    print(summary_line(total, failures, not_checked))
     return 1 if failures else 0
 
 
