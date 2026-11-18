@@ -20,6 +20,10 @@
     "check_seconds": 60,
     "room": {"min_free_disk_gb": 25, "max_pressure": "critical", "max_swap_gb": 4}
   },
+  "session_tools": {
+    "key_file": "~/.pipeline-runner/session-writer-key",
+    "writer_user_id": "<the session writer's tracker user id, never the owner's>"
+  },
   "projects": {
     "app": {
       "repo": "/Users/<role-account>/repos/app",

@@ -111,6 +111,14 @@ def edit(p, new=""):
     return {"tool_name": "Edit", "tool_input": {"file_path": p, "old_string": "a", "new_string": new}}
 
 
+def notebook(p, src=""):
+    """A NotebookEdit payload as Claude Code sends it: the file is `notebook_path` and the
+    cell's text is `new_source`, so a guard that reads only `file_path` and `content` never
+    sees either (KIT-673)."""
+    return {"tool_name": "NotebookEdit",
+            "tool_input": {"notebook_path": p, "cell_id": "cell-1", "new_source": src}}
+
+
 def sub(payload):
     """Mark a payload as coming from a SUBAGENT. The CLI sets `agent_id` only for
     subagent sessions, and the hook widens the session root to the cwd's worktree
@@ -302,6 +310,55 @@ def run_tree(argv, timeout, **kw):
                     pass
         raise
     return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+
+
+PS_ARGV = ("ps", "-ax", "-o", "pid=,command=")
+
+
+def process_listing(argv=PS_ARGV):
+    """(lines, None) — this machine's processes — or (None, why) when it will not list them.
+    Claude Code's sandbox refuses `ps` outright (KIT-785). A refusal is never an empty list:
+    that would read as "no process left behind", a pass nobody checked."""
+    try:
+        r = subprocess.run(list(argv), capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, "the process list could not be read (%s: %s)" % (type(exc).__name__, exc)
+    if r.returncode != 0:
+        return None, "the process list could not be read (ps exited %d: %s)" % (
+            r.returncode, (r.stderr or "").strip()[-160:])
+    return r.stdout.splitlines(), None
+
+
+def hung_scanner_verdict(rc, said, took, listing, why_not, hang_mark):
+    """The KIT-424 case's verdict, as (word, failed, detail). Whether the hung stand-in was left
+    running needs the process list. Where it cannot be read (KIT-785) that part is NOT CHECKED,
+    said with the reason: never a PASS, and what could be checked still fails the case."""
+    timed_out = rc == 124 and "TIMED OUT after 8 s" in said and took < 40
+    if listing is None:
+        if not timed_out:
+            return "FAIL", True, (f" — rc={rc} took={took:.0f}s said={said.strip()[-200:]!r}; "
+                                  f"and {why_not}")
+        return "NOT CHECKED", False, (f" — it failed by name in {took:.0f}s, but whether it left a "
+                                      f"process running was not checked: {why_not}")
+    left = [ln.split()[0] for ln in listing if ln.rstrip().endswith(hang_mark)]
+    if timed_out and not left:
+        return "PASS", False, ""
+    return "FAIL", True, f" — rc={rc} took={took:.0f}s left_running={left} said={said.strip()[-200:]!r}"
+
+
+def record_verdict(word, failed, name, not_checked):
+    """A case's verdict into the battery's count: the failures it adds, and, for NOT CHECKED,
+    its name in `not_checked`, so the last line leaves it out of the passed count (KIT-785)."""
+    if word == "NOT CHECKED":
+        not_checked.append(name)
+    return 1 if failed else 0
+
+
+def summary_line(total, failures, not_checked):
+    """The battery's last line. A case this machine could not check is neither passed nor failed:
+    it is named, and left out of the passed count (KIT-785)."""
+    return (f"\n{total - failures - len(not_checked)}/{total} cases passed"
+            + ("; NOT CHECKED here: " + "; ".join(not_checked) if not_checked else ""))
 
 
 def _say(name, ok, detail=""):
@@ -1647,6 +1704,47 @@ def main():
         branch="feat/decompose-the-epic",
         pin={"session_mode": "planning", "ticket": None,
              "expires_at": "2020-01-01T00:00:00Z"})
+    # KIT-674: a pin that is GONE is not one that never was. The dispatcher's ledger,
+    # <pinsRoot>/ledger.jsonl, outside the worktree, holds a row for every pin written and
+    # every release. Its last row for a worktree, a pin row under a day old (no kit
+    # dispatcher lets a pin live longer), says a pin must be there.
+    def _ledger(pins, *rows):
+        with open(os.path.join(pins, "ledger.jsonl"), "a") as fh:
+            for row in rows:
+                fh.write((row if isinstance(row, str) else json.dumps(row)) + "\n")
+
+    def _ago(hours):
+        return (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+    pl_gone_root, pl_gone, pl_gone_pins = make_pipeline_sandbox(pin=None)
+    _ledger(pl_gone_pins,
+            {"dispatch_id": "d_other", "ticket": "ENG-9", "worktree": "/elsewhere/ENG-9",
+             "pinned_at": _ago(1), "stage": "local-dispatch"},
+            {"dispatch_id": "d_gone", "ticket": "ENG-123", "worktree": pl_gone_root,
+             "pinned_at": _ago(1), "pinned_by": "dispatcher:battery",
+             "stage": "local-dispatch"},
+            "a line that is not JSON names nothing")
+    pl_freed_root, pl_freed, pl_freed_pins = make_pipeline_sandbox(pin=None)
+    _ledger(pl_freed_pins,
+            {"dispatch_id": "d_freed", "ticket": "ENG-123", "worktree": pl_freed_root,
+             "pinned_at": _ago(2), "stage": "local-dispatch"},
+            {"dispatch_id": "d_freed", "ticket": "ENG-123", "worktree": pl_freed_root,
+             "released_at": _ago(1), "stage": "local-release"})
+    pl_elsewhere_root, pl_elsewhere, pl_elsewhere_pins = make_pipeline_sandbox(pin=None)
+    _ledger(pl_elsewhere_pins,
+            {"dispatch_id": "d_x", "ticket": "ENG-123", "worktree": pl_elsewhere_root + "-2",
+             "pinned_at": _ago(1), "stage": "runner"})
+    pl_stale_root, pl_stale, pl_stale_pins = make_pipeline_sandbox(pin=None)
+    _ledger(pl_stale_pins,
+            {"dispatch_id": "d_stale", "ticket": "ENG-123", "worktree": pl_stale_root,
+             "pinned_at": _ago(25), "stage": "local-dispatch"})
+    pl_undated_root, pl_undated, pl_undated_pins = make_pipeline_sandbox(pin=None)
+    _ledger(pl_undated_pins,
+            {"dispatch_id": "d_undated", "ticket": "ENG-123", "worktree": pl_undated_root,
+             "stage": "local-dispatch"})
+    _PL_TMP.extend([pl_gone_root, pl_gone_pins, pl_freed_root, pl_freed_pins,
+                    pl_elsewhere_root, pl_elsewhere_pins, pl_stale_root, pl_stale_pins,
+                    pl_undated_root, pl_undated_pins])
     # `dispatch.pinsRoot` pointing inside the worktree — a pin the session can write
     # is not a pin (§3), and §7 makes it a hard config failure.
     pl_pinsin_root, pl_pinsin, pl_pinsin_pins = make_pipeline_sandbox(
@@ -1734,6 +1832,14 @@ def main():
         pl_acct, os.path.join(pl_acct_root, "home"), "in-repo")
     acct_launch["none"] = make_account_launcher(pl_acct, None, "none")
     nopin_noacct = make_account_launcher(pl_nopin, None, "none")
+    # KIT-674: a configured project whose delivery.json names no pins root reads the default,
+    # ~/.claude/pipeline/pins under the account's home. With no ledger there, nothing expects
+    # a pin, so a person's session stays allowed: the ledger check changes nothing for it.
+    pl_defroot_root, pl_defroot, pl_defroot_pins = make_pipeline_sandbox(
+        pin=None, cfg_over={"dispatch": {"pinsRoot": None}})
+    defroot_home = os.path.realpath(tempfile.mkdtemp(prefix="hook-battery-acct-"))
+    defroot_launch = make_account_launcher(pl_defroot, defroot_home, "defroot")
+    _PL_TMP.extend([pl_defroot_root, pl_defroot_pins, defroot_home])
     lane_home_env = {**os.environ, "CLAUDE_PROJECT_DIR": pl_acct_root, "HOME": lane_fakehome}
     # The marker's SYSTEM path, /etc/claude-pipeline/dispatched-lane/<account> (CK-10):
     # folders root owns all the way down, so the role account cannot rename it away the
@@ -2136,6 +2242,29 @@ def main():
          write(os.path.join(wt_root, "src/x.ts"), "x"), ALLOW, wt_hook),
         ("Write OUTSIDE any worktree allowed (scratchpad/tmp)",
          write("/tmp/scratch/x.ts", "x"), ALLOW, wt_hook),
+
+        # ── KIT-673: NotebookEdit is a write, and every write guard judges it ────
+        # It names its file `notebook_path` and its text `new_source`, so the guards
+        # that read only `file_path` and `content` let it through. Each BLOCK here was an
+        # allow on the old hook; the reason cases below say which guard fired.
+        ("NotebookEdit in-project on main blocked (KIT-673)",
+         notebook(os.path.join(main_root, "nb/a.ipynb"), "x = 1"), BLOCK, main_hook),
+        ("NotebookEdit in-project on a feature branch allowed (KIT-673)",
+         notebook(os.path.join(feat_root, "nb/a.ipynb"), "x = 1"), ALLOW, feat_hook),
+        ("NotebookEdit OUTSIDE the project while on main allowed (KIT-673)",
+         notebook("/somewhere/else/a.ipynb", "x = 1"), ALLOW, main_hook),
+        ("NotebookEdit on a claude/<codename> branch blocked (KIT-673)",
+         notebook(os.path.join(codename_root, "nb/a.ipynb"), "x = 1"), BLOCK, codename_hook),
+        ("NotebookEdit into a SIBLING worktree blocked (KIT-673)",
+         notebook(os.path.join(wt_sibling, "nb/a.ipynb"), "x = 1"), BLOCK, wt_hook),
+        ("NotebookEdit into its OWN worktree allowed (KIT-673)",
+         notebook(os.path.join(wt_root, "nb/a.ipynb"), "x = 1"), ALLOW, wt_hook),
+        ("NotebookEdit with a key in the cell blocked (KIT-673)",
+         notebook("/x/a.ipynb", f"key = '{FAKE_ANTHROPIC}'"), BLOCK, HOOK),
+        ("NotebookEdit with a clean cell allowed (KIT-673)",
+         notebook("/x/a.ipynb", "print('reference the key by its env var name')"), ALLOW, HOOK),
+        ("NotebookEdit of a .env-named file blocked (KIT-673)",
+         notebook("/x/.env.ipynb", "x = 1"), BLOCK, HOOK),
 
         # ── item 7: the session root is CLAUDE_PROJECT_DIR, widened to the cwd's
         #    worktree ONLY for a genuine subagent (payload carries `agent_id`) whose
@@ -2714,6 +2843,10 @@ def main():
          edit(os.path.join(pl_lowpin_root, "src/app.ts"), "x"), ALLOW, pl_lowpin),
         ("ticket-branch: git commit on a mismatched branch blocked",
          bash("git commit -F /tmp/msg.txt"), BLOCK, pl_wrongbr),
+        ("ticket-branch: NotebookEdit on a mismatched branch blocked (KIT-673)",
+         notebook(os.path.join(pl_wrongbr_root, "nb/a.ipynb"), "x = 1"), BLOCK, pl_wrongbr),
+        ("ticket-branch: NotebookEdit on the matching branch allowed (KIT-673)",
+         notebook(os.path.join(pl_root, "nb/a.ipynb"), "x = 1"), ALLOW, pl_hook),
         ("ticket-branch: requireTicketId off → a plain slug is fine",
          edit(os.path.join(pl_noreq_root, "src/app.ts"), "x"), ALLOW, pl_noreq),
 
@@ -2854,6 +2987,35 @@ def main():
         ("expired pin, planning mode: risk-path edit STILL blocked (a lapse grants nothing)",
          edit(os.path.join(pl_expplan_root, ".github/workflows/ci.yml"), "x"),
          BLOCK, pl_expplan),
+
+        # ── a DELETED pin is broken, not absent (KIT-674) ────────────────────
+        # The ledger says a dispatcher bound this worktree and nothing released it, so a
+        # pin that is not there was taken away. Reading that as "a person's session"
+        # switched every withholding guard off for the session that deleted it.
+        ("deleted pin: a tracker write to another ticket is BLOCKED (KIT-674)",
+         mcp("save_issue", id="ENG-456", stateId=PL_RAW), BLOCK, pl_gone),
+        ("deleted pin: a comment is BLOCKED too (the binding is unverifiable) (KIT-674)",
+         mcp("save_comment", issueId="ENG-123", body="done"), BLOCK, pl_gone),
+        ("deleted pin: an ordinary source edit is BLOCKED (KIT-674)",
+         edit(os.path.join(pl_gone_root, "src/app.ts"), "x"), BLOCK, pl_gone),
+        ("deleted pin: Read stays allowed (diagnosis) (KIT-674)",
+         read(os.path.join(pl_gone_root, "delivery.json")), ALLOW, pl_gone),
+        ("no pin and no ledger: a person's session stays allowed (KIT-674)",
+         mcp("save_issue", id="ENG-456", stateId=PL_RAW), ALLOW, pl_nopin),
+        ("no pins root named, no ledger at the default: a person's session stays allowed "
+         "(KIT-674)",
+         mcp("save_issue", id="ENG-456", stateId=PL_RAW), ALLOW, defroot_launch),
+        ("…and an edit there stays allowed too (KIT-674)",
+         edit(os.path.join(pl_defroot_root, "src/app.ts"), "x"), ALLOW, defroot_launch),
+        ("released pin: the worktree is a person's again (KIT-674)",
+         mcp("save_issue", id="ENG-456", stateId=PL_RAW), ALLOW, pl_freed),
+        ("a ledger row for ANOTHER worktree expects no pin here (KIT-674)",
+         mcp("save_issue", id="ENG-456", stateId=PL_RAW), ALLOW, pl_elsewhere),
+        ("a pin row older than any pin may live expects nothing (stale pin deleted by hand) "
+         "(KIT-674)",
+         mcp("save_issue", id="ENG-456", stateId=PL_RAW), ALLOW, pl_stale),
+        ("a pin row whose age cannot be read still expects its pin (KIT-674)",
+         mcp("save_issue", id="ENG-456", stateId=PL_RAW), BLOCK, pl_undated),
 
         # ── the pin must live where the session cannot reach it (§3, §7) ──────
         ("pinsRoot inside the worktree is BROKEN config (a forgeable pin is not a pin)",
@@ -3361,6 +3523,7 @@ def main():
 
     failures = 0
     seq_ran = 0
+    not_checked = []   # cases this machine could not check: never counted as passed (KIT-785)
     for name, payload, expect_block, hook_path, *rest in cases:
         env = rest[0] if rest else None          # rest = (env,) or (env, cwd)
         cwd = rest[1] if len(rest) > 1 else None
@@ -3468,6 +3631,26 @@ def main():
         ("stderr reason: branch-naming guard fires in the acting worktree",
          sub(edit(os.path.join(wt_codename, "src/x.ts"), "x")), "naming convention",
          wt_hook, subagent_env, wt_codename),
+        # KIT-673: each NotebookEdit block is the guard the same Edit would meet.
+        ("stderr reason: NotebookEdit on main meets the branch guard (KIT-673)",
+         notebook(os.path.join(main_root, "nb/a.ipynb"), "x = 1"),
+         "You're on `main` in this repo, where direct edits/commits are blocked", main_hook),
+        ("stderr reason: NotebookEdit on a codename branch meets the naming guard (KIT-673)",
+         notebook(os.path.join(codename_root, "nb/a.ipynb"), "x = 1"),
+         "doesn't match this repo's naming convention", codename_hook),
+        ("stderr reason: NotebookEdit into a sibling worktree meets the cross-worktree guard "
+         "(KIT-673)",
+         notebook(os.path.join(wt_sibling, "nb/a.ipynb"), "x = 1"),
+         "Cross-worktree write blocked", wt_hook),
+        ("stderr reason: a key in a NotebookEdit cell is named (KIT-673)",
+         notebook("/x/a.ipynb", f"key = '{FAKE_ANTHROPIC}'"),
+         "Secret value pattern detected in file content (Anthropic API key", HOOK),
+        ("stderr reason: a .env-named NotebookEdit target is refused by name (KIT-673)",
+         notebook("/x/.env.ipynb", "x = 1"), "Writing to .env.ipynb is blocked", HOOK),
+        ("stderr reason: NotebookEdit on a mismatched ticket branch names the pinned ticket "
+         "(KIT-673)",
+         notebook(os.path.join(pl_wrongbr_root, "nb/a.ipynb"), "x = 1"),
+         "does not carry this session's pinned ticket ID", pl_wrongbr),
         # pipeline guards: the reason is the product — each names the fix
         ("stderr reason: grader-path block names the path",
          edit(os.path.join(pl_root, ".github/workflows/ci.yml"), "x"),
@@ -3484,6 +3667,21 @@ def main():
         ("stderr reason: an expired pin is named as a lapse, not an absence",
          edit(os.path.join(pl_exp_root, "src/app.ts"), "x"),
          "An expiry is not an absence", pl_exp),
+        # KIT-674: the block names the missing pin, the ledger row that expects it, and
+        # the one way to end a binding.
+        ("stderr reason: a deleted pin is named as missing (KIT-674)",
+         mcp("save_issue", id="ENG-456", stateId=PL_RAW),
+         "Dispatcher pin MISSING for this session root", pl_gone),
+        ("stderr reason: a deleted pin's block names the pin file (KIT-674)",
+         mcp("save_issue", id="ENG-456", stateId=PL_RAW),
+         os.path.join(pl_gone_pins, hashlib.sha256(pl_gone_root.encode("utf-8"))
+                      .hexdigest()[:16] + ".json"), pl_gone),
+        ("stderr reason: a deleted pin's block names the ledger row (KIT-674)",
+         mcp("save_issue", id="ENG-456", stateId=PL_RAW),
+         "dispatch d_gone for ENG-123", pl_gone),
+        ("stderr reason: a deleted pin's block says how a binding ends (KIT-674)",
+         mcp("save_issue", id="ENG-456", stateId=PL_RAW),
+         "pipeline_dispatch_local.py --release", pl_gone),
         ("stderr reason: lifecycle-label block names the label it refused",
          mcp("save_issue", id="ENG-123", labels=["agent:needs-human"]),
          "agent:needs-human", pl_hook),
@@ -3626,6 +3824,39 @@ def main():
           f"nothing, once per session (KIT-214)")
     failures += 0 if ok else 1
 
+    # KIT-683: the pipeline's own credentials, from the one list the scanner's selftest
+    # checks the real secretlint rules against (scripts/secret_shapes.py). The hook refuses
+    # each sample in a Write and in an Edit, naming it, and lets each near miss through. A
+    # list that lost a shape would pass vacuously, so the shapes the ticket names must be on it.
+    from secret_shapes import SHAPES as _SHAPES
+    seq_ran += 1
+    _want = {"Linear API key", "Slack bot token", "Slack user token", "Slack app-level token",
+             "GitHub fine-grained token"}
+    ok = _want <= {_s[0] for _s in _SHAPES}
+    print(f"[{'PASS' if ok else 'FAIL'}] pipeline credentials (KIT-683): the shared list holds "
+          f"every shape the pipeline holds"
+          + ("" if ok else f"  (missing: {sorted(_want - {_s[0] for _s in _SHAPES})})"))
+    failures += 0 if ok else 1
+    for _name, _label, _rule, _sample, _near in _SHAPES:
+        for _how, _payload, _named in (
+                ("in a Write is refused, by name", write("/x/notes.md", "TOKEN=" + _sample),
+                 _label),
+                ("in an Edit is refused, by name", edit("/x/client.py", "token = '%s'" % _sample),
+                 _label),
+                ("near miss is allowed", write("/x/notes.md", "TOKEN=" + _near), None)):
+            _cn = f"pipeline credential (KIT-683): {_name} {_how}"
+            seq_ran += 1
+            _starting(_cn)
+            _r = run_hook_proc(_payload)
+            if _named:
+                ok = (_r.returncode == 2 and
+                      f"Secret value pattern detected in file content ({_named}" in _r.stderr)
+            else:
+                ok = _r.returncode == 0
+            print(f"[{'PASS' if ok else 'FAIL'}] {_cn}"
+                  + ("" if ok else f"  (exit {_r.returncode}: {_r.stderr[-200:]!r})"))
+            failures += 0 if ok else 1
+
     # KIT-214: session-start.py (advisory; self-protected since KIT-463) describes the session's
     # own worktree, and WARNS THE PERSON (systemMessage) when the guards are about to
     # judge the session as a different checkout than the one it started in. The
@@ -3645,6 +3876,89 @@ def main():
     ok = len(_copies) == 1 and not next(iter(_copies)).startswith("MISSING")
     print(f"[{'PASS' if ok else 'FAIL'}] the transcript-folder resolver is identical in all "
           f"three hooks (KIT-214)")
+    failures += 0 if ok else 1
+
+    # KIT-684: a hook that runs past its `timeout` is Claude Code's NON-blocking error, so the
+    # tool call would run unjudged. The hook keeps a deadline of its own and refuses the call.
+    # Staged with a `git` that hangs, first on PATH, so every git call outlives its own
+    # timeout: the refusal must come inside the settings timeout, name the deadline, and leave
+    # no stuck git behind. The sleep's length is this run's own, so the check finds only ours.
+    with open(HOOK, encoding="utf-8") as _fh:
+        _hook_src = _fh.read()
+    _consts = {}
+    for _cname in ("HOOK_DEADLINE_SECONDS", "HOOK_DEADLINE_GRACE_SECONDS"):
+        _m = re.search(r"^%s = (\d+)\b" % _cname, _hook_src, re.M)
+        _consts[_cname] = int(_m.group(1)) if _m else None
+    # The bound is the timeout the wiring gives this hook: past it Claude Code runs the tool.
+    with open(os.path.join(os.path.dirname(HOOKS_DIR), "settings.json"), encoding="utf-8") as _fh:
+        _pre = json.load(_fh).get("hooks", {}).get("PreToolUse", [])
+    _wired = [h.get("timeout") for _m in _pre for h in _m.get("hooks", [])
+              if "pre-tool-use.py" in str(h.get("command", ""))]
+    _wired_ok = bool(_wired) and all(isinstance(t, (int, float)) for t in _wired)
+    _bound = min(_wired) if _wired_ok else 0
+    _hang = str(30000 + os.getpid() % 9000)
+    _hang_bin = os.path.realpath(tempfile.mkdtemp(prefix="hook-battery-hang-"))
+    _PL_TMP.append(_hang_bin)
+    with open(os.path.join(_hang_bin, "git"), "w") as _fh:
+        _fh.write("#!/bin/sh\nexec sleep %s\n" % _hang)
+    os.chmod(os.path.join(_hang_bin, "git"), 0o755)
+    _label = "a hook whose git hangs refuses the call inside its own deadline, naming it (KIT-684)"
+    seq_ran += 1
+    _starting(_label)
+    _t0 = time.monotonic()
+    _r = run_hook_proc(edit(os.path.join(feat_root, "src/app.ts"), "x"), hook_path=feat_hook,
+                       env={**os.environ, "CLAUDE_PROJECT_DIR": feat_root,
+                            "PATH": _hang_bin + os.pathsep + os.environ.get("PATH", "")})
+    _took = time.monotonic() - _t0
+    _left = (subprocess.run(["pgrep", "-f", "sleep " + _hang], capture_output=True,
+                            text=True).stdout.split() if shutil.which("pgrep") else [])
+    for _pid in _left:
+        subprocess.run(["kill", "-9", _pid], capture_output=True)
+    ok = (_r.returncode == 2 and "ran out of time" in _r.stderr
+          and ("deadline of %s seconds" % _consts["HOOK_DEADLINE_SECONDS"]) in _r.stderr
+          and _took < _bound and not _left)
+    print(f"[{'PASS' if ok else 'FAIL'}] {_label}"
+          + ("" if ok else f"  (exit {_r.returncode} after {_took:.1f}s against a settings "
+                           f"timeout of {_bound}s, deadline {_consts['HOOK_DEADLINE_SECONDS']}s "
+                           f"+ backstop {_consts['HOOK_DEADLINE_GRACE_SECONDS']}s; stuck git "
+                           f"left: {len(_left)}; {_r.stderr[-200:]!r})"))
+    failures += 0 if ok else 1
+
+    # …the deadline and its backstop end before the settings timeout, with a second to spare
+    # for the interpreter's start: past that timeout Claude Code runs the tool.
+    seq_ran += 1
+    _dl, _gr = _consts["HOOK_DEADLINE_SECONDS"], _consts["HOOK_DEADLINE_GRACE_SECONDS"]
+    ok = (_wired_ok and _dl is not None and _gr is not None and _dl + _gr + 1 <= min(_wired))
+    print(f"[{'PASS' if ok else 'FAIL'}] the hook's deadline and backstop end before its "
+          f"settings timeout (KIT-684) (deadline {_dl}, backstop {_gr}, timeout {_wired})")
+    failures += 0 if ok else 1
+
+    # …and every subprocess the hook starts has its own timeout, so no single git or gh call
+    # can spend the whole deadline unannounced.
+    seq_ran += 1
+    import ast as _ast
+    _tree = _ast.parse(_hook_src)
+    _runs = [n for n in _ast.walk(_tree) if isinstance(n, _ast.Call)
+             and isinstance(n.func, _ast.Attribute) and isinstance(n.func.value, _ast.Name)
+             and (n.func.value.id, n.func.attr) in (
+                 ("subprocess", "run"), ("subprocess", "Popen"), ("subprocess", "call"),
+                 ("subprocess", "check_call"), ("subprocess", "check_output"),
+                 ("os", "system"), ("os", "popen"))]
+    _untimed = [n.lineno for n in _runs if not any(k.arg == "timeout" for k in n.keywords)]
+    # A call spelt any other way would slip past that scan, so the spellings that make one are
+    # refused outright: `from subprocess import …`, `from os import system/popen`, and
+    # subprocess imported under another name.
+    _spelt = sorted(
+        n.lineno for n in _ast.walk(_tree)
+        if (isinstance(n, _ast.ImportFrom) and n.module in ("subprocess", "os")
+            and any(a.name in ("run", "Popen", "call", "check_call", "check_output", "system",
+                               "popen", "*") for a in n.names))
+        or (isinstance(n, _ast.Import) and any(a.name == "subprocess" and a.asname
+                                               for a in n.names)))
+    ok = len(_runs) >= 5 and not _untimed and not _spelt
+    print(f"[{'PASS' if ok else 'FAIL'}] every subprocess the hook starts has its own timeout "
+          f"(KIT-684) ({len(_runs)} calls" + (f"; none on lines {_untimed}" if _untimed else "")
+          + (f"; started another way on lines {_spelt}" if _spelt else "") + ")")
     failures += 0 if ok else 1
 
     # The pipeline sandboxes read the system lane marker from a stand-in folder (see
@@ -3675,6 +3989,56 @@ def main():
         print(f"[{'PASS' if ok else 'FAIL'}] pin path: {_name} gives no pin path "
               f"(got {_got!r})")
         failures += 0 if ok else 1
+
+    # KIT-674: a pins root or ledger the hook cannot read is "could not check", never "no
+    # pin". Both sandboxes are allowed while readable (cases above), so a block here is the
+    # unreadability's alone. A pins root it cannot search was already refused before
+    # KIT-674, by the lane marker's own could-not-check (KIT-241), whose reason it keeps. As
+    # root every folder reads, so neither can be staged there, and each says so.
+    for _name, _target, _mode, _sb_hook, _why in (
+            ("a pins root it cannot search", pl_freed_pins, 0o700, pl_freed,
+             "could not be checked, which counts as the lane"),
+            ("a ledger it cannot read", os.path.join(pl_elsewhere_pins, "ledger.jsonl"), 0o644,
+             pl_elsewhere, "Dispatcher pin store could not be read")):
+        _label = "unreadable pin store: %s blocks writes and names it (KIT-674)" % _name
+        if os.geteuid() == 0:
+            print(f"[SKIP] {_label} (as root nothing is unreadable, so this was not run)")
+            continue
+        seq_ran += 1
+        _starting(_label)
+        os.chmod(_target, 0)
+        try:
+            _r = run_hook_proc(mcp("save_issue", id="ENG-456", stateId=PL_RAW), hook_path=_sb_hook)
+        finally:
+            os.chmod(_target, _mode)
+        ok = (_r.returncode == 2 and _why in _r.stderr and _target in _r.stderr)
+        print(f"[{'PASS' if ok else 'FAIL'}] {_label}"
+              + ("" if ok else f"  (exit {_r.returncode}: {_r.stderr[-300:]!r})"))
+        failures += 0 if ok else 1
+
+    # KIT-674: "a pin row under a day old" is the longest any kit dispatcher lets a pin live.
+    # Were a dispatcher's cap to grow past the hook's, a pin deleted late in its life would
+    # read as a person's session, so the three numbers must agree.
+    def _product_const(path, name):
+        with open(path, encoding="utf-8") as fh:
+            m = re.search(r"^%s = ([0-9][0-9 *]*?)\s*(?:#.*)?$" % name, fh.read(), re.M)
+        if not m:
+            return None
+        n = 1
+        for part in m.group(1).split("*"):
+            n *= int(part)
+        return n
+    seq_ran += 1
+    _kit_scripts = os.path.join(os.path.dirname(os.path.dirname(HOOKS_DIR)), "scripts")
+    _lives = (_product_const(HOOK, "PIN_LIFE_MAX_SECONDS"),
+              60 * (_product_const(os.path.join(_kit_scripts, "pipeline_dispatch_local.py"),
+                                   "MAX_EXPIRY_MINUTES") or 0),
+              60 * (_product_const(os.path.join(_kit_scripts, "pipeline_runner.py"),
+                                   "PIN_MAX_MINUTES") or 0))
+    ok = _lives[0] is not None and len(set(_lives)) == 1
+    print(f"[{'PASS' if ok else 'FAIL'}] the hook expects a deleted pin for as long as a "
+          f"dispatcher lets one live (KIT-674) (hook, local, runner seconds: {_lives})")
+    failures += 0 if ok else 1
 
     def _session_start(payload, cwd):
         r = subprocess.run([sys.executable, SESSION_START_HOOK], input=json.dumps(payload),
@@ -4396,8 +4760,10 @@ def main():
     seq_ran += 1
     name2 = "a descendant that left the process group cannot hold the battery: run_tree still gives up in time"
     _starting(name2)
-    escaper = ("import subprocess, time; subprocess.Popen(['sleep', '%s'], start_new_session=True); "
-               "time.sleep(600)" % str(int(HANG_SECONDS) + 1))
+    # The escaper writes its child's pid, so the cleanup can stop it by pid where `ps` is refused (KIT-785).
+    escaped_pid_file = os.path.join(tempfile.mkdtemp(prefix="kit424-escaper-"), "child.pid")
+    escaper = ("import subprocess, time; p = subprocess.Popen(['sleep', '%s'], start_new_session=True); "
+               "open(%r, 'w').write(str(p.pid)); time.sleep(600)" % (str(int(HANG_SECONDS) + 1), escaped_pid_file))
     t1 = time.time()
     try:
         run_tree([sys.executable, "-c", escaper], 3)
@@ -4409,19 +4775,58 @@ def main():
     print(f"[{'PASS' if ok2 else 'FAIL'}] pre-commit (KIT-424): {name2}"
           + ("" if ok2 else f" — gave_up={gave_up} took={took2:.0f}s"))
     failures += 0 if ok2 else 1
-    listing = subprocess.run(["ps", "-ax", "-o", "pid=,command="], capture_output=True, text=True).stdout
-    left = [ln.split()[0] for ln in listing.splitlines() if ln.rstrip().endswith(HANG_MARK)]
-    ok = rc == 124 and "TIMED OUT after 8 s" in said and took < 40 and not left
-    listing2 = subprocess.run(["ps", "-ax", "-o", "pid=,command="], capture_output=True, text=True).stdout
-    escaped = [ln.split()[0] for ln in listing2.splitlines()
-               if ln.rstrip().endswith("sleep " + str(int(HANG_SECONDS) + 1))]
-    if escaped:
-        subprocess.run(["kill", "-9", *escaped], capture_output=True)   # the one that left its group
-    if left:
-        subprocess.run(["kill", "-9", *left], capture_output=True)   # this run's own stand-in
-    print(f"[{'PASS' if ok else 'FAIL'}] pre-commit (KIT-424): {name}"
-          + ("" if ok else f" — rc={rc} took={took:.0f}s left_running={left} said={said.strip()[-200:]!r}"))
-    failures += 0 if ok else 1
+    # The one that left its group is stopped by the pid it wrote, so this needs no process list.
+    try:
+        with open(escaped_pid_file) as fh:
+            os.kill(int(fh.read().strip()), 9)
+    except (OSError, ValueError):
+        pass   # it never started, wrote nothing, or is gone already
+    # Where the process list cannot be read (a sandbox refuses `ps`, KIT-785), the case says NOT
+    # CHECKED for the one thing it needs the list for, and its stand-in is not looked for by pid.
+    listing, why_not = process_listing()
+    word, failed, detail = hung_scanner_verdict(rc, said, took, listing, why_not, HANG_MARK)
+    if listing is not None:
+        left = [ln.split()[0] for ln in listing if ln.rstrip().endswith(HANG_MARK)]
+        escaped = [ln.split()[0] for ln in listing   # a second look, in case its pid was never written
+                   if ln.rstrip().endswith("sleep " + str(int(HANG_SECONDS) + 1))]
+        if escaped:
+            subprocess.run(["kill", "-9", *escaped], capture_output=True)   # the one that left its group
+        if left:
+            subprocess.run(["kill", "-9", *left], capture_output=True)   # this run's own stand-in
+    print(f"[{word}] pre-commit (KIT-424): {name}{detail}")
+    failures += record_verdict(word, failed, "pre-commit (KIT-424): " + name, not_checked)
+    # KIT-785, pinned: a refused process list is NOT CHECKED, never a pass, and a case that failed
+    # what it could check still fails. A refusal is no list at all, never an empty one.
+    seq_ran += 1
+    name3 = "a process list this machine refuses is NOT CHECKED, never a pass (KIT-785)"
+    _starting(name3)
+    bad_ps = process_listing(("/nonexistent/ps-kit-785",))
+    false_ps = process_listing(("false",))
+    verdicts = [hung_scanner_verdict(124, "TIMED OUT after 8 s", 9, None, "ps refused", HANG_MARK),
+                hung_scanner_verdict(0, "", 50, None, "ps refused", HANG_MARK),
+                hung_scanner_verdict(124, "TIMED OUT after 8 s", 9, ["123 " + HANG_MARK], None, HANG_MARK),
+                hung_scanner_verdict(124, "TIMED OUT after 8 s", 9, ["1 /sbin/launchd"], None, HANG_MARK)]
+    # Each verdict as the battery records it: a NOT CHECKED case is named and adds no failure.
+    named = []
+    counted = [record_verdict(w, f, "case-%d" % i, named) for i, (w, f, _d) in enumerate(verdicts)]
+    try:
+        with open(escaped_pid_file) as fh:
+            wrote_pid = fh.read().strip().isdigit()
+    except OSError:
+        wrote_pid = False
+    ok3 = (bad_ps[0] is None and "could not be read" in (bad_ps[1] or "")
+           and counted == [0, 1, 1, 0] and named == ["case-0"]
+           and wrote_pid
+           and false_ps[0] is None and "exited" in (false_ps[1] or "")
+           and [v[:2] for v in verdicts] == [("NOT CHECKED", False), ("FAIL", True), ("FAIL", True),
+                                             ("PASS", False)]
+           and "ps refused" in verdicts[0][2] and "not checked" in verdicts[0][2]
+           and summary_line(10, 1, ["x"]) == "\n8/10 cases passed; NOT CHECKED here: x"
+           and summary_line(10, 0, []) == "\n10/10 cases passed")
+    print(f"[{'PASS' if ok3 else 'FAIL'}] pre-commit (KIT-424, KIT-785): {name3}"
+          + ("" if ok3 else f" — listings {bad_ps!r} {false_ps!r}, verdicts {verdicts!r}, "
+                            f"recorded {counted!r} {named!r}, escaper wrote its pid: {wrote_pid}"))
+    failures += 0 if ok3 else 1
     for r in _PRECOMMIT_TMP:
         shutil.rmtree(r, ignore_errors=True)
 
@@ -4499,7 +4904,7 @@ def main():
     # printed "134/134 cases passed" for 138 checks, and a nonsense ratio when red.
     total = (len(cases) + len(stop_cases) + len(reason_cases)
              + len(stop_reason_cases) + seq_ran)
-    print(f"\n{total - failures}/{total} cases passed")
+    print(summary_line(total, failures, not_checked))
     return 1 if failures else 0
 
 

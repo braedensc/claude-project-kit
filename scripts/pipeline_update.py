@@ -117,6 +117,9 @@ CONF_KEYS = (
     "NOTIFIER_HEARTBEAT_FILE", "MONITOR_HEARTBEAT_FILE",
     "WATCHER_PAGE_HEARTBEAT_FILE", "WATCHER_PAGE_MAX_AGE_MINUTES",
     "CREDENTIAL_EXPIRIES", "CREDENTIAL_WARN_DAYS", "PUSH_HEARTBEAT_FILE",
+    "QUEUE_HEARTBEAT_FILE", "MORNING_HEARTBEAT_FILE", "SWEEP_HEARTBEAT_FILE",
+    "QUEUE_HEARTBEAT_MAX_AGE_MINUTES", "MORNING_HEARTBEAT_MAX_AGE_MINUTES",
+    "SWEEP_HEARTBEAT_MAX_AGE_MINUTES",
     "MEMORY_FREE_FLOOR_PCT", "SWAP_CEILING_GB", "BURN_USAGE_FILE", "BURN_WEEK_PCT", "BURN_FIVE_HOUR_PCT",
 )
 CONF_DEFAULTS = {
@@ -144,6 +147,12 @@ CONF_DEFAULTS = {
     "MONITOR_HEARTBEAT_FILE": "",
     "WATCHER_PAGE_HEARTBEAT_FILE": "",
     "PUSH_HEARTBEAT_FILE": "",
+    "QUEUE_HEARTBEAT_FILE": "",
+    "MORNING_HEARTBEAT_FILE": "",
+    "SWEEP_HEARTBEAT_FILE": "",
+    "QUEUE_HEARTBEAT_MAX_AGE_MINUTES": "60",
+    "MORNING_HEARTBEAT_MAX_AGE_MINUTES": "60",
+    "SWEEP_HEARTBEAT_MAX_AGE_MINUTES": "180",
     "WATCHER_PAGE_MAX_AGE_MINUTES": "120",
     "CREDENTIAL_EXPIRIES": "",
     "CREDENTIAL_WARN_DAYS": "30",
@@ -336,7 +345,8 @@ def validate_conf(values):
     if waker and not waker.startswith("/"):
         errors.append("CONFLICT_WAKER_STATE_DIR must be an absolute path (got %r)" % waker)
     for key in ("NOTIFIER_HEARTBEAT_FILE", "MONITOR_HEARTBEAT_FILE", "WATCHER_PAGE_HEARTBEAT_FILE",
-                "PUSH_HEARTBEAT_FILE"):
+                "PUSH_HEARTBEAT_FILE", "QUEUE_HEARTBEAT_FILE", "MORNING_HEARTBEAT_FILE",
+                "SWEEP_HEARTBEAT_FILE"):
         beat = conf.get(key, "")
         if beat and not beat.startswith("/"):
             errors.append("%s must be an absolute path (got %r)" % (key, beat))
@@ -353,6 +363,11 @@ def validate_conf(values):
     burn = conf.get("BURN_USAGE_FILE", "")
     if burn and not (burn.startswith("/") or burn.startswith("~/")):
         errors.append("BURN_USAGE_FILE must be an absolute path (or start with ~/)")
+    for key in ("QUEUE_HEARTBEAT_MAX_AGE_MINUTES", "MORNING_HEARTBEAT_MAX_AGE_MINUTES",
+                "SWEEP_HEARTBEAT_MAX_AGE_MINUTES"):
+        limit = conf.get(key, "")
+        if not limit.isdigit() or not 5 <= int(limit) <= 10080:
+            errors.append("%s must be a whole number from 5 to 10080 (got %r)" % (key, limit))
     age = conf.get("WATCHER_PAGE_MAX_AGE_MINUTES", "")
     if not age.isdigit() or not 5 <= int(age) <= 10080:
         errors.append("WATCHER_PAGE_MAX_AGE_MINUTES must be a whole number from 5 to 10080 (got %r)" % age)

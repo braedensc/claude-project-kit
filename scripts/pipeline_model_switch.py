@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Move the tech lead to another model, and keep every ticket the pipeline makes on its own.
+"""Move the dispatcher's chat model, and keep every ticket the pipeline makes on its own.
 
     python3 scripts/pipeline_model_switch.py --to sonnet [--backup haiku]
         [--conf <your stage-a.conf>] [--stage-e-conf <your stage-e.conf>]
@@ -16,7 +16,7 @@ alone. A ticket session with no `[model=…]` tag and no model label runs on tha
 model, since a repository entry's own `model` is never read (cyrus 0.2.73
 RunnerSelectionService.js:297-310; KIT-377). The dispatcher works that model out again each
 time a session resumes (EdgeWorker.js:5191-5247), so a ticket already in progress moves
-too, at its next prompt. So moving the tech lead moves every untagged ticket with it, and
+too, at its next prompt. So moving the chat model moves every untagged ticket with it, and
 the order matters: the tickets first, then the pair.
 
 WHAT IT DOES, IN ORDER
@@ -528,7 +528,7 @@ def main(argv=None, io=None):
     io = io or IO()
     parser = argparse.ArgumentParser(
         prog="pipeline_model_switch.py",
-        description="Move the tech lead to another model, keeping every ticket the "
+        description="Move the dispatcher's chat model, keeping every ticket the "
                     "pipeline makes on its own.")
     parser.add_argument("--to", help="the model chat turns move to: fable, opus, sonnet, "
                                      "haiku or a claude- model id")
@@ -558,9 +558,9 @@ def main(argv=None, io=None):
             "dispatcher's model from one would let a session choose its own model. Open the "
             "Terminal app, or this app's Terminal tab, and run it there." % ", ".join(found))
         return EX_REFUSED
-    if io.uid() == 0:
-        say("REFUSED: do not run this with sudo. Run it as yourself; it asks for your Mac "
-            "password when it needs it.")
+    import pipeline_root_guard as rg      # KIT-693: the one refusal every installer shares
+    if rg.refusal(io.uid()):
+        say(rg.refusal(io.uid()))
         return EX_REFUSED
     if not io.is_tty():
         say("This asks you one question before it changes anything, so it runs only in a "
@@ -621,7 +621,7 @@ def main(argv=None, io=None):
     going_back = all(chat.bare_model(kept[n]) == chat.bare_model(args.to)
                      for n in ("stage-a.conf", "stage-e.conf"))
     pair = chat.chat_pair_wanted(want)
-    say("Moving the tech lead to %s, with %s as the backup." % pair)
+    say("Moving the dispatcher's chat model to %s, with %s as the backup." % pair)
     if chat.same_model(*pair):
         say("  Note: %s and %s are in one family, so they may be one model, and the backup "
             "may back up nothing." % pair)
@@ -815,7 +815,7 @@ def main(argv=None, io=None):
             "run this again." % c_path)
         return EX_USAGE
     say("")
-    if not io.ask("Move the tech lead to %s now?" % args.to):
+    if not io.ask("Move the dispatcher's chat model to %s now?" % args.to):
         say("Nothing was changed.")
         return EX_DECLINED
 
@@ -1275,7 +1275,7 @@ def _selftest_cases(check, tmp, failures, cases):
         check("refused-under:%s" % marker, (code, io.lane.ran, tracker.queries, io.loads),
               (EX_REFUSED, [], [], 0))
     code, io, _t = go(uid=0)
-    check("refused-as-root", (code, io.lane.ran), (EX_REFUSED, []))
+    check("refused-as-root", (code, io.lane.ran, __import__("pipeline_root_guard").MESSAGE in "\n".join(io.out)), (EX_REFUSED, [], True))
     code, io, _t = go(tty=False)
     check("stopped-without-a-person", (code, io.lane.ran), (EX_USAGE, []))
     code, io, _t = go(["--conf", a_path])
@@ -1303,6 +1303,13 @@ def _selftest_cases(check, tmp, failures, cases):
     check("switch-planning-tag-under-the-routing-tag", dict(tracker.updates)["KIT-10"],
           "[repo=stage-a-planning-widgets]\n[model=opus]\n\n**Planning run** for **PROD-1**.")
     check("switch-asks-once", len(io.asked), 1)
+    # KIT-615: it moves the dispatcher's chat model, which is not the tech lead's own (that is
+    # TURN_MODEL), so what it says and asks never calls it the tech lead.
+    check("switch-says-the-dispatchers-chat-model-never-the-tech-lead",
+          (any("Moving the dispatcher's chat model to " in line for line in io.out),
+           "dispatcher's chat model" in io.asked[0],
+           any("tech lead" in text for text in list(io.out) + list(io.asked))),
+          (True, True, False))
     check("switch-runs-merge-then-verify", io.lane.ran, ["merge", "verify"])
     check("switch-asks-sudo-for-its-own-reason",
           ("the switch reads" in io.why, "planner job" in io.why), (True, False))

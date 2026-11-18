@@ -391,7 +391,7 @@ WATCHERS = {
     # is installed (it is listed in `watch`), since an absent heartbeat would page for ever;
     # only exit 0 is good, as for the notifier.
     BRIDGE_JOB: {
-        "label": "bridge",
+        "label": "tech lead",
         "affects": "your direct messages go quiet: no asks are read and no stand-up is sent",
         "writer": "scripts/pipeline_bridge.py",
         "dir_key": "bridge_state_dir",
@@ -3384,7 +3384,7 @@ def selftest():
                    for ln in render_report(unlisted, {}).splitlines()),
            render_report(unlisted, {}))
         ok("the bridge's page names it, and says its direct messages go quiet",
-           page_job_words().get("bridge", ("", ""))[0] == "bridge"
+           page_job_words().get("bridge", ("", ""))[0] == "tech lead"
            and "direct messages go quiet" in page_job_words()["bridge"][1], page_job_words())
         # The exit is read only when it is an integer. A boolean is not a number here —
         # `False == 0` in Python, so it would otherwise read as exit 0 — and a string or a

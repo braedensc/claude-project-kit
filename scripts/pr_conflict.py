@@ -26,10 +26,11 @@ WHY THE FIX RUNS LOCALLY, NOT IN ACTIONS
   The template's answer is an `@claude` comment for claude.yml. It needs a model
   credential in Actions, a PAT (GITHUB_TOKEN-authored comments and pushes fire no
   workflows, so neither the handoff nor the fix's CI would start), `workflows`
-  scope for any conflict under .github/workflows/, and it runs the model OUTSIDE
-  the PreToolUse hooks. The sessions that own these branches already exist on a
-  machine that holds the owner's credentials and runs the hooks. So GitHub keeps
-  the clock and the budget; the machine does the work:
+  scope for any conflict under .github/workflows/, and it runs the model with none
+  of the kit's walls. The sessions that own these branches already exist on a
+  machine that holds the owner's credentials, where a fix can run held to its
+  worktree (THE FIX SESSION'S WALLS). So GitHub keeps the clock and the budget; the
+  machine does the work:
 
     monitor (Actions)                     wake (a person's machine)
     ─────────────────                     ─────────────────────────
@@ -53,10 +54,11 @@ WHY THE FIX RUNS LOCALLY, NOT IN ACTIONS
 
 WHOSE PULL REQUEST THE WAKER MAY TAKE — AND WHOSE IT MAY NEVER TAKE
 
-  A fix session starts OUTSIDE any sandbox, as the person running the waker, and
-  reads a branch it did not write. That is fine for a branch the same person's own
-  local session wrote, and wrong for one a dispatcher's SANDBOXED session wrote:
-  the fix would run with the owner's reach over text a sandboxed agent authored.
+  A fix session runs as the person running the waker. It is held to its worktree (THE
+  FIX SESSION'S WALLS), but it pushes with that person's GitHub login and runs on their
+  model sign-in, over a branch it did not write. That is fine for a branch the same
+  person's own local session wrote, and wrong for one a dispatcher's SANDBOXED session
+  wrote: the fix would carry the owner's reach over text a sandboxed agent authored.
   A dispatcher's PR has its own wake path that keeps the sandbox — the Stage E
   bounce driver re-prompts the original session in its tracker thread
   (scripts/pipeline_bounce_local.py, the `conflict` action), and it answers the
@@ -75,6 +77,32 @@ WHOSE PULL REQUEST THE WAKER MAY TAKE — AND WHOSE IT MAY NEVER TAKE
   A request none of that matches is left alone, and the monitor's ack deadline
   turns it into a page. If Claude Code ever moves its transcripts, every request
   reads "no local session" and pages — loud, never a fix in the wrong place.
+
+THE FIX SESSION'S WALLS (KIT-676)
+
+  A fix session used to start with the worktree's own settings, so a project that ships
+  `bypassPermissions` gave it the owner's whole reach. Now it loads none of the worktree's
+  settings, hooks or MCP servers, and none of the owner's (`--setting-sources ""`,
+  `--strict-mcp-config`). The waker hands it its own:
+
+    * every command it may run, by name (FIX_COMMANDS, and each --check-command by its
+      exact words), under `--permission-mode dontAsk` with nobody to ask, so anything
+      else is refused, never prompted;
+    * Read, Edit and Write by the worktree's own path, never by bare name;
+    * Claude Code's sandbox for every command but `gh pr checks`: writes only inside the
+      worktree, its git folder (never its hooks or config) and Claude Code's own temp
+      folder; github.com its only host; no unsandboxed retry; and no start at all where
+      the sandbox cannot run (`failIfUnavailable`);
+    * the kit's secret-file denials, for the file tools and for every command's reads;
+    * no reads in the owner's home, /Users, /Volumes, the temp folders or other sessions'
+      scratchpads, except where its tools need them (KIT-786, FIX_READ_DENY and the two
+      tables after it, each row with its reason).
+
+  Each wall was measured on this Mac with a scripted stand-in for the API, so no model ran
+  (docs/adr/2026-11-17-the-conflict-fix-session-is-held-to-its-worktree.md and
+  docs/adr/2026-11-18-the-conflict-fix-session-reads-only-what-it-needs.md). Not held: the
+  owner's GitHub login, which the push needs. `wake --dry-run` prints the list, and the
+  installer's CK-W1 sign-off reads it.
 
 WHAT A PASS IS BOUNDED BY
 
@@ -123,12 +151,17 @@ MARKERS (the whole producer/consumer contract)
 
   A request states its fix limit when that is not the default of 3: `limit=` and the number,
   0 to 20, spelled in letters. The bounce driver cannot read the monitor's argument, so it
-  reads the limit here (`fix_limit`) and a request that states none means 3. Letters, because
+  reads the limit here (`fix_limit`) and a request that states none means 3. It counts against
+  the lowest limit any request on the pull request states (`fix_cap`), so a later request can
+  lower its count but never raise it (KIT-749). Letters, because
   an older copy of this grammar takes none but letters in a value and would drop a request
   with a digit in it. Anything else in the attribute is the default.
 
   Bot markers count only from the Actions bot, so the budget cannot be reset by a
-  comment. Waker markers count only from a writer, and only when posted after the
+  comment. Nor by deleting or editing one (KIT-671): the monitor puts the label on once
+  per episode, and GitHub keeps each of those `labeled` events whatever becomes of the
+  comments, so attempts are also counted from them (`fix_attempts`). The count can only
+  rise. Waker markers count only from a writer, and only when posted after the
   episode opened, so an ack cannot be pre-posted for a future episode. A waker
   marker can never grant anything: an ack only moves the deadline (bounded), and a
   result only ends the wait — whether the conflict is gone is read from GitHub's
@@ -139,7 +172,8 @@ MARKERS (the whole producer/consumer contract)
 WHAT NEITHER HALF EVER DOES (asserted in --selftest)
 
   Merge, enable auto-merge, approve, push, or write any label except `conflict`.
-  The fix session runs under the repo's own hooks, which block all of those too.
+  The fix session can run only its named commands: none merges, approves or labels,
+  and its one push is `git push origin <branch>` (THE FIX SESSION'S WALLS).
 
 EXIT CODES (contract §13)
 
@@ -166,7 +200,9 @@ import fcntl
 import hashlib
 import json
 import os
+import pwd
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -181,11 +217,13 @@ MAX_FIX_REQUESTS = 3          # automated attempts per PR, lifetime; the 4th con
 # paths, so it is the only knob that needs to exist for that.
 # ONE SOURCE (KIT-670). The monitor reads the limit once, from its argument. Each request it
 # writes STATES a limit that is not the default (`limit=five`), and the bounce driver reads the
-# limit from that request through `fix_limit`: it holds no number of its own, so the two cannot
+# limit from the requests through `fix_cap`: it holds no number of its own, so the two cannot
 # stop at different counts. A request that states none means MAX_FIX_REQUESTS.
 # The limit is the bot's own word. Only a request the Actions bot wrote is read, and nothing above
-# FIX_LIMIT_MAX is ever stated or counted, but a forged request from the bot account itself could
-# still raise the driver's cap, to that ceiling (KIT-749 tightens it).
+# FIX_LIMIT_MAX is ever stated or counted. The driver keeps the LOWEST limit any request on the
+# pull request states (KIT-749), so a request forged from the bot account itself can lower its cap
+# but never raise it. The cost: a limit raised while a pull request is in flight does not reach
+# that pull request; its next request goes unanswered and the monitor pages at its ack deadline.
 # The number is spelled in letters on purpose. `MARKER_RE` takes only lowercase letters and
 # hyphens in a value, and every copy of this file already deployed (a monitor in another
 # repository, a waker, the role account's clone) runs that grammar until it is updated: `limit=5`
@@ -263,7 +301,8 @@ def limit_attrs(limit):
 
 def fix_limit(mark):
     """The fix limit a parsed request marker states, else MAX_FIX_REQUESTS (KIT-670). THE ONE
-    PLACE A LIMIT IS READ: the bounce driver counts against this and nothing else.
+    PLACE A MARKER'S LIMIT IS READ. The bounce driver counts against the lowest of them
+    (`fix_cap`), never against one request alone.
 
     Only a request marker states one, and `parse_marker` has already refused a request from
     anyone but the Actions bot, so a marker anybody else writes states nothing. The same
@@ -271,13 +310,38 @@ def fix_limit(mark):
     FIX_LIMIT_MAX or not text is the default, never an exception, and never more than the ceiling.
 
     The limit is the bot's own word, so it is only as trustworthy as the bot's comments: a forged
-    request from the bot account itself could state up to FIX_LIMIT_MAX, the most the driver's cap
-    can ever reach (KIT-749 tightens it)."""
+    request from the bot account itself can state up to FIX_LIMIT_MAX. That is why the driver's
+    cap is the lowest limit stated, which such a request can lower but never raise (KIT-749)."""
     if not isinstance(mark, dict) or mark.get("kind") != "request":
         return MAX_FIX_REQUESTS
     attrs = mark.get("attrs")
     word = attrs.get("limit") if isinstance(attrs, dict) else None
     return LIMIT_BY_WORD.get(word, MAX_FIX_REQUESTS) if isinstance(word, str) else MAX_FIX_REQUESTS
+
+
+def fix_cap(state):
+    """The most conflict fixes the bounce driver sends for one pull request (KIT-749): the LOWEST
+    limit any request the Actions bot wrote on it has stated, in any episode, else
+    MAX_FIX_REQUESTS. `state` is `episode_state`'s answer.
+
+    A later request can lower the cap and never raise it. Any workflow holding a write token can
+    post as the Actions bot, so a forged request is possible; it can only stop fixes, never buy one
+    an earlier request did not allow. A forged FIRST request is held to the lowest limit a later
+    one states, and the monitor's own requests state the limit set on the default branch, which
+    no session can change.
+
+    The price, by design: a limit the repository RAISES while a pull request is in flight does not
+    reach that pull request. Its earlier requests stated the old limit, so the driver stops there,
+    the monitor's next request goes unanswered, and the monitor pages a person at its ack deadline
+    (ACK_DEADLINE_MIN). A pull request whose requests all come after the raise gets the new limit.
+    A LOWER limit takes effect at the next request.
+
+    Anything but a state with a list of limits, and a state with no request, is the default,
+    never an exception."""
+    limits = state.get("limits") if isinstance(state, dict) else None
+    stated = [n for n in limits if isinstance(n, int) and not isinstance(n, bool)
+              and 0 <= n <= FIX_LIMIT_MAX] if isinstance(limits, list) else []
+    return min(stated) if stated else MAX_FIX_REQUESTS
 
 
 def _ts(value):
@@ -315,6 +379,10 @@ def episode_state(comments):
 
     return {
         "requests": sum(1 for m in marks if m["kind"] == "request"),
+        "pages": sum(1 for m in marks if m["kind"] == "page"),
+        # The limit each request states, in comment order: the bounce driver's cap is the lowest
+        # of them (`fix_cap`, KIT-749). Only the Actions bot's requests reach `marks`.
+        "limits": [fix_limit(m) for m in marks if m["kind"] == "request"],
         "opened": len(opened),
         "latest": latest,
         "episode": n,
@@ -322,6 +390,30 @@ def episode_state(comments):
         "ack": (of("ack") or [None])[0],
         "result": (of("result") or [None])[-1],
     }
+
+
+def bot_label_episodes(events):
+    """How many episodes the Actions bot opened on this PR, read from GitHub's own record (KIT-671).
+    The monitor puts `conflict` on a PR once per episode, as its last write. Each time it does,
+    GitHub keeps a `labeled` event naming the bot, and no comment delete or edit touches that."""
+    count = 0
+    for e in events or ():
+        if not isinstance(e, dict):
+            continue
+        actor = e.get("actor") if isinstance(e.get("actor"), dict) else {}
+        label = e.get("label") if isinstance(e.get("label"), dict) else {}
+        if (e.get("event") == "labeled" and label.get("name") == LABEL
+                and actor.get("login") == BOT_LOGIN and actor.get("type") == "Bot"):
+            count += 1
+    return count
+
+
+def fix_attempts(state, episodes):
+    """The automated fix requests this PR has had, as a number no deleted or edited comment can
+    lower (KIT-671): the requests its comments show, or the episodes the label's events show less
+    the pages its comments show, whichever is more. A deleted page comment can only raise it, and
+    so can an episode labelled before the markers began: both count as spent, never as fresh."""
+    return max(state["requests"], episodes - state["pages"])
 
 
 def decide_ongoing(state, now):
@@ -445,6 +537,17 @@ class Gh:
             if len(batch) < 100:
                 return out
         raise CouldNotTell(f"#{number} has more than {MAX_COMMENT_PAGES * 100} comments")
+
+    def issue_events(self, number):
+        """The PR's issue events: GitHub's own record, which no comment delete or edit touches."""
+        out = []
+        for page in range(1, MAX_COMMENT_PAGES + 1):
+            batch = self._api("GET", f"repos/{self.owner}/{self.name}/issues/{number}/events"
+                                     f"?per_page=100&page={page}") or []
+            out += batch
+            if len(batch) < 100:
+                return out
+        raise CouldNotTell(f"#{number} has more than {MAX_COMMENT_PAGES * 100} events")
 
     def ensure_label(self):
         description = f"Merge conflicts with {self.default_branch} (auto-managed by pr-conflict-monitor)"
@@ -666,14 +769,23 @@ def monitor(gh, now, sleep=time.sleep, dry_run=False, summary=print, page_to=(),
         tally["conflicted"] += 1
         state = episode_state(gh.comments(n))
         if not labeled:
-            episode = state["opened"] + 1
+            # THE COUNT A DELETED COMMENT CANNOT LOWER (KIT-671). Comments can be deleted or edited by
+            # anyone with write access; the label's events cannot. So the budget is read from both,
+            # and so is the next episode's number, which must never reuse one still on the PR.
+            episodes = bot_label_episodes(gh.issue_events(n))
+            attempts = fix_attempts(state, episodes)
+            if episodes > state["requests"] + state["pages"]:
+                print(f"::warning::#{n}: the bot labelled {episodes} episode(s), and only "
+                      f"{state['requests'] + state['pages']} of its request or page comments are still there "
+                      "(deleted, edited, or older than the markers). Counted as spent, never as fresh.")
+            episode = max(state["opened"], state["episode"], episodes) + 1
             stacked = not pr["isCrossRepository"] and is_stacked(pr, gh)
             # THE LABEL IS THE LAST WRITE (KIT-167). It is the dedupe key: a labelled PR with no marker
             # is read, further down, as one the pre-marker monitor already paged. Set first, a comment
             # that failed (a 502, a rate limit) left the PR labelled and silent for the whole episode.
             # Set last, a failure anywhere above leaves it unlabelled and the next run asks again; the
             # one cost is a repeated request or page when only the label call fails.
-            if pr["isCrossRepository"] or stacked or state["requests"] >= budget:
+            if pr["isCrossRepository"] or stacked or attempts >= budget:
                 reason = "fork" if pr["isCrossRepository"] else ("stacked" if stacked else "budget")
                 recipients = page_recipients(pr, gh, page_to)
                 comment(n, page_body(pr, episode, reason, base_of(pr, gh), recipients, budget,
@@ -683,7 +795,7 @@ def monitor(gh, now, sleep=time.sleep, dry_run=False, summary=print, page_to=(),
                 tally["paged"].append(n)
                 print(f"#{n}: CONFLICTING — paged ({reason}), episode {episode}")
             else:
-                comment(n, request_body(pr, episode, state["requests"] + 1, base_of(pr, gh), budget))
+                comment(n, request_body(pr, episode, attempts + 1, base_of(pr, gh), budget))
                 add_label(n)
                 tally["requested"].append(n)
                 print(f"#{n}: CONFLICTING — fix requested, episode {episode}")
@@ -724,17 +836,262 @@ FIX_PROMPT = """\
 PR #{number} (branch `{branch}`) now has merge conflicts with `{base}`: `{base}` moved after this PR \
 went green, so its required checks are not running. You are in this branch's worktree. Resolve it:
 
-1. Confirm `git status` is clean and you are on `{branch}`.
+1. `git status`: confirm it is clean and you are on `{branch}`.
 2. `git fetch origin {base} && git merge origin/{base}` — merge, do not rebase. A rebase ends in a \
 force-push under a branch a session may still hold, and stops mid-way on a detached HEAD.
-3. Resolve each conflict by reading BOTH sides and keeping both intents. Where they genuinely \
-contradict, do not pick one: stop and say what contradicts.
-4. Run the project's local checks (CLAUDE.md names them), commit the merge with `git commit -F`, \
-and `git push` (never --force).
-5. Watch CI to green: `gh pr checks {number} --watch`.
+3. Resolve each conflict by reading BOTH sides and keeping both intents, then `git add` the file \
+(`git rm` for one the merge deletes). Where they genuinely contradict, do not pick one: \
+`git merge --abort`, and say what contradicts.
+4. {checks}
+5. `git commit --no-edit`, then `git push origin {branch}` (never --force).
+6. Watch CI to green: `gh pr checks {number} --watch`.
 
-Never merge this PR, never approve it, never add or remove labels. If you cannot resolve it \
-safely, push nothing and end with a short account of what conflicts and why."""
+This session runs only the commands named above. It reads and edits files only inside this \
+worktree, and its commands run in a sandbox that refuses writes outside it. Anything else is \
+refused, so do not look for another way. Claude Code also refuses edits to settings files such as \
+`.claude/` and `.mcp.json`: if a conflict is in one, `git merge --abort` and say so. Never merge this \
+PR, never approve it, never add or remove labels. If you cannot resolve it safely, push nothing and \
+end with a short account of what conflicts and why."""
+
+# ── the fix session's walls (KIT-676) ───────────────────────────────────────
+#
+# A fix session used to start with the worktree's own settings, so a project that ships
+# `bypassPermissions` gave it the owner's whole reach. Now nothing loads from the worktree or the
+# owner's settings, and the waker hands in its own. Every row below was measured on Claude Code
+# 2.1.287 with a scripted stand-in for the API, so no model ran:
+# docs/adr/2026-11-17-the-conflict-fix-session-is-held-to-its-worktree.md.
+#
+# Every command a fix session may run is named here, and the prompt names the same ones, so a
+# session that follows its prompt is never refused. `{base}`, `{branch}` and `{number}` are the PR's
+# own, matched against BRANCH_RE before they get here. A rule ending in ` *` takes any arguments, and
+# only git's own reading and staging commands have one: no interpreter is named by a prefix. gh is
+# exact: it cannot verify TLS inside the sandbox, so its two forms run outside it, by those words only.
+FIX_COMMANDS = (
+    "git status *", "git diff *", "git log *", "git show *",
+    "git fetch origin {base}", "git merge origin/{base}", "git merge --abort",
+    "git add *", "git rm *", "git commit --no-edit", "git push origin {branch}",
+    "gh pr checks {number} --watch", "gh pr checks {number}",
+)
+FIX_TOOLS = "Bash,Read,Edit,Write,Glob,Grep"
+FIX_HOSTS = ("github.com",)        # git over HTTPS; gh runs outside the sandbox and needs none here
+# The kit's own secret-file denials (.claude/settings.json). With nothing loaded from the worktree
+# they would be gone, so the waker carries them: for the file tools, and for every command's reads.
+SECRET_FILES = (".env", ".env.local", ".env.development", ".env.production", ".env.staging",
+                ".env.test", ".env.*.local", "secrets/**", "*.pem", "*.key", "id_rsa", "credentials")
+
+# ── what a fix session's commands may read (KIT-786) ────────────────────────
+#
+# The sandbox fences writes, but it fenced reads only where a rule denied them. So a check's child
+# could read a secret anywhere you can, write it into the worktree, and push it. Now every
+# command's reads are denied where people and programs keep files, and opened again only where
+# the session's own tools need them. On a Mac, Claude Code's own block on reads outside a
+# session's folders denies two of the same places, /Users and /Volumes. `{home}` is your account's
+# home from the user database, never $HOME: a variable is not where the files are. `{tmp}` is
+# /tmp by its real path. Each row was measured on Claude Code 2.1.287 with a scripted stand-in
+# for the API, so no model ran (docs/adr/2026-11-18-the-conflict-fix-session-reads-only-what-it-needs.md).
+FIX_READ_DENY = (
+    ("{home}", "your own files: keys, logins, mail, and every other project"),
+    ("/Users", "every account's files on this Mac, and /Users/Shared"),
+    ("/Volumes", "other disks, where backups and copies of the same files live"),
+    ("/private/var/folders", "every account's own temp and cache folders, which other programs fill"),
+    ("{tmp}", "the shared temp folder, where any program may leave a file"),
+    ("{claude_tmp}/-*/*/scratchpad", "other Claude Code sessions' scratchpads"),
+)
+# Opened again, and why. Each folder here keeps the kit's secret-file denials (SECRET_FILES), so a
+# `.env` or a `credentials` file inside one is still denied: the narrower deny wins (measured), as
+# the scratchpad deny wins inside Claude Code's temp folder. Everything else under your home stays
+# denied, npm's cache (~/.npm) included: `npm run` and `npx` of an installed tool need none of it,
+# and npm only says it could not write its log (measured).
+FIX_READ_FOLDERS = (
+    ("{worktree}", "the session's own files"),
+    ("{checkout}", "the checkout the worktree belongs to: git's shared objects, refs and hooks, "
+                   "and the scanner the pre-commit hook runs from its node_modules"),
+    ("{claude_tmp}", "Claude Code's own temp folder: the TMPDIR its sandbox gives every command, and "
+                     "where each command's output is kept. With it unreadable, cat and node fail to "
+                     "write their output (measured)"),
+    ("{home}/.config/git", "git's second settings folder: its config, ignore and attributes files"),
+    ("{home}/.nvm", "Node and npm where nvm installs them: a check runs them, and the kit's "
+                    "pre-commit hook looks there for Node 20 or newer"),
+    ("{home}/.pyenv", "Python where pyenv installs it: its shims and its versions"),
+)
+FIX_READ_FILES = (
+    ("{home}/.gitconfig", "git's own settings: the name and email the merge commit carries"),
+    ("{home}/Library/Keychains/login.keychain-db",
+     "your login keychain, which git's osxkeychain helper reads itself to push: without it the push "
+     "fails with `could not read Username` (measured)"),
+)
+# A check is allowed by its exact words. Each of these would make it a wildcard, a compound command,
+# a substitution or a redirect, which Claude Code judges part by part, so the whole would never match.
+CHECK_FORBIDDEN = frozenset(";&|<>$`()*\\\n\r\t")
+MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:\[\]-]{0,99}$")   # sonnet, claude-sonnet-4-6, opus[1m]
+
+
+def check_command_problem(cmd):
+    """Why `cmd` cannot be one of a fix session's named checks, or None (KIT-676)."""
+    if not isinstance(cmd, str) or not cmd.strip():
+        return "a check command is empty"
+    bad = sorted(set(cmd) & CHECK_FORBIDDEN)
+    if bad:
+        return ("%r carries %s: a check is one plain command, allowed by its exact words"
+                % (cmd, " ".join(repr(c) for c in bad)))
+    if cmd != " ".join(cmd.split()):
+        return "%r has a space at an end or two in a row: a check is matched by its exact words" % cmd
+    try:
+        words = shlex.split(cmd)
+    except ValueError as exc:
+        return "%r does not split into words: %s" % (cmd, exc)
+    if not words or "=" in words[0] or words[0].startswith("-"):
+        return "%r does not start with a program" % cmd
+    return None
+
+
+def checks_step(checks):
+    """Step 4 of the prompt: the named checks, or the plain fact that there are none."""
+    if not checks:
+        return "No local checks are named for this repository, so CI is the only check. Say so at the end."
+    return ("Run the local checks, each exactly as written: %s. If one fails because of the merge, fix "
+            "it before you commit. If it fails for a reason the merge did not cause, say so at the end."
+            % ", then ".join("`%s`" % c for c in checks))
+
+
+def fix_rules(home, number, branch, base, checks):
+    """--allowedTools: the named commands, each check by its exact words, and the file tools by the
+    worktree's own path. Never a file tool by bare name: that reached outside (KIT-630, row r4a)."""
+    commands = [c.format(number=number, branch=branch, base=base) for c in FIX_COMMANDS] + list(checks)
+    return ["Bash(%s)" % c for c in commands] + ["%s(/%s/**)" % (t, home) for t in ("Read", "Edit", "Write")]
+
+
+def claude_tmp(uid):
+    """Claude Code's own temp root for this uid, by its real path."""
+    return os.path.join(os.path.realpath("/tmp"), "claude-%d" % uid)
+
+
+def account_home(uid):
+    """This uid's home from the user database, by its real path, or None when it has no entry.
+    Never $HOME: the fix session's reads are denied where the files are, not where a variable
+    points (KIT-786)."""
+    try:
+        home = pwd.getpwuid(uid).pw_dir
+    except KeyError:
+        return None
+    return os.path.realpath(home) if home and home.startswith("/") and home != "/" else None
+
+
+def opens_home(paths, home):
+    """The first of `paths` that is your home or holds it, else None. Opening one again would undo
+    the deny on your home, so a session in it is declined (KIT-786)."""
+    for path in paths:
+        if path == home or home.startswith(path.rstrip("/") + "/"):
+            return path
+    return None
+
+
+def fix_read_paths(worktree, checkout, home, uid):
+    """(denyRead, allowRead) for a fix session's commands (KIT-786): every place in FIX_READ_DENY,
+    then each folder and file its tools need, opened again. Each folder opened again keeps the
+    kit's secret-file denials. `home` is account_home(), never $HOME."""
+    values = {"home": home, "worktree": worktree, "checkout": checkout, "claude_tmp": claude_tmp(uid),
+              "tmp": os.path.realpath("/tmp")}
+    folders = list(dict.fromkeys(path.format(**values) for path, _why in FIX_READ_FOLDERS))
+    files = [path.format(**values) for path, _why in FIX_READ_FILES]
+    deny = [path.format(**values) for path, _why in FIX_READ_DENY]
+    deny += ["%s/**/%s" % (folder, name) for folder in folders for name in SECRET_FILES]
+    return deny, folders + files
+
+
+def _under(path, root):
+    return path == root or path.startswith(root.rstrip("/") + "/")
+
+
+def program_unreadable(path, home, uid):
+    """The denied place that keeps a fix session's commands from reading `path`, or None when they
+    can (KIT-786). The installer asks it of each check's program. A session's worktree and checkout
+    differ per PR, so only the folders and files opened for its tools count here."""
+    values = {"home": home, "claude_tmp": claude_tmp(uid), "tmp": os.path.realpath("/tmp")}
+    for row, _why in FIX_READ_FOLDERS + FIX_READ_FILES:
+        if "{worktree}" not in row and "{checkout}" not in row and _under(path, row.format(**values)):
+            return None
+    for row, _why in FIX_READ_DENY:
+        root = row.format(**values)
+        if "*" not in root and _under(path, root):
+            return root
+    return None
+
+
+def fix_settings(home, number, uid, checkout, account):
+    """--settings: Claude Code's sandbox for every command but `gh pr checks`, with no unsandboxed
+    retry and no start without it. Only these keys: in -p, Claude Code ignores a settings file that
+    fails its validation, silently, so a key it does not know would take the sandbox with it.
+    `home` is the worktree, `checkout` the REPO_DIRS entry it belongs to, `account` the account's
+    home (account_home)."""
+    secrets = ["%s/**/%s" % (home, name) for name in SECRET_FILES]
+    deny_read, allow_read = fix_read_paths(home, checkout, account, uid)
+    return {
+        "permissions": {"deny": ["Read(/%s)" % p for p in secrets]},
+        "sandbox": {
+            "enabled": True, "failIfUnavailable": True, "allowUnsandboxedCommands": False,
+            "autoAllowBashIfSandboxed": False,
+            "excludedCommands": ["gh pr checks %d --watch" % number, "gh pr checks %d" % number],
+            # Claude Code's own temp root stays writable (its shell keeps its working folder there),
+            # but the per-project folders in it are other sessions' scratchpads and task output.
+            "filesystem": {"denyWrite": [claude_tmp(uid) + "/-*"],
+                           "denyRead": deny_read, "allowRead": allow_read},
+            "network": {"allowedDomains": list(FIX_HOSTS)},
+        },
+    }
+
+
+def fix_argv(claude_bin, prompt, number, budget_usd, resume_mode, model, rules, settings):
+    """The fix session's one command line. --allowedTools takes every word after it, so it is last."""
+    cmd = [claude_bin, "-p", prompt, "--max-budget-usd", f"{budget_usd:g}"]
+    cmd += {"from-pr": ["--from-pr", str(number)], "continue": ["--continue"], "fresh": []}[resume_mode]
+    if model:
+        cmd += ["--model", model]
+    return cmd + ["--setting-sources", "", "--strict-mcp-config",
+                  "--settings", json.dumps(settings, sort_keys=True), "--tools", FIX_TOOLS,
+                  "--permission-mode", "dontAsk", "--permission-prompts", "none",
+                  "--allowedTools"] + rules
+
+
+def describe_fix_session(checks, model):
+    """What a fix session may do, as the dry run prints it and CK-W1 signs it. Built from the same
+    lists as its command line, with the PR's own values as placeholders."""
+    commands = [c.format(number="<number>", branch="<branch>", base="<base>") for c in FIX_COMMANDS]
+    return [
+        "fix session: commands  " + "; ".join(commands),
+        "fix session: checks    " + ("; ".join(checks) if checks else "none named, so CI is the only check"),
+        "fix session: files     read, edit and write inside its worktree only. Claude Code refuses edits "
+        "to .claude/ settings, .mcp.json and the like. The kit's secret files (.env, *.pem, *.key ...) "
+        "are never read",
+        "fix session: sandbox   every command but gh pr checks runs in Claude Code's sandbox. It writes "
+        "only in the worktree, its git folder and Claude Code's own temp folder, and reaches only "
+        "%s. No unsandboxed retry; no start without the sandbox" % ", ".join(FIX_HOSTS),
+        describe_reads(),
+        "fix session: loads     none of your settings, none of the worktree's settings or hooks, no MCP servers",
+        "fix session: model     " + (model or "Claude Code's default"),
+    ]
+
+
+def describe_reads(uid=None):
+    """The read walls as one line of the dry run's list (KIT-786): the same tables the settings are
+    built from, with the session's own folders as placeholders and your home as ~."""
+    values = {"home": "~", "worktree": "<worktree>", "checkout": "<checkout>",
+              "claude_tmp": claude_tmp(os.getuid() if uid is None else uid), "tmp": os.path.realpath("/tmp")}
+    deny = [path.format(**values) for path, _why in FIX_READ_DENY]
+    opened = [path.format(**values) for path, _why in FIX_READ_FOLDERS + FIX_READ_FILES]
+    return ("fix session: reads     every command reads nothing in %s. Opened again for its tools: %s. "
+            "The kit's secret files stay denied inside each folder opened again"
+            % (", ".join(deny), ", ".join(opened)))
+
+
+def held_home(home_of, uid, dry_run):
+    """The home a fix session's reads are denied in (KIT-786), or Refusal: without one, no session
+    can start with its reads held, so none starts. A dry run starts nothing and is never refused."""
+    home = home_of(uid)
+    if not home and not dry_run:
+        raise Refusal(f"REFUSED: uid {uid} has no home in the user database, so a fix session's reads\n"
+                      "  could not be denied there (KIT-786). Nothing was read and no session started.")
+    return home
 
 
 def agent_env_markers_present(env):
@@ -832,14 +1189,19 @@ def new_tally():
 
 
 def wake(gh, repo_dir, now, *, runner=run, env=None, sleep=time.sleep, dry_run=False,
-         claude_bin="claude", resume_mode="from-pr", claude_args=(), budget_usd=DEFAULT_BUDGET_USD,
+         claude_bin="claude", resume_mode="from-pr", checks=(), model=None, budget_usd=DEFAULT_BUDGET_USD,
          timeout_min=DEFAULT_TIMEOUT_MIN, lock_dir=None, sessions_left=DEFAULT_MAX_SESSIONS,
-         claude_dir=None, uid=None, dispatcher_env=DISPATCHER_ENV_FILE):
+         claude_dir=None, uid=None, dispatcher_env=DISPATCHER_ENV_FILE, home_of=account_home):
     """One repository's share of a pass. Returns its tally; raises CouldNotTell when the
-    repository cannot be read at all, and Refusal before anything is read."""
+    repository cannot be read at all, and Refusal before anything is read. A check no rule could
+    name is a ValueError, raised before anything is read too: `main` refuses it as usage first."""
     env = os.environ if env is None else env
     uid = os.getuid() if uid is None else uid
     refuse_waker(env, dry_run, uid, os.path.expanduser(dispatcher_env) if dispatcher_env else None)
+    for check in checks:
+        if check_command_problem(check):
+            raise ValueError(check_command_problem(check))
+    account = held_home(home_of, uid, dry_run)
     lock_dir = lock_dir or os.path.join(tempfile.gettempdir(), "pr-conflict-waker")
     claude_dir = claude_dir or env.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
     trees = worktrees_by_branch(repo_dir, runner)
@@ -893,6 +1255,9 @@ def wake(gh, repo_dir, now, *, runner=run, env=None, sleep=time.sleep, dry_run=F
                 reason = "`git status` failed in the worktree"
             elif dirty.stdout.strip():
                 reason = "the worktree has uncommitted changes — a session may be mid-work there"
+            elif account and opens_home([os.path.realpath(wt), os.path.realpath(repo_dir)], account):
+                reason = ("the worktree or its checkout is your home or holds it, so a fix session could "
+                          "not be kept from reading your home (KIT-786)")
             if reason:
                 lock.close()
                 tally["declined"].append(n)
@@ -932,13 +1297,16 @@ def wake(gh, repo_dir, now, *, runner=run, env=None, sleep=time.sleep, dry_run=F
                 print(f"#{n}: COULD NOT acknowledge — no session started: {e}")
 
         for n, branch, wt, episode, _held, base in runnable:
-            cmd = [claude_bin, "-p", FIX_PROMPT.format(number=n, branch=branch, base=base),
-                   "--max-budget-usd", f"{budget_usd:g}"]
-            cmd += {"from-pr": ["--from-pr", str(n)], "continue": ["--continue"], "fresh": []}[resume_mode]
-            cmd += list(claude_args)
+            # The worktree by its real path: the session's working folder and every path rule
+            # must name the same folder, or a rule would miss through a symlink (/tmp on macOS).
+            home = os.path.realpath(wt)
+            prompt = FIX_PROMPT.format(number=n, branch=branch, base=base, checks=checks_step(checks))
+            cmd = fix_argv(claude_bin, prompt, n, budget_usd, resume_mode, model,
+                           fix_rules(home, n, branch, base, checks),
+                           fix_settings(home, n, uid, os.path.realpath(repo_dir), account))
             timed_out, rc, output = False, None, ""
             try:
-                r = runner(cmd, cwd=wt, timeout=timeout_min * 60)
+                r = runner(cmd, cwd=home, timeout=timeout_min * 60)
                 rc, output = r.returncode, (r.stdout or "") + (r.stderr or "")
             except subprocess.TimeoutExpired as e:
                 timed_out = True
@@ -1020,8 +1388,12 @@ def wake_pass(repo_dirs, gh_for, now, *, state_dir, dry_run=False, max_sessions=
     env = os.environ if env is None else env
     uid = os.getuid() if uid is None else uid
     refuse_waker(env, dry_run, uid, os.path.expanduser(dispatcher_env) if dispatcher_env else None)
+    held_home(wake_kw.get("home_of", account_home), uid, dry_run)
     state_dir = os.path.expanduser(state_dir)
     wake_kw.setdefault("lock_dir", os.path.join(state_dir, "locks"))
+    if dry_run:   # what a fix session may do, said before any PR is: the installer's card signs it
+        for line in describe_fix_session(wake_kw.get("checks", ()), wake_kw.get("model")):
+            print(line)
     started = dt.datetime.now(dt.timezone.utc).isoformat()
     beat = (lambda **f: None) if dry_run else (lambda **f: write_heartbeat(state_dir, **f))
     beat(started_at=started, result="running", repos=list(repo_dirs))
@@ -1081,9 +1453,10 @@ class FakeGh:
     owner, name = "acme", "widgets"
 
     def __init__(self, prs=(), comments=None, closed=(), mergeable_after="MERGEABLE",
-                 default_branch="main", owner_type="Organization"):
+                 default_branch="main", owner_type="Organization", events=None):
         self.prs = [dict(p) for p in prs]
         self._comments = comments or {}
+        self._events = events or {}   # GitHub's issue events: a label the bot adds is one (KIT-671)
         self.closed = list(closed)
         self.writes = []
         self.mergeable_after = mergeable_after
@@ -1098,17 +1471,26 @@ class FakeGh:
     def comments(self, n):
         return list(self._comments.get(n, []))
 
+    def issue_events(self, n):
+        return list(self._events.get(n, []))
+
+    def _event(self, n, kind):
+        self._events.setdefault(n, []).append({"event": kind, "label": {"name": LABEL},
+                                               "actor": {"login": BOT_LOGIN, "type": "Bot"}})
+
     def ensure_label(self):
         self.writes.append(("ensure_label",))
 
     def add_label(self, n):
         self.writes.append(("add_label", n))
+        self._event(n, "labeled")
         for p in self.prs:   # kept across runs, as GitHub keeps it (KIT-167 review)
             if p["number"] == n and LABEL not in p["labels"]:
                 p["labels"] = p["labels"] + [LABEL]
 
     def remove_label(self, n):
         self.writes.append(("remove_label", n))
+        self._event(n, "unlabeled")
         for p in self.prs:
             if p["number"] == n:
                 p["labels"] = [x for x in p["labels"] if x != LABEL]
@@ -1369,6 +1751,33 @@ def selftest():
         m = parse_marker(who(marker(kind_, 1, limit="twenty"), 5))
         expect(m is not None and fix_limit(m) == 3, f"a {kind_} marker states no limit, whatever it carries")
 
+    # 2g. THE DRIVER'S CAP IS THE LOWEST LIMIT STATED (KIT-749). The bounce driver counts against
+    #     `fix_cap`: the lowest limit any request the Actions bot wrote on the pull request states, in
+    #     any episode. A later request can lower it and never raise it, so a request the bot account
+    #     itself forged buys no fix an earlier request did not allow.
+    def cap(*comments):
+        return fix_cap(episode_state(list(comments)))
+    expect((cap(), fix_cap(None), fix_cap({})) == (3, 3, 3) == (MAX_FIX_REQUESTS,) * 3,
+           "no request, or no state at all, must be the default cap")
+    got = (cap(_bot(marker("request", 1), 30), _bot(marker("request", 2, limit="twenty"), 10)),
+           cap(_bot(marker("request", 1, limit="five"), 30), _bot(marker("request", 2, limit="twenty"), 10)))
+    expect(got == (3, 5), f"a later request from the bot stating twenty must not raise the cap: {got}")
+    got = cap(_bot(marker("request", 1, limit="five"), 30), _bot(marker("request", 2, limit="two"), 10))
+    expect(got == 2, f"a later request must be able to lower the cap: five then two is 2, got {got}")
+    got = cap(_bot(marker("request", 1, limit="twenty"), 30), _bot(marker("request", 2), 10))
+    expect(got == 3, f"a forged FIRST request must be held to the lowest a later one states: {got}")
+    got = cap(_bot(marker("request", 1, limit="zero"), 30), _bot(marker("request", 2, limit="five"), 10))
+    expect(got == 0, f"a stated zero must hold, never read as the default: {got}")
+    got = cap(_bot(marker("request", 1, limit="five"), 30), _human(marker("request", 2, limit="one"), 10))
+    expect(got == 5, f"a request anyone but the Actions bot wrote must not lower the cap either: {got}")
+    for odd in ({"limits": None}, {"limits": "five"}, {"limits": [True, False]}, {"limits": [21, -1, "3", 2.5]},
+                {"limits": []}, [], "limits", 3):
+        try:
+            got = fix_cap(odd)
+        except Exception as exc:       # noqa: BLE001  (the point: nothing may raise)
+            got = exc
+        expect(got == 3, f"fix_cap({odd!r}) must be the default, never an exception: {got!r}")
+
     # 2f. A READER SHIPS BEFORE ITS WRITER (KIT-670). Copies of this file already deployed — a monitor
     #     in another repository, a waker, the role account's clone — read markers with the code below.
     #     It is MARKER_RE and parse_marker exactly as `git show 6f8e9ded7a32:scripts/pr_conflict.py`
@@ -1430,6 +1839,60 @@ def selftest():
             pass
         except Exception as exc:   # noqa: BLE001
             expect(False, f"limit_attrs({bad!r}) must refuse it with a ValueError, not {exc!r}")
+
+    # 2h. A SPENT BUDGET STAYS SPENT (KIT-671). Anyone with write access can delete or edit the bot's
+    #     request comments; the count of attempts must not drop with them, and the next conflict pages.
+    def spent_then(tamper, n=31):
+        g = FakeGh([_pr(n)])
+        with contextlib.redirect_stdout(io.StringIO()):
+            for _ in range(MAX_FIX_REQUESTS):
+                for merge_state in ("CONFLICTING", "MERGEABLE"):
+                    g.prs[0]["mergeable"] = merge_state
+                    run_monitor(g)
+            tamper(g._comments.setdefault(n, []))
+            g.prs[0]["mergeable"] = "CONFLICTING"
+            g.writes.clear()
+            run_monitor(g)
+        return [w[2].split("\n", 1)[0] for w in g.writes if w[0] == "comment"]
+    for how, tamper in (("deleted", lambda cs: cs.clear()),
+                        ("edited", lambda cs: [c.update(body="edited\n" + c["body"]) for c in cs]),
+                        ("one deleted", lambda cs: cs.pop(0))):
+        firsts = spent_then(tamper)
+        expect(firsts == [marker("page", MAX_FIX_REQUESTS + 1, reason="budget")],
+               f"a spent budget must stay spent when its request comments are {how}: {firsts}")
+    # Only the bot's own `labeled: conflict` events count: a person's label, another label, an
+    # unlabel, another app, or the bot's login on a user account counts nothing.
+    bot = {"login": BOT_LOGIN, "type": "Bot"}
+    noise = [{"event": "labeled", "label": {"name": LABEL}, "actor": {"login": "someone", "type": "User"}},
+             {"event": "labeled", "label": {"name": "bug"}, "actor": bot},
+             {"event": "unlabeled", "label": {"name": LABEL}, "actor": bot},
+             {"event": "labeled", "label": {"name": LABEL}, "actor": {"login": "other-app[bot]", "type": "Bot"}},
+             {"event": "labeled", "label": {"name": LABEL}, "actor": {"login": BOT_LOGIN, "type": "User"}},
+             {"event": "commented"}, {}, None, "labeled"]
+    expect(bot_label_episodes(noise) == 0
+           and bot_label_episodes(noise + [{"event": "labeled", "label": {"name": LABEL}, "actor": bot}] * 2) == 2,
+           "only the Actions bot's own conflict labels count as episodes")
+    # A deleted page comment, or an episode labelled before the markers began, can only raise the count.
+    st0 = episode_state([_bot(marker("request", 1), 30), _bot(marker("page", 2, reason="stacked"), 20)])
+    expect(fix_attempts(st0, 2) == 1 and fix_attempts(st0, 4) == 3
+           and fix_attempts(episode_state([]), 3) == 3 and fix_attempts(st0, 0) == 1,
+           "attempts: the comments' requests, or the episodes less the pages, whichever is more")
+    # The run says when the bot's comments are fewer than its episodes, and pages rather than ask.
+    gh = FakeGh([_pr(32)], events={32: [{"event": "labeled", "label": {"name": LABEL}, "actor": bot}] * 3})
+    out32 = io.StringIO()
+    with contextlib.redirect_stdout(out32):
+        rc32, _ = run_monitor(gh)
+    expect(rc32 == 0 and [w[2].split("\n", 1)[0] for w in gh.writes if w[0] == "comment"]
+           == [marker("page", 4, reason="budget")] and "only 0 of its request or page comments" in out32.getvalue(),
+           f"episodes with no comment left are spent, and said: {gh.writes} {out32.getvalue()[-300:]}")
+    # A budget not spent still asks, and counts the attempt the events show (one deleted request).
+    gh = FakeGh([_pr(33)], {33: [_bot(marker("request", 2), 30)]},
+                events={33: [{"event": "labeled", "label": {"name": LABEL}, "actor": bot}] * 2})
+    with contextlib.redirect_stdout(io.StringIO()):
+        run_monitor(gh)
+    req33 = [w[2] for w in gh.writes if w[0] == "comment"]
+    expect(req33 and req33[0].startswith(marker("request", 3)) and "attempt 3 of 3" in req33[0],
+           f"the next request counts every attempt the events show: {req33[:1]}")
 
     # 3. a fork is paged, never requested.
     gh = FakeGh([_pr(3, fork=True)])
@@ -1589,6 +2052,17 @@ def selftest():
     real.assign(5, ["acme/on-call"])
     expect([json.loads(i) for _c, i in seen30] == [{"assignees": ["alice"]}],
            f"assign must carry people only, and skip a call with none: {seen30}")
+    # …and reads a PR's issue events page by page, from the events endpoint (KIT-671).
+    seen_ev = []
+
+    def rec_ev(cmd, cwd=None, input=None, timeout=None):
+        seen_ev.append(cmd[4])
+        page = int(cmd[4].rsplit("page=", 1)[1])
+        return subprocess.CompletedProcess(cmd, 0, json.dumps([{"event": "labeled"}] * (100 if page == 1 else 3)), "")
+    evs = Gh("acme/widgets", runner=rec_ev).issue_events(9)
+    expect(len(evs) == 103 and seen_ev == ["repos/acme/widgets/issues/9/events?per_page=100&page=1",
+                                           "repos/acme/widgets/issues/9/events?per_page=100&page=2"],
+           f"the events are read whole, page by page: {seen_ev}")
     empty = Gh("acme/widgets", runner=lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, "{}", ""))
     try:
         empty.default_branch
@@ -1771,8 +2245,14 @@ def selftest():
         beat_path = os.path.join(state_dir, "heartbeat.json")
         pass_kw = {k: v for k, v in common.items() if k != "lock_dir"}
         calls.clear()
-        rc = wake_pass([repo], lambda d: FakeGh([]), NOW, state_dir=state_dir, dry_run=True, env={}, **pass_kw)
+        dry_out = io.StringIO()
+        with contextlib.redirect_stdout(dry_out):
+            rc = wake_pass([repo], lambda d: FakeGh([]), NOW, state_dir=state_dir, dry_run=True, env={},
+                           checks=("npm run test:hooks",), **pass_kw)
         expect(rc == 0 and not os.path.exists(beat_path), "a dry run must leave no heartbeat")
+        printed = [ln for ln in dry_out.getvalue().splitlines() if ln.startswith("fix session:")]
+        expect(printed == describe_fix_session(("npm run test:hooks",), None),
+               f"a dry run must print what a fix session may do (KIT-676): {printed}")
         rc = wake_pass([repo], lambda d: FakeGh([]), NOW, state_dir=state_dir, env={}, **pass_kw)
         with open(beat_path) as fh:
             beat = json.load(fh)
@@ -1835,6 +2315,204 @@ def selftest():
         expect(calls == [] and firsts_for(gh, 7) == [marker("result", 1, outcome="declined")],
                f"a base the prompt must not carry is declined, never embedded: {gh.writes} {calls}")
 
+        # 31. THE FIX SESSION'S WALLS (KIT-676). Nothing loads from the worktree or the owner's
+        #     settings; the waker's own settings turn on Claude Code's sandbox, with no unsandboxed
+        #     retry and no start without it; every command is named, each check by its exact words;
+        #     the file tools are held to the worktree by its path, never allowed by bare name.
+        calls.clear()
+        checks = ("npm run test:hooks", "python3 scripts/check_placeholders.py")
+        gh = FakeGh([_pr(7, labels=[LABEL])], {7: [_bot(marker("request", 1), 2)]})
+        wake(gh, repo, NOW, env={}, checks=checks, model="sonnet", **common)
+        argv = calls[0][0] if calls else []
+        home = os.path.realpath(wt)
+
+        def after(flag):
+            return argv[argv.index(flag) + 1] if flag in argv[:-1] else None
+        expect(len(calls) == 1 and calls[0][1] == home and after("--setting-sources") == ""
+               and "--strict-mcp-config" in argv and after("--tools") == "Bash,Read,Edit,Write,Glob,Grep"
+               and after("--permission-mode") == "dontAsk" and after("--permission-prompts") == "none"
+               and after("--model") == "sonnet" and after("--from-pr") == "7",
+               f"the fix session must load nothing, ask nobody and run in its worktree: {argv[3:12]}")
+        for banned in ("--dangerously-skip-permissions", "--allow-dangerously-skip-permissions",
+                       "bypassPermissions", "acceptEdits", "--add-dir", "--mcp-config", "--plugin-dir",
+                       "--agents", "--claude-arg"):
+            expect(not any(banned in a for a in argv[3:]), f"the fix session's command line carries {banned!r}")
+        settings = json.loads(after("--settings") or "{}")
+        secrets = ["%s/**/%s" % (home, name) for name in SECRET_FILES]
+        tmp_glob = os.path.join(os.path.realpath("/tmp"), "claude-%d" % os.getuid(), "-*")
+        # KIT-786: every command's reads are denied where people keep files, your home taken from the
+        # user database, and opened again only where the session's tools need them. Spelled out here,
+        # never rebuilt from the tables, so a row dropped from one is a failure, not a match.
+        acct = os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir)
+        ctmp = os.path.join(os.path.realpath("/tmp"), "claude-%d" % os.getuid())
+        opened = [home, os.path.realpath(repo), ctmp, acct + "/.config/git", acct + "/.nvm", acct + "/.pyenv"]
+        deny_read = ([acct, "/Users", "/Volumes", "/private/var/folders", os.path.realpath("/tmp"),
+                      ctmp + "/-*/*/scratchpad"] + ["%s/**/%s" % (f, n) for f in opened for n in SECRET_FILES])
+        allow_read = opened + [acct + "/.gitconfig", acct + "/Library/Keychains/login.keychain-db"]
+        expect(settings == {
+            "permissions": {"deny": ["Read(/%s)" % p for p in secrets]},
+            "sandbox": {"enabled": True, "failIfUnavailable": True, "allowUnsandboxedCommands": False,
+                        "autoAllowBashIfSandboxed": False,
+                        "excludedCommands": ["gh pr checks 7 --watch", "gh pr checks 7"],
+                        "filesystem": {"denyWrite": [tmp_glob], "denyRead": deny_read, "allowRead": allow_read},
+                        "network": {"allowedDomains": ["github.com"]}}},
+               f"the sandbox settings are pinned key by key (in -p Claude Code ignores a whole settings "
+               f"file it cannot validate, silently): {settings}")
+        expect(len(deny_read) == 6 + 6 * len(SECRET_FILES) and set(secrets) <= set(deny_read)
+               and not any(p.startswith(acct + "/.npm") for p in allow_read),
+               f"the worktree keeps its secret files denied, and npm's cache stays closed: {allow_read}")
+        expect(".env" in SECRET_FILES and "*.pem" in SECRET_FILES and ".env.example" not in SECRET_FILES
+               and all(p.startswith(home + "/**/") for p in secrets), f"the kit's secret files, under the worktree: {secrets}")
+
+        # 31b. THE READ TABLES (KIT-786): each row is a path and the reason it is there, pinned row by
+        #      row. Every reason names what it is for; the keychain is the one file push needs, never
+        #      the whole folder; nothing opened again holds your home, /Users or a temp folder whole.
+        expect([p for p, _w in FIX_READ_DENY] == ["{home}", "/Users", "/Volumes", "/private/var/folders", "{tmp}",
+                                                  "{claude_tmp}/-*/*/scratchpad"]
+               and [p for p, _w in FIX_READ_FOLDERS] == ["{worktree}", "{checkout}", "{claude_tmp}",
+                                                          "{home}/.config/git", "{home}/.nvm", "{home}/.pyenv"]
+               and [p for p, _w in FIX_READ_FILES] == ["{home}/.gitconfig", "{home}/Library/Keychains/login.keychain-db"],
+               "the read tables, row by row")
+        reasons = dict(FIX_READ_DENY + FIX_READ_FOLDERS + FIX_READ_FILES)
+        for path, words in (("{home}", ("keys", "logins")), ("/Users", ("every account",)),
+                            ("/Volumes", ("disks", "backups")), ("/private/var/folders", ("temp", "cache")),
+                            ("{tmp}", ("shared temp",)), ("{claude_tmp}/-*/*/scratchpad", ("other", "scratchpads")),
+                            ("{worktree}", ("own files",)), ("{checkout}", ("git", "pre-commit")),
+                            ("{claude_tmp}", ("TMPDIR", "output", "measured")), ("{home}/.config/git", ("git",)),
+                            ("{home}/.nvm", ("Node", "npm", "pre-commit")), ("{home}/.pyenv", ("Python",)),
+                            ("{home}/.gitconfig", ("git", "name and email")),
+                            ("{home}/Library/Keychains/login.keychain-db", ("osxkeychain", "to push",
+                                                                            "could not read Username"))):
+            expect(all(w in reasons.get(path, "") for w in words), f"the reason for {path} must say {words}: "
+                   f"{reasons.get(path)!r}")
+        expect(len(reasons) == len(FIX_READ_DENY) + len(FIX_READ_FOLDERS) + len(FIX_READ_FILES)
+               and all(isinstance(w, str) and len(w) >= 20 for w in reasons.values()),
+               "every row has its own path and a reason")
+        ff = fix_read_paths("/w/t", "/w", "/Users/you", 501)
+        expect(not any(p in ("/Users/you", "/Users", "/Volumes", "/private/var/folders", os.path.realpath("/tmp"))
+                       or "/Users/you".startswith(p.rstrip("/") + "/") for p in ff[1]),
+               f"nothing opened again may hold a denied place whole: {ff[1]}")
+        # Your home is the user database's, never $HOME: a variable is not where the files are.
+        saved_home = os.environ.get("HOME")
+        os.environ["HOME"] = os.path.join(tmp, "a-moved-home")
+        try:
+            calls.clear()
+            gh = FakeGh([_pr(7, labels=[LABEL])], {7: [_bot(marker("request", 1), 2)]})
+            wake(gh, repo, NOW, env={"HOME": os.environ["HOME"]}, **common)
+            moved = json.loads(calls[0][0][calls[0][0].index("--settings") + 1]) if calls else {}
+            got = moved.get("sandbox", {}).get("filesystem", {})
+            expect(account_home(os.getuid()) == acct and got.get("denyRead", [""])[0] == acct
+                   and not any("a-moved-home" in p for p in got.get("denyRead", []) + got.get("allowRead", [])),
+                   f"a moved $HOME must not move the denied home: {got.get('denyRead', [])[:2]}")
+        finally:
+            if saved_home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = saved_home
+        # No home to deny means no session: refused before anything is read, written or started; a dry
+        # run starts nothing and goes on. A pass is refused before its heartbeat.
+        calls.clear()
+        read_seen = []
+
+        class Watched(FakeGh):
+            def open_prs(self):
+                read_seen.append("open_prs")
+                return FakeGh.open_prs(self)
+        gh = Watched([_pr(7, labels=[LABEL])], {7: [_bot(marker("request", 1), 2)]})
+        try:
+            wake(gh, repo, NOW, env={}, home_of=lambda uid: None, **common)
+            expect(False, "wake with no home to deny must refuse")
+        except Refusal as e:
+            expect(gh.writes == [] and read_seen == [] and calls == [] and "KIT-786" in str(e),
+                   f"…writing, reading and starting nothing: {gh.writes} {read_seen} {calls}")
+        wake(fresh_gh(), repo, NOW, env={}, dry_run=True, home_of=lambda uid: None, **common)
+        expect(calls == [], "a dry run with no home starts nothing and is not refused")
+        homeless_state = os.path.join(tmp, "homeless-state")
+        try:
+            wake_pass([repo], lambda d: FakeGh([]), NOW, state_dir=homeless_state, env={},
+                      home_of=lambda uid: None, **{k: v for k, v in common.items() if k != "lock_dir"})
+            expect(False, "a pass with no home to deny must refuse")
+        except Refusal:
+            expect(not os.path.exists(homeless_state), "…before its heartbeat is written")
+        # A checkout that IS your home, or holds it, would open it all again: declined, said on the PR.
+        calls.clear()
+        gh = FakeGh([_pr(7, labels=[LABEL])], {7: [_bot(marker("request", 1), 2)]})
+        tally = wake(gh, repo, NOW, env={}, home_of=lambda uid: os.path.realpath(repo), **common)
+        expect(calls == [] and tally["declined"] == [7]
+               and any(w[0] == "comment" and "your home" in w[2] for w in gh.writes),
+               f"a checkout holding your home must be declined, never opened: {gh.writes} {calls}")
+        expect(opens_home(["/Users/you/src/app"], "/Users/you") is None and opens_home(["/Users"], "/Users/you") == "/Users"
+               and opens_home(["/Users/you"], "/Users/you") == "/Users/you" and opens_home(["/"], "/Users/you") == "/"
+               and opens_home(["/Users/someone"], "/Users/you") is None, "opens_home")
+        rules = argv[argv.index("--allowedTools") + 1:] if "--allowedTools" in argv else []
+        bash = [r[len("Bash("):-1] for r in rules if r.startswith("Bash(") and r.endswith(")")]
+        expect(rules[-3:] == ["Read(/%s/**)" % home, "Edit(/%s/**)" % home, "Write(/%s/**)" % home]
+               and len(bash) == len(rules) - 3 and argv[-1] == rules[-1]
+               and not set(rules) & {"Bash", "Read", "Edit", "Write", "Glob", "Grep"},
+               f"--allowedTools last; the file tools by the worktree's path only, nothing by bare name: {rules}")
+        expect(bash == ["git status *", "git diff *", "git log *", "git show *", "git fetch origin main",
+                        "git merge origin/main", "git merge --abort", "git add *", "git rm *",
+                        "git commit --no-edit", "git push origin feat/pr-7", "gh pr checks 7 --watch",
+                        "gh pr checks 7"] + list(checks),
+               f"the named commands, exactly, each check by its exact words: {bash}")
+        prompt = argv[2] if len(argv) > 2 else ""
+
+        def may_run(command):
+            return any(command == r or (r.endswith(" *") and (command == r[:-2] or command.startswith(r[:-1])))
+                       for r in bash)
+        named = [part.strip() for quoted in re.findall(r"`([^`]+)`", prompt) for part in quoted.split("&&")
+                 if part.strip().startswith(("git ", "gh ")) or part.strip() in checks]
+        expect(len(named) >= 10 and all(may_run(c) for c in named),
+               f"every command the prompt names must be one it may run: {[c for c in named if not may_run(c)]}")
+        expect(all("`%s`" % c in prompt for c in checks) and "CI is the only check" not in prompt,
+               "the prompt names each check, exactly as the rule allows it")
+        # The list the dry run prints (and CK-W1 signs) covers every command the session is given.
+        desc = describe_fix_session(checks, "sonnet")
+        reads = [ln for ln in desc if ln.startswith("fix session: reads")]
+        expect(len(reads) == 1 and all(w in reads[0] for w in (
+            "nothing in ~, /Users, /Volumes, /private/var/folders, " + os.path.realpath("/tmp"), "scratchpad",
+            "<worktree>, <checkout>, " + ctmp, "~/.config/git", "~/.nvm", "~/.pyenv", "~/.gitconfig",
+            "~/Library/Keychains/login.keychain-db", "secret files stay denied")),
+               f"the dry run names every read wall, from the same tables (KIT-786): {reads}")
+        for program, want in (("/Users/you/.nvm/versions/node/v22/bin/npm", None), ("/Users/you/.pyenv/shims/python3", None),
+                              ("/opt/homebrew/bin/npm", None), ("/usr/bin/python3", None),
+                              ("/Users/you/.cargo/bin/cargo", "/Users/you"), ("/Users/you/bin/check", "/Users/you"),
+                              ("/Users/someone/bin/x", "/Users"), ("/Volumes/ext/bin/x", "/Volumes"),
+                              ("/Users/you/.nvm", None), ("/Users/you/.nvmx/bin/node", "/Users/you")):
+            got = program_unreadable(program, "/Users/you", 501)
+            expect(got == want, f"program_unreadable({program!r}) = {got!r}, not {want!r}")
+        placeholders = fix_rules("/w", "<number>", "<branch>", "<base>", checks)
+        expect(all(r[len("Bash("):-1] in desc[0] + desc[1] for r in placeholders if r.startswith("Bash("))
+               and desc[-1].endswith("sonnet"), f"the signed list must name every command a session gets: {desc}")
+        # No checks named: the prompt says CI is the only check, and nothing else is allowed in its place.
+        calls.clear()
+        gh = FakeGh([_pr(7, labels=[LABEL])], {7: [_bot(marker("request", 1), 2)]})
+        wake(gh, repo, NOW, env={}, **common)
+        argv0 = calls[0][0] if calls else []
+        expect("CI is the only check" in (argv0[2] if len(argv0) > 2 else "") and "--model" not in argv0
+               and argv0[-4:-3] == ["Bash(gh pr checks 7)"],
+               f"no check named means none allowed, said in the prompt: {argv0[-5:]}")
+        # A check no exact rule could name is refused: by wake before anything is read, and by the CLI
+        # as a usage error. So is the old pass-through, and a model that is not a name.
+        for bad in ("npm *", "npm test; rm x", "npm test && x", "echo $(id)", "npm test > out", "a | b",
+                    "", "  npm test", "npm  test", "npm test ", "FOO=1 npm test", "-x", "npm\ttest",
+                    "python3 -c 'print(1)'", "npm test `x`", 'pytest -k "unclosed', None, 3):
+            expect(check_command_problem(bad), f"{bad!r} must not be a named check")
+        for good in ("npm run test:hooks", "python3 scripts/check_placeholders.py", 'pytest -k "not slow"',
+                     "make test", "./scripts/check.sh"):
+            expect(check_command_problem(good) is None, f"{good!r} is a plain check: {check_command_problem(good)}")
+        calls.clear()
+        gh = fresh_gh()
+        try:
+            wake(gh, repo, NOW, env={}, checks=("npm *",), **common)
+            expect(False, "wake must refuse a check no rule could name")
+        except ValueError:
+            expect(gh.writes == [] and calls == [], "…before anything is read, written or started")
+        for args_ in (["wake", "--check-command", "npm *", "--dry-run"],
+                      ["wake", "--claude-arg=--permission-mode", "--dry-run"],
+                      ["wake", "--model", "two words", "--dry-run"]):
+            expect(main(args_) == 2, f"{args_} must be a usage error")
+
     # 21. the real transport: label writes carry only `conflict`; nothing merges or approves.
     seen = []
 
@@ -1885,7 +2563,7 @@ def selftest():
         for f in failures:
             print("  -", f)
         return 1
-    print("pr_conflict selftest: OK (30 cases%s)" % (
+    print("pr_conflict selftest: OK (31 cases%s)" % (
         "; NOT CHECKED HERE: " + "; ".join(not_checked) if not_checked else ""))
     return 0
 
@@ -1918,8 +2596,12 @@ def main(argv=None):
                    help="fix sessions per pass, across every --repo-dir")
     w.add_argument("--resume-mode", choices=["from-pr", "continue", "fresh"], default="from-pr")
     w.add_argument("--claude-bin", default="claude")
-    w.add_argument("--claude-arg", action="append", default=[],
-                   help="passed through to claude, e.g. --claude-arg=--permission-mode --claude-arg=acceptEdits")
+    w.add_argument("--check-command", action="append", default=[],
+                   help="a local check a fix session may run, by its exact words; repeat for several, "
+                        "e.g. --check-command 'npm run test:hooks'. The session runs nothing else but "
+                        "the git and gh commands its prompt names (KIT-676)")
+    w.add_argument("--model", default="", help="the fix session's model (default: Claude Code's own)")
+    w.add_argument("--claude-arg", action="append", default=[], help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
     if args.selftest:
         from scratch_run import contained   # KIT-450: its temp folders go when it ends
@@ -1950,7 +2632,16 @@ def main(argv=None):
                            dry_run=args.dry_run, summary=summary, page_to=page_to,
                            max_fix_requests=args.max_fix_requests)
         if args.cmd == "wake":
+            if args.claude_arg:
+                print("wake: --claude-arg is gone (KIT-676). The waker builds a fix session's whole command "
+                      "line: name each local check with --check-command, by its exact words, and a model "
+                      "with --model. Nothing else is passed through.", file=sys.stderr)
+                return 2
             problem = queue_problem(args.max_sessions, args.timeout_min, args.max_budget_usd)
+            problem = problem or next((check_command_problem(c) for c in args.check_command
+                                       if check_command_problem(c)), None)
+            if not problem and args.model and not MODEL_RE.match(args.model):
+                problem = "--model %r is not a model name" % args.model
             if problem:
                 print(f"wake: {problem}", file=sys.stderr)
                 return 2
@@ -1966,8 +2657,8 @@ def main(argv=None):
                              dt.datetime.now(dt.timezone.utc), state_dir=args.state_dir,
                              dry_run=args.dry_run, max_sessions=args.max_sessions,
                              claude_bin=args.claude_bin, resume_mode=args.resume_mode,
-                             claude_args=args.claude_arg, budget_usd=args.max_budget_usd,
-                             timeout_min=args.timeout_min)
+                             checks=tuple(args.check_command), model=args.model or None,
+                             budget_usd=args.max_budget_usd, timeout_min=args.timeout_min)
     except CouldNotTell as e:
         print(f"COULD NOT TELL: {e}", file=sys.stderr)
         return 1

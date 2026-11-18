@@ -125,8 +125,8 @@ are built, nothing is approved for you.
 ## 2. The ledger
 
 Every decision the validator makes is one row in its ledger: what it decided, about what, and
-why. Only the validator writes it. The stand-up, the weekly recap and the watcher will read it,
-and the watcher will check every merge against it. Nothing writes rows yet: the pieces that
+why. Only the validator writes it. The stand-up and the weekly recap will read it. The watcher
+checks every merge against it (`docs/WATCHER.md`, the `approval-rate` monitor). Nothing writes rows yet: the pieces that
 decide come next. The format is contract §24; the code is `scripts/pipeline_validator_ledger.py`.
 
 | A row says | For example |
@@ -135,13 +135,17 @@ decide come next. The format is contract §24; the code is `scripts/pipeline_val
 | The decision | `approved`, `sent-back`, `escalated`, `escalated-urgent` or `held` |
 | Each layer's verdict | hard limits `pass`, evidence `pass`, agent `pass` |
 | Which switches were on, and the size limits | `approve-merges`; 400 lines, 20 files |
+| Why, when it held, escalated or sent back | closed words, such as `risk-path` or `send-back-budget-spent` |
 | The agent's reason, in its own words | `The diff does what the criteria ask, and nothing else.` |
 
 **One verdict per head.** A row is never changed. A new push to a pull request is a new head,
 and gets a new row.
 
-**An approval is whole.** All three layers passed, and its own switch was on. A row that says
-otherwise is refused, and nothing is written.
+**An approval is whole.** All three layers passed, its own switch was on, and code gave no
+reason to hold. A row that says otherwise is refused, and nothing is written.
+
+**Code's reasons are closed words.** A hold from the limits or the evidence says why in code's
+own words, never the agent's. The agent's reason is kept apart, as its words.
 
 **The agent's words are quoted, never obeyed.** Its reason is one line of at most 300 characters,
 with nothing hidden in it. It is the only text in the ledger.
@@ -310,7 +314,7 @@ pull request. The code is `scripts/pipeline_validator_evidence.py`.
 | What | `yes` means | Some reasons for `no` |
 |---|---|---|
 | The head | GitHub's head is that exact commit. A push makes old evidence count for nothing. | `head-moved` |
-| Checks | Every check is finished and green, and every check the branch requires has run. A check is known by its workflow and name. | `check-pending`, `check-failed`, `check-missing` |
+| Checks | Every check is finished and green, and every check the branch requires has run. A check is known by its workflow and name. A required check counts only from the app your branch rules name as its source; one of the same name from another app is not it. | `check-pending`, `check-failed`, `check-missing` |
 | Stage E's review | A full review of this exact head, never edited, from Stage E's own bot login, named in your settings. | `review-login-unset`, `review-login-shared`, `review-missing`, `review-stale`, `review-partial`, `review-declined`, `review-edited` |
 | Its findings | Nothing at or above the bar. The bar is `medium` unless set. | `review-finding-at-bar`, `review-unreadable` |
 | Acceptance | For a plan's last piece, the acceptance check passed. | `acceptance-none`, `acceptance-not-passed` |
@@ -482,3 +486,103 @@ and its selftest checks that no other script names it.
 
 Good: the validator's own job, started by your scheduler, as you. Not that: a session running the
 agent to see what it would say.
+
+## 7. What a no does
+
+When the validator does not approve, code decides what happens next, from the agent's answer and
+the layers. The code is `scripts/pipeline_validator_route.py`. Nothing calls it yet: the merge path
+and the approvals are their own pieces.
+
+| What happened | What it records | What happens next |
+|---|---|---|
+| The agent sends it back, and Stage E has send-backs left | `sent-back` | Stage E re-prompts the dev session, from the same budget a review's send-back uses. |
+| The agent sends it back, and none are left | `escalated`, `send-back-budget-spent` | It waits for you. |
+| The agent sends back a plan or a piece | `escalated`, `send-back-no-session` | It waits for you: there is no dev session yet. |
+| The agent escalates | `escalated` | It waits for you, with the agent's reason. |
+| The agent believes the dev session is compromised | `escalated-urgent` | It waits for you, marked urgent, and the watcher pages you. |
+| A limit or the evidence holds it for good | `held`, with closed words such as `risk-path` | It waits for you. |
+| The agent gave an answer that could not be used | `held`, with a word such as `answer-not-two-lines` | It waits for you. |
+
+**A hold that settles by itself writes nothing.** Checks still running, a review not in yet, the
+working window closed, a fact it could not read, an agent run that failed before it judged (a
+timeout, a CLI that would not start): it waits, and a later pass judges again. A pull
+request's head gets one verdict, so a wait never spends it. Good: no row while checks run. Not
+that: a `held` row for a check still running, which would leave that head unable to be approved.
+
+**A send-back goes through Stage E.** The validator never re-prompts anyone itself. It writes the
+`sent-back` row, and Stage E's bounce driver re-prompts the session that opened the pull request,
+from its own ledger. So a send-back counts against the bounce budget Stage E already keeps: there
+is no second count. The agent's reason reaches the session as one line marked as its words, inside
+the re-prompt's data fence, never as an order. One row buys one re-prompt. The session's next push
+is a new head, reviewed and judged again from the start.
+
+To turn it on, add the ledger's absolute path to the bounce driver's config as
+`validator_ledger_file` (`docs/STAGE-E-OPERATOR.md`). The driver must be able to read the file. A
+path it cannot read stops it, said on each pull request, rather than missing a send-back quietly.
+
+Good: `validator_ledger_file` names the ledger, and a send-back arrives in the session's thread.
+Not that: no `validator_ledger_file`. Then a `sent-back` row waits, and nothing re-prompts the
+session.
+
+**What you see.** Each escalation and each hold that waits for you is a blocker, with its reason in
+plain words and the reply that clears it: `approve <plan>` for a plan, `start <piece>` for a
+piece. A pull request is yours to merge or close on GitHub. A later piece puts these in the
+stand-up. The agent's own words are shown apart, as its words, never as the report's.
+
+**An urgent one pages you through the watcher,** which reads the ledger on its own account. The
+validator sends nothing itself, so it never assumes a page. It says `paged` only once the watcher's
+status shows that escalation flagged, `not paged yet` until then, and `could not page` while the
+watcher is stale, unreadable, off or blind. The blocker stands either way. Good: `not paged yet:
+the watcher has not flagged this urgent escalation, so it stays your blocker until it does`. Not
+that: taking an urgent escalation as paged because it was written down.
+
+**Your `Validator` check.** Stage E's bounce driver never treats a red `Validator` check as
+something the dev session must fix, whatever your list of checks that wait on a person says. Its
+verdict is the validator's: a send-back has its own path, and an escalation or a hold is yours.
+
+## 8. The facts it reads
+
+Before it judges anything, the validator reads the facts about it once: who filed the idea, which
+files change, how big the change is, whether the window is open, and so on. The code is
+`scripts/pipeline_validator_facts.py`. It only reads. Nothing calls it yet: the merge path and the
+approvals are their own pieces.
+
+Each fact comes from the part of the kit that owns it, through that part's own reader:
+
+| Fact | Where it comes from |
+|---|---|
+| The ticket a pull request belongs to | The tracker's own link from the ticket to the pull request, never the branch name. |
+| Who filed the idea | The piece, then its plan, then the planning run, then the idea, judged by the queue's own rule for a ticket you filed. |
+| The files and the size | GitHub. A renamed file counts under both names. |
+| Your project's risk paths, and its send-back budget | `delivery.json` on the default branch. |
+| Send-backs spent | Stage E's own ledger. |
+| The window and the runaway stops | The queue's own config and its own stop checks. |
+| The watcher and its hold | The watcher's status file, and the hold file. |
+| The last piece of a plan, and its acceptance check | The tracker, and the acceptance check's own record at this head. |
+| The criteria | Stage E's snapshot of them, taken when the work was delegated. |
+| The diff | GitHub. |
+
+**A fact it could not read holds the item.** It is said by name, with the reason, and never read
+as clear, empty or zero. So a source that is down stops approvals instead of letting one through.
+
+Good: `ticket: the tracker records no one ticket for the pull request`, and the pull request waits.
+Not that: a pull request approved because its ticket could not be read.
+
+**Its sources are yours to point it at.** Its config names the tracker key's variable (a read-only
+key), the work teams, the queue's config, Stage E's ledger and snapshot folder, the acceptance
+ledger, and the watcher's status and hold files. One left empty is a source it does not read, and
+every fact from it is said as unread. The install (a later piece) sets them.
+
+**Read one pull request's facts yourself.** It prints the facts as fields, with the criteria and the
+diff as sizes only, and changes nothing:
+
+```bash
+python3 scripts/pipeline_validator_facts.py show --config ~/.validator/config.json \
+  --repo OWNER/NAME --pr 12
+```
+
+Exit 0: every fact was read. Exit 1: at least one was not, and `unread` says which. Exit 2: the
+config could not be read or is not valid.
+
+**What it does not read yet.** Agent-filed work's generation is the queue's to certify, from its own
+verdict, and is not read here: such work's provenance is said as unread, so it waits for you.

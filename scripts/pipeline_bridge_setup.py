@@ -544,23 +544,16 @@ def ask_name(conf_path, values, reader=None, tty=None, err=None):
         err.write("No name was written to %s. Run this again to name your tech lead.\n"
                   % conf_path)
         return EX_USAGE, values
-    # A temp file beside the conf, swapped in whole: a failed write never leaves it partial.
-    tmp = "%s.name.%d" % (conf_path, os.getpid())
     try:
-        with open(conf_path, encoding="utf-8") as fh:
-            text = fh.read()
-        mode = os.stat(conf_path).st_mode & 0o777
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(set_conf_line(text, "APP_NAME", name))
-        os.replace(tmp, conf_path)
-    except OSError as exc:
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
-        err.write("Could not write the name into %s: %s. Nothing was written.\n"
-                  % (conf_path, exc))
+        write_conf_name(conf_path, name)
+    except NameWriteError as exc:
+        if exc.kind in ("readback", "mismatch"):    # the file was swapped in: it was written
+            err.write("The name was written to %s but %s. Check it by hand.\n"
+                      % (conf_path, "reads back differently" if exc.kind == "mismatch"
+                         else "could not be read back (%s)" % exc.detail))
+        else:
+            err.write("Could not write the name into %s: %s. Nothing was written.\n"
+                      % (conf_path, exc.detail or exc.kind))
         return EX_FAILED, values
     err.write("Saved: your tech lead is called %r (APP_NAME in %s). To rename it later, change "
               "that line and paste the manifest again.\n" % (name, conf_path))
@@ -2194,14 +2187,89 @@ def drill_command(conf):
 
 
 def set_conf_line(text, key, value):
-    """The conf's text with KEY=value set: its own line changed in place, or one added."""
-    lines, done = text.splitlines(), False
-    for n, line in enumerate(lines):
-        if line.strip().split("=", 1)[0].strip() == key and not line.strip().startswith("#"):
-            lines[n], done = "%s=%s" % (key, value), True
+    """The conf's text with KEY=value set, and no other byte changed (KIT-747).
+
+    The active line is the one whose key (the part before the first `=`), stripped, is KEY and
+    that is not a comment. It is replaced and keeps its own ending (none, on a last line with
+    none). A commented `#KEY=` example stays as it is. With no active line, one is added after
+    the last line, ended like the file's lines: CRLF when the last line that has an ending ends
+    in CRLF, else LF. A last line with no ending is ended in that style first. An empty file
+    gets the line alone, ended with LF."""
+    out, done, style, last_end = [], False, "\n", None
+    for piece in text.splitlines(keepends=True):
+        body = piece.splitlines()[0]
+        end = piece[len(body):]
+        last_end = end
+        if end:
+            style = "\r\n" if end == "\r\n" else "\n"
+        stripped = body.strip()
+        if stripped.split("=", 1)[0].strip() == key and not stripped.startswith("#"):
+            out.append("%s=%s%s" % (key, value, end))
+            done = True
+        else:
+            out.append(piece)
     if not done:
-        lines.append("%s=%s" % (key, value))
-    return "\n".join(lines) + "\n"
+        if last_end == "":
+            out.append(style)            # the last line had no ending: end it first, in the file's style
+        out.append("%s=%s%s" % (key, value, style))
+    return "".join(out)
+
+
+class NameWriteError(Exception):
+    """write_conf_name's failure. `kind` is read, changed, write, readback or mismatch; `detail`
+    is the exception's class name, or empty."""
+
+    def __init__(self, kind, detail=""):
+        Exception.__init__(self, kind, detail)
+        self.kind, self.detail = kind, detail
+
+
+def write_conf_name(path, name, guard=None):
+    """KIT-747: the one writer of the tech lead's name. Sets the active APP_NAME line of the
+    settings file at `path` (or adds one), keeps every other byte, swaps the whole file in
+    from a temp file made new beside it (never through a link, with the old mode), and reads it
+    back. `guard(text)`, if given, returns a reason to stop (the file changed since it was
+    read): then nothing is written. Raises NameWriteError; returns the text written."""
+    try:
+        with open(path, "rb") as fh:
+            old = fh.read().decode("utf-8")
+        mode = os.stat(path).st_mode & 0o777
+    except (OSError, ValueError) as exc:
+        raise NameWriteError("read", type(exc).__name__)
+    if guard is not None and guard(old):
+        raise NameWriteError("changed")
+    new = set_conf_line(old, "APP_NAME", name).encode("utf-8")
+    tmp = "%s.name.%d" % (path, os.getpid())
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+    except OSError as exc:
+        raise NameWriteError("write", type(exc).__name__)
+    swapped = False
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            os.fchmod(fh.fileno(), mode)
+            fh.write(new)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        swapped = True
+    except OSError as exc:
+        raise NameWriteError("write", type(exc).__name__)
+    finally:
+        if not swapped:                  # a failure or Ctrl-C: the temp file this call made goes
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    try:
+        with open(path, "rb") as fh:
+            back = fh.read()
+        back_values, back_errors = parse_conf(back.decode("utf-8"))
+    except (OSError, ValueError) as exc:
+        raise NameWriteError("readback", type(exc).__name__)
+    if back != new or back_errors or back_values.get("APP_NAME") != name:
+        raise NameWriteError("mismatch")
+    return new.decode("utf-8")
 
 
 def cmd_direct_asks(conf, conf_path, runner, sudo, apply_it, reader=None):
@@ -3819,6 +3887,65 @@ def selftest():
         check("name-written-whole-through-a-swap-keeping-the-mode-and-a-failed-write-keeps-the-conf",
               (w_rc, w_left, f_rc, f_kept, f_left, "Nothing was written" in f_err.getvalue()),
               (EX_OK, (["bridge.conf"], "0o600"), EX_FAILED, True, ["bridge.conf"], True))
+        # KIT-747: the one writer keeps every other byte: CRLF endings, a missing final newline,
+        # a commented example, an active line. Each is written to a file, read back and compared.
+        keep_cases = (
+            ("crlf-no-line", "# c\r\nACT=no\r\n", "# c\r\nACT=no\r\nAPP_NAME=Rex\r\n"),
+            ("crlf-active-line", "# c\r\nAPP_NAME=Old\r\nACT=no\r\n",
+             "# c\r\nAPP_NAME=Rex\r\nACT=no\r\n"),
+            ("no-final-newline-no-line", "# c\nACT=no", "# c\nACT=no\nAPP_NAME=Rex\n"),
+            ("no-final-newline-active-last", "ACT=no\nAPP_NAME=Old", "ACT=no\nAPP_NAME=Rex"),
+            ("commented-example-only", "#APP_NAME=Tech lead\nACT=no\n",
+             "#APP_NAME=Tech lead\nACT=no\nAPP_NAME=Rex\n"),
+            ("active-line-and-a-commented-one", "#APP_NAME=Tech lead\nAPP_NAME=Old\nACT=no\n",
+             "#APP_NAME=Tech lead\nAPP_NAME=Rex\nACT=no\n"),
+            ("trailing-spaces-and-tabs-kept", "ACT=no  \r\nINTERVAL_SECONDS=60\t\n",
+             "ACT=no  \r\nINTERVAL_SECONDS=60\t\nAPP_NAME=Rex\n"),
+            ("empty-file", "", "APP_NAME=Rex\n"),
+        )
+        with tempfile.TemporaryDirectory() as ktmp:
+            for klabel, before, expected in keep_cases:
+                kpath = os.path.join(ktmp, "k.conf")
+                with open(kpath, "wb") as fh:
+                    fh.write(before.encode("utf-8"))
+                try:
+                    write_conf_name(kpath, "Rex")
+                except NameWriteError as exc:
+                    got = "failed: %s" % exc.kind
+                else:
+                    with open(kpath, "rb") as fh:
+                        got = fh.read().decode("utf-8")
+                check("kit747-name-writer-keeps-every-other-byte-" + klabel, got, expected)
+                check("kit747-set-conf-line-keeps-every-other-byte-" + klabel,
+                      set_conf_line(before, "APP_NAME", "Rex"), expected)
+        # The file was swapped in before a read-back or a mismatch is found, so those two say
+        # "written", not "nothing was written"; a failed swap says nothing was written.
+        with tempfile.TemporaryDirectory() as mtmp:
+            mpath = os.path.join(mtmp, "bridge.conf")
+            with open(mpath, "w", encoding="utf-8") as fh:
+                fh.write(bare)
+            said = {}
+            real_write = globals()["write_conf_name"]
+            try:
+                for kind in ("mismatch", "readback", "write"):
+                    def boom(path, name, guard=None, _k=kind):
+                        raise NameWriteError(_k, "OSError" if _k != "mismatch" else "")
+                    globals()["write_conf_name"] = boom
+                    m_err = io.StringIO()
+                    m_rc = ask_name(mpath, {}, reader=lambda _q: "Rex", tty=True, err=m_err)[0]
+                    said[kind] = (m_rc, m_err.getvalue())
+            finally:
+                globals()["write_conf_name"] = real_write
+        check("kit747-a-name-found-wrong-after-the-swap-says-it-was-written",
+              (said["mismatch"][0], "was written to" in said["mismatch"][1],
+               "reads back differently" in said["mismatch"][1],
+               "Nothing was written" in said["mismatch"][1]), (EX_FAILED, True, True, False))
+        check("kit747-a-name-that-cannot-be-read-back-says-it-was-written",
+              ("was written to" in said["readback"][1], "Nothing was written" in said["readback"][1]),
+              (True, False))
+        check("kit747-a-swap-that-fails-says-nothing-was-written",
+              ("Nothing was written" in said["write"][1], "was written to" in said["write"][1]),
+              (True, False))
         check("name-saved-line-says-the-name-and-how-to-rename",
               (r_asked[4].startswith("Saved: your tech lead is called 'babyclaw' (APP_NAME in "),
                "change that line and paste the manifest again" in r_asked[4]), (True, True))
@@ -6307,7 +6434,13 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.selftest:
         from scratch_run import contained   # KIT-450: its temp folders go when it ends
-        return contained(selftest, "bridge-setup-selftest-run-")
+        import pipeline_root_guard as _rg   # KIT-693: the root case ends every installer's own selftest
+        return contained(selftest, "bridge-setup-selftest-run-") or _rg.root_case_rc(main, ["install"])
+    import pipeline_root_guard as _rg   # KIT-693: the one refusal every installer shares
+    _root = _rg.refusal()
+    if _root:
+        say(_root)
+        return EX_REFUSED
     if args.command in ("token", "writer-token", "install", "verify", "standup",
                         "direct-asks", "push-token", "push-probe", "push"):
         found = agent_markers_present()

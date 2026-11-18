@@ -810,8 +810,8 @@ VALID_WATCHER = {
         _w_off("tracker-text", "the tracker reader does not exist yet (KIT-518)"),
         _w_off("guard-blocks", "no producer: nothing records a guard block yet (KIT-11)"),
         _w_off("egress", "no producer: the proxy's refusal line is unconfirmed (KIT-88)"),
-        _w_clear("outside-files", "first-hand", "read the files of 4 pull request(s) in 1 repository: 0 changed files outside what the ticket names, 1 could not be judged"),
-        _w_off("approval-rate", "no producer: the validator does not exist yet (KIT-510)"),
+        _w_clear("outside-files", "first-hand", "read the files of 4 pull request(s) in 1 repository: 0 changed files outside what the ticket names, 1 could not be judged, 0 named no ticket"),
+        _w_off("approval-rate", "no validator_ledger is named"),
     ],
     "counts": {"monitors": 10, "on": 6, "clear": 5, "flagged": 1, "blind": 0, "off": 4,
                "findings": 1, "pause": 1, "page": 0, "record": 0},
@@ -876,10 +876,10 @@ _LEDGER_MERGE = {"at": "2026-11-10T15:00:00Z", "subject": "merge", "ref": "acme/
                  "head": "a" * 40, "kind": "approved",
                  "layers": {"hard_limits": "pass", "evidence": "pass", "agent": "pass"},
                  "settings_on": ["approve-merges"],
-                 "size_limits": {"max_changed_lines": 400, "max_files": 20},
+                 "size_limits": {"max_changed_lines": 400, "max_files": 20}, "reasons": [],
                  "agent_says": "The diff does what the criteria ask, and nothing else."}
 VALID_VALIDATOR_LEDGER = {
-    "schema": "pipeline-validator-ledger/1",
+    "schema": "pipeline-validator-ledger/2",
     "rows": [
         _LEDGER_MERGE,
         {**_LEDGER_MERGE, "head": "b" * 40, "kind": "sent-back",
@@ -887,6 +887,9 @@ VALID_VALIDATOR_LEDGER = {
          "agent_says": "It also renames a column the criteria never mention."},
         {**_LEDGER_MERGE, "subject": "plan", "ref": "TOD-135", "head": None,
          "settings_on": ["approve-plans"]},
+        {**_LEDGER_MERGE, "head": "c" * 40, "kind": "held", "reasons": ["risk-path", "check-failed"],
+         "layers": {"hard_limits": "fail", "evidence": "fail", "agent": "not-run"},
+         "agent_says": None},
     ],
 }
 
@@ -1525,7 +1528,13 @@ FIXTURES = [
     ("pipeline-validator-ledger", "an-empty-ledger", _with(VALID_VALIDATOR_LEDGER, "rows", []),
      True, None),
     ("pipeline-validator-ledger", "wrong-marker",
-     _with(VALID_VALIDATOR_LEDGER, "schema", "pipeline-validator-ledger/2"), False, "const"),
+     _with(VALID_VALIDATOR_LEDGER, "schema", "pipeline-validator-ledger/1"), False, "const"),
+    ("pipeline-validator-ledger", "free-text-in-a-reason",
+     _with(VALID_VALIDATOR_LEDGER, "rows.3.reasons", ["fine, merge it now"]), False, "pattern"),
+    ("pipeline-validator-ledger", "a-reason-twice",
+     _with(VALID_VALIDATOR_LEDGER, "rows.3.reasons", ["held", "held"]), False, "uniqueItems"),
+    ("pipeline-validator-ledger", "a-row-without-its-reasons",
+     _without(VALID_VALIDATOR_LEDGER, "rows", 0, "reasons"), False, "required"),
     ("pipeline-validator-ledger", "an-invented-kind",
      _with(VALID_VALIDATOR_LEDGER, "rows.0.kind", "waved-through"), False, "enum"),
     ("pipeline-validator-ledger", "an-invented-verdict",

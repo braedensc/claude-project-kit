@@ -256,6 +256,7 @@ npm run test:notifier        # human-action notifier: marks table, the three §1
 npm run test:heartbeat-monitor  # the job that READS the three heartbeats: one comment
                              #   per incident, the sleep blind spot, §13 exit codes
 npm run test:notifier-setup  # notifier installer (KIT-116): conf-all-errors, agent-refused, no secret in output
+npm run test:root-guard      # every installer refuses to run as root with one shared message, and changes nothing (KIT-693)
 npm run test:stage-e-setup   # Stage E installer: conf errors all-at-once, idempotency, no
                              #   Reviews team (labels on the work teams, a drain gate, KIT-599),
                              #   agent-refused, §13 exit codes, no secret in any output
@@ -270,7 +271,7 @@ npm run test:install         # the one command (scripts/pipeline_install.py): sk
                              #   Stage E after a yes, then Stage A; refused under a model
 npm run test:parts           # every part listed once (pipeline-parts.json): owners, needs, cards, docs/PARTS.md
 npm run test:chat-lane-setup # chat-lane composer: owner's grant, fence keeps defaults, verify agent-refused
-npm run test:model-switch    # the tech lead's model switch (KIT-385): the pair alone or no
+npm run test:model-switch    # the dispatcher's chat-model switch (KIT-385): the pair alone or no
                              #   go, every open pipeline ticket on the default tagged first
                              #   (the dispatcher's own rule), one yes, the pair read back
 npm run test:bridge          # Slack bridge (KIT-221): Slack-verified sender, its own question,
@@ -338,8 +339,12 @@ npm run test:validator-settings  # the validator's switches (KIT-533): absent, i
                              #   untrusted is every switch off; the safety system is never one
 npm run test:validator-evidence  # the validator's evidence (KIT-534): checks, Stage E's review at the
                              #   PR's own head, acceptance, merge state; anything unread is no
+npm run test:validator-facts  # the validator's facts for one item (KIT-791): each from its owner's
+                             #   reader, read-only; an unread fact is said by name and never clear
 npm run test:validator-check  # the Validator check (KIT-540): the ledger's decision at its own head,
                              #   posted as its own app; nothing for an unjudged head, holds in words
+npm run test:validator-route  # what the validator's no does (KIT-542): a send-back on Stage E's own
+                             #   budget, an escalation past it, holds in closed words, no row for a wait
 npm run test:validator-app  # the validator's owner script (KIT-541): its app and its required check,
                              #   one typed yes, refused under a model, a rerun changes nothing
 npm run test:tech-lead-tools # the tech lead's read tools over MCP (KIT-488): hostile
@@ -388,6 +393,9 @@ npm run test:runner          # the runner (KIT-642): start, resume, stop and a r
 npm run test:runner-limits   # the runner's limits (KIT-643): stand-ins that grow without bound
                              #   in memory (a child that left the group too) and on disk stopped
                              #   with their whole tree; the floor; each incident told once
+npm run test:session-tools   # a session's own tracker tools (KIT-706): five tools tied to its run, no
+                             #   ticket argument; hostile text refused or made inert; §8's caps; each
+                             #   comment read by its job; only the fixed requests sent; real stdio
 npm run test:queue-setup     # the queue's installer (KIT-456): configs pass the jobs' own loaders; no plist
                              #   overwritten, no job loaded; refused under a model
 npm run test:day-plan        # the day plan file (KIT-438): the queue's decision as fields only, each
@@ -405,10 +413,17 @@ npm run test:acceptance-setup  # the acceptance installer (KIT-326): the browser
 npm run test:union           # union check: green alone + red together, bisected, report-only
 npm run test:hooks-path      # core.hooksPath pinned absolute: a worktree runs the pre-commit hook (KIT-420)
 npm run test:runner-pin       # no workflow on a moving -latest runner image (KIT-429)
+npm run test:direct-checks  # the 3.9 job's list of direct checks matches Kit checks' direct steps (KIT-659)
+npm run test:ci-covers      # every package.json test:* script has a CI step outside the leak sweeps (KIT-620)
+npm run lint:ci-covers      # …and the same check over this repo
 npm run test:stdlib-only    # the kit's Python imports only the standard library, bar a named list (KIT-652)
 npm run lint:stdlib-only    # …and the same check over this repo's tracked .py files
 npm run test:pr-base         # PR-base gate: a PR's base must be a base branch; an unknown
                              #   event or missing value FAILS, main() itself is exercised
+npm run test:label-gate      # the label gate runs the default branch's workflow and code on
+                             #   pull_request_target, never the PR's: one closed reason per rule (KIT-668)
+npm run test:gate-policy     # the owner's Actions policy that lets the gate run after 2 Dec 2026:
+                             #   check, show, one typed yes, one POST, read back; refused under a model
 npm run test:alert-pages     # alert templates page a person (ALERT_PAGE_TO, else a user
                              #   owner) or fail their run; runs each copy under node
 npm run lint:secrets    # secretlint over every tracked file, read as git stores it
