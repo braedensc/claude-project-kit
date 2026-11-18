@@ -1012,17 +1012,27 @@ def ask_choices(edits, ask, out):
     return choices
 
 
+def folder_problems(text, kit, projects):
+    """Everything check would refuse in a machine.conf of this text beside these projects: its lines, its
+    places, anything shaped like a secret, and the rules that read both (the queue's)."""
+    folder, problems = parse_machine(text, kit)
+    folder.projects = projects
+    return problems + secret_problems(text) + queue_problems(folder)
+
+
 def take_from_files(sdir, kit, takes):
     """Put each file's own value in its part's own section of machine.conf, so the folder takes it. None, or
-    why not (then machine.conf is as it was)."""
+    why not (then machine.conf is as it was). The new machine.conf must pass every rule check has."""
     path = os.path.join(sdir, MACHINE)
     try:
         text = read_text(path)
+        pdir = os.path.join(sdir, PROJECTS)
+        projects = read_projects(pdir)[0] if os.path.lexists(pdir) else {}
     except (OSError, ValueError) as exc:
-        return "machine.conf could not be read (%s)" % type(exc).__name__
+        return "the settings could not be read (%s)" % type(exc).__name__
     for name, key, value in takes:
         text = set_section_line(text, own_section(name), key, value)
-    problems = parse_machine(text, kit)[1] + secret_problems(text)
+    problems = folder_problems(text, kit, projects)
     if problems:
         return "machine.conf would not pass check with them: %s" % "; ".join(problems)
     try:
@@ -2499,6 +2509,18 @@ def battery():
           (code, any("no longer sets POLL_INTERVAL_SECONDS" in s for s in said)), (EX_WAITING, True))
     run("write", "--apply", *sd, ask=lambda p: "folder")
     check("…and the folder's value goes back in", conf_values(get(stage_e)).get("POLL_INTERVAL_SECONDS"), "300")
+    project("ops", "TEAM_KEY=OPS\nPARTS=work-queue\n")
+    with open(machine, "a", encoding="utf-8") as fh:
+        fh.write("[queue.conf]\nREPO_BY_LABEL=repo:ops=acme/ops\n")
+    run("write", "--apply", *sd)
+    queue = os.path.join(parts, "queue.conf")
+    put(queue, set_line(get(queue), "REPO_BY_LABEL", ""))
+    kept_machine = get(machine)
+    code, said = run("write", "--apply", *sd, ask=lambda p: "file")
+    check("a file's value that would leave the folder failing check is never taken: machine.conf stays as it was",
+          (code, get(machine) == kept_machine, any("would not pass check" in s for s in said)), (EX_FIX, True, True))
+    run("write", "--apply", *sd, ask=lambda p: "folder")
+    os.remove(os.path.join(pdir, "ops.conf"))
     put(rec, "{not a record")
     check("a record that cannot be read stops the write, and never reads as no record",
           run("write", *sd)[0], EX_FIX)
@@ -2707,6 +2729,11 @@ def selftest():
         ("import takes a file of any name", dict(bundle_path_ok=lambda path: True)),
         ("import takes settings check would refuse", dict(import_problems=lambda files, kit: (Folder(), []))),
         ("import writes what the export said before it changed", dict(same_export=lambda again, text: True)),
+        ("a file's value is taken though the folder would then fail check",
+         dict(folder_problems=lambda text, kit, projects: [])),
+        ("import writes without --apply",
+         dict(cmd_import=lambda sdir, kit, uid, src, apply, out, ask, stop=None: o["cmd_import"](
+             sdir, kit, uid, src, True, out, lambda prompt: "yes", stop))),
         ("gather writes what the part files said before they changed", dict(unchanged=lambda g, again: True)),
     )
     missed = [label for label, patched in mutants if not caught(**patched)]
