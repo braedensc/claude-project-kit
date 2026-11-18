@@ -44,8 +44,10 @@ its reason (KIT-485):
 - **An installer.** You run it by hand.
 
 For such work the tech lead never offers a plan. It says the work is yours to do by hand, and
-what it would take, from what it has read. Its selftest pins those lines word for word, and
-checks them against this kit's own rule in `docs/SESSION-BRIEF.md` and the fix-CI skill.
+what it would take, from what it has read. It files no tickets: if you ask it to file such work
+as an idea, it says you can file it, and that the description should say why no dev session can
+land it, so the planner sees that too. Its selftest pins those lines word for word, and checks
+them against this kit's own rule, in the words of `docs/SESSION-BRIEF.md` and the fix-CI skill.
 
 `reach` says so for a ticket. The tools that start work (`plan`, `replan`, `approve`, `retry`
 and `start`) refuse such a ticket, and say why, however the tech lead's rules are worded. The
