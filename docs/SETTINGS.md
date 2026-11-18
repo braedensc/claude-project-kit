@@ -47,7 +47,10 @@ python3 scripts/pipeline_settings.py where           # where the folder, the par
 - **`write --apply` keeps the rest of each file.** Only the lines it names change. The mode stays, the
   file is swapped in whole, and it is read back.
 - **A part file that is not there is off on this Mac.** Nothing is made for it. Copy its example first.
-- **A problem anywhere stops the whole write.** One value cannot reach some files and miss others.
+- **A problem anywhere stops the whole write.** Every part file is read again just before the first
+  one is written, so one changed file stops them all. Only a failure part way through the writing
+  itself, such as a full disk, can leave some files written. The output then names each file,
+  written or not.
 - **`init` and `write --apply` refuse inside a Claude session,** and as root. Run them in your own
   terminal. `check`, `where`, `map` and `write` without `--apply` only read.
 

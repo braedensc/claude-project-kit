@@ -37,7 +37,9 @@ each change: the file, the key, the value now and the value after. It writes not
 `--apply`, run by you in your own terminal, it writes them. Every other byte of the file stays, and
 so does its mode. The file is swapped in whole from a file made new beside it, never written
 through a link, and read back. A part file that is not there is off on this Mac: nothing is written
-for it. A problem anywhere, and nothing is written at all.
+for it. A problem anywhere, and nothing is written at all: every part file is read again just before
+the first one is written. Only a failure part way through the writing itself, such as a full disk,
+can leave some files written, and then the output names each file, written or not.
 
 WHAT `check` FAILS ON (`write` runs it first, so a folder that fails it is never written from)
   secret      a value or a comment shaped like a credential (the notifier's scrub, the one the tech
@@ -83,6 +85,8 @@ MACHINE = "machine.conf"
 PARTS_LIST = "pipeline-parts.json"
 FILE_MAX = 1 << 20
 WALK_MAX = 500
+FOLDER_MODE, FILE_MODE = 0o700, 0o600       # what `init` makes
+OTHER_ACCESS = 0o077                         # any of these bits, and another account can reach it
 
 # Each shared value: its name under [shared], what it is, and the part files it is written to,
 # as file stems. "stem" means the same key in that file; "stem:KEY" names another key. Only the
@@ -325,14 +329,20 @@ class ScrubError(Exception):
     """The shared scrub could not run, so nothing it would have judged is called clean."""
 
 
+def scrub(text):
+    """The notifier's scrub, the one the tech lead's installer runs on its own settings. Raises
+    ScrubError when it cannot run."""
+    try:
+        import pipeline_notify_local as notify
+        return list(notify.secret_hits(text))
+    except Exception as exc:
+        raise ScrubError(type(exc).__name__)
+
+
 def secret_labels(text):
     """What `text` is shaped like, as labels; [] when clean. Raises ScrubError when the shared scrub
     cannot run, so a folder that could not be checked is never called clean."""
-    try:
-        import pipeline_notify_local as notify
-        labels = list(notify.secret_hits(text))
-    except Exception as exc:
-        raise ScrubError(type(exc).__name__)
+    labels = scrub(text)
     labels += [label for pattern, label in LOCAL_SHAPES if pattern.search(text) and label not in labels]
     for run in RANDOM_RUN_RE.findall(text):
         if re.search(r"[a-z]", run) and re.search(r"[A-Z]", run) and re.search(r"[0-9]", run):
@@ -380,21 +390,29 @@ def git_tree(path, stop=None):
     return None
 
 
+def linked(st):
+    return stat.S_ISLNK(st.st_mode)
+
+
+def foreign(st, uid):
+    return st.st_uid != uid
+
+
 def tree_problems(top, uid):
     """The folder and everything in it: yours, no other account may read it, and no links."""
     out, count = [], [0]
 
     def judge(path, label, folder):
         st = os.lstat(path)
-        if stat.S_ISLNK(st.st_mode):
+        if linked(st):
             out.append("%s is a link. Nothing in the settings folder may be one" % label)
             return False
         if folder and not stat.S_ISDIR(st.st_mode):
             out.append("%s is not a folder" % label)
             return False
-        if st.st_uid != uid:
+        if foreign(st, uid):
             out.append("%s belongs to another account" % label)
-        if st.st_mode & 0o077:
+        if st.st_mode & OTHER_ACCESS:
             out.append("%s can be read by other accounts (mode %03o). Make it %s"
                        % (label, st.st_mode & 0o777, "700" if stat.S_ISDIR(st.st_mode) else "600"))
         return stat.S_ISDIR(st.st_mode)
@@ -488,6 +506,15 @@ class Plan(object):
         self.state, self.why, self.changes, self.old, self.new = "same", "", [], None, None
 
 
+def unsafe_part(st, uid):
+    """Why a part file is never written, or "": a link, not a plain file, or another account's."""
+    if stat.S_ISLNK(st.st_mode):
+        return "is a link, and nothing is written through a link"
+    if not stat.S_ISREG(st.st_mode):
+        return "is not a plain file"
+    return "belongs to another account" if foreign(st, uid) else ""
+
+
 def plan_file(folder, kit, name, uid):
     path, source = part_path(folder, kit, name)
     plan, wanted = Plan(name, path, source), part_values(folder, name)
@@ -499,10 +526,9 @@ def plan_file(folder, kit, name, uid):
     except OSError as exc:
         plan.state, plan.why = "unread", "could not be looked at (%s)" % type(exc).__name__
         return plan
-    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode) or st.st_uid != uid:
+    plan.why = unsafe_part(st, uid)
+    if plan.why:
         plan.state = "held"
-        plan.why = ("is a link, and nothing is written through a link" if stat.S_ISLNK(st.st_mode) else
-                    "is not a plain file" if not stat.S_ISREG(st.st_mode) else "belongs to another account")
         return plan
     if not wanted:
         plan.state = "empty"
@@ -529,15 +555,48 @@ def plan_file(folder, kit, name, uid):
     return plan
 
 
-def apply_plan(plan):
-    """None when the file is written and read back; else why not, in words."""
+def still_as_planned(plan):
+    """"" when the part file is still the plain file it was when planned; else what changed."""
     try:
         st = os.lstat(plan.path)
         if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
-            return "is no longer a plain file, so nothing was written to it"
+            return "is no longer a plain file"
         if read_text(plan.path) != plan.old:
-            return "changed while this ran, so nothing was written to it. Run write again"
+            return "changed while this ran"
     except (OSError, ValueError) as exc:
+        return "could not be read again (%s)" % type(exc).__name__
+    return ""
+
+
+def preflight(todo):
+    """[(plan, what changed)] for every part file about to be written. All are read again before the
+    first one is written, so one changed file stops the whole write."""
+    return [(p, why) for p, why in ((p, still_as_planned(p)) for p in todo) if why]
+
+
+def blocked(plans):
+    """(exit code, words) when one part file stops the whole write, else None: all or nothing."""
+    if any(p.state == "unread" for p in plans):
+        return EX_UNREAD, "Nothing was written: a part file could not be read."
+    if any(p.state == "held" for p in plans):
+        return EX_FIX, "Nothing was written: fix the part file named above first."
+    return None
+
+
+def reads_back(plan, back):
+    """True when the text read back is the text written, and every changed key holds its new value."""
+    values = conf_values(back)
+    return back == plan.new and all(values.get(k) == new for k, _o, new, _s in plan.changes)
+
+
+def apply_plan(plan):
+    """None when the file is written and read back; else why not, in words."""
+    why = still_as_planned(plan)
+    if why:
+        return "%s, so nothing was written to it. Run write again" % why
+    try:
+        st = os.lstat(plan.path)
+    except OSError as exc:
         return "could not be read again (%s), so nothing was written to it" % type(exc).__name__
     mode, tmp, swapped = stat.S_IMODE(st.st_mode), "%s.settings.%d" % (plan.path, os.getpid()), False
     try:
@@ -561,8 +620,7 @@ def apply_plan(plan):
         back = read_text(plan.path)
     except (OSError, ValueError) as exc:
         return "was written but could not be read back (%s). Check it by hand" % type(exc).__name__
-    values = conf_values(back)
-    if back != plan.new or any(values.get(k) != new for k, _o, new, _s in plan.changes):
+    if not reads_back(plan, back):
         return "was written but reads back differently. Check it by hand"
     return None
 
@@ -655,12 +713,10 @@ def cmd_write(sdir, kit, uid, apply, out, stop=None):
         names = [p.name for p in plans if p.state == state]
         if names:
             out("%s: %s." % (words, ", ".join(names)))
-    if any(p.state == "unread" for p in plans):
-        out("Nothing was written: a part file could not be read.")
-        return EX_UNREAD
-    if any(p.state == "held" for p in plans):
-        out("Nothing was written: fix the part file named above first.")
-        return EX_FIX
+    stop_all = blocked(plans)
+    if stop_all:
+        out(stop_all[1])
+        return stop_all[0]
     todo = [p for p in plans if p.state == "change"]
     count = sum(len(p.changes) for p in todo)
     if not todo:
@@ -670,6 +726,12 @@ def cmd_write(sdir, kit, uid, apply, out, stop=None):
         out("Nothing was written. `write --apply` writes these %d change%s to %d file%s."
             % (count, "" if count == 1 else "s", len(todo), "" if len(todo) == 1 else "s"))
         return EX_WAITING
+    stale = preflight(todo)
+    if stale:
+        for p, why in stale:
+            out("NOT WRITTEN: %s %s." % (p.path, why))
+        out("Nothing was written: a part file changed after it was read. Run write again.")
+        return EX_FIX
     failed = 0
     for p in todo:
         why = apply_plan(p)
@@ -679,8 +741,8 @@ def cmd_write(sdir, kit, uid, apply, out, stop=None):
         else:
             out("Wrote %s and read it back: it matches." % p.path)
     if failed:
-        out("%d of %d files were not written. Each one named above is as it was, or says to check it."
-            % (failed, len(todo)))
+        out("%d of %d files were not written, part way through the write. The lines above name each file: "
+            "Wrote, or FAILED and as it was, or check it by hand." % (failed, len(todo)))
         return EX_FAILED
     return EX_OK
 
@@ -716,17 +778,31 @@ def cmd_init(sdir, kit, uid, out, stop=None):
         return EX_FIX
     try:
         if not os.path.lexists(sdir):
-            os.makedirs(sdir, 0o700)
-            os.chmod(sdir, 0o700)
-        fd = os.open(machine, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            os.makedirs(sdir, FOLDER_MODE)
+            os.chmod(sdir, FOLDER_MODE)
+        fd = os.open(machine, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, FILE_MODE)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            os.fchmod(fh.fileno(), 0o600)
+            os.fchmod(fh.fileno(), FILE_MODE)
             fh.write(template(kit))
     except OSError as exc:
         out("FAILED: %s could not be made (%s)." % (machine, type(exc).__name__))
         return EX_FAILED
     out("Made %s. Type each value once there, then run `check` and `write`." % machine)
     return cmd_check(sdir, kit, uid, out, stop)
+
+
+def places_of(folder, kit):
+    """[(what, where, which setting said so, what reads it)]: every place, the folder's or the default."""
+    base = folder.places.get("PARTS_DIR")
+    rows = [("The part files", base or kit.root, "[places] PARTS_DIR" if base else "the default: this kit folder",
+             "Read by `write`.")]
+    rows += [("  " + name, folder.places[place_key(name)], "[places] " + place_key(name), "")
+             for name in kit.files if folder.places.get(place_key(name))]
+    for key, what, default, reads in PLACES:
+        value = folder.places.get(key)
+        rows.append((what, value or (default if default is not None else consent_default()),
+                     "[places] " + key if value else "the default", reads))
+    return rows
 
 
 def cmd_where(sdir, source, kit, uid, out, stop=None):
@@ -738,16 +814,8 @@ def cmd_where(sdir, source, kit, uid, out, stop=None):
     elif problems:
         out("  machine.conf has problems (`check` names them). The places below are the defaults.")
         folder = Folder()
-    base = folder.places.get("PARTS_DIR")
-    out("The part files: %s (%s). Read by `write`." % (base or kit.root, "[places] PARTS_DIR" if base else
-                                                       "the default: this kit folder"))
-    for name in kit.files:
-        if folder.places.get(place_key(name)):
-            out("  %s: %s ([places] %s)." % (name, folder.places[place_key(name)], place_key(name)))
-    for key, what, default, reads in PLACES:
-        value = folder.places.get(key)
-        out("%s: %s (%s). %s" % (what, value or (default if default is not None else consent_default()),
-                                 "[places] " + key if value else "the default", reads))
+    for what, where, said, reads in places_of(folder, kit):
+        out(("%s: %s (%s). %s" % (what, where, said, reads)).rstrip())
     return EX_FIX if problems else EX_OK
 
 
@@ -812,10 +880,13 @@ def main(argv=None, environ=None, out=print, uid=None, kit_root=KIT, stop=None):
 # ======================================================================================
 # SELFTEST: nothing below this line runs outside --selftest, and the source scan stops here.
 # ======================================================================================
-def selftest():
+def battery():
+    """Every rule, once, in a folder of its own. Returns (the failed checks, how many checks ran)."""
     import shutil
     import tempfile
     import secret_shapes
+    from pipeline_dispatch_local import AGENT_ENV_MARKERS as MARKERS   # the list itself, never a mutant's
+    from scratch_run import remove_tree
     failures, total = [], [0]
 
     def check(name, got, want):
@@ -877,7 +948,7 @@ def selftest():
     check("a place that is not a full path is refused", settings_dir_of("rel/s", {})[0], None)
 
     # 2. init: refused in a session and as root, never inside a repository, private, never overwrites.
-    for marker in AGENT_ENV_MARKERS:
+    for marker in MARKERS:
         code, said = run("init", *sd, environ={marker: ""})
         check("init is refused in a session (%s), before anything is made" % marker,
               (code, os.path.lexists(sdir)), (EX_REFUSED, False))
@@ -963,7 +1034,7 @@ def selftest():
     # 5. --apply is refused in a session and as root, before anything is read.
     settings("[shared]\nROLE_ACCOUNT=_other\n")
     before = snapshot(parts)
-    for marker in AGENT_ENV_MARKERS:
+    for marker in MARKERS:
         code, said = run("write", "--apply", *sd, environ={marker: "1"})
         check("write --apply is refused in a session (%s)" % marker, (code, snapshot(parts) == before),
               (EX_REFUSED, True))
@@ -1005,6 +1076,26 @@ def selftest():
         globals()["read_text"] = real_read
     check("a file that reads back differently is said, never called written", "reads back differently" in (why or ""),
           True)
+    real_plan = globals()["plan_file"]
+
+    def plan_then_edit(folder, kit, name, uid):      # the last file changes after it is read
+        plan = real_plan(folder, kit, name, uid)
+        if name == "watcher.conf":
+            with open(os.path.join(parts, name), "a", encoding="utf-8") as fh:
+                fh.write("# edited while write ran\n")
+        return plan
+
+    def others():
+        return dict((k, v) for k, v in snapshot(parts).items() if not k.endswith("watcher.conf"))
+    before = others()
+    globals()["plan_file"] = plan_then_edit
+    try:
+        code, said = run("write", "--apply", *sd)
+    finally:
+        globals()["plan_file"] = real_plan
+    check("a part file that changes after it is read stops the whole write before any file is written",
+          (code, others() == before, any("watcher.conf" in s and "changed while this ran" in s for s in said)),
+          (EX_FIX, True, True))
     crlf = os.path.join(parts, "bridge.conf")
     put(crlf, "ROLE_ACCOUNT=_old\r\nJOB_LABEL=com.test.bridge\r\n# no final newline\r\nTEAM_KEYS=X", 0o600)
     settings("[shared]\nROLE_ACCOUNT=_crlf\n")
@@ -1129,7 +1220,7 @@ def selftest():
             seen.append((name, key))
     check("no part file's key is the target of two shared values", len(seen), len(set(seen)))
     check("the keys that go together are all shared targets",
-          [k for k in TOGETHER["update.conf"] if ("update.conf", k) not in seen], [])
+          [k for k in TOGETHER.get("update.conf", ()) if ("update.conf", k) not in seen], [])
     check("no tool's key is a shared target", [k for k in TOOL_KEYS if k in seen], [])
     check("every tool's key is a key its file's example names", [k for k in TOOL_KEYS if k[1] not in kit.keys[k[0]]], [])
     check("map runs anywhere and lists every shared value",
@@ -1144,13 +1235,91 @@ def selftest():
           [b for b in banned if b in above], [])
     check("a part file is only ever written through apply_plan, and machine.conf only by init",
           (above.count("os.replace("), above.count("O_CREAT")), (1, 2))
+    remove_tree(tmp)
+    return failures, total[0]
 
+
+def selftest():
+    """The battery once, then once with each rule broken in turn: every mutant must turn it red. Then
+    once more, to show it is whole again with every rule restored."""
+    failures, count = battery()
     if failures:
         for line in failures:
             print(line)
-        print("settings selftest: %d of %d checks failed" % (len(failures), total[0]))
+        print("settings selftest: %d of %d checks failed" % (len(failures), count))
         return 1
-    print("OK: settings selftest (%d checks)" % total[0])
+    o = dict(globals())
+    never = re.compile(r"(?!)")
+
+    def caught(**patched):
+        saved = dict((k, globals()[k]) for k in patched)
+        globals().update(patched)
+        try:
+            return bool(battery()[0])
+        except Exception:                # a mutant that breaks the battery outright is caught too
+            return True
+        finally:
+            globals().update(saved)
+
+    def shared_too(folder, name):        # part_values without "a part's own value wins"
+        out = []
+        for entry in MAP:
+            if entry[0] in folder.shared:
+                out += [(k, folder.shared[entry[0]], "[shared] " + entry[0]) for f, k in targets(entry) if f == name]
+        return out + [(k, v, "[%s]" % name) for k, v in folder.parts.get(name, {}).items()]
+
+    def crlf_lost(text, key, value):
+        return o["set_line"](text, key, value).replace("\r\n", "\n")
+
+    mutants = (
+        ("the folder's place ignores %s" % DIR_ENV,
+         dict(settings_dir_of=lambda flag, environ: o["settings_dir_of"](flag, {}))),
+        ("a shared value misses the last part file it reaches",
+         dict(targets=lambda entry: o["targets"](entry)[:-1])),
+        ("a part's own value no longer stops the shared one", dict(part_values=shared_too)),
+        ("check no longer says where a part's own value wins", dict(overrides=lambda folder: [])),
+        ("write without --apply writes",
+         dict(cmd_write=lambda sdir, kit, uid, apply, out, stop=None: o["cmd_write"](sdir, kit, uid, True, out, stop))),
+        ("a Claude session is not refused", dict(AGENT_ENV_MARKERS=())),
+        ("root is not refused",
+         dict(refused=lambda what, environ, uid, out: o["refused"](what, environ, uid or 501, out))),
+        ("a file that reads back wrong is called written", dict(reads_back=lambda plan, back: True)),
+        ("a file that changed while it ran is written", dict(still_as_planned=lambda plan: "")),
+        ("the files are not read again before the first is written", dict(preflight=lambda todo: [])),
+        ("a link or another account's part file is planned", dict(unsafe_part=lambda st, uid: "")),
+        ("one part file that is held or unread stops no write", dict(blocked=lambda plans: None)),
+        ("a written line rewrites the file's line endings", dict(set_line=crlf_lost)),
+        ("the notifier's scrub is skipped", dict(scrub=lambda text: [])),
+        ("nothing is shaped like a secret", dict(secret_labels=lambda text: [])),
+        ("the Slack app token and signing secret shapes are gone", dict(LOCAL_SHAPES=())),
+        ("a long random run passes", dict(RANDOM_RUN_RE=never)),
+        ("a key named like a secret passes", dict(SECRET_NAME_RE=never)),
+        ("a file other accounts can read passes", dict(OTHER_ACCESS=0)),
+        ("another account's file passes", dict(foreign=lambda st, uid: False)),
+        ("a link in the folder passes", dict(linked=lambda st: False)),
+        ("a folder inside a git working tree passes", dict(git_tree=lambda path, stop=None: None)),
+        ("init makes the folder readable by others", dict(FOLDER_MODE=0o755)),
+        ("where shows the defaults, not the folder's places",
+         dict(places_of=lambda folder, kit: o["places_of"](Folder(), kit))),
+        ("a part file's own place is ignored",
+         dict(part_path=lambda folder, kit, name: (os.path.join(folder.places.get("PARTS_DIR") or kit.root, name), "x"))),
+        ("a place that is not a full path passes", dict(place_problems=lambda folder, kit: [])),
+        ("an unknown key passes", dict(key_problem=lambda kit, section, key: None)),
+        ("another tool's key is kept in the folder", dict(TOOL_KEYS={})),
+        ("update.conf's three dispatcher values may split", dict(TOGETHER={})),
+    )
+    missed = [label for label, patched in mutants if not caught(**patched)]
+    whole, again = battery()
+    for label in missed:
+        print("FAIL a mutant the battery did not catch: %s" % label)
+    for line in whole:
+        print("FAIL with every rule restored: %s" % line)
+    if missed or whole:
+        print("settings selftest: %d of %d mutants not caught, %d checks failed after them"
+              % (len(missed), len(mutants), len(whole)))
+        return 1
+    print("OK: settings selftest (%d checks; each of %d mutants turns it red; whole again after)"
+          % (again, len(mutants)))
     return 0
 
 
