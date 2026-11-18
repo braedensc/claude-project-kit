@@ -32,6 +32,18 @@ when a detail here is not enough; do not invent a second shape for anything it d
 > the credential does not make the write yours: route it through safe-outputs exactly as
 > if you held nothing.
 
+> **A session the runner started has five tracker tools of its own, and no sign-in.** They
+> show as `mcp__ticket__read_ticket`, `mcp__ticket__comment`, `mcp__ticket__ask_question`,
+> `mcp__ticket__file_finding` and `mcp__ticket__report_done`. They take no ticket id: they
+> know your run's (`docs/RUNNER.md`, *The session's own tracker tools*). When you have them,
+> they are your only way to the tracker, and they replace the safe-outputs file. Read the
+> ticket with `read_ticket` (step 2). Post the plan with `comment` (step 5). Escalate with
+> `ask_question` (step 5). Request a finding with `file_finding` (step 5). End with
+> `report_done` (step 9): it posts your summary, with the telemetry block it builds from your
+> run's own facts.
+> Then write no safe-outputs file. Never type a mark or a block into a `comment`: it is
+> refused, because each one has its own tool.
+
 > **The Linear MCP server must be keyed `linear`.** MCP tool names are
 > `mcp__<server-key>__<tool>`, so the key in `.mcp.json` *is* the prefix this skill's
 > `allowed-tools` grants — and a grant cannot wildcard across server names. A server
@@ -195,6 +207,9 @@ If the branch already matches `pin.branch`, leave it alone. A branch that disagr
 the pin is a naming problem to fix, never evidence about which ticket you are on.
 
 ### 4. The write channel — requests, not writes
+
+With the runner's `ticket` tools (above), there is no file: each write below is a tool call,
+and the tool holds the same caps.
 
 Every tracker mutation this session wants (the plan comment, an escalation question, the
 telemetry block, and — from `/ship` — the move to `review`) is a **request** appended to
@@ -425,6 +440,10 @@ On an escalating path you do **not** reach `/ship`: there is no PR, no state mov
 batch is the escalation comment plus the telemetry block.
 
 ### 9. Queue the telemetry block — last
+
+With the runner's `ticket` tools, call `report_done` instead, once, on every ending. Give it
+your summary, the outcome, an error class for any outcome but `completed`, the pull request's
+number, the two timestamps below and your counts. It builds the block from your run's own facts.
 
 Queue **one** `ticket-comment` request whose body carries a single fenced JSON block (§4).
 It travels as a request like everything else — the session does not post it. Rows are

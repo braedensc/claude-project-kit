@@ -336,31 +336,47 @@ What it does, in order:
    - **The probe.** After a yes, it files two test tickets per repository, as you, and hands
      them to the agent. The planning setup's own instructions say what to do with a ticket
      of exactly the probe's title; the tickets' text only points there (KIT-215). It reads
-     where the dispatcher sent them. It reads the tool list the session was given from the
-     dispatcher's own session log, and a helper's from the session's answer. If the log
-     cannot be read, the answer is used for both lists, and the probe says so. A tool
-     outside the keep-set in any list that came back stops the probe, without asking,
-     whatever the log says of a helper (KIT-261). Then it asks you **one** question: is the
-     team's agent guidance empty, or silent about planning and building? The API cannot
-     read it. It records the sign-off and closes the tickets.
+     where the dispatcher sent them. Then it asks you **one** question: is the team's agent
+     guidance empty, or silent about planning and building? The API cannot read it. It
+     records the sign-off and closes the tickets.
 
-     Two more questions come only when a list was not measured. If a list came back but
-     could not be read, it asks about that list alone. It asks the same when a list names
-     a tool server or a rule, like `mcp__linear__*`, only in a sentence. The sentence may
-     say the session holds those tools or that it does not, so you read it.
+     **Code judges the fence, and it asks you nothing about it** (KIT-796). It reads the
+     tools the session was given from the dispatcher's own session log, which no session
+     can write. It reads a helper's tools from the session's answer, because no log records
+     them. A tool outside the keep-set in the log, or named as a tool in the helper's list,
+     stops the probe. The failure names the tool. That holds whatever the log says of a
+     helper (KIT-261).
 
-     A line that may name a tool is never passed over in silence, however many clean lines
-     sit beside it (KIT-734). That covers a note such as `Read (and Bash)`, a sentence such
-     as `I also hold Bash and Write`, and a name wrapped in punctuation, such as `**Bash**`.
-     The probe shows you the line and asks the same question. An exact `mcp__` tool name
-     still stops the probe, wrapped in underscores or not. A line with no capital letter and
-     no `mcp__` in it, such as a code fence or `sorted by name`, names no tool and is
-     ignored. So is a lower-case sentence that uses `read` or `write` as a verb. A lower-case
-     `bash`, `webfetch` or `notebookedit` is not ignored: no English word looks like them. If no helper
-     list came back, it says the helper was not measured and asks whether to sign anyway.
-     If a helper list came back but the log shows no helper started, that list is **not
-     counted**, even as prose. It says so and asks the same question. The record says
-     which lists were read, and how. A session list nothing measured is never signed.
+     - Good: `fence: judged by code, nothing asked.` The sign-off quotes the log's list.
+     - Not that: `holds a tool the fence should have removed`. Nothing was signed. See the
+       idea-gate runbook's table.
+
+     **A log the probe cannot read is UNKNOWN**, exit 4. So is a log whose start-up list
+     names no tools. Nothing is signed, and the session's answer never stands in for the
+     log. Make the session logs readable as the dispatcher's account, then run it again.
+
+     **The rest of the answer is a cross-check, for you to read.** It decides nothing and
+     waits on nothing. The probe prints each line that disagrees with the log, and the
+     record keeps them:
+     - a name in the session's own list that the log does not give it, even `Bash`: the
+       log, not that list, judges the session;
+     - a tool the log gives the session that its own list leaves out. A helper's list may
+       name fewer tools, and that is not reported;
+     - a server or rule named only in a sentence, like `mcp__linear__*`;
+     - a line that may name a tool and is not one name, such as `Read (and Bash)` or
+       `I also hold Bash and Write`. A sentence may say a tool is held or that it is not.
+
+     An item is one name on a line, with a list mark, a number or a lower-case note such as
+     `(deferred)`, or not. One name in markdown, quotes or brackets, such as `**Bash**`, is
+     an item too. An exact `mcp__` tool name counts as a tool anywhere, wrapped or not. A
+     line with no capital letter and no `mcp__` in it, such as a code fence or `sorted by
+     name`, names no tool and is ignored. So is a lower-case sentence that uses `read` or
+     `write` as a verb. A lower-case `bash`, `webfetch` or `notebookedit` is reported: no
+     English word looks like them.
+
+     If no helper list came back, or one came back but the log shows no helper started, the
+     record says the helper was not measured, and why. That list is **not counted**, but a
+     tool outside the keep-set named in it still stops the probe.
 
      The same session's log also says whether a helper started and whether the test file
      was read. An older session's log never answers for it. If that log holds no call
@@ -389,7 +405,7 @@ What is still yours, at most:
 | Each planned repository | Merge the pull request it opened (and add the guard-change label if the checks ask). |
 | A repository whose schema copy is older than the kit's | Bring its schema and contract up to the kit's first (card `CA-SCHEMA`). |
 | Before each change | Type `y`, or `yes` where it asks for the word. |
-| The probe | Answer the agent-guidance question, and any question about a tool list it could not measure. |
+| The probe | Answer the agent-guidance question. Code judges the tool lists, and asks nothing about them. |
 | At the end | Plan two test ideas and one real idea, then sign `CA-LANE` (the card lists them). |
 
 Each checkpoint card (`card <id>`) is what you see only when you answered no, or ran the
@@ -627,17 +643,22 @@ else happened (`created`, `already-filed`, `asked`, `no-proposal`, `no-message`,
   later. Changing the brief makes `verify` ask for one new planning probe (KIT-219).
 - **The tracker's limit on a session's final message is unmeasured.** A twenty-child plan
   measures about 50,000 characters. An overlong one arrives as "no plan", never a partial one.
-- **A helper session inherits the fence, per the runner's source.** It is not measured
-  live yet. The probe's steps now sit in the planning setup's own instructions, keyed on
-  the probe's exact title, so a session that follows them starts a helper (KIT-215). That
-  this happens on a live session is not yet seen. If the log shows no helper started, a
-  helper list in the answer is not counted, and the record says so. A fenced tool named
-  in it still stops the probe (KIT-261).
-- **A helper's list is the session's own words.** The probe asks about every line that may
-  name a tool (KIT-734). It cannot catch a paraphrase that names none, such as "a shell",
-  or a lower-case `read`, `write` or `edit`, which are also ordinary verbs. Only a helper
-  whose tools the runner records closes that. The dispatcher's log records the session's
-  tools, never a helper's.
+- **A helper session inherits the fence, per the runner's source.** No log measures it.
+  The probe's steps now sit in the planning setup's own instructions, keyed on the
+  probe's exact title, so a session that follows them starts a helper (KIT-215). That
+  this happens on a live session is not yet recorded. If the log shows no helper started,
+  a helper list in the answer is not counted, and the record says so. A fenced tool named
+  as a tool in it still stops the probe (KIT-261).
+- **A helper's list is the session's own words.** Code judges every item in it, and
+  reports every other line that may name a tool (KIT-734, KIT-796). A sentence that says a
+  helper holds `Bash` is reported, not refused: a parser cannot tell "holds" from "does not
+  hold". Nor can it catch a paraphrase that names no tool, such as "a shell", or a
+  lower-case `read`, `write` or `edit`, which are also ordinary verbs. Only a helper whose
+  tools the runner records closes that. The dispatcher's log records the session's tools,
+  never a helper's.
+- **A bold label on a line of its own reads as an item.** `**Deferred**` in the helper's list
+  is judged as a tool named `Deferred`, and stops the probe. A label with a colon,
+  `**Deferred:**`, is reported instead (KIT-796).
 - **The duplicate check compares titles, not intent.**
 - **The heartbeat monitor watches the job, once the Stage E installer has run.** It reads
   `~/.stage-a/state/heartbeat.json` as its seventh job (`docs/HEARTBEAT-MONITOR.md`): a stale
@@ -659,8 +680,9 @@ else happened (`created`, `already-filed`, `asked`, `no-proposal`, `no-message`,
 - **Installed disabled, enabled at your yes.** That the override launchd records outlives a
   reboot is from its documentation, not yet seen on this kit's job.
 - **The session log's tool list is read from the SDK's start-up message.** That it lists the
-  tools after the fence removed them is read from the runner's source, not yet seen live. A
-  list that still held a fenced tool would fail the probe loudly, never pass it.
+  tools after the fence removed them is read from the runner's source. A live probe on
+  18 Nov 2026 showed it: the list named eleven tools, all in the keep-set. A list that
+  still held a fenced tool would fail the probe loudly, never pass it.
 - **The log's call records are read in the shape the runner's source writes** (0.2.69
   and 0.2.73). Whether a helper started, and whether the test file was read, come from
   them. That shape is not yet seen live. A log with no call records reads as not
@@ -670,5 +692,5 @@ else happened (`created`, `already-filed`, `asked`, `no-proposal`, `no-message`,
   asks the session to read it, and reports what came back. If the file's contents come
   back, that is "read", whatever the log shows: they cannot come back unread. "Not
   returned" counts only when the dispatcher's log shows the read was attempted. Without
-  that, or when the log holds no call records or cannot be read, the result is "no
-  answer". Tracked as KIT-162.
+  that, or when the log holds no call records, the result is "no answer". A log that
+  cannot be read stops the probe as UNKNOWN before this. Tracked as KIT-162.

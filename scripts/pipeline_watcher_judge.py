@@ -115,7 +115,9 @@ GITHUB_COMMENT_RE = re.compile(
 GITHUB_PULL_RE = re.compile(r"^https://github\.com/([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)/pull/([0-9]+)\Z")
 TICKET_RE = re.compile(r"^[A-Z][A-Z0-9]{0,9}-[0-9]{1,7}\Z")
 # Findings about no text at all: a label, money, runs. Nothing is fetched for them.
-NO_TEXT = ("protected-label", "spend-day", "spend-piece", "key-run", "runs-day", "runs-piece")
+NO_TEXT = ("protected-label", "spend-day", "spend-piece", "key-run", "runs-day", "runs-piece",
+           # The validator's ledger against the merges (KIT-546): fields, never a text to fetch.
+           "merge-without-approval", "approval-without-merge", "approval-rate", "urgent-escalation")
 
 
 class ConfigError(Exception):

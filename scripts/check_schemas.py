@@ -811,7 +811,7 @@ VALID_WATCHER = {
         _w_off("guard-blocks", "no producer: nothing records a guard block yet (KIT-11)"),
         _w_off("egress", "no producer: the proxy's refusal line is unconfirmed (KIT-88)"),
         _w_off("outside-files", "needs each ticket's declared files (KIT-518)"),
-        _w_off("approval-rate", "no producer: the validator does not exist yet (KIT-510)"),
+        _w_off("approval-rate", "no validator_ledger is named"),
     ],
     "counts": {"monitors": 10, "on": 5, "clear": 4, "flagged": 1, "blind": 0, "off": 5,
                "findings": 1, "pause": 1, "page": 0, "record": 0},

@@ -68,7 +68,8 @@ below was allowed by an exact rule. A refusal is therefore the sandbox's, and it
 
 ## What it does not hold
 
-- **Reads.** Commands can still read most of the machine. KIT-786 plans a deny-read list.
+- **Reads.** Commands could still read most of the machine. KIT-786 closed that:
+  [the fix session reads only what it needs](2026-11-18-the-conflict-fix-session-reads-only-what-it-needs.md).
 - **The owner's GitHub login.** The push needs it, and gh runs outside the sandbox.
 - **Claude Code's temp folder.** Files at its top level stay writable.
 - **This kit's own gate inside the sandbox.** `npm run test:hooks` passes every case, then its
