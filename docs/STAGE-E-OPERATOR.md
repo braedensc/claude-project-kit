@@ -725,6 +725,61 @@ check catches it, and nothing is collected from it, but the session ran.
 
 ---
 
+## Reviews through our own runner: no review ticket (KIT-644)
+
+Our own runner (`docs/RUNNER.md`) can run a review itself. A project whose review lane is on
+there gets each review as one of the runner's runs, not as a review ticket. The rest of Stage E
+does not change.
+
+**The switch is the runner's own.** In the runner's settings, `projects.<key>.lanes.review` is
+true for that project. Stage E keeps no setting of its own for it: the review job reads the
+runner's settings at every pass. Turn the lane off there, and the next review goes by review
+ticket again. A review already asked finishes on the lane it started on.
+
+- **Which repository.** A project's repository is the one its committed `delivery.json` names
+  (`github.owner` and `github.repo`), read from the runner's own clone.
+- **Where the settings are.** `runner_settings` in `poller.json`, by default
+  `~/.pipeline-runner/runner.json`, where the runner's installer puts them. No file there means
+  the runner is not installed, and every review goes by review ticket.
+- **A file it cannot read stops the pass.** Nothing is filed or asked, on either lane, until it
+  can be read again. A lane never changes because a file could not be read.
+
+What happens for one review:
+
+1. The job builds the same review: the same basis, diff, parts and caps.
+2. It records one request in its own state, then writes it to the runner's store. A crash
+   between the two never buys a second paid review.
+3. The request carries the review's facts only: the pull request, the basis, the threshold,
+   what was left out, and the diff. The session's instructions are its run's rules, from
+   `scripts/pipeline_review_brief.py`, the words the review ticket uses too.
+4. A change to a guarded path asks for the stronger model, as the guarded label does.
+5. When the run ends, the job reads its final message from the runner's store and holds it to
+   the same checks. It posts the same one comment, writes the same outcome, and sends the same
+   telemetry.
+
+**Approval.** The runner starts a review only with the approval it recorded when it started
+that ticket's code run. A ticket coded on the old dispatcher has none, so its review is refused
+and the pull request says "NOT reviewed". Switch a project's review lane on only once its
+coding runs through the runner too.
+
+Each of these is a loud "NOT reviewed", never a quiet one:
+
+- the runner refused the review, in its own words;
+- the run stopped at a limit, failed, or ended with no final message;
+- its answer carries no `pipeline-review/1` block, says `blocked`, or starts `WRONG REPOSITORY:`;
+- nothing came back within `collect_timeout_seconds`. A request still waiting is withdrawn, and
+  a run still going is asked to stop.
+
+What this lane skips: the review ticket, the routing label and its check, the version gate, the
+tracker's dedup search, and the ticket's close. The routing probe's pause does not hold a
+repository on this lane.
+
+Good: `asked the runner for a review run of example-org/app#12 (APP-7), request rq-…` in the log,
+then one comment on the pull request.
+Not that: a review ticket filed for a repository whose review lane is on.
+
+---
+
 ## What runs where
 
 | Component | Runs as | Trust position |
@@ -1691,6 +1746,9 @@ refused by name. The example below is the work-team shape the installer writes:
   when the session log names none, and says so), `basis_snapshot_dir` (a tier-2 snapshot
   directory for the basis resolver). `reviews_team_key` and `reviews_team_id` belong to the
   older Reviews-team shape only: beside the sign-off they are refused by name.
+- Optional too: `runner_settings`, where our own runner's settings are (default
+  `~/.pipeline-runner/runner.json`). It is a place, not a switch: see *Reviews through our own
+  runner* above.
 
 `~/.stage-e/config.json` — the bounce driver's default path, so its commands need no
 `--config` at all:

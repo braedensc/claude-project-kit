@@ -32,6 +32,18 @@ WHAT THIS IS
              extract the `pipeline-review/1` block → tamper-check the description hash →
              classify → publish → write the outcome → close the ticket → emit telemetry
 
+  ON OUR OWN RUNNER (KIT-644). A project whose `review` lane is on in our own runner's settings
+  gets no review ticket. The lane is the runner's own switch, read each pass from
+  `runner_settings`; this poller keeps none. Its review is one start request to the runner
+  (scripts/pipeline_runner_store.py), under an id made from the review itself and recorded before
+  it is written, so neither a crash nor a lost seen-set asks twice. The request carries the
+  review's facts alone (`review_facts`); its instructions are the run's rules, from
+  scripts/pipeline_review_brief.py, the words the review ticket uses too. `collect` reads the
+  runner's answer, the run and its final message from the store, and holds the message to the
+  same checks and the same settle. A refusal, a run that did not end with an answer, and the
+  timeout are each a loud decline. There is no routing check, version gate, dedup search in
+  Linear or ticket to close. A review in flight finishes on the lane it started on.
+
   ONE RUN IS ONE PASS AND THEN AN EXIT. There is no internal loop: the scheduler (a system
   LaunchDaemon with `StartInterval`, `RunAtLoad` and NO `KeepAlive`) starts a fresh process
   every interval, and each process does scan → collect → exit under a wall-clock
@@ -48,7 +60,8 @@ WHAT IT NEVER DOES (asserted in --selftest, the same way every Stage E script as
   a transport that has no merge endpoint by construction. Its Linear writes are exactly:
   `issueCreate` (the review ticket, with the configured cheap-model label, or the guarded
   label for a change to a guarded path, and the delegate), and `issueUpdate` to move THAT
-  review ticket to its team's completed state.
+  review ticket to its team's completed state. On our own runner its one other write is to the
+  runner's store: a review's start request, and a stop of that review's own run past the timeout.
   It never moves the ORIGINAL ticket anywhere — a coding ticket reaching Done makes the
   dispatcher delete the coding worktree the bounce driver may still need. It applies no
   `agent:*` label: exhaustion labelling is the bounce driver's call, not this file's.
