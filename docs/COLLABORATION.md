@@ -350,6 +350,9 @@ twice on doc-tail merges before these rules existed:
    - **`CLAUDE_CONFIG_DIR` is read at install.** The job keeps the value your shell had
      then (else `~/.claude`). Change it later and re-run `run`, or the waker finds no
      transcripts and every conflict pages you. Preflight refuses a directory with none.
+   - **`verify` also proves the sandbox still holds (KIT-829).** It starts one short session
+     on the small model: a write outside the worktree must be refused, and one inside must
+     land. The health watch runs the same check after every Claude Code update.
    - **After a merge, run `verify`.** It reads `behind` only when a script the job runs
      changed: `scripts/pr_conflict.py` or a `scripts/` module it imports. Then `run`
      moves the clone. Nothing schedules this.

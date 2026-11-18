@@ -5,6 +5,8 @@ Design: docs/adr/2026-11-05-the-validator-approves-inside-limits-that-code-enfor
     from pipeline_validator_ledger import append, read
     append(path, row, now)    THE ONE WRITER: adds one row, in one piece, and changes no other
     read(path)                the rows, or why there are none to trust
+    blocker(row)              a row that waits on the owner, in words: its reason and its reply
+    reason_words(reasons)     a row's closed words, in plain words
 
     python3 scripts/pipeline_validator_ledger.py --selftest
 
@@ -13,7 +15,8 @@ a merge), the ticket or `owner/name#N`, the head, each layer's verdict as a clos
 its switches were on and the size limits in force, the kind of decision, the closed words code
 gave for a decision that is not an approval (`reasons`, KIT-542), and the agent's reason as one
 plain line in `agent_says`, marked as the agent's words. The stand-up, the recap and the watcher
-read it. Who writes rows, and those readers, come in their own pieces.
+read it. The stand-up and the recap say its rows with this file's words (KIT-545), so neither
+loads the validator's other files.
 
 THE RULES, each one tested.
   * Fields only. No ticket, comment or pull request text, except `agent_says`: one line of at most
@@ -323,6 +326,102 @@ def append(path, row, now):
     finally:
         os.close(lock)          # closing it releases the lock
     return new
+
+
+# ======================================================================================
+# THE ROWS IN WORDS: how a reader says a row to the owner. The stand-up and the recap read the
+# rows with read() and say them with these, so neither loads the validator's other files
+# (KIT-545). pipeline_validator_route.py gives them under its own names too (KIT-542).
+# ======================================================================================
+# Plain words for the reasons the owner most needs to read; any other closed word is shown as it is.
+WORDS = {
+    "send-back-budget-spent": "its send-backs are used up",
+    "send-back-budget-unknown": "its send-backs could not be counted",
+    "send-back-no-session": "it has no dev session to send it back to",
+    "provenance-not-owner": "the idea was not yours",
+    "provenance-later-generation": "it is agent-filed work past its first generation",
+    "too-many-lines": "it changes too many lines",
+    "too-many-files": "it changes too many files",
+    "risk-path": "it changes the safety system or a risk path",
+    "credentials": "it touches credentials",
+    "billing-and-accounts": "it touches billing or accounts",
+    "production-deploy": "it touches production deploy settings",
+    "deleting-data": "it may delete data",
+    "bounce-budget-spent": "Stage E's send-backs are used up",
+    "review-edited": "its review was edited",
+    "review-partial": "its review did not cover every file",
+    "review-declined": "Stage E declined to review it",
+    "acceptance-not-passed": "the acceptance check did not pass",
+    "brief-over-cap": "the change is too big for the agent to read whole",
+}
+AGENT_SAID = "the validator's agent said"
+GITHUB = "https://github.com"
+# The kinds that wait on the owner: each is a blocker in the stand-up.
+BLOCKER_KINDS = ("escalated", "escalated-urgent", "held")
+
+
+def _unique(words):
+    out = []
+    for w in words:
+        if w not in out:
+            out.append(w)
+    return out
+
+
+def reason_words(reasons):
+    """The reasons in plain words where they have them, each closed word as it is otherwise."""
+    out = []
+    for w in reasons or ():
+        if w in WORDS:
+            out.append(WORDS[w])
+        elif isinstance(w, str) and w.startswith(("answer-", "brief-")):
+            out.append("the agent's answer could not be used (%s)" % w)
+        elif isinstance(w, str) and w.startswith("run-"):
+            out.append("the agent could not answer (%s)" % w)
+        elif isinstance(w, str) and REASON_RE.fullmatch(w):
+            out.append(w)
+    return _unique(out)
+
+
+def name_of(row):
+    """What a row is about, as the owner reads it: `Plan TOD-1`, `TOD-2`, or `Pull request #12 in
+    acme/app`."""
+    ref = row["ref"]
+    if row["subject"] == "merge":
+        repo, number = ref.split("#", 1)
+        return "Pull request #%s in %s" % (number, repo)
+    return ("Plan %s" % ref) if row["subject"] == "plan" else ref
+
+
+def blocker(row):
+    """The stand-up's line for one ledger row that waits on the owner: an escalation, or a hold the
+    validator cannot settle. None for an approval or a send-back: those are the pipeline's own.
+    {"key", "subject", "urgent", "what", "agent_says", "reply", "where"}: `reply` is the exact reply
+    that clears it (`approve <plan>`, `start <piece>`), and `where` where to act when no reply can.
+    `agent_says` is the agent's own line, to be quoted as its words and never as the report's."""
+    if not isinstance(row, dict) or row_problems(dict(row, at=row.get("at") or
+                                                      "2000-01-01T00:00:00Z")):
+        return None
+    kind = row["kind"]
+    if kind not in BLOCKER_KINDS:
+        return None
+    done = {"held": "was held by the validator", "escalated": "was sent to you by the validator",
+            "escalated-urgent": "was sent to you by the validator, urgently"}[kind]
+    words = reason_words(row["reasons"])
+    what = "%s %s%s" % (name_of(row), done, (": %s" % "; ".join(words)) if words else "")
+    if kind == "escalated-urgent":
+        what = "Urgent: " + what + ". It believes the dev session may be compromised"
+    reply, where = "", ""
+    if row["subject"] == "plan":
+        reply = "approve %s" % row["ref"]
+    elif row["subject"] == "piece":
+        reply = "start %s" % row["ref"]
+    else:
+        repo, number = row["ref"].split("#", 1)
+        where = "It's yours to merge or close: %s/%s/pull/%s" % (GITHUB, repo, number)
+    return {"key": row["ref"].lower() if row["subject"] == "merge" else row["ref"],
+            "subject": row["subject"], "urgent": kind == "escalated-urgent", "what": what,
+            "agent_says": row["agent_says"], "reply": reply, "where": where}
 
 
 def main(argv=None):
@@ -653,6 +752,21 @@ def selftest():
         check("schema and code both refuse %s" % label,
               (bool(check_schemas.document_problems(d, SCHEMA_NAME)), bool(problems(d))),
               (True, True))
+
+    # 9b. The rows in words (KIT-545): the stand-up's and the recap's, so neither loads the
+    # validator's other files. Route's selftest covers each kind; these pin that they live here.
+    worded = dict(held, at=_iso(NOW))
+    check("a hold says its code's reasons in plain words, never the agent's, with where to act",
+          (blocker(worded)["what"], blocker(worded)["where"], blocker(worded)["urgent"]),
+          ("Pull request #12 in acme/app was held by the validator: it changes the safety system "
+           "or a risk path; it changes too many lines",
+           "It's yours to merge or close: https://github.com/acme/app/pull/12", False))
+    check("an approval and a send-back wait on nobody: no blocker",
+          (blocker(dict(merge_ok, at=_iso(NOW))), blocker(dict(sent, at=_iso(NOW)))), (None, None))
+    check("a closed word with no plain words is said as it is; anything else is dropped",
+          reason_words(["check-pending", "run-timeout", "Not A Word", "risk-path", "risk-path"]),
+          ["check-pending", "the agent could not answer (run-timeout)",
+           "it changes the safety system or a risk path"])
 
     # 10. One writer: nothing above the selftest line but append() writes, removes or renames.
     with open(os.path.abspath(__file__), encoding="utf-8") as fh:

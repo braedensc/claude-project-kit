@@ -297,6 +297,10 @@ CONF_KEYS = {
     "STANDUP_HEALTH_FILE": ("", "the health watch's status file (its HEALTH_STATUS_FILE, KIT-609): when its memory or "
                                 "burn-rate check is firing, both messages add one plain line; otherwise they say "
                                 "nothing about either. Empty: off"),
+    "STANDUP_VALIDATOR_LEDGER": ("", "the validator's ledger (KIT-545, contract section 24), which this account must be "
+                                     "able to read: each approval since the last stand-up is one line, each escalation "
+                                     "and hold is a blocker, and the sprint review lists the week's decisions. A ledger "
+                                     "that cannot be read is said, never shown as none. Empty: off"),
     "STANDUP_SPRINT_REVIEW_CONFIG": ("", "the sprint review's config file (KIT-576, `python3 scripts/pipeline_sprint_review.py "
                                          "--example-config`): on the sprint's last working day, from the afternoon "
                                          "time, one message links a Linear document recapping the week. Needs "
@@ -473,7 +477,8 @@ STANDUP_KEY_FOR = {"morning_at": "STANDUP_MORNING_AT", "afternoon_at": "STANDUP_
                    "usage_file": "STANDUP_USAGE_FILE", "weekly_day": "STANDUP_WEEKLY_DAY",
                    "sprint": "STANDUP_SPRINT", "sprint_plan_file": "STANDUP_SPRINT_PLAN_FILE",
                    "sprint_review_config": "STANDUP_SPRINT_REVIEW_CONFIG",
-                   "health_file": "STANDUP_HEALTH_FILE", "repos": "STANDUP_REPOS"}
+                   "health_file": "STANDUP_HEALTH_FILE", "repos": "STANDUP_REPOS",
+                   "validator_ledger_file": "STANDUP_VALIDATOR_LEDGER"}
 
 
 # KIT-477: the app a project's owner talks to is that project's tech lead. Slack's limit on an
@@ -669,7 +674,8 @@ def standup_settings(conf):
            "status_file": conf["STANDUP_STATUS_FILE"], "bridge_config": conf["BRIDGE_CONFIG"]}
     # KIT-471: the spend keys are written only when set, so a conf without them writes the
     # file it always wrote.
-    for key in ("day_plan_file", "usage_file", "weekly_day", "health_file", "sprint_plan_file", "sprint_review_config"):
+    for key in ("day_plan_file", "usage_file", "weekly_day", "health_file", "sprint_plan_file", "sprint_review_config",
+                "validator_ledger_file"):
         if conf[STANDUP_KEY_FOR[key]]:
             doc[key] = conf[STANDUP_KEY_FOR[key]]
     if conf["STANDUP_SPRINT"] == "yes":       # KIT-574: written only when on
@@ -4961,6 +4967,14 @@ def selftest():
                 errs_hf, standup_settings(conf_hf).get("health_file"), "health_file" in standup_settings(conf_on),
                 any(e.startswith("STANDUP_HEALTH_FILE must be an absolute path") for e in errs_hf_rel)),
                 ([], "/Users/Shared/pipeline-health/status.json", False, True))
+            # KIT-545: the validator's ledger is written only when named, and must be an absolute path
+            conf_vl, errs_vl = validate_conf(dict(vals, STANDUP_VALIDATOR_LEDGER="/Users/Shared/validator/ledger.json"))
+            _c, errs_vl_rel = validate_conf(dict(vals, STANDUP_VALIDATOR_LEDGER="ledger.json"))
+            check("standup-validator-ledger-is-written-only-when-named-and-must-be-absolute", (
+                errs_vl, standup_settings(conf_vl).get("validator_ledger_file"),
+                "validator_ledger_file" in standup_settings(conf_on),
+                any(e.startswith("STANDUP_VALIDATOR_LEDGER must be an absolute path") for e in errs_vl_rel)),
+                ([], "/Users/Shared/validator/ledger.json", False, True))
             # KIT-576: the sprint review's config is written only when named, and needs the sprint line
             conf_srv, errs_srv = validate_conf(dict(vals, STANDUP_SPRINT="yes", STANDUP_USAGE_FILE="~/usage.json",
                                                     STANDUP_SPRINT_REVIEW_CONFIG="~/.stage-e/sprint-review.json"))

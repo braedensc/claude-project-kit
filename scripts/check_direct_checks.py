@@ -40,6 +40,7 @@ DIRECT = (
     "scripts/check_alert_pages.py",
     "scripts/pipeline_parts.py check",
     "scripts/check_label_gate.py",
+    "scripts/check_template_label_gate.py",
     "scripts/check_ci_covers_tests.py",
     "scripts/pipeline_session_kinds.py --check",
 )

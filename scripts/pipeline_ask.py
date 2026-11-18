@@ -17,6 +17,10 @@ WHAT IT ASKS, AND WHEN
       parts list does not know is never asked about. The dates live in the health check's
       settings file (update.conf); `pipeline_watch.py dates` lists them.
     * The tech lead's name, when bridge.conf names none (neither APP_NAME nor PROJECT_NAME).
+  The health check's three job heartbeats (KIT-782) are not asked: when watcher.conf names a heartbeat
+  file for the queue, the morning job or the sweep, the one command points the matching *_HEARTBEAT_FILE
+  line of update.conf at the copier's copy of it, and lists that line on the consent page like the rest.
+  A job watcher.conf leaves out is written as off, and only if the line holds its own copy path.
   A settings file that is not there asks nothing and is said in one plain line, before the first
   question: `Not asked: no bridge.conf in the kit folder, so the tech lead's name was not asked.`
   (and the same for update.conf and the key end dates). It says where it looked. A file that is
@@ -405,9 +409,11 @@ def settings_lines(changes):
         return []
     lines = ["Settings I will write, after you agree:"]
     for c in changes:
-        lines.append("  - %s: %s: %s -> %s%s" % (label(c.file), c.key, c.old or "none", c.new,
+        lines.append("  - %s: %s: %s -> %s%s" % (label(c.file), c.key, c.old or "none", c.new or "off",
                                                  " (already past)" if c.past else ""))
-    lines.append("Names and dates only. Every other line of those files stays as it is.")
+    lines.append("Names, dates and file paths only, never a key. Every other line of those files stays as it is."
+                 if any(c.kind == "setting" for c in changes) else
+                 "Names and dates only. Every other line of those files stays as it is.")
     return lines
 
 
@@ -489,6 +495,13 @@ def write_answers(io, changes, kit=KIT):
     jobs += [(path, lambda path=path: write_dates(
         io, path, [c for c in changes if c.kind == "date" and c.file == path], kit))
         for path in date_files]
+    setting_files = []
+    for c in changes:
+        if c.kind == "setting" and c.file not in setting_files:
+            setting_files.append(c.file)
+    jobs += [(path, lambda path=path: write_settings(
+        io, path, [c for c in changes if c.kind == "setting" and c.file == path]))
+        for path in setting_files]
     for path, write in jobs:
         try:
             why = write()
@@ -497,6 +510,107 @@ def write_answers(io, changes, kit=KIT):
         if why:
             failed.append(why)
     return "; ".join(failed) or None
+
+
+# --------------------------------------------------------------------------- #
+# Settings the one command derives, and asks nothing about (KIT-782)
+# --------------------------------------------------------------------------- #
+def _watcher():
+    import pipeline_watcher_setup
+    return pipeline_watcher_setup
+
+
+def level_settings(update_conf, watcher_conf):
+    """The changes that bring the health check's settings level with the watcher's: for each of the queue, the
+    morning job and the sweep that watcher.conf gives a heartbeat file, the health check's *_HEARTBEAT_FILE names
+    the copier's copy of it. A job watcher.conf leaves out is written as off, and only when the line holds that job's
+    own copy path: a path a person typed is never touched. Nothing is asked and nothing is written here. A file
+    that is not there, or is not usable, gives no change. Rerun, it gives none, because each line already matches."""
+    if not (os.path.isfile(update_conf) and os.path.isfile(watcher_conf)):
+        return []
+    pu, ws = _update(), _watcher()
+    try:
+        have = pu.load_conf(update_conf)
+        want, errors = ws.load_conf(watcher_conf)
+    except (pu.ConfError, ws.SetupError, ValueError):
+        return []
+    if errors:
+        return []
+    out = []
+    for source, (_name, ukey) in sorted(ws.BEATS.items()):
+        copy = ws.beat_copy_path(want, source)
+        new = copy if want[source] else ""
+        old = have.get(ukey, "")
+        if new and old != new:
+            out.append(Change("setting", update_conf, ukey, old, new, False))
+        elif not new and old == copy:
+            out.append(Change("setting", update_conf, ukey, old, "", False))
+    return out
+
+
+def _set_lines(text, items):
+    """`text` with each key's active `KEY=value` line replaced (a key with none is appended), every other byte
+    kept, line endings and a missing final newline included. The new text, or None when a key's current value
+    is not the one that was shown."""
+    lines = text.splitlines(True)
+    for c in items:
+        pattern = re.compile(r"^\s*%s\s*=(.*?)(\r?\n)?$" % re.escape(c.key))
+        for n, line in enumerate(lines):
+            m = pattern.match(line)
+            if m and not line.lstrip().startswith("#"):
+                if m.group(1).strip() != c.old:
+                    return None
+                lines[n] = "%s=%s%s" % (c.key, c.new, m.group(2) or "")
+                break
+        else:
+            if c.old:
+                return None
+            if lines and not lines[-1].endswith("\n"):
+                lines[-1] += "\n"
+            lines.append("%s=%s\n" % (c.key, c.new))
+    return "".join(lines)
+
+
+def write_settings(io, path, items):
+    """None when the lines are written and read back; else why not, naming the file. A temp file beside it, flushed,
+    renamed over it, the old mode kept. Only the lines in `items` change. Read back through the health check's own
+    loader."""
+    name = label(path)
+    try:
+        with open(path, encoding="utf-8", newline="") as fh:
+            text = fh.read()
+        mode = os.stat(path).st_mode & 0o777
+    except OSError as exc:
+        return "%s could not be read (%s), so nothing was written to it" % (name, exc.strerror or "error")
+    new = _set_lines(text, items)
+    if new is None:
+        return "%s changed while you were answering, so nothing was written to it" % name
+    tmp = "%s.tmp-%d" % (path, os.getpid())
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
+            fh.write(new)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except OSError as exc:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return "%s could not be written (%s); it is as it was" % (name, exc.strerror or "error")
+    try:
+        with open(path, encoding="utf-8", newline="") as fh:
+            back = fh.read()
+        conf = _update().load_conf(path)
+    except (OSError, _update().ConfError) as exc:
+        return "%s was written but could not be read back (%s); check it by hand" % (name, type(exc).__name__)
+    if back != new or any(conf.get(c.key, "") != c.new for c in items):
+        return "%s was written but reads back differently; check it by hand" % name
+    io.say("Wrote %s in %s and read %s back: %s."
+           % (", ".join(c.key for c in items), name, "it" if len(items) == 1 else "them",
+              "it matches" if len(items) == 1 else "they match"))
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -1416,6 +1530,96 @@ def run_cases(check):
     code, io = go(["1", "yes"])
     check("kit735-the-consent-page-says-what-it-writes",
           (all(c in said(io) for c in one["consent"]), code), (True, pi.EX_OK))
+
+    # E. THE HEARTBEAT LINES (KIT-782): derived from watcher.conf, asked about nothing, written after the one yes.
+    ws = _watcher()
+    watcher_conf = os.path.join(tmp, "watcher.conf")
+    INST = "/usr/local/claw-watcher"
+
+    def put_watcher(**over):
+        values = {"WATCHER_ACCOUNT": "_clawwatcher", "ROLE_ACCOUNT": "_clawdispatch", "KIT_COMMIT": "a" * 40,
+                  "JOB_LABEL": "local.test-claw-watcher", "WATCH_REPOS": "acme/app", "TRUSTED_ACTORS": "owner"}
+        values.update(over)
+        put(watcher_conf, "".join("%s=%s\n" % kv for kv in sorted(values.items())), 0o600)
+
+    def beats_of(path):
+        conf = pu.load_conf(path)
+        return [conf.get(k, "") for k in ("QUEUE_HEARTBEAT_FILE", "MORNING_HEARTBEAT_FILE", "SWEEP_HEARTBEAT_FILE")]
+
+    def shown(changes):
+        return [(c.key, c.old, c.new) for c in changes]
+
+    ON = {"QUEUE_HEARTBEAT": "/srv/q.json", "MORNING_HEARTBEAT": "/srv/m.json", "SWEEP_HEARTBEAT": "/srv/s.json"}
+    COPY = [INST + "/copy/queue-heartbeat.json", INST + "/copy/morning-heartbeat.json",
+            INST + "/copy/sweep-heartbeat.json"]
+    put_update()
+    put_watcher(**ON)
+    got = level_settings(update_conf, watcher_conf)
+    check("kit782-each-job-watcher-conf-names-gets-the-line-for-its-copy",
+          shown(got), [("MORNING_HEARTBEAT_FILE", "", COPY[1]), ("QUEUE_HEARTBEAT_FILE", "", COPY[0]),
+                       ("SWEEP_HEARTBEAT_FILE", "", COPY[2])])
+    page = "\n".join(settings_lines(got))
+    check("kit782-the-consent-page-lists-them-and-says-paths-only",
+          ("QUEUE_HEARTBEAT_FILE: none -> " + COPY[0] in page, "file paths only, never a key" in page), (True, True))
+    before = get(update_conf)
+    check("kit782-a-read-changes-nothing", get(update_conf) == before, True)
+    io = pi.FakeIo()
+    check("kit782-the-write-reads-back-through-the-health-checks-own-loader",
+          (write_settings(io, update_conf, got), beats_of(update_conf)), (None, COPY))
+    after = get(update_conf)
+    check("kit782-every-other-byte-is-kept",
+          (after.startswith(before), after[len(before):]),
+          (True, ("MORNING_HEARTBEAT_FILE=%s\nQUEUE_HEARTBEAT_FILE=%s\nSWEEP_HEARTBEAT_FILE=%s\n"
+                  % (COPY[1], COPY[0], COPY[2])).encode("utf-8")))
+    check("kit782-a-rerun-changes-nothing",
+          (level_settings(update_conf, watcher_conf), write_settings(io, update_conf, []) is None, get(update_conf)),
+          ([], True, after))
+    put_watcher(QUEUE_HEARTBEAT="/srv/q.json")
+    off = level_settings(update_conf, watcher_conf)
+    check("kit782-a-job-that-is-off-by-design-is-written-as-off-when-the-line-was-its-copy",
+          shown(off), [("MORNING_HEARTBEAT_FILE", COPY[1], ""), ("SWEEP_HEARTBEAT_FILE", COPY[2], "")])
+    check("kit782-and-the-page-says-off", "MORNING_HEARTBEAT_FILE: %s -> off" % COPY[1] in "\n".join(settings_lines(off)), True)
+    check("kit782-writing-off-leaves-the-key-in-place-and-empty",
+          (write_settings(io, update_conf, off), beats_of(update_conf)), (None, ["" + COPY[0], "", ""]))
+    put_update()
+    put(update_conf, UPDATE_HEAD + "MORNING_HEARTBEAT_FILE=/home/me/their-own.json\n# end of file\n")
+    put_watcher()
+    check("kit782-a-path-a-person-typed-is-never-touched-when-the-job-is-off",
+          level_settings(update_conf, watcher_conf), [])
+    put_watcher(**ON)
+    typed = get(update_conf)
+    moved = [c for c in level_settings(update_conf, watcher_conf) if c.key == "MORNING_HEARTBEAT_FILE"]
+    check("kit782-a-path-a-person-typed-is-replaced-only-when-the-watcher-names-the-job-and-the-page-shows-it",
+          shown(moved), [("MORNING_HEARTBEAT_FILE", "/home/me/their-own.json", COPY[1])])
+    put(update_conf, typed.decode("utf-8").replace("their-own", "changed-since"))
+    check("kit782-a-line-that-changed-since-it-was-shown-is-not-written",
+          ("changed while you were answering" in (write_settings(io, update_conf, moved) or ""),
+           b"changed-since" in get(update_conf)), (True, True))
+    put_update()
+    put(update_conf, UPDATE_HEAD + "QUEUE_HEARTBEAT_FILE=\r\n# end of file")
+    crlf = [c for c in level_settings(update_conf, watcher_conf) if c.key == "QUEUE_HEARTBEAT_FILE"]
+    write_settings(io, update_conf, crlf)
+    check("kit782-line-endings-and-a-missing-final-newline-are-kept",
+          get(update_conf), (UPDATE_HEAD + "QUEUE_HEARTBEAT_FILE=%s\r\n# end of file" % COPY[0]).encode("utf-8"))
+    rm(watcher_conf)
+    check("kit782-no-watcher-conf-gives-no-change", level_settings(update_conf, watcher_conf), [])
+    put_watcher(**dict(ON, KIT_COMMIT="not-a-commit"))
+    check("kit782-a-watcher-conf-with-a-problem-gives-no-change", level_settings(update_conf, watcher_conf), [])
+    put_watcher(**ON)
+    reset(expiries=FAR, body="APP_NAME=Rex\n")
+    reset_state = get(update_conf)
+    io_all = Watching(codes=dict(healthy), typed=["1", "yes"])
+    io_all.level_settings = lambda u, w: pi.Io.level_settings(io_all, u, w)
+    code = pi.main(base + ["--watcher-conf", watcher_conf], io=io_all)
+    check("kit782-the-one-command-lists-them-and-writes-them-after-the-yes",
+          (code, beats_of(update_conf), "QUEUE_HEARTBEAT_FILE: none -> " + COPY[0] in said(io_all), get(update_conf) != reset_state),
+          (pi.EX_OK, COPY, True, True))
+    io_again = Watching(codes=dict(healthy), typed=["1"])
+    io_again.level_settings = lambda u, w: pi.Io.level_settings(io_again, u, w)
+    before_again = get(update_conf)
+    pi.main(base + ["--watcher-conf", watcher_conf], io=io_again)
+    check("kit782-run-again-it-changes-nothing-and-lists-nothing",
+          (get(update_conf) == before_again, "QUEUE_HEARTBEAT_FILE" in said(io_again)), (True, False))
 
     shutil.rmtree(tmp, ignore_errors=True)
 
