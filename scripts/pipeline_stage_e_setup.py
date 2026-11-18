@@ -442,6 +442,8 @@ REQUIRED_SCRIPTS = ("pipeline_review_poller.py", "pipeline_bounce_local.py",
                     "pipeline_hold.py",
                     # Stage E's own app: the review poller signs its token with it (KIT-578).
                     "pipeline_github_app.py",
+                    # The validator's ledger, whose send-backs the bounce driver reads (KIT-542).
+                    "pipeline_validator_ledger.py",
                     # Their `--selftest` runs inside one run folder it removes (KIT-450).
                     "scratch_run.py")
 

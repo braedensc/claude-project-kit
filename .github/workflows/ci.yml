@@ -414,6 +414,12 @@ jobs:
       # the kit that owns it; the safety-system floor is never a switch; closed words only.
       - name: Validator limits selftest (pass or closed reasons; what it cannot tell fails)
         run: python3 scripts/pipeline_validator_limits.py --selftest
+      # What the validator's no does (KIT-542). Offline: one case per answer, the send-back budget's
+      # edge (the last send-back, then an escalation), a layer 1 or 2 hold carried as closed words
+      # and never the agent's, a wait that writes no row, the blocker's reply, and an urgent page
+      # that is said when the watcher cannot take it.
+      - name: Validator route selftest (send back on Stage E's budget; escalate; holds in closed words)
+        run: python3 scripts/pipeline_validator_route.py --selftest
       # The usage runs (KIT-422, contract §17): the dispatcher's logs, and the Stage E and
       # idea-gate records beside them, read into runs. Offline, reading only, in a temp folder:
       # a run's spend is its share of its session's running totals, a crash is unpriced and

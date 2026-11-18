@@ -2999,11 +2999,11 @@ The validator's record of every decision, one row each (KIT-535). The stand-up, 
 
 **One verdict per head.** A row for a head is never changed afterwards, and a second row for the same head is refused. A later push is a new head, and a new row. A plan or a piece has no head, so it may be decided again.
 
-**An approval is whole.** It needs all three layers to pass and its own switch on. Only an approval has all three pass.
+**An approval is whole.** It needs all three layers to pass, its own switch on and no reason to hold. Only an approval has all three pass.
 
 **No approval from a ledger that cannot be trusted.** `read()` gives the rows. A ledger that cannot be read, does not validate, gives a key twice, is larger than 16 MiB on disk, or that a session could have written gives no rows: `None`, never an empty list, with the reason in words. A session could have written one inside a git working tree, a link, one writable by group or other, or one in or under a folder others can write without the sticky bit. Absent is an empty ledger: nothing has been decided.
 
-**Fields only.** No ticket, comment or pull request text, except `agent_says`: the agent's reason, one plain line of at most 300 characters, marked as the agent's words. It has no line break, control character or character a reader cannot see: every character is judged by its Unicode category, so format characters such as bidi controls, the soft hyphen and the tag characters are refused. A reader that shows it quotes it as the agent's, and never acts on it.
+**Fields only.** No ticket, comment or pull request text, except `agent_says`: the agent's reason, one plain line of at most 300 characters, marked as the agent's words. `reasons` are closed words, so a hold's code reasons are never the agent's words (KIT-542). It has no line break, control character or character a reader cannot see: every character is judged by its Unicode category, so format characters such as bidi controls, the soft hyphen and the tag characters are refused. A reader that shows it quotes it as the agent's, and never acts on it.
 
 **Whose file it is.** The validator's, under the user's own login, outside every git working tree. Mode 644, so the watcher can read it from its own account.
 
@@ -3011,7 +3011,7 @@ The validator's record of every decision, one row each (KIT-535). The stand-up, 
 
 | Field | Type | Notes |
 |---|---|---|
-| `schema` | `"pipeline-validator-ledger/1"` | A reader that does not know the value gives no rows. |
+| `schema` | `"pipeline-validator-ledger/2"` | A reader that does not know the value gives no rows. The first version, `/1`, from before `reasons`, is not read; nothing ever wrote one. |
 | `rows` | row[] | One per decision, oldest first. Only ever added to. |
 
 ### A row
@@ -3026,6 +3026,7 @@ The validator's record of every decision, one row each (KIT-535). The stand-up, 
 | `layers` | layers | Each layer's verdict. |
 | `settings_on` | switch[] | The validator's switches that were on, each once: `approve-plans`, `approve-pieces`, `approve-merges`, `allow-credentials`, `allow-billing-and-accounts`, `allow-production-deploy`, `allow-deleting-data`. |
 | `size_limits` | size limits | The size limits in force. |
+| `reasons` | closed word[] | Why code held, escalated or sent back, each once and at most 40: the hard limits' reasons, the evidence's, the agent's hold, or the send-back's own (`send-back-budget-spent`, `send-back-budget-unknown`, `send-back-no-session`). Each is lower-case letters, digits and hyphens. Empty for an approval, and for a decision that was the agent's alone. |
 | `agent_says` | text, or null | The agent's reason, in its own words. Null when it said nothing, and always null when it did not run. |
 
 ### Layers
@@ -3047,7 +3048,7 @@ Each is `pass`, `fail`, `unsure` or `not-run`. `unsure` holds, as `fail` does. `
 
 ### Who reads it
 
-Nothing yet. The validator's own pieces write rows, and the stand-up, the recap and the watcher read them, each in its own piece.
+Stage E's bounce driver reads a `sent-back` row for a pull request at its current head, when its config names the ledger (`validator_ledger_file`, KIT-542). It re-prompts the dev session from its own ledger and budget. The stand-up, the recap and the watcher read the ledger in their own pieces.
 
 ---
 
