@@ -1568,9 +1568,9 @@ def run_cases(check):
           (write_settings(io, update_conf, got), beats_of(update_conf)), (None, COPY))
     after = get(update_conf)
     check("kit782-every-other-byte-is-kept",
-          (after.startswith(before.rstrip(b"\n")[:len(before) - 20]), b"# end of file\n" in after,
-           len(after.splitlines()) - len(before.splitlines())),
-          (True, True, 3))
+          (after.startswith(before), after[len(before):]),
+          (True, ("MORNING_HEARTBEAT_FILE=%s\nQUEUE_HEARTBEAT_FILE=%s\nSWEEP_HEARTBEAT_FILE=%s\n"
+                  % (COPY[1], COPY[0], COPY[2])).encode("utf-8")))
     check("kit782-a-rerun-changes-nothing",
           (level_settings(update_conf, watcher_conf), write_settings(io, update_conf, []) is None, get(update_conf)),
           ([], True, after))
