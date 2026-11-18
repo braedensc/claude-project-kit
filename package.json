@@ -140,6 +140,7 @@
     "test:sync-kit": "python3 .claude/skills/sync-kit/compare.py --selftest",
     "test:scratch-run": "python3 scripts/scratch_run.py --selftest",
     "test:temp-leaks": "python3 scripts/check_temp_leaks.py --selftest",
+    "test:agent-env": "python3 scripts/pipeline_agent_env.py --selftest",
     "test:cleanup-probe": "python3 scripts/pipeline_cleanup_probe.py --selftest",
     "check:temp-leaks": "python3 scripts/check_temp_leaks.py",
     "prepare": "husky && (python3 scripts/pin_hooks_path.py || echo 'WARNING: could not pin core.hooksPath; a worktree made later may run no pre-commit hook (KIT-420)' >&2)"

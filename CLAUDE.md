@@ -448,6 +448,8 @@ npm run test:machine-tickets # with test:routing-tags and test:sync-kit, three s
 npm run test:scratch-run     # the batteries' temp helper: one folder per run, gone on a
                              #   pass, a failure, Ctrl-C or a SIGTERM (KIT-450)
 npm run test:temp-leaks      # the leak check's own selftest
+npm run test:agent-env       # the one list of agent-environment markers (KIT-690): the hook's and the probe's copies equal it,
+                             #   no other copy under scripts/, each refusal pinned per marker
 npm run test:cleanup-probe   # the cleanup probe (KIT-468): a snapshot of the role account's areas names and sizes
                              #   only; `compare` says what a run left behind, and never calls unread areas clean
 npm run check:temp-leaks     # every battery once, one at a time, in its own empty TMPDIR;
