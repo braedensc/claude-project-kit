@@ -279,6 +279,9 @@ CATCHUP_WEBHOOK_ID=
 # catch-up poller, which is not installed at all once no team is left.
 # Name a repository only once its coding sessions run through the runner too:
 # until then a fix finds no session there, and the driver says so on the PR.
+# The catch-up poller works by team, so a team leaves it as a whole: name
+# every repository of that team, or none.  One left on the thread would lose
+# the catch-up for its delegations.
 # RULE: comma-separated OWNER/NAME:TEAM:PROJECT entries.  OWNER/NAME is one of
 # REVIEW_REPOS, TEAM one of MANAGED_TEAM_KEYS, and PROJECT that repository's
 # key in the runner's settings.  To switch one back, remove its entry and run

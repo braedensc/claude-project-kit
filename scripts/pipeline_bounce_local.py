@@ -34,7 +34,8 @@ ON THE RUNNER LANE (KIT-765)
   the pull request's own coding session in its own workspace, the findings fenced as data. The
   coding run is found in the runner's own records, by project, ticket and branch, never by
   anything a session wrote. No such run is a Decline and spends nothing; a run still going is a
-  hold, and spends nothing either. The ledger rows, the budget, the re-review request and the
+  hold, and spends nothing either, until it has been going past `blocked_after_seconds`: then the
+  runner may be down, and it is a Decline too. The ledger rows, the budget, the re-review request and the
   no-push page are the same as on the thread, and the visible record line goes on the ticket as
   a top-level comment. The runner judges the request against the tracker before it starts
   anything. A conflict still goes by the thread. This lane is for a repository whose coding
@@ -3501,7 +3502,18 @@ def perform_bounce(sit, verdict, cfg, state_dir, dry_run):
         if run is None:
             raise Decline(why, sit)
         if run["state"] in runner_store.LIVE or run["auto_resume"] == "pending":
-            # Not a bounce yet: a resume needs the run ended, and the next pass asks again.
+            # Not a bounce yet: a resume needs the run ended, and the next pass asks again. But a
+            # wait past blocked_after_seconds is no longer a wait: the runner's own time limit is
+            # shorter, so the runner may be down. That is a could-not, said on the PR (§13).
+            since = _parse_iso(run["ended_at"] or run["started_at"])
+            waited = (datetime.now(timezone.utc) - since).total_seconds() if since else None
+            if waited is not None and waited > float(cfg.get("blocked_after_seconds")
+                                                     or DEFAULT_BLOCKED_AFTER_SECONDS):
+                raise Decline("the coding session (runner run %s) has been %s for %s, longer than "
+                              "the driver waits for it, so the runner may be down. Nothing was sent, "
+                              "no bounce was spent, and a person is needed"
+                              % (run["run"], "running" if run["state"] in runner_store.LIVE
+                                 else "waiting for the runner's own resume", _duration(waited)), sit)
             print("%s — held, nothing spent: the coding session (runner run %s) is still going; "
                   "the fix is asked once it ends" % (describe(sit, verdict), run["run"]))
             return EXIT_OK
@@ -6169,13 +6181,26 @@ def selftest():
         for name, setup, want in (
                 ("a coding run still going is a hold that spends nothing",
                  lambda s: runner_store.write_run(s, lane_record(
-                     "run-" + "d" * 32, "fix", "2026-11-17T13:00:00Z", state="running", resumes="run-" + "b" * 32)),
+                     "run-" + "d" * 32, "fix", _now_iso(), state="running", resumes="run-" + "b" * 32)),
                  (EXIT_OK, [], False, 0, "held, nothing spent")),
                 ("so is one the runner is about to resume itself",
                  lambda s: runner_store.write_run(s, lane_record(
-                     "run-" + "d" * 32, "fix", "2026-11-17T13:00:00Z", resumes="run-" + "b" * 32,
+                     "run-" + "d" * 32, "fix", _now_iso(), resumes="run-" + "b" * 32,
                      auto_resume="pending")),
                  (EXIT_OK, [], False, 0, "held, nothing spent")),
+                # Stage E on #601: a hold past the driver's wait is a could-not, said, never silent.
+                ("a coding run still running past the driver's wait is a decline on the PR",
+                 lambda s: runner_store.write_run(s, lane_record(
+                     "run-" + "d" * 32, "fix", (datetime.now(timezone.utc) - timedelta(
+                         seconds=DEFAULT_BLOCKED_AFTER_SECONDS + 3600)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                     state="running", resumes="run-" + "b" * 32)),
+                 (EXIT_USAGE, ["prComment"], False, 0, "running for 7h 00m, longer than the driver waits")),
+                ("…and so is a resume of its own the runner never made",
+                 lambda s: runner_store.write_run(s, lane_record(
+                     "run-" + "d" * 32, "fix", (datetime.now(timezone.utc) - timedelta(
+                         seconds=DEFAULT_BLOCKED_AFTER_SECONDS + 3600)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                     resumes="run-" + "b" * 32, auto_resume="pending")),
+                 (EXIT_USAGE, ["prComment"], False, 0, "waiting for the runner's own resume")),
                 ("no coding run in the runner is a decline on the PR, and nothing is spent",
                  lambda s: [(os.unlink(os.path.join(s, "runs", r, "run.json")),
                              os.rmdir(os.path.join(s, "runs", r))) for r in os.listdir(os.path.join(s, "runs"))],

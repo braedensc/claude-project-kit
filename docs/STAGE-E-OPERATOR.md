@@ -2517,9 +2517,12 @@ the installer again to switch it back.
 - **What the driver needs.** The runner's record of the pull request's coding run, matched by
   project, ticket and branch. With none, nothing is sent, no bounce is spent, and the pull
   request says a person is needed. While that run is still going, the fix waits for it to end
-  and spends nothing.
+  and spends nothing. Past `blocked_after_seconds` that wait is said on the pull request
+  instead, since the runner may be down.
 - **The catch-up poller** leaves that repository's team out. With every team on this lane it
-  is not installed, as with `CATCHUP_INTERVAL_SECONDS=off`.
+  is not installed, as with `CATCHUP_INTERVAL_SECONDS=off`. It works by team, so a team leaves
+  it as a whole: name every repository of that team, or none. A repository of it still on the
+  thread would no longer have its lost delegations re-sent.
 - **A conflict** still goes by the thread. That move comes later.
 - **Name a repository only once its coding sessions run through the runner too.** Until then
   every fix finds no run there, and says so on the pull request.
