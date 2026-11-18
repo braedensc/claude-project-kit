@@ -2740,6 +2740,10 @@ class PlansMixin(object):
         A read that failed, a ledger that refuses, or a hand-over the tracker would not take
         stops this pass's starts, and the pass ends loud."""
         if self.now - self.state.get("queue_at", 0) < self.cfg["queue_every_seconds"]:
+            # KIT-695: a pass the throttle skips stays loud while a runaway stop stands, or the
+            # passes between two asks would end clean and the monitor would read each as recovery.
+            if self.state.get("queue_stops"):
+                self.queue_failed("a runaway stop holds every start (%s)" % self.state["queue_stops"])
             return
         self.state["queue_at"] = self.now
         try:
@@ -2782,6 +2786,17 @@ class PlansMixin(object):
             return self.queue_failed("the tracker could not be read (%s)" % result["why"])
         if self.state.pop("queue_room", None) is not None:
             self.say("  queue: room again: starts resume")
+        # KIT-695: a runaway stop holds every start, so it reaches the owner the way a short
+        # machine does: the pass ends loud while it stands (the heartbeat monitor pages once
+        # per incident, not once per pass, and says so when it clears), and the log says when
+        # it lifts. The words are the starter's: codes, ids and numbers only.
+        stops = starter.stop_words(result.get("decision"))
+        if stops:
+            self.state["queue_stops"] = self.clean("; ".join(stops))[:300]
+            self.queue_failed("a runaway stop holds every start (%s)" % self.state["queue_stops"])
+            return                  # nothing more starts, and nothing is resumed either
+        elif self.state.pop("queue_stops", None) is not None:
+            self.say("  queue: the runaway stop is lifted: starts resume")
         stopped = self.resume_stopped(cfg, ledger, agent_id, why)
         if stopped is None:
             return
@@ -4900,6 +4915,28 @@ def cases_approve(kit):
                 path = os.path.join(c_["state_dir"], ROOM_FILE)
                 return json.load(open(path)) if os.path.exists(path) else None
 
+            # KIT-695: a runaway stop holds every start and ends the pass loud while it stands, so
+            # the heartbeat monitor pages it once; the pass after it lifts is clean.
+            def stopped(*stops):
+                return {"state": "decided", "why": None, "window": {}, "inputs": None,
+                        "decision": {"start": [], "held": [], "stops": list(stops)}}
+            day_stop = {"stop": "day-hard-stop", "ref": None, "value": 61.5, "limit": 60}
+            c, s, t, out, ledger = queued("q-stop", stopped(day_stop))
+            check("a-runaway-stop-ends-the-pass-loud-and-names-the-stop",
+                  (out[0] != EXIT_OK, "a runaway stop holds every start (day-hard-stop (61.5 "
+                   "against 60))" in out[1], delegated(t)), (True, True, []))
+            answer["v"] = stopped(day_stop)
+            again = run(c, s, t, at=now + 2000)
+            check("…and stays loud while it stands, so the page is not cleared early",
+                  (again[0] != EXIT_OK, "day-hard-stop" in again[1]), (True, True))
+            throttled = run(c, s, t, at=now + 2060)
+            check("…and a pass the throttle skips stays loud while it stands",
+                  (throttled[0] != EXIT_OK, "day-hard-stop" in throttled[1]), (True, True))
+            answer["v"] = decided()
+            lifted = run(c, s, t, at=now + 3000)
+            check("…and the first pass after it lifts is clean and says so",
+                  (lifted[0], "the runaway stop is lifted" in lifted[1]), (EXIT_OK, True))
+
             def room_story2(name):
                 c_, s_, t_, out_, ledger_ = queued(name, short("disk"))
                 seen_ = [room_record(c_)]
@@ -5025,6 +5062,12 @@ def cases_approve(kit):
                   (got[0], got[1], got[2], [b for i, b in got[4] if i == "uuid-51"]),
                   ([("uuid-51", None), ("uuid-51", "agent-1")], [("PROD-51", "resume")], False,
                    [RESUME_WORDS]))
+            got = resume_scene("q-resume-under-stop", usage_of(stop_of()), v={
+                "state": "decided", "why": None, "window": {}, "inputs": None,
+                "decision": {"start": [], "held": [], "stops": [
+                    {"stop": "day-hard-stop", "ref": None, "value": 61.5, "limit": 60}]}})
+            check("a-runaway-stop-resumes-nothing-either",
+                  (got[0], got[1], got[2]), ([], None, True))
             c, s, t, out, ledger = resumed("q-resume-twice", usage_of(stop_of()))
             for k in (1, 2):
                 answer["v"] = decided()
