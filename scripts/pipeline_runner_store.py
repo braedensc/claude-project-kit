@@ -64,6 +64,9 @@ CALLERS = {
     "acceptance": ("acceptance",),
 }
 STARTS = ("code", "review", "plan", "acceptance")        # fix and conflict are only resumes
+# The review job's name as a caller, which is also its one kind (KIT-644): one spelling, which the
+# review job's own code uses rather than writing the word out.
+REVIEW = "review"
 # A run of kind K may be resumed as kind R when K is in RESUMES[R].
 RESUMES = {
     "code": ("code",),
