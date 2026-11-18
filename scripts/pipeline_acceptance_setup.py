@@ -76,7 +76,7 @@ CONF_DEFAULTS = {
     # runner's own `lanes.acceptance` does. Empty: no repository's check goes to the runner.
     "ACCEPTANCE_RUNNER_LANE_REPOS": "", "ACCEPTANCE_RUNNER_STORE_DIR": "",
 }
-RUNNER_PROJECT_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}\Z")      # the runner's own project key
+RUNNER_PROJECT_RE = arun.runner_store.PROJECT_RE    # the runner's own project-key rule, imported, never copied
 CONF_KEYS = set(CONF_REQUIRED) | set(CONF_DEFAULTS)
 # Left invalid on purpose, so an unedited copy of the example cannot run.
 CONF_UNEDITED = {"DISPATCHER_CONFIG": "/opt/example-dispatcher/config.json",
@@ -198,8 +198,11 @@ def validate_conf(values, invoking_user=None):
     need(c.get("ACCEPTANCE_LOOK_CONFIG_DIR") != c.get("ACCEPTANCE_LOOK_RECORD_DIR"),
          "ACCEPTANCE_LOOK_CONFIG_DIR and ACCEPTANCE_LOOK_RECORD_DIR are one folder")
     lane = runner_lane_entries(c)
+    # The project is checked for its shape here. Whether the runner knows it is the live pass's to say: a project the
+    # runner's lanes do not name is said on every pass, and its checks file their tickets.
     need(lane is not None, "ACCEPTANCE_RUNNER_LANE_REPOS must list OWNER/NAME:PROJECT entries, each repository one of "
-                           "ACCEPTANCE_REPOS and each project a key of the runner's settings")
+                           "ACCEPTANCE_REPOS, once, and each PROJECT shaped like a key of the runner's settings "
+                           "(lower case letters, digits and dashes)")
     store = c.get("ACCEPTANCE_RUNNER_STORE_DIR") or ""
     need(not lane or path_ok(store), "ACCEPTANCE_RUNNER_STORE_DIR must be the runner's store, `~/…` or an absolute path "
                                      "with no `..`, while a repository is named in ACCEPTANCE_RUNNER_LANE_REPOS")
@@ -1213,6 +1216,8 @@ def _cases(check, tmp):
           (json.loads(compose(lane_conf, fake.home)["run"]).get("runner_lane"), "runner_lane" in run_doc,
            validate_conf(lane_conf, person)[1]),
           ({"store_dir": fake.home + "/.pipeline-runner/store", "repos": {"acme/app": "app"}}, False, []))
+    check("conf (KIT-708): a project key is judged by the runner store's own rule, imported, never a copy",
+          RUNNER_PROJECT_RE is arun.runner_store.PROJECT_RE, True)
     check("conf (KIT-708): a runner lane for a repository the check does not cover, or with no store, is refused", [
         refused("ACCEPTANCE_RUNNER_LANE_REPOS must", ACCEPTANCE_RUNNER_LANE_REPOS="other/repo:app"),
         refused("ACCEPTANCE_RUNNER_LANE_REPOS must", ACCEPTANCE_RUNNER_LANE_REPOS="acme/app:App"),

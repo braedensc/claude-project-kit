@@ -1160,6 +1160,7 @@ class Pass:
         self._team = None
         self._base = None
         self._lanes = None
+        self.said_projects = set()
 
     # ---- KIT-708: which road a check takes
     def road(self, repo):
@@ -1179,6 +1180,11 @@ class Pass:
         how, lanes = self._lanes
         if how == "unread":
             return "unknown", "the runner's lanes could not be read (%s)" % lanes
+        if lanes is not None and project not in lanes["projects"] and project not in self.said_projects:
+            # A key the runner does not know is a typo or a project not set up there: said, never silent.
+            self.said_projects.add(project)
+            self.say("NOTE: runner_lane names project %s for %s, but the runner's lanes name no such project, so its "
+                     "checks file their tickets" % (project, repo))
         if not runner_store.lane_on(lanes, project, "acceptance"):
             return "ticket", None
         if lanes["look_config_dir"] != self.cfg["look_config_dir"]:
@@ -3006,8 +3012,15 @@ def selftest():
                "ran": [{"check": "c1", "viewport": "desktop", "mode": "default", "result": "passed"}], "problems": []}
     lin, gh, rcfg, store = on_runner(on=False)
     code, out = go(lin, gh, c=rcfg)
-    expect(lin.kinds() == ["create", "delegate"] and asked(store) == [],
+    expect(lin.kinds() == ["create", "delegate"] and asked(store) == [] and "no such project" not in out,
            "with the runner's acceptance lane off for the project, the check files its ticket as before: %s" % out)
+    lin, gh, rcfg, store = on_runner(on=False)
+    runner_store.write_lanes(store, dict(runner_store.read_lanes(store), projects={"web": ["acceptance"]}))
+    code, out = go(lin, gh, c=rcfg)
+    expect(lin.kinds() == ["create", "delegate"] and asked(store) == []
+           and out.count("the runner's lanes name no such project") == 1,
+           "a project the runner's lanes do not name (a typo, say) is said once a pass, never silent, and its checks "
+           "file their tickets: %s" % out)
     lin, gh, rcfg, store = on_runner()
     real_ask, before = runner_store.ask, []
 
