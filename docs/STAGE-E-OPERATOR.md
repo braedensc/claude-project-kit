@@ -201,11 +201,12 @@ heartbeat left from before the load came from the old code. It says nothing abou
 just loaded. The installer records the second it loads each daemon, and holds each heartbeat
 to its own daemon's load. That covers the load in `enable`, the one the `code` step makes as
 soon as the clone has moved, and the one a stopped run makes on its way out. A daemon is
-proven when its heartbeat was written in a later second than its load. One written in the
-load's own second cannot be told from one the old job left just before it exited, so it waits
-for the next pass.
+proven when its heartbeat was written at or after its load. The installer starts each load at
+the top of a second, so nothing the old job wrote can share that second.
 
-If a daemon is not proven within 90 seconds, the step ends `UNKNOWN`, never done. It names
+A heartbeat comes when a pass ends, and a pass can run for minutes. The step waits one whole
+pass for each daemon: 15 minutes for the review poller and the bounce driver, 5 for the finding
+poller, plus 30 seconds. If a daemon is not proven by then, the step ends `UNKNOWN`, never done. It names
 each daemon with `no heartbeat` or `its heartbeat is from before the load`. `verify` reads the
 same record and says the same sentence. Read the logs it points to under the role account's
 `~/.stage-e/`, then run the same command again.

@@ -357,7 +357,7 @@ required check is still running. Exit 2: the settings path is not absolute.
 
 The third layer is one agent that reads and judges, and can do nothing else. Code builds everything
 it reads, and code reads everything it says. The code is `scripts/pipeline_validator_brief.py`. No
-model runs here: running the agent is its own piece.
+model runs there: section 6 is the run.
 
 **What the agent reads.** One brief with three parts:
 
@@ -442,6 +442,50 @@ in its `riskPaths`, where they always stay yours.
 
 Good: a pull request that changes `src/app/views.py` passes, with the merges switch on. Not that:
 one that touches `.github/workflows/ci.yml` passing. It fails with `risk-path`, whatever is on.
+
+## 6. The agent's run
+
+The agent is one run of the `claude` CLI. It reads the brief from section 4 and answers in two
+lines. It can do nothing else. The code is `scripts/pipeline_validator_run.py`. Nothing calls it
+yet: the validator's own job is its own piece.
+
+**What it can do.** Read the brief, and answer. It has no tools, so it cannot read a file, run a
+command, or reach the tracker or GitHub. It loads none of your settings, hooks, plugins or skills.
+Each run is a new conversation that is never saved. No session can resume it or send it a message.
+
+**Where it runs.** As you, under your own login, like your other jobs. It makes no new account and
+uses no `sudo`. Its home and working folder are one fresh, empty folder, removed when the run ends,
+however it ends. A `CLAUDE.md` in that folder or any folder above it stops the run: your own
+instructions are never loaded into it.
+
+**What it uses.** The `claude setup-token` token your other jobs use, by its variable's name. Only a
+setup token is sent: an API key would bill every call. No GitHub token and no tracker key reach it.
+
+**Its settings.** One answer, a spend cap and a time limit:
+
+| Setting | Default | What it is |
+|---|---|---|
+| `agent_bin` | none | The claude CLI's full path, as `command -v claude` prints it. |
+| `agent_model` | `sonnet` | The model's name or alias. |
+| `agent_token_env` | `CLAUDE_WRITER_OAUTH_TOKEN` | The name of the variable that holds the token. |
+| `agent_timeout_seconds` | `300` | How long one run may take: 30 to 900. |
+| `agent_max_budget_usd` | `1.0` | The spend cap for one run: above 0, at most 5. |
+
+A setting that is not valid holds every run, and names the setting.
+
+**When it cannot answer, it holds.** A run that times out, cannot start, exits with an error, or
+gives no answer is a hold. Each is said in fixed words, never in the CLI's own. It never retries:
+one brief is one run.
+
+Good: `the agent took longer than 300 seconds`, and the change waits. Not that: an approval because
+the agent did not answer.
+
+**Only its own job starts it.** It is refused in an agent's environment: a session that could start
+the validator's agent could choose what it is shown. It has no command line that runs the model,
+and its selftest checks that no other script names it.
+
+Good: the validator's own job, started by your scheduler, as you. Not that: a session running the
+agent to see what it would say.
 
 ## 7. What a no does
 
