@@ -20,7 +20,8 @@ WHAT IT BUILDS, for the person running it and nobody else. It makes no account a
         settings.json               the switches. Written ONCE, when absent, with every switch off
         config.json                 the job's config, composed from validator.conf: the settings,
                                     the ledger, the watcher's hold and status, the facts' sources,
-                                    the agent and the app's id. The job's own loader accepts it first
+                                    the agent and the app's id. Each pass's own loader accepts it
+                                    first: the merge path's and the piece pass's
         validator.log               what each pass said: `OFF: ...` while every switch is off
         last-pass.json              the time and exit code of the job's last pass, written by the
                                     job's own shell line after each pass
@@ -47,7 +48,7 @@ THE STEPS, in order. Each row says what it found, and what it did or would do.
              reaches this process. Under a model it is never read: NOT MEASURED
   hold       the watcher's hold, read as the job reads it (pipeline_validator_limits.hold_state).
              A hold it cannot read FAILS: every pass would hold. The status file is a note
-  config     composed, accepted by the job's own loader, written mode 600 when it differs
+  config     composed, accepted by each pass's own loader, written mode 600 when it differs
   job        the plist, written when it differs, never over a job that runs something else.
              Written while the job is off, its label is disabled in the same step, so a new
              login does not start it before the next row decides
@@ -124,7 +125,8 @@ try:
     import pipeline_validator_check as vcheck
     import pipeline_validator_ledger as vledger
     import pipeline_validator_limits as limits
-    import pipeline_validator_merge as vmerge             # the job's own config loader
+    import pipeline_validator_merge as vmerge             # each pass's own config loader:
+    import pipeline_validator_pieces as vpieces           # the merge path's, and the piece pass's
     import pipeline_validator_settings as vsettings
 except ImportError as exc:  # a packaging accident, never a state to run in
     sys.exit("FAIL: %s. The installer uses those files' own code and keeps no copy." % exc)
@@ -142,9 +144,10 @@ BEAT_NAME, STATE_NAME = "last-pass.json", "setup.json"
 # The NAME the job's config gives the app key file's path (pipeline_validator_check.credential).
 # The plist sets it to APP_KEY_FILE: a path, never the key.
 KEY_ENV = "VALIDATOR_APP_KEY_FILE"
-# The passes the job runs, in order, each `run --config <config>`. The validator's piece pass
-# (KIT-543) joins here when it lands; nothing else in this file changes for it.
-PASSES = ("pipeline_validator_merge.py",)
+# The passes the job runs, in order, each `run --config <config>`: the merge path, then the piece
+# pass (KIT-543). Each reads the one config through its own loader, says `OFF:` while its switch is
+# off, and prints `[dry-run]` for each thing a rehearsal says it would decide.
+PASSES = ("pipeline_validator_merge.py", "pipeline_validator_pieces.py")
 ROWS_SCHEMA = "validator-setup-rows/1"
 ANSWERS_SCHEMA = "validator-answers/1"
 ANSWERS_KEYS = frozenset(("schema", "consent"))
@@ -994,11 +997,20 @@ def read_json(path):
         return None
 
 
+def loaders_refuse(load):
+    """Every problem each pass's own loader finds, named by its pass; [] when both accept it."""
+    out = []
+    for name, module in (("the merge path", vmerge), ("the piece pass", vpieces)):
+        _cfg, bad = load(module)
+        out += ["%s: %s" % (name, b) for b in bad]
+    return out
+
+
 def step_config(ctx, apply_it):
     path, doc = ctx.config_path, compose_config(ctx)
-    _cfg, bad = vmerge.config(doc)
+    bad = loaders_refuse(lambda module: module.config(doc))
     if bad:
-        raise se.SetupError("the job's own loader would refuse the config: %s" % "; ".join(bad[:3]))
+        raise se.SetupError("a pass's own loader would refuse the config: %s" % "; ".join(bad[:3]))
     have = read_json(path)
     if have == doc:
         return True, "%s: current; it names the hold %s and the ledger %s" % (
@@ -1009,11 +1021,11 @@ def step_config(ctx, apply_it):
         return False, "would write %s (%s)" % (path, why), []
     text = json.dumps(doc, indent=2, sort_keys=True) + "\n"
     ctx.runner.do("write the job's config", path, lambda: write_text(path, text, 0o600))
-    _back, bad = vmerge.load_config(path)
+    bad = loaders_refuse(lambda module: module.load_config(path))
     if bad or read_json(path) != doc:
-        raise se.SetupError("%s was written, and the job's own loader does not read it back as "
+        raise se.SetupError("%s was written, and a pass's own loader does not read it back as "
                             "written: %s" % (path, "; ".join(bad[:2]) or "it differs"))
-    return False, "wrote %s (%s), mode 600; read back by the job's own loader" % (path, why), []
+    return False, "wrote %s (%s), mode 600; read back by each pass's own loader" % (path, why), []
 
 
 def read_plist(path):
@@ -1200,7 +1212,8 @@ STEPS = (
     ("app", (), "the app's id, and its key file by lstat", step_app),
     ("env-file", (), "the env file sets each name, judged in a shell", step_env_file),
     ("hold", (), "the watcher's hold, read as the job reads it", step_hold),
-    ("config", ("preflight", "settings", "ledger", "app"), "the job's config, by its own loader", step_config),
+    ("config", ("preflight", "settings", "ledger", "app"), "the job's config, by each pass's loader",
+     step_config),
     ("job", ("config", "env-file"), "the LaunchAgent's file", step_job),
     ("enable", ("job", "hold"), "loaded, current, and its last pass exited 0", step_enable),
 )
@@ -1764,10 +1777,13 @@ def selftest():
         if stub is None:
             os.symlink(HERE, os.path.join(kit, "scripts"))
         else:
+            # The first pass says it would decide `n` things and exits `rc`; the others decide
+            # nothing and exit 0, as a pass whose switch is off does.
             n, rc = stub
-            write(os.path.join(kit, "scripts", PASSES[0]), "import sys\n%ssys.exit(%d)\n" % (
-                "".join("print('  [dry-run] would record approved for acme/app#%d at 0123456789ab')\n"
-                        % (i + 1) for i in range(n)), rc), 0o644)
+            for i_, pass_ in enumerate(PASSES):
+                write(os.path.join(kit, "scripts", pass_), "import sys\n%ssys.exit(%d)\n" % (
+                    "".join("print('  [dry-run] would record approved for acme/app#%d at 0123456789ab')\n"
+                            % (i + 1) for i in range(n if i_ == 0 else 0)), rc if i_ == 0 else 0), 0o644)
         conf = os.path.join(base, "validator.conf")
         write(conf, "HOLD_FILE=%s\nWATCHER_STATUS=%s\nAGENT_BIN=%s\nGH_BIN=%s\nPYTHON=%s\n"
               "ENV_FILE=%s\nAPP_KEY_FILE=%s\n%s" % (
@@ -1880,10 +1896,12 @@ def selftest():
        got.get("settings") == DONE and s["state"] == vsettings.READ and not switches_on(s)
        and s[vsettings.REPOS_KEY] == [] and not any(s["limits"].values()), s)
     cfg, bad_cfg = vmerge.load_config(os.path.join(p["home"], FOLDER, CONFIG_NAME))
-    ok("apply: the config holds the hold file and the ledger, and the job's own loader accepts it",
-       not bad_cfg and cfg["facts"]["hold_file"] == p["hold"]
+    pcfg, bad_pcfg = vpieces.load_config(os.path.join(p["home"], FOLDER, CONFIG_NAME))
+    ok("apply: the config holds the hold file and the ledger, and both passes' own loaders accept it",
+       not bad_cfg and not bad_pcfg and cfg["facts"]["hold_file"] == p["hold"]
+       and pcfg["facts"]["hold_file"] == p["hold"] and pcfg["ledger_file"] == cfg["ledger_file"]
        and cfg["ledger_file"] == os.path.join(p["home"], FOLDER, "ledger.json")
-       and cfg["check"] == {"app_id": 4242, "key_file_env": KEY_ENV}, bad_cfg or cfg)
+       and cfg["check"] == {"app_id": 4242, "key_file_env": KEY_ENV}, bad_cfg or bad_pcfg or cfg)
     plist_path = os.path.join(p["home"], "Library", "LaunchAgents", "local.validator.plist")
     with open(plist_path, "rb") as fh:
         pl = plistlib.load(fh)
@@ -1899,9 +1917,17 @@ def selftest():
     with open(os.path.join(p["home"], FOLDER, LOG_NAME), encoding="utf-8") as fh:
         log = fh.read()
     beat, _why = read_beat(c)
-    ok("apply: the job's first pass ran its real command and said every switch is off",
-       "OFF: the merges switch is off" in log and beat and beat["exit"] == 0
-       and "exited 0" in detail(rows, "enable") and c.first_pass == (0, 0), log + str(beat))
+    ok("apply: the job's first pass ran both real passes, the merge path and then the piece pass, "
+       "and each said its switch is off",
+       PASSES == ("pipeline_validator_merge.py", "pipeline_validator_pieces.py")
+       and "OFF: the merges switch is off" in log and "OFF: the pieces switch is off" in log
+       and log.index("OFF: the merges switch") < log.index("OFF: the pieces switch")
+       and beat and beat["exit"] == 0 and "exited 0" in detail(rows, "enable")
+       and c.first_pass == (0, 0), log + str(beat))
+    ok("apply: the job file runs each pass with this config, in order",
+       [x_ for x_ in PASSES if "/scripts/%s run --config %s" % (
+           x_, os.path.join(p["home"], FOLDER, CONFIG_NAME)) in pl["ProgramArguments"][2]]
+       == list(PASSES), pl["ProgramArguments"][2][:300])
     state = read_state(c)
     ok("apply: it records once that the job was switched on, by apply",
        state and state["switched_on"]["by"] == "apply", state)
