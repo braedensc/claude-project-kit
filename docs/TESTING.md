@@ -283,7 +283,12 @@ Code that is fine on a newer Python can break there, so one job runs on it.
 The Python 3.9 job (`.github/workflows/ci-mac-python.yml`) puts a `python3` link to
 `/usr/bin/python3` first on the PATH, then fails unless `python3 -V` says 3.9 and matches
 `/usr/bin/python3 -V`. It byte-compiles every tracked `.py`, then runs `npm run check:temp-leaks`
-(the hook battery and every other battery, one at a time). A failure turns the PR red.
+(the hook battery and every other battery, one at a time). It also runs the **direct checks**:
+the scripts Kit checks runs bare over the real tree (runner pin, agent trigger, standard-library,
+workflow calls, placeholders, session brief, schemas, delivery config, alert pages, the parts list) and the
+JSON/YAML parse, through `python3 scripts/check_direct_checks.py --run`. That script holds the list.
+Kit checks keeps its own named steps and runs `--verify`, which fails when its direct steps and
+the list differ (`npm run test:direct-checks`). A failure turns the PR red.
 
 It is **not a required context**, so a failure turns the PR red without blocking the merge. The
 owner can add it with the same command as Temp-leak sweeps above, using the context name

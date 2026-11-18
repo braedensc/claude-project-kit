@@ -408,6 +408,7 @@ npm run test:acceptance-setup  # the acceptance installer (KIT-326): the browser
 npm run test:union           # union check: green alone + red together, bisected, report-only
 npm run test:hooks-path      # core.hooksPath pinned absolute: a worktree runs the pre-commit hook (KIT-420)
 npm run test:runner-pin       # no workflow on a moving -latest runner image (KIT-429)
+npm run test:direct-checks  # the 3.9 job's list of direct checks matches Kit checks' direct steps (KIT-659)
 npm run test:ci-covers      # every package.json test:* script has a CI step outside the leak sweeps (KIT-620)
 npm run lint:ci-covers      # …and the same check over this repo
 npm run test:stdlib-only    # the kit's Python imports only the standard library, bar a named list (KIT-652)
