@@ -22,7 +22,8 @@ from a root-owned copy, and a live probe of the walls as the role account (KIT-7
 Each pass, every few seconds:
 
 1. **Finds each live run again.** A run whose process is gone gets its record finished and its pin
-   removed. Anything left of it is killed first, and again until nothing is: one kill can miss a
+   removed. Its session's final message is kept first, for the caller that asked for the run
+   (below). Anything left of it is killed first, and again until nothing is: one kill can miss a
    process that is being forked at that instant. A run that left no result and no exit is
    *interrupted*, and is resumed once. A lock only the wrapper holds says a run is alive; the
    session never gets it, so it cannot fake its own end.
@@ -35,6 +36,18 @@ the ticket and the text of the request whose work it carries on. Its record says
 session-gone` and names the lost session in `gone_session`. It happens once per request: a fresh
 start that is itself lost later is not started again, and its record says why. A resume that fails
 any other way keeps its own reason.
+
+**A start may carry its caller's text** (KIT-858). A job can send the facts its session needs with
+the start: a planning run's earlier attempts, say, or the head an acceptance check builds. The
+session gets them after the ticket, fenced as data, as it gets a resume's text. A fresh start after
+a lost session gets them again. A stop carries no text.
+
+**The session's final message is kept for its caller** (KIT-858). When a run ends, the runner keeps
+the final message the program reported in `<store_dir>/outputs/<run>.json`. That is its last 150,000
+characters, marked `cut` when the message was longer. The caller reads it with `run_output()` once
+the run's record says it ended. `None` means the run left no result at all. A result that carried
+no message is kept as one with none, never as an empty message. The message is the session's own
+words: data for its caller, never part of the run's record.
 
 Before it starts anything, it checks the request against the tracker:
 
@@ -53,11 +66,12 @@ keep sessions from writing a request at all.
 
 | Thing | Where | Notes |
 | --- | --- | --- |
-| A workspace | `<work_dir>/<kind>/<TICKET>` | A fresh git worktree on a new branch. A folder already there is never reused. |
+| A workspace | `<work_dir>/<kind>/<TICKET>` | A fresh git worktree on a new branch. A folder already there is never reused. A review, plan or acceptance start first removes the workspace and branch an earlier run of its kind left on the ticket, once that run has ended (KIT-858). |
 | A branch | `<type>/<ticket, lower case>-<title or kind>` | One fixed pattern. Every git command is a list of arguments. No repository hook runs. |
 | A pin | the project's pins root | Written before the program runs, removed when the run ends. Budget, mode, criteria and out of scope. |
 | The run's folder | `<store_dir>/runs/<run>/` | The command's inputs, the program's output, its exit, and the run's record. |
 | Its remembered processes | `<store_dir>/trees/<run>.json` | The runner's alone. Never in the run's folder, which the run's own processes write. |
+| Its final message | `<store_dir>/outputs/<run>.json` | Kept when the run ends, for its caller. The runner's alone, for the same reason. |
 | A temp folder | `<work_dir>/.tmp/<run>` | The session's TMPDIR, outside every wall. Removed when the run ends. |
 
 A start refused after its workspace was made removes the workspace and its branch, so the next start
@@ -210,7 +224,8 @@ Each refusal says why, in the request's answer (`<store_dir>/taken/<id>.json`).
 | It says | What to do |
 | --- | --- |
 | the ticket's newest move was not the owner's | The owner moves the ticket himself. |
-| a workspace is there already | The sweep removes old workspaces. A new start needs a fresh one. |
+| a workspace is there already | For a code start: the ticket's earlier code run keeps its workspace for its fixes, so remove it before a new start. For a review, plan or acceptance start: no run of the runner's left that folder, so it is never removed for you. Look at what it is first. |
+| an earlier run is still going or is to be resumed | Wait. A review, plan or acceptance start can follow once that run has ended. |
 | the project has no committed delivery.json | The project is not set up for the pipeline. |
 | `<name>` is not set | The sign-in token's variable is missing from the job's environment. |
 | the tracker could not be read | Nothing to do: the request waits, and the next pass tries again. |

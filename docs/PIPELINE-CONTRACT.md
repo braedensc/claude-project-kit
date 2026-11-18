@@ -3211,6 +3211,7 @@ session nobody approved.
 <store>/taken/<id>.json        a request the runner acted on, with its answer
 <store>/runs/<run>/run.json    the run's record
 <store>/trees/<run>.json       the processes the runner remembered of the run (KIT-739)
+<store>/outputs/<run>.json     the session's final message, kept when the run ends (KIT-858)
 ```
 
 ### A request
@@ -3228,7 +3229,7 @@ One JSON file, written whole by `ask()`, mode 0600.
 | `project` | a key of the runner's `projects` | Which repository. |
 | `ticket` | ticket id | The ticket the session is for. |
 | `run` | `run-` and 32 hex characters, or null | The run to resume or stop. Null for a start. |
-| `text` | text of 1 to 20000 characters, or null | A resume's words, written by the caller's own code. Null otherwise. |
+| `text` | text of 1 to 20000 characters, or null | A resume's words, or a start's facts, written by the caller's own code (KIT-858). A resume must carry it, a start may, and a stop never does. |
 
 **Who may ask, each for its own kinds.**
 
@@ -3250,14 +3251,21 @@ dispatcher's own user never approves. A history that cannot be read whole approv
 
 **Who asked is reporting.** Under one account any process that can write the store can name any
 caller, so `caller` narrows what a request may ask and nothing more. What keeps a session from
-writing a request at all is the store's walls and the session's sandbox. A resume's text, whoever
-wrote it, reaches the session only fenced as data.
+writing a request at all is the store's walls and the session's sandbox. A start's or a resume's
+text, whoever wrote it, reaches the session only fenced as data.
 
 **The answer.** Each request is answered once, in `taken/<id>.json`: `{"request", "answer": {"at",
 "ok", "run", "why"}}`. A request the runner cannot judge now waits, and is not answered: the tracker
 did not answer, git could not fetch, or the watcher's hold (§20) is set. Everything else is answered
 `ok: false` with the reason in words. A start refused after its workspace was made removes the
 workspace and its branch. Off (`enabled` false), the runner takes no request and resumes nothing.
+
+**A kind that changes nothing gets a fresh workspace at each start (KIT-858).** Before a review, plan
+or acceptance start makes its workspace, the runner removes, through git, the workspace and branch an
+earlier run of that kind left on the ticket. It does so only once every such run has ended and none
+waits for the runner's own resume; until then the start is refused. It removes only the planned path
+and the fixed branch, and only what its own records name. A folder no run of its own left is never
+removed, and the start is refused. A code run's workspace is never removed this way.
 
 ### A run record
 
@@ -3333,9 +3341,18 @@ keeps the newest, counts the rest in `dropped`, and stops the run at `limit:memo
 list (§13). The usage job reads the runs through it once a lane moves to the runner;
 `USAGE_KINDS` gives the usage file's kind for each (§17).
 
-**Fields only.** No ticket text is in a request or a record. A resume's `text` reaches the session
-fenced as data. Each run's own folder also holds its command's inputs, the program's output and its
-exit. Those are the run's. Only the runner reads them, except the run's own tool server, which
+**A run's final message (KIT-858).** When a run ends, and before its record says so, the runner keeps
+the final message the program reported in `<store>/outputs/<run>.json`: `{"schema":
+"pipeline-runner-output/1", "run", "at", "is_error", "subtype", "text", "cut"}`. `text` is the
+message's last 150,000 characters, or null when the program's result carried none, and `cut` says it
+was longer. A run that left no result at all has no file. The runner alone writes it, outside the
+run's folder. The caller that asked for the run reads it with `run_output()`: the document, `None`
+when there is none, or an error when one is there and cannot be read (§13). The text is the
+session's own words: data for its caller, checked by the caller's own rules, never part of the record.
+
+**Fields only.** No ticket text is in a request or a record. A start's or a resume's `text` reaches
+the session fenced as data. Each run's own folder also holds its command's inputs, the program's
+output and its exit. Those are the run's. Only the runner reads them, except the run's own tool server, which
 reads its run file and keeps its counts there (below).
 
 ### The session's own tool server (KIT-706)
