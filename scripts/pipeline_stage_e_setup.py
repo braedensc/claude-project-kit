@@ -16879,6 +16879,11 @@ def _selftest_body():
     # KIT-280: the clone runs more than those five. Every installer that execs a job out of
     # ROLE_KIT_CLONE names its entry script the same way, so the entries are read out of the
     # installers themselves: one that names the clone and no entry fails here, never passes.
+    # The settings folder (KIT-853) names ROLE_KIT_CLONE only as a setting it writes into the part
+    # files, and starts nothing. It is passed over only while that stays true: once it names an
+    # entry or imports subprocess, it fails here like any other.
+    key_only = ("pipeline_settings.py",)
+
     def _kit280_closure():
         nonlocal cases
         cases += 1
@@ -16891,6 +16896,10 @@ def _selftest_body():
             if "ROLE_KIT_CLONE" not in src:
                 continue
             named = re.findall(r'ROLE_KIT_CLONE"\]\.rstrip\("/"\) \+ "/scripts/" \+ (\w+)', src)
+            if fname in key_only:
+                if named or "import subprocess" in src:
+                    silent.append(fname + " (it names the key only, yet it can start a job)")
+                continue
             values = [re.search(r'^%s = "([\w.]+\.py)"$' % n, src, re.M) for n in named]
             if not named or not all(values):
                 silent.append(fname)
