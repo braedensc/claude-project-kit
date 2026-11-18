@@ -6030,9 +6030,9 @@ PROBE_CLEARS = (
                               r"signed, or it no longer holds\. The one command offers to run it")),
     ("stopped", re.compile(r"stopped since (\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ): (.*)\. Only a probe "
                            r"signed after it clears it")),
-    ("stopped", re.compile(r"a review ticket misrouted at (\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ): (.*)\. "
-                           r"Its stop could not be written; only a probe signed after it clears "
-                           r"it")),
+    ("misrouted", re.compile(r"a review ticket misrouted at (\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ): "
+                             r"(.*)\. Its stop could not be written; only a probe signed after it "
+                             r"clears it")),
     ("version-changed", re.compile(r"the dispatcher is version \S+, and the routing probe was "
                                    r"signed on \S+; sign it again on this version")),
 )
@@ -6045,9 +6045,20 @@ PROBE_REASON_CUT = re.compile(r"; (?=there is no routing sign-off at |stopped si
 # A stop file that cannot be read counts as a stop, as of its last write or of no time at
 # all. A person has to look at that file, so it is never one the probe clears.
 UNREADABLE_STOP = re.compile(r"the stop at .* could not be read, so it counts as stopped")
+# BUT THE IDEA GATE SEES ONLY THE SHARED STOP (review of KIT-794). Its installer offers the
+# probe again for a stop only when the shared stop file is newer than the sign-off. The
+# poller also pauses on its own record of stops and on a misroute its seen-set holds, and
+# writes the shared file only when none stands. So a stop passes only when the same line
+# shows the shared stop holding too: the poller names that one first, then its own, so a
+# line with BOTH holds it. Or when the line also says no sign-off or a changed version: the
+# idea gate offers the probe for those anyway, and a new sign-off clears every stop beside
+# them. A stop alone in either record still fails the step, as before.
+PROBE_OFFERED_ANYWAY = frozenset(("no-signoff", "version-changed"))
 PROBE_SAYS = {"no-signoff": "no routing sign-off stands",
               "stopped": "a review ticket did not reach its review setup, so reviews stopped "
                          "as a precaution",
+              "misrouted": "a review ticket did not reach its review setup, so reviews stopped "
+                           "as a precaution",
               "version-changed": "the dispatcher changed since the probe was signed"}
 # The lines the poller prints beside every error it counts (`result.errors += 1`): its
 # `FAIL:` lines, a review it will try again (`RETRY`), and a telemetry row it lost.
@@ -6056,7 +6067,8 @@ POLLER_ERROR_LINE = re.compile(r"^(FAIL:|RETRY |TELEMETRY LOST)")
 
 def probe_clears(reasons):
     """The codes of one PAUSED line's reasons when only a newer routing-probe sign-off clears
-    every one of them (PROBE_CLEARS), or None."""
+    every one of them (PROBE_CLEARS) AND the idea gate will offer that probe; or None. A stop
+    passes only beside the shared stop or a reason the probe is offered for anyway."""
     codes = []
     for part in PROBE_REASON_CUT.split(reasons):
         for code, shape in PROBE_CLEARS:
@@ -6069,6 +6081,9 @@ def probe_clears(reasons):
                                   or UNREADABLE_STOP.fullmatch(found.group(2))):
             return None
         codes.append(code)
+    stopped = codes.count("stopped") + codes.count("misrouted")
+    if stopped and codes.count("stopped") != 2 and not PROBE_OFFERED_ANYWAY & set(codes):
+        return None
     return codes or None
 
 
@@ -6077,12 +6092,14 @@ def paused_only_for_the_probe(said):
     every PAUSED line is one only a newer routing-probe sign-off clears (`probe_clears`), and
     none of its error lines (`POLLER_ERROR_LINE`) is there; {} otherwise.
 
-    That is: no sign-off at all (KIT-733), a stop dated after the sign-off, and a changed
-    dispatcher version (KIT-794). A sign-off that cannot be read or is not one, a stop file
-    that cannot be read, a review entry the sign-off does not prove, a version that cannot be
-    read, an unreadable record of stops and a missing or unreadable routing label are NOT
-    that: each still fails the install, because each needs a person to look, and the probe
-    alone would not clear it.
+    That is: no sign-off at all (KIT-733), a stop dated after the sign-off that the shared stop
+    file holds too, and a changed dispatcher version (KIT-794). A stop only the poller's own
+    record or its seen-set holds passes only beside no sign-off or a changed version: the idea
+    gate reads the shared file alone, so it would not offer the probe for it. A sign-off that
+    cannot be read or is not one, a stop file that cannot be read, a review entry the sign-off
+    does not prove, a version that cannot be read, an unreadable record of stops and a missing
+    or unreadable routing label are NOT that: each still fails the install, because each needs
+    a person to look, and the probe alone would not clear it.
 
     WHAT IT CANNOT SEE. Every other line is ignored. A pass can exit 1 for a cause that
     prints none of the above: a close or a telemetry row still pending on an earlier review.
@@ -6312,7 +6329,8 @@ def step_dry_run(ctx, apply_it):
     if waits_on_probe:
         why = []
         for code in sorted(set(c for codes in waits_on_probe.values() for c in codes)):
-            why.append(PROBE_SAYS[code])
+            if PROBE_SAYS[code] not in why:
+                why.append(PROBE_SAYS[code])
         say("  Waiting on you: sign the routing probe. Reviews of %s are paused until it is "
             "signed again (%s), so this dry run counted none of their pull requests. That is "
             "expected, not a failed install: the idea gate's installer asks \"Run the probe "
@@ -12153,8 +12171,9 @@ def _selftest_body():
          {"example-org/app": ["no-signoff"], "example-org/kit": ["no-signoff", "stopped"]}),
         ("a stop whose own reason holds a '; '", _poller_says(semi),
          {"example-org/app": ["stopped", "stopped"]}),
-        ("a misroute the seen-set holds", _poller_says(_nosig_cfg("misroute"), seen=misroute_seen),
-         {"example-org/app": ["no-signoff"], "example-org/kit": ["no-signoff", "stopped"]}),
+        ("a misroute the seen-set holds, beside no sign-off",
+         _poller_says(_nosig_cfg("misroute"), seen=misroute_seen),
+         {"example-org/app": ["no-signoff"], "example-org/kit": ["no-signoff", "misrouted"]}),
         ("a dispatcher that changed since the probe", _poller_says(bumped, version="0.2.74"),
          {"example-org/app": ["version-changed"], "example-org/kit": ["version-changed"]}),
     )
@@ -12183,6 +12202,12 @@ def _selftest_body():
     os.makedirs(os.path.dirname(badstop["shared_stop_file"]))
     with open(badstop["shared_stop_file"], "w", encoding="utf-8") as fh:
         fh.write("{")                                  # a stop file that cannot be read
+    # …and beside no sign-off, which the idea gate offers the probe for anyway: only the
+    # unreadable file can fail this line, so this one pins that rule on its own.
+    badstop_nosig = _nosig_cfg("badstop-nosig")
+    os.makedirs(os.path.dirname(badstop_nosig["shared_stop_file"]))
+    with open(badstop_nosig["shared_stop_file"], "w", encoding="utf-8") as fh:
+        fh.write("{")
     unproven = _nosig_cfg("unproven")
     _sign(unproven, "2026-11-17T12:00:00Z", {_poller_mod.review_entry_name("example-org/kit"):
                                              list(_machine_mod.ROUTE_METHODS)})
@@ -12191,6 +12216,30 @@ def _selftest_body():
     os.makedirs(stopsbad["state_dir"])
     with open(_poller_mod.review_stops_path(stopsbad["state_dir"]), "w", encoding="utf-8") as fh:
         fh.write("{")                                  # this poller's own stops, unreadable
+    # THE IDEA GATE SEES ONLY THE SHARED STOP (Stage E's review of this change). A review stop
+    # written after the sign-off, beside a stale shared stop from before it that the planner
+    # job has not cleared yet: the shared file was not written, so the idea gate would not
+    # offer the probe. And a misroute only the seen-set holds, after the sign-off.
+    stale = _nosig_cfg("stale")
+    _sign(stale, "2026-11-17T12:00:00Z")
+    _machine_mod.write_stop_if_absent(stale["shared_stop_file"], _machine_mod.stop_document(
+        "an older planning stop", "example-org/kit", "planning", {}, at="2026-11-17T08:00:00Z"))
+    _review_stop(stale, "example-org/kit", "2026-11-17T21:32:40Z",
+                 "no routing note from the dispatcher within 120 seconds")
+    stale_lines = _poller_says(stale)
+    expect("stop-waits-on-the-probe",
+           len(stale_lines) == 1 and stale_lines[0].count("stopped since") == 1
+           and "2026-11-17T21:32:40Z" in stale_lines[0]
+           and _machine_mod.read_stop(stale["shared_stop_file"])["at"] == "2026-11-17T08:00:00Z",
+           "the fixture is not a review stop held only in the poller's own record, beside a "
+           "stale shared stop: %r" % stale_lines)
+    seen_only = _nosig_cfg("seenonly")
+    _sign(seen_only, "2026-11-17T12:00:00Z")
+    seen_only_lines = _poller_says(seen_only, seen={"k": dict(
+        misroute_seen["k"], routing={"checked_at": "2026-11-17T21:32:40Z", "reason": "wrong team"})})
+    expect("stop-waits-on-the-probe",
+           len(seen_only_lines) == 1 and "a review ticket misrouted at" in seen_only_lines[0],
+           "the fixture is not a misroute only the seen-set holds: %r" % seen_only_lines)
     stopnolabel = _nosig_cfg("stopnolabel")
     _sign(stopnolabel, "2026-11-17T12:00:00Z")
     _review_stop(stopnolabel, "example-org/kit", "2026-11-17T21:32:40Z", "a late note")
@@ -12212,11 +12261,16 @@ def _selftest_body():
         ("a TELEMETRY LOST line beside the pause", (1, _paused_out(
             live_lines, "TELEMETRY LOST: example-org/kit#75 is due for a re-review, so its "
                         "record is being re-opened\n"))),
+        ("a review stop beside a stale shared stop", (1, _paused_out(stale_lines))),
+        ("a misroute only the seen-set holds, after the sign-off",
+         (1, _paused_out(seen_only_lines))),
         ("a FAIL line beside the stop", (1, _paused_out(
             incident_lines, "FAIL: could not list open PRs on example-org/app: HTTP 502\n"))),
         ("a sign-off that cannot be read", (1, _paused_out(_poller_says(sign_bad)))),
         ("a sign-off that is not one", (1, _paused_out(_poller_says(junk)))),
         ("a stop file that cannot be read", (1, _paused_out(_poller_says(badstop)))),
+        ("a stop file that cannot be read, beside no sign-off",
+         (1, _paused_out(_poller_says(badstop_nosig)))),
         ("a review entry the sign-off does not prove", (1, _paused_out(_poller_says(unproven)))),
         ("a dispatcher version that cannot be read, beside the stop",
          (1, _paused_out(_poller_says(incident, version=None)))),
@@ -12429,6 +12483,13 @@ def _selftest_body():
            and (rowsB.get("code"), rowsB.get("dry-run")) == (WOULD_CHANGE, ALREADY_DONE),
            "with the clone behind, a stop held back Stage E's own installer (the clone's move): "
            "carried on %r, ran %r, asked %r, rows %r" % (carryB, ioB.ran, ioB.asked, rowsB))
+    # …and a review stop the idea gate cannot see stops the one command before the idea gate
+    # too, whose probe would never be offered for it.
+    carrySS, _rSS, ioSS, _repSS = _one_command(_paused_out(stale_lines))
+    expect("stop-waits-on-the-probe",
+           carrySS not in (None, 0) and ("pipeline_stage_a_setup.py", "run") not in ioSS.ran,
+           "a review stop beside a stale shared stop let the one command reach an idea gate that "
+           "would not offer the probe: %r %r" % (carrySS, ioSS.ran))
     carryBS, _rBS, ioBS, _repBS = _one_command(_paused_out(stopnolabel_lines), behind=True,
                                                run_code=EX_OK)
     expect("stop-waits-on-the-probe",

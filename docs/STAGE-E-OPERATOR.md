@@ -2156,8 +2156,9 @@ So the dry run reads a pause as waiting on you when every reason on it is one th
 newer probe sign-off clears, and that the idea gate offers the probe for:
 
 - no sign-off at all;
-- a stop dated after the sign-off: the poller's own, the shared one, or a misroute its
-  record holds;
+- a stop dated after the sign-off, when the shared stop file holds it too. The idea gate
+  reads only that file, so a stop only the poller's own record or its seen-set holds still
+  fails the step, unless the line also says one of the other two;
 - a dispatcher version other than the one the probe was signed on.
 
 It prints one line, `Waiting on you: sign the routing probe.`, naming the paused
