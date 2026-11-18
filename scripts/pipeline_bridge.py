@@ -194,7 +194,9 @@ CATCHES UP AFTER SLEEP
 
   The FIRST pass (no state file) records everything already in the window as seen and
   answers none of it. A state file that cannot be read is refused, never treated as a first
-  pass: the record of open questions is what binds a "yes" to a ticket.
+  pass: the record of open questions is what binds a "yes" to a ticket. So is a state file
+  that is GONE once this job has written one (KIT-677): the pass says "state missing" and
+  stops, and `run --init-state` starts a clean one on purpose.
 
 SAYS WHICH NOTHING IT DID (contract §13)
 
@@ -326,7 +328,7 @@ from pipeline_bridge_config import (CHANNEL_RE, CONFIG_KEYS,  # noqa: E402,F401
                                     epoch, heartbeat_path,
                                     iso, key_of, label_names, live_secrets, load_config,
                                     load_dm_posts, load_pings, load_state, lock_path,
-                                    new_state, run_idea, save_state, state_path,
+                                    new_state, run_idea, save_state, seen_path, state_path,
                                     ticket_number, ts_float, validate_config,
                                     write_heartbeat)
 from pipeline_bridge_requests import (DM_HELP, EDITED_WHY, NO_RE,  # noqa: E402,F401
@@ -2340,6 +2342,53 @@ def _selftest(identity=(True,) * 5, reached=()):
         code, out = run(cfg, slack, tracker)
         check("first-pass-asks-nothing", (code, slack.posts, "first pass" in out),
               (EXIT_OK, [], True))
+        # KIT-677: a state file that was written and is then gone is LOST, not a first pass.
+        cfg7, slack7, tracker7 = world("lost-state")
+        run(cfg7, slack7, tracker7)
+        check("a-first-pass-leaves-a-state-and-the-mark-that-one-was-written",
+              (os.path.exists(state_path(cfg7)), os.path.exists(seen_path(cfg7))), (True, True))
+        os.remove(state_path(cfg7))
+        lost_out = io.StringIO()
+        lost_code = run_command(cfg7, False, 30, slack=slack7, tracker=tracker7, out=lost_out)
+        lost_beat = json.load(open(heartbeat_path(cfg7)))
+        check("a-lost-state-file-ends-the-job-non-zero-and-its-heartbeat-says-state-missing",
+              (lost_code != EXIT_OK, lost_beat["exit"] != EXIT_OK, "state missing" in lost_beat["summary"]),
+              (True, True, True))
+        code7, out7 = run(cfg7, slack7, tracker7)
+        check("a-lost-state-file-stops-the-pass-and-says-so",
+              (code7 != EXIT_OK, "state missing" in out7, os.path.exists(state_path(cfg7))),
+              (True, True, False))
+        init_cfg = os.path.join(os.path.dirname(state_path(cfg7)), "init.json")
+        with open(init_cfg, "w", encoding="utf-8") as fh:
+            json.dump(dict(EXAMPLE_CONFIG, state_dir=cfg7["state_dir"]), fh)
+        seen_flag = []
+        real_run_command = globals()["run_command"]
+        globals()["run_command"] = lambda c, d, t, **k: seen_flag.append(c.get("init_state")) or 0
+        try:
+            main(["run", "--config", init_cfg, "--init-state"])
+            main(["run", "--config", init_cfg])
+        finally:
+            globals()["run_command"] = real_run_command
+        check("the---init-state-flag-reaches-the-pass-through-main-and-only-then",
+              seen_flag, [True, None])
+        code7, out7 = run(dict(cfg7, init_state=True), slack7, tracker7)
+        check("init-state-starts-a-clean-state-on-purpose",
+              (code7, os.path.exists(state_path(cfg7)), "first pass" in out7),
+              (EXIT_OK, True, True))
+        code7, out7 = run(cfg7, slack7, tracker7)
+        check("…and the pass after it needs no flag", code7, EXIT_OK)
+        # A mark that cannot be written is said, never swallowed: a broken link stands where it goes.
+        cfg8 = world("lost-state-unmarked")[0]
+        os.makedirs(cfg8["state_dir"], exist_ok=True)
+        os.symlink(os.path.join(cfg8["state_dir"], "no-such-folder", "mark"), seen_path(cfg8))
+        stderr_was, sys.stderr = sys.stderr, io.StringIO()
+        try:
+            save_state(cfg8, new_state())
+            noted = sys.stderr.getvalue()
+        finally:
+            sys.stderr = stderr_was
+        check("a-mark-that-cannot-be-written-is-said-and-the-state-still-lands",
+              ("lost-state mark" in noted, os.path.exists(state_path(cfg8))), (True, True))
         # KIT-291: the first pass checks each HANDOFF_STATES name on each team, in the log
         # alone. A name a team lacks is said once, and the pass still does its work.
         check("first-pass-finds-every-handoff-lane-and-says-nothing-of-it",
@@ -3942,6 +3991,8 @@ def main(argv=None):
                         choices=("run", "lanes", "name"), default="run")
     parser.add_argument("--config")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--init-state", action="store_true",
+                        help="start a clean state on purpose, when the old one is gone (KIT-677)")
     parser.add_argument("--timeout", type=int, default=None)
     parser.add_argument("--example-config", action="store_true")
     parser.add_argument("--selftest", action="store_true")
@@ -3971,6 +4022,8 @@ def main(argv=None):
     if args.command == "name":
         return name_command(cfg)
     timeout = args.timeout if args.timeout is not None else cfg["run_timeout_seconds"]
+    if args.init_state:
+        cfg = dict(cfg, init_state=True)
     return run_command(cfg, args.dry_run, timeout)
 
 
