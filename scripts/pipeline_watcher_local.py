@@ -29,7 +29,11 @@ THE MONITORS.  Ten, in a fixed order. Each ends in one of four states, and the f
                 first line from an author who is not trusted. The tracker's newest 100 tickets and
                 100 comments, by the one fixed read-only query in pipeline_watcher_tracker.py.
                                                                                           first-hand
-  guard-blocks, egress, outside-files, approval-rate
+  outside-files a pull request that changes files its ticket does not name or imply (KIT-831).
+                The PR's file list from GitHub, the files and areas the ticket's text names, from
+                the tracker. A ticket that names none is "could not judge", never clear.
+                                                                                          first-hand
+  guard-blocks, egress, approval-rate
                 OFF, each with its reason: a producer does not exist yet.
 
 THE FOUR STATES (contract section 13).
@@ -111,11 +115,11 @@ LEVEL_ORDER = {RECORD: 1, PAGE: 2, PAUSE: 3}
 MONITORS = ("spend", "runs", "labels", "markers", "injection", "tracker-text", "guard-blocks",
             "egress", "outside-files", "approval-rate")
 KIND = {"spend": "second-hand", "runs": "second-hand", "labels": "first-hand",
-        "markers": "first-hand", "injection": "first-hand", "tracker-text": "first-hand"}
+        "markers": "first-hand", "injection": "first-hand", "tracker-text": "first-hand",
+        "outside-files": "first-hand"}
 OFF_BY_DESIGN = {
     "guard-blocks": "no producer: nothing records a guard block yet (KIT-11)",
     "egress": "no producer: the proxy's refusal line is unconfirmed (KIT-88)",
-    "outside-files": "needs each ticket's declared files (KIT-518)",
     "approval-rate": "no producer: the validator does not exist yet (KIT-510)",
 }
 
@@ -555,11 +559,13 @@ def which_on(cfg):
     gh = None if cfg["repos"] else "no repository is named in `repos`"
     for m in ("labels", "markers", "injection"):
         off[m] = gh
-    off["tracker-text"] = (
+    off["tracker-text"] = off["outside-files"] = (
         "no linear_key_env is named" if not cfg["linear_key_env"] else
         "no tracker_teams are named" if not cfg["tracker_teams"] else
         "no tracker_trusted_users are named: without them every marker would look forged"
         if not cfg["tracker_trusted_users"] else None)
+    # outside-files reads GitHub and the tracker both, so it needs both's settings.
+    off["outside-files"] = gh or off["outside-files"]
     for m, why in OFF_BY_DESIGN.items():
         off[m] = why
     return off
@@ -1215,6 +1221,168 @@ def monitor_tracker_text(cfg, tr, now):
 
 
 # --------------------------------------------------------------------------- #
+# Work outside a ticket's files (KIT-831)
+# --------------------------------------------------------------------------- #
+BRANCH_TICKET_RE = re.compile(r"^[a-z]+/([a-z][a-z0-9]{0,9}-[0-9]{1,7})(?:-|\Z)")
+SCOPE_WORD_RE = re.compile(r"^[A-Za-z0-9_.*/-]{1,200}\Z")
+SCOPE_EXT_RE = re.compile(r"^[^/]*[A-Za-z0-9_-]{2}\.[A-Za-z][A-Za-z0-9]{0,4}\Z")
+SCOPE_SPLIT_RE = re.compile(r"[\s`\"'(),;:<>\[\]]+")
+SAFE_PATH_RE = re.compile(r"^[A-Za-z0-9_.:/#-]{1,120}\Z")
+OUTSIDE_ALLOWANCE = 3         # up to this many files outside the named ones is recorded, not paged
+OUTSIDE_NAMED = 5             # files named in findings, per pull request
+MAX_SCOPE_TOKENS = 200
+FILES_PAGE_LIMIT = 3000       # GitHub lists no more than this many files of one pull request
+
+
+def scope_tokens(text):
+    """The files and areas a ticket's text names: words that hold a `/` or end in a file extension,
+    with no `..`, no leading `/` and no web link. Words are read, never run, and capped."""
+    found = []
+    for raw in SCOPE_SPLIT_RE.split(text[:SCAN_CAP] if isinstance(text, str) else ""):
+        word = raw.strip(".")
+        if word.startswith("./"):
+            word = word[2:]
+        if (not word or not SCOPE_WORD_RE.match(word) or ".." in word or word.startswith("/")
+                or "//" in word or not ("/" in word or SCOPE_EXT_RE.match(word))):
+            continue
+        if word not in found:
+            found.append(word)
+        if len(found) >= MAX_SCOPE_TOKENS:
+            break
+    return found
+
+
+def _glob_re(token):
+    return re.compile("^" + "".join(".*" if c == "*" else re.escape(c) for c in token) + r"\Z")
+
+
+def named_by(path, tokens):
+    """Whether the ticket's scope covers a changed file: the file itself, anything under a named
+    folder, a glob, a bare file name, or a file beside a named file (a test or a doc kept next to it)."""
+    folder = path.rsplit("/", 1)[0] if "/" in path else ""
+    for t in tokens:
+        if "*" in t:
+            if _glob_re(t).match(path):
+                return True
+        elif "/" not in t:
+            if path.rsplit("/", 1)[-1] == t:
+                return True
+        elif t.endswith("/"):
+            if path.startswith(t):
+                return True
+        elif path == t or path.startswith(t + "/"):
+            return True
+        elif folder and t.rsplit("/", 1)[0] == folder and "." in t.rsplit("/", 1)[-1]:
+            return True
+    return False
+
+
+def _pr_files(gh, repo, number, max_pages):
+    """(file names, why not). The names are what was read, even when the list was cut short."""
+    files = []
+    for n in range(1, max_pages + 1):
+        try:
+            batch = gh.ask("files", "/repos/%s/pulls/%d/files?per_page=%d&page=%d"
+                           % (repo, number, PAGE_SIZE, n))
+        except SourceError as exc:
+            return files, _line(str(exc), 80)
+        if not isinstance(batch, list):
+            return files, "GitHub's answer held no list"
+        for f in batch:
+            if not isinstance(f, dict) or not isinstance(f.get("filename"), str):
+                return files, "a file entry named no file"
+            files.append(f["filename"])
+            if isinstance(f.get("previous_filename"), str):
+                files.append(f["previous_filename"])
+        if len(batch) < PAGE_SIZE:
+            return files, ("as many files as GitHub lists, so some may be missing"
+                           if len(files) >= FILES_PAGE_LIMIT else None)
+    return files, "the list ran past max_pages"
+
+
+def monitor_outside_files(cfg, gh, tr, now):
+    """Each pull request updated inside the lookback: its changed files against the files and areas
+    its ticket names. The ticket is the one the branch name claims, and a branch is the worker's
+    word, so this is a tripwire. A pull request that names no ticket, a ticket that names nothing
+    or was not written by a trusted user, and a file list that could not be read all say so: none
+    of them is clear."""
+    name, found, incomplete, since = "outside-files", [], [], _since(cfg, now)
+    trusted, teams = set(cfg["tracker_trusted_users"]), set(cfg["tracker_teams"])
+    try:
+        issues, _unused = tr.ask("tracker", "text")
+    except SourceError as exc:
+        return blind(name, _line(str(exc)), *gh.feed_stats("pulls", "files"))
+    by_ident = dict((i["identifier"], i) for i in issues
+                    if isinstance(i, dict) and isinstance(i.get("identifier"), str))
+    judged_n = unjudged = 0
+    for repo in cfg["repos"]:
+        pulls, complete, why = read_pages(
+            gh, "pulls", lambda n, r=repo: ("/repos/%s/pulls?state=all&sort=updated&direction=desc"
+                                            "&per_page=%d&page=%d" % (r, PAGE_SIZE, n)),
+            cfg["max_pages"],
+            stop=lambda batch: (_epoch((batch[-1] or {}).get("updated_at")) or since + 1) < since
+            if batch and isinstance(batch[-1], dict) else False)
+        if not complete:
+            incomplete.append((repo, why))
+        for p in pulls:
+            at, number = _epoch(p.get("updated_at")), p.get("number")
+            if at is None or at < since:
+                continue
+            if not isinstance(number, int) or isinstance(number, bool) or number < 1:
+                incomplete.append((repo, "a pull request named no number"))
+                continue
+            ref, url = _ref(repo, number), _url(repo, "pull", number)
+            user = p.get("user") if isinstance(p.get("user"), dict) else {}
+            head = p.get("head") if isinstance(p.get("head"), dict) else {}
+            m = BRANCH_TICKET_RE.match(head.get("ref").lower()) if isinstance(head.get("ref"), str) else None
+            ident = m.group(1).upper() if m else None
+            if ident is None or ident.split("-")[0] not in teams:
+                found.append(finding(RECORD, "no-scope", ref, actor=user.get("login"),
+                                     at=p.get("updated_at"), url=url))
+                unjudged += 1
+                continue
+            ticket = by_ident.get(ident)
+            if ticket is None:
+                incomplete.append((repo, "a pull request names a ticket the tracker's newest page did not hold"))
+                continue
+            made = ticket.get("creator") if isinstance(ticket.get("creator"), dict) else {}
+            tokens = scope_tokens("%s\n%s" % (
+                ticket.get("title") if isinstance(ticket.get("title"), str) else "",
+                ticket.get("description") if isinstance(ticket.get("description"), str) else ""))
+            if made.get("id") not in trusted or not tokens:
+                found.append(finding(RECORD, "no-scope", ref, actor=user.get("login"),
+                                     at=p.get("updated_at"), url=url))
+                unjudged += 1
+                continue
+            files, cut = _pr_files(gh, repo, number, cfg["max_pages"])
+            if cut:
+                incomplete.append((repo, "the files of %s were not all read: %s" % (ref, cut)))
+            if not files:
+                continue
+            judged_n += 1
+            outside = sorted(set(f for f in files if not named_by(f, tokens)))
+            if not outside:
+                continue
+            level = PAGE if len(outside) > OUTSIDE_ALLOWANCE else RECORD
+            found.append(finding(level, "outside-files", ref, actor=user.get("login"),
+                                 at=p.get("updated_at"), url=url, count=len(outside)))
+            named = [x for x in outside if SAFE_PATH_RE.match(x) and len(ref) + len(x) < 190]
+            for path in named[:OUTSIDE_NAMED]:
+                found.append(finding(level, "outside-file", "%s:%s" % (ref, path),
+                                     actor=user.get("login"), at=p.get("updated_at"), url=url))
+    if judged_n == 0 and unjudged:
+        incomplete.append(("all", "no pull request could be judged: none named a ticket that names files or "
+                                  "areas, so nothing was compared"))
+    asked, answered, read_at = gh.feed_stats("pulls", "files")
+    said = ("read the files of %d pull request(s) in %d repositor%s since %s: %d changed files outside "
+            "what the ticket names, %d could not be judged (no ticket named, no files or areas named, "
+            "or the ticket's writer not trusted)"
+            % (judged_n, len(cfg["repos"]), "y" if len(cfg["repos"]) == 1 else "ies", _iso(since),
+               sum(1 for f in found if f["what"] == "outside-files"), unjudged))
+    return judged(name, found, said, _gaps(incomplete), asked, answered, read_at)
+
+
+# --------------------------------------------------------------------------- #
 # One pass
 # --------------------------------------------------------------------------- #
 def credential(environ, name):
@@ -1260,7 +1428,7 @@ def build(cfg, environ=None, gh=None, now=None, clock=None, tracker=None):
     off = which_on(cfg)
     results = []
     token = token_why = None
-    if any(off[m] is None for m in ("labels", "markers", "injection")):
+    if any(off[m] is None for m in ("labels", "markers", "injection", "outside-files")):
         token, token_why = credential(environ, cfg["github_token_env"])
     # No credential means no GitHub, whatever transport a caller stood in for it.
     get = None if not token else (gh if gh is not None else (lambda path: github_get(path, token)))
@@ -1268,7 +1436,7 @@ def build(cfg, environ=None, gh=None, now=None, clock=None, tracker=None):
     # The tracker has its own key and its own counter. No credential means no tracker, whatever
     # transport a caller stood in for it.
     tkey = tkey_why = None
-    if off["tracker-text"] is None:
+    if off["tracker-text"] is None or off["outside-files"] is None:
         tkey, tkey_why = credential(environ, cfg["linear_key_env"])
 
     def tracker_get(_path):
@@ -1287,7 +1455,8 @@ def build(cfg, environ=None, gh=None, now=None, clock=None, tracker=None):
                "labels": lambda: monitor_labels(cfg, github, started),
                "markers": lambda: monitor_markers(cfg, github, started),
                "injection": lambda: monitor_injection(cfg, github, started),
-               "tracker-text": lambda: monitor_tracker_text(cfg, tracker_gh, started)}
+               "tracker-text": lambda: monitor_tracker_text(cfg, tracker_gh, started),
+               "outside-files": lambda: monitor_outside_files(cfg, github, tracker_gh, started)}
     for name in MONITORS:
         if off[name] is not None:
             results.append(monitor(name, OFF, "not on", off[name]))
@@ -1749,7 +1918,7 @@ def selftest():
             on = [m for m in doc["monitors"] if m["state"] != OFF]
             check("rules file %s: every monitor that is on is blind, by name, exit 4" % label,
                   (code, doc["result"], len(on), all(m["state"] == BLIND and why in m["reason"]
-                                                      for m in on)), (EXIT_BLIND, "blind", 6, True))
+                                                      for m in on)), (EXIT_BLIND, "blind", 7, True))
             if os.path.islink(cfg_path):
                 os.unlink(cfg_path)
         # An unsafe rules file also names where the output goes: it may replace only a file this
@@ -2256,6 +2425,101 @@ def selftest():
               ('method="POST"' in open(os.path.abspath(__file__), encoding="utf-8").read().split(
                   "\n# SELFTEST: " + "nothing below", 1)[0].split('"""', 2)[2]), False)
 
+        # -- KIT-831: outside-files, a pull request's files against what its ticket names ---------------------------------------
+        def opr(n, ref="feat/kit-1-x", minutes=5):
+            return {"number": n, "updated_at": ago(minutes), "user": {"login": "the-owner", "type": "User"},
+                    "head": {"ref": ref}}
+
+        def files_of(names):
+            return [{"filename": x} for x in names]
+
+        def go_o(issues, pulls, files, environ=None, **over):
+            """files: {pull number: list of names | an exception}. A path no case named is a 404."""
+            answers = {}
+            for num, names in files.items():
+                answers["/repos/%s/pulls/%d/files" % (R, num)] = (
+                    names if isinstance(names, Exception) else files_of(names))
+            answers.update({EV: [], CM: [], PL: list(pulls)})
+            over = dict({"linear_key_env": "WL", "tracker_teams": ["KIT"],
+                         "tracker_trusted_users": [OWNER_ID, AGENT_ID]}, **over)
+            put(cfg_path, raw_cfg(**over))
+            code = run(cfg_path, environ=TENV if environ is None else environ, gh=FakeGH(answers),
+                       tracker=tk(issues), now=lambda: NOW, clock=lambda: 0.0, say=[].append)
+            return code, mon(written(), "outside-files")
+
+        SCOPED = tissue("KIT-1", desc="Change `scripts/foo.py` and the docs/ folder; see PIPELINE-CONTRACT.md "
+                                      "and scripts/lib/*.py, and e.g. nothing else.")
+        code, m = go_o([SCOPED], [opr(7)], {7: ["scripts/foo.py", "docs/a/b.md", "PIPELINE-CONTRACT.md",
+                                                 "scripts/lib/x.py", "scripts/test_foo.py", "docs/x.md"]})
+        check("outside-files: files inside what the ticket names, beside it, or by glob are clear, and it says so",
+              (m["state"], m["kind"], m["findings"]), (CLEAR, "first-hand", []))
+        ok("outside-files: ...it says how many pull requests it read", "files of 1 pull request" in m["said"], m["said"])
+        code, m = go_o([SCOPED], [opr(7)], {7: ["scripts/foo.py", "src/a.py", "src/b.py", "src/c.py", "src/d.py"]})
+        check("outside-files: more than three files outside is a page, and names the files",
+              (m["state"], [(f["what"], f["level"], f["count"]) for f in m["findings"]][:1],
+               sorted(f["ref"] for f in m["findings"] if f["what"] == "outside-file")),
+              (FLAGGED, [("outside-files", PAGE, 4)],
+               ["%s#7:src/%s.py" % (R, x) for x in "abcd"]))
+        code, m = go_o([SCOPED], [opr(7)], {7: ["scripts/foo.py", "src/a.py", "src/b.py"]})
+        check("outside-files: a few files outside are recorded, not paged",
+              (m["state"], [f["level"] for f in m["findings"]]), (CLEAR, [RECORD, RECORD, RECORD]))
+        code, m = go_o([SCOPED], [opr(7)], {7: ["scripts/foo.py"] + ["x y/%d.py" % i for i in range(5)]})
+        check("outside-files: a file name outside the safe characters is counted, never named",
+              (m["state"], [(f["what"], f["count"]) for f in m["findings"]]), (FLAGGED, [("outside-files", 5)]))
+        code, m = go_o([SCOPED], [opr(7)], {7: [{"filename": "scripts/foo.py", "previous_filename": "src/old.py"}]})
+        # a rename's old path counts too (the dict is not a name, so it is the unreadable-entry case below)
+        check("outside-files: a file entry that names no file is blind, never clear", m["state"], BLIND)
+        BARE = tissue("KIT-1", desc="Make the watcher better somehow.")
+        code, m = go_o([BARE], [opr(7)], {7: ["src/a.py"]})
+        check("outside-files: a ticket that names no files is could-not-judge, and with nothing else judged it is blind",
+              (m["state"], [(f["what"], f["level"]) for f in m["findings"]]), (BLIND, [("no-scope", RECORD)]))
+        code, m = go_o([BARE, tissue("KIT-2", desc="Edit scripts/bar.py")], [opr(7), opr(8, "fix/kit-2-y")],
+                       {8: ["scripts/bar.py"]})
+        check("outside-files: ...beside a pull request that was judged it is a record, and the monitor is clear",
+              (m["state"], [f["what"] for f in m["findings"]]), (CLEAR, ["no-scope"]))
+        ok("outside-files: ...and it counts the one it could not judge", "1 could not be judged" in m["said"], m["said"])
+        code, m = go_o([tissue("KIT-1", desc="Edit scripts/foo.py", creator=STRANGER)], [opr(7)], {7: ["src/a.py"]})
+        check("outside-files: a scope written by a stranger is not trusted: could-not-judge",
+              (m["state"], [f["what"] for f in m["findings"]]), (BLIND, ["no-scope"]))
+        code, m = go_o([SCOPED], [opr(7, "my-branch")], {})
+        check("outside-files: a pull request that names no ticket is could-not-judge, never clear",
+              (m["state"], [f["what"] for f in m["findings"]]), (BLIND, ["no-scope"]))
+        code, m = go_o([SCOPED], [opr(7, "feat/other-5-x")], {})
+        check("outside-files: a ticket of another team is not looked up",
+              (m["state"], [f["what"] for f in m["findings"]]), (BLIND, ["no-scope"]))
+        code, m = go_o([SCOPED], [opr(7, "feat/kit-9-x")], {7: ["src/a.py"]})
+        check("outside-files: a ticket the tracker page did not hold is blind, never clear",
+              (m["state"], "newest page" in m["reason"]), (BLIND, True))
+        code, m = go_o([SCOPED], [opr(7)], {7: SourceError("GitHub answered HTTP 500", whole=False)})
+        check("outside-files: a pull request whose files could not be read is blind, never clear",
+              (m["state"], "KIT" not in m["reason"], "could not be read" in m["reason"] or "not all read" in m["reason"]),
+              (BLIND, True, True))
+        code, m = go_o([SCOPED], [opr(7), opr(8)], {7: SourceError("GitHub answered HTTP 500", whole=False),
+                                                     8: ["src/a.py"] * 1 + ["src/%d.py" % i for i in range(4)]})
+        check("outside-files: one unreadable pull request does not hide a flagged one",
+              (m["state"], "could not be read" in m["reason"] or "not all read" in m["reason"]), (FLAGGED, True))
+        code, m = go_o([SCOPED], [opr(7, minutes=60 * 40)], {})
+        check("outside-files: a pull request not updated within the lookback is not read",
+              (m["state"], m["findings"]), (CLEAR, []))
+        code, m = go_o([SCOPED], [opr(7)], {7: ["src/a.py"]}, environ=dict(ENV))
+        check("outside-files: no tracker key in the environment is blind, never clear", m["state"], BLIND)
+        for label, over in (("no linear_key_env", {"linear_key_env": ""}), ("no tracker_teams", {"tracker_teams": []}),
+                            ("no repos", {"repos": []})):
+            put(cfg_path, raw_cfg(**dict({"linear_key_env": "WL", "tracker_teams": ["KIT"],
+                                          "tracker_trusted_users": [OWNER_ID]}, **over)))
+            code = run(cfg_path, environ=TENV, gh=FakeGH({EV: [], CM: [], PL: []}), tracker=tk(),
+                       now=lambda: NOW, clock=lambda: 0.0, say=[].append)
+            m = mon(written(), "outside-files")
+            check("outside-files: %s is off, with its reason" % label, (m["state"], bool(m["reason"])), (OFF, True))
+        check("outside-files: scope words are files and areas, never a link or a path out of the repository",
+              scope_tokens("see https://x.io/a/b and ../etc/passwd and /abs/p.py and `docs/` and foo.py, e.g."),
+              ["docs/", "foo.py"])
+        check("outside-files: the glob, bare name, folder and sibling rules",
+              [named_by(p, ["scripts/*.py"]) for p in ("scripts/a.py", "scripts/a/b.py", "docs/a.py")]
+              + [named_by("a/b/NOTES.md", ["NOTES.md"]), named_by("docs/z.md", ["docs/"]),
+                 named_by("docs", ["docs/"]), named_by("src/b.py", ["src/a.py"]), named_by("srcx/b.py", ["src/"])],
+              [True, True, False, True, True, False, True, False])
+
         # -- KIT-517: the watcher checks its own files against the manifest, every pass ------------------------------------------
         inst = os.path.join(tmp, "install")
         for sub in ("scripts", "schemas", "etc"):
@@ -2357,7 +2621,7 @@ def selftest():
         check("install: a mismatch makes every monitor that could be on blind, by name, and the pass exit 4",
               (code_i, len(on_i), all(m["state"] == BLIND and "do not match" in m["reason"] and
                                       "scripts/check_schemas.py" in m["reason"] for m in on_i)),
-              (EXIT_BLIND, 6, True))
+              (EXIT_BLIND, 7, True))
         check("install: ...and it is said, loud, in the pass's own output",
               any("do not match" in line for line in said_i), True)
         try:

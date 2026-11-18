@@ -87,7 +87,7 @@
       "additionalProperties": false,
       "properties": {
         "level": {"$ref": "#/$defs/level", "description": "`pause`: something got through, or money is moving. `page`: an attempt readers ignored. `record`: noted, never paged."},
-        "what": {"enum": ["spend-day", "spend-piece", "key-run", "runs-day", "runs-piece", "protected-label", "forged-marker", "shape-fence-tag", "shape-ignore-instructions", "shape-system-tag", "shape-secret-ask", "shape-hidden-char"], "description": "A word from a closed list. The names of the shapes say which pattern matched, never what the text said."},
+        "what": {"enum": ["spend-day", "spend-piece", "key-run", "runs-day", "runs-piece", "protected-label", "forged-marker", "shape-fence-tag", "shape-ignore-instructions", "shape-system-tag", "shape-secret-ask", "shape-hidden-char", "outside-files", "outside-file", "no-scope"], "description": "A word from a closed list. The names of the shapes say which pattern matched, never what the text said."},
         "ref": {"type": "string", "pattern": "^[A-Za-z0-9_.:/#-]{1,200}$", "description": "What it is about: a local date, a ticket id, or a pull request or issue as `owner/name#N`."},
         "actor": {"type": ["string", "null"], "pattern": "^[A-Za-z0-9][A-Za-z0-9-]{0,38}(\\[bot\\])?$", "description": "A GitHub login: who applied the label, or wrote the text. Null when the source gave none."},
         "at": {"$ref": "#/$defs/time_or_null"},

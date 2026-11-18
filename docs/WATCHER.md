@@ -20,9 +20,22 @@ its job are KIT-517. The way it pauses the system is KIT-515, and its urgent pag
 | `injection` | Shapes that try to steer an AI reading the text: closing the kit's fence, "ignore the previous instructions", a system-role tag, a request to print a secret, and characters a reader can't see. | GitHub's comments and pull requests |
 
 | `tracker-text` | The same shapes in ticket and comment text, and a pipeline marker on a comment's first line from an author who is not trusted. The tracker's newest 100 tickets and 100 comments. | The tracker, by one fixed read-only query |
+| `outside-files` | A pull request that changes files its ticket does not name. More than three files outside is a `page`; one to three is a `record`. | GitHub's pull request file lists, and the tracker |
 
-Four more are listed as `off`, each with its reason, until something writes their signal: guard blocks,
-egress refusals, work outside a ticket's files, and the validator's approval rate (KIT-518). The file
+**What `outside-files` counts as named (KIT-831).** The files and areas a ticket names are the path-like words in
+its title and description: a word with a `/` or a file extension, such as `scripts/foo.py`, `docs/` or `*.md`. A
+changed file is named if it is one of them, is under a named folder, matches a named glob, has a named bare file
+name, or sits in the same folder as a named file. The ticket is the one the pull request's branch name claims, and
+a branch is the worker's own word, so this is a tripwire, not a lock. It reads a scope only from a ticket a
+trusted user wrote (`tracker_trusted_users`). It needs `repos`, the three tracker settings and the GitHub token,
+and is on whenever `tracker-text` is.
+
+Good: `no-scope` at `record` on a pull request whose ticket names no files, with the monitor `clear` beside
+pull requests that were judged. Not that: a pull request nobody could judge counted as clean. When nothing at
+all could be judged the monitor is `blind`.
+
+Three more are listed as `off`, each with its reason, until something writes their signal: guard blocks,
+egress refusals, and the validator's approval rate (KIT-518). The file
 always says how many monitors are on.
 
 **Where the judge's cost shows (KIT-569).** The usage file counts the watcher judge's model calls as runs of
