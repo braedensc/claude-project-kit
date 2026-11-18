@@ -18,13 +18,15 @@ program that runs it, never a terminal, a file or an argument: {"schema": "runne
 "consent": "yes"}. Answers it cannot read exit 2; anything but a yes changes nothing and exits 10.
 With no live sudo it exits 5.
 
-EVERY LANE OFF.  The settings it writes give every project every lane off. Switching one on is the
-owner's yes, per project, and never this file's. `enabled` is the part's own switch: a part already
-on stays on. Otherwise its first pass is counted, the requests waiting in its store and its
-unfinished runs. At or below the part's ceiling in pipeline-parts.json it is switched on: `enabled`
-true, `launchctl enable`, loaded. Above it, it is installed and left off: `enabled` false,
-`launchctl disable`, not loaded, and the document's `left_off` says why in one line. A ceiling it
-cannot read leaves it off too.
+EVERY LANE OFF.  It writes only the settings it owns, from runner.conf, and gives a new project every
+lane off. Switching one on is the owner's yes, per project, and never this file's: so a lane he
+switched on, his approved states and every other key it does not write are kept as installed. A file
+that is not one JSON object is never written over. `enabled` is the part's own switch, and once
+installed it is kept: on stays on, and off (left off by an install, or switched off by him) is never
+switched back on here. A first install counts its first pass: the requests waiting in its store and
+its unfinished runs. At or below the part's ceiling in pipeline-parts.json it is switched on: `enabled`
+true, `launchctl enable`, loaded. Above it, or with a ceiling it cannot read, it is installed and left
+off: `enabled` false, `launchctl disable`, not loaded. The document's `left_off` says why, in one line.
 
 ITS JOB.  One LaunchDaemon as the role account, kept alive, running the runner from Stage E's kit
 clone, which Stage E's `run` moves and restarts it around. The file says Disabled, so the file alone
@@ -184,21 +186,35 @@ def part_ceiling(root=KIT):
     return got[0] if ok else None
 
 
-# ── what it composes: the runner's settings and its job, from the conf alone ───────────────────────────────
-def compose(c, on):
-    """The runner's settings. Every lane is off for every project: no line here can switch one on."""
-    d = c["RUNNER_DIR"].rstrip("/")
-    return {"enabled": bool(on), "store_dir": d + "/store", "work_dir": d + "/work", "session_home": d + "/home",
-            "claude_bin": c["CLAUDE_BIN"], "token_env": c["TOKEN_ENV"], "linear_key_file": d + "/tracker-key",
-            "owner_user_ids": split_list(c["OWNER_USER_IDS"]),
-            "dispatcher_user_ids": split_list(c["DISPATCHER_USER_IDS"]),
-            "projects": dict((k, {"repo": repo, "base": base, "lanes": dict.fromkeys(store.KINDS, False)})
-                             for k, (repo, base) in sorted(projects(c["PROJECTS"])[0].items()))}
+# ── what it composes: the runner's settings and its job, from the conf and what is installed ───────────────
+# The keys this installer owns. Every other key in the installed settings is the owner's, and is kept.
+OWNED = ("enabled", "store_dir", "work_dir", "session_home", "claude_bin", "token_env", "linear_key_file",
+         "owner_user_ids", "dispatcher_user_ids", "projects")
+PROJECT_OWNED = ("repo", "base")
 
 
-def settings_body(c, on, home):
+def compose(c, on, was=None):
+    """The runner's settings: the keys it owns from the conf, the rest of `was` (the installed settings) as it
+    is. A project the conf names keeps its own lanes, approved states and hosts; a new one gets every lane off.
+    No line here switches a lane on."""
+    d, was = c["RUNNER_DIR"].rstrip("/"), was if isinstance(was, dict) else {}
+    old = was.get("projects") if isinstance(was.get("projects"), dict) else {}
+    doc = dict((k, v) for k, v in was.items() if k not in OWNED)
+    doc.update({"enabled": bool(on), "store_dir": d + "/store", "work_dir": d + "/work", "session_home": d + "/home",
+                "claude_bin": c["CLAUDE_BIN"], "token_env": c["TOKEN_ENV"], "linear_key_file": d + "/tracker-key",
+                "owner_user_ids": split_list(c["OWNER_USER_IDS"]),
+                "dispatcher_user_ids": split_list(c["DISPATCHER_USER_IDS"]), "projects": {}})
+    for k, (repo, base) in sorted(projects(c["PROJECTS"])[0].items()):
+        mine = old.get(k) if isinstance(old.get(k), dict) else {}
+        p = dict((pk, pv) for pk, pv in mine.items() if pk not in PROJECT_OWNED)
+        p.setdefault("lanes", dict.fromkeys(store.KINDS, False))
+        doc["projects"][k] = dict(p, repo=repo, base=base)
+    return doc
+
+
+def settings_body(c, on, home, was=None):
     """The settings file's bytes, or SetupError when the runner's own loader refuses them."""
-    doc = compose(c, on)
+    doc = compose(c, on, was)
     _cfg, bad = runner_job.load_config(qs.with_home(doc, home))
     if bad:
         raise SetupError("the runner's own loader REFUSES these settings, so nothing was written: %s" % "; ".join(bad))
@@ -339,44 +355,67 @@ def first_pass(ctx):
     return (0, 0) if m.group(1) == "absent" else (int(m.group(2)), int(m.group(3)))
 
 
-def step_settings(ctx, apply_it):
-    """The runner's settings as installed: every lane off for every project, and its switch."""
-    if not ctx.home:
-        raise Unknown("waits on `home`", "clear that row first")
-    c, path = ctx.conf, settings_path(ctx.conf)
+def installed(ctx, path):
+    """(text, mode, document) of the settings the role account holds, or (None, mode, None). A file that is
+    not one JSON object is never written over: what it holds may be the owner's."""
     have, mode = qs.read_role_file(ctx, path)
+    if have is None:
+        return None, mode, None
     try:
-        was = json.loads(have) if have is not None else None
+        was = json.loads(have)
     except ValueError:
-        was = "unreadable"
-    if isinstance(was, dict) and was.get("enabled") is True:
-        ctx.on, why = True, "on before, so it stays on"
+        was = None
+    if not isinstance(was, dict):
+        raise SetupError("%s is not one JSON object, so nothing was written over it: fix it, or move it aside, "
+                         "then run this again" % path)
+    return have, mode, was
+
+
+def decide(ctx, was, path):
+    """(on, why). Installed, the switch is kept: on stays on, and off is never switched back on here. A first
+    install is decided by its first pass against the part's ceiling. Sets ctx.left_off and ctx.first."""
+    if was is not None:
+        on = was.get("enabled") is True
+        why = "on before, so it stays on" if on else (
+            "its settings say enabled is false, as an earlier install left it or as you set it. Set it to true in "
+            "%s to switch it on" % path)
     elif ctx.ceiling is None:
-        ctx.on, why = False, "its first-pass ceiling could not be read"
-        ctx.left_off = "left off: " + why
+        on, why = False, "its first-pass ceiling could not be read"
     else:
         waiting, unfinished = first_pass(ctx)
         ctx.first = waiting + unfinished
-        ctx.on = ctx.first <= ctx.ceiling
+        on = ctx.first <= ctx.ceiling
         why = "its first pass would act on %d waiting request(s) and %d unfinished run(s), %s its ceiling of %d" % (
-            waiting, unfinished, "within" if ctx.on else "above", ctx.ceiling)
-        ctx.left_off = None if ctx.on else "left off: " + why
-    body = settings_body(c, ctx.on, ctx.home)
+            waiting, unfinished, "within" if on else "above", ctx.ceiling)
+    ctx.left_off = None if on else "left off: " + why
+    return on, why
+
+
+def step_settings(ctx, apply_it):
+    """The runner's settings as installed: what it owns from the conf, every lane off for a new project, the
+    owner's own keys kept, and its switch."""
+    if not ctx.home:
+        raise Unknown("waits on `home`", "clear that row first")
+    c, path = ctx.conf, settings_path(ctx.conf)
+    have, mode, was = installed(ctx, path)
+    ctx.on, why = decide(ctx, was, path)
+    body = settings_body(c, ctx.on, ctx.home, was)
     said = "enabled %s (%s); installed: %s" % ("true" if ctx.on else "false", why, lanes_said(was))
     if have == body and mode == "600":
         return True, "%s is current: %s" % (path, said)
     state = "absent" if have is None else "differs" if have != body else "mode " + mode
     keys = ", ".join(sorted(projects(c["PROJECTS"])[0]))
     if not apply_it:
-        return False, "would write %s (%s) with every lane off for %s; %s" % (path, state, keys, said)
+        return False, "would write %s (%s) for %s, each lane kept as installed, every lane off for a new " \
+                      "project; %s" % (path, state, keys, said)
     res = ctx.as_role(ns.CONFIG_WRITE_SH.replace("@F@", ns._q(path)), "writing " + path, stdin=body,
                       why="write %s (mode 600)" % path)
     back, mode = qs.read_role_file(ctx, path) if res.ok else (None, "")
     if back != body or mode != "600":
         raise SetupError("could not write %s as %s, or reading it back does not match (exit %d, mode %s)"
                          % (path, ctx.account, res.rc, mode))
-    return False, "wrote %s with every lane off for %s, enabled %s (%s)" % (
-        path, keys, "true" if ctx.on else "false", why)
+    return False, "wrote %s for %s, each lane kept as installed, every lane off for a new project; enabled %s " \
+                  "(%s)" % (path, keys, "true" if ctx.on else "false", why)
 
 
 def loaded(ctx, label):
@@ -830,8 +869,8 @@ def _cases(check, tmp):  # noqa: C901  (one battery, read top to bottom)
     case("apply: settings with every lane off for every project, on within the ceiling, the job loaded; a check "
          "then finds it current, and every sudo call was `sudo -n`", fresh_apply,
          (0, (True, ["app", "web"], {False}), (True, True, True), True, 0, {ALREADY_DONE}, True, True),
-         ("a lane written on", [(me, "compose", lambda c, on, real=compose: dict(real(c, on), projects=dict(
-             (k, dict(p, lanes=dict(p["lanes"], review=True))) for k, p in real(c, on)["projects"].items())))]),
+         ("a lane written on", [(me, "compose", lambda c, on, was=None, real=compose: dict(real(c, on, was), projects=dict(
+             (k, dict(p, lanes=dict(p["lanes"], review=True))) for k, p in real(c, on, was)["projects"].items())))]),
          ("never enabled at boot", [(me, "boot", lambda ctx, lab: True)]),
          ("a sudo that may ask", [(Runner, "as_root", lambda self, argv, why=None, stdin=None, timeout=300:
                                    self.read(["sudo"] + list(argv), stdin, timeout))]))
@@ -867,6 +906,55 @@ def _cases(check, tmp):  # noqa: C901  (one battery, read top to bottom)
         return go(fake, "apply")[0], settings(fake)[0], job(fake)[2]
     case("on before, so it stays on", stays_on, (0, True, True),
          ("the switch read afresh", [(qs, "read_role_file", lambda ctx, path: (None, ""))]))
+
+    # 5b. The owner's own: a lane he switched on, his approved states and limits survive an apply, and an
+    #     explicit off is never switched back on. A file that is not JSON is never written over.
+    def hand_edit(fake, **changes):
+        path = fake.home + "/.pipeline-runner/runner.json"
+        with open(path) as fh:
+            doc = json.load(fh)
+        for key, value in changes.items():
+            doc[key] = value
+        doc["projects"]["app"]["lanes"]["review"] = changes.get("enabled", True) is not False
+        doc["projects"]["app"]["approval_states"] = {"review": ["st-1"]}
+        _put(path, json.dumps(doc, indent=2, sort_keys=True) + "\n")
+        return path
+
+    def kept():
+        fake = world()
+        go(fake, "apply")
+        path = hand_edit(fake, limits={"wall_minutes": 120})
+        code = go(fake, "apply")[0]
+        with open(path) as fh:
+            after = json.load(fh)
+        app = after["projects"]["app"]
+        return code, app["lanes"].get("review"), app.get("approval_states"), after.get("limits"), \
+            set(after["projects"]["web"]["lanes"].values())
+    case("a lane the owner switched on, his approved states and his limits survive an apply", kept,
+         (0, True, {"review": ["st-1"]}, {"wall_minutes": 120}, {False}),
+         ("the installed settings ignored", [(me, "compose", lambda c, on, was=None, real=compose: real(c, on))]))
+
+    def paused():
+        fake = world()
+        go(fake, "apply")
+        hand_edit(fake, enabled=False)
+        code, doc, _err, _left = go(fake, "apply")
+        return code, settings(fake)[0], job(fake)[1:3], (doc["left_off"] or "").startswith(
+            "left off: its settings say enabled is false")
+    case("an explicit enabled false is never switched back on, and its job is left off", paused,
+         (10, False, (False, False), True),
+         ("an installed off taken as a first install", [(me, "decide", lambda ctx, was, path, real=decide:
+                                                         real(ctx, None, path))]))
+
+    def not_json():
+        fake = world()
+        _put(fake.home + "/.pipeline-runner/runner.json", "my own notes\n")
+        code, doc, _err, _left = go(fake, "apply")
+        with open(fake.home + "/.pipeline-runner/runner.json") as fh:
+            return code, rows(doc).get("settings"), fh.read()
+    case("a settings file that is not JSON is never written over", not_json, (1, FAILED, "my own notes\n"),
+         ("an unreadable file taken as none", [(me, "installed", lambda ctx, path:
+                                                (lambda h, m: (h, m, None))(*qs.read_role_file(ctx, path)))]))
 
     # 6. The answers: one JSON object through a pipe, of `schema` and `consent`, and a yes.
     def answers():

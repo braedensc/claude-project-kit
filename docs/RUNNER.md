@@ -209,12 +209,17 @@ echo '{"schema": "runner-answers/1", "consent": "yes"}' | python3 scripts/pipeli
 Each prints one JSON document of rows on standard output (`runner-setup-rows/1`), whatever its exit,
 and every word for a person on standard error, as the notifier's installer does.
 
-- **Every lane off.** It writes `<RUNNER_DIR>/runner.json` as the role account, with every lane off
-  for every project. Switching one on is the owner's yes, per project. This installer never does it.
-- **Its switch and its ceiling.** `enabled` is the part's own switch, and a runner already on stays
-  on. Otherwise its first pass is counted: the requests waiting in its store and its unfinished runs.
-  At or below its ceiling in `pipeline-parts.json` (0), it is switched on and loaded. Above it, or
-  with a ceiling it cannot read, it is installed and left off, and the document's `left_off` says why.
+- **Every lane off.** It writes `<RUNNER_DIR>/runner.json` as the role account, and gives a new
+  project every lane off. Switching one on is the owner's yes, per project, and this installer never
+  does it. So it writes only the keys it owns, from `runner.conf`. A lane you switched on, its approved
+  states and every other key you set are kept as installed. A file that is not JSON is never written
+  over.
+- **Its switch and its ceiling.** `enabled` is the part's own switch. Once installed it is kept: on
+  stays on, and off is never switched back on by the installer. To switch it on, set `enabled` to true
+  in `runner.json`. A first install counts its first pass: the requests waiting in its store and its
+  unfinished runs. At or below its ceiling in `pipeline-parts.json` (0), it is switched on and loaded.
+  Above it, or with a ceiling it cannot read, it is installed and left off. The document's `left_off`
+  says why.
 - **Its job.** One LaunchDaemon as the role account, kept alive, running the runner from Stage E's
   clone. Stage E's `run` stops it around a move of the clone and loads it again. The job file says
   `Disabled`, so it starts at boot only after `launchctl enable`, which only an install that switches

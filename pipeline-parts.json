@@ -2334,12 +2334,6 @@
           "ends": "one-year",
           "clock": "claude-writer-token",
           "date_from": "The day you made it with `claude setup-token`, plus one year."
-        },
-        {
-          "key": "RUNNER_DIR",
-          "default_name": null,
-          "what": "A file in that folder, tracker-key, mode 0600, that holds the tracker key, to read each ticket and its history once a lane is on.",
-          "ends": "never"
         }
       ],
       "jobs": [
