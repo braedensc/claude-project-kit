@@ -1,4 +1,4 @@
-# Slack bridge — operator steps
+# Your tech lead in Slack — operator steps
 
 *Written 2026-10-10 (KIT-221); updated 2026-10-10 (KIT-222, planning an idea; KIT-223,
 approving a plan), 2026-10-30 (KIT-295, working in your DM) and 2026-11-11 (KIT-492, the
@@ -7,7 +7,7 @@ cutover: one chat with the tech lead). Design:
 `docs/adr/2026-10-30-one-dm-tech-lead-voice.md` and
 `docs/adr/2026-11-05-one-chat-with-the-tech-lead-per-project.md`.*
 
-The bridge lets a trusted member of your Slack workspace act as you, from the chat. Someone
+Your tech lead lets a trusted member of your Slack workspace act as you, from the chat. Someone
 asks it about a ticket, it asks its own question, and a member's "yes" is the go-ahead. It
 checks with Slack itself who said yes.
 
@@ -25,7 +25,7 @@ checks with Slack itself who said yes.
 
 With `ACT=no`, the default, it asks and records, and nothing in the tracker changes.
 
-**One chat.** Your DM with the bridge is the one place you talk to the tech lead. What you
+**One chat.** Your DM with your tech lead is the one place you talk to the tech lead. What you
 write there that is not a command, a yes or a no is answered by the tech lead's own turn
 ("The tech lead's own turn", below). Since the cutover (KIT-492) the dispatcher keeps dev
 sessions only. Its chat lane, the back room, the relay and the writer are gone.
@@ -75,7 +75,7 @@ Set `DISPATCHER_ENV_FILE` too. `token` refuses the dispatcher's own Slack token,
 `verify`'s `old-paths` row reads that file, by name only, to say the dispatcher's chat lane
 is off.
 It must be a different file from `ENV_FILE`. The dispatcher hands its env file to every
-session it starts, so the bridge's token must never go there. The installer refuses the
+session it starts, so the tech lead's token must never go there. The installer refuses the
 same file.
 
 The Slack app comes first, and its member ID is the one value only the finished app can give.
@@ -169,7 +169,7 @@ python3 scripts/pipeline_bridge_setup.py token
 Good: `wrote BRIDGE_SLACK_BOT_TOKEN (… characters) into …/env, mode 600`. The token itself is
 never printed.
 Not that: `REFUSED: that token is already in the env file under …`. You pasted another app's
-token. Copy the bridge app's own.
+token. Copy your tech lead's own.
 Not that: `REFUSED: … is the same file as DISPATCHER_ENV_FILE`. The two settings name one
 file, perhaps through a link. Point `ENV_FILE` at the role account's own env file.
 Not that: `FAILED: the token could not be written into …`. The line ends with the writer's
@@ -806,7 +806,7 @@ has this step and Step 11 in order:
 python3 scripts/pipeline_bridge_setup.py card CK-B6
 ```
 
-1. Invite the bridge's app to the notifier's pings channel.
+1. Invite your tech lead's app to the notifier's pings channel.
 2. Add that channel's id to `CHANNEL_IDS` in `bridge.conf`, after the chat channel's.
 3. In `bridge.conf`, set `NOTIFIER_STATE_DIR` to the `STATE_DIR` in `notifier.conf`. Both
    default to `~/.stage-e/state`. The bridge reads the notifier's pings file there.
@@ -818,7 +818,7 @@ python3 scripts/pipeline_bridge_setup.py card CK-B6
 python3 scripts/pipeline_notifier_setup.py run
 ```
 
-6. Then the bridge's install again:
+6. Then the tech lead's install again:
 
 ```sh
 python3 scripts/pipeline_bridge_setup.py install --apply
@@ -1659,11 +1659,11 @@ bridge stops at 10 an hour.
 
 ---
 
-## After a merge that changes the bridge
+## After a merge that changes the tech lead
 
 Run the one command, `python3 scripts/pipeline_install.py`. Its Stage E check counts the
-role account's clone as behind when a file the bridge runs changed. Say yes, and the Stage
-E installer moves the clone. It stops the bridge just before the move and loads it again
+role account's clone as behind when a file the tech lead runs changed. Say yes, and the Stage
+E installer moves the clone. It stops the tech lead just before the move and loads it again
 straight after.
 
 Good: the Stage E `code` row's note names `system/<label>`. Then this installer's `verify`
@@ -1686,7 +1686,7 @@ out.
 
 To turn it back on, follow card CK-B2 again. Its `enable` line undoes the `disable` here.
 
-With Step 11 done, this also stops the bridge's watch on the notifier. While the bridge is
+With Step 11 done, this also stops the tech lead's watch on the notifier. While the tech lead is
 off, nothing tells you in Slack that the notifier is down.
 
 ---
