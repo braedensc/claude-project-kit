@@ -11,6 +11,12 @@ BESIDE THE OLD DISPATCHER, AND OFF.  This is built beside the third-party dispat
 doing everything. `enabled` ships false: then a pass takes no request. No lane asks it for anything
 yet, and no job loads it: each lane moves later, on the owner's yes. Docs: docs/RUNNER.md.
 
+EACH LANE, PER PROJECT (KIT-866).  A project's `lanes` say, for each kind of session, whether the
+runner takes it for that project. Absent is off. A request for a lane that is off is refused in words
+before anything is made or read, and so is the runner's own resume of a run on it, whose record then
+says `auto_resume: refused`. A stop is always taken. A lane that is on needs its approved states.
+`enabled` stays the runner's own switch: off, it takes nothing, whatever the lanes say.
+
 WHAT A PASS DOES.  Each pass, every `poll_seconds`:
   1. Each live run: is its process still there? If not, its record is finished from what the
      session left, and its pin is removed. A run that left no result and no exit is interrupted,
@@ -180,7 +186,7 @@ DEFAULTS = {
     "session_tools": None,
     "projects": None,
 }
-PROJECT_DEFAULTS = {"repo": None, "base": "main", "approval_states": None,
+PROJECT_DEFAULTS = {"repo": None, "base": "main", "approval_states": None, "lanes": None,
                     "allowed_hosts": ["github.com", "api.github.com"]}
 RANGES = {"poll_seconds": (1, 60), "stop_grace_seconds": (1, 600),
           "max_starts_per_ticket": (1, 100)}
@@ -319,13 +325,26 @@ def load_project(raw):
         bad.append("repo: must be the absolute path of the runner's own clone")
     if not (isinstance(p["base"], str) and BASE_RE.match(p["base"]) and ".." not in p["base"]):
         bad.append("base: not a branch name")
-    states = p["approval_states"]
-    if not (isinstance(states, dict) and states
+    states = {} if p["approval_states"] is None else p["approval_states"]
+    if not (isinstance(states, dict)
             and all(k in store.STARTS for k in states)
             and all(isinstance(v, list) and v and all(isinstance(s, str) and STATE_ID_RE.match(s)
                                                       for s in v) for v in states.values())):
         bad.append("approval_states: needs, for each kind it starts (%s), a list of state ids"
                    % ", ".join(store.STARTS))
+        states = {}
+    p["approval_states"] = states
+    lanes = {} if p["lanes"] is None else p["lanes"]       # KIT-866: absent is every lane off
+    if not (isinstance(lanes, dict) and all(k in store.KINDS and isinstance(v, bool)
+                                            for k, v in lanes.items())):
+        bad.append("lanes: needs, for each kind of session (%s), true or false"
+                   % ", ".join(store.KINDS))
+        lanes = {}
+    p["lanes"] = dict((k, lanes.get(k) is True) for k in store.KINDS)
+    unset = sorted(set(KIND_DATA[k]["states"] for k in store.KINDS if p["lanes"][k]) - set(states))
+    if unset:
+        bad.append("approval_states: a lane that is on needs its approved states (%s)"
+                   % ", ".join(unset))
     hosts = p["allowed_hosts"]
     if not (isinstance(hosts, list) and all(isinstance(h, str) and HOST_RE.match(h) for h in hosts)):
         bad.append("allowed_hosts: needs a list of host names")
@@ -1283,6 +1302,8 @@ class Runner(object):
         proj = cfg["projects"].get(project_key)
         if proj is None:
             return "refused", None, "the runner's settings have no project %s" % project_key
+        if not proj["lanes"].get(kind):
+            return "refused", None, "the %s lane is off for project %s" % (kind, project_key)
         if cfg["hold"]["file"]:
             blocked, why = hold.gate(cfg["hold"]["file"])
             if blocked:
@@ -1704,7 +1725,8 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
            "max_starts_per_ticket": 20,
            "projects": {"app": {"repo": repo, "base": "main",
                                 "approval_states": {"code": ["st-ready"], "review": ["st-ready"],
-                                                    "plan": ["st-plan"], "acceptance": ["st-ready"]}}}}
+                                                    "plan": ["st-plan"], "acceptance": ["st-ready"]},
+                                "lanes": dict.fromkeys(store.KINDS, True)}}}
     environ = {"RUNNER_TEST_TOKEN": "a-test-token"}
     keys = pool.HISTORY_KEYS
 
@@ -1784,6 +1806,11 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
             r'"<[^"]*>"', lambda _m: '"x-%d"' % next(filled), json.dumps(example))))
         expect("the example settings load once their <...> values are filled in", ex_bad, [])
         expect("the example ships off", (ex_cfg or {}).get("enabled"), False)
+        expect("the example ships every lane off",
+               set(((ex_cfg or {}).get("projects") or {}).get("app", {}).get("lanes", {}).values()), {False})
+        bare, bare_bad = load_config(dict(raw, projects={"app": {"repo": repo}}))
+        expect("KIT-866: lanes left out are every lane off, and need no approved states",
+               (bare_bad, set(bare["projects"]["app"]["lanes"].values())), ([], {False}))
         for name, change, want in (
                 ("a relative store", {"store_dir": "state/store"},
                  "store_dir: must be an absolute path (~/ is this account's home)"),
@@ -1794,7 +1821,15 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                  "store_dir: must not be inside work_dir, nor hold it"),
                 ("a store in a git working tree", {"store_dir": os.path.join(repo, "store")},
                  "store_dir: is inside a git working tree, where a session can write"),
-                ("no approved states", {"projects": {"app": {"repo": repo}}},
+                ("a lane on with no approved states", {"projects": {"app": {"repo": repo,
+                                                                            "lanes": {"fix": True}}}},
+                 "projects.app.approval_states: a lane that is on needs its approved states (code)"),
+                ("a lane that is no kind of session", {"projects": {"app": {"repo": repo,
+                                                                            "lanes": {"deploy": False}}}},
+                 "projects.app.lanes: needs, for each kind of session (code, fix, conflict, review, "
+                 "plan, acceptance), true or false"),
+                ("empty approved states", {"projects": {"app": {"repo": repo,
+                                                                "approval_states": {"code": []}}}},
                  "projects.app.approval_states: needs, for each kind it starts (code, review, plan, "
                  "acceptance), a list of state ids"),
                 ("a poll of zero", {"poll_seconds": 0}, "poll_seconds: must be a whole number from 1 to 60"),
@@ -1804,6 +1839,44 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                  "work_dir: holds a pattern character, so a rule for it would not be exact")):
             _, got = load_config(dict(raw, **change))
             expect("settings: %s is refused" % name, got[:1], [want])
+
+        # ---- a lane that is off (KIT-866): refused in words, nothing made or read ---- #
+        lanes_store = os.path.join(tmp, "state", "store-lanes")
+        shut = dict(cfg, store_dir=lanes_store, projects={"app": dict(
+            cfg["projects"]["app"], lanes=dict(cfg["projects"]["app"]["lanes"], code=False))})
+        expect("the lanes' own store is made", store.prepare(lanes_store), [])
+        rq_lane = store.ask(lanes_store, "queue", "start", "code", "app", "ENG-1")
+        rq_stop = store.ask(lanes_store, "queue", "stop", "code", "app", "ENG-1", run="run-" + "0" * 32)
+        tracker.down = True                      # a start that reached the tracker would wait
+        got = Runner(shut, tracker, environ=environ, git_env=genv, say=said.append, room=roomy).pass_once()
+        tracker.down = False
+        expect("a lane that is off: its start is refused in words before the tracker is read, nothing "
+               "is made, and a stop is still taken",
+               (sorted(got["refused"]), (store.answer(lanes_store, rq_lane) or {}).get("why"),
+                os.path.lexists(os.path.join(cfg["work_dir"], "code", "ENG-1")),
+                (store.answer(lanes_store, rq_stop) or {}).get("why")),
+               (sorted([rq_lane, rq_stop]), "the code lane is off for project app", False,
+                "there is no such run to stop"))
+        gone = {"schema": store.RUN_SCHEMA, "run": "run-" + "1" * 32, "request": None, "caller": "queue",
+                "kind": "code", "project": "app", "ticket": "ENG-1", "resumes": None, "started_for": "request",
+                "approved_by": "owner-1", "approved_at": "2026-11-01T10:00:00Z", "how": "move",
+                "session_id": "00000000-0000-4000-8000-000000000001",
+                "workspace": os.path.join(cfg["work_dir"], "code", "ENG-1"), "branch": "feat/eng-1-add-a-thing",
+                "pin": None, "pid": None, "state": "interrupted", "started_at": "2026-11-01T10:00:00Z",
+                "ended_at": "2026-11-01T10:05:00Z", "seconds": 300, "exit": None, "reason": "interrupted",
+                "why": "the session left no result and no exit: it was interrupted", "cost_usd": None,
+                "turns": None, "stop_asked_at": None, "auto_resume": "pending", "resumed_by": None,
+                "gone_session": None}
+        store.write_run(lanes_store, gone)
+        tracker.down = True
+        again = Runner(shut, tracker, environ=environ, git_env=genv, say=said.append, room=roomy).pass_once()
+        tracker.down = False
+        back = store.read_run(lanes_store, gone["run"]) or {}
+        expect("a lane that is off: the runner's own resume of a run on it is refused in words, and the run's "
+               "record says so",
+               (again["refused"], back.get("auto_resume"), back.get("resumed_by"),
+                any(gone["run"] in line and "the code lane is off for project app" in line for line in said)),
+               ([gone["run"]], "refused", None, True))
 
         # ---- approval: the pool's judge, over the whole history -------------- #
         def judge(ident, kind="code"):
@@ -1822,6 +1895,8 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
 
         # ---- off: nothing is taken ----------------------------------------- #
         off = Runner(dict(cfg, enabled=False), tracker, environ=environ, git_env=genv, say=said.append, room=roomy)
+        expect("KIT-866: off holds whatever the lanes say: the off runner's project has every lane on",
+               set(off.cfg["projects"]["app"]["lanes"].values()), {True})
         expect("off with no store: nothing is made", (off.pass_once()["state"], os.path.isdir(sdir)),
                ("off", False))
         expect("the store is made on the first pass", store.prepare(sdir), [])
