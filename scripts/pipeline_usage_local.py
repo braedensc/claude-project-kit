@@ -1304,13 +1304,14 @@ def _cases(check):
         # -- the runner's runs count beside the logs, each under its source (KIT-860) ---------
         real_add_run, real_scan_r, real_judge = add_run, scan, judge
 
-        def runner_pass(name, store=True, **patched):
+        def runner_pass(name, store=True, spend=False, **patched):
             """One pass of the standard world with the runner's store (or, `store` False, one
-            the config names and that is not there), module names patched for a mutant: (exit,
-            what it said, the file)."""
+            the config names and that is not there), and with `spend` a spend ledger for each
+            caller too, module names patched for a mutant: (exit, what it said, the file)."""
             root = os.path.join(tmp, name)
             where = kit.runner_world(root) if store else os.path.join(root, "no-store")
-            cfg_x, _ = std_world(root, runner_store=where)
+            more = {"spend_ledgers": spend_world(root)} if spend else {}
+            cfg_x, _ = std_world(root, runner_store=where, **more)
             saved = dict((k, globals()[k]) for k in patched)
             globals().update(patched)
             try:
@@ -1355,6 +1356,13 @@ def _cases(check):
               ([dig(doc_r, "week", k) for k in ("runs", "unpriced", "usd")],
                dig(doc_r, "week", "by_source"), adds_up(doc_r)),
               ([29, 6, 12.55], sourced(logs=(21, 2, 10.6), runner=(8, 4, 1.95)), True))
+        code_b, _said_b, doc_b = runner_pass("runner-and-spend", spend=True)
+        check("…and with the spend ledgers' own-cost calls beside the runner's runs, every day and "
+              "the week still add up across all four sources, the calls under `spend`",
+              (code_b, adds_up(doc_b), dig(doc_b, "week", "by_source"),
+               [dig(doc_b, "week", k) for k in ("runs", "unpriced", "usd")]),
+              (EXIT_OK, True, sourced(logs=(21, 2, 10.6), runner=(8, 4, 1.95),
+                                      spend=(6, 2, 0.36)), [35, 8, 12.91]))
         pieces_r = dict((p["id"], (p["kind"], p["usd"], p["runs"])) for p in dig(doc_r, "pieces"))
         check("…its tickets are pieces, a ticket it reviewed or planned of that kind, and a run "
               "both hold is one run of its piece",
