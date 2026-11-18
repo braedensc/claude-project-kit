@@ -87,8 +87,8 @@ limit hit in normal use is a defect.
 - **It measures only its own:** its runs' trees, by process group and parent, its runs' folders, and
   three numbers about the whole machine. It reads nothing about any other app.
 - **Each incident is told once,** in plain words, in `<store_dir>/incidents.json`: a run stopped at a
-  limit, a run it could not measure, or the floor holding starts. A floor incident ends when there is
-  room again.
+  limit, a run it could not measure, a run whose processes it could not remember or check, or the
+  floor holding starts. A floor incident ends when there is room again.
 
 Good: a session's tree passes 8 GB. It is stopped, its record says `limit:memory`, and one line is told.
 Not: the same session is told about again on every pass.
