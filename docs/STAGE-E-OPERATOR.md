@@ -2142,33 +2142,46 @@ the number you sign off. Exits 1 and 2 are still failures. If exit 3 stopped the
 Stage E could never be switched on while any open PR's ticket lacked criteria, which is a
 property of your backlog, not of Stage E.
 
-**Exit 1 from a poller paused for want of the routing sign-off is an unsigned probe, not a
-broken install** (KIT-733). On the work teams the poller pauses every repository's reviews
-until the routing probe has written `~/.stage-a/routing-signoff.json`. A pass with a paused
-repository exits 1.
+**Exit 1 from a poller paused until the routing probe is signed is waiting on you, not a
+broken install** (KIT-733, KIT-794). On the work teams the poller pauses a repository's
+reviews until the routing probe's sign-off, `~/.stage-a/routing-signoff.json`, covers it. A
+pass with a paused repository exits 1.
 
 The probe belongs to the idea gate, and the one command runs the idea gate after this
-installer. A Mac with no sign-off yet could never reach the step that writes it. That is a
-first install, or one whose review entries were just rewritten.
+installer. Read as a failure, a pause stopped the one command at `verify`: before `run` moved
+the clone, and before the probe that clears it. That happened on a first install (KIT-733),
+and on 17 Nov after a review stop, when the owner needed `--skip-stage-e` (KIT-794).
 
-So the dry run reads a pause for that one reason as expected. It prints one line naming the
-routing probe, and the run goes on. It excuses nothing beside it. These still fail the step:
+So the dry run reads a pause as waiting on you when every reason on it is one that only a
+newer probe sign-off clears, and that the idea gate offers the probe for:
+
+- no sign-off at all;
+- a stop dated after the sign-off: the poller's own, the shared one, or a misroute its
+  record holds;
+- a dispatcher version other than the one the probe was signed on.
+
+It prints one line, `Waiting on you: sign the routing probe.`, naming the paused
+repositories and why. The step passes and the run goes on to the idea gate. These still fail
+the step, beside such a pause or alone:
 
 - a sign-off that cannot be read, or is not one;
-- a stop, a missing routing label, or a changed dispatcher version;
+- a stop file that cannot be read;
+- a review entry the sign-off does not prove by both routes;
+- a dispatcher version that cannot be read, or this poller's own stops record unreadable;
+- a missing routing label, or one that could not be read just now;
 - any `FAIL`, `RETRY` or `TELEMETRY LOST` line, and any other exit.
 
 A dry run cannot see every cause of exit 1. A close or a telemetry row still pending on an
 earlier review also exits 1, and prints nothing of it. That shows on the poller's heartbeat
 and in the heartbeat monitor.
 
-A paused poller counts no pull requests, so the count `CK-5` asks you to sign is empty until
-the probe is signed. Read it again with `run --dry-run` once it is.
+A paused repository's pull requests are not counted, so the count `CK-5` asks you to sign
+leaves them out until the probe is signed. Read it again with `run --dry-run` once it is.
 
-Good: `The poller is paused until the idea gate's routing probe is signed ... after this one.`,
-then the steps after the dry run.
+Good: `Waiting on you: sign the routing probe. Reviews of <repo> are paused ...`, then the
+steps after the dry run, then the idea gate's `Run the probe now?`.
 Not that: `FAILED at step dry-run: the poller's dry run failed (exit 1)`, with
-`there is no routing sign-off at ...` in it, and the idea gate never reached.
+`reviews are paused` in it, and the idea gate never reached.
 
 `decide --all` prints one line per PR that has a review outcome on file and says what it
 would do. With no outcomes yet it says so in words, and exits 0.
