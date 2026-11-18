@@ -30,8 +30,10 @@ Each pass, every few seconds:
 
 **A resume whose session is gone starts afresh, once.** The program may no longer have the
 conversation a resume names. Then the runner starts one new session in the same workspace, given
-the ticket and the same request's text. Its record says `started_for: session-gone` and names the
-lost session in `gone_session`. A resume that fails any other way keeps its own reason.
+the ticket and the text of the request whose work it carries on. Its record says `started_for:
+session-gone` and names the lost session in `gone_session`. It happens once per request: a fresh
+start that is itself lost later is not started again, and its record says why. A resume that fails
+any other way keeps its own reason.
 
 Before it starts anything, it checks the request against the tracker:
 

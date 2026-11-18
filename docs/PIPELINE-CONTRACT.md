@@ -3271,13 +3271,17 @@ conversation a resume names. Then it says so: an error result after no turn, who
 conversation was found, or no result and those words as the last line of its errors. The tech
 lead's turn reads the same words. That run ends with reason `session-gone`, and the runner starts
 one fresh session, as itself, on its next pass. The fresh start uses the same workspace and branch
-and a new `session_id`. Its prompt holds the ticket and the same request's text, each fenced, read
-back from `taken/`. Its record says `started_for: "session-gone"`, `how: "fresh-session"` and
-`resumes` (the run that failed), and `gone_session` names the lost session. Only a run that was
-itself a resume can end `session-gone`, so a fresh start never leads to another. A resume that
-fails any other way ends with its own reason and is never retried. The words come from the
-program's own output. A session that printed them itself would gain one fresh start of the same
-request, and never a second.
+and a new `session_id`. Its prompt holds the ticket and the text of the request whose work it
+carries on, each fenced. That text is read back from `taken/`, past any resume the runner made of
+its own, so a fix that was cut short and then lost keeps its own words. Its record says
+`started_for: "session-gone"`, `how: "fresh-session"` and `resumes` (the run that failed), and
+`gone_session` names the lost session. **Once per request.** Only a resume can end
+`session-gone`. If the runs back to its request already hold a fresh start, no second one is made.
+That happens when a fresh start was interrupted before its session was saved and then resumed. No
+fresh start is made either when those runs cannot all be read. Either way the record's `why`
+says so. A resume that fails any other way ends with its own reason and is never retried. The
+words come from the program's own output. A session that printed them itself would gain one
+fresh start of the same request, and never a second.
 
 **Its limits (KIT-643).** Each run is held to a wall-clock limit, a memory limit for its whole
 process tree and a disk limit for its own folders, from the runner's `limits` settings. Past one,
