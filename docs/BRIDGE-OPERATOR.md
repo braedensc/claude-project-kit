@@ -1341,6 +1341,8 @@ left in an old config is ignored, and the log says that too.
 spend ledger in `STATE_DIR`. A DM's turn and a plan note's go to `tech-lead-spend.jsonl`. The
 stand-up's goes to `standup-spend.jsonl`. The usage job counts them into the day and the week
 (docs/QUEUE-OPERATOR.md). If a row cannot be written, the log says so and the answer still goes out.
+A resumed conversation's cost from the CLI is its running total, so the bridge keeps the newest
+total with the conversation, and each row holds only that turn's share.
 
 **A new conversation never starts blank (KIT-751).** The first conversation in a DM, and one that
 had to begin again, is given the DM's recent messages: yours, the tech lead's own and the

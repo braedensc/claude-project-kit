@@ -5,6 +5,7 @@ KIT-687, contract §30).
     from pipeline_spend_ledger import row_from_result, append, read
     row_from_result(caller, doc, billing, model)  a row from the claude CLI's JSON output
     kept_output(doc)               what of that output a row is built from, and nothing else
+    own_costs(outputs, bases)      a resumed session's runs made each its own cost
     append(path, row, now)         THE ONE WRITER: one line at the ledger's end, in one write
     read(path, caller, since)      THE ONE READER: (note, calls), or why there are none to count
 
@@ -225,6 +226,37 @@ def kept_output(doc):
     if not isinstance(doc, dict):
         return None
     return dict((k, doc[k]) for k in OUTPUT_KEYS if k in doc)
+
+
+def own_costs(outputs, bases):
+    """KIT-687: each run's output with its total made that run's own cost, and the newest total of
+    each session, for the caller to keep. The CLI's `total_cost_usd` for a resumed session is the
+    session's RUNNING total, while its `usage` is the run's own (measured 18 Nov 2026 on Claude
+    Code 2.1.287: a resumed call's total was the first call's total plus its own usage priced,
+    exactly). So a run's own cost is its total less the same session's previous total: `bases`
+    (session id: its newest known total, or None when it was resumed and its earlier total is not
+    known), then each earlier run in `outputs`. A smaller total is a session begun again, so its
+    whole total is its own. A run of a session whose previous total is unknown has an unknown cost,
+    null and never its running total. A run with no total leaves its session's base as it was, so
+    its spend lands in the next priced run. Only numbers and the session id are read."""
+    known, out = dict(bases), []
+    for doc in outputs:
+        sid = doc.get("session_id") if isinstance(doc, dict) else None
+        total = doc.get("total_cost_usd") if isinstance(doc, dict) else None
+        if not (isinstance(sid, str) and _number(total) and total >= 0):
+            out.append(doc)
+            continue
+        if sid not in known:
+            own = total
+        elif known[sid] is None:
+            own = None                       # resumed, and its earlier total is not known
+        elif total < known[sid]:
+            own = total                      # the session began again
+        else:
+            own = round(total - known[sid], 6)
+        out.append(dict(doc, total_cost_usd=own))
+        known[sid] = total
+    return out, known
 
 
 def path_in(folder, caller):
@@ -597,6 +629,34 @@ def selftest():
     check("…and each key it keeps is one some row needs", needed, [True] * len(OUTPUT_KEYS))
     check("no output, or one that is not an object, keeps nothing",
           [kept_output(v) for v in (None, [DOC], "text")], [None, None, None])
+
+    # -- a resumed session's running total, made each run's own cost (KIT-687) -----------------
+    # Measured 18 Nov 2026 (Claude Code 2.1.287, two haiku calls, the second resuming the first):
+    # the resumed call's total was the first call's plus its own usage priced, exactly.
+    first, resumed = 0.0209443, 0.0303449
+    call = lambda total, sid=SID: {"session_id": sid, "total_cost_usd": total,  # noqa: E731
+                                   "is_error": False, "subtype": "success"}
+    outs, newest = own_costs([call(first)], {})
+    outs2, newest2 = own_costs([call(resumed)], newest)
+    check("the measured pair: a new session's total is its own; the resumed call's own cost is "
+          "its running total less the session's previous total",
+          ([o["total_cost_usd"] for o in outs + outs2], newest2),
+          ([first, 0.009401], {SID: resumed}))
+    check("…so its row holds its own cost, never the session's running total",
+          [row_from_result("tech_lead", o, "plan")["usd"] for o in outs + outs2],
+          [0.020944, 0.009401])
+    other = "1b6c3e1e-1d2f-4a5b-8c9d-0e1f2a3b4c5d"
+    got, kept = own_costs([call(0.5), None, call(None), call(0.8), call(0.3), call(0.2, other),
+                           call(0.45)], {SID: 0.25})
+    check("each run less the previous total of its own session: a run with no total moves no "
+          "base, a smaller total is a session begun again, another session keeps its own",
+          ([g["total_cost_usd"] if isinstance(g, dict) else g for g in got], kept),
+          ([0.25, None, None, 0.3, 0.3, 0.2, 0.15], {SID: 0.45, other: 0.2}))
+    check("a session resumed with its earlier total unknown has an unknown cost, never its "
+          "running total, and its total is kept as the next run's base",
+          own_costs([call(0.9), call(1.2)], {SID: None}),
+          ([dict(call(0.9), total_cost_usd=None), dict(call(1.2), total_cost_usd=0.3)],
+           {SID: 1.2}))
 
     # -- the hand rules and the schema agree ----------------------------------------------------
     good = dict(row, at=_iso(T))

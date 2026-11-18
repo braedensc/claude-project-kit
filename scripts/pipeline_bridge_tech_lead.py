@@ -529,25 +529,36 @@ class TechLeadMixin(object):
         """The turn runs through this, so a case can stand in for the CLI (KIT-489)."""
         return turn.run_turn(*args, **kwargs)
 
-    def record_spend(self, caller, res):
+    def record_spend(self, caller, res, session=None):
         """KIT-687: one row for each run of the CLI the turn `res` started, in `caller`'s spend
         ledger in the bridge's state folder (contract §30): `tech_lead` for a DM's turn and a plan
         note's, `standup` for the stand-up's. The usage job reads both. Billing is `plan`: a turn
         sends only a setup token. The model is turn_model, unless the run's output names the one
-        that carried it. A row that cannot be written is said in the log, and never fails the
-        turn: its ledger's mark says the call was not counted."""
+        that carried it. Each row holds that run's own cost: a resumed session's total is its
+        running total, so `session`, the DM's conversation record the turn resumed, gives the
+        session's previous total (spend_ledger.own_costs), and a resumed one whose total is not
+        known has an unknown cost. Returns each session's newest total, for the record to keep. A
+        row that cannot be written is said in the log, and never fails the turn: its ledger's
+        mark says the call was not counted."""
         runs = res.get("runs") if isinstance(res, dict) else None
         if not isinstance(runs, list) or not runs:
-            return
+            return {}
+        bases = {}
+        if isinstance(session, dict) and isinstance(session.get("id"), str):
+            total = session.get("total")
+            bases[session["id"]] = total if isinstance(total, (int, float)) and not isinstance(
+                total, bool) and total >= 0 else None
+        outputs, newest = spend_ledger.own_costs(runs, bases)
         model = turn.settings(self.cfg)[0].get("turn_model")
         path = spend_ledger.path_in(self.cfg["state_dir"], caller)
-        for output in runs:
+        for output in outputs:
             try:
                 spend_ledger.append(path, spend_ledger.row_from_result(caller, output, "plan",
                                                                        model))
             except (OSError, ValueError) as exc:
                 self.say("  could not record the spend of a turn's run in %s: %s"
                          % (path, type(exc).__name__))
+        return newest
 
     def stream_judge(self, raw):
         """(held, text) for one whole line of an answer, for the stream (KIT-565): every check the
@@ -765,7 +776,12 @@ class TechLeadMixin(object):
         try:
             res = self.run_turn(dict(self.cfg, turn_timeout_seconds=seconds), text,
                                 sessions.get(skey), self.now, **more)
-            self.record_spend("tech_lead", res)
+            newest = self.record_spend("tech_lead", res, sessions.get(skey))
+            # KIT-687: the conversation's newest running total is the base of its next resumed
+            # run's own cost. A turn that failed, or left the message for later, still moved it.
+            kept = sessions.get(skey)
+            if kept and newest.get(kept.get("id")) is not None:
+                kept["total"] = newest[kept["id"]]
             if res.get("began_again"):
                 # KIT-759: the one way a DM's conversation begins again, said in the log. Past
                 # Claude Code's own summary, the older turns are dropped, and that is said too.
@@ -799,6 +815,8 @@ class TechLeadMixin(object):
                          % removed)
             if res["session_id"] and res["text"]:
                 sessions[skey] = {"id": res["session_id"], "last_at": self.now}
+                if newest.get(res["session_id"]) is not None:      # KIT-687: its base
+                    sessions[skey]["total"] = newest[res["session_id"]]
             # KIT-565: what was streamed ends as exactly the message the whole-answer path would have
             # posted, or as the held-back line, or not at all; True means Slack holds it already.
             in_place = False
@@ -2535,6 +2553,42 @@ def cases_tech_lead(kit):
         check("tl-a-dm-turn-whose-row-cannot-be-written-is-still-answered-and-the-log-says-so",
               outcome(lambda: case_dm_turn_spend("tl-kit-687-blocked", blocked=True)),
               (EXIT_OK, ["Two plans are open."], "could-not-read", [], True))
+
+        # KIT-687: a resumed DM conversation's total is its RUNNING total (measured 18 Nov 2026 on
+        # Claude Code 2.1.287: two haiku calls, the second resuming the first, cost 0.0209443 and
+        # 0.0303449, and the second call's own usage priced to 0.0094006). Each row holds its own.
+        def resumed_call(total):
+            return {"session_id": t_sid, "total_cost_usd": total, "is_error": False,
+                    "subtype": "success", "modelUsage": {"claude-haiku-4-5": {"costUSD": total}}}
+
+        def case_resumed_turns(name):
+            """Two DM messages, the second answered by a turn that resumed the first's
+            conversation: (each row's cost, the conversation's kept total)."""
+            fake = FakeTurn({"text": "Two plans are open.", "session_id": t_sid,
+                             "runs": [resumed_call(0.0209443)]},
+                            {"text": "And one is blocked.", "session_id": t_sid, "resumed": True,
+                             "runs": [resumed_call(0.0303449)]})
+            c, s, t = tlworld(name)
+            s.add(ALICE, "where are we?", channel=DM)
+            with_turn(fake, lambda: run(c, s, t))
+            s.add(ALICE, "and what is blocked?", channel=DM, at=now + 60)
+            with_turn(fake, lambda: run(c, s, t, at=now + 120))
+            _note, rows = spend_ledger.read(spend_ledger.path_in(c["state_dir"], "tech_lead"),
+                                            "tech_lead", 0)
+            return ([r["usd"] for r in rows or []],
+                    json.load(open(state_path(c)))["turn_sessions"][DM].get("total"),
+                    fake.calls[1]["session"]["id"] if fake.calls[1:] else None)
+        check("tl-a-resumed-conversations-row-holds-its-own-cost-never-the-running-total-kit-687",
+              outcome(lambda: case_resumed_turns("tl-kit-687-resumed")),
+              ([0.020944, 0.009401], 0.0303449, t_sid))
+        real_own_costs = spend_ledger.own_costs
+        spend_ledger.own_costs = lambda outputs, bases: (list(outputs), {})
+        try:
+            raw = outcome(lambda: case_resumed_turns("tl-kit-687-resumed-mutant"))
+        finally:
+            spend_ledger.own_costs = real_own_costs
+        check("tl-mutant-a-resumed-run-priced-at-its-running-total-is-caught",
+              raw != ([0.020944, 0.009401], 0.0303449, t_sid), True)
 
         # And what the stand-up's turn recorded comes to the bridge's own fixed question right
         # after the stand-up, in the owner's DM, through the request path: a ticket the tech lead

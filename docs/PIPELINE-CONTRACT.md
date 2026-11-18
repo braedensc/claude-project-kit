@@ -3502,6 +3502,14 @@ time. No prompt, reply or error text reaches a row.
 call as unpriced. So is a zero total from a call that did not end in success, as §17 reads a
 crash's zeroed total. A token count the CLI's output did not give is null.
 
+**A row is its own call's cost.** For a resumed session the CLI's `total_cost_usd` is the session's
+running total, while its `usage` is that run's own (measured 18 Nov 2026 on Claude Code 2.1.287:
+a resumed call's total was the first call's total plus its own usage priced, exactly). So a caller
+that resumes a session records each run's own share: its total less the same session's previous
+total, through `own_costs()`. A smaller total is a session begun again, so its whole total is its
+own. A resumed run whose session's earlier total the caller does not know has a null cost, never
+its running total. The tech lead's DM conversation keeps its newest total for that (KIT-687).
+
 ### Where each ledger lives
 
 Each ledger is a JSON Lines file in its caller's own state folder, outside every git working tree:
@@ -3529,7 +3537,7 @@ that run ends (KIT-687). A run that never started (the CLI could not be run) add
 |---|---|---|---|---|
 | `morning` | the morning job's one planner call (`scripts/pipeline_morning.py`) | the output's, else `planner_model` | `plan` | the CLI's; unknown after a timeout |
 | `standup` | the stand-up's turn, in the bridge (`scripts/pipeline_bridge_tech_lead.py`) | the output's, else `turn_model` | `plan` | the CLI's; unknown after a timeout |
-| `tech_lead` | a DM's turn and a plan note's turn, in the bridge | the output's, else `turn_model` | `plan` | the CLI's; unknown after a timeout |
+| `tech_lead` | a DM's turn and a plan note's turn, in the bridge | the output's, else `turn_model` | `plan` | the CLI's; for a resumed DM conversation, the run's share of its running total; unknown after a timeout |
 | `conflict_waker` | each fix session the waker starts (`scripts/pr_conflict.py wake`) | `--model`, or null | `unknown` | unknown: the session prints text, not JSON |
 
 The morning job and the turns send only a `claude setup-token` token, so their calls draw on the
@@ -3553,7 +3561,7 @@ goes in the ledger's mark, so the usage job says the call was not counted.
 | `at` | time | When the call ended, in UTC to the second. `append()` stamps it; a caller cannot. |
 | `caller` | `morning` \| `standup` \| `tech_lead` \| `conflict_waker` | Who made the call. A ledger holds its own caller's rows only. |
 | `model` | string \| null | The model that carried the call: of the models the CLI's `modelUsage` names, the one it gives the most cost. `other` for a name that is not a plain one. With no such output, the model the caller asked for, or null when it asked for none. |
-| `usd` | number \| null | The CLI's own estimate of the call's cost at API prices, its `total_cost_usd`, to a millionth of a dollar. Null when the caller could not read it: no JSON output, or a call that ended in an error with no total. |
+| `usd` | number \| null | The CLI's own estimate of the call's cost at API prices, from its `total_cost_usd`, to a millionth of a dollar: for a resumed session, that total less the session's previous total (above). Null when the caller could not read it: no JSON output, a call that ended in an error with no total, or a resumed session whose earlier total is not known. |
 | `tokens` | object | `input`, `output`, `cache_read` and `cache_write`: the CLI's `usage` figures `input_tokens`, `output_tokens`, `cache_read_input_tokens` and `cache_creation_input_tokens`. Each is null when the output did not give it. |
 | `run_id` | string \| null | The CLI's `session_id` for the call, when its output gave one. |
 | `billing` | `plan` \| `key` \| `unknown` | How the call was paid for, from the credential the caller handed the CLI. `plan`: a `claude setup-token` token and no key, so the call draws on the plan's usage windows. `key`: an API key, billed by the token. `unknown`: the CLI ran under a sign-in the caller did not choose, as a fix session on a person's machine does. |
