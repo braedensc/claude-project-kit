@@ -8,6 +8,7 @@ session and escalating to the owner, and escalates urgently if it believes a dev
     decide(subject, layer1, layer2, answer, bounces)   THE ONE DECISION: what is recorded, if anything
     row_for(subject, ref, head, decision, settings)    the ledger row for it, for append() to write
     blocker(row)                                       the stand-up's line for an escalation or a hold
+                                                       (the ledger's own, KIT-545)
     urgent_route(status_file, now)                     whether the watcher can page an urgent one
 
     python3 scripts/pipeline_validator_route.py --selftest
@@ -69,29 +70,9 @@ FINAL_HOLDS = ("provenance-not-owner", "provenance-later-generation", "too-many-
                "production-deploy", "deleting-data", "bounce-budget-spent", "review-edited",
                "review-partial", "review-declined", "acceptance-not-passed")
 RUN_HOLD_RE = re.compile(r"run-[a-z][a-z-]{0,36}")
-# Plain words for the reasons the owner most needs to read; any other closed word is shown as it is.
-WORDS = {
-    "send-back-budget-spent": "its send-backs are used up",
-    "send-back-budget-unknown": "its send-backs could not be counted",
-    "send-back-no-session": "it has no dev session to send it back to",
-    "provenance-not-owner": "the idea was not yours",
-    "provenance-later-generation": "it is agent-filed work past its first generation",
-    "too-many-lines": "it changes too many lines",
-    "too-many-files": "it changes too many files",
-    "risk-path": "it changes the safety system or a risk path",
-    "credentials": "it touches credentials",
-    "billing-and-accounts": "it touches billing or accounts",
-    "production-deploy": "it touches production deploy settings",
-    "deleting-data": "it may delete data",
-    "bounce-budget-spent": "Stage E's send-backs are used up",
-    "review-edited": "its review was edited",
-    "review-partial": "its review did not cover every file",
-    "review-declined": "Stage E declined to review it",
-    "acceptance-not-passed": "the acceptance check did not pass",
-    "brief-over-cap": "the change is too big for the agent to read whole",
-}
-AGENT_SAID = "the validator's agent said"
-GITHUB = "https://github.com"
+# How a row is said to the owner lives with the ledger's reader, so the stand-up and the recap say
+# rows without loading this file's imports (KIT-545). The names stay here for this file's callers.
+WORDS, AGENT_SAID, GITHUB = ledger.WORDS, ledger.AGENT_SAID, ledger.GITHUB
 # The watcher's monitor that reads this ledger, and its finding for an urgent escalation: the urgent
 # page goes through it, and is believed only when the watcher shows that finding (KIT-546).
 WATCHER_MONITOR = "approval-rate"
@@ -240,58 +221,7 @@ def row_for(subject, ref, head, decision, settings):
             "reasons": list(decision["reasons"]), "agent_says": decision["agent_says"]}
 
 
-def reason_words(reasons):
-    """The reasons in plain words where they have them, each closed word as it is otherwise."""
-    out = []
-    for w in reasons or ():
-        if w in WORDS:
-            out.append(WORDS[w])
-        elif isinstance(w, str) and w.startswith(("answer-", "brief-")):
-            out.append("the agent's answer could not be used (%s)" % w)
-        elif isinstance(w, str) and w.startswith("run-"):
-            out.append("the agent could not answer (%s)" % w)
-        elif isinstance(w, str) and ledger.REASON_RE.fullmatch(w):
-            out.append(w)
-    return _unique(out)
-
-
-def _name(row):
-    ref = row["ref"]
-    if row["subject"] == "merge":
-        repo, number = ref.split("#", 1)
-        return "Pull request #%s in %s" % (number, repo)
-    return ("Plan %s" % ref) if row["subject"] == "plan" else ref
-
-
-def blocker(row):
-    """The stand-up's line for one ledger row that waits on the owner: an escalation, or a hold the
-    validator cannot settle. None for an approval or a send-back: those are the pipeline's own.
-    {"key", "subject", "urgent", "what", "agent_says", "reply", "where"}: `reply` is the exact reply
-    that clears it (`approve <plan>`, `start <piece>`), and `where` where to act when no reply can.
-    `agent_says` is the agent's own line, to be quoted as its words and never as the report's."""
-    if not isinstance(row, dict) or ledger.row_problems(dict(row, at=row.get("at") or
-                                                             "2000-01-01T00:00:00Z")):
-        return None
-    kind = row["kind"]
-    if kind not in ("escalated", "escalated-urgent", "held"):
-        return None
-    done = {"held": "was held by the validator", "escalated": "was sent to you by the validator",
-            "escalated-urgent": "was sent to you by the validator, urgently"}[kind]
-    words = reason_words(row["reasons"])
-    what = "%s %s%s" % (_name(row), done, (": %s" % "; ".join(words)) if words else "")
-    if kind == "escalated-urgent":
-        what = "Urgent: " + what + ". It believes the dev session may be compromised"
-    reply, where = "", ""
-    if row["subject"] == "plan":
-        reply = "approve %s" % row["ref"]
-    elif row["subject"] == "piece":
-        reply = "start %s" % row["ref"]
-    else:
-        repo, number = row["ref"].split("#", 1)
-        where = "It's yours to merge or close: %s/%s/pull/%s" % (GITHUB, repo, number)
-    return {"key": row["ref"].lower() if row["subject"] == "merge" else row["ref"],
-            "subject": row["subject"], "urgent": kind == "escalated-urgent", "what": what,
-            "agent_says": row["agent_says"], "reply": reply, "where": where}
+reason_words, blocker = ledger.reason_words, ledger.blocker
 
 
 def urgent_route(status_file, now, ref, max_age=limits.DEFAULT_WATCHER_MAX_AGE):

@@ -125,9 +125,10 @@ are built, nothing is approved for you.
 ## 2. The ledger
 
 Every decision the validator makes is one row in its ledger: what it decided, about what, and
-why. Only the validator writes it. The stand-up and the weekly recap will read it. The watcher
-checks every merge against it (`docs/WATCHER.md`, the `approval-rate` monitor). Nothing writes rows yet: the pieces that
-decide come next. The format is contract §24; the code is `scripts/pipeline_validator_ledger.py`.
+why. Only the validator writes it. The stand-up and the sprint recap read it (section 7, "In
+the stand-up"). The watcher checks every merge against it (`docs/WATCHER.md`, the
+`approval-rate` monitor). Nothing writes rows yet: the pieces that decide come next. The format
+is contract §24; the code is `scripts/pipeline_validator_ledger.py`.
 
 | A row says | For example |
 |---|---|
@@ -199,7 +200,8 @@ python3 scripts/pipeline_validator_app.py run --repo OWNER/NAME --key-file ~/.va
 It checks what is done, shows what it will change, and asks for one typed `yes`. Then:
 
 1. It opens GitHub's page to create the app. You click GitHub's own Create button. The app may
-   write check runs, and nothing else.
+   write check runs. For the merge path (section 9), it may also turn GitHub's own auto-merge on
+   or off, and ask GitHub to update a pull request's branch. It never merges, approves or labels.
 2. It writes the app's key to the file you named, mode 600. The key is never printed. The
    app's id goes in `~/.validator-app/state.json`.
 3. It opens GitHub's page to install the app. Pick the repository. It waits until GitHub shows
@@ -398,7 +400,7 @@ runs the other way: `ESCALATE_URGENT` always reaches you.
 
 The hard limits are the first layer: plain code with no model. They are worked out again at each
 decision, from things no session can write. The code is `scripts/pipeline_validator_limits.py`.
-The piece pass calls it (section 9). The merge path and plan approvals are their own pieces.
+The merge path (section 9) and the piece pass (section 10) call it. Plan approvals are their own piece.
 
 It answers `pass`, or `fail` with every reason, in short fixed words. It never quotes a ticket or a
 pull request.
@@ -490,8 +492,8 @@ agent to see what it would say.
 ## 7. What a no does
 
 When the validator does not approve, code decides what happens next, from the agent's answer and
-the layers. The code is `scripts/pipeline_validator_route.py`. The piece pass calls it (section
-9). The merge path and plan approvals are their own pieces.
+the layers. The code is `scripts/pipeline_validator_route.py`. The merge path (section 9) and the
+piece pass (section 10) call it. Plan approvals are their own piece.
 
 | What happened | What it records | What happens next |
 |---|---|---|
@@ -526,8 +528,28 @@ session.
 
 **What you see.** Each escalation and each hold that waits for you is a blocker, with its reason in
 plain words and the reply that clears it: `approve <plan>` for a plan, `start <piece>` for a
-piece. A pull request is yours to merge or close on GitHub. A later piece puts these in the
-stand-up. The agent's own words are shown apart, as its words, never as the report's.
+piece. A pull request is yours to merge or close on GitHub. The agent's own words are shown apart,
+as its words, never as the report's.
+
+### In the stand-up
+
+The daily stand-up and the sprint recap say the validator's decisions, built by code from the
+ledger (KIT-545, `docs/STANDUP.md`). Each approval since the last stand-up is one line. Each
+escalation and each hold that still waits for you is a blocker, an urgent one first and marked
+urgent. The recap lists the week's approvals, send-backs, escalations and holds.
+
+To turn it on:
+
+1. Set `STANDUP_VALIDATOR_LEDGER` in `bridge.conf` to the ledger's absolute path.
+2. Run the bridge installer's `standup` command (`docs/BRIDGE-OPERATOR.md`). It shows the file it
+   writes, asks one yes, and reads it back.
+
+The bridge runs as the role account, so that account must be able to read the ledger. A ledger
+it cannot read is said in the stand-up: *The validator's record could not be read, so no
+approval is claimed.* It is never shown as none.
+
+Good: one line per approval, and the agent's reason quoted under it as its words. Not that: a
+quiet stand-up while the record cannot be read.
 
 **An urgent one pages you through the watcher,** which reads the ledger on its own account. The
 validator sends nothing itself, so it never assumes a page. It says `paged` only once the watcher's
@@ -544,8 +566,8 @@ verdict is the validator's: a send-back has its own path, and an escalation or a
 
 Before it judges anything, the validator reads the facts about it once: who filed the idea, which
 files change, how big the change is, whether the window is open, and so on. The code is
-`scripts/pipeline_validator_facts.py`. It only reads. The piece pass calls it (section 9). The
-merge path and plan approvals are their own pieces.
+`scripts/pipeline_validator_facts.py`. It only reads. The merge path (section 9) and the piece pass
+(section 10) call it. Plan approvals are their own piece.
 
 Each fact comes from the part of the kit that owns it, through that part's own reader:
 
@@ -587,7 +609,83 @@ config could not be read or is not valid.
 **What it does not read yet.** Agent-filed work's generation is the queue's to certify, from its own
 verdict, and is not read here: such work's provenance is said as unread, so it waits for you.
 
-## 9. A piece starting
+## 9. The merge path
+
+The validator's own job turns on GitHub's own auto-merge for one pull request at a time, each on
+the latest main. It never merges, approves a review or labels: GitHub merges, once its own rules
+pass. The code is `scripts/pipeline_validator_merge.py`. Nothing schedules it yet: the install is
+a later piece.
+
+**What one pass does.**
+
+1. It reads the switches. Off, or no repository in `merge_repos`: it stops and says `OFF`.
+2. It reads the watcher's hold. A hold, or a hold file it cannot read: it stops and says `HELD`.
+3. It reads the ledger, and every open pull request in the listed repositories. One it cannot read
+   whole stops it.
+4. One in flight. A pull request with auto-merge on waits for GitHub to merge it. While one is on,
+   nothing else is turned on.
+5. The rest, oldest first. Each is judged by its facts, the hard limits, the evidence and, last,
+   one agent run.
+
+| What it finds | What it does |
+|---|---|
+| A hold no pass can settle: the safety system, a human-only class, a declined review | A `held` row and its check. It waits for you. |
+| Behind main, and nothing else | GitHub's own update-branch at that head, and the pass ends. The new head is judged from scratch. |
+| Checks running or red, a review not in yet or stale, a fact not read | Nothing written. It waits, and says why. |
+| Both layers pass | One agent run, its row and its check. For an approval, auto-merge on at exactly that head. |
+| Auto-merge on, but no approval at its head | Turned off if the validator turned it on. Left alone, and said, if someone else did. |
+| Approved and in flight, but now behind main | Its auto-merge goes off first, then GitHub's own update-branch. The new head is judged from scratch before anything turns auto-merge on again. |
+
+At most one agent run, and one pull request turned on, per pass.
+
+**What is written down.** The ledger holds one verdict per head: an approval, a send-back, an
+escalation, or a hold no pass can settle. A wait spends no verdict. So a skip (a draft, a pull
+request into another branch), a wait, an update and turning auto-merge off write no row. Each pass
+says each of them, and its output is their record.
+
+**It acts as its own app.** It reads with your `gh` login, and writes only as the validator's app.
+A merge GitHub makes for the app is the app's, so the watcher checks it against the ledger. A merge
+under your login would be yours, and the watcher would not check it.
+
+**The app needs two more permissions.** GitHub asks `Contents: write` and `Pull requests: write` of
+an app that turns auto-merge on or updates a branch. An app made by `run` from now on has them. For
+one made before:
+
+1. Open the app's settings on GitHub. Under Permissions, set Contents and Pull requests to Read and
+   write. Save.
+2. Accept the new permissions on the app's installation.
+
+Good: `acme/app#12: turn GitHub's own auto-merge on at 0a1b2c3d4e5f`. Not that: `could not turn
+GitHub's own auto-merge on ... FORBIDDEN`.
+
+**The stale-review limit (KIT-792).** Updating a pull request moves its head, so its review is stale
+until Stage E reviews the new head. Stage E re-reviews a moved head once per pull request. One
+updated a second time waits, and each pass says why. It is never approved on a stale review.
+
+**Its config** is `~/.validator/config.json`: `settings_file`, `ledger_file`, the `merge` section
+(`review_bar`, `merge_method`, `max_pages`), and the `facts`, `agent` and `check` sections. Print
+one to start from:
+
+```bash
+python3 scripts/pipeline_validator_merge.py --example-config
+```
+
+**Try one pass that writes nothing.** It reads and judges, runs no agent, and changes nothing. Run
+it in a terminal, as yourself: it is refused in an agent's environment.
+
+```bash
+python3 scripts/pipeline_validator_merge.py run --config ~/.validator/config.json --dry-run
+```
+
+**A merge queue is optional.** The job needs no paid feature: it keeps one pull request in flight,
+and updates the next itself. Where GitHub's merge queue is free, a repository may use it instead.
+Its required workflows must then also run on the `merge_group` event. That is a workflow change
+only a person can land.
+
+Exit 0: the pass ran and said what it did, or that it was off or held. 1: a write failed. 2: the
+config needs fixing, or this is an agent's environment. 3: something could not be read.
+
+## 10. A piece starting
 
 A piece of a plan you approved waits for your `start` when it was added to the plan, or changed,
 after your approval. With the pieces switch on, the validator may give that start in your place

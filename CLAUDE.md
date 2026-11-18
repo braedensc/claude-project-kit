@@ -355,6 +355,8 @@ npm run test:validator-limits  # the validator's hard limits (KIT-538): pass or 
                              #   each fact from its owner's reader; the floor is never a switch
 npm run test:validator-run   # the validator agent's run (KIT-537): one tool-less CLI call, its argv and
                              #   environment pinned, a failure a hold in fixed words, only its job starts it
+npm run test:validator-merge  # the merge path (KIT-539): GitHub's own auto-merge on one pull request at a
+                             #   time, the next updated and judged again; never merges, approves or labels
 npm run test:validator-pieces  # the validator approves a piece starting (KIT-543): the ticket as written,
                              #   against its plan's criteria; it records, and the queue's pool starts it
 npm run test:day-planner     # the day planner (KIT-439): ticket text fenced as data in its brief, one
@@ -420,12 +422,16 @@ npm run test:ci-covers      # every package.json test:* script has a CI step out
 npm run lint:ci-covers      # …and the same check over this repo
 npm run test:stdlib-only    # the kit's Python imports only the standard library, bar a named list (KIT-652)
 npm run lint:stdlib-only    # …and the same check over this repo's tracked .py files
+npm run test:repo-setup     # the repo-setup check: missing label, missing variable, all present, unreadable (KIT-692)
+npm run check:repo-setup    # …and the real one: reads GitHub only, names each missing label and variable (owner runs it)
 npm run test:pr-base         # PR-base gate: a PR's base must be a base branch; an unknown
                              #   event or missing value FAILS, main() itself is exercised
 npm run test:label-gate      # the label gate runs the default branch's workflow and code on
                              #   pull_request_target, never the PR's: one closed reason per rule (KIT-668)
 npm run test:gate-policy     # the owner's Actions policy that lets the gate run after 2 Dec 2026:
                              #   check, show, one typed yes, one POST, read back; refused under a model
+npm run test:template-label-gate  # the stack template's label gate runs the default branch's workflow on
+                             #   pull_request_target, never the PR's: one closed reason per rule (KIT-788)
 npm run test:alert-pages     # alert templates page a person (ALERT_PAGE_TO, else a user
                              #   owner) or fail their run; runs each copy under node
 npm run lint:secrets    # secretlint over every tracked file, read as git stores it

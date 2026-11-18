@@ -505,10 +505,11 @@ match its `update.conf`, and run the Stage E installer:
 - `HEALTH_STATUS_FILE`: the same absolute path as its `HEALTH_STATUS_FILE`.
 - `HEALTH_WATCH_INTERVAL_SECONDS`: the same number as its `WATCH_INTERVAL_SECONDS`.
 
-The step adds `health-watch` to `watch`, at that interval plus 4300 s (3900 s before the `credentials` kind, KIT-579; 3100 s before the `notifier` and `monitor` kinds, KIT-286). A monitor installed earlier keeps the
+The step adds `health-watch` to `watch`, at that interval plus 4800 s (4300 s before the waker's sandbox check, KIT-829; 3900 s before the `credentials` kind, KIT-579; 3100 s before the `notifier` and `monitor` kinds, KIT-286). A monitor installed earlier keeps the
 old gap until this step runs again, and can page `health-watch` as stale on a pass where every
 kind changes at once. Re-run the step. That is one alert
-send per GitHub kind if every kind changes at once, plus up to 60 s counting temp space. A monitor
+send per GitHub kind if every kind changes at once, plus up to 60 s counting temp space, plus up
+to 480 s for the waker's sandbox check. A monitor
 installed before the `temp` kind (KIT-461) keeps the old 2700 s until this step runs
 again. Empty, the step's note says the health watch is
 not watched, by name.
@@ -534,7 +535,7 @@ interval plus its `run_timeout_seconds`), and set `notifier_state_dir` if the no
 `state_dir` is not this file's `state_dir`.
 
 To read the health watch by hand, add `health-watch` to `watch` and set `health_status_file`
-to its status file. Give it an interval of its `WATCH_INTERVAL_SECONDS` plus 4300.
+to its status file. Give it an interval of its `WATCH_INTERVAL_SECONDS` plus 4800.
 
 To read the status job by hand, add `pipeline-status` to `watch` and set `status_file` to the
 `status_file` its own config names. Give it an interval of its schedule plus its

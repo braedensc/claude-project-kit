@@ -157,6 +157,9 @@ FLOOR = (
     # bytes that run there.
     "templates/workflows/pr-conflict-monitor.yml",
     "templates/workflows/pipeline-*.yml",
+    # The stack template of the label gate itself (KIT-788): at bootstrap it IS the check that
+    # makes a guard-machinery edit visible, so the bytes chosen here are the bytes that run there.
+    "templates/workflows/hooks-change-guard.yml",
     "templates/hooks/**",
     "delivery.json",
     # The parts list (KIT-624) names the commands the one command will run with the owner's

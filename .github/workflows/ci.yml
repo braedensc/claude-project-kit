@@ -124,6 +124,12 @@ jobs:
           python3 scripts/check_label_gate.py
       - name: Label gate policy selftest (the owner's allow for pull_request_target)
         run: python3 scripts/pipeline_gate_policy.py --selftest
+      # KIT-788. The stack template's label gate runs the default branch's workflow, never the PR's.
+      - name: Template label gate check (the gate runs from the default branch)
+        run: |
+          python3 -m pip install --quiet pyyaml
+          python3 scripts/check_template_label_gate.py --selftest
+          python3 scripts/check_template_label_gate.py
 
       # KIT-652. The kit's Python imports only the standard library, bar a short named list,
       # because its jobs and hooks run on a Python with nothing added to it.
@@ -416,6 +422,12 @@ jobs:
       # and never a retry, the run folder always removed, and no script but its callers names it.
       - name: Validator run selftest (one read-only call; a failure holds; only its job starts it)
         run: python3 scripts/pipeline_validator_run.py --selftest
+      # The validator's merge path (KIT-539): GitHub's own auto-merge on for one pull request at a
+      # time, each on the latest main. Offline, against a stood-in code host: one in flight, the
+      # next updated and judged again from scratch, the floor held, a stale review never approved
+      # (KIT-792), off and held said, and it never merges, approves or labels.
+      - name: Validator merge path selftest (one in flight; never merges, approves or labels)
+        run: python3 scripts/pipeline_validator_merge.py --selftest
       # The validator approves a piece starting (KIT-543). Offline: only a piece of an approved plan
       # waiting for the owner's start is judged; the floor is held once; the agent judges the ticket
       # as written; one agent run a pass; off and held said; it never starts a piece itself.
@@ -808,6 +820,7 @@ jobs:
           python3 scripts/pipeline_acceptance_poller.py --selftest
           python3 scripts/pin_hooks_path.py --selftest
           python3 scripts/pipeline_machine_tickets.py --selftest
+          python3 scripts/check_repo_setup.py --selftest
           python3 scripts/pipeline_root_guard.py --selftest
           python3 scripts/pipeline_routing_tags.py --selftest
           python3 .claude/skills/sync-kit/compare.py --selftest
