@@ -17,8 +17,9 @@ THE SHAPE.  One document for every item. Each consumer reads its own part, and l
             exactly the facts limits() reads, each None when it could not be read
   evidence  {"last_piece", "acceptance"}: what pipeline_validator_evidence.evidence_for() takes
             besides the platform, which it reads itself
-  brief     {"criteria", "diff"}: what pipeline_validator_brief.build_brief() takes besides the
-            evidence record
+  brief     {"criteria", "diff", "ticket"}: what the brief builder takes. A merge's: the criteria
+            as delegated, and the diff, for build_brief() with the evidence record. A piece's: its
+            plan's criteria, and the piece's own text, for build_ticket_brief() (KIT-543)
   ticket, plan, idea   the tracker ids it followed, or None
   unread    {fact: why}: every fact it could not read, by name, in fixed words
 
@@ -189,7 +190,7 @@ def _empty(kind, ref):
             "limits": dict((k, None) for k in ("origin", "paths", "risk_paths", "pr", "window",
                                                "queue", "bounces", "watcher", "hold")),
             "evidence": {"last_piece": None, "acceptance": None},
-            "brief": {"criteria": None, "diff": None},
+            "brief": {"criteria": None, "diff": None, "ticket": None},
             "ticket": None, "plan": None, "idea": None, "unread": {}}
 
 
@@ -552,11 +553,18 @@ def for_piece(cfg, ident, now, run=None, queue_result=None):
                 raise Unread("the piece's repository named no default branch")
             return _delivery(run, repo, branch)[0]
         doc["limits"]["risk_paths"] = _read(doc, "risk_paths", risk_fact)
-        acceptance, out = snapshots.criteria_of(node.get("description"))
+        # The agent judges the piece as written against its plan's criteria (KIT-543): no code yet.
+        parent = node.get("parent") if isinstance(node.get("parent"), dict) else {}
+        plan_text = parent.get("description")
+        acceptance, out = (snapshots.criteria_of(plan_text) if isinstance(plan_text, str)
+                           else (None, None))
         if acceptance:
             doc["brief"]["criteria"] = criteria_text(acceptance, out)
         else:
-            doc["unread"]["criteria"] = "the piece's ticket has no acceptance criteria"
+            doc["unread"]["criteria"] = "the piece's plan has no acceptance criteria"
+        text = node.get("description")
+        if isinstance(text, str) and text.strip():
+            doc["brief"]["ticket"] = text
     else:
         for fact in ("paths", "risk_paths", "criteria"):
             doc["unread"].setdefault(fact, "its ticket was not read")
@@ -722,7 +730,8 @@ def selftest():
         def plan_node(*kids, more=False):
             return {"id": "id-TOD-10", "identifier": "TOD-10", "creator": {"id": OWNER},
                     "labels": {"nodes": [{"name": pool.GATE_EPIC_LABEL}]},
-                    "description": "Plan id: TOD-5/abcdef",
+                    "description": "Plan id: TOD-5/abcdef\n\n## Acceptance criteria\n\n"
+                                   "- [ ] The pieces work together.\n",
                     "children": {"nodes": [{"identifier": i, "state": {"type": t}} for i, t in kids],
                                  "pageInfo": {"hasNextPage": more}}}
         PLAN = plan_node(("TOD-13", "started"), ("TOD-14", "started"))
@@ -916,6 +925,11 @@ def selftest():
                   (piece["limits"]["origin"], piece["limits"]["paths"], piece["limits"]["risk_paths"],
                    bool(piece["brief"]["criteria"]), piece["item"]),
                   ("owner", ["src/a.py"], ["infra/**"], True, {"kind": "piece", "ref": "TOD-13", "head": None}))
+            check("...its brief is its plan's criteria and its own text, for the ticket brief (KIT-543)",
+                  ("The pieces work together." in piece["brief"]["criteria"],
+                   "It works." in piece["brief"]["criteria"], piece["brief"]["ticket"],
+                   piece["brief"]["diff"]),
+                  (True, False, "## Acceptance criteria\n\n- [ ] It works.\n\nTouch `src/a.py`.", None))
             check("...and what a piece has not got yet is said, never zero",
                   sorted(piece["unread"]), ["acceptance", "bounces", "diff", "last_piece", "pr", "queue"])
             got = facts_with(tickets_over=piece_ticket, piece=True, cfg_over={

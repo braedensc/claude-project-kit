@@ -1,0 +1,20 @@
+{
+  "schema": "pipeline-session-kind/1",
+  "kind": "plan",
+  "about": "Reads the project and answers with one plan for an idea. It changes nothing.",
+  "brief": "Plan the idea this ticket describes. Change nothing.",
+  "mode": "planning",
+  "branch": {"type": "chore", "word": "plan"},
+  "approval": {"newest_move": true, "states": "plan"},
+  "permissions": "deny-unlisted",
+  "tools": ["Read", "Grep", "Glob"],
+  "allow": {"Read": "workspace", "Grep": "workspace", "Glob": "workspace"},
+  "deny": ["store", "pins", "keys", "home"],
+  "wall": "own-sandbox",
+  "hosts": [],
+  "env": ["PATH", "HOME", "TMPDIR", "LANG", "CLAUDE_CODE_OAUTH_TOKEN", "DISABLE_AUTOUPDATER",
+          "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"],
+  "guards": ["pre-tool-use"],
+  "tool_servers": [],
+  "limits": {"wall_minutes": 180, "memory_mb": 4096, "disk_mb": 20480}
+}

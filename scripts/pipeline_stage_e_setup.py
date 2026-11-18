@@ -499,8 +499,8 @@ SIBLING_JOBS = (
                             "pipeline_sprint.py", "pipeline_sprint_changes.py", "pipeline_sprint_plan.py",
                             "pipeline_sprint_review.py", "pipeline_standup.py",
                             "pipeline_tech_lead_tools.py",
-                            "pipeline_tech_lead_turn.py", "pipeline_voice.py",
-                            "pipeline_window.py")),
+                            "pipeline_tech_lead_turn.py", "pipeline_validator_settings.py",
+                            "pipeline_voice.py", "pipeline_window.py")),
     # The bridge's always-on job (KIT-561): Slack's push connection, run by its own LaunchDaemon from
     # the same clone. It loads the bridge, and the standard-library WebSocket client it reads Slack with.
     ("pipeline_bridge_push.py", ("pipeline_bridge.py", "pipeline_bridge_answers.py",
@@ -518,7 +518,8 @@ SIBLING_JOBS = (
                                 "pipeline_sprint.py", "pipeline_sprint_changes.py", "pipeline_sprint_plan.py",
                                 "pipeline_sprint_review.py", "pipeline_standup.py",
                                 "pipeline_tech_lead_tools.py", "pipeline_tech_lead_turn.py",
-                                "pipeline_voice.py", "pipeline_window.py",
+                                "pipeline_validator_settings.py", "pipeline_voice.py",
+                                "pipeline_window.py",
                                 "pipeline_ws_client.py")),
     # The queue's two jobs (KIT-456): the usage job, and the morning job.
     ("pipeline_usage_local.py", ("pipeline_usage_local.py",)),
@@ -539,7 +540,8 @@ SIBLING_JOBS = (
                              "pipeline_sprint_review.py", "pipeline_standup.py",
                              "pipeline_tech_lead_tools.py",
                              "pipeline_tech_lead_turn.py", "pipeline_usage_local.py",
-                             "pipeline_voice.py", "pipeline_window.py")),
+                             "pipeline_validator_settings.py", "pipeline_voice.py",
+                             "pipeline_window.py")),
     # The bridge installer's verify runs the writer's probe from the clone (KIT-297).
     ("pipeline_voice.py", ("pipeline_voice.py", "pipeline_notify_events.py",
                            "pipeline_notify_local.py")),
