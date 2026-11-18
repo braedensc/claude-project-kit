@@ -167,7 +167,8 @@ after the other.
   wrote for a `ticket` session on the ticket its workspace is named after adds the pinned rules
   (grader paths, the ticket branch) beside the lane's, which still hold. Any other pin there binds
   nothing, as before. It is not behind a lane's setting, as item 2 above planned: only a lane that
-  is on makes a runner pin, and a pin can only add rules there. The owner applied the hook change.
+  is on makes a runner pin, and a pin can only add rules there. The hook change is the owner's: his
+  own apply script commits it to this change's pull request, which cannot merge without it.
 - **A code start is judged by the queue's own reader and judge,** strictly: a named approver, or
   no start. An agent-filed finding the queue's limits admit is refused on this lane.
 - **The runner's one tracker write** moves a code start's ticket into its working state, as the
