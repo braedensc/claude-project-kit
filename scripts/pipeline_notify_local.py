@@ -2148,7 +2148,7 @@ HEALTH_JOB_WORDS = {
     "bounce-driver": ("bounce driver", "review findings are not sent back for a fix"),
     "finding-poller": ("finding poller", "follow-up tickets a dev asks for are not filed"),
     "notifier": ("notifier", "pages like this one may not reach you"),
-    "bridge": ("bridge", "your direct messages go quiet: no asks are read and no stand-up is sent"),
+    "bridge": ("tech lead", "your direct messages go quiet: no asks are read and no stand-up is sent"),
     "catch-up": ("catch-up poller", "a hand-over the dispatcher missed is not sent again"),
     "health-watch": ("health watch", "something outside the daemons needs a look, or is not "
                                      "being checked"),
@@ -2375,6 +2375,12 @@ def is_authorised(mark, author_id, cfg):
 
 
 SATURATED_SKIP = "comment window saturated"
+# KIT-680: the ticket list is read in pages of TICKET_PAGE_SIZE, newest update first, until one
+# older than TICKET_WINDOW_DAYS days; more than TICKET_MAX_PAGES pages inside that window is a
+# failed read that says so.
+TICKET_PAGE_SIZE = 50
+TICKET_WINDOW_DAYS = 14
+TICKET_MAX_PAGES = 10
 # The two ways a daemon-health mark goes unpaged. The first is named in the pass summary
 # with its ticket, comment and author, because something other than the configured monitor
 # wrote the monitor's mark; the second is counted in the summary's OFF clause.
@@ -3242,7 +3248,7 @@ class ChatClient:
             if error == "missing_scope":
                 raise ChatDMScopeError(
                     "I could not open a direct message with %s: the chat token is missing a "
-                    "scope (needed: %s; provided: %s). The Slack bridge's app needs im:write "
+                    "scope (needed: %s; provided: %s). The tech lead's Slack app needs im:write "
                     "to page a person directly. Add it to that app and reinstall the app. No "
                     "page reached that person"
                     % (user_id, doc.get("needed") or "im:write",
@@ -3434,13 +3440,39 @@ class TrackerClient:
         is a live-test assumption and not a guarantee, a ticket whose window came back FULL
         is flagged, and the pass reports the truncation instead of going quiet about it.
         """
-        query = ("query($t:String!,$n:Int!,$c:Int!){issues(filter:{team:{key:{eq:$t}}},"
-                 "first:$n,orderBy:updatedAt){nodes{id identifier title state{type} "
+        query = ("query($t:String!,$n:Int!,$c:Int!,$a:String){issues(filter:{team:{key:{eq:$t}}},"
+                 "first:$n,after:$a,orderBy:updatedAt){pageInfo{hasNextPage endCursor} "
+                 "nodes{id identifier title updatedAt state{type} "
                  "labels{nodes{id}} "
                  "comments(first:$c,orderBy:createdAt){nodes{id body createdAt parent{id} "
                  "user{id} botActor{id}}}}}}")
-        doc = self._gql(query, {"t": team_key, "n": 50, "c": int(limit)})
-        nodes = (((doc.get("data") or {}).get("issues") or {}).get("nodes")) or []
+        # KIT-680: the list is read a page at a time, newest update first, until a ticket
+        # older than the window turns up (a mark lands on a ticket that was just updated) or
+        # the pages run out. A team whose window holds more than the page limit is a failed
+        # read, said as one, never a quiet cut at the 50th ticket.
+        nodes, cursor, pages = [], None, 0
+        horizon = time.time() - TICKET_WINDOW_DAYS * 86400
+        while True:
+            doc = self._gql(query, {"t": team_key, "n": TICKET_PAGE_SIZE, "c": int(limit),
+                                    "a": cursor})
+            conn = ((doc.get("data") or {}).get("issues")) or {}
+            page = conn.get("nodes") or []
+            nodes.extend(page)
+            pages += 1
+            info = conn.get("pageInfo") or {}
+            if not info.get("hasNextPage") or not info.get("endCursor") or not page:
+                break
+            last = _moment(page[-1].get("updatedAt"))
+            if last is not None and last < horizon:
+                break                       # past the window: older tickets need no read
+            if pages >= TICKET_MAX_PAGES:
+                raise NotifierError(
+                    "team %s has more than %d tickets updated in the last %d days (%d pages "
+                    "of %d were read): the notifier could not see all of them, so this read "
+                    "is a FAILURE, not a quiet week" % (
+                        team_key, TICKET_MAX_PAGES * TICKET_PAGE_SIZE, TICKET_WINDOW_DAYS,
+                        pages, TICKET_PAGE_SIZE), code=EXIT_ERROR)
+            cursor = info["endCursor"]
         out = []
         for n in nodes:
             comments = []
@@ -5819,6 +5851,45 @@ def selftest():
            and [c.get("created_at") for c in read_t[0]["comments"]]
            == ["2026-09-12T12:30:00.000Z", "2026-09-12T12:00:00.000Z"],
            (_GqlStub.asked[:1], read_t))
+
+        # KIT-680: 60 tickets in a team are all read, over two pages.
+        def _ago(seconds):
+            # relative to the real clock, which the read's window is judged against
+            return time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(time.time() - seconds))
+
+        class _PagedStub(TrackerClient):
+            def __init__(self, *a, total=60, stamp=None, **k):
+                TrackerClient.__init__(self, *a, **k)
+                self.total, self.calls = total, []
+                self.stamp = stamp or (lambda i: _ago(3600))
+
+            def _gql(self, query, variables):
+                self.calls.append(variables.get("a"))
+                start = int(variables.get("a") or 0)
+                end = min(start + variables["n"], self.total)
+                nodes = [{"id": "u-%d" % i, "identifier": "KIT-%d" % i, "title": "t",
+                          "labels": {"nodes": []}, "state": {"type": "started"},
+                          "updatedAt": self.stamp(i), "comments": {"nodes": []}}
+                         for i in range(start, end)]
+                return {"data": {"issues": {"nodes": nodes, "pageInfo": {
+                    "hasNextPage": end < self.total, "endCursor": str(end)}}}}
+        paged = _PagedStub(cfg, "not-a-real-key")
+        got = paged.recent_tickets("KIT", 20)
+        ok("KIT-680: a team with 60 tickets is read whole, over two pages",
+           (len(got), paged.calls) == (60, [None, "50"]), (len(got), paged.calls))
+        old_after = lambda i: _ago(3600) if i < 55 else _ago(30 * 86400)
+        paged_old = _PagedStub(cfg, "not-a-real-key", total=5000, stamp=old_after)
+        got = paged_old.recent_tickets("KIT", 20)
+        ok("KIT-680: the read stops at the first page that reaches past the window",
+           len(paged_old.calls) == 2 and len(got) == 100, (paged_old.calls, len(got)))
+        busy = _PagedStub(cfg, "not-a-real-key", total=5000)
+        try:
+            busy.recent_tickets("KIT", 20)
+            said = ""
+        except NotifierError as exc:
+            said = str(exc)
+        ok("KIT-680: more tickets in the window than the page limit is a FAILED read, named",
+           "more than 500 tickets" in said and len(busy.calls) == 10, (said, len(busy.calls)))
 
         # ── §7d. A hostile ticket title cannot control the chat client ───────────
         nasty = [tkt("KIT-5", ESC_BLOCKED, "c5", title="<!channel> <http://x|click>",
