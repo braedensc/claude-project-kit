@@ -1439,6 +1439,27 @@ and drops straight away waits like a failed try. Its heartbeat,
 `bridge-push-heartbeat.json` in the state folder, says whether the connection is up, when Slack was last
 heard, how many events it handled, and how many times it reconnected.
 
+**The logs (KIT-761).** Each job writes its log beside the bridge's config, in the role account's
+`~/.stage-e` folder by default. launchd points the job's output there.
+
+| Job | Its log | A healthy one shows |
+|---|---|---|
+| The bridge's pass, once a minute | `bridge.log` | One line a minute, such as `bridge: 0 message(s) examined, 0 asked, …`. It grows all day. |
+| The push job, always on | `bridge-push.log` | `push job: started, opening Slack's connection` each time the job starts. Then one line for each message it answers, such as `answered a DM message from U… with a turn (the conversation resumed); cost $0.0123, 90% of its input read from the cache`. While it is idle, nothing. |
+
+A problem is a line too: `could not open the connection (…); trying again in 4s`, or `message … could
+not be handled yet`. If the job cannot make its own output reach the file line by line, its first
+line says so: `push job: could not make its output line-buffered (…), so its log may stay empty
+while it runs`.
+
+Good: you send a DM, and within a second of the answer a new line shows in `bridge-push.log`.
+Not that: `bridge-push.log` at 0 bytes while the job answers messages. Before 16 Nov this was the
+normal state. The job never exits, and Python keeps a file's output in memory until the process
+ends, so its lines never arrived. The job now writes each line as it prints it, and prints one line
+when it starts. It reads its code when it starts, so a job started before the fix needs one restart.
+Not that: a quiet log, read as a stopped job. An idle job prints nothing, so read the heartbeat
+first: `connected: true` and a recent `at` mean it is up.
+
 | Config key | What it is |
 |---|---|
 | `push_mode` | `true` lets the job run, and makes the pass reply in a thread. Default `false`: the bridge behaves as it always did. It needs `tech_lead_turn`. |
