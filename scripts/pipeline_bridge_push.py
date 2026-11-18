@@ -36,6 +36,14 @@ address Slack gives carries a one-time ticket, so it is never printed or kept, n
 THE HEARTBEAT (`bridge-push-heartbeat.json` in the bridge's state directory) says whether the
 connection is up, when Slack was last heard, how many events were handled and how many times it
 reconnected. A reader that cannot read it says UNKNOWN, never a pass.
+
+THE LOG (KIT-761). launchd points the job's stdout at `bridge-push.log`, and Python buffers a file
+in blocks of 8 KB. The once-a-minute pass exits every time, which flushes; this job never exits,
+so its lines stayed in memory and the log read 0 bytes while it answered messages (measured 16 Nov).
+`run` therefore line-buffers stdout first, and every line the job prints, its own and each Pass's,
+reaches the file as it is written. It prints one line when it starts, so a log that shows it is a
+log that works. If stdout cannot be made line-buffered, it says so on stderr first, so a log
+that may stay empty says why.
 """
 import json
 import os
@@ -68,6 +76,7 @@ STABLE_SECONDS = 30.0                       # a connection that stayed up this l
 SEEN_MAX = 500                              # envelopes and messages remembered against a redelivery
 TOOL_POLL_SECONDS = 0.4                     # how often the tool note is looked at while a turn runs
 WORKING = "working on it"
+START_LINE = "push job: started, opening Slack's connection"
 ON_IT = "On it."
 COULD_NOT_YET = "I hit a problem with that and will try again in a minute."
 # The status line each tool shows, by name (KIT-560): fixed, never the model's own words. A test
@@ -89,6 +98,25 @@ PHRASES = {
 def status_text(phrase):
     """What Slack is asked to show: it prints the app's name, then this."""
     return "is %s…" % phrase
+
+
+NOT_LINE_BUFFERED = ("could not make its output line-buffered (%s), so its log may stay empty "
+                     "while it runs")
+
+
+def line_buffered_output():
+    """KIT-761: make stdout write each line as it is printed. Under launchd stdout is a file, and
+    Python holds a file's output until 8 KB are waiting or the process ends. This job never ends,
+    so its log stayed empty. Both ways it prints (its own `say` and each Pass's `out`) write whole
+    lines to sys.stdout, so one setting covers them. Returns "" once it is set. A stdout that
+    cannot be changed, such as a test's stand-in, is left as it is, never an error, and the
+    reason comes back in fixed words, so run can say why its log may stay empty (Stage E on
+    #563, contract §13)."""
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError, OSError) as exc:
+        return NOT_LINE_BUFFERED % type(exc).__name__
+    return ""
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════
@@ -582,6 +610,14 @@ def main(argv=None):
         sys.stderr.write("usage: pipeline_bridge_push.py run --config PATH | probe --config PATH"
                          " | --selftest\n")
         return EXIT_USAGE
+    why = line_buffered_output()          # before anything can print: KIT-761
+    if why:
+        # Said on stderr, which Python line-buffers since 3.9, so the log says why it may stay
+        # empty instead of staying empty with no sign (Stage E on #563).
+        try:
+            sys.stderr.write("push job: %s\n" % why)
+        except (AttributeError, ValueError, OSError):
+            pass                          # no stream left to say it on
     try:
         cfg = bridge.load_config(argv[2])
         if cfg["push_mode"] is not True:
@@ -599,7 +635,13 @@ def main(argv=None):
         tools_cfg, errors = tools.load_config(os.path.expanduser(cfg["turn_tools_config"]))
         if errors:
             tools_cfg = None            # no tool phrases; the job still answers
-    job = PushJob(cfg, slack, tracker, app_token, tools_cfg=tools_cfg)
+    return run_job(PushJob(cfg, slack, tracker, app_token, tools_cfg=tools_cfg))
+
+
+def run_job(job):
+    """The job's first line, then its loop until it is stopped. An idle job prints nothing else,
+    so the first line is how a log that works shows it (KIT-761)."""
+    job.log(START_LINE)
     try:
         job.run()
     except KeyboardInterrupt:
@@ -1583,6 +1625,88 @@ def selftest_body():
           (None, 0))
     check("mutant: the real run streams (so the two above differ from it)",
           [c[0] for c in slack_s.calls].count("startStream"), 1)
+
+    # -- 10. the log reaches its file while the job runs (KIT-761) ----------------------------------------------------------
+    import subprocess
+
+    def logged(body):
+        """Run `body` in a child as launchd runs the job, stdout and stderr to one file, and read the
+        file once the child says it is up, so a line that is going to be there already is. Returns
+        (the file's text, whether the child was still running). The child leaves when this process
+        does, and is killed here, so nothing is left behind."""
+        log = os.path.join(tempfile.mkdtemp(prefix="push-log-"), "job.log")
+        code = ("import os, sys, time\n"
+                "sys.path.insert(0, %r)\n"
+                "import pipeline_bridge_push as p\n"
+                "%s"
+                "sys.stderr.write('child up\\n')\n"
+                "for _ in range(80):\n"
+                "    if os.getppid() != %d:\n"
+                "        break\n"
+                "    time.sleep(0.1)\n") % (HERE, body, os.getpid())
+        env = dict((k, v) for k, v in os.environ.items() if k != "PYTHONUNBUFFERED")
+        with open(log, "wb") as fh:
+            proc = subprocess.Popen([sys.executable, "-c", code], stdout=fh, stderr=fh, env=env)
+        try:
+            text, until = "", time.monotonic() + 30
+            while "child up" not in text and proc.poll() is None and time.monotonic() < until:
+                time.sleep(0.05)
+                text = open(log, encoding="utf-8", errors="replace").read()
+            time.sleep(0.2)
+            return open(log, encoding="utf-8", errors="replace").read(), proc.poll() is None
+        finally:
+            proc.kill()
+            proc.wait()
+
+    no_config, said = os.path.join(ROOTDIR, "no-such-config.json"), "  a line printed while it runs"
+    text, alive = logged("p.PushJob({}, None, None, '').say(%r)\n" % said)
+    check("log: the control. With nothing set up, as launchd runs it, a job's line is still in "
+          "memory while it runs: that is why bridge-push.log read 0 bytes",
+          (said in text, alive), (False, True))
+    text, alive = logged("p.main(['run', '--config', %r])\n"
+                         "p.PushJob({}, None, None, '').say(%r)\n" % (no_config, said))
+    check("log: once run has set up its output, the job's own line is in the file while it runs",
+          (said in text, alive), (True, True))
+    text, alive = logged("p.main(['run', '--config', %r])\n"
+                         "pp = type('P', (), {'secrets': [], 'out': sys.stdout, "
+                         "'clean': p.bridge.Pass.clean, 'say': p.bridge.Pass.say})()\n"
+                         "pp.say(%r)\n" % (no_config, said))
+    check("log: and so is a line a Pass prints, which is how each answered message is logged",
+          (said in text, alive), (True, True))
+    lines = []
+    quiet = PushJob({}, None, None, "", say=lines.append)
+    quiet.run = lambda: None
+    check("log: the job's first line says it started, so a log that works shows it",
+          (run_job(quiet), lines), (EXIT_OK, [START_LINE]))
+    # Stage E on #563: a stdout that cannot be made line-buffered is never an error, and never
+    # silent either (contract §13): the log could stay empty again, so run says why, on stderr.
+    not_set = "could not make its output line-buffered (AttributeError), so its log may stay " \
+              "empty while it runs"
+    real_out, real_err = sys.stdout, sys.stderr
+    sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
+    try:
+        why = line_buffered_output()
+        main(["run", "--config", no_config])
+        err = sys.stderr.getvalue()
+    except Exception as exc:                            # noqa: BLE001
+        why, err = "raised %s" % type(exc).__name__, ""
+    finally:
+        sys.stdout, sys.stderr = real_out, real_err
+    check("log: a stdout that cannot be changed is left as it is, never an error, and the setter "
+          "says why in fixed words", why, not_set)
+    check("log: and run says it on stderr before anything else, so a log that may stay empty "
+          "says why", err.splitlines()[:1], ["push job: " + not_set])
+    with open(os.path.join(ROOTDIR, "real-out.txt"), "wb") as raw:
+        wrapped = io.TextIOWrapper(raw, encoding="utf-8")
+        real_out, sys.stdout = sys.stdout, wrapped
+        try:
+            why = line_buffered_output()
+            got = (why, wrapped.line_buffering)
+        finally:
+            sys.stdout = real_out
+            wrapped.detach()
+    check("log: a stdout that is a file is made line-buffered, and the setter says nothing",
+          got, ("", True))
 
     if failures:
         print("FAIL: pipeline_bridge_push selftest (%d of %d cases failed)" % (len(failures),

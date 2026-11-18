@@ -979,6 +979,32 @@ share. It stops there, before it changes anything: run the two again in the orde
 
 ---
 
+## How many tickets it reads (KIT-680)
+
+The notifier reads each team's tickets 50 at a time, newest update first, and keeps going
+until it reaches a ticket not updated in the last 14 days. A mark lands on a ticket that was
+just updated, so older tickets need no read. If a team has more than 500 tickets updated in
+that window, the read is a FAILURE: the pass says "more than 500 tickets" and exits with the
+error code. It does not cut the list quietly.
+
+Good: `FAIL: could not read 1 of 2 team(s): PROD: team PROD has more than 500 tickets updated
+in the last 14 days`.
+Not that: a pass that says `nothing to do` while ticket 51 held a mark.
+
+Other fixed list sizes found in the readers (nothing was changed for these; each is a ceiling
+that a very busy ticket or team could pass without a word):
+
+| Reader | Size | Past it |
+|---|---|---|
+| Notifier, comments per ticket | `lookback_comments` | the ticket is flagged "comment window saturated" |
+| Bridge tracker, comments per ticket | 100, not paged | older comments are not read |
+| Bridge tracker, a ticket's history | 50 a page, paged | all read |
+| Acceptance run, comments per ticket | 50, not paged | older comments are not read |
+| Finding poller, team labels and states | 250 and 100, not paged | a label or state past them is not found |
+| Catch-up poller, webhooks | 50, not paged | a webhook past them is not seen (being removed) |
+
+---
+
 ## What is not proven
 
 - **That the Stage E installer stops and reloads the notifier around a real clone move.**

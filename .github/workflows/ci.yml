@@ -403,6 +403,12 @@ jobs:
       # the answer's grammar is closed, the reason is cleaned, and the agent can only hold.
       - name: Validator brief selftest (fenced input; a closed answer; it can only hold)
         run: python3 scripts/pipeline_validator_brief.py --selftest
+      # The validator agent's run (KIT-537): one headless call of the claude CLI. Offline, with a
+      # stand-in for the CLI: the command line and the environment pinned (no tools, no MCP server,
+      # no settings, no saved session, the one token), each failure a hold in fixed words, one run
+      # and never a retry, the run folder always removed, and no script but its callers names it.
+      - name: Validator run selftest (one read-only call; a failure holds; only its job starts it)
+        run: python3 scripts/pipeline_validator_run.py --selftest
       # The validator's hard limits (KIT-538): layer 1, plain code with no model. Offline, in a
       # temp folder: one case per rule and every reason reached; each fact read by the part of
       # the kit that owns it; the safety-system floor is never a switch; closed words only.
