@@ -3785,6 +3785,89 @@ def main():
           f"three hooks (KIT-214)")
     failures += 0 if ok else 1
 
+    # KIT-684: a hook that runs past its `timeout` is Claude Code's NON-blocking error, so the
+    # tool call would run unjudged. The hook keeps a deadline of its own and refuses the call.
+    # Staged with a `git` that hangs, first on PATH, so every git call outlives its own
+    # timeout: the refusal must come inside the settings timeout, name the deadline, and leave
+    # no stuck git behind. The sleep's length is this run's own, so the check finds only ours.
+    with open(HOOK, encoding="utf-8") as _fh:
+        _hook_src = _fh.read()
+    _consts = {}
+    for _cname in ("HOOK_DEADLINE_SECONDS", "HOOK_DEADLINE_GRACE_SECONDS"):
+        _m = re.search(r"^%s = (\d+)\b" % _cname, _hook_src, re.M)
+        _consts[_cname] = int(_m.group(1)) if _m else None
+    # The bound is the timeout the wiring gives this hook: past it Claude Code runs the tool.
+    with open(os.path.join(os.path.dirname(HOOKS_DIR), "settings.json"), encoding="utf-8") as _fh:
+        _pre = json.load(_fh).get("hooks", {}).get("PreToolUse", [])
+    _wired = [h.get("timeout") for _m in _pre for h in _m.get("hooks", [])
+              if "pre-tool-use.py" in str(h.get("command", ""))]
+    _wired_ok = bool(_wired) and all(isinstance(t, (int, float)) for t in _wired)
+    _bound = min(_wired) if _wired_ok else 0
+    _hang = str(30000 + os.getpid() % 9000)
+    _hang_bin = os.path.realpath(tempfile.mkdtemp(prefix="hook-battery-hang-"))
+    _PL_TMP.append(_hang_bin)
+    with open(os.path.join(_hang_bin, "git"), "w") as _fh:
+        _fh.write("#!/bin/sh\nexec sleep %s\n" % _hang)
+    os.chmod(os.path.join(_hang_bin, "git"), 0o755)
+    _label = "a hook whose git hangs refuses the call inside its own deadline, naming it (KIT-684)"
+    seq_ran += 1
+    _starting(_label)
+    _t0 = time.monotonic()
+    _r = run_hook_proc(edit(os.path.join(feat_root, "src/app.ts"), "x"), hook_path=feat_hook,
+                       env={**os.environ, "CLAUDE_PROJECT_DIR": feat_root,
+                            "PATH": _hang_bin + os.pathsep + os.environ.get("PATH", "")})
+    _took = time.monotonic() - _t0
+    _left = (subprocess.run(["pgrep", "-f", "sleep " + _hang], capture_output=True,
+                            text=True).stdout.split() if shutil.which("pgrep") else [])
+    for _pid in _left:
+        subprocess.run(["kill", "-9", _pid], capture_output=True)
+    ok = (_r.returncode == 2 and "ran out of time" in _r.stderr
+          and ("deadline of %s seconds" % _consts["HOOK_DEADLINE_SECONDS"]) in _r.stderr
+          and _took < _bound and not _left)
+    print(f"[{'PASS' if ok else 'FAIL'}] {_label}"
+          + ("" if ok else f"  (exit {_r.returncode} after {_took:.1f}s against a settings "
+                           f"timeout of {_bound}s, deadline {_consts['HOOK_DEADLINE_SECONDS']}s "
+                           f"+ backstop {_consts['HOOK_DEADLINE_GRACE_SECONDS']}s; stuck git "
+                           f"left: {len(_left)}; {_r.stderr[-200:]!r})"))
+    failures += 0 if ok else 1
+
+    # …the deadline and its backstop end before the settings timeout, with a second to spare
+    # for the interpreter's start: past that timeout Claude Code runs the tool.
+    seq_ran += 1
+    _dl, _gr = _consts["HOOK_DEADLINE_SECONDS"], _consts["HOOK_DEADLINE_GRACE_SECONDS"]
+    ok = (_wired_ok and _dl is not None and _gr is not None and _dl + _gr + 1 <= min(_wired))
+    print(f"[{'PASS' if ok else 'FAIL'}] the hook's deadline and backstop end before its "
+          f"settings timeout (KIT-684) (deadline {_dl}, backstop {_gr}, timeout {_wired})")
+    failures += 0 if ok else 1
+
+    # …and every subprocess the hook starts has its own timeout, so no single git or gh call
+    # can spend the whole deadline unannounced.
+    seq_ran += 1
+    import ast as _ast
+    _tree = _ast.parse(_hook_src)
+    _runs = [n for n in _ast.walk(_tree) if isinstance(n, _ast.Call)
+             and isinstance(n.func, _ast.Attribute) and isinstance(n.func.value, _ast.Name)
+             and (n.func.value.id, n.func.attr) in (
+                 ("subprocess", "run"), ("subprocess", "Popen"), ("subprocess", "call"),
+                 ("subprocess", "check_call"), ("subprocess", "check_output"),
+                 ("os", "system"), ("os", "popen"))]
+    _untimed = [n.lineno for n in _runs if not any(k.arg == "timeout" for k in n.keywords)]
+    # A call spelt any other way would slip past that scan, so the spellings that make one are
+    # refused outright: `from subprocess import …`, `from os import system/popen`, and
+    # subprocess imported under another name.
+    _spelt = sorted(
+        n.lineno for n in _ast.walk(_tree)
+        if (isinstance(n, _ast.ImportFrom) and n.module in ("subprocess", "os")
+            and any(a.name in ("run", "Popen", "call", "check_call", "check_output", "system",
+                               "popen", "*") for a in n.names))
+        or (isinstance(n, _ast.Import) and any(a.name == "subprocess" and a.asname
+                                               for a in n.names)))
+    ok = len(_runs) >= 5 and not _untimed and not _spelt
+    print(f"[{'PASS' if ok else 'FAIL'}] every subprocess the hook starts has its own timeout "
+          f"(KIT-684) ({len(_runs)} calls" + (f"; none on lines {_untimed}" if _untimed else "")
+          + (f"; started another way on lines {_spelt}" if _spelt else "") + ")")
+    failures += 0 if ok else 1
+
     # The pipeline sandboxes read the system lane marker from a stand-in folder (see
     # _install_hook_copy). What they test is the hook's path only if the hook names it,
     # once, exactly as card CK-10 writes it.
