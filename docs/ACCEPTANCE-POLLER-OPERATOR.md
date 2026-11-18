@@ -406,10 +406,6 @@ root and close to group and others. A session that could write the browser could
 **Not:** a browser folder you can write to. The `browser` row names the first file that is, and stops.
 **Not:** a `yes` you typed to something you did not read. The plan above it is what you are agreeing to.
 
-**Known gap.** Stage E's installer finds "the entry that manages a repository" among the dispatcher's entries and skips its
-own `reviews-` entries and the idea gate's, but not these. Today it takes the first match in file order, which is the
-coding entry, since these are added last. Teach it to skip `acceptance-` entries too if that order ever changes.
-
 ## What comes next
 
 The bridge's gate, which waits for the verdict before it closes a plan, is its own piece (KIT-325).
