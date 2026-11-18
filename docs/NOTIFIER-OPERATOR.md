@@ -5,7 +5,8 @@ decision drown in bookkeeping. The notifier separates them: one short ping per e
 one private Slack channel, or straight to your direct messages (*DM mode*, below).
 
 **Mechanism** ships in this kit as tested scripts. **Activation** is yours, at your own
-terminal. No session installs, loads or edits it. This file is generic on purpose: no
+terminal: by hand, or by the one command after your consent. No session installs, loads or
+edits it. This file is generic on purpose: no
 account names, ids or paths from a real deployment. Keep the filled-in copy in your
 private runbook.
 
@@ -546,20 +547,70 @@ do, it prints a numbered card and exits 10. Do that one thing. Run the same comm
 It checks your work and carries on.
 
 **The one command runs this for you** (`python3 scripts/pipeline_install.py`, step 3c) when this
-Mac has a `notifier.conf`. It runs `run --dry-run` and shows it. If a step would change something
-it asks, then runs `run` on a yes: that is how a new setting reaches the job after a merge. If
-only a card is left, it asks nothing and the end list says "waiting on you". With no
-`notifier.conf` the notifier reads "off on this Mac".
+Mac has a `notifier.conf`. With no `notifier.conf` the notifier reads "off on this Mac".
+
+- **In Manual,** it runs `run --dry-run` and shows it. If a step would change something it
+  asks, then runs `run` on a yes: that is how a new setting reaches the job after a merge. If
+  only a card is left, it asks nothing and the end list says "waiting on you".
+- **In Automatic (KIT-850),** it holds your Mac password once, then runs `check`. If a row
+  would change something, it runs `apply` with your consent piped in. `apply` asks nothing.
+  It loads the job itself when the job's first pass would send no more messages than its
+  ceiling (below). Above it, the job stays off, and the end list says why in one line.
 
 | Command | What it is |
 |---|---|
-| `run` | do everything possible; stop at the first card |
+| `run` | do everything possible; stop at the first card. Never loads the job |
 | `run --dry-run` | the same pass with nothing applied. Names what would change. Asks for nothing |
 | `status` | replays the ledger. Probes nothing |
 | `verify` | re-measures every step. Changes nothing, records nothing, asks for no credential |
+| `check` | for a program: every step measured as `apply` would see it. Changes nothing, records nothing, asks nothing, not even your Mac password. Prints one JSON document of rows; its words go to stderr |
+| `apply` | for a program, after your consent: answers through a pipe, and nothing asked. It loads the job itself, under its ceiling. A person types `run` instead |
 | `card CK-N1` | print a card, at any time. Without a conf that loaded, it shows the example values, and its header says why: not found, or found and rejected, with the first problem |
 | `card CK-N5` | is it alive, and how to pause and resume it. Printed only when you ask: no step stops on it, nothing is signed on it |
 | `attest A-PRIVATE-CHANNEL --initials YOUR-INITIALS --note "..."` | record something no computer can check. `YOUR-INITIALS` is refused as typed |
+
+### `check` and `apply`: the commands a program runs (KIT-850)
+
+**`check`** prints one JSON document on stdout: each step's name, its outcome word, its
+reason, and the card when a person must act. It never asks for your Mac password. Without a
+live administrator session, the rows that need one say NOT MEASURED, and it exits 4.
+
+**`apply`** reads its answers from a pipe on stdin:
+
+```json
+{"schema": "notifier-answers/1", "consent": "yes"}
+```
+
+- **A pipe only.** A terminal, a file or an argument is refused. A session could write a
+  file, and every process can read an argument.
+- **Anything but `"consent": "yes"`** changes nothing, records nothing, and exits 10.
+- **The token may come too,** as `"token"`. It goes to the role account's shell on stdin, as
+  the hidden prompt's does. It is never printed, recorded or passed as an argument. A
+  working token in the env file is never replaced.
+- **It asks nothing.** The program that calls it holds the Mac password first. Without that,
+  it exits 5 and changes nothing.
+- **It stops at the first step only a person can do,** and names the card without printing
+  it. The one command lists it at the end.
+
+**The first-pass ceiling.** `pipeline-parts.json` gives the notifier's part a ceiling: the
+most messages its first pass may send with nobody reading the number first. It is 5. `apply`
+runs the rehearsal and counts its `WOULD SEND` lines.
+
+- **At or below the ceiling,** it enables and loads the job, then waits one pass for the
+  job's own heartbeat. A pass that has not finished in time is NOT MEASURED, not "on".
+- **Above it,** the job stays installed, disabled and off. The end line says, for example,
+  `left off: its first pass would send 7 messages, above its ceiling of 5`. Read the
+  rehearsal's list. Then clear what you can in the tracker, or load it yourself with card
+  `CK-N3`. The next Automatic run counts again.
+- **A rehearsal that declined something** (exit 3), or a ceiling it cannot read, also leaves
+  it off.
+
+**A job you paused stays paused.** A job that was on, and is not loaded now, was paused by
+you. Neither `run` nor `apply` loads it again. Card `CK-N5` says how to resume it.
+
+**A job file written while the job is off is disabled,** in the same step, so a restart
+cannot start it. launchd loads every plist in `/Library/LaunchDaemons` at boot unless its
+label is disabled. Card `CK-N3`'s enable line comes first for this reason.
 
 **The labels step reads the tracker key from YOUR shell,** for that one command. It never
 reads the role account's file. Give it to that one command, and to nothing else:
@@ -593,12 +644,12 @@ nothing.
 |---|---|---|
 | `preflight` | reads the conf, finds the role account's home, runs the notifier's own selftest from this checkout, and checks that account's clone holds every file the notifier runs **byte for byte as this checkout does** (sha256, read as that account) | any problem, all listed at once. A clone file that is missing, unreadable, or different is named |
 | `slack-app` | waits for your sign-off that the app is separate and the channel private. In DM mode it passes with a note, and asks for nothing | card `CK-N1` |
-| `credentials` | checks the token in the role account's env file. Its shape is judged in that account's shell; the value never reaches the installer. Missing, `run` asks at a hidden prompt and writes it, mode 600, keeping every other line. With `WRITER=yes`, it also checks the writer's token is there, by name only. With `PAGE_IMAGES=yes`, it asks Slack whether the token holds `files:write` (KIT-568) | no terminal: card `CK-N2`. No tracker key: a failure naming the Stage E installer. No writer token: a failure naming the bridge installer's `writer-token` step. No `files:write`: card `CK-N6`. Slack not reached: NOT MEASURED |
+| `credentials` | checks the token in the role account's env file. Its shape is judged in that account's shell; the value is never read back out of the file. Missing, `run` asks at a hidden prompt and writes it, mode 600, keeping every other line; `apply` writes the one in its answers, and asks for none. With `WRITER=yes`, it also checks the writer's token is there, by name only. With `PAGE_IMAGES=yes`, it asks Slack whether the token holds `files:write` (KIT-568) | no terminal, or no token in `apply`'s answers: card `CK-N2`. No tracker key: a failure naming the Stage E installer. No writer token: a failure naming the bridge installer's `writer-token` step. No `files:write`: card `CK-N6`. Slack not reached: NOT MEASURED |
 | `labels` | finds `agent:blocked` and `agent:needs-human` by exact name, workspace-scoped, looks up `self` for `EXECUTOR_ACTOR_IDS`, `MONITOR_ACTOR_IDS`, `BOUNCE_ACTOR_IDS` and `FINDING_ACTOR_IDS`, and resolves **every key in `TEAM_KEYS`** | a missing label fails and names `/setup-board`. A team key this workspace has no team for fails here. The installer never creates either |
 | `config` | writes the notifier's config, mode 600, after the notifier's **own loader** accepts it, and after the notifier in the role account's clone is seen to know every key in it | a composition the notifier would refuse fails here, before anything is written. So does a key the clone's older notifier does not know |
-| `job` | installs `/Library/LaunchDaemons/<JOB_LABEL>.plist`. **Does not load it** | a plist already there that runs something else is never replaced: pick a `JOB_LABEL` nothing else uses |
+| `job` | installs `/Library/LaunchDaemons/<JOB_LABEL>.plist`. **Does not load it.** While the job is off, it disables the label in the same step, so a restart cannot start it | a plist already there that runs something else is never replaced: pick a `JOB_LABEL` nothing else uses |
 | `dry-run` | runs the notifier once, as the role account, through the job's own command, with `--dry-run` | exit 1, 2 or 4 fails, with the notifier's own words |
-| `enable` | asks launchd **what it is running**: that the job is loaded, that it holds this plist's command and interval, and that its own passes are getting through | card `CK-N3` when it is not loaded or holds an older plist; a job that has run nothing, stopped running, or could not deliver is not a green row |
+| `enable` | asks launchd **what it is running**: that the job is loaded, that it holds this plist's command and interval, and that its own passes are getting through. Under `apply`, it switches a job that was never on at or below the ceiling, and reloads one that holds an older plist | under `run`: card `CK-N3` when it is not loaded or holds an older plist. Under `apply`: card `CK-N3` when it was left off above the ceiling, or you paused it. A job that has run nothing, stopped running, or could not deliver is not a green row |
 | `first-ping` | waits for your sign-off on one live test | card `CK-N4` |
 | `handover` | prints what is on, what is off, and what is not proven, each with a ticket id. It reads the heartbeat monitor's config and heartbeat as the role account, and **never writes them**, and this notifier's own config file, to say whether the daemon-health page is on. It reads the bounce driver's config the same way, to say whether the ready-to-merge page is on, and the finding job's, for the finding-filed page. It also says who a ping that needs you @mentions | — |
 
@@ -616,8 +667,9 @@ ran under. Change the config and `CK-N4` comes back.
 
 ### Under a model
 
-`run` and `attest` refuse. There is no override flag. `run --dry-run`, `verify`, `status`
-and `card` still work, and under a model they:
+`run`, `apply` and `attest` refuse. There is no override flag. `apply` refuses before it
+reads its stdin. `run --dry-run`, `check`, `verify`, `status` and `card` still work, and
+under a model they:
 
 - ask for nothing, and acquire no password;
 - attempt nothing that needs `sudo`. Those rows say **NOT MEASURED**, exit 4;
@@ -672,7 +724,9 @@ reporting a failure.
 
 ## Turn it on — card CK-N3
 
-The installer never loads the job. You do:
+`run` never loads the job. In Automatic, `apply` loads it at or below its ceiling (above).
+Otherwise, you do: in Manual, for a job left off above the ceiling, or to resume one you
+paused:
 
 ```sh
 sudo launchctl enable system/<JOB_LABEL>
@@ -682,10 +736,10 @@ python3 scripts/pipeline_notifier_setup.py run
 ```
 
 **The enable line comes before every load.** It does nothing to a job that was never
-disabled. A job paused with `disable` (card `CK-N5`) will not load without it, not even
-after a restart. The installer does not read launchd's disabled flag: a job unloaded and
-disabled, and one only unloaded, both read as not loaded, BLOCKED on `CK-N3`. The card's
-lines load either.
+disabled. A job the installer left off is disabled, and so is one paused with `disable`
+(card `CK-N5`): neither loads without it, not even after a restart. A job that was on reads
+the same as paused, whether only unloaded or also disabled: BLOCKED on `CK-N3`, and the
+installer does not touch its disabled flag. The card's lines load either.
 
 Changed the plist while it was loaded? Unload it first:
 `sudo launchctl bootout system/<JOB_LABEL>`. Wait a few seconds before loading again. A load
@@ -695,11 +749,13 @@ does.
 
 **launchd keeps what it was given.** Change `INTERVAL_SECONDS`, or a path the job's command
 names, and the file on disk moves on while the running job does not. The installer asks
-launchd what it is actually running and compares it with the plist, on every run — so this
-card keeps coming back until you reload it, not just on the run that rewrote the file.
+launchd what it is actually running and compares it with the plist, on every run — so under
+`run` this card keeps coming back until you reload it, not just on the run that rewrote the
+file. Under `apply` the installer reloads it itself: unload, wait, enable, load, then it
+waits for the job's next pass and judges it.
 
-To pause the notifier, unload it. A later `run` does not load it again. Card `CK-N5`
-says what paused looks like, and how to resume.
+To pause the notifier, unload it. A later `run` or `apply` does not load it again. Card
+`CK-N5` says what paused looks like, and how to resume.
 
 ## Is it alive? Pause and resume — card CK-N5
 
@@ -745,7 +801,8 @@ future.
 **What paused looks like:**
 
 - `sudo launchctl print system/<JOB_LABEL>` answers `Could not find service`.
-- A later `run` does not load it again. The installer never loads the job.
+- A later `run` does not load it again, and nor does `apply`: a job that was on is never
+  switched back on by the installer.
 - `verify` reports the `enable` step BLOCKED on `CK-N3` for as long as it is paused. It
   cannot say "No drift" until you resume.
 - If your Stage E install watches the notifier (`NOTIFIER_JOB_LABEL` in `stage-e.conf`),
@@ -1013,6 +1070,14 @@ that a very busy ticket or team could pass without a word):
 
 ## What is not proven
 
+- **That `apply`'s launchd calls work on a real Mac.** The selftest drives a fake launchd:
+  disable, enable, load, reload, and a load it refuses. No live `apply` has run yet. (KIT-850)
+- **That the one command's Mac password reaches `check` and `apply`.** They ask for none and
+  use the session the one command holds, which macOS keeps per terminal. If it does not reach
+  them, `check` says NOT MEASURED and the one command stops there, by name. Not measured on a
+  live Mac. (KIT-850)
+- **That 5 is the right ceiling.** It is a first choice, with no measurement behind it. A
+  board with more open escalations leaves the notifier off until you look. (KIT-850)
 - **That the Stage E installer stops and reloads the notifier around a real clone move.**
   The selftest covers it with a faked launchd. No live run has yet (KIT-280).
 - **A dead notifier cannot page about itself.** The heartbeat monitor can watch its
