@@ -25,11 +25,13 @@ Each pass, every few seconds:
    removed. Anything left of its process group is killed first. A run that left no result and no
    exit is *interrupted*, and is resumed once. A lock only the wrapper holds says a run is alive;
    the session never gets it, so it cannot fake its own end.
-   A resume whose session the program no longer has is started afresh once: a new session in the
-   same workspace, given the ticket and the same request's text. Its record says `started_for:
-   session-gone` and names the lost session in `gone_session`.
 2. **Answers each waiting request, oldest first.** It starts, resumes or stops a session, or refuses
    with a reason. A request it cannot judge now waits for a later pass.
+
+**A resume whose session is gone starts afresh, once.** The program may no longer have the
+conversation a resume names. Then the runner starts one new session in the same workspace, given
+the ticket and the same request's text. Its record says `started_for: session-gone` and names the
+lost session in `gone_session`. A resume that fails any other way keeps its own reason.
 
 Before it starts anything, it checks the request against the tracker:
 
