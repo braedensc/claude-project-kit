@@ -2700,13 +2700,15 @@ def _cases_validator(check, tmp, now, ago, record, put, settings_with):
             # An approval before the last morning: not said again.
             (epoch(days=3), row("piece", "KIT-611", "approved", says="Old news.")),
             (epoch(hours=21), row("piece", "KIT-612", "approved")),
+            (epoch(hours=7), row("merge", "example-org/kit#614", "sent-back", head=C,
+                                 says="Add a test.")),
+            # Its latest row is a hold, but at a head the pull request has moved past: a later
+            # push is judged again, so it is no blocker.
             (epoch(hours=6), row("merge", "example-org/kit#614", "held", head=B,
-                                 reasons=["risk-path"])),       # its head moved: no blocker
+                                 reasons=["risk-path"])),
             (epoch(hours=5), row("plan", "KIT-600", "held", reasons=["provenance-not-owner"])),
             (epoch(hours=4), row("merge", "example-org/kit#611", "approved", head=A,
                                  says=link_says)),
-            (epoch(hours=3), row("merge", "example-org/kit#614", "sent-back", head=C,
-                                 says="Add a test.")),
             (epoch(hours=3), row("piece", "TOD-9", "held", reasons=["risk-path"])),
             (epoch(hours=2), row("merge", "example-org/kit#612", "escalated-urgent", head=A,
                                  says=urgent_says)),
@@ -2784,19 +2786,19 @@ def _cases_validator(check, tmp, now, ago, record, put, settings_with):
     one = {"what": VALIDATOR_NEEDS, "things": 1, "items": [
         {"is": "plan", "ticket": "KIT-600", "title": "Login plan",
          "why": "the idea was not yours"}]}
-    check("validator-one-held-thing-is-named-with-its-reason",
-          (_need_line(one), _need_line(dict(one, items=[{"is": "pull request",
-                                                         "why": "it may delete data"}]))),
-          ("Plan KIT-600, Login plan, was held for you by the validator: the idea was not "
-           "yours.", "A pull request outside any plan was held for you by the validator: it "
-           "may delete data."))
+    named = (_need_line(one), _need_line(dict(one, items=[{"is": "pull request",
+                                                          "why": "it may delete data"}])))
+    check("validator-one-held-thing-is-named-with-its-reason", named == (
+        "Plan KIT-600, Login plan, was held for you by the validator: the idea was not yours.",
+        "A pull request outside any plan was held for you by the validator: it may delete "
+        "data."), named)
     # 3. Whoever words the stand-up, an urgent one is said as urgent.
     lead_words = ("Morning! A quiet night here.\nNeeds you:\n%s the pull request for KIT-612 and "
                   "two more things the validator held.\nWant the details? Just ask." % BULLET)
+    judged = (check_words(lead_words, facts), check_words(lead_words.replace(
+        "the pull request", "urgent: the pull request"), facts))
     check("validator-the-tech-leads-words-must-say-urgent-when-one-is",
-          (check_words(lead_words, facts), check_words(lead_words.replace(
-              "the pull request", "urgent: the pull request"), facts)),
-          ("it left out that one is urgent", ""))
+          judged == ("it left out that one is urgent", ""), judged)
     check("validator-the-prompt-asks-for-it", "anything the facts mark urgent said as urgent"
           in standup_prompt("morning", facts))
     # 4. The afternoon counts approvals since midnight, as it counts the rest.
