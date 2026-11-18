@@ -37,7 +37,10 @@ THE MODEL CALL.  One `claude -p` run, never retried: no tools, MCP servers, sett
 session, one turn, a spend cap. The brief is on stdin. The child's cwd, HOME and TMPDIR are one
 fresh folder, removed afterwards, and its environment is the seven variables
 scripts/pipeline_voice.py gives its writer. Only a setup token goes: an API key bills each call.
-Nothing the CLI said is printed.
+Nothing the CLI said is printed. A call that started leaves one row in the morning job's spend
+ledger, morning-spend.jsonl beside the day plan, which the usage job reads (KIT-687, contract §30):
+its cost, tokens and model, billed to the plan. A call that timed out has no cost to read, so its
+row's cost is unknown, never zero.
 
 EXIT CODES (contract §13).  0: nothing to do, or planned by the agent, or by the queue because the
 planner is off or nothing was admitted. 3: planned, but by the queue after an answer it could not
@@ -72,6 +75,7 @@ try:
     import pipeline_day_planner as planner
     import pipeline_queue_order as order
     import pipeline_queue_pool as pool
+    import pipeline_spend_ledger as spend_ledger      # KIT-687: the planner call's row, contract §30
     import pipeline_sprint as sprint
     import pipeline_sprint_plan as sprint_plan
     import pipeline_status_local as status_job
@@ -382,14 +386,20 @@ def argv_of(m):
             "--permission-mode", "dontAsk", "--system-prompt", SYSTEM]
 
 
+def output_of(done):
+    """The CLI's JSON output of one finished run, as an object, or None."""
+    try:
+        doc = json.loads(getattr(done, "stdout", None) or "")
+    except (ValueError, RecursionError):
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
 def read_answer(done):
     """(answer or None, why, cost) from one finished run: nothing the CLI said is kept, its words
     only choose among voice.refusal_reason's fixed ones."""
     code = getattr(done, "returncode", None)
-    try:
-        doc = json.loads(getattr(done, "stdout", None) or "")
-    except ValueError:
-        doc = None
+    doc = output_of(done)
     said, status, cost, erred = "", None, None, False
     if isinstance(doc, dict):
         erred = doc.get("is_error") is not False or str(doc.get("subtype")).startswith("error")
@@ -413,9 +423,25 @@ def read_answer(done):
     return text, "", cost
 
 
+def record_spend(cfg, doc):
+    """KIT-687: one row in the morning job's spend ledger, beside the day plan (contract §30), for a
+    call that ran: `doc` is its JSON output, or None when it gave none in time. Billing is plan:
+    only a setup token is ever sent (token_problem). The model is planner_model, unless the output
+    names the one that carried the call. A row that cannot be written is said on stderr, and never
+    changes the pass: the ledger's mark says the call was not counted."""
+    path = spend_ledger.path_in(os.path.dirname(cfg["day_plan_file"]), "morning")
+    try:
+        spend_ledger.append(path, spend_ledger.row_from_result(
+            "morning", doc, "plan", cfg["morning"]["planner_model"]))
+    except (OSError, ValueError) as exc:
+        sys.stderr.write("NOTE: could not record the planner call's spend in %s: %s\n"
+                         % (path, type(exc).__name__))
+
+
 def ask(cfg, text, runner):
     """(answer or None, why, cost): THE call, in a fresh folder that is its cwd, HOME and TMPDIR,
-    with exactly voice.child_env's variables."""
+    with exactly voice.child_env's variables. A call that started, its timeout included, leaves
+    one row in the spend ledger (record_spend); one that never started leaves none."""
     m = cfg["morning"]
     token = (os.environ.get(m["planner_token_env"]) or "").strip()
     why = token_problem(token)
@@ -423,22 +449,26 @@ def ask(cfg, text, runner):
         return None, why, None
     # The folder goes however the call ends: a SIGTERM (a launchd unload) too, which a bare
     # `finally` never sees (KIT-466).
-    home = None
+    home, done, failed = None, None, None
     try:
         with scratch_run("pipeline-morning-") as home:
             try:
                 done = runner(argv_of(m), cwd=home, env=voice.child_env(home, token),
                               input=text, timeout=m["planner_timeout_seconds"])
             except subprocess.TimeoutExpired:
-                return None, ("the planner took longer than %g seconds"
-                              % m["planner_timeout_seconds"]), None
-            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                failed = "the planner took longer than %g seconds" % m["planner_timeout_seconds"]
+            except (OSError, ValueError) as exc:        # it never started: no row
                 return None, "could not run the planner (%s)" % (
                     getattr(exc, "strerror", None) or type(exc).__name__), None
+            except subprocess.SubprocessError as exc:   # it may have run: unknown, never no call
+                failed = "could not run the planner (%s)" % type(exc).__name__
     except OSError:                          # only the folder itself: the call's are caught above
         return None, "could not make a scratch folder", None
     finally:
         _noted(home)
+    record_spend(cfg, None if failed else output_of(done))
+    if failed:
+        return None, failed, None
     return read_answer(done)
 
 
@@ -861,7 +891,17 @@ def _cases(verify, hits, tmp):
 
     DEFAULT = dict(edit=None, fix=None, usage=True, reader=0, reader_raise=None, silent=False,
                    model=cli(GOOD), model_code=0, model_raise=None, now=NOW, dry=False,
-                   token=TOKEN, plan=None, absent=False, blocked=False)
+                   token=TOKEN, plan=None, absent=False, blocked=False, pre=None)
+    LEDGER = spend_ledger.FILE_NAMES["morning"]
+
+    def spent(plans):
+        """The spend ledger's rows beside the day plan, each without the time append() stamped
+        (the real clock's), or None when there is no ledger file."""
+        try:
+            with open(os.path.join(plans, LEDGER), encoding="utf-8") as fh:
+                return [dict(json.loads(x), at=None) for x in fh.read().splitlines()]
+        except (OSError, ValueError):
+            return None
 
     def go(n, **kw):       # one pass in a folder of its own, all else stood in for
         k = dict(DEFAULT, **kw)
@@ -880,6 +920,8 @@ def _cases(verify, hits, tmp):
         elif k["plan"] is not None:
             os.makedirs(plans)
             dump(os.path.join(plans, "day-plan.json"), k["plan"])
+        if k["pre"]:
+            k["pre"](plans)
         if k["usage"]:
             dump(os.path.join(where, "usage.json"), k["usage"] if isinstance(
                 k["usage"], dict) else USAGE)
@@ -899,10 +941,11 @@ def _cases(verify, hits, tmp):
         def spy_brief(pieces, c):
             stand.briefs.append((pieces, real[2](pieces, c)))
             return stand.briefs[-1][1]
-        said = []
+        said, err = [], io.StringIO()
         me.READER, voice.run, planner.brief = reader, stand, spy_brief
         try:
-            code = run(cfg, k["dry"], k["now"] and (lambda: k["now"]), say=said.append)
+            with contextlib.redirect_stderr(err):
+                code = run(cfg, k["dry"], k["now"] and (lambda: k["now"]), say=said.append)
         finally:
             me.READER, voice.run, planner.brief = real
         try:
@@ -915,7 +958,8 @@ def _cases(verify, hits, tmp):
         return types.SimpleNamespace(
             code=code, said=[fresh(x) for x in said], calls=stand.calls, stand=stand, cfg=cfg,
             plan=written, leftover=sorted(os.listdir(scratch)), fresh=fresh,
-            inputs_left=os.path.exists(cfg["inputs_file"]))
+            inputs_left=os.path.exists(cfg["inputs_file"]), spend=spent(plans),
+            err=fresh(err.getvalue()))
     cfg_dir = os.path.join(tmp, "cfg")
     os.makedirs(cfg_dir)
 
@@ -982,7 +1026,15 @@ def _cases(verify, hits, tmp):
         ("sprint-planned", dict(usage=dict(USAGE, week=SPRINT_WEEK), edit=lambda c: sprint_cfg(c, plan=["ENG-3"]))),
         ("sprint-damaged", dict(usage=dict(USAGE, week=SPRINT_WEEK), edit=lambda c: sprint_cfg(c, damaged=True))),
         ("sprint-dry", dict(usage=dict(USAGE, week=SPRINT_WEEK), edit=lambda c: sprint_cfg(c), dry=True)),
-        ("sprint-off", dict(usage=dict(USAGE, week=SPRINT_WEEK)))]
+        ("sprint-off", dict(usage=dict(USAGE, week=SPRINT_WEEK))),
+        # KIT-687: a spend ledger that will not take the call's row (a folder where it should be)
+        ("ledger-blocked", dict(pre=lambda plans: os.makedirs(os.path.join(plans, LEDGER)))),
+        # …and a call whose output names its model, tokens and session
+        ("spend-full", dict(model=cli(GOOD, session_id="0b6c3e1e-1d2f-4a5b-8c9d-0e1f2a3b4c5d",
+                                      usage={"input_tokens": 1200, "output_tokens": 340,
+                                             "cache_read_input_tokens": 8000,
+                                             "cache_creation_input_tokens": 0},
+                                      modelUsage={"claude-sonnet-5-5": {"costUSD": 0.1234}})))]
     KW, NUM = dict(SCEN), dict((k, i) for i, (k, _kw) in enumerate(SCEN))
     seen = dict((key, go(i, **kw)) for i, (key, kw) in enumerate(SCEN))
 
@@ -1063,11 +1115,14 @@ def _cases(verify, hits, tmp):
             {"state": "open", "opens_at": "2026-11-04T21:00:00Z",
              "closes_at": "2026-11-05T03:00:00Z"}))
     target = ag.cfg["day_plan_file"]
-    verify("…the plan conforms, is the file at 0644 alone, and holds no text but cleaned titles",
+    verify("…the plan conforms, is the file at 0644 beside only the call's spend ledger (KIT-687), "
+           "and holds no text but cleaned titles; the ledger holds none at all",
            (day_plan.problems_of(d), check_schemas.document_problems(d, "pipeline-day-plan"),
-            oct(os.stat(target).st_mode & 0o777), os.listdir(os.path.dirname(target)),
-            [x for x in (LEAK, WORDS, TOKEN) if x in json.dumps([ag.said, d])], d["date"]),
-           ([], [], "0o644", ["day-plan.json"], [], TODAY))
+            oct(os.stat(target).st_mode & 0o777), sorted(os.listdir(os.path.dirname(target))),
+            [x for x in (LEAK, WORDS, TOKEN) if x in json.dumps([ag.said, d])],
+            [x for x in (LEAK, WORDS, TOKEN, SENT, "Here is the plan") if x in json.dumps(ag.spend)],
+            d["date"]),
+           ([], [], "0o644", ["day-plan.json", LEDGER], [], [], TODAY))
     verify("the reader: once, as the job names it, in its environment, with a timeout",
            (rd["argv"][1:], rd["env"], rd["timeout"], rd["wrote"] == ag.cfg["inputs_file"],
             [c["kind"] for c in ag.calls]),
@@ -1242,6 +1297,41 @@ def _cases(verify, hits, tmp):
     verify("a plan the disk will not take: said in fixed words, not stored",
            (stored, lines), (False, ["COULD NOT WRITE /x/plan.json: OSError"]))
 
+    # -- KIT-687: the planner call's row in the spend ledger beside the day plan ------------------
+    def row(usd, model="sonnet", run_id=None, tokens=None):
+        return {"schema": spend_ledger.SCHEMA, "at": None, "caller": "morning", "model": model,
+                "usd": usd, "run_id": run_id, "billing": "plan", "tokens": tokens or dict.fromkeys(
+                    ("input", "output", "cache_read", "cache_write"))}
+    verify("KIT-687 a call that started leaves one row beside the day plan, billed to the plan, "
+           "with the model asked for when the output names none; a timeout's cost, and one with no "
+           "cost or no JSON, is unknown, never zero",
+           [seen[k].spend for k in ("agent", "queue-plain", "m-exit", "m-timeout", "m-notjson",
+                                    "m-noresult")],
+           [[row(0.1234)], [row(0.1234)], [row(0.1234)], [row(None)], [row(None)], [row(None)]])
+    verify("…the model, tokens and session the output names are kept",
+           seen["spend-full"].spend,
+           [row(0.1234, "claude-sonnet-5-5", "0b6c3e1e-1d2f-4a5b-8c9d-0e1f2a3b4c5d",
+                {"input": 1200, "output": 340, "cache_read": 8000, "cache_write": 0})])
+    verify("…a call that never started, and a pass that asks nothing, leave no row",
+           [seen[k].spend for k in ("m-oserror", "t-missing", "t-api", "off", "nothing", "dry",
+                                    "closed-before", "have-plan", "reader-1", "folder-blocked")],
+           [None] * 10)
+    ledger_of = lambda s: os.path.join(os.path.dirname(s.cfg["day_plan_file"]), LEDGER)  # noqa: E731
+    note_a, calls_a = spend_ledger.read(ledger_of(ag), "morning", 0)
+    verify("…the usage job's own reader reads it: one call, its cost and billing; the file is 0644",
+           (note_a, [(c["usd"], c["billing"], c["model"]) for c in calls_a or []],
+            oct(os.stat(ledger_of(ag)).st_mode & 0o777)),
+           ({"state": "read", "reason": None}, [(0.1234, "plan", "sonnet")], "0o644"))
+    lb = seen["ledger-blocked"]
+    verify("…a row the ledger will not take is said on stderr in fixed words, the pass is as it "
+           "was, and the reader says the ledger could not be read, never no calls",
+           (lb.err, out(lb), lb.spend, spend_ledger.read(ledger_of(lb), "morning", 0)),
+           ("NOTE: could not record the planner call's spend in <dir>/plans/%s: IsADirectoryError\n"
+            % LEDGER, out(ag), None,
+            ({"state": "could-not-read", "reason": spend_ledger.NOT_REGULAR}, None)))
+    verify("…and no other pass says anything on stderr",
+           [k for k, s in seen.items() if s.err and k != "ledger-blocked"], [])
+
     # -- the config ------------------------------------------------------------------------------
     def config_problems(edit):
         raw = base_raw(cfg_dir)
@@ -1348,7 +1438,7 @@ def _cases(verify, hits, tmp):
             return ("model", c["argv"], sorted(c["env"]), c["env"] == child_env(c["cwd"], TOKEN),
                     c["cwd_existed"], c["input"], c["timeout"])
         return (s.code, s.said, [one(c) for c in s.calls], json.dumps(s.plan, sort_keys=True),
-                s.leftover, s.inputs_left)
+                s.leftover, s.inputs_left, s.spend, s.err)
 
     def rerun(key):
         if key == "config":
@@ -1368,7 +1458,8 @@ def _cases(verify, hits, tmp):
             setattr(owner, attr, held)
     O = dict((n, getattr(me, n)) for n in (
         "todays_plan", "inputs_problem", "ask", "argv_of", "batch", "token_problem",
-        "check_morning", "plan_the_day", "exit_code", "store"))
+        "check_morning", "plan_the_day", "exit_code", "store", "record_spend"))
+    row_from_result, _append = spend_ledger.row_from_result, spend_ledger.append
 
     def minus(flag, argv):
         i = argv.index(flag)
@@ -1446,7 +1537,17 @@ def _cases(verify, hits, tmp):
          lambda raw: (lambda r: (r[0], [b for b in r[1] if "planner_bin" not in b]))(
              O["check_morning"](raw))),
         ("a plan in a working tree welcome", status_job, "inside_git_worktree",
-         lambda path: False))
+         lambda path: False),
+        # KIT-687: the planner call's row in the spend ledger
+        ("no row for a call", me, "record_spend", lambda cfg, doc: None),
+        ("no row for a call that gave no output", me, "record_spend",
+         lambda cfg, doc: doc is not None and O["record_spend"](cfg, doc)),
+        ("a call billed as a key", spend_ledger, "row_from_result",
+         lambda caller, doc, billing, model=None: row_from_result(caller, doc, "key", model)),
+        ("the model asked for left out", spend_ledger, "row_from_result",
+         lambda caller, doc, billing, model=None: row_from_result(caller, doc, billing)),
+        ("a row the ledger refuses, not said", spend_ledger, "append",
+         lambda path, row, now=None: None if os.path.isdir(path) else _append(path, row, now)))
     for name, owner, attr, value in MUT:
         verify("mutant: %s is caught" % name, caught(owner, attr, value), True)
     verify("…every mutant undone, the job is as it was", rerun("agent") == base["agent"], True)

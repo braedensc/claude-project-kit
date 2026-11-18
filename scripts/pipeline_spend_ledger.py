@@ -4,6 +4,7 @@ KIT-687, contract §30).
 
     from pipeline_spend_ledger import row_from_result, append, read
     row_from_result(caller, doc, billing, model)  a row from the claude CLI's JSON output
+    kept_output(doc)               what of that output a row is built from, and nothing else
     append(path, row, now)         THE ONE WRITER: one line at the ledger's end, in one write
     read(path, caller, since)      THE ONE READER: (note, calls), or why there are none to count
 
@@ -66,6 +67,10 @@ TOKENS = (("input", "input_tokens"), ("output", "output_tokens"),
           ("cache_read", "cache_read_input_tokens"),
           ("cache_write", "cache_creation_input_tokens"))
 ROW_KEYS = ("at", "billing", "caller", "model", "run_id", "schema", "tokens", "usd")
+# The keys of the CLI's JSON output a row is built from: numbers, words the CLI chose, the models'
+# names and the session id, never a word of the reply. A caller that keeps a call's output until
+# it writes the row keeps only these (kept_output, KIT-687).
+OUTPUT_KEYS = ("is_error", "modelUsage", "session_id", "subtype", "total_cost_usd", "usage")
 
 READ, PARTLY, COULD_NOT, OFF = "read", "partly-read", "could-not-read", "off"
 # A row is about 300 bytes. A longer line is not one, and the reader reads at most a ledger's
@@ -211,6 +216,15 @@ def row_from_result(caller, doc, billing, model=None):
             "tokens": _tokens_of(doc),
             "run_id": sid if isinstance(sid, str) and RUN_ID_RE.match(sid) else None,
             "billing": billing}
+
+
+def kept_output(doc):
+    """What of the CLI's JSON output `doc` a row is built from (OUTPUT_KEYS), and nothing else, or
+    None when there is no output to keep. row_from_result() gives the same row from either, so a
+    caller can keep this until it writes the row, and never the reply's text (KIT-687)."""
+    if not isinstance(doc, dict):
+        return None
+    return dict((k, doc[k]) for k in OUTPUT_KEYS if k in doc)
 
 
 def path_in(folder, caller):
@@ -561,6 +575,28 @@ def selftest():
            all(n.endswith(".jsonl") for n in FILE_NAMES.values())), (True, 4, True))
     check("the model pattern is the usage file's own",
           MODEL_RE.pattern, usage_runs.MODEL_RE.pattern)
+
+    # -- what a caller keeps of a call's output until it writes the row (KIT-687) ----------------
+    full = dict(DOC, permission_denials=[{"tool_input": {"command": WORDS}}], num_turns=3)
+    kept = kept_output(full)
+    check("kept_output keeps only the keys a row is built from, and no word of the reply",
+          (sorted(kept), WORDS in json.dumps(kept)), (sorted(OUTPUT_KEYS), False))
+    check("…and every row it gives is the row the whole output gives",
+          [row_from_result(c, kept_output(d), b, model=m) == row_from_result(c, d, b, model=m)
+           for c, d, b, m in (("tech_lead", full, "plan", "sonnet"), ("standup", None, "plan", None),
+                              ("morning", dict(DOC, total_cost_usd=0), "plan", "sonnet"),
+                              ("morning", dict(DOC, is_error=True, total_cost_usd=0), "plan", None))],
+          [True] * 4)
+    zero = dict(DOC, total_cost_usd=0)
+    needed = []
+    for key in OUTPUT_KEYS:
+        short = lambda d, k=key: dict((x, y) for x, y in kept_output(d).items() if x != k)  # noqa: E731
+        needed.append(any(row_from_result("morning", short(d), "plan") != row_from_result(
+            "morning", d, "plan") for d in (DOC, zero, dict(zero, subtype="error_during_execution",
+                                                           is_error=False))))
+    check("…and each key it keeps is one some row needs", needed, [True] * len(OUTPUT_KEYS))
+    check("no output, or one that is not an object, keeps nothing",
+          [kept_output(v) for v in (None, [DOC], "text")], [None, None, None])
 
     # -- the hand rules and the schema agree ----------------------------------------------------
     good = dict(row, at=_iso(T))

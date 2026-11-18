@@ -30,6 +30,9 @@ WHAT IS HERE
   The memory     one conversation per DM, kept (KIT-757, KIT-759). A turn that has to start a
                  new one is given the DM's recent messages, read from Slack by message count
                  (`recent_conversation`, KIT-751), so the tech lead never starts blank.
+  The spend      one row for each run of the CLI a turn started, in the tech lead's spend
+                 ledger or, for the stand-up's turn, the stand-up's, in the state folder, where
+                 the usage job reads them (`record_spend`, KIT-687, contract §30).
 
 THE CUTOVER (KIT-492). The dispatcher's chat bot answered here before, through a back room:
 the question passed on with a mention, the answer relayed back, request lines read from a
@@ -49,6 +52,7 @@ if HERE not in sys.path:
 
 import pipeline_notify_local as notify  # noqa: E402
 import pipeline_queue_settings as queue_settings  # noqa: E402  (KIT-700: the one write path into queue.conf)
+import pipeline_spend_ledger as spend_ledger  # noqa: E402  (KIT-687: a row per turn's run, contract §30)
 import pipeline_tech_lead_turn as turn  # noqa: E402  (KIT-489: the tech lead's own turn)
 from pipeline_bridge_transport import AnswerStream, BridgeError  # noqa: E402
 from pipeline_bridge_config import (EXIT_USAGE, OPEN, TICKET_RE, key_of,  # noqa: E402
@@ -525,6 +529,26 @@ class TechLeadMixin(object):
         """The turn runs through this, so a case can stand in for the CLI (KIT-489)."""
         return turn.run_turn(*args, **kwargs)
 
+    def record_spend(self, caller, res):
+        """KIT-687: one row for each run of the CLI the turn `res` started, in `caller`'s spend
+        ledger in the bridge's state folder (contract §30): `tech_lead` for a DM's turn and a plan
+        note's, `standup` for the stand-up's. The usage job reads both. Billing is `plan`: a turn
+        sends only a setup token. The model is turn_model, unless the run's output names the one
+        that carried it. A row that cannot be written is said in the log, and never fails the
+        turn: its ledger's mark says the call was not counted."""
+        runs = res.get("runs") if isinstance(res, dict) else None
+        if not isinstance(runs, list) or not runs:
+            return
+        model = turn.settings(self.cfg)[0].get("turn_model")
+        path = spend_ledger.path_in(self.cfg["state_dir"], caller)
+        for output in runs:
+            try:
+                spend_ledger.append(path, spend_ledger.row_from_result(caller, output, "plan",
+                                                                       model))
+            except (OSError, ValueError) as exc:
+                self.say("  could not record the spend of a turn's run in %s: %s"
+                         % (path, type(exc).__name__))
+
     def stream_judge(self, raw):
         """(held, text) for one whole line of an answer, for the stream (KIT-565): every check the
         whole-answer path makes, on the one line. `held` is the reason a line that looks like a
@@ -593,6 +617,7 @@ class TechLeadMixin(object):
         self.save()
         res = self.run_turn(dict(self.cfg, turn_timeout_seconds=seconds),
                             plan_note_prompt(rec["ticket"], piece, note, kids), None, self.now)
+        self.record_spend("tech_lead", res)
         acts, left_out = self.read_plan_outbox()
         if left_out:
             self.say("  a plan note's turn left %d action(s) out: %s"
@@ -740,6 +765,7 @@ class TechLeadMixin(object):
         try:
             res = self.run_turn(dict(self.cfg, turn_timeout_seconds=seconds), text,
                                 sessions.get(skey), self.now, **more)
+            self.record_spend("tech_lead", res)
             if res.get("began_again"):
                 # KIT-759: the one way a DM's conversation begins again, said in the log. Past
                 # Claude Code's own summary, the older turns are dropped, and that is said too.
@@ -861,6 +887,7 @@ class TechLeadMixin(object):
         self.state["forwarded_at"].append(self.now)
         self.save()
         res = self.run_turn(dict(self.cfg, turn_timeout_seconds=seconds), prompt, None, self.now)
+        self.record_spend("standup", res)
         acts, left_out = self.read_outbox()
         words = (res.get("text") or "").strip()
         why = "" if words else ("the turn gave no words" + (" (%s)" % res["why"] if res.get(
@@ -2362,13 +2389,15 @@ def cases_tech_lead(kit):
         check("turn-words-lines-that-tell-him-what-to-type-are-counted",
               rundown_take_words("Approve PROD-9 first.\nReply `yes PROD-9`.", hosts_)[1], 1)
 
+        RUNS_ = [{"is_error": False, "subtype": "success", "total_cost_usd": 0.01}]
+
         class RundownStub(object):
             """What rundown_words reads of a Pass, and nothing else."""
             def __init__(self, text, acts, turn_on=True, seconds=60, why=""):
                 self.cfg = {"tech_lead_turn": turn_on, "tech_lead_link_hosts": hosts_,
                             "turn_bin": "claude", "turn_tools_config": "/x/tools.json"}
                 self.state, self.now, self.said, self.ran = {"forwarded_at": []}, 100.0, [], []
-                self.counts, self.saved, self.dropped = {}, 0, 0
+                self.counts, self.saved, self.dropped, self.spent = {}, 0, 0, []
                 self._text, self._acts, self._seconds, self._why = text, acts, seconds, why
 
             def turn_seconds(self):
@@ -2383,7 +2412,10 @@ def cases_tech_lead(kit):
             def run_turn(self, cfg, prompt, session, now):
                 self.ran.append((prompt, session, self.saved, cfg["turn_timeout_seconds"]))
                 return {"text": self._text, "why": self._why, "session_id": None,
-                        "resumed": False}
+                        "resumed": False, "runs": list(RUNS_)}
+
+            def record_spend(self, caller, res):
+                self.spent.append((caller, res.get("runs")))
 
             def read_outbox(self):
                 return self._acts, []
@@ -2398,6 +2430,8 @@ def cases_tech_lead(kit):
         check("rundown-the-words-come-back-as-written-for-the-stand-ups-check-with-their-actions",
               (got, stub.rundown_recorded, len(stub.state["forwarded_at"]), stub.ran),
               ((said_, ""), [acts_[0], acts_[2]], 1, [("THE PROMPT", None, 1, 60)]))
+        check("rundown-its-turn-is-recorded-in-the-stand-ups-own-spend-ledger-kit-687",
+              stub.spent, [("standup", RUNS_)])
         for name_, text_, why_, want_why_ in (
                 ("no-words", None, "", "the turn gave no words"),
                 ("a-failed-turn", None, "the turn took longer than 90 seconds",
@@ -2415,7 +2449,92 @@ def cases_tech_lead(kit):
             stub = RundownStub("Hello.", acts_, **over_)
             got = Pass.rundown_words(stub, "P")
             check("rundown-%s-runs-no-turn" % name_,
-                  (got, stub.ran, stub.rundown_recorded), (("", want_why_), [], []))
+                  (got, stub.ran, stub.rundown_recorded, stub.spent),
+                  (("", want_why_), [], [], []))
+
+        # KIT-687: a plan note's turn is the tech lead's, recorded in its own spend ledger.
+        class PlanNoteStub(RundownStub):
+            """What plan_note_take reads of a Pass, and nothing else."""
+            def __init__(self, *a, **k):
+                RundownStub.__init__(self, *a, **k)
+                self.cfg["forward_max_per_hour"] = 5
+
+            def read_plan_outbox(self):
+                return [], []
+
+            def clean(self, text):
+                return text
+        stub = PlanNoteStub("Wait for PROD-52.", [])
+        got = Pass.plan_note_take(stub, {"ticket": "PROD-50"}, {"identifier": "PROD-51"},
+                                  {"kind": "reorder", "reason": "x", "prerequisite": ""}, [])
+        check("plan-note-its-turn-is-recorded-in-the-tech-leads-spend-ledger-kit-687",
+              (got, stub.spent), (([], "Wait for PROD-52."), [("tech_lead", RUNS_)]))
+
+        # KIT-687: the writer itself. One row for each run of the CLI the turn started, in the
+        # caller's own ledger in the bridge's state folder, read back by the usage job's reader:
+        # billing plan, the model the run's output names or else turn_model, an unread cost
+        # unpriced. A row that cannot be written is said in the log and never raises.
+        class SpendStub(object):
+            def __init__(self, state_dir):
+                self.cfg, self.said = {"state_dir": state_dir, "turn_model": "sonnet"}, []
+
+            def say(self, line):
+                self.said.append(line)
+        spend_dir = os.path.join(tmp, "kit-687-spend")
+        os.makedirs(spend_dir)
+        stub = SpendStub(spend_dir)
+        priced = {"is_error": False, "subtype": "success", "total_cost_usd": 0.0412,
+                  "session_id": t_sid, "modelUsage": {"claude-opus-5-5": {"costUSD": 0.0412}},
+                  "usage": {"input_tokens": 9, "output_tokens": 4}}
+        Pass.record_spend(stub, "tech_lead", {"runs": [priced, None]})
+        Pass.record_spend(stub, "standup", {"runs": [dict(priced, modelUsage={})]})
+        Pass.record_spend(stub, "tech_lead", {"runs": []})
+        Pass.record_spend(stub, "tech_lead", {"text": "no runs key, as an old stand-in gives"})
+        note_t, rows_t = spend_ledger.read(spend_ledger.path_in(spend_dir, "tech_lead"),
+                                           "tech_lead", 0)
+        note_s, rows_s = spend_ledger.read(spend_ledger.path_in(spend_dir, "standup"),
+                                           "standup", 0)
+        check("record-spend-one-row-per-run-in-the-callers-own-ledger-read-by-the-usage-job",
+              (note_t["state"], [(r["model"], r["usd"], r["billing"], r["run_id"],
+                                  r["tokens"]["input"]) for r in rows_t],
+               note_s["state"], [(r["model"], r["usd"], r["billing"]) for r in rows_s],
+               sorted(os.listdir(spend_dir)), stub.said),
+              ("read", [("claude-opus-5-5", 0.0412, "plan", t_sid, 9),
+                        ("sonnet", None, "plan", None, None)],
+               "read", [("sonnet", 0.0412, "plan")],
+               ["standup-spend.jsonl", "tech-lead-spend.jsonl"], []))
+        blocked_dir = os.path.join(tmp, "kit-687-blocked")
+        os.makedirs(os.path.join(blocked_dir, spend_ledger.FILE_NAMES["tech_lead"]))
+        stub = SpendStub(blocked_dir)
+        Pass.record_spend(stub, "tech_lead", {"runs": [priced]})
+        check("record-spend-a-row-that-cannot-be-written-is-said-and-never-raises",
+              (stub.said, spend_ledger.read(spend_ledger.path_in(blocked_dir, "tech_lead"),
+                                            "tech_lead", 0)[0]["state"]),
+              (["  could not record the spend of a turn's run in %s: IsADirectoryError"
+                % spend_ledger.path_in(blocked_dir, "tech_lead")], "could-not-read"))
+
+        def case_dm_turn_spend(name, blocked=False):
+            """One DM message answered by a turn that ran once, in a real pass."""
+            fake = FakeTurn({"text": "Two plans are open.", "session_id": t_sid,
+                             "runs": [priced]})
+            c, s, t = tlworld(name)
+            led = spend_ledger.path_in(c["state_dir"], "tech_lead")
+            if blocked:
+                os.makedirs(led)
+            s.add(ALICE, "where are we?", channel=DM)
+            code, out = with_turn(fake, lambda: run(c, s, t))
+            note, rows = spend_ledger.read(led, "tech_lead", 0)
+            return (code, dm_lines(s)[-1:], note["state"],
+                    [(r["caller"], r["model"], r["usd"], r["billing"]) for r in rows or []],
+                    "could not record the spend of a turn's run in %s: IsADirectoryError" % led
+                    in out)
+        check("tl-a-dm-turn-is-recorded-in-the-tech-leads-spend-ledger-kit-687",
+              outcome(lambda: case_dm_turn_spend("tl-kit-687-spend")),
+              (EXIT_OK, ["Two plans are open."], "read",
+               [("tech_lead", "claude-opus-5-5", 0.0412, "plan")], False))
+        check("tl-a-dm-turn-whose-row-cannot-be-written-is-still-answered-and-the-log-says-so",
+              outcome(lambda: case_dm_turn_spend("tl-kit-687-blocked", blocked=True)),
+              (EXIT_OK, ["Two plans are open."], "could-not-read", [], True))
 
         # And what the stand-up's turn recorded comes to the bridge's own fixed question right
         # after the stand-up, in the owner's DM, through the request path: a ticket the tech lead
