@@ -24,6 +24,7 @@
     "key_file": "~/.pipeline-runner/session-writer-key",
     "writer_user_id": "<the session writer's tracker user id, never the owner's>"
   },
+  "look_config_dir": "~/.stage-e/acceptance/look-configs",
   "projects": {
     "app": {
       "repo": "/Users/<role-account>/repos/app",

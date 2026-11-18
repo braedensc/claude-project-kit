@@ -19,6 +19,9 @@ move into it; until then this is the whole store.
     <store>/outputs/<run>.json     the session's final message, kept by the runner when the run
                                    ends, for the caller that asked for it (KIT-858): the runner's
                                    alone, for the same reason
+    <store>/lanes.json             the lanes the runner takes, per project, from its own checked
+                                   settings (KIT-708): the runner's alone, read by the jobs that
+                                   ask it, so each takes the old road for a lane that is off
 
 WHO MAY ASK.  Five jobs, each for its own kinds of session (CALLERS):
 
@@ -40,6 +43,13 @@ ticket. A stop carries none. When a run ends, the runner keeps the session's fin
 OUTPUT_MAX characters, in outputs/<run>.json. The caller reads it with run_output(): a document,
 None when the run left no result at all, or StoreError when one is there and cannot be read. The
 message is the session's own words, so it is data to its caller and never part of a run's record.
+
+WHICH ROAD (KIT-708).  A job that asks the runner reads lanes.json first, with read_lanes(): a
+lane the runner does not take for a project is the job's old road, and so is a runner that has said
+nothing yet (no file). A file that is there and cannot be read is "could not tell", never "off".
+A job that must name its request before writing it (the acceptance check names the look tool's
+record folder after it) takes an id from new_request_id() and passes it to ask(). A caller may
+withdraw() its own request while it waits.
 
 THE WALLS.  A session must never write here: a request it wrote could start a session nobody
 approved. So the store must be an absolute path, outside every git working tree, a real folder
@@ -129,6 +139,10 @@ RUN_KEYS = ("schema", "run", "request", "caller", "kind", "project", "ticket", "
             "branch", "pin", "pid", "state", "started_at", "ended_at", "seconds", "exit",
             "reason", "why", "cost_usd", "turns", "stop_asked_at", "auto_resume", "resumed_by",
             "gone_session")
+# KIT-708: the lanes the runner takes, as it says them in its store for the jobs that ask it.
+LANES_SCHEMA = "pipeline-runner-lanes/1"
+LANES_FILE = "lanes.json"
+LANES_KEYS = ("schema", "enabled", "work_dir", "look_config_dir", "projects")
 
 
 class StoreError(Exception):
@@ -360,11 +374,18 @@ def read_json(path):
 # --------------------------------------------------------------------------- #
 # Requests
 # --------------------------------------------------------------------------- #
-def ask(store, caller, action, kind, project, ticket, run=None, text=None, now=None):
+def new_request_id():
+    """A fresh request id, for a caller that must name its request before it writes it (KIT-708)."""
+    return "rq-" + uuid.uuid4().hex
+
+
+def ask(store, caller, action, kind, project, ticket, run=None, text=None, now=None,
+        request_id=None):
     """Write one request, and return its id. ValueError, in words, when it is not one this caller
     may write, or the store fails its walls. The caller's own code writes `text`; the runner hands
-    it to the session fenced as data."""
-    doc = {"schema": REQUEST_SCHEMA, "id": "rq-" + uuid.uuid4().hex,
+    it to the session fenced as data. `request_id`, from new_request_id(), names the request when
+    the caller needs its name first: one already used is refused."""
+    doc = {"schema": REQUEST_SCHEMA, "id": new_request_id() if request_id is None else request_id,
            "at": iso(time.time() if now is None else now), "caller": caller, "action": action,
            "kind": kind, "project": project, "ticket": ticket, "run": run, "text": text}
     bad = request_problems(doc)
@@ -374,8 +395,30 @@ def ask(store, caller, action, kind, project, ticket, run=None, text=None, now=N
     bad = walls(store) or walls(folder)
     if bad:
         raise ValueError(bad[0])
+    if any(os.path.lexists(os.path.join(store, where, doc["id"] + ".json")) for where in ("requests", "taken")):
+        raise ValueError("the request's id is used already")
     write_json(os.path.join(folder, doc["id"] + ".json"), doc)
     return doc["id"]
+
+
+def withdraw(store, request_id):
+    """Take back a request while it waits (KIT-708): True when it was waiting and is gone, False
+    when it was not waiting. The runner may have been taking it at that very moment: its answer
+    then says so, and the caller reads answer() again later. ValueError for a bad id, StoreError
+    when the store fails its walls or the file cannot be removed."""
+    if not (isinstance(request_id, str) and REQUEST_RE.match(request_id)):
+        raise ValueError("not a request id")
+    folder = os.path.join(store, "requests")
+    bad = walls(store) or walls(folder)
+    if bad:
+        raise StoreError(bad[0])
+    try:
+        os.unlink(os.path.join(folder, request_id + ".json"))
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise StoreError("the request could not be withdrawn (%s)" % type(exc).__name__)
+    return True
 
 
 def pending(store):
@@ -580,6 +623,71 @@ def run_output(store, run_id):
 
 
 # --------------------------------------------------------------------------- #
+# The lanes the runner takes (KIT-708)
+# --------------------------------------------------------------------------- #
+def lanes_problems(doc):
+    """Everything wrong with a lanes document's shape, in words. Empty when it is well formed."""
+    if not isinstance(doc, dict):
+        return ["the lanes are not an object"]
+    if sorted(doc) != sorted(LANES_KEYS):
+        return ["the lanes' fields are not the lanes'"]
+    path = lambda v: isinstance(v, str) and os.path.isabs(v) and "\0" not in v   # noqa: E731
+    projects = doc["projects"]
+    checks = (
+        ("schema", doc["schema"] == LANES_SCHEMA),
+        ("enabled", isinstance(doc["enabled"], bool)),
+        ("work_dir", path(doc["work_dir"])),
+        ("look_config_dir", doc["look_config_dir"] is None or path(doc["look_config_dir"])),
+        ("projects", isinstance(projects, dict) and all(
+            isinstance(k, str) and PROJECT_RE.match(k) and isinstance(v, list)
+            and all(isinstance(x, str) and x in KINDS for x in v) and len(set(v)) == len(v)
+            for k, v in projects.items())),
+    )
+    return ["the lanes' %s is not valid" % name for name, ok in checks if not ok]
+
+
+def write_lanes(store, doc):
+    """The runner's one way to say which lanes it takes: written whole, and only when it changed.
+    True when it was written. ValueError when it is not well formed."""
+    bad = lanes_problems(doc)
+    if bad:
+        raise ValueError(bad[0])
+    path = os.path.join(store, LANES_FILE)
+    try:
+        if read_json(path) == doc:
+            return False
+    except StoreError:
+        pass
+    write_json(path, doc)
+    return True
+
+
+def read_lanes(store):
+    """The lanes the runner said it takes: the document, or None when it has said nothing (no store,
+    or no file), which every caller reads as each lane off. StoreError when the file is there and
+    cannot be read, or the store fails its walls: "could not tell" is never "off" (section 13)."""
+    if not (isinstance(store, str) and os.path.isabs(store)):
+        raise StoreError("the store must be an absolute path")
+    path = os.path.join(store, LANES_FILE)
+    if not os.path.lexists(path):
+        return None
+    bad = walls(store)
+    if bad:
+        raise StoreError(bad[0])
+    doc = read_json(path)
+    bad = lanes_problems(doc)
+    if bad:
+        raise StoreError(bad[0])
+    return doc
+
+
+def lane_on(lanes, project, kind):
+    """True only when the runner said it is on and takes this kind for this project."""
+    return (isinstance(lanes, dict) and lanes.get("enabled") is True
+            and kind in ((lanes.get("projects") or {}).get(project) or ()))
+
+
+# --------------------------------------------------------------------------- #
 # Selftest
 # --------------------------------------------------------------------------- #
 def selftest():
@@ -689,6 +797,52 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
              "the store is inside a git working tree, where a session can write")):
         expect("ask refuses %s" % name, refused(fn), want)
     expect("no refused ask wrote a request", len(pending(store)), 1)
+
+    # KIT-708: a request its caller names first, and one it takes back while it waits.
+    named = new_request_id()
+    expect("a new request id is one", bool(REQUEST_RE.match(named)), True)
+    expect("ask writes a request under the id its caller chose",
+           ask(store, "acceptance", "start", "acceptance", "app", "ENG-2", text="facts", request_id=named), named)
+    expect("…and refuses that id again", refused(lambda: ask(store, "acceptance", "start", "acceptance", "app",
+                                                              "ENG-2", request_id=named)),
+           "the request's id is used already")
+    expect("…and an id that is not one", refused(lambda: ask(store, "acceptance", "start", "acceptance", "app",
+                                                              "ENG-2", request_id="rq-../x")),
+           "the request's id is not one")
+    expect("a waiting request is withdrawn", (withdraw(store, named), named in [i[0] for i in pending(store)]),
+           (True, False))
+    expect("…once: then there is nothing waiting to withdraw", withdraw(store, named), False)
+    expect("withdraw takes only a request id", refused(lambda: withdraw(store, "../requests")), "not a request id")
+    expect("a withdrawn request has no answer", answer(store, named), None)
+
+    # KIT-708: the lanes the runner takes, as it says them.
+    lanes = {"schema": LANES_SCHEMA, "enabled": True, "work_dir": "/w", "look_config_dir": "/l",
+             "projects": {"app": ["acceptance", "conflict"], "web": []}}
+    expect("a runner that has said nothing has no lanes: every lane off", read_lanes(store), None)
+    expect("the lanes are written once, and not again while they are the same",
+           (write_lanes(store, lanes), write_lanes(store, dict(lanes))), (True, False))
+    expect("they read back", read_lanes(store), lanes)
+    expect("a lane is on only for its project and kind, and only while the runner is on",
+           [lane_on(lanes, "app", "acceptance"), lane_on(lanes, "app", "fix"), lane_on(lanes, "web", "conflict"),
+            lane_on(lanes, "other", "acceptance"), lane_on(dict(lanes, enabled=False), "app", "acceptance"),
+            lane_on(None, "app", "acceptance")],
+           [True, False, False, False, False, False])
+    for what, change, want in (
+            ("a kind the runner does not know", {"projects": {"app": ["deploy"]}}, "the lanes' projects is not valid"),
+            ("a project key that is not one", {"projects": {"App": []}}, "the lanes' projects is not valid"),
+            ("a relative work folder", {"work_dir": "w"}, "the lanes' work_dir is not valid"),
+            ("an extra field", {"at": "now"}, "the lanes' fields are not the lanes'")):
+        expect("lanes refused: %s" % what, refused(lambda: write_lanes(store, dict(lanes, **change))), want)
+    with open(os.path.join(store, LANES_FILE), "w") as fh:
+        fh.write("{not json")
+    expect("lanes that cannot be read are an error, never 'off'", refused(lambda: read_lanes(store)),
+           "it could not be read (JSONDecodeError)")
+    write_json(os.path.join(store, LANES_FILE), dict(lanes, enabled="yes"))
+    expect("lanes out of shape are an error", refused(lambda: read_lanes(store)), "the lanes' enabled is not valid")
+    expect("lanes in a store that fails its walls are an error", refused(lambda: read_lanes(loose)) if
+           write_json(os.path.join(loose, LANES_FILE), lanes) is None else None,
+           "others can read or write the store: it must be mode 0700")
+    os.unlink(os.path.join(store, LANES_FILE))
 
     # A request with a field it may not hold, or a broken file, is said, not acted on.
     with open(os.path.join(store, "requests", "rq-" + "b" * 32 + ".json"), "w") as fh:
