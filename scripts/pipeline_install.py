@@ -88,10 +88,12 @@ and Ctrl-C included; the refusals read nothing, so they print nothing)
   questions; Automatic cannot answer them yet". The note changes no outcome, no exit code
   and not the short list.
 
-  Two limits, plainly. "Off on this Mac" means the part's settings file is not in the kit
-  folder (or the folder you named with --conf and its kin); settings kept elsewhere read as
-  off. Checks that need the Mac password read "could not be measured", because they run
-  without a terminal and cannot ask for it.
+  Two limits, plainly. "Off on this Mac" means the part's settings file is in neither the kit
+  folder (or the folder you named with --conf and its kin) nor the place this Mac says it
+  keeps it: /Library/Application Support/claude-pipeline/settings-places.json, a file only
+  root can write, that maps a settings file's name to its full path (KIT-752). The kit folder
+  wins when the file is there. Checks that need the Mac password read "could not be measured",
+  because they run without a terminal and cannot ask for it.
 
 TO ONLY LOOK: --check (KIT-736)
   `pipeline_install.py --check` looks at every part and changes nothing. It needs no terminal,
@@ -293,6 +295,10 @@ class Io(object):
     def exists(self, path):
         return os.path.exists(path)
 
+    def places(self, path):
+        """({settings file name: where this Mac keeps it}, why it was ignored) (KIT-752)."""
+        return load_places(path)
+
     def parts(self):
         """The pipeline's parts, in the list's order. Raises OSError or ValueError."""
         import pipeline_parts
@@ -470,7 +476,12 @@ def missing(path):
     was named in (--conf and its kin can point elsewhere)."""
     here = os.path.dirname(os.path.abspath(path))
     where = "the kit folder" if here == KIT else here
-    return "no %s in %s" % (os.path.basename(path), where)
+    name = os.path.basename(path)
+    if PLACES_WHY[0]:
+        where += " (the places file at %s was not used: %s)" % (DEFAULT_PLACES, PLACES_WHY[0])
+    if name in PLACES and os.path.abspath(PLACES[name]) != os.path.abspath(path):
+        where += " (or at %s, where this Mac says it is kept)" % PLACES[name]
+    return "no %s in %s" % (name, where)
 
 
 def look_first(io, rep, key):
@@ -1172,8 +1183,53 @@ def step_of(part):
     return STEP_OF_SCRIPT.get(base)
 
 
+# KIT-752: a settings file may live outside the kit folder. This Mac says where in ONE place,
+# a file only root could have written, read like the consent record: a map of file name to the
+# full path it is kept at. It is never read from the repository, and it holds paths, never
+# values. The kit folder stays the default: a file found there wins.
+DEFAULT_PLACES = "/Library/Application Support/claude-pipeline/settings-places.json"
+PLACES = {}
+PLACES_WHY = [""]          # why the places file, or part of it, was ignored; "" when it was not
+
+
+def load_places(path, lstat=os.lstat, realpath=os.path.realpath, read=_read_small):
+    """({file name: full path}, why). Empty, with the reason, when there is no such file, it is
+    not one only root could have written, or it is not a plain map of names to absolute
+    paths: the kit folder is then the only place, as before."""
+    try:
+        why = untrusted_why(path, lstat, realpath)
+    except FileNotFoundError:
+        return {}, ""
+    except OSError as exc:
+        return {}, "it could not be inspected (%s)" % exc
+    if why:
+        return {}, why
+    try:
+        data = json.loads(read(path))
+    except (OSError, ValueError) as exc:
+        return {}, "it could not be read (%s)" % exc
+    if not isinstance(data, dict):
+        return {}, "it is not a map of file names to paths"
+    out, dropped = {}, []
+    for name, where in data.items():
+        if (isinstance(name, str) and isinstance(where, str) and name == os.path.basename(name)
+                and name.endswith((".conf", ".json")) and os.path.isabs(where)
+                and os.path.basename(where) == name):
+            out[name] = where
+        else:
+            dropped.append(str(name)[:40])
+    return out, ("ignored %d entr%s that are not a file name with its own full path (%s)"
+                 % (len(dropped), "y" if len(dropped) == 1 else "ies", ", ".join(dropped))
+                 if dropped else "")
+
+
 def conf_path(name, files):
-    return files.get(name) or os.path.join(KIT, name)
+    if files.get(name):
+        return files[name]
+    here = os.path.join(KIT, name)
+    if name in PLACES and not os.path.exists(here) and os.path.exists(PLACES[name]):
+        return PLACES[name]
+    return here
 
 
 def check_argv(part, files):
@@ -1503,8 +1559,8 @@ def main(argv=None, io=None):
     parser.add_argument("--consent-record", default=DEFAULT_RECORD, help=argparse.SUPPRESS)
     parser.add_argument("--update-conf", default=os.path.join(KIT, "update.conf"),
                         help=argparse.SUPPRESS)
-    parser.add_argument("--bridge-conf", default=os.path.join(KIT, "bridge.conf"),
-                        help=argparse.SUPPRESS)
+    parser.add_argument("--bridge-conf", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--settings-places", default=DEFAULT_PLACES, help=argparse.SUPPRESS)
     parser.add_argument("--selftest", action="store_true")
     args = parser.parse_args(argv)
     if args.selftest:
@@ -1522,6 +1578,13 @@ def main(argv=None, io=None):
     if io.uid() == 0:
         return stop(io, "do not run this with sudo. Run it as yourself; it asks for your Mac "
                         "password when it needs it.", EX_USAGE)
+    # KIT-752: the one place that says where a settings file is kept, read only now, past the two
+    # refusals. A file that was ignored says why on the lines of the parts it would have found.
+    found_places, PLACES_WHY[0] = io.places(args.settings_places)
+    PLACES.clear()
+    PLACES.update(found_places)
+    if args.bridge_conf is None:
+        args.bridge_conf = conf_path("bridge.conf", {})
     if args.check:                   # KIT-736: it only looks, so it needs no terminal
         return look_only(io, args)
     if not io.is_tty():
@@ -1609,7 +1672,8 @@ class FakeIo(Io):
     program this case did not script is a failure of the case, never a silent pass."""
 
     def __init__(self, codes=None, answers=(), env=None, uid=501, tty=True, git_state=None,
-                 steps=None, typed=None, record=None, conf=None):
+                 steps=None, typed=None, record=None, conf=None, places=None,
+                 places_why=""):
         # The first screen and the consent read lines from `typed` (default: Manual, then
         # yes), so the cases written before them keep their meaning. `record` is what the
         # consent record reads as: (state, data, why). Everything the new seams do is logged.
@@ -1619,6 +1683,9 @@ class FakeIo(Io):
         self.record_reads = []
         self.conf = dict(conf or {})
         self.conf_reads = []
+        self.placed = dict(places or {})
+        self.places_why = places_why
+        self.places_reads = []
         # The ask (KIT-735) finds nothing unless a case scripts it, so a machine's own settings
         # files can never reach a case written before it. Its battery (pipeline_ask.py) puts the
         # real seams back over files of its own.
@@ -1701,6 +1768,10 @@ class FakeIo(Io):
         if path.startswith(KIT + os.sep):
             return path in self.present
         return os.path.exists(path)
+
+    def places(self, path):
+        self.places_reads.append(path)
+        return dict(self.placed), self.places_why
 
     def parts(self):
         if isinstance(self.parts_list, Exception):
@@ -2470,6 +2541,62 @@ def selftest():
           [r["detail"] for r in io.records if r["id"] == "cleanup"], ["no sweep.conf in %s" % tmp])
     check("lines-a-part-off-never-runs-its-check",
           "pipeline_notifier_setup.py run" in io.measured, False)
+
+    # 9b. KIT-752: a settings file kept outside the kit folder, found from the one place on the
+    #     machine that says so. The kit folder stays the default; a part with no file anywhere
+    #     still reads off, and says every place it looked.
+    ops = os.path.join(tmp, "ops")
+    os.makedirs(ops)
+    placed = os.path.join(ops, "bridge.conf")
+    open(placed, "w").close()
+    bridge_id = "tech-lead"
+    code, io = go(argv=["--settings-places", "/x/places.json"], places={"bridge.conf": placed})
+    check("kit752-the-one-place-is-read", io.places_reads, ["/x/places.json"])
+    code, io2 = go()
+    check("kit752-a-plain-run-reads-the-default-place", io2.places_reads, [DEFAULT_PLACES])
+    code, io2 = go(env={AGENT_ENV_MARKERS[0]: ""})
+    check("kit752-nothing-is-read-before-the-refusals", io2.places_reads, [])
+    code, io2 = go(uid=0)
+    check("kit752-nothing-is-read-as-root", io2.places_reads, [])
+    code, io2 = go(argv=["--settings-places", "/x/places.json"], places_why="it is a link")
+    got = dict((r["id"], r) for r in io2.records)
+    check("kit752-an-ignored-places-file-says-why-on-the-line",
+          ("the places file at" in got["tech-lead"]["detail"], "it is a link" in got["tech-lead"]["detail"]),
+          (True, True))
+    got = dict((r["id"], r) for r in io.records)
+    check("kit752-a-placed-file-is-not-off",
+          (got[bridge_id]["outcome"] != OUT_OFF, "pipeline_bridge_setup.py verify" in io.measured),
+          (True, True))
+    code, io = go(argv=["--settings-places", "/x/places.json"],
+                  places={"bridge.conf": os.path.join(ops, "nowhere", "bridge.conf")})
+    got = dict((r["id"], r) for r in io.records)
+    check("kit752-a-placed-file-that-is-absent-reads-off-naming-both-places",
+          (got[bridge_id]["outcome"], "the kit folder (or at " in got[bridge_id]["detail"],
+           "nowhere" in got[bridge_id]["detail"]), (OUT_OFF, True, True))
+    code, io = go()
+    got = dict((r["id"], r) for r in io.records)
+    check("kit752-no-place-no-file-reads-off-as-before",
+          (got[bridge_id]["outcome"], got[bridge_id]["detail"]),
+          (OUT_OFF, "no bridge.conf in the kit folder"))
+    PLACES.clear()
+    from collections import namedtuple
+    PSt = namedtuple("PSt", "st_uid st_mode")
+    _Root = PSt(0, stat.S_IFREG | 0o644)
+    _User = PSt(501, stat.S_IFREG | 0o644)
+    _Dir = PSt(0, stat.S_IFDIR | 0o755)
+    fs = lambda who: (lambda q: _Dir if q == "/" else who)          # noqa: E731
+    for name, where in (("nested", {"a/b.conf": "/x/b.conf"}), ("relative", {"b.conf": "b.conf"}),
+                        ("other-name", {"b.conf": "/x/c.conf"}), ("not-a-conf", {"b.txt": "/x/b.txt"}),
+                        ("not-a-string", {"b.conf": 5})):
+        check("kit752-places-refuses-%s" % name,
+              load_places("/p", fs(_Root), lambda q: q, lambda q: json.dumps(where))[0], {})
+    check("kit752-places-takes-a-good-map",
+          load_places("/p", fs(_Root), lambda q: q,
+                      lambda q: json.dumps({"bridge.conf": "/ops/bridge.conf"}))[0],
+          {"bridge.conf": "/ops/bridge.conf"})
+    check("kit752-places-untrusted-reads-nothing",
+          load_places("/p", fs(_User), lambda q: q,
+                      lambda q: json.dumps({"bridge.conf": "/ops/bridge.conf"}))[0], {})
 
     # up to date vs updated, from the step's own result
     code, io = go(codes={"sync_user_skills.py --apply": 0, "sync_user_skills.py": [1]},
