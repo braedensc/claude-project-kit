@@ -149,4 +149,12 @@ Source: `docs/BRIDGE-OPERATOR.md`, `docs/STANDUP.md`, `docs/HEARTBEAT-MONITOR.md
 - **The telemetry and schema-gate section.** No failure observed. KIT-46.
 - **The three dispatcher unknowns** from the resilience ticket: whether the tracker retries a failed hand-over and for how long, whether an idle session stays "working", and whether a non-interrupt kill orphans the child. KIT-44.
 - **That each *Check* column command still works** as the guides change. Run it before relying on it. KIT-46.
+- **That a later green run cannot hide the label gate's red one.** GitHub does not document how
+  it judges two runs that carry a required check's name. A probe PR measured it once, on 17 Nov
+  2026: a job named "Hooks change guard" in another workflow passed after the real gate failed,
+  and the merge stayed blocked. Re-measure after any GitHub change to required checks: open a PR
+  that adds such a job, passing a few minutes after the gate fails, and read its merge state. If
+  it ever reads mergeable, bind the required check to an app that no workflow can post as.
+  Binding it to GitHub Actions, as now, does not help: a PR's own jobs are GitHub Actions too.
+  KIT-668.
 - **Every event the tracker's GitHub integration acts on.** Two moves were measured from ticket history, in each team that has a repository: a PR opening and a PR merging. A draft PR, a review request and a PR closed without merging were not seen. Each team's Git automation settings page says, and it needs a person's sign-in. KIT-51.

@@ -1,4 +1,4 @@
-# Slack bridge — operator steps
+# Your tech lead in Slack — operator steps
 
 *Written 2026-10-10 (KIT-221); updated 2026-10-10 (KIT-222, planning an idea; KIT-223,
 approving a plan), 2026-10-30 (KIT-295, working in your DM) and 2026-11-11 (KIT-492, the
@@ -7,7 +7,7 @@ cutover: one chat with the tech lead). Design:
 `docs/adr/2026-10-30-one-dm-tech-lead-voice.md` and
 `docs/adr/2026-11-05-one-chat-with-the-tech-lead-per-project.md`.*
 
-The bridge lets a trusted member of your Slack workspace act as you, from the chat. Someone
+Your tech lead lets a trusted member of your Slack workspace act as you, from the chat. Someone
 asks it about a ticket, it asks its own question, and a member's "yes" is the go-ahead. It
 checks with Slack itself who said yes.
 
@@ -25,7 +25,7 @@ checks with Slack itself who said yes.
 
 With `ACT=no`, the default, it asks and records, and nothing in the tracker changes.
 
-**One chat.** Your DM with the bridge is the one place you talk to the tech lead. What you
+**One chat.** Your DM with your tech lead is the one place you talk to the tech lead. What you
 write there that is not a command, a yes or a no is answered by the tech lead's own turn
 ("The tech lead's own turn", below). Since the cutover (KIT-492) the dispatcher keeps dev
 sessions only. Its chat lane, the back room, the relay and the writer are gone.
@@ -75,7 +75,7 @@ Set `DISPATCHER_ENV_FILE` too. `token` refuses the dispatcher's own Slack token,
 `verify`'s `old-paths` row reads that file, by name only, to say the dispatcher's chat lane
 is off.
 It must be a different file from `ENV_FILE`. The dispatcher hands its env file to every
-session it starts, so the bridge's token must never go there. The installer refuses the
+session it starts, so the tech lead's token must never go there. The installer refuses the
 same file.
 
 The Slack app comes first, and its member ID is the one value only the finished app can give.
@@ -169,7 +169,7 @@ python3 scripts/pipeline_bridge_setup.py token
 Good: `wrote BRIDGE_SLACK_BOT_TOKEN (… characters) into …/env, mode 600`. The token itself is
 never printed.
 Not that: `REFUSED: that token is already in the env file under …`. You pasted another app's
-token. Copy the bridge app's own.
+token. Copy your tech lead's own.
 Not that: `REFUSED: … is the same file as DISPATCHER_ENV_FILE`. The two settings name one
 file, perhaps through a link. Point `ENV_FILE` at the role account's own env file.
 Not that: `FAILED: the token could not be written into …`. The line ends with the writer's
@@ -240,6 +240,13 @@ it. The row names the file and why. `no heartbeat yet` means the file is not the
 
 **The first pass answers nothing.** It records every message already in the channel as seen,
 so an old request is never answered late.
+
+**A lost state file stops the job.** The state holds your approved plans and open questions.
+If it is gone after the job has written one, the pass says `state missing` and stops, and the
+heartbeat says so. Restore the file from a backup. To start clean on purpose, run the job once
+with `run --init-state`. This covers a lost file, not a lost folder: the job's mark of an earlier
+state sits beside the state, so wiping the whole state folder reads as a first pass. If the mark
+itself cannot be written, the job says so in its log, and until it exists a lost file reads as a first pass.
 
 ---
 
@@ -693,6 +700,45 @@ said as partial, so "no notes" never stands for files it did not read.
 
 The close and the follow-up each count toward the 90 actions an hour.
 
+### When the acceptance check is on (KIT-325)
+
+Set `ACCEPTANCE_REPOS` in `bridge.conf` to the `owner/repo` names whose plans the acceptance check
+looks at (`docs/ACCEPTANCE-POLLER-OPERATOR.md`). Empty, the default, and every plan closes as above.
+`ACCEPTANCE_LEDGER` says where the check keeps its records. Leave it, unless you moved the check's
+state dir.
+
+For a plan whose pull requests are in one of them, the close waits for the check. The bridge reads
+the check's records to find the plan's **newest** check, then looks on the plan for that check's
+verdict:
+
+| The newest check | What the bridge does |
+|---|---|
+| No records file where `ACCEPTANCE_LEDGER` says | Holds the plan, and says it can't find the records. |
+| None yet | Holds it. The check runs on its own after the merge, so one comes. |
+| Still running | Holds it, and says so once in its thread. |
+| Couldn't start | Holds it, and names `check <plan>`. |
+| Done, but its verdict isn't on the plan | Holds it, and looks again. |
+| `passed` | Closes it, and the wrap-up says the acceptance check passed. |
+| `held` | Holds it, and says why once. A later check that passes closes it. |
+| `could-not-check`, or a verdict it can't read | Holds it, says it isn't a pass, and names `check <plan>`. |
+
+A verdict counts only if it names the newest check's head and was posted after that check started,
+from the owner's key (`acceptance_author_ids` in the bridge's config, if the check writes with
+another). So an older pass never closes a plan while a newer check is running or unposted. Each run
+of the check is said once, so a re-run that holds again is said again.
+
+**Run the check again: `check <plan>`.** It asks first, like `pause` and `resume`. A yes posts one
+request on the plan (contract §26). The check picks it up on its next pass and runs again, even at a
+head it checked before. The bridge moves nothing and starts no work itself.
+
+Good: `check PROD-50` on a plan held at could-not-check, then `yes`.
+Not: `check PROD-51` on a piece. The bridge says it runs no plan for it.
+
+**What it can't see.** The bridge has no GitHub access, so it can't tell the head a piece merged at.
+If a fix is pushed after the check passed, and the piece merges before a new check of it starts, the
+plan closes on the earlier pass. So merge the last piece only at a head the check passed, or send
+`check <plan>` after the merge. KIT-610 tracks closing this gap.
+
 ### With the queue on (MVP 2)
 
 The queue starts approved work without you, inside the working window. Set `QUEUE_CONFIG` in
@@ -760,7 +806,7 @@ has this step and Step 11 in order:
 python3 scripts/pipeline_bridge_setup.py card CK-B6
 ```
 
-1. Invite the bridge's app to the notifier's pings channel.
+1. Invite your tech lead's app to the notifier's pings channel.
 2. Add that channel's id to `CHANNEL_IDS` in `bridge.conf`, after the chat channel's.
 3. In `bridge.conf`, set `NOTIFIER_STATE_DIR` to the `STATE_DIR` in `notifier.conf`. Both
    default to `~/.stage-e/state`. The bridge reads the notifier's pings file there.
@@ -772,7 +818,7 @@ python3 scripts/pipeline_bridge_setup.py card CK-B6
 python3 scripts/pipeline_notifier_setup.py run
 ```
 
-6. Then the bridge's install again:
+6. Then the tech lead's install again:
 
 ```sh
 python3 scripts/pipeline_bridge_setup.py install --apply
@@ -1241,7 +1287,7 @@ closed. Reply in the thread under its message in Linear, or ask the tech lead wh
 | `turn_bin` | The `claude` CLI's full path, as `command -v claude` prints it. |
 | `turn_tools_config` | The full path of the tool server's config file. |
 | `turn_token_env` | The name of the env var holding the token. Default: `CLAUDE_WRITER_OAUTH_TOKEN`, the name the writer used, so a token stored before the cutover still serves. |
-| `turn_model`, `turn_timeout_seconds`, `turn_max_turns`, `turn_max_budget_usd`, `turn_session_hours` | Optional limits. Defaults: `sonnet`, 90, 8, 0.5. `turn_session_hours` is no longer used: a number there is ignored. |
+| `turn_model`, `turn_timeout_seconds`, `turn_max_turns`, `turn_max_budget_usd`, `turn_session_hours` | Optional limits. Defaults: `sonnet`, 90, 20, 2. The rounds and the spend cap stop a runaway, never a normal request: a request of several steps can take more than 8 rounds, and the first reply after a quiet gap in a long conversation can cost more than $0.50. `turn_session_hours` is no longer used: a number there is ignored. |
 
 A pass must keep time to say a turn failed: `turn_timeout_seconds` is at most
 `run_timeout_seconds` less 25.
@@ -1268,6 +1314,25 @@ whole conversation is read again, with nothing left in the cache. Each turn's li
 bridge's log says what it cost and how much of its input came from the cache. A new conversation
 starts only when the saved one cannot be resumed, and the log says why. A `turn_session_hours`
 left in an old config is ignored, and the log says that too.
+
+**A new conversation never starts blank (KIT-751).** The first conversation in a DM, and one that
+had to begin again, is given the DM's recent messages: yours, the tech lead's own and the
+pipeline's, oldest first. The tech lead reads them as a record of what was said, not as requests.
+
+- It reads the newest 30 messages before yours, and the threads among them, where the tech lead
+  answers. That is at most 8,000 characters, the oldest dropped first, with no time limit.
+- A message shaped like a key is left out, and the block says how many were.
+- If Slack cannot be read, or is slow, the turn still answers with what was read, and the log
+  says so. It reads no thread after 10 seconds.
+- The reads come out of the turn's own time. If they leave too little of a pass for the turn, the
+  message waits for the next pass, and the log says so.
+- A conversation too long even for Claude Code's own summary starts again with the DM's recent
+  messages only. Its older turns are dropped, not summarised, and the log says that too.
+- The tech lead never says it has no memory. If you mention something it does not have, it asks.
+
+Good: `the tech lead's new conversation was given 12 of the DM's recent messages`, right after
+`the tech lead's conversation began again: …`.
+Not that: an answer that says it cannot see your earlier messages. Look for that log line first.
 
 **What it costs.** Each message is one turn on your Claude subscription. It counts toward
 your plan's limits. It never uses an API key, and `writer-token` refuses one.
@@ -1399,6 +1464,27 @@ and then ended is Slack's own refresh, and the job opens the next one at once; o
 and drops straight away waits like a failed try. Its heartbeat,
 `bridge-push-heartbeat.json` in the state folder, says whether the connection is up, when Slack was last
 heard, how many events it handled, and how many times it reconnected.
+
+**The logs (KIT-761).** Each job writes its log beside the bridge's config, in the role account's
+`~/.stage-e` folder by default. launchd points the job's output there.
+
+| Job | Its log | A healthy one shows |
+|---|---|---|
+| The bridge's pass, once a minute | `bridge.log` | One line a minute, such as `bridge: 0 message(s) examined, 0 asked, …`. It grows all day. |
+| The push job, always on | `bridge-push.log` | `push job: started, opening Slack's connection` each time the job starts. Then one line for each message it answers, such as `answered a DM message from U… with a turn (the conversation resumed); cost $0.0123, 90% of its input read from the cache`. While it is idle, nothing. |
+
+A problem is a line too: `could not open the connection (…); trying again in 4s`, or `message … could
+not be handled yet`. If the job cannot make its own output reach the file line by line, its first
+line says so: `push job: could not make its output line-buffered (…), so its log may stay empty
+while it runs`.
+
+Good: you send a DM, and within a second of the answer a new line shows in `bridge-push.log`.
+Not that: `bridge-push.log` at 0 bytes while the job answers messages. Before 16 Nov this was the
+normal state. The job never exits, and Python keeps a file's output in memory until the process
+ends, so its lines never arrived. The job now writes each line as it prints it, and prints one line
+when it starts. It reads its code when it starts, so a job started before the fix needs one restart.
+Not that: a quiet log, read as a stopped job. An idle job prints nothing, so read the heartbeat
+first: `connected: true` and a recent `at` mean it is up.
 
 | Config key | What it is |
 |---|---|
@@ -1592,11 +1678,11 @@ bridge stops at 10 an hour.
 
 ---
 
-## After a merge that changes the bridge
+## After a merge that changes the tech lead
 
 Run the one command, `python3 scripts/pipeline_install.py`. Its Stage E check counts the
-role account's clone as behind when a file the bridge runs changed. Say yes, and the Stage
-E installer moves the clone. It stops the bridge just before the move and loads it again
+role account's clone as behind when a file the tech lead runs changed. Say yes, and the Stage
+E installer moves the clone. It stops the tech lead just before the move and loads it again
 straight after.
 
 Good: the Stage E `code` row's note names `system/<label>`. Then this installer's `verify`
@@ -1619,7 +1705,7 @@ out.
 
 To turn it back on, follow card CK-B2 again. Its `enable` line undoes the `disable` here.
 
-With Step 11 done, this also stops the bridge's watch on the notifier. While the bridge is
+With Step 11 done, this also stops the tech lead's watch on the notifier. While the tech lead is
 off, nothing tells you in Slack that the notifier is down.
 
 ---

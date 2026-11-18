@@ -1,6 +1,6 @@
 # The conflict waker is supervised, and a conflict goes to the lane that owns the session
 
-**Date:** 2026-09-15 · **Status:** Accepted · **Amends:** [A conflict fix runs where the worktree lives](2026-09-15-conflict-fix-runs-where-the-worktree-lives.md)
+**Date:** 2026-09-15 · **Status:** Accepted · **Amends:** [A conflict fix runs where the worktree lives](2026-09-15-conflict-fix-runs-where-the-worktree-lives.md) · **Amended by:** [The conflict fix session is held to its worktree](2026-11-17-the-conflict-fix-session-is-held-to-its-worktree.md) (KIT-676) — the fix session now runs in Claude Code's sandbox; the routing below still holds, because it pushes with the owner's GitHub login
 
 ## Context
 
