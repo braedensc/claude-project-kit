@@ -1128,7 +1128,8 @@ def run_cases(check):
     base = ["--conf", a_conf, "--stage-e-conf", se_conf, "--sweep-conf", sweep_conf,
             "--update-conf", update_conf, "--bridge-conf", bridge_conf]
     healthy = {"sync_user_skills.py": 0, "pipeline_stage_e_setup.py verify": 0,
-               "pipeline_stage_a_setup.py run": 0}
+               "pipeline_stage_a_setup.py run": 0,
+               "pipeline_bridge_setup.py install": 0, "pipeline_bridge_setup.py verify": 0}
 
     def state():
         return (get(update_conf), get(bridge_conf))

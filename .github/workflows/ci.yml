@@ -136,21 +136,15 @@ jobs:
       - name: Validate all tracked JSON/YAML
         run: |
           python3 -m pip install --quiet pyyaml
-          git ls-files '*.json' '*.yml' '*.yaml' | python3 -c '
-          import json, sys, yaml
-          bad = []
-          for f in sys.stdin.read().split():
-              try:
-                  with open(f) as fh:
-                      if f.endswith(".json"):
-                          json.load(fh)
-                      else:
-                          list(yaml.safe_load_all(fh))
-              except Exception as e:
-                  bad.append(f + ": " + str(e))
-          print("\n".join(bad) if bad else "all tracked JSON/YAML parse OK")
-          sys.exit(1 if bad else 0)
-          '
+          python3 scripts/check_direct_checks.py --json-yaml
+
+      # KIT-659. The Python 3.9 job runs the direct checks above (the ones run bare, not as a
+      # selftest) from the list in scripts/check_direct_checks.py. This fails when that list and the
+      # direct steps in this job differ, so a new direct check cannot reach one job and miss the other.
+      - name: Direct-check list matches this job's direct steps
+        run: |
+          python3 scripts/check_direct_checks.py --selftest
+          python3 scripts/check_direct_checks.py --verify
 
       # Parsing proves a workflow is well-formed, not that it can START. A job
       # doing `uses: ./…` whose permissions are narrower than the callee declares
@@ -382,6 +376,11 @@ jobs:
       # merge state; anything it cannot read is no.
       - name: Validator evidence selftest (no when it cannot tell; never PR text in its answer)
         run: python3 scripts/pipeline_validator_evidence.py --selftest
+      # The validator's facts for one item (KIT-791): what the limits, the evidence and the brief
+      # read, each through its owner's reader. Offline, with a stubbed tracker and code host: every
+      # fact read, and each one unread said by name and held by the limits, never clear or zero.
+      - name: Validator facts selftest (each fact from its owner; an unread one is never clear)
+        run: python3 scripts/pipeline_validator_facts.py --selftest
       # The validator's ledger (KIT-535, contract section 24): one row per decision, written by one
       # function. Offline: append-only and atomic, one verdict per head, an approval only when all three
       # layers pass, and a ledger that cannot be trusted gives no rows, never an empty list.
@@ -798,11 +797,13 @@ jobs:
           python3 scripts/pipeline_ws_client.py --selftest
           python3 scripts/pipeline_bridge_handover.py --selftest
           python3 scripts/pipeline_tech_lead_tools.py --selftest
+          python3 scripts/pipeline_session_tools.py --selftest
           python3 scripts/pipeline_tech_lead_turn.py --selftest
           python3 scripts/pipeline_sprint.py --selftest
           python3 scripts/pipeline_acceptance_poller.py --selftest
           python3 scripts/pin_hooks_path.py --selftest
           python3 scripts/pipeline_machine_tickets.py --selftest
+          python3 scripts/pipeline_root_guard.py --selftest
           python3 scripts/pipeline_routing_tags.py --selftest
           python3 .claude/skills/sync-kit/compare.py --selftest
           python3 scripts/pipeline_acceptance_run.py --selftest

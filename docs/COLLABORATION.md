@@ -317,7 +317,8 @@ twice on doc-tail merges before these rules existed:
 
    That is a LaunchAgent, not a loop in a terminal. It writes a heartbeat every pass,
    and `verify` reports a stale one as **not running**. It stops at one card: read the
-   dry-run count and sign it off. It takes only a worktree **your own Claude Code
+   dry-run count and sign it off. The sign-off holds only for the settings that dry run
+   ran with. Change one later and `run` asks again, naming it. It takes only a worktree **your own Claude Code
    worked in**. A dispatcher's PR never qualifies; the bounce driver re-prompts that
    session in its own thread. Each session is capped (`MAX_BUDGET_USD`, `TIMEOUT_MIN`),
    and so is each pass (`MAX_SESSIONS_PER_PASS`). Three automated attempts per PR, and
@@ -333,6 +334,11 @@ twice on doc-tail merges before these rules existed:
      and none of the worktree's. Its file tools reach only its worktree. Its commands run
      in Claude Code's sandbox, which refuses writes outside the worktree. It may run only
      the git and gh steps its prompt names, plus your `CHECK_COMMANDS`.
+   - **Its commands read none of your home but what their tools need (KIT-786).** Open:
+     the worktree and its checkout, git's settings, `~/.nvm`, `~/.pyenv` and the login
+     keychain file. `/Users`, `/Volumes`, the temp folders and other sessions' scratchpads
+     are refused too. A check whose program lives elsewhere in your home is refused by
+     preflight. The Stage E guide's waker section says what stays readable, and why.
    - **`CHECK_COMMANDS` names your whole local gate**, each check by its exact words
      (`conflict-waker.conf.example` has the kit's line). A check left out is never run, and
      the fix is pushed with only CI to test it. The dry run prints the whole list for you to
@@ -407,7 +413,9 @@ Stop hook between them:
 1. **Claude Code PreToolUse hook** — runs before every tool call; the model **cannot**
    skip the hook. Block reasons print to **stderr** (the only stream Claude Code relays
    for a blocking exit 2), and an internal hook error **fails closed** (blocks)
-   instead of crashing to a non-blocking exit.
+   instead of crashing to a non-blocking exit. So does a call the hook could not judge
+   within its own 7-second deadline, which sits under the settings timeout: past that
+   timeout Claude Code would run the tool unjudged (KIT-684).
 
    > **Read this list as "catches mistakes", not "cannot be evaded".** The *invocation*
    > is unbypassable; the **Bash** guards below are regular expressions over raw command
@@ -419,8 +427,8 @@ Stop hook between them:
    > *What the pattern guards actually carry*). A cooperating agent that mistypes is
    > still caught every time; a motivated caller is not. Each block below therefore
    > names what it stops — and where a guarantee has to survive an adversary, the
-   > server-side layer named in item 4 is the one carrying it. The Edit/Write guards
-   > (self-protection, cross-worktree, branch) resolve real paths and refs rather than
+   > server-side layer named in item 4 is the one carrying it. The Edit/Write/NotebookEdit
+   > guards (self-protection, cross-worktree, branch) resolve real paths and refs rather than
    > matching text, and are not in that class.
 
    The blocks themselves:
@@ -433,8 +441,9 @@ Stop hook between them:
      project scalars, so writing it could neutralize every guard), so a guard can't be
      edited away or unwired — changing them is a human-only terminal step. (Reads are
      fine.)
-   - Blocks `Edit`/`Write`/`git commit` while on `main`/`master` — a new task is
-     forced onto a branch. The project's CLAUDE.md (from docs/CLAUDE-template.md)
+   - Blocks `Edit`/`Write`/`NotebookEdit`/`git commit` while on `main`/`master` — a new task is
+     forced onto a branch. A NotebookEdit names its file `notebook_path` and its text
+     `new_source`; every Edit/Write guard reads those too (KIT-673). The project's CLAUDE.md (from docs/CLAUDE-template.md)
      also tells Claude to branch *proactively* before ever hitting the block. A
      commit is also judged by the checkout it lands in (KIT-237): a persisted `cd`, a
      `cd`/`pushd` on the same line, or `git -C <dir> commit` into another worktree of
@@ -466,7 +475,7 @@ Stop hook between them:
      the remote's recorded default (`origin/HEAD`, which the config anchor now protects)
      — widening only, never read from the worktree copy. Advisory like every Bash guard;
      the Stop hook and the `PR base` workflow are the layers that do not read command text.
-   - Blocks `Edit`/`Write` whose path is in a **different worktree** than the acting
+   - Blocks `Edit`/`Write`/`NotebookEdit` whose path is in a **different worktree** than the acting
      session's (resolved via `git worktree list`) — a write into another checkout
      (classically the main checkout on `main`, reached via a stray `cd`) otherwise
      lands there silently, past every branch guard. The session's own worktree is
@@ -574,8 +583,10 @@ Stop hook between them:
      that reads in review as just a move); work on a branch
      that doesn't carry the pinned ticket ID when `branch.requireTicketId` is on; a
      `dispatch.pinsRoot` resolving inside the repo (a pins directory the session can
-     write is a pin it can forge); and a malformed, unrecognized, foreign-worktree or
-     — in `ticket` mode — **expired** pin. Write-blocking and approval checks fail
+     write is a pin it can forge); a malformed, unrecognized, foreign-worktree or
+     — in `ticket` mode — **expired** pin; and a pin the dispatcher's ledger says was
+     written and never released that is gone, or a pin store the hook cannot read
+     (KIT-674). Write-blocking and approval checks fail
      **closed**; checks that merely withhold autonomy from an *unpinned* session fail
      **open**, so a human's ad-hoc session in a configured repo is never bricked. A
      session on a dispatcher's lane that writes no pin is not ad-hoc: its account

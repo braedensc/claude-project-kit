@@ -62,6 +62,27 @@ EXIT CODES — contract §13, the Stage E installer's own numbers.
         this: NOT RUNNING is a different fact from nothing-to-do, and it blocks)
     10  BLOCKED-ON-HUMAN — a card is printed; do it and re-run
 
+THE SIGN-OFF HOLDS ONLY FOR WHAT IT SIGNED (KIT-688).  Each dry run records what it ran with:
+every setting but LABEL, and the transcripts folder. `attest` binds the sign-off to that record.
+A later run that measures anything else asks again at CK-W1 and names what changed. A sign-off
+made before the binding names nothing, so it asks once more. The count is not part of the
+record, because it moves with the pull requests; the note carries it. The record also keeps
+every dry-run line that starts `fix session:`, the list CK-W1 shows of what a session may do
+(KIT-676). So a change to the checks, the model, or the waker's own command list asks again
+too, even one that a merge brought in.
+
+THE OTHER INSTALLERS' SIGN-OFFS.  Each is bound to what it measured, or holds nothing that can
+drift:
+  * notifier: A_PRIVATE is bound to the channel, and A_FIRST_PING to the config's hash;
+  * Stage E: CK-7's sign-off is bound to the review entries' fence, A-ENTRY-LOADED to the
+    entries, and A-CATCHUP-COUNT to the count its note names. A-DRY-RUN (CK-5) is not bound
+    yet: KIT-790 binds it to the settings its count depends on;
+  * Stage A: CA-PROBE is bound to the routing code and the entries. CA-LANE and CA-HANDOVER
+    record a run the person watched after that probe, and a routing change asks again
+    through CA-PROBE;
+  * bridge and acceptance: no sign-off is kept. Each asks for a typed yes in the same run that
+    shows and applies its plan, so no yes outlives the plan it was given for.
+
 WHAT IT REFUSES.  `run` (not --dry-run) and `attest` under an agent environment — a
 session that installs a job which starts sessions is the attack; the markers are the
 local dispatcher's, imported, and like every use of them tamper-evident, not tamper-proof.
@@ -77,16 +98,19 @@ conflicted local PR, each capped, never an unbounded retry.
 WHAT HOLDS EACH FIX SESSION (KIT-676).  It loads none of your settings and none of the
 worktree's. It may run only the commands its prompt names, and CHECK_COMMANDS by their
 exact words. Its file tools reach only its worktree, and its commands run in Claude
-Code's sandbox (scripts/pr_conflict.py, THE FIX SESSION'S WALLS). The dry run prints that
+Code's sandbox (scripts/pr_conflict.py, THE FIX SESSION'S WALLS). Those commands read
+nothing in your home but the folders their tools need (KIT-786). The dry run prints that
 list, and CK-W1 signs it with the count. Preflight puts each check's program folder on the
-job's PATH, because nothing from your settings reaches the session. It also refuses an
-SSH origin: git cannot use SSH inside the sandbox on macOS. The `sandbox` step proves the
-walls still hold before CK-W1 is read: one short session on the small model, from the job's
-own clone, must find a write outside its worktree refused and a write inside landing, and a
-read outside refused where the settings deny a named folder there (KIT-829). Where they deny
-none, it says no read was judged. It costs a few cents, in `run` and `verify` alike.
+job's PATH, because nothing from your settings reaches the session, and refuses a program
+the session could not read. It also refuses an SSH origin: git cannot use SSH inside the
+sandbox on macOS. The `sandbox` step proves the walls still hold before CK-W1 is read: one
+short session on the small model, from the job's own clone, must find a write outside its
+worktree refused and a write inside landing, and a read outside refused where the settings
+deny a named folder there (KIT-829). Where they deny none, it says no read was judged. It
+costs a few cents, in `run` and `verify` alike.
 """
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -323,12 +347,66 @@ CARDS = {
                "    python3 scripts/pipeline_conflict_waker_setup.py attest A-WAKE-DRY-RUN "
                "--initials " + se.INITIALS_PLACEHOLDER + " --note \"count read: N\"",
                "(YOUR initials, 2-4 letters, and N the count. Both the placeholder and an empty",
-               "note are refused: this is the cost gate.)"],
+               "note are refused: this is the cost gate.)",
+               "The sign-off holds only for the settings this dry run ran with. Change one later",
+               "(the checkouts, a bound, the fix session's tools) and the installer asks again."],
         "good": "the count you signed is the count you meant",
         "attest": "A-WAKE-DRY-RUN",
     },
 }
 ATTESTATIONS = {"A-WAKE-DRY-RUN": "the conflict waker's dry-run count is the number you meant (CK-W1)"}
+
+# THE SIGN-OFF HOLDS ONLY FOR WHAT IT SIGNED (KIT-688). The dry-run step records a fingerprint of
+# what the dry run was run with; `attest` binds the sign-off to that record; and a later run that
+# measures anything else asks again, naming what changed. A sign-off made before the binding
+# names nothing, so it asks once more.
+FACTS_NOTE = "dry-run-facts"
+# Every setting but LABEL, launchd's name for the job: each of the rest changes what a fix session
+# may do, how many start, how often, from which code, or for which checkouts.
+SIGNED_SETTINGS = tuple(sorted(k for k in CONF_KEYS if k != "LABEL"))
+# How a waker's dry run says what a fix session may do (KIT-676): the list CK-W1 shows, signed with it.
+SESSION_LINE = "fix session:"
+
+
+def signed_facts(ctx, said=""):
+    """What A-WAKE-DRY-RUN signs, besides the count its note names. The settings; the folder whose
+    transcripts mark a worktree as yours; and every line of the dry run that says what a fix
+    session may do. The count is not one: it moves with the pull requests."""
+    return {"settings": dict((k, ctx.conf.get(k, "")) for k in SIGNED_SETTINGS),
+            "transcripts": ctx.claude_dir,
+            "session": [ln.strip() for ln in (said or "").splitlines() if ln.strip().startswith(SESSION_LINE)]}
+
+
+def facts_sha256(facts):
+    return hashlib.sha256(json.dumps(facts, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _what_changed(old, new):
+    """The facts that differ, in words: each setting by name, then the rest."""
+    old = old if isinstance(old, dict) else {}
+    was = old.get("settings") if isinstance(old.get("settings"), dict) else {}
+    names = [k for k in sorted(set(was) | set(new["settings"])) if was.get(k) != new["settings"].get(k)]
+    if old.get("transcripts") != new["transcripts"]:
+        names.append("the transcripts folder")
+    if old.get("session") != new["session"]:
+        names.append("what a fix session may do")
+    return ", ".join(names) or "something the record no longer shows"
+
+
+def signoff_problem(state, facts):
+    """None when A-WAKE-DRY-RUN holds for `facts`; else why not, in words."""
+    signed = (state.data.get("attestations") or {}).get("A-WAKE-DRY-RUN")
+    if not signed:
+        return "not signed off"
+    signed = signed if isinstance(signed, dict) else {}
+    when = "%s by %s" % (str(signed.get("at") or "undated")[:10], signed.get("initials") or "?")
+    if not signed.get("facts_sha256"):
+        return ("the sign-off (%s) names no settings, because it was made before a sign-off was bound to "
+                "what it signed (KIT-688). Read the dry run and sign again" % when)
+    if signed["facts_sha256"] != facts_sha256(facts):
+        return ("changed since the sign-off (%s): %s. Read the dry run and sign again"
+                % (when, _what_changed(signed.get("facts"), facts)))
+    return None
 NEVER = ["Never merge a pull request, approve one, or apply a protected label.",
          "Never install the waker as a dispatcher's role account, or as root.",
          "Never reword a command a guard blocked. Say that it blocked you, and stop."]
@@ -377,6 +455,10 @@ class Ctx(object):
         self.conf, self.runner, self.state = conf, runner, state
         self.home = home or os.path.expanduser("~")
         self.uid = os.getuid() if uid is None else uid
+        # The home a fix session's reads are denied in: the user database's, as the waker reads it
+        # (pr_conflict.account_home), never $HOME. Where the database has none, the waker refuses
+        # to start sessions at all, and preflight judges against this shell's home instead.
+        self.account_home = prc.account_home(self.uid) or self.home
         self.env = os.environ if env is None else env
         self.platform = sys.platform
         self.claude_bin = None
@@ -450,6 +532,20 @@ def ssh_url(url):
     return colon > 0 and (slash == -1 or colon < slash)
 
 
+def unreadable_program(ctx, check, path):
+    """The problem line when a fix session's commands may not read `check`'s program at `path`, by
+    the name found or its real path, else None (KIT-786)."""
+    for p in (path, os.path.realpath(path)):
+        blocked = prc.program_unreadable(p, ctx.account_home, ctx.uid)
+        if blocked:
+            opened = [row.replace("{home}", "~") for row, _why in prc.FIX_READ_FOLDERS if row.startswith("{home}/")]
+            return ("CHECK_COMMANDS names `%s`, and its program %s is in %s, where a fix session's commands "
+                    "may not read (KIT-786), so it could not run there. Install it outside your home "
+                    "(Homebrew, for one), or in a folder a fix session may read: %s"
+                    % (check, path, "your home" if blocked == ctx.account_home else blocked, ", ".join(opened)))
+    return None
+
+
 def gh_helper(value):
     """True for a git credential helper that runs gh, as `gh auth setup-git` writes it."""
     words = (value or "").strip().lstrip("!").split()
@@ -464,9 +560,9 @@ def step_preflight(ctx, apply_it):
     if unsupported:
         raise Unsupported(unsupported)
     r, problems = ctx.runner, []
-    if ctx.uid == 0:
-        problems.append("this is root. The waker runs as the person whose local sessions it wakes; "
-                        "run the installer as that person, without sudo")
+    import pipeline_root_guard as rg      # KIT-693: the one rule every installer shares
+    if rg.refusal(ctx.uid):
+        problems.append(rg.BODY)          # the one shared wording; the waker runs as the person whose sessions it wakes
     role_env = os.path.join(ctx.home, prc.DISPATCHER_ENV_FILE[2:])
     if os.path.exists(role_env):
         problems.append("%s exists, so this is a dispatcher's role account. Its sessions are "
@@ -524,6 +620,8 @@ def step_preflight(ctx, apply_it):
         if program.startswith("/"):
             if not r.read(["test", "-x", program]).ok:
                 problems.append("CHECK_COMMANDS names `%s`, and %s is not a program that runs" % (check, program))
+            elif unreadable_program(ctx, check, program):
+                problems.append(unreadable_program(ctx, check, program))
             continue
         if "/" in program:
             continue                  # relative to the worktree, where the session runs it
@@ -531,6 +629,8 @@ def step_preflight(ctx, apply_it):
         if not found.startswith("/"):
             problems.append("CHECK_COMMANDS names `%s`, and `%s` is not on your PATH, so a fix session "
                             "could not run it" % (check, program))
+        elif unreadable_program(ctx, check, found):
+            problems.append(unreadable_program(ctx, check, found))
         elif os.path.dirname(found) not in ctx.check_dirs:
             ctx.check_dirs.append(os.path.dirname(found))
     for d in ctx.repo_dirs:
@@ -754,9 +854,15 @@ def step_dry_run(ctx, apply_it):
     if not m:
         raise Unknown("the waker's dry run never printed its `would wake` count, so no count was proved",
                       "read its output above")
-    if not ctx.state.attested("A-WAKE-DRY-RUN"):
-        raise Blocked("CK-W1", "would wake %s — not signed off" % m.group(1))
-    return True, "dry run ran (would wake %s) and the count is signed off" % m.group(1)
+    # What this dry run ran with, recorded for `attest` to bind to: what the person just read (KIT-688).
+    facts = signed_facts(ctx, text)
+    ctx.state.data.setdefault("notes", {})[FACTS_NOTE] = {"sha256": facts_sha256(facts), "facts": facts,
+                                                          "at": se.now_iso()}
+    problem = signoff_problem(ctx.state, facts)
+    if problem:
+        raise Blocked("CK-W1", "would wake %s — %s" % (m.group(1), problem))
+    return True, ("dry run ran (would wake %s), and the sign-off holds for these settings (%s…)"
+                  % (m.group(1), facts_sha256(facts)[:12]))
 
 
 def sandbox_answer(text):
@@ -1067,8 +1173,11 @@ def cmd_status(ctx):
         if outcome not in (DONE, ALREADY_DONE):
             worst = max(worst, {FAILED: EX_FAILED, UNKNOWN: EX_UNKNOWN}.get(outcome, EX_BLOCKED))
     rec = st.data["attestations"].get("A-WAKE-DRY-RUN")
-    say("  A-WAKE-DRY-RUN  %s" % ("signed %s by %s  %s" % (rec["at"][:10], rec["initials"], rec.get("note", ""))
-                                  if rec else "NOT SIGNED — " + ATTESTATIONS["A-WAKE-DRY-RUN"]))
+    say("  A-WAKE-DRY-RUN  %s" % ("signed %s by %s  %s  %s" % (
+        rec["at"][:10], rec["initials"], rec.get("note", ""),
+        "(for settings %s…)" % rec["facts_sha256"][:12] if rec.get("facts_sha256")
+        else "(names no settings: made before KIT-688, so `run` asks again)")
+        if rec else "NOT SIGNED — " + ATTESTATIONS["A-WAKE-DRY-RUN"]))
     path = os.path.join(ctx.state_dir, "heartbeat.json")
     try:
         with open(path, encoding="utf-8") as fh:
@@ -1095,9 +1204,17 @@ def cmd_attest(state, aid, initials, note):
         raise SetupError("--initials wants YOUR OWN 2-4 letters (%r is not a person)" % initials)
     if not note:
         raise SetupError("%s needs a --note saying what you read, e.g. --note \"count read: 1\"" % aid)
-    state.attest(aid, initials.lower(), note)
+    # Bound to what the last dry run ran with: the settings and session list the person read (KIT-688).
+    read = (state.data.get("notes") or {}).get(FACTS_NOTE) or {}
+    if not read.get("sha256") or not isinstance(read.get("facts"), dict):
+        raise SetupError("%s signs what the waker's dry run ran with, and no dry run is recorded yet.\n"
+                         "  Run `python3 %s run` until it stops at CK-W1, read its dry run, then sign."
+                         % (aid, _self_path()))
+    state.attest(aid, initials.lower(), note, facts_sha256=read["sha256"], facts=read["facts"])
     state.save()
     say("recorded: %s  %s  %s  %s" % (aid, initials.lower(), se.now_iso(), note))
+    say("  for the settings the last dry run ran with (%s…): change one and this sign-off stops counting"
+        % read["sha256"][:12])
     return EX_OK
 
 
@@ -1116,12 +1233,14 @@ def _fake_ctx(conf_text=GOOD_CONF, answers=(), dry_run=False, attested=True, uid
     assert not errors + more, errors + more
     conf["__source__"] = "conflict-waker.conf"
     state = State(tempfile.mkdtemp(prefix="waker-selftest."))
-    if attested:
-        state.attest("A-WAKE-DRY-RUN", "ab", "count read: 1")
     runner = se.FakeRunner(list(answers), dry_run=dry_run)
     ctx = Ctx(conf, runner, state, home=HOME, uid=uid, env={})
+    ctx.account_home = HOME    # the user database's home for this fake account (KIT-786)
     ctx.platform = "darwin"
     ctx.sleep = lambda s: None
+    if attested:   # bound to what this context's dry run runs with, walls included, as `attest` binds it
+        facts = signed_facts(ctx, dry_run_text("", ctx))
+        state.attest("A-WAKE-DRY-RUN", "ab", "count read: 1", facts_sha256=facts_sha256(facts), facts=facts)
     return ctx, runner
 
 
@@ -1559,7 +1678,7 @@ def _selftest_body():
         f.answers = []
         rows, _ = quiet(lambda: measure(c, apply_it=False))
         detail = rows[0][2] if rows else ""
-        expect("preflight-refuses", rows and rows[0][1] == FAILED and "root" in detail
+        expect("preflight-refuses", rows and rows[0][1] == FAILED and __import__("pipeline_root_guard").BODY in detail
                and "role account" in detail and "no gui/0 domain" in detail and "not on your PATH" in detail,
                detail)
 
@@ -1581,6 +1700,63 @@ def _selftest_body():
             expect("attest-refused", False, "%r/%r must be refused" % (initials, note))
         except SetupError:
             pass
+
+    # 10b. THE SIGN-OFF HOLDS ONLY FOR WHAT IT SIGNED (KIT-688). `attest` binds it to what the last
+    #      dry run ran with. A changed setting, tool list or session line asks again and names what
+    #      changed. A sign-off from before the binding asks once more. The count, and LABEL, do not.
+    def dry_run_row(conf_text=GOOD_CONF, said="pending 1 · would wake [7]", state=None, env=None):
+        c, f = _fake_ctx(conf_text, attested=False)
+        if state is not None:
+            c.state = state
+        if env is not None:
+            c.env = env
+        f.answers = [a for a in _settled_answers(c) if a[0] != "pr_conflict.py wake"] + [
+            ("pr_conflict.py wake", 0, dry_run_text(said, c))]     # the walls for this conf, then `said`
+        rows, _out = quiet(lambda: measure(c, apply_it=False, keep_going=True))
+        return [(o, d) for s, o, d, _e in rows if s == "dry-run"][0], c
+
+    st = State(tempfile.mkdtemp(prefix="waker-selftest."))
+    try:
+        quiet(lambda: cmd_attest(st, "A-WAKE-DRY-RUN", "ab", "count read: 1"))
+        expect("attest-needs-a-dry-run", False, "a sign-off with no dry run recorded must be refused")
+    except SetupError as exc:
+        expect("attest-needs-a-dry-run", "no dry run is recorded" in str(exc), str(exc))
+    (o, d), c = dry_run_row(state=st)
+    expect("unsigned-asks", o == BLOCKED and "not signed off" in d, "%s: %s" % (o, d))
+    _code, out = quiet(lambda: cmd_attest(st, "A-WAKE-DRY-RUN", "ab", "count read: 1"))
+    signed = st.data["attestations"]["A-WAKE-DRY-RUN"]
+    expect("attest-binds", signed.get("facts_sha256") == st.data["notes"][FACTS_NOTE]["sha256"]
+           and signed.get("facts", {}).get("settings", {}).get("REPO_DIRS") == "/Users/you/src/app,/Users/you/src/kit"
+           and "stops counting" in out, "%s %s" % (signed, out))
+    for name, kw, want, needle in (
+            ("same-settings-hold", {}, ALREADY_DONE, "holds for these settings"),
+            ("a-new-count-still-holds", {"said": "pending 4 · would wake [7, 8, 9]"}, ALREADY_DONE, "would wake [7, 8, 9]"),
+            ("label-is-not-signed", {"conf_text": GOOD_CONF + "LABEL=local.other-waker\n"}, ALREADY_DONE, "holds"),
+            ("a-bound-changed-asks", {"conf_text": GOOD_CONF + "MAX_SESSIONS_PER_PASS=1\n"}, BLOCKED,
+             "changed since the sign-off (%s by ab): MAX_SESSIONS_PER_PASS." % se.now_iso()[:10]),
+            ("the-tool-list-changed-asks", {"conf_text": GOOD_CONF + "CHECK_COMMANDS=make test\n"},
+             BLOCKED, ": CHECK_COMMANDS, what a fix session may do."),
+            ("a-checkout-added-asks", {"conf_text": "REPO_DIRS=/Users/you/src/app,/Users/you/src/kit,/Users/you/src/new\n"},
+             BLOCKED, ": REPO_DIRS."),
+            ("the-transcripts-moved-asks", {"env": {"CLAUDE_CONFIG_DIR": "/Users/you/other-claude"}}, BLOCKED,
+             "the transcripts folder"),
+            # The waker's own list changed, as a merge could change it, with every setting the same.
+            ("a-session-line-changed-asks", {"said": "fix session: commands  git push --force\npending 1 · would wake [7]"},
+             BLOCKED, ": what a fix session may do.")):
+        (o, d), _c = dry_run_row(state=st, **kw)
+        expect("signoff-%s" % name, o == want and needle in d, "%s: %s" % (o, d))
+    st.data["attestations"]["A-WAKE-DRY-RUN"] = {"initials": "ab", "note": "count read: 1", "at": se.now_iso()}
+    (o, d), _c = dry_run_row(state=st)
+    expect("signoff-made-before-the-binding-asks", o == BLOCKED and "names no settings" in d and "KIT-688" in d,
+           "%s: %s" % (o, d))
+
+    # 10c. KIT-688's regression: signed off, then the tool list changed (CLAUDE_ARGS then, CHECK_COMMANDS now).
+    c, f = _fake_ctx()
+    c.conf = validate_conf(parse_conf(GOOD_CONF + "CHECK_COMMANDS=make test\n")[0])[0]
+    f.answers = _settled_answers(c)
+    rows, _ = quiet(lambda: measure(c, apply_it=False, keep_going=True))
+    expect("kit-688-a-tool-list-changed-after-sign-off-asks-again",
+           [o for s, o, _d, _e in rows if s == "dry-run"] == [BLOCKED], str(rows))
 
     # 12. not macOS: preflight names the platform and points at the portable waker, and NOTHING
     #     else is read or run — not launchctl, not the clone — even when asked to keep going.
@@ -1629,6 +1805,31 @@ def _selftest_body():
     expect("preflight-check-found", rows and rows[0][1] == ALREADY_DONE and c.check_dirs == [os.path.dirname(nvm_npm)]
            and os.path.dirname(nvm_npm) in plistlib.loads(render_plist(c).encode())["EnvironmentVariables"]["PATH"],
            "%s %s" % (rows[:1], c.check_dirs))
+    # KIT-786: a check whose program a fix session's commands may not read is refused, by name, with
+    # where it may live instead. One in ~/.nvm (opened for the session's tools) passes, as one outside
+    # your home would.
+    c, f = _fake_ctx(GOOD_CONF + "CHECK_COMMANDS=cargo test, npm run test:hooks, /Users/you/bin/check --all\n")
+    f.answers = [("command -v cargo", 0, "/Users/you/.cargo/bin/cargo\n"), ("command -v npm", 0, nvm_npm + "\n"),
+                 ("test -x /Users/you/bin/check", 0, "")] + _settled_answers(c)
+    rows, _ = quiet(lambda: measure(c, apply_it=False))
+    detail = rows[0][2] if rows else ""
+    expect("preflight-check-unreadable", rows and rows[0][1] == FAILED
+           and "`cargo test`, and its program /Users/you/.cargo/bin/cargo is in your home" in detail
+           and "`/Users/you/bin/check --all`, and its program /Users/you/bin/check is in your home" in detail
+           and "~/.config/git, ~/.nvm, ~/.pyenv" in detail and "test:hooks`, and" not in detail
+           and c.check_dirs == [os.path.dirname(nvm_npm)], detail)
+    # …judged against the home the waker denies, the user database's, never $HOME: where they
+    # differ, the same program passes or is refused as the session would find it (review of #615).
+    for shell_home, db_home, want in (("/Users/you", "/Users/someone", FAILED), ("/Users/me", "/Users/you", ALREADY_DONE)):
+        c, f = _fake_ctx(GOOD_CONF + "CHECK_COMMANDS=npm run test:hooks\n")
+        c.home, c.account_home = shell_home, db_home
+        c.env = {"CLAUDE_CONFIG_DIR": "/Users/you/.claude"}    # transcripts where the settled machine has them
+        f.answers = [("command -v npm", 0, nvm_npm + "\n")] + _settled_answers(c)
+        rows, _ = quiet(lambda: measure(c, apply_it=False))
+        expect("preflight-home-is-the-databases-%s" % db_home, rows and rows[0][1] == want
+               and (want != FAILED or "%s is in /Users," % nvm_npm in rows[0][2]), "%s" % rows[:1])
+    expect("ctx-home-from-the-database", Ctx({}, None, None, home="/Users/me", uid=os.getuid()).account_home
+           == (prc.account_home(os.getuid()) or "/Users/me"), "Ctx takes the denied home from the user database")
     # Every host here is example.invalid: the provenance scan reads a real host after a user as an email.
     for url, want in (("git@example.invalid:o/n.git", True), ("ssh://git@example.invalid/o/n", True),
                       ("example.invalid:o/n.git", True), ("myalias:o/n", True),
@@ -1712,7 +1913,9 @@ def _selftest_body():
         "script the job execs changed, and that set is the import closure; a fix session's walls "
         "are printed in full for CK-W1 and a dry run without them fails; CLAUDE_ARGS is refused by "
         "name; each check is named by its exact words and its program found on the job's PATH; an "
-        "SSH origin is refused")
+        "SSH origin is refused; the sign-off is bound to what its dry run ran with, so a changed "
+        "setting or fix-session line asks again and says which, an older unbound sign-off asks "
+        "once, and the count and LABEL ask nothing")
     return 0
 
 
