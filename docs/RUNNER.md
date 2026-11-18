@@ -11,7 +11,7 @@ The formats it reads and writes: `docs/PIPELINE-CONTRACT.md` section 28, and sec
 
 - **Built, and off.** It is built beside the third-party dispatcher, which still runs every session.
 - **No lane uses it yet.** Each lane moves later, one at a time, on the owner's yes, a drill repository first.
-- **Nothing installs it yet.** Its installer comes with the first lane that moves.
+- **Its installer puts it in place with every lane off** for every project. See "Installing it".
 - **No real session goes through it yet.** Its selftest runs it against a stand-in program.
 
 A lane runs through the runner only when both switches are on: the caller's own (the job that asks)
@@ -103,8 +103,8 @@ limit hit in normal use is a defect.
 Good: a session's tree passes 8 GB. It is stopped, its record says `limit:memory`, and one line is told.
 Not: the same session is told about again on every pass.
 
-The health watch does not page from the incidents file yet. It learns the runner with the runner's
-installer, when the first lane moves.
+The health watch does not page from the incidents file yet. It learns the runner when the first lane
+moves.
 
 ## What a session is given
 
@@ -159,7 +159,8 @@ finding filer's `agent_user_id` and the bridge's agent user must both name it.
 
 ## Settings
 
-One JSON file. The example is `runner.example.json`. `~/` means the account's own home.
+One JSON file, which the installer writes from `runner.conf` (see "Installing it"). Its own example is
+`runner.example.json`. `~/` means the account's own home.
 
 | Key | What it is | Default |
 | --- | --- | --- |
@@ -194,6 +195,41 @@ is on needs its approved states in `approval_states`: `fix` and `conflict` use t
 Good: `"lanes": {"review": true}` for the drill repository. Only reviews of it go through the runner.
 Not: a review request for a project whose `review` lane is off. It is refused: "the review lane is
 off for project app".
+
+## Installing it
+
+The one command installs it when this Mac has a `runner.conf` (copy `runner.conf.example`). Its
+installer also runs alone:
+
+```bash
+python3 scripts/pipeline_runner_setup.py check          # reads, changes nothing, asks nothing
+echo '{"schema": "runner-answers/1", "consent": "yes"}' | python3 scripts/pipeline_runner_setup.py apply
+```
+
+Each prints one JSON document of rows on standard output (`runner-setup-rows/1`), whatever its exit,
+and every word for a person on standard error, as the notifier's installer does.
+
+- **Every lane off.** It writes `<RUNNER_DIR>/runner.json` as the role account, with every lane off
+  for every project. Switching one on is the owner's yes, per project. This installer never does it.
+- **Its switch and its ceiling.** `enabled` is the part's own switch, and a runner already on stays
+  on. Otherwise its first pass is counted: the requests waiting in its store and its unfinished runs.
+  At or below its ceiling in `pipeline-parts.json` (0), it is switched on and loaded. Above it, or
+  with a ceiling it cannot read, it is installed and left off, and the document's `left_off` says why.
+- **Its job.** One LaunchDaemon as the role account, kept alive, running the runner from Stage E's
+  clone. Stage E's `run` stops it around a move of the clone and loads it again. The job file says
+  `Disabled`, so it starts at boot only after `launchctl enable`, which only an install that switches
+  it on runs.
+- **It asks nothing.** `apply` takes its answers through a pipe from the program that runs it, never a
+  terminal, a file or an argument. Every sudo call is `sudo -n`. With no live sudo session, `check`
+  says NOT MEASURED and `apply` exits 5. The one command holds that session. Inside a Claude session,
+  `apply` is refused before it reads anything.
+
+`check` reports the job: its file, whether it starts at boot, and the kit commit launchd runs. It
+reports the clone's commit, whether its runner scripts are this checkout's, and each project's lanes
+as installed.
+
+Good: a fresh Mac. `apply` writes every lane off, switches the runner on and loads it. It starts nothing.
+Not: a store with requests left from before. The runner is left off, and the line says how many wait.
 
 ## Checking it
 

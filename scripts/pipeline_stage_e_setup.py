@@ -556,6 +556,20 @@ SIBLING_JOBS = (
     # The acceptance check's live pass (KIT-571), run from this clone by its own LaunchDaemon, which the acceptance installer
     # puts in place (KIT-326). It loads the poller that decides and judges, and the look tool's record reader.
     ("pipeline_acceptance_run.py", ("pipeline_acceptance_poller.py", "pipeline_acceptance_run.py", "pipeline_look.py")),
+    # The runner (KIT-859), our own dispatcher's always-on job, run from this clone by the LaunchDaemon its installer
+    # puts in place. `run` stops it around the clone's move and loads it again, so it runs the moved kit.
+    ("pipeline_runner.py", ("pipeline_bridge.py", "pipeline_bridge_answers.py", "pipeline_bridge_bind.py",
+                            "pipeline_bridge_config.py", "pipeline_bridge_direct.py", "pipeline_bridge_handover.py",
+                            "pipeline_bridge_pings.py", "pipeline_bridge_plans.py", "pipeline_bridge_replan.py",
+                            "pipeline_bridge_requests.py", "pipeline_bridge_tech_lead.py", "pipeline_bridge_tracker.py",
+                            "pipeline_bridge_transport.py", "pipeline_bridge_watch.py", "pipeline_notify_events.py",
+                            "pipeline_notify_local.py", "pipeline_plan_executor.py", "pipeline_plan_poller.py",
+                            "pipeline_queue_order.py", "pipeline_queue_pool.py", "pipeline_queue_read.py",
+                            "pipeline_queue_settings.py", "pipeline_queue_start.py", "pipeline_runner.py",
+                            "pipeline_runner_limits.py", "pipeline_session_tools.py", "pipeline_sprint.py",
+                            "pipeline_sprint_changes.py", "pipeline_sprint_plan.py", "pipeline_sprint_review.py",
+                            "pipeline_standup.py", "pipeline_tech_lead_tools.py", "pipeline_tech_lead_turn.py",
+                            "pipeline_voice.py", "pipeline_window.py")),
 )
 SIBLING_ENTRY_SCRIPTS = tuple(entry for entry, _files in SIBLING_JOBS)
 

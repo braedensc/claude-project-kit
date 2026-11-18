@@ -103,6 +103,7 @@
     "test:runner-store": "python3 scripts/pipeline_runner_store.py --selftest",
     "test:runner": "python3 scripts/pipeline_runner.py --selftest",
     "test:runner-limits": "python3 scripts/pipeline_runner_limits.py --selftest",
+    "test:runner-setup": "python3 scripts/pipeline_runner_setup.py --selftest",
     "test:session-tools": "python3 scripts/pipeline_session_tools.py --selftest",
     "test:queue-setup": "python3 scripts/pipeline_queue_setup.py --selftest",
     "test:day-plan": "python3 scripts/pipeline_day_plan.py --selftest",

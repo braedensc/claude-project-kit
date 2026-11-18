@@ -2288,30 +2288,47 @@
       "state": "built-off",
       "needs": [],
       "scripts": [
+        "scripts/pipeline_runner_setup.py",
         "scripts/pipeline_runner.py",
         "scripts/pipeline_runner_store.py",
         "scripts/pipeline_runner_limits.py",
         "scripts/pipeline_session_tools.py"
       ],
-      "installer": null,
-      "check": null,
-      "apply": null,
-      "no_command_reason": "Not installable yet: it is built beside the old dispatcher and ships off. Its installer comes with the first lane that moves to it, on the owner's yes.",
-      "restarts": [],
+      "installer": "scripts/pipeline_runner_setup.py",
+      "check": {
+        "script": "scripts/pipeline_runner_setup.py",
+        "args": [
+          "check",
+          "--conf",
+          "runner.conf"
+        ]
+      },
+      "apply": {
+        "script": "scripts/pipeline_runner_setup.py",
+        "args": [
+          "apply",
+          "--conf",
+          "runner.conf"
+        ]
+      },
+      "no_command_reason": null,
+      "restarts": [
+        "The runner's own job, when its kit or its job file changed."
+      ],
       "settings": {
-        "file": "runner settings",
-        "example": "runner.example.json",
+        "file": "runner.conf",
+        "example": "runner.conf.example",
         "keys": [
-          "enabled",
-          "store_dir",
-          "work_dir",
-          "limits",
-          "projects"
+          "ROLE_ACCOUNT",
+          "PROJECTS",
+          "RUNNER_DIR",
+          "CLAUDE_BIN",
+          "JOB_LABEL"
         ]
       },
       "secrets": [
         {
-          "key": "token_env",
+          "key": "TOKEN_ENV",
           "default_name": "CLAUDE_WRITER_OAUTH_TOKEN",
           "what": "The sign-in token the sessions use, by the name of the variable that holds it.",
           "ends": "one-year",
@@ -2319,36 +2336,28 @@
           "date_from": "The day you made it with `claude setup-token`, plus one year."
         },
         {
-          "key": "linear_key_file",
+          "key": "RUNNER_DIR",
           "default_name": null,
-          "what": "A file of the account's own that holds the tracker key, to read each ticket and its history.",
-          "ends": "never"
-        },
-        {
-          "key": "session_tools",
-          "default_name": null,
-          "what": "A file of the account's own that holds the session writer's tracker key, which a session's own tools comment with. Never the owner's key.",
+          "what": "A file in that folder, tracker-key, mode 0600, that holds the tracker key, to read each ticket and its history once a lane is on.",
           "ends": "never"
         }
       ],
       "jobs": [
         {
           "label": "local.pipeline-runner",
-          "from_key": null,
+          "from_key": "JOB_LABEL",
           "account": "role",
           "loaded_by": "installer",
           "command": {
-            "program": "<python>",
+            "program": "/bin/sh",
             "args": [
-              "<kit>/scripts/pipeline_runner.py",
-              "run",
-              "--config",
-              "<conf file>"
+              "-c",
+              "set -a; . <ENV_FILE>; set +a; exec /usr/bin/python3 <ROLE_KIT_CLONE>/scripts/pipeline_runner.py run --config <RUNNER_DIR>/runner.json # kit <commit>"
             ]
           },
           "schedule": "always-on",
           "interval_key": null,
-          "log": "<role home>/.pipeline-runner/runner.log",
+          "log": "<RUNNER_DIR>/runner.log",
           "switch": {
             "key": "enabled",
             "example": "runner.example.json"
@@ -2358,9 +2367,10 @@
         }
       ],
       "person_steps": [],
-      "ceiling": null,
+      "ceiling": 0,
       "consent": [
-        "Installs an always-on job under the pipeline's account that starts the sessions the pipeline asks for, each held to its ticket's budget."
+        "Installs an always-on job under the pipeline's account that starts the sessions the pipeline asks for, each held to its ticket's budget.",
+        "Every lane stays off for every project: no session starts through it until you switch a lane on for a project."
       ],
       "docs": {
         "guide": "docs/RUNNER.md",

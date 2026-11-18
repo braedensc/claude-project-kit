@@ -45,6 +45,7 @@ def refusal(uid=None):
 INSTALLERS = (
     ("pipeline_sweep_setup", ["run"]),
     ("pipeline_queue_setup", ["run"]),
+    ("pipeline_runner_setup", ["check"]),
     ("pipeline_acceptance_setup", ["run"]),
     ("pipeline_watcher_setup", ["run"]),
     ("pipeline_bridge_setup", ["install"]),

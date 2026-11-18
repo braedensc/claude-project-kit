@@ -97,6 +97,12 @@ WHAT IT DOES, IN ORDER
      typed yes; the job is looked at again afterwards, and one not seen loaded is "could not be
      measured", never "updated". A declined or untyped yes is "waiting on you"; a job that could
      not be looked at is "could not be measured". With no `update.conf` it is "off on this Mac".
+  3g. The runner, with every lane off (`scripts/pipeline_runner_setup.py`), when this Mac has a
+     `runner.conf` (`--runner-conf` names another). Its installer has only the program-facing pair,
+     so in both modes it runs as the notifier does in Automatic (3c): the Mac password held once,
+     its `check` read as one JSON document, and on a WOULD-CHANGE row, asked in Manual, its `apply`
+     with the consent piped in. A part its installer left off above its first-pass ceiling is
+     "waiting on you", with the document's `left_off` line as the reason, and the run carries on.
   4. The idea gate (`scripts/pipeline_stage_a_setup.py run`). On a first run it writes
      its own settings from what the review installer's settings already say. Then it
      works through its steps, asking before each one that changes something a person
@@ -169,6 +175,7 @@ TO ONLY LOOK: --check (KIT-736)
 Usage:
     pipeline_install.py [--conf stage-a.conf] [--stage-e-conf stage-e.conf]
                         [--no-pull] [--skip-stage-e] [--notifier-conf notifier.conf] [--queue-conf queue.conf]
+                        [--runner-conf runner.conf]
     pipeline_install.py --check [--conf stage-a.conf] [--stage-e-conf stage-e.conf]
                         [--sweep-conf sweep.conf] [--queue-conf queue.conf] [--skip-stage-e]
     pipeline_install.py --selftest
@@ -220,6 +227,7 @@ SWEEP_SETUP = os.path.join(HERE, "pipeline_sweep_setup.py")
 BRIDGE_SETUP = os.path.join(HERE, "pipeline_bridge_setup.py")
 NOTIFIER_SETUP = os.path.join(HERE, "pipeline_notifier_setup.py")
 QUEUE_SETUP = os.path.join(HERE, "pipeline_queue_setup.py")
+RUNNER_SETUP = os.path.join(HERE, "pipeline_runner_setup.py")
 WATCH = os.path.join(HERE, "pipeline_watch.py")
 
 # What each installer's exit code means, in a sentence a person can act on. The codes are
@@ -933,6 +941,16 @@ JOB_STEPS = (
      "note": "It writes the queue's settings and its two job files (the usage reader and the morning "
              "job) as the role account; it never loads them."},
 )
+# KIT-859: run after the health check (3f). Its installer has no `look` of its own, only the
+# program-facing pair, so step_job runs it through step_job_auto in Manual too, asking first.
+RUNNER_STEP = {
+    "key": "runner", "number": "3g", "title": "The runner, with every lane off",
+    "noun": "The runner", "conf": "runner.conf", "script": RUNNER_SETUP,
+    "auto_check": ["check"], "auto_apply": ["apply"], "rows_schema": "runner-setup-rows/1",
+    "answers": {"schema": "runner-answers/1", "consent": "yes"},
+    "auto_note": "It writes the runner's settings with every lane off for every project, and installs "
+                 "its job as the role account. It switches the job on itself only when its first pass "
+                 "would act on nothing; otherwise the job stays off, and the end says why."}
 
 
 def job_done(io, spec, base, conf, rep, updated):
@@ -1020,7 +1038,8 @@ def step_job_auto(io, spec, base, conf, rep):
     if not rows_with(doc, "WOULD-CHANGE"):
         io.say("")
         io.say("%s has nothing to change; what is left is for you, named above." % noun)
-        rep.note(key, OUT_WAITING, "a card is still yours", card_only=True)
+        # A part left off above its ceiling with nothing to change still says why (KIT-859).
+        rep.note(key, OUT_WAITING, doc.get("left_off") or "a card is still yours", card_only=True)
         return None
     io.say("")
     io.say("%s is not up to date: the rows above name what would change." % noun)
@@ -1069,7 +1088,8 @@ def step_job(io, spec, files, rep):
                % (os.path.relpath(conf, KIT), noun.lower(), spec["conf"]))
         return None
     base = [sys.executable, spec["script"]]
-    if io.auto and spec.get("auto_check"):
+    # An installer with no `look` of its own has only the program-facing pair: Manual runs it too.
+    if spec.get("auto_check") and (io.auto or not spec.get("look")):
         return step_job_auto(io, spec, base, conf, rep)
     code, out = io.run_seen(base + spec["look"] + ["--conf", conf])
     if io.interrupted:
@@ -1602,7 +1622,8 @@ STEP_OF_SCRIPT = {"sync_user_skills.py": "skills", "pipeline_stage_e_setup.py": 
                   "pipeline_sweep_setup.py": "sweep", "pipeline_stage_a_setup.py": "stage_a",
                   "pipeline_bridge_setup.py": "bridge",
                   "pipeline_notifier_setup.py": "notifier",
-                  "pipeline_queue_setup.py": "queue", "pipeline_watch.py": "watch"}
+                  "pipeline_queue_setup.py": "queue", "pipeline_watch.py": "watch",
+                  "pipeline_runner_setup.py": "runner"}
 
 
 def step_of(part):
@@ -1998,6 +2019,7 @@ def look_only(io, args):
              "bridge.conf": os.path.abspath(args.bridge_conf),
              "notifier.conf": os.path.abspath(args.notifier_conf),
              "queue.conf": os.path.abspath(args.queue_conf),
+             "runner.conf": os.path.abspath(args.runner_conf),
              "update.conf": os.path.abspath(args.update_conf)}
     rep, parts, unreadable = Report(), [], None
     try:
@@ -2055,6 +2077,8 @@ def main(argv=None, io=None):
     parser.add_argument("--queue-conf", default=os.path.join(KIT, "queue.conf"),
                         help="the usage job and the queue's settings (default: queue.conf in the kit; "
                              "absent skips it)")
+    parser.add_argument("--runner-conf", default=os.path.join(KIT, "runner.conf"),
+                        help="the runner's settings (default: runner.conf in the kit; absent skips it)")
     parser.add_argument("--skip-stage-e", action="store_true",
                         help="do not check or update the review jobs")
     parser.add_argument("--check", action="store_true", help="only look: change nothing, ask nothing, no terminal needed")
@@ -2107,6 +2131,7 @@ def main(argv=None, io=None):
              "bridge.conf": os.path.abspath(args.bridge_conf),
              "notifier.conf": os.path.abspath(args.notifier_conf),
              "queue.conf": os.path.abspath(args.queue_conf),
+             "runner.conf": os.path.abspath(args.runner_conf),
              "update.conf": os.path.abspath(args.update_conf)}
     rep = Report()
     parts, unreadable = [], None
@@ -2161,6 +2186,7 @@ def main(argv=None, io=None):
              lambda: step_sweep(io, files["sweep.conf"], rep)) \
         + tuple((lambda spec=spec: step_job(io, spec, files, rep)) for spec in JOB_STEPS) \
         + (lambda: step_watch(io, files["update.conf"], rep),) \
+        + (lambda: step_job(io, RUNNER_STEP, files, rep),) \
         + (lambda: step_stage_a(io, files["stage-a.conf"], files["stage-e.conf"], rep),)
     code, reached, stopped = None, True, False
     try:
@@ -3286,6 +3312,77 @@ def selftest():
     check("queue-ctrl-c-stops-the-run", (code, "pipeline_stage_a_setup.py run" in io.ran), (EX_BLOCKED, False))
     os.unlink(queue_conf)
 
+    # 6g. THE RUNNER (KIT-859): the installer's own `check` and `apply` in both modes, the Mac password held
+    #     first, the answer piped and never typed. Left off above its ceiling is waiting on you with the
+    #     document's own line, and the run carries on. Rows it cannot read are never up to date.
+    import pipeline_runner_setup as runner_setup
+    runner_conf = os.path.join(tmp, "runner.conf")                # absent: the runner is off
+    look, apply_ = "pipeline_runner_setup.py check", "pipeline_runner_setup.py apply"
+    off = "left off: its first pass would act on 2 waiting request(s) and 0 unfinished run(s), above its ceiling of 0"
+
+    def rdoc(command, code, *rows, **more):
+        """A document in the shape the installer's own main writes (pinned by its battery)."""
+        return json.dumps(dict({"schema": runner_setup.ROWS_SCHEMA, "command": command, "exit": code, "why": None,
+                                "rows": [{"step": s, "outcome": o, "detail": "", "card": None} for s, o in rows],
+                                "ceiling": 0, "first_pass": 0, "left_off": None}, **more))
+    work = rdoc("check", 10, ("settings", runner_setup.WOULD_CHANGE), ("job", runner_setup.WOULD_CHANGE))
+    check("runner-its-step-names-the-installer's-own-schemas",
+          (RUNNER_STEP["rows_schema"], RUNNER_STEP["answers"]["schema"]),
+          (runner_setup.ROWS_SCHEMA, runner_setup.ANSWERS_SCHEMA))
+
+    class NoPassword(FakeIo):
+        """The password is not given when the runner's step asks (the consent record's write still gets it)."""
+        def sudo_once(self, why):
+            self.events.append("sudo")
+            return "The runner's check" not in why
+
+    def runner(codes=None, rows=None, answers=(), cls=FakeIo, **kw):
+        io = cls(codes=dict(healthy, **(codes or {})), answers=answers, **kw)
+        io.rows_out = dict(rows or {})
+        return main(base + ["--runner-conf", runner_conf], io=io), io
+
+    def rout(io):
+        return [(r["outcome"], r["detail"]) for r in io.records if r["id"] == "runner"]
+
+    code, io = runner()
+    check("runner-no-conf-is-off-and-not-run", (code, [k for k in io.ran if "runner_setup" in k], rout(io)),
+          (EX_OK, [], [(OUT_OFF, "no runner.conf in %s" % tmp)]))
+    with open(runner_conf, "w") as fh:
+        fh.write("ROLE_ACCOUNT=_x\n")
+    code, io = runner({look: 0}, {look: rdoc("check", 0, ("settings", runner_setup.ALREADY_DONE))})
+    check("runner-current-is-up-to-date-asks-nothing-pipes-nothing",
+          (code, io.asked, io.piped, rout(io)), (EX_OK, [], ((look, None),), [(OUT_OK, "")]))
+    applied = rdoc("apply", 0, ("settings", runner_setup.DONE))
+    code, io = runner({look: 10, apply_: 0}, {look: work, apply_: applied}, answers=[True])
+    check("runner-manual-asks-then-applies-with-its-answer-piped",
+          (code, io.asked, io.piped, rout(io)),
+          (EX_OK, ["Update the runner now?"], ((look, None), (apply_, json.dumps(RUNNER_STEP["answers"]))),
+           [(OUT_UPDATED, "")]))
+    code, io = runner({look: 10, apply_: 0}, {look: work, apply_: applied}, typed=["1", "yes"])
+    check("runner-automatic-applies-on-the-consent", (code, io.asked, [k for k in io.ran if "runner_setup" in k]),
+          (EX_OK, [], [look, apply_]))
+    code, io = runner({look: 10, apply_: 10}, {look: work, apply_: rdoc("apply", 10, ("settings", runner_setup.DONE),
+                                                                        left_off=off)}, answers=[True])
+    check("runner-left-off-above-its-ceiling-is-waiting-with-its-line-and-the-run-carries-on",
+          (code, "pipeline_stage_a_setup.py run" in io.ran, rout(io)), (EX_BLOCKED, True, [(OUT_WAITING, off)]))
+    code, io = runner({look: 10}, {look: rdoc("check", 10, ("job", runner_setup.ALREADY_DONE), left_off=off)})
+    check("runner-left-off-with-nothing-to-change-asks-nothing-and-says-why",
+          (io.asked, io.ran.count(apply_), rout(io)), ([], 0, [(OUT_WAITING, off)]))
+    code, io = runner({look: 10}, {look: work}, answers=[False])
+    check("runner-declined-is-waiting-and-applies-nothing",
+          (code, io.ran.count(apply_), rout(io)), (EX_BLOCKED, 0, [(OUT_WAITING, "behind; you did not update it")]))
+    code, io = runner({look: 0}, cls=NoPassword)
+    check("runner-no-password-runs-nothing-and-stops",
+          (code, io.ran.count(look), rout(io)), (5, 0, [(OUT_WAITING, "it needs your Mac password")]))
+    code, io = runner({look: 10}, {look: "a table, not rows"})
+    check("runner-rows-it-cannot-read-are-never-up-to-date",
+          (code, rout(io)), (EX_UNMEASURED, [(OUT_UNMEASURED, "its check printed no rows (exit 10)")]))
+    for rc in (1, 2, 4):
+        code, io = runner({look: 10, apply_: rc}, {look: work, apply_: rdoc("apply", rc)}, answers=[True])
+        check("runner-installer-exit-%d-is-never-up-to-date" % rc,
+              (code, [o for o, _d in rout(io)]), (rc, [OUT_UNMEASURED]))
+    os.unlink(runner_conf)
+
     # 6f. THE HOURLY HEALTH CHECK (KIT-585): read whether its job is level, ask, install, look again.
     update_conf = os.path.join(tmp, "update.conf")                # absent: the health check is off
     watch_run = "pipeline_watch.py --conf"
@@ -3861,8 +3958,8 @@ def selftest():
     keys = dict((pt["id"], step_of(pt)) for pt in real)
     check("lines-steps-are-found-from-the-list",
           (keys["one-command"], keys["skills"], keys["cleanup"], keys["idea-gate"],
-           set(k for k in keys.values() if k) == set(["checkout", "skills", "stage_e",
-                                                      "sweep", "stage_a", "bridge", "notifier", "queue", "watch"]),
+           set(k for k in keys.values() if k) == set(["checkout", "skills", "stage_e", "sweep", "stage_a",
+                                                      "bridge", "notifier", "queue", "watch", "runner"]),
            all(keys[pt["id"]] == "stage_e" for pt in real
                if pt["check"] and pt["check"]["script"].endswith("pipeline_stage_e_setup.py"))),
           ("checkout", "skills", "sweep", "stage_a", True, True))
@@ -4075,12 +4172,15 @@ def selftest():
            got["settings"]["jobs"]["review/" + review["jobs"][0]["label"]]),
           ({"key": "STATUS_INTERVAL_SECONDS", "value": "900"}, {"key": None, "value": None}))
     # KIT-850: the notifier's part is the first to declare one; the record keeps the list's number.
+    # KIT-859: the runner's part declares one too.
     paging_ceiling = [p for p in real_parts if p["id"] == "paging"][0]["ceiling"]
+    runner_ceiling = [p for p in real_parts if p["id"] == "runner"][0]["ceiling"]
     check("kit717-record-has-each-ceiling-from-the-parts-list",
-          (got["settings"]["ceilings"]["paging"], isinstance(paging_ceiling, int),
-           set(v for k, v in got["settings"]["ceilings"].items() if k != "paging"),
+          (got["settings"]["ceilings"]["paging"], got["settings"]["ceilings"]["runner"],
+           isinstance(paging_ceiling, int), isinstance(runner_ceiling, int),
+           set(v for k, v in got["settings"]["ceilings"].items() if k not in ("paging", "runner")),
            "review" in got["settings"]["ceilings"]),
-          (paging_ceiling, True, {None}, True))
+          (paging_ceiling, runner_ceiling, True, True, {None}, True))
     check("kit717-a-switch-that-looks-like-a-secret-is-never-recorded-by-value",
           (switch_value("LINEAR_API_KEY", {"LINEAR_API_KEY": "abc"}),
            switch_value("LINEAR_API_KEY", {}), switch_value("STATUS_FILE", {"STATUS_FILE": "x"})),
