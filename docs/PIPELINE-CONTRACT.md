@@ -1254,6 +1254,20 @@ partly applied, and the job says how far it got rather than implying it got nowh
 > own reporting channel. What the agent cannot influence is the artifact name the
 > dispatcher collects and the pinned ID the validator compares against.
 
+### On the runner's lane: tool calls in place of the file
+
+A session our own runner starts (§28) holds no tracker credential and writes no requests file.
+It has five tools tied to its run instead (`scripts/pipeline_session_tools.py`, KIT-706). This
+section's rule holds, checked at each call in place of a batch:
+
+- Every write goes to the run's own ticket. No tool takes a ticket as an argument.
+- A finding is a `pipeline-finding/1` comment, which the finding filer files into the backlog
+  (`docs/FINDING-POLLER.md`). Three a run.
+- No tool sets a state, a label or an approval.
+- The caps are the table above's: 20 writes a run, bodies of 16 000 characters, titles of 200.
+
+A refused call writes nothing, and a call the tracker did not confirm is not counted.
+
 ---
 
 ## 9. Dispatcher state record
@@ -3320,7 +3334,40 @@ list (§13). The usage job reads the runs through it once a lane moves to the ru
 
 **Fields only.** No ticket text is in a request or a record. A resume's `text` reaches the session
 fenced as data. Each run's own folder also holds its command's inputs, the program's output and its
-exit. Those are the run's, and nothing but the runner reads them.
+exit. Those are the run's. Only the runner reads them, except the run's own tool server, which
+reads its run file and keeps its counts there (below).
+
+### The session's own tool server (KIT-706)
+
+With the runner's `session_tools` setting, a `code`, `fix` or `conflict` run gets one tool server
+of its own: `scripts/pipeline_session_tools.py`. The session holds no tracker credential, and this
+server is its only way to the tracker. Its five tools are §8's requests as calls, with §8's caps.
+Two files in the run's folder hold its state.
+
+`runs/<run>/session-tools.json` is the run file. The runner writes it whole, mode 0600, before the
+program starts, and names it as the server's one start-up argument. The server does not start on
+one that is a link, another account's, changeable by others, or not this shape.
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `schema` | `"pipeline-session-tools/1"` | |
+| `run` | run id | This run. The telemetry block's `run_id` and `dispatch_id`. |
+| `kind` | `code` \| `fix` \| `conflict` | The kinds that get the tools. |
+| `ticket`, `team_key` | ticket id; its team's key | The only ticket any tool reads or writes. No tool takes a ticket. |
+| `auth_mode`, `model`, `started_at` | from the pin and the settings | For the telemetry block. |
+| `key_file` | absolute path | The session writer's tracker key. Walled from the session. |
+| `writer_user_id` | user id | The user the key must belong to. Checked with the tracker before the first call. |
+| `owner_user_ids` | user ids | The writer is never one of them. |
+
+`runs/<run>/session-tools-state.json` holds the run's counts. Only the server writes it, whole,
+mode 0600: `{"schema": "pipeline-session-tools-state/1", "run", "writes": [{"tool", "at",
+"state"}]}`. Each write's `state` is `pending`, `posted` or `failed`.
+
+- A write is recorded `pending` before it is sent. So a server that dies mid-write still counts it.
+- A `pending` or `posted` write counts against the caps. A `failed` one, which the tracker did not
+  confirm, does not.
+- A counts file that cannot be read is never read as no writes. Every write is refused until it
+  can be read.
 
 ---
 
