@@ -693,6 +693,45 @@ said as partial, so "no notes" never stands for files it did not read.
 
 The close and the follow-up each count toward the 90 actions an hour.
 
+### When the acceptance check is on (KIT-325)
+
+Set `ACCEPTANCE_REPOS` in `bridge.conf` to the `owner/repo` names whose plans the acceptance check
+looks at (`docs/ACCEPTANCE-POLLER-OPERATOR.md`). Empty, the default, and every plan closes as above.
+`ACCEPTANCE_LEDGER` says where the check keeps its records. Leave it, unless you moved the check's
+state dir.
+
+For a plan whose pull requests are in one of them, the close waits for the check. The bridge reads
+the check's records to find the plan's **newest** check, then looks on the plan for that check's
+verdict:
+
+| The newest check | What the bridge does |
+|---|---|
+| No records file where `ACCEPTANCE_LEDGER` says | Holds the plan, and says it can't find the records. |
+| None yet | Holds it. The check runs on its own after the merge, so one comes. |
+| Still running | Holds it, and says so once in its thread. |
+| Couldn't start | Holds it, and names `check <plan>`. |
+| Done, but its verdict isn't on the plan | Holds it, and looks again. |
+| `passed` | Closes it, and the wrap-up says the acceptance check passed. |
+| `held` | Holds it, and says why once. A later check that passes closes it. |
+| `could-not-check`, or a verdict it can't read | Holds it, says it isn't a pass, and names `check <plan>`. |
+
+A verdict counts only if it names the newest check's head and was posted after that check started,
+from the owner's key (`acceptance_author_ids` in the bridge's config, if the check writes with
+another). So an older pass never closes a plan while a newer check is running or unposted. Each run
+of the check is said once, so a re-run that holds again is said again.
+
+**Run the check again: `check <plan>`.** It asks first, like `pause` and `resume`. A yes posts one
+request on the plan (contract §26). The check picks it up on its next pass and runs again, even at a
+head it checked before. The bridge moves nothing and starts no work itself.
+
+Good: `check PROD-50` on a plan held at could-not-check, then `yes`.
+Not: `check PROD-51` on a piece. The bridge says it runs no plan for it.
+
+**What it can't see.** The bridge has no GitHub access, so it can't tell the head a piece merged at.
+If a fix is pushed after the check passed, and the piece merges before a new check of it starts, the
+plan closes on the earlier pass. So merge the last piece only at a head the check passed, or send
+`check <plan>` after the merge. KIT-610 tracks closing this gap.
+
 ### With the queue on (MVP 2)
 
 The queue starts approved work without you, inside the working window. Set `QUEUE_CONFIG` in
@@ -1399,6 +1438,27 @@ and then ended is Slack's own refresh, and the job opens the next one at once; o
 and drops straight away waits like a failed try. Its heartbeat,
 `bridge-push-heartbeat.json` in the state folder, says whether the connection is up, when Slack was last
 heard, how many events it handled, and how many times it reconnected.
+
+**The logs (KIT-761).** Each job writes its log beside the bridge's config, in the role account's
+`~/.stage-e` folder by default. launchd points the job's output there.
+
+| Job | Its log | A healthy one shows |
+|---|---|---|
+| The bridge's pass, once a minute | `bridge.log` | One line a minute, such as `bridge: 0 message(s) examined, 0 asked, …`. It grows all day. |
+| The push job, always on | `bridge-push.log` | `push job: started, opening Slack's connection` each time the job starts. Then one line for each message it answers, such as `answered a DM message from U… with a turn (the conversation resumed); cost $0.0123, 90% of its input read from the cache`. While it is idle, nothing. |
+
+A problem is a line too: `could not open the connection (…); trying again in 4s`, or `message … could
+not be handled yet`. If the job cannot make its own output reach the file line by line, its first
+line says so: `push job: could not make its output line-buffered (…), so its log may stay empty
+while it runs`.
+
+Good: you send a DM, and within a second of the answer a new line shows in `bridge-push.log`.
+Not that: `bridge-push.log` at 0 bytes while the job answers messages. Before 16 Nov this was the
+normal state. The job never exits, and Python keeps a file's output in memory until the process
+ends, so its lines never arrived. The job now writes each line as it prints it, and prints one line
+when it starts. It reads its code when it starts, so a job started before the fix needs one restart.
+Not that: a quiet log, read as a stopped job. An idle job prints nothing, so read the heartbeat
+first: `connected: true` and a recent `at` mean it is up.
 
 | Config key | What it is |
 |---|---|
