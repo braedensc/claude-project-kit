@@ -41,7 +41,8 @@ WHAT IT CHECKS, one KIND each (a kind is what an alert is about):
   waker-sandbox  where CONFLICT_WAKER_STATE_DIR is set: one short session on the small model,
               started the way the waker starts one, must find a write outside its worktree
               refused by Claude Code's sandbox, a write inside landing, and a read outside
-              refused wherever the settings deny it (KIT-829). After every
+              refused where the settings deny a named folder there (KIT-829). The waker's own
+              claude and script, as its heartbeat names them, are the ones run. After every
               Claude Code update and once a day; again each pass while it was not held. Failed
               fires at once; a check that cannot run is unknown. Slack only, like conflict-waker
   watcher-page  the watcher's urgent page job (KIT-549), where WATCHER_PAGE_HEARTBEAT_FILE names its
@@ -759,6 +760,28 @@ def sandbox_answer(text):
     return None
 
 
+def waker_tools(folder):
+    """(claude, script, notes): the claude the waker starts and its own pr_conflict.py, as its
+    heartbeat in `folder` names them, each only as an absolute path to a file that is there. Where
+    it names none (a waker from before KIT-829), this job's own `claude` and this checkout's script
+    are used, and `notes` says so: the answer is then about them, not certainly the waker's."""
+    try:
+        with open(os.path.join(folder, "heartbeat.json"), encoding="utf-8") as fh:
+            beat = json.load(fh)
+    except (OSError, ValueError):
+        beat = {}
+    beat = beat if isinstance(beat, dict) else {}
+    claude, script, notes = beat.get("claude_bin"), beat.get("script"), []
+    if not (isinstance(claude, str) and claude.startswith("/") and os.path.isfile(claude)):
+        claude = "claude"
+        notes.append("the waker's heartbeat names no claude of its own, so the one on this job's PATH was checked")
+    if not (isinstance(script, str) and script.startswith("/") and os.path.basename(script) == "pr_conflict.py"
+            and os.path.isfile(script)):
+        script = os.path.join(HERE, "pr_conflict.py")
+        notes.append("it names no script of its own, so this checkout's was run")
+    return claude, script, notes
+
+
 def check_waker_sandbox(env, conf, state):
     """The conflict waker's fix session is still held by Claude Code's sandbox (KIT-829), where
     CONFLICT_WAKER_STATE_DIR names the waker. One short session on the small model, started the
@@ -768,33 +791,36 @@ def check_waker_sandbox(env, conf, state):
     if not conf.get("CONFLICT_WAKER_STATE_DIR"):
         return finding(SANDBOX_KIND, OK, "CONFLICT_WAKER_STATE_DIR is not set: no conflict waker's sandbox "
                                          "is checked on this machine")
-    got = env.runner.read(["claude", "--version"], timeout=60)
+    claude, script, notes = waker_tools(conf["CONFLICT_WAKER_STATE_DIR"])
+    said = "" if not notes else " (%s)" % "; ".join(notes)
+    got = env.runner.read([claude, "--version"], timeout=60)
     version = got.out.strip().splitlines()[0].strip() if got.ok and got.out.strip() else ""
     if not version:
-        return finding(SANDBOX_KIND, UNKNOWN, "could not be measured: `claude --version` did not answer on "
-                                              "this job's PATH, so no session could be started")
+        return finding(SANDBOX_KIND, UNKNOWN, "could not be measured: `%s --version` did not answer, so no "
+                                              "session could be started%s" % (claude, said))
     now, cached = _now(env), state.get("sandbox") or {}
-    if (cached.get("result") == "held" and cached.get("version") == version
+    if (cached.get("result") == "held" and cached.get("version") == version and cached.get("claude") == claude
             and isinstance(cached.get("at"), (int, float)) and now - cached["at"] < SANDBOX_EVERY):
-        return finding(SANDBOX_KIND, OK, "held on Claude Code %s, measured %s" % (version, _iso(cached["at"])))
-    res = env.runner.read([sys.executable, os.path.join(HERE, "pr_conflict.py"), "sandbox-check",
-                           "--claude-bin", "claude", "--json"], timeout=SANDBOX_TIMEOUT)
+        return finding(SANDBOX_KIND, OK, "held on Claude Code %s, measured %s%s" % (version, _iso(cached["at"]), said))
+    res = env.runner.read([sys.executable, script, "sandbox-check", "--claude-bin", claude, "--json"],
+                          timeout=SANDBOX_TIMEOUT)
     doc = sandbox_answer(res.out)
     if doc is None:
         state.pop("sandbox", None)
-        return finding(SANDBOX_KIND, UNKNOWN, "could not be measured: the check gave no answer (exit %s): %s"
-                       % (res.rc, ((res.err or "") + (res.out or "")).strip()[-200:]))
+        return finding(SANDBOX_KIND, UNKNOWN, "could not be measured: the check gave no answer (exit %s): %s%s"
+                       % (res.rc, ((res.err or "") + (res.out or "")).strip()[-200:], said))
     seen = str(doc.get("version") or version)
     detail = str(doc.get("detail") or "")[:300]
-    state["sandbox"] = {"at": now, "version": seen, "result": doc["result"]}
+    state["sandbox"] = {"at": now, "version": seen, "claude": claude, "result": doc["result"]}
     if doc["result"] == "held":
-        return finding(SANDBOX_KIND, OK, "held on Claude Code %s: %s" % (seen, detail))
+        return finding(SANDBOX_KIND, OK, "held on Claude Code %s: %s%s" % (seen, detail, said))
     if doc["result"] == "failed":
         return finding(SANDBOX_KIND, FIRING, (
             "Claude Code %s does NOT hold the conflict waker's fix session: %s. A fix session would run "
             "outside its walls. Stop the waker until a version holds it again: `launchctl bootout "
-            "gui/$(id -u)/<its label>`. Check: `python3 scripts/pr_conflict.py sandbox-check`." % (seen, detail)))
-    return finding(SANDBOX_KIND, UNKNOWN, "could not be measured on Claude Code %s: %s" % (seen, detail))
+            "gui/$(id -u)/<its label>`. Check: `python3 %s sandbox-check --claude-bin %s`%s."
+            % (seen, detail, script, claude, said)))
+    return finding(SANDBOX_KIND, UNKNOWN, "could not be measured on Claude Code %s: %s%s" % (seen, detail, said))
 
 
 def _page_problem(path, now, max_age):
@@ -2155,6 +2181,43 @@ def selftest():
                               for a in env.runner.answers]
         check_waker_sandbox(env, cs, st_s)
         check("…and is measured again after a Claude Code update", len(sb_ran), 3)
+        # The claude and the script are the waker's own, as its heartbeat names them (review of #616);
+        # a heartbeat that names none, or a path that is not there, falls back to this job's, said.
+        tools_dir = os.path.join(home, "waker-tools")
+        os.makedirs(os.path.join(tools_dir, "code", "scripts"))
+        own_claude, own_script = os.path.join(tools_dir, "claude"), os.path.join(tools_dir, "code", "scripts", "pr_conflict.py")
+        for path in (own_claude, own_script):
+            open(path, "w").close()
+        waker_beat(result="idle", at=_iso(T - 60), finished_at=_iso(T - 60), claude_bin=own_claude, script=own_script)
+        env, sb_ran = sandbox_env((0, HELD_LINE))
+        asked = []
+        real_read = env.runner.read
+
+        def asked_of(argv, **kw):
+            asked.append(list(argv))
+            return real_read(argv, **kw)
+        env.runner.read = asked_of
+        st_t = {}
+        own = check_waker_sandbox(env, cs, st_t)
+        check("the waker's own claude and script are the ones checked, and nothing is said about a fallback",
+              (own["state"], asked[0] if asked else None, asked[-1][1:] if asked else None, "names no" in own["summary"]),
+              (OK, [own_claude, "--version"], [own_script, "sandbox-check", "--claude-bin", own_claude, "--json"], False))
+        other_claude = os.path.join(tools_dir, "second-install", "claude")
+        os.makedirs(os.path.dirname(other_claude))
+        open(other_claude, "w").close()
+        waker_beat(result="idle", at=_iso(T - 60), finished_at=_iso(T - 60), claude_bin=other_claude, script=own_script)
+        check_waker_sandbox(env, cs, st_t)
+        check("a held answer is never reused for another claude, even of the same version",
+              (len(sb_ran), sb_ran[-1][-2] if sb_ran else None), (2, other_claude))
+        for name, fields in (("relative", {"claude_bin": "claude", "script": "pr_conflict.py"}),
+                             ("not there", {"claude_bin": own_claude + "-gone", "script": own_script + "-gone"}),
+                             ("another script", {"claude_bin": own_claude, "script": own_claude})):
+            waker_beat(result="idle", at=_iso(T - 60), finished_at=_iso(T - 60), **fields)
+            claude_, script_, notes_ = waker_tools(wk_dir)
+            check("a heartbeat whose paths are %s falls back to this job's own, and says so" % name,
+                  (claude_ == (own_claude if name == "another script" else "claude"),
+                   script_ == os.path.join(HERE, "pr_conflict.py"), bool(notes_)), (True, True, True))
+        os.remove(wk_beat)
         failed_line = json.dumps({"result": "failed", "version": "2.2.0 (Claude Code)",
                                   "detail": "a write outside the worktree landed: the sandbox did not refuse it"})
         env, sb_ran = sandbox_env((1, failed_line + "\n"))

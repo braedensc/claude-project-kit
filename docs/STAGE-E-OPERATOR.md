@@ -2623,8 +2623,9 @@ none of your settings. It may run only the git and gh steps of its prompt and yo
 update could change how the sandbox setting is read. So one short check proves them again. It
 starts one session on the small model, the way the waker starts a fix session. A write outside
 its worktree must be refused by the sandbox, and a write inside must land. Where the settings
-deny reads outside the worktree, a read of a planted fake there must be refused too. Each run
-costs a few cents.
+deny a named folder outside the worktree, a read of a planted fake there must be refused too.
+Where they deny none, the answer says that no read was judged: the secret-file patterns the
+settings carry are not judged by this check. Each run costs a few cents.
 
 - `run` and `verify` run it, from the waker's own clone, as the `sandbox` step.
 - The health watch runs it after every Claude Code update and once a day, where

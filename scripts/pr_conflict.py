@@ -105,7 +105,8 @@ THE SANDBOX CHECK (KIT-829)
   A wall measured once can be gone after a Claude Code update. `pr_conflict.py sandbox-check`
   starts one short session on the small model with the waker's own command line: a write
   outside its worktree must be refused by the sandbox, and a write inside must land. Where the
-  settings deny reads outside the worktree, a read of a planted fake there must be refused too.
+  settings deny a named folder outside the worktree, a read of a planted fake there must be
+  refused too; where they deny none (patterns are not judged), its answer says no read was judged.
   It answers held, failed (naming the version) or could not be measured, from what the commands
   printed and what is on disk, never from the model's words. The installer's `verify` and the
   health watch run it.
@@ -946,8 +947,9 @@ def describe_fix_session(checks, model):
 # The walls above were measured by hand, on one Claude Code version. An update could change how
 # it reads the sandbox setting, and a fix session would run unconfined with no sign. So one short
 # session, started by the same code the waker starts one with, proves it again: a write outside
-# its worktree is refused by the sandbox, and a write inside lands. Where the settings deny reads
-# outside the worktree, a read of a planted fake there must be refused too. Each answer comes from
+# its worktree is refused by the sandbox, and a write inside lands. Where the settings deny a named
+# folder outside the worktree, a read of a planted fake there must be refused too; where they deny
+# none (their patterns are not judged), the answer says no read was judged. Each answer comes from
 # what the session's commands printed AND what is on disk after it, never from the model's words.
 # The installer's `verify` runs it, and the health watch runs it once a day and after every
 # Claude Code update. One of three answers, never a fourth (contract §13):
@@ -1443,7 +1445,10 @@ def wake_pass(repo_dirs, gh_for, now, *, state_dir, dry_run=False, max_sessions=
         for line in describe_fix_session(wake_kw.get("checks", ()), wake_kw.get("model")):
             print(line)
     started = dt.datetime.now(dt.timezone.utc).isoformat()
-    beat = (lambda **f: None) if dry_run else (lambda **f: write_heartbeat(state_dir, **f))
+    # The claude this waker starts and its own script, so the health watch's sandbox check runs
+    # the same two, not whatever its own PATH and checkout hold (KIT-829, review of #616).
+    tools = {"claude_bin": wake_kw.get("claude_bin", "claude"), "script": os.path.abspath(__file__)}
+    beat = (lambda **f: None) if dry_run else (lambda **f: write_heartbeat(state_dir, **dict(tools, **f)))
     beat(started_at=started, result="running", repos=list(repo_dirs))
     total = new_tally()
     for repo_dir in repo_dirs:
@@ -2279,6 +2284,8 @@ def selftest():
             beat = json.load(fh)
         expect(rc == 0 and beat["schema"] == WAKER_HEARTBEAT_SCHEMA and beat["result"] == "idle"
                and beat.get("finished_at"), f"nothing to do must say idle, with a finish time: {beat}")
+        expect(beat.get("claude_bin") == "claude" and beat.get("script") == os.path.abspath(__file__),
+               f"the beat names the claude it starts and its own script, for the watch's sandbox check: {beat}")
         clock_now = _awake_clock()
         expect(isinstance(beat.get("awake_clock"), float) and clock_now is not None
                and 0 <= clock_now - beat["awake_clock"] < 5,

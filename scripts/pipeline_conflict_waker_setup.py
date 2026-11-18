@@ -83,8 +83,8 @@ job's PATH, because nothing from your settings reaches the session. It also refu
 SSH origin: git cannot use SSH inside the sandbox on macOS. The `sandbox` step proves the
 walls still hold before CK-W1 is read: one short session on the small model, from the job's
 own clone, must find a write outside its worktree refused and a write inside landing, and a
-read outside refused wherever the settings deny it (KIT-829). It costs a few cents, in `run`
-and `verify` alike.
+read outside refused where the settings deny a named folder there (KIT-829). Where they deny
+none, it says no read was judged. It costs a few cents, in `run` and `verify` alike.
 """
 import argparse
 import json
