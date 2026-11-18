@@ -2444,17 +2444,26 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
         noread.pass_once()
         ans44 = store.answer(sdir, rq) or {}
         expect("…while a review of the same ticket starts: no review ever reads it", ans44.get("ok"), True)
+        expect("…and a review's environment, offered the token, holds none of its names",
+               [n for n in kinds_data.PUSH_ENV
+                if n in child_env("review", {"claude_bin": claude, "home": tmp, "tmp": tmp}, "t", fake_push)], [])
         if ans44.get("ok"):
             _wait(lambda: noread.pass_once() and store.read_run(sdir, ans44["run"])["state"] not in store.LIVE, 20)
             rdir44 = store.run_dir(sdir, ans44["run"])
-            homecalls = os.path.join(cfg["session_home"], "calls.jsonl")
-            seen44 = [c for c in _calls(calls) + (_calls(homecalls) if os.path.exists(homecalls) else [])
-                      if c.get("cwd") == workspace_path(cfg, "review", "ENG-44")]
-            expect("…and the review session gets none of the push token's names, nor the token",
-                   [([n for n in kinds_data.PUSH_ENV if n in c["env"]], c["push"]) for c in seen44], [([], None)])
             with open(os.path.join(rdir44, "sandbox.sb")) as fh:
                 expect("…while its own sandbox walls the push token's file off, as every key file",
                        '(literal "%s")' % os.path.join(pdir, "open") in fh.read(), True)
+            if sys.platform == "darwin" and os.path.exists(harness.SANDBOX_EXEC):
+                homecalls = os.path.join(cfg["session_home"], "calls.jsonl")
+                seen44 = [c for c in _calls(calls) + (_calls(homecalls) if os.path.exists(homecalls) else [])
+                          if c.get("cwd") == workspace_path(cfg, "review", "ENG-44")]
+                expect("…and the review session, run for real, got none of the push token's names, nor the token",
+                       [([n for n in kinds_data.PUSH_ENV if n in c["env"]], c["push"]) for c in seen44],
+                       [([], None)])
+            else:
+                # Not a pass: a review runs inside our own sandbox, on a Mac only (as the ENG-41 case).
+                print("  (skipped: a review session runs inside our own sandbox, which needs %s on a Mac)"
+                      % harness.SANDBOX_EXEC)
 
         # ---- a start's text, the final message, a fresh workspace (KIT-858) ----- #
         def fenced(prompt, tag):
