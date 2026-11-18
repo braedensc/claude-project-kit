@@ -444,6 +444,9 @@ REQUIRED_SCRIPTS = ("pipeline_review_poller.py", "pipeline_bounce_local.py",
                     "pipeline_github_app.py",
                     # The validator's ledger, whose send-backs the bounce driver reads (KIT-542).
                     "pipeline_validator_ledger.py",
+                    # The runner's store, where the bounce driver asks the runner for a fix on the
+                    # runner lane (KIT-765), and the usage kinds its own battery checks.
+                    "pipeline_runner_store.py", "pipeline_usage_runs.py",
                     # Their `--selftest` runs inside one run folder it removes (KIT-450).
                     "scratch_run.py")
 
@@ -508,7 +511,7 @@ SIBLING_JOBS = (
                                 "pipeline_voice.py", "pipeline_window.py",
                                 "pipeline_ws_client.py")),
     # The queue's two jobs (KIT-456): the usage job, and the morning job.
-    ("pipeline_usage_local.py", ("pipeline_usage_local.py", "pipeline_usage_runs.py")),
+    ("pipeline_usage_local.py", ("pipeline_usage_local.py",)),
     ("pipeline_morning.py", ("pipeline_bridge.py", "pipeline_bridge_answers.py",
                              "pipeline_bridge_bind.py", "pipeline_bridge_config.py",
                              "pipeline_bridge_direct.py", "pipeline_bridge_handover.py",
@@ -526,8 +529,7 @@ SIBLING_JOBS = (
                              "pipeline_sprint_review.py", "pipeline_standup.py",
                              "pipeline_tech_lead_tools.py",
                              "pipeline_tech_lead_turn.py", "pipeline_usage_local.py",
-                             "pipeline_usage_runs.py", "pipeline_voice.py",
-                             "pipeline_window.py")),
+                             "pipeline_voice.py", "pipeline_window.py")),
     # The bridge installer's verify runs the writer's probe from the clone (KIT-297).
     ("pipeline_voice.py", ("pipeline_voice.py", "pipeline_notify_events.py",
                            "pipeline_notify_local.py")),
@@ -775,6 +777,12 @@ CONF_DEFAULTS = {
     # Empty checks the one OAuth-application webhook the key can see. With several, the
     # check cannot tell which is the dispatcher's and says so: name it here.
     "CATCHUP_WEBHOOK_ID": "",
+    # KIT-765: the repositories whose fixes go to our own runner as a resume of the pull
+    # request's own coding session, not as a reply in the tracker thread. Comma-separated
+    # OWNER/NAME:TEAM:PROJECT entries; empty is off. TEAM leaves the catch-up job, which is not
+    # installed when no team is left. RUNNER_STORE_DIR is the runner's store.
+    "RUNNER_LANE_REPOS": "",
+    "RUNNER_STORE_DIR": "",
     # The watcher's hold file (KIT-527). Empty: the bounce driver and the catch-up job read no
     # hold, and say so on every pass. Set: while the file exists neither sends a re-prompt.
     # An absolute path, or ~/ for the role account's home, in a folder no worker can write.
@@ -994,6 +1002,7 @@ def validate_conf(values):
     hook_id = (conf.get("CATCHUP_WEBHOOK_ID") or "").strip()
     if hook_id and not re.match(r"^[A-Za-z0-9-]+$", hook_id):
         errors.append("CATCHUP_WEBHOOK_ID must be a Linear webhook id, or empty (got %r)" % hook_id)
+    errors.extend(runner_lane_errors(conf, repos))
     nlabel = (conf.get("NOTIFIER_JOB_LABEL") or "").strip()
     if nlabel and not _RDNS_RE.match(nlabel):
         errors.append("NOTIFIER_JOB_LABEL %r is not a reverse-DNS launchd label — the "
@@ -1110,9 +1119,73 @@ def catchup_label(conf):
     return conf["DISPATCHER_SERVICE"].rsplit(".", 1)[0] + ".stage-e-catchup"
 
 
-def catchup_off(conf):
+_LANE_PROJECT_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")    # the runner's project keys
+
+
+def runner_lane(conf):
+    """[(OWNER/NAME, TEAM, PROJECT)] from RUNNER_LANE_REPOS (KIT-765), in order; [] while it is
+    empty, which is off: every repository's fixes go by the tracker thread."""
+    out = []
+    for entry in split_list(conf.get("RUNNER_LANE_REPOS", "")):
+        parts = entry.split(":")
+        if len(parts) == 3:
+            out.append((parts[0].strip(), parts[1].strip().upper(), parts[2].strip()))
+    return out
+
+
+def runner_lane_errors(conf, repos):
+    """Everything wrong with RUNNER_LANE_REPOS and RUNNER_STORE_DIR, each said in full."""
+    errors, seen = [], set()
+    for entry in split_list(conf.get("RUNNER_LANE_REPOS", "")):
+        parts = [p.strip() for p in entry.split(":")]
+        if len(parts) != 3:
+            errors.append("RUNNER_LANE_REPOS entry %r must be OWNER/NAME:TEAM:PROJECT" % entry)
+            continue
+        repo, team, project = parts[0], parts[1].upper(), parts[2]
+        if repo not in repos:
+            errors.append("RUNNER_LANE_REPOS entry %r names %s, which is not in REVIEW_REPOS: only a "
+                          "reviewed repository has fixes to send" % (entry, repo))
+        if team not in [k.upper() for k in split_list(conf.get("MANAGED_TEAM_KEYS", ""))]:
+            errors.append("RUNNER_LANE_REPOS entry %r names team %s, which is not in "
+                          "MANAGED_TEAM_KEYS" % (entry, team))
+        if not _LANE_PROJECT_RE.match(project):
+            errors.append("RUNNER_LANE_REPOS entry %r names project %r, which is not a key of the "
+                          "runner's settings (lower case letters, digits and -)" % (entry, project))
+        if repo in seen:
+            errors.append("RUNNER_LANE_REPOS names %s twice" % repo)
+        seen.add(repo)
+    store = (conf.get("RUNNER_STORE_DIR") or "").strip()
+    if seen and not (os.path.isabs(store) or store.startswith("~/")):
+        errors.append("RUNNER_STORE_DIR must be the runner's store_dir, an absolute path or one "
+                      "under ~/, when RUNNER_LANE_REPOS names a repository (got %r)" % store)
+    return errors
+
+
+def catchup_teams(conf):
+    """The work teams the catch-up poller covers: every managed team but the runner lane's
+    (KIT-765), whose hand-offs no longer travel through the tracker."""
+    lane = set(team for _, team, _ in runner_lane(conf))
+    return [k.upper() for k in split_list(conf.get("MANAGED_TEAM_KEYS", "")) if k.upper() not in lane]
+
+
+def catchup_off_by_name(conf):
     """CATCHUP_INTERVAL_SECONDS=off declines the catch-up poller by name."""
     return (conf.get("CATCHUP_INTERVAL_SECONDS") or "").strip().lower() == "off"
+
+
+def catchup_off(conf):
+    """The catch-up poller is off: declined by name, or, with every managed team on the runner
+    lane (KIT-765), left with no team to catch up. Either way it is not installed, and one an
+    earlier run installed is unloaded and its plist removed."""
+    return catchup_off_by_name(conf) or not catchup_teams(conf)
+
+
+def catchup_off_words(conf):
+    """Why the catch-up poller is off, in words: by name, or because no team is left for it."""
+    if catchup_off_by_name(conf):
+        return "OFF by conf (CATCHUP_INTERVAL_SECONDS=off)"
+    return ("OFF by conf: every managed team's fixes go to the runner (RUNNER_LANE_REPOS), so "
+            "no team is left for it")
 
 
 # The status job (KIT-335, KIT-411): its config, its log and, by default, its file, under the
@@ -4052,9 +4125,11 @@ def step_configs(ctx, apply_it):
     # its own state dir, so its heartbeat and ledger collide with nothing. The age floor
     # stays the script's default on purpose: the owner chose it (2026-10-27), and the
     # script refuses anything inside Linear's retry ladder.
+    # KIT-765: a team whose fixes go to the runner is left out; with none left the job is off
+    # (catchup_off), and this file is still written, as it is for CATCHUP_INTERVAL_SECONDS=off.
     catchup = {
         "agent_user_id": ids["agent_user_id"],
-        "teams": [k.upper() for k in split_list(conf["MANAGED_TEAM_KEYS"])],
+        "teams": catchup_teams(conf),
         "linear_key_env": conf["LINEAR_KEY_ENV"],
         "state_dir": "~/.stage-e/catchup",
         "dispatcher_url": conf["CATCHUP_DISPATCHER_URL"].strip(),
@@ -4066,6 +4141,11 @@ def step_configs(ctx, apply_it):
     # before the key existed is still, byte for byte, the composed one.
     if (conf.get("HOLD_FILE") or "").strip():
         bounce["hold"] = catchup["hold"] = {"file": conf["HOLD_FILE"].strip()}
+    # KIT-765: the runner lane, composed only when it names a repository, so a conf without it
+    # still composes, byte for byte, the config it always did.
+    if runner_lane(conf):
+        bounce["runner_lane"] = {"store_dir": conf["RUNNER_STORE_DIR"].strip(),
+                                 "repos": dict((repo, project) for repo, _, project in runner_lane(conf))}
     # KIT-411 status job config: the work teams, the same required checks as the bounce
     # driver's, the review poller's records, and where the file goes. Its other keys keep the
     # job's own defaults.
@@ -4165,6 +4245,19 @@ def step_configs(ctx, apply_it):
                              "config and review nothing. Nothing was written. Leave GITHUB_APP_ID, "
                              "GITHUB_APP_LOGIN and GITHUB_APP_KEY_FILE empty until origin carries "
                              "the change, then run this again.")
+    if "config.json" in stale and "runner_lane" in bounce:
+        # KIT-765, the hazard of the hold below: a bounce driver from before the key ignores it,
+        # and every fix would still go by the thread while the conf says the runner.
+        code = r.as_role(ctx.account, "cat %s/kit/scripts/pipeline_bounce_local.py 2>/dev/null"
+                         % ctx.stage_home)
+        if not code.ok and not code.skipped:
+            raise Unknown("could not read the bounce driver's own code, to see whether it knows "
+                          "RUNNER_LANE_REPOS", "run this from a terminal as yourself")
+        if code.ok and '"runner_lane"' not in (code.out or ""):
+            raise SetupError("RUNNER_LANE_REPOS is set, but the role account's clone runs a bounce "
+                             "driver from before that key, which would ignore it and send every fix "
+                             "by the thread. Nothing was written. Leave RUNNER_LANE_REPOS empty "
+                             "until origin carries the change, then run this again.")
     for fname, script, job in (("config.json", "pipeline_bounce_local.py", "bounce driver"),
                                ("catchup/poller.json", "pipeline_catchup_poller.py",
                                 "catch-up job")):
@@ -6139,7 +6232,7 @@ def step_dry_run(ctx, apply_it):
         ctx.account, "test -f %s/kit/scripts/pipeline_catchup_poller.py && test -f "
                      "%s/catchup/poller.json" % (ctx.stage_home, ctx.stage_home)).ok
     if catchup_off(ctx.conf):
-        catchup = Result(0, "[catchup-poller] OFF by conf (CATCHUP_INTERVAL_SECONDS=off)\n", "")
+        catchup = Result(0, "[catchup-poller] %s\n" % catchup_off_words(ctx.conf), "")
     elif not have_catchup:
         # Before `run` moves the clone and writes its config, there is nothing to measure. Said,
         # and not a failure: a `verify` before the first upgrade must not stop the one command
@@ -7146,14 +7239,15 @@ def step_catchup(ctx, apply_it):
 
     if catchup_off(conf):
         if not loaded and not installed:
-            return True, "OFF by conf (CATCHUP_INTERVAL_SECONDS=off): a delegation lost while " \
-                         "the dispatcher was down stays lost", []
+            return True, (catchup_off_words(conf) + ": a delegation lost while the dispatcher "
+                          "was down stays lost" if catchup_off_by_name(conf)
+                          else catchup_off_words(conf)), []
         if not apply_it:
             return False, ("OFF by conf, and %s is still %s — would unload it and remove its "
                            "plist" % (label, "loaded" if loaded else "installed")), []
         if loaded:
             out = r.as_root(["launchctl", "bootout", "system/" + label],
-                            why="unload %s: CATCHUP_INTERVAL_SECONDS=off" % label)
+                            why="unload %s: %s" % (label, catchup_off_words(conf)))
             if not out.skipped:
                 gone, waited = _wait_until_gone(r, label,
                                                 _exit_timeout(r, plist) + EXIT_TIMEOUT_HEADROOM)
@@ -8272,7 +8366,9 @@ def _unloaded_notice(ctx, off=None):
             say("    system/%s%s" % (label, "  (%s)" % off[label] if off.get(label) else ""))
     if clabel in ctx.unloaded and catchup_off(ctx.conf):
         say("")
-        say("The catch-up poller was stopped too. CATCHUP_INTERVAL_SECONDS=off, so leave it")
+        say("The catch-up poller was stopped too. %s, so leave it"
+            % ("CATCHUP_INTERVAL_SECONDS=off" if catchup_off_by_name(ctx.conf)
+               else "Every managed team's fixes go to the runner (RUNNER_LANE_REPOS)"))
         say("unloaded. The `catch-up` step removes its plist; until that step runs, the next")
         say("boot loads it again.")
     if slabel in ctx.unloaded and status_off(ctx.conf):
@@ -12784,6 +12880,89 @@ def _selftest_body():
     expect("catchup-conf", any("CATCHUP_WEBHOOK_ID" in e for e in validate_conf(
         dict(parse_conf(GOOD_CONF)[0], CATCHUP_WEBHOOK_ID="not an id!"))[1]),
            "a CATCHUP_WEBHOOK_ID that is not an id was accepted")
+
+    # -- KIT-765. THE RUNNER LANE: one entry per repository sends its fixes to the runner as a
+    # resume; its team leaves the catch-up poller, which is off, as by name, once no team is left.
+    cases += 1
+    goodL = parse_conf(GOOD_CONF)[0]
+    store_l = "~/.pipeline-runner/store"
+    lane_on = dict(goodL, RUNNER_LANE_REPOS="example-org/kit:KIT:kit", RUNNER_STORE_DIR=store_l)
+    expect("runner-lane-conf", not validate_conf(lane_on)[1] and not validate_conf(goodL)[1],
+           "a well-formed RUNNER_LANE_REPOS, or none at all, was refused: %r"
+           % validate_conf(lane_on)[1])
+    for value, store, needle in (
+            ("example-org/kit:KIT", store_l, "must be OWNER/NAME:TEAM:PROJECT"),
+            ("example-org/other:KIT:kit", store_l, "which is not in REVIEW_REPOS"),
+            ("example-org/kit:TOD:kit", store_l, "which is not in MANAGED_TEAM_KEYS"),
+            ("example-org/kit:KIT:Kit", store_l, "is not a key of the runner's settings"),
+            ("example-org/kit:KIT:kit,example-org/kit:KIT:kit", store_l, "names example-org/kit twice"),
+            ("example-org/kit:KIT:kit", "", "RUNNER_STORE_DIR must be the runner's store_dir"),
+            ("example-org/kit:KIT:kit", "store", "RUNNER_STORE_DIR must be the runner's store_dir")):
+        errs = validate_conf(dict(goodL, RUNNER_LANE_REPOS=value, RUNNER_STORE_DIR=store))[1]
+        expect("runner-lane-conf", any(needle in e for e in errs),
+               "RUNNER_LANE_REPOS=%r, RUNNER_STORE_DIR=%r was not refused with %r: %r"
+               % (value, store, needle, errs))
+    two_teams = dict(lane_on, MANAGED_TEAM_KEYS="KIT,TOD")
+    expect("runner-lane-catchup-teams",
+           (runner_lane(goodL), catchup_teams(goodL), catchup_off(goodL),
+            catchup_teams(two_teams), catchup_off(two_teams),
+            catchup_teams(lane_on), catchup_off(lane_on), catchup_off_by_name(lane_on),
+            "RUNNER_LANE_REPOS" in catchup_off_words(lane_on))
+           == ([], ["KIT"], False, ["TOD"], False, [], True, False, True),
+           "the catch-up poller's teams do not leave out the runner lane's, or it is not off when "
+           "none is left")
+    composedL = {}
+    for lane_value in ("", "example-org/kit:KIT:kit"):      # the fixture's one team, KIT
+        ctxL, fakeL = _settled_ctx(dict(conf, RUNNER_LANE_REPOS=lane_value,
+                                        RUNNER_STORE_DIR=store_l if lane_value else ""))
+        fakeL.answers = [("cat $HOME/.stage-e/config.json", 0, ""),
+                         ("cat $HOME/.stage-e/catchup/poller.json", 0, ""),
+                         ("cat $HOME/.stage-e/kit/scripts/pipeline_bounce_local.py", 0,
+                          'cfg["runner_lane"] = 1\n'),
+                         ("mkdir -p", 0, ""), ("cat > ", 0, "")] + list(fakeL.answers)
+        step_configs(ctxL, apply_it=True)
+        composedL[lane_value] = dict(
+            (name, json.loads(w["stdin"])) for w in fakeL.writes if "cat >" in _fmt(w["argv"])
+            for name in ("config.json", "catchup/poller.json") if ".stage-e/" + name in _fmt(w["argv"]))
+    offL, onL = composedL[""], composedL["example-org/kit:KIT:kit"]
+    expect("runner-lane-composed-only-when-set",
+           set(offL) == set(onL) == {"config.json", "catchup/poller.json"}
+           and "runner_lane" not in offL["config.json"]
+           and offL["catchup/poller.json"]["teams"] == ["KIT"]
+           and onL["config.json"].get("runner_lane") == {"store_dir": store_l,
+                                                          "repos": {"example-org/kit": "kit"}}
+           and onL["catchup/poller.json"]["teams"] == []
+           and dict(onL["config.json"], runner_lane=None) == dict(offL["config.json"], runner_lane=None)
+           and dict(onL["catchup/poller.json"], teams=None) == dict(offL["catchup/poller.json"], teams=None),
+           "the lane reached the configs wrongly: off %r, on %r" % (offL, onL))
+    ctxLO, fakeLO = _settled_ctx(dict(conf, RUNNER_LANE_REPOS="example-org/kit:KIT:kit",
+                                      RUNNER_STORE_DIR=store_l))
+    fakeLO.answers = [("cat $HOME/.stage-e/config.json", 0, ""),
+                      ("cat $HOME/.stage-e/catchup/poller.json", 0, ""),
+                      ("cat $HOME/.stage-e/kit/scripts/pipeline_bounce_local.py", 0, 'cfg.get("x")\n'),
+                      ("mkdir -p", 0, ""), ("cat > ", 0, "")] + list(fakeLO.answers)
+    try:
+        step_configs(ctxLO, apply_it=True)
+        refusedL = ""
+    except SetupError as exc:
+        refusedL = str(exc)
+    expect("runner-lane-old-bounce-driver-refused",
+           "Nothing was written" in refusedL and "RUNNER_LANE_REPOS" in refusedL
+           and not [w for w in fakeLO.writes if "cat >" in _fmt(w["argv"])],
+           "a clone whose bounce driver would ignore the lane was handed it: %r" % refusedL)
+    conf_lane = dict(conf, RUNNER_LANE_REPOS="example-org/kit:KIT:kit", RUNNER_STORE_DIR=store_l)
+    ctxLC, fakeLC = _settled_ctx(conf_lane)
+    fakeLC.answers = [("launchctl print system/" + clabel, 1, ""), ("test -f " + cplist, 1, "")] \
+        + fakeLC.answers
+    try:
+        (okLC, detLC, _n), _p = _quiet(lambda: step_catchup(ctxLC, apply_it=True))
+    except Exception as exc:        # taken for on, the step would install it, or stop on its card
+        okLC, detLC = False, "the step raised %s: %s" % (type(exc).__name__, exc)
+    expect("runner-lane-catchup-off", okLC is True and "RUNNER_LANE_REPOS" in detLC
+           and "stays lost" not in detLC and not fakeLC.writes
+           and "the catch-up poller" not in _privilege_reason("run", False, "x", conf_lane),
+           "with every team on the runner lane the catch-up poller was not a quiet, named off: %r"
+           % detLC)
 
     # -- KIT-411. THE STATUS JOB: its conf, its config, its plist, its dry run, its step -------
     cases += 1
