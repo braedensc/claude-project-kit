@@ -7,13 +7,13 @@ name: CI
 # (see templates/README.md — `git mv` it to .github/workflows/ci.yml).
 #
 # Layer 3 of the security/quality model — the unbypassable gate (--no-verify
-# can't skip it). Eight parallel jobs on every push to main and every PR (the
-# hooks and ticket guards are PR-only):
+# can't skip it). Parallel jobs on every push to main and every PR (the
+# ticket guard is PR-only):
 #   - "Secret scan + forbidden paths" — secretlint + planning//.env path gate
 #   - "Provenance scan"               — no absolute home paths / real emails
 #   - "Lint" / "Typecheck" / "Test"  — adapt the npm scripts to your toolchain
 #   - "E2E (smoke)"                  — non-required by design (see its comment)
-#   - "Hooks change guard"           — PR-only label gate on guard-machinery edits
+#   - "Hooks change guard"           — NOT here: workflows/hooks-change-guard.yml (KIT-788)
 #   - "Ticket link"                  — PR-only: branch / PR / pinned ticket agree
 # Plus two commented STUBS to adapt at the bottom: a second-runtime gate and a
 # migration guard.
@@ -35,10 +35,9 @@ on:
   # default branch is still checked (it also fails the "PR base" workflow, which
   # ships active at .github/workflows/pr-base.yml: stacked PRs are not allowed,
   # docs/COLLABORATION.md). `labeled`/`unlabeled`
-  # are included so the label-driven gates re-evaluate the moment their label is
-  # added or removed — `hooks-change` for "Hooks change guard", `no-ticket` for
-  # "Ticket link" (the default PR activity types — opened/synchronize/reopened —
-  # don't cover labels).
+  # are included so the label-driven gate re-evaluates the moment its label is
+  # added or removed — `no-ticket` for "Ticket link" (the default PR activity types —
+  # opened/synchronize/reopened — don't cover labels).
   pull_request:
     types: [opened, synchronize, reopened, labeled, unlabeled]
 
@@ -231,64 +230,9 @@ jobs:
       - name: Run E2E smoke
         run: npm run test:e2e
 
-  # Server-side backstop for hook self-protection (docs/SECURITY.md; from a
-  # production build's audit job). The local PreToolUse guard constrains
-  # only sessions that run the hook — a PR authored anywhere else (another
-  # clone, the GitHub web UI, an @claude workflow) never meets it. So a PR that
-  # changes the guard machinery (.claude/hooks/** or .claude/settings*.json), the
-  # CI workflows that gate the PR (.github/workflows/**), or the secret scan's own
-  # rules and scanner (.secretlintrc*, any .secretlintignore*,
-  # scripts/check_secret_scan.py), must not land unnoticed: it has to carry an
-  # explicit `hooks-change` label. The scan runs the base's copies of its rules and
-  # scanner, so a PR's change to them takes effect once merged; the label is how a
-  # person sees it first. `--no-renames` lists a renamed file's old path too, so
-  # moving a guarded file away is gated like deleting it.
-  # Operational notes (learned in production):
-  #   - the `hooks-change` label must EXIST in your repo before this job's
-  #     first run can pass on a guarded PR — one-time setup:
-  #       gh label create hooks-change --color D93F0B \
-  #         --description 'Acknowledges a PR that intentionally edits the Claude hook guard machinery'
-  #   - adding/removing the label re-runs the check via the labeled/unlabeled
-  #     trigger types above; if a run ever wedges, an empty commit gives a
-  #     clean re-run;
-  #   - this flag only becomes a real gate once branch protection requires a
-  #     review (required_approving_review_count >= 1, owner-set in the GitHub
-  #     UI) so a human actually sees it. PR-only — a push to main has no label
-  #     context.
-  hooks-change-guard:
-    name: Hooks change guard
-    runs-on: ubuntu-24.04
-    if: github.event_name == 'pull_request'
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Require the 'hooks-change' label to edit hook/settings files
-        env:
-          LABELS: ${{ join(github.event.pull_request.labels.*.name, ' ') }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          set -euo pipefail
-          # Against the default branch, never the base the PR names: its author could have
-          # pushed that base, and retargeting a PR re-runs nothing.
-          # -z: names come raw; quoted, a name with a non-ASCII character matched no pattern.
-          SENSITIVE=$(git diff -z --no-renames --name-only "origin/${DEFAULT_BRANCH}...${HEAD_SHA}" | { grep --null-data -E '^\.claude/(hooks/|settings[^/]*\.json$)|^\.github/workflows/|^\.secretlintrc|(^|/)\.secretlintignore|^scripts/check_secret_scan\.py$' || [ $? -eq 1 ]; } | tr '\0' '\n')
-          if [ -z "$SENSITIVE" ]; then
-            echo "No security-hook files changed — nothing to gate."
-            exit 0
-          fi
-          echo "This PR modifies security-critical hook/settings files:"
-          printf '  %s\n' $SENSITIVE
-          for label in $LABELS; do
-            if [ "$label" = "hooks-change" ]; then
-              echo "OK: 'hooks-change' label present — change acknowledged."
-              exit 0
-            fi
-          done
-          echo "::error::This PR changes .claude/hooks/**, .claude/settings*.json, .github/workflows/** or the secret scan's rules or scanner (.secretlintrc*, .secretlintignore*, scripts/check_secret_scan.py) — guard machinery whose edits must be reviewed, not silent. Add the 'hooks-change' label to acknowledge, then this check re-runs."
-          exit 1
+  # The label gate ("Hooks change guard") is NOT a job here: it has a workflow of its own,
+  # hooks-change-guard.yml, that runs from the default branch on `pull_request_target`, so a PR
+  # that edits the gate cannot turn its own check green (KIT-788). Do not add it back to this file.
 
   # Ticket link (PR-only). In an agent-driven pipeline the ticket ID is the only
   # thread tying a tracker issue → a branch → a PR → a merge commit. When those

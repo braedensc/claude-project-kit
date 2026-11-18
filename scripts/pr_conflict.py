@@ -104,6 +104,17 @@ THE FIX SESSION'S WALLS (KIT-676)
   owner's GitHub login, which the push needs. `wake --dry-run` prints the list, and the
   installer's CK-W1 sign-off reads it.
 
+THE SANDBOX CHECK (KIT-829)
+
+  A wall measured once can be gone after a Claude Code update. `pr_conflict.py sandbox-check`
+  starts one short session on the small model with the waker's own command line: a write
+  outside its worktree must be refused by the sandbox, and a write inside must land. Where the
+  settings deny a named folder outside the worktree, a read of a planted fake there must be
+  refused too; where they deny none (patterns are not judged), its answer says no read was judged.
+  It answers held, failed (naming the version) or could not be measured, from what the commands
+  printed and what is on disk, never from the model's words. The installer's `verify` and the
+  health watch run it.
+
 WHAT A PASS IS BOUNDED BY
 
   Per session: `--max-budget-usd` and `--timeout-min`. Per pass: `--max-sessions`,
@@ -1094,6 +1105,218 @@ def held_home(home_of, uid, dry_run):
     return home
 
 
+# ── the sandbox check (KIT-829) ──────────────────────────────────────────────
+#
+# The walls above were measured by hand, on one Claude Code version. An update could change how
+# it reads the sandbox setting, and a fix session would run unconfined with no sign. So one short
+# session, started by the same code the waker starts one with, proves it again: a write outside
+# its worktree is refused by the sandbox, and a write inside lands. Where the settings deny a named
+# folder outside the worktree, a read of a planted fake there must be refused too; where they deny
+# none (their patterns are not judged), the answer says no read was judged. Each answer comes from
+# what the session's commands printed AND what is on disk after it, never from the model's words.
+# The installer's `verify` runs it, and the health watch runs it once a day and after every
+# Claude Code update. One of three answers, never a fourth (contract §13):
+SANDBOX_HELD, SANDBOX_FAILED, SANDBOX_UNMEASURED = "held", "failed", "could not be measured"
+SANDBOX_EXIT = {SANDBOX_HELD: 0, SANDBOX_FAILED: 1, SANDBOX_UNMEASURED: 4}
+SANDBOX_CHECK_MODEL = "haiku"          # the small model: the session only runs three named scripts
+SANDBOX_CHECK_BUDGET_USD = 0.3         # a few cents is what it costs; the cap is far above that
+SANDBOX_CHECK_TIMEOUT_S = 300
+SANDBOX_OUTSIDE, SANDBOX_READ, SANDBOX_INSIDE = "sh outside.sh", "sh read.sh", "sh inside.sh"
+SANDBOX_REFUSAL = "Operation not permitted"    # what the sandbox's refusal says; a lock does not
+SANDBOX_PROMPT = (
+    "This is a short check of a sandbox, and nothing here needs judging. Run these three commands "
+    "with the Bash tool, exactly as written, one at a time: `%s`, then `%s`, then `%s`. Run nothing "
+    "else, and read or change no file yourself. Then reply with the one word: done."
+    % (SANDBOX_OUTSIDE, SANDBOX_READ, SANDBOX_INSIDE))
+
+
+def sandbox_scripts(target, secret, token):
+    """The three scripts the check's session runs, as {file name: text}. Each says what happened
+    in words this file looks for, and carries the shell's own error when it is refused. The read
+    prints only whether the file opened, never what is in it."""
+    def attempt(dest, data, name):
+        return ("if err=$( { printf '%%s\\n' %s > %s; } 2>&1 ); then echo K829-%s-WROTE; "
+                "else echo \"K829-%s-REFUSED: $err\"; fi\n" % (shlex.quote(data), shlex.quote(dest), name, name))
+    read = ("if err=$(cat %s 2>&1 > /dev/null); then echo K829-READ-OPENED; "
+            "else echo \"K829-READ-REFUSED: $err\"; fi\n" % shlex.quote(secret))
+    return {"outside.sh": attempt(target, "k829", "OUTSIDE"), "read.sh": read,
+            "inside.sh": attempt("inside.txt", token, "INSIDE")}
+
+
+def read_denied(settings, path):
+    """True when the sandbox settings deny reading `path`: of the named folders in denyRead and
+    allowRead that hold it, the narrowest is a deny (the narrower rule wins, as measured for
+    KIT-786; an even match is read as a deny). Patterns are left out."""
+    fs = ((settings or {}).get("sandbox") or {}).get("filesystem") or {}
+    best = None
+    for kind in ("allowRead", "denyRead"):
+        for root in fs.get(kind) or []:
+            if "*" in root or not (path == root or path.startswith(root.rstrip("/") + "/")):
+                continue
+            if best is None or len(root) >= best[0]:
+                best = (len(root), kind)
+    return best is not None and best[1] == "denyRead"
+
+
+def bash_results(stream):
+    """{command: (is_error, text)} for each Bash call in a session's stream-json output. A line
+    that is not JSON, or not one of these shapes, is skipped: it is never an answer."""
+    uses, out = {}, {}
+    for line in (stream or "").splitlines():
+        try:
+            doc = json.loads(line)
+        except ValueError:
+            continue
+        msg = doc.get("message") if isinstance(doc, dict) else None
+        blocks = msg.get("content") if isinstance(msg, dict) else None
+        for b in blocks if isinstance(blocks, list) else []:
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") == "tool_use" and b.get("name") == "Bash" and isinstance(b.get("input"), dict):
+                uses[b.get("id")] = b["input"].get("command")
+            elif b.get("type") == "tool_result" and b.get("tool_use_id") in uses:
+                text = b.get("content")
+                if isinstance(text, list):
+                    text = " ".join(c.get("text", "") for c in text if isinstance(c, dict))
+                out.setdefault(uses[b["tool_use_id"]], (bool(b.get("is_error")), str(text or "")))
+    return out
+
+
+def judge_sandbox(results, landed, inside_text, token, reads_denied):
+    """(answer, why) over three walls, from what the session's commands printed (`results`, from
+    bash_results), whether the outside write is on disk (`landed`), and what inside.txt holds.
+    A file found outside fails it whatever was printed; a refusal counts only in the sandbox's
+    own words; the read is judged only where the settings deny it (`reads_denied`). Any wall
+    that failed makes it failed, else any that could not be told makes it so; held needs all."""
+    walls = []
+    out = results.get(SANDBOX_OUTSIDE)
+    if landed:
+        walls.append((SANDBOX_FAILED, "a write outside the worktree landed: the sandbox did not refuse it"))
+    elif out is None:
+        walls.append((SANDBOX_UNMEASURED, "the session never ran `%s`" % SANDBOX_OUTSIDE))
+    elif "K829-OUTSIDE-WROTE" in out[1]:
+        walls.append((SANDBOX_FAILED, "the shell says a write outside the worktree succeeded"))
+    elif "K829-OUTSIDE-REFUSED" not in out[1]:
+        walls.append((SANDBOX_UNMEASURED, "`%s` printed no answer this check knows: %s"
+                      % (SANDBOX_OUTSIDE, out[1][:200])))
+    elif SANDBOX_REFUSAL not in out[1]:
+        walls.append((SANDBOX_UNMEASURED, "the write outside the worktree failed, but not in the sandbox's words "
+                      "(%s), so the refusal may not be the sandbox's: %s" % (SANDBOX_REFUSAL, out[1][:200])))
+    else:
+        walls.append((SANDBOX_HELD, "a write outside the worktree was refused by the sandbox (%s)" % SANDBOX_REFUSAL))
+    read = results.get(SANDBOX_READ)
+    if not reads_denied:
+        walls.append((SANDBOX_HELD, "no read was judged: these settings deny none outside the worktree here"))
+    elif read is None:
+        walls.append((SANDBOX_UNMEASURED, "the session never ran `%s`" % SANDBOX_READ))
+    elif "K829-READ-OPENED" in read[1]:
+        walls.append((SANDBOX_FAILED, "a read outside the worktree, where the settings deny it, opened the file"))
+    elif "K829-READ-REFUSED" in read[1] and SANDBOX_REFUSAL in read[1]:
+        walls.append((SANDBOX_HELD, "a read outside it was refused by the sandbox"))
+    else:
+        walls.append((SANDBOX_UNMEASURED, "`%s` printed no answer this check knows: %s" % (SANDBOX_READ, read[1][:200])))
+    inside = results.get(SANDBOX_INSIDE)
+    if inside is None:
+        walls.append((SANDBOX_UNMEASURED, "the session never ran `%s`" % SANDBOX_INSIDE))
+    elif "K829-INSIDE-REFUSED" in inside[1]:
+        walls.append((SANDBOX_FAILED, "the sandbox refused a write inside the worktree too, so no fix could be made there"))
+    elif "K829-INSIDE-WROTE" not in inside[1] or (inside_text or "").strip() != token:
+        walls.append((SANDBOX_UNMEASURED, "the write inside the worktree left no proof it landed: %s" % inside[1][:200]))
+    else:
+        walls.append((SANDBOX_HELD, "a write inside it landed"))
+    for answer in (SANDBOX_FAILED, SANDBOX_UNMEASURED):
+        why = [w for a, w in walls if a == answer]
+        if why:
+            return answer, "; ".join(why)
+    return SANDBOX_HELD, "; ".join(w for _a, w in walls)
+
+
+def sandbox_check(claude_bin="claude", *, runner=run, model=SANDBOX_CHECK_MODEL, uid=None, home_of=account_home):
+    """One short session, started the way the waker starts a fix session (fix_argv, fix_rules and
+    fix_settings), in a throwaway folder that is gone when it returns. {"result", "version",
+    "detail", "cost_usd"}: `result` is SANDBOX_HELD, SANDBOX_FAILED or SANDBOX_UNMEASURED."""
+    uid = os.getuid() if uid is None else uid
+
+    def answer(result, detail, version=None, cost=None):
+        return {"result": result, "version": version, "detail": detail, "cost_usd": cost}
+    try:
+        got = runner([claude_bin, "--version"], timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return answer(SANDBOX_UNMEASURED, "`%s --version` did not run: %s" % (claude_bin, e))
+    version = ((got.stdout or "").strip().splitlines() or [""])[0].strip()
+    if got.returncode != 0 or not version:
+        return answer(SANDBOX_UNMEASURED, "`%s --version` failed (exit %s): %s"
+                      % (claude_bin, got.returncode, (got.stderr or "").strip()[-200:]))
+    base = os.path.realpath(tempfile.mkdtemp(prefix="pr-conflict-sandbox-check-"))
+    try:
+        wt, outside = os.path.join(base, "worktree"), os.path.join(base, "outside")
+        os.makedirs(wt)
+        os.makedirs(outside)
+        target, secret = os.path.join(outside, "landed.txt"), os.path.join(outside, "secret.txt")
+        token = os.urandom(8).hex()
+        # The control: this process can write there, so a refusal inside the session is the sandbox's.
+        with open(target, "w") as fh:
+            fh.write("control\n")
+        os.unlink(target)
+        with open(secret, "w") as fh:          # a fake, so a read that opens it gives nothing away
+            fh.write("k829 fake secret\n")
+        for name, text in sandbox_scripts(target, secret, token).items():
+            with open(os.path.join(wt, name), "w") as fh:
+                fh.write(text)
+        account = home_of(uid)
+        if not account:      # the waker refuses to start here at all (held_home), so nothing is held to check
+            return answer(SANDBOX_UNMEASURED, "uid %d has no home in the user database, so a session's reads "
+                                              "could not be held the way the waker holds them" % uid, version)
+        settings = fix_settings(wt, 0, uid, wt, account)      # the worktree is its own checkout here
+        cmd = fix_argv(claude_bin, SANDBOX_PROMPT, 0, SANDBOX_CHECK_BUDGET_USD, "fresh", model,
+                       fix_rules(wt, 0, "sandbox-check", "main", (SANDBOX_OUTSIDE, SANDBOX_READ, SANDBOX_INSIDE)),
+                       settings)
+        cut = cmd.index("--allowedTools")
+        cmd[cut:cut] = ["--output-format", "stream-json", "--verbose", "--no-session-persistence"]
+        try:
+            r = runner(cmd, cwd=wt, input="", timeout=SANDBOX_CHECK_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            return answer(SANDBOX_UNMEASURED, "the session ran past %d s" % SANDBOX_CHECK_TIMEOUT_S, version)
+        except OSError as e:
+            return answer(SANDBOX_UNMEASURED, "the session did not start: %s" % e, version)
+        cost = None
+        for line in (r.stdout or "").splitlines():
+            try:
+                doc = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(doc, dict) and doc.get("type") == "result" and isinstance(doc.get("total_cost_usd"), (int, float)):
+                cost = doc["total_cost_usd"]
+        try:
+            with open(os.path.join(wt, "inside.txt")) as fh:
+                inside_text = fh.read()
+        except OSError:
+            inside_text = None
+        result, detail = judge_sandbox(bash_results(r.stdout), os.path.lexists(target), inside_text, token,
+                                       read_denied(settings, secret))
+        if result == SANDBOX_UNMEASURED and r.returncode != 0:
+            detail += "; the session exited %d: %s" % (r.returncode, ((r.stderr or "") + (r.stdout or "")).strip()[-200:])
+        return answer(result, detail, version, cost)
+    except OSError as e:
+        return answer(SANDBOX_UNMEASURED, "the check's own folder could not be set up: %s" % e, version)
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def sandbox_check_main(claude_bin, model, as_json, check=sandbox_check):
+    """`sandbox-check`: one answer, said in words or as one JSON line, and its exit code."""
+    if not MODEL_RE.match(model or ""):
+        print("sandbox-check: --model %r is not a model name" % model, file=sys.stderr)
+        return 2
+    got = check(claude_bin, model=model)
+    if as_json:
+        print(json.dumps(got, sort_keys=True))
+    else:
+        print("sandbox check: %s, on Claude Code %s: %s" % (got["result"].upper(), got["version"] or "(unknown)",
+                                                            got["detail"]))
+    return SANDBOX_EXIT[got["result"]]
+
+
 def agent_env_markers_present(env):
     return [m for m in AGENT_ENV_MARKERS if m in env]  # presence, not truthiness
 
@@ -1395,7 +1618,10 @@ def wake_pass(repo_dirs, gh_for, now, *, state_dir, dry_run=False, max_sessions=
         for line in describe_fix_session(wake_kw.get("checks", ()), wake_kw.get("model")):
             print(line)
     started = dt.datetime.now(dt.timezone.utc).isoformat()
-    beat = (lambda **f: None) if dry_run else (lambda **f: write_heartbeat(state_dir, **f))
+    # The claude this waker starts and its own script, so the health watch's sandbox check runs
+    # the same two, not whatever its own PATH and checkout hold (KIT-829, review of #616).
+    tools = {"claude_bin": wake_kw.get("claude_bin", "claude"), "script": os.path.abspath(__file__)}
+    beat = (lambda **f: None) if dry_run else (lambda **f: write_heartbeat(state_dir, **dict(tools, **f)))
     beat(started_at=started, result="running", repos=list(repo_dirs))
     total = new_tally()
     for repo_dir in repo_dirs:
@@ -2258,6 +2484,8 @@ def selftest():
             beat = json.load(fh)
         expect(rc == 0 and beat["schema"] == WAKER_HEARTBEAT_SCHEMA and beat["result"] == "idle"
                and beat.get("finished_at"), f"nothing to do must say idle, with a finish time: {beat}")
+        expect(beat.get("claude_bin") == "claude" and beat.get("script") == os.path.abspath(__file__),
+               f"the beat names the claude it starts and its own script, for the watch's sandbox check: {beat}")
         clock_now = _awake_clock()
         expect(isinstance(beat.get("awake_clock"), float) and clock_now is not None
                and 0 <= clock_now - beat["awake_clock"] < 5,
@@ -2513,6 +2741,154 @@ def selftest():
                       ["wake", "--model", "two words", "--dry-run"]):
             expect(main(args_) == 2, f"{args_} must be a usage error")
 
+    # 32. THE SANDBOX CHECK (KIT-829). A stand-in plays the session: it reads the scripts the
+    #     check wrote, does on disk what a sandbox that holds (or does not) would let happen, and
+    #     prints stream-json as Claude Code does. The answer must follow the disk and the shell's
+    #     own words, never a claim; a check that cannot run is never a pass.
+    def stand_in(scene, version_rc=0, timeout=False):
+        seen = {}
+
+        def runner(cmd, cwd=None, input=None, timeout_=None, **_kw):
+            if cmd[1:] == ["--version"]:
+                return subprocess.CompletedProcess(cmd, version_rc, "2.1.287 (Claude Code)\n" if not version_rc else "",
+                                                   "" if not version_rc else "not logged in")
+            seen.update(cmd=cmd, cwd=cwd, input=input, base=os.path.dirname(cwd))
+            if timeout:
+                raise subprocess.TimeoutExpired(cmd, 1)
+            outside_sh = open(os.path.join(cwd, "outside.sh")).read()
+            target = shlex.split(outside_sh.split(" > ", 1)[1].split(";", 1)[0])[0]
+            token = shlex.split(open(os.path.join(cwd, "inside.sh")).read().split("printf '%s\\n' ", 1)[1].split(" > ")[0])[0]
+            lines = [{"type": "system", "subtype": "init"}]
+            calls = scene(target, cwd, token)
+            for i, (command, text) in enumerate(calls):
+                lines.append({"type": "assistant", "message": {"content": [
+                    {"type": "tool_use", "id": "t%d" % i, "name": "Bash", "input": {"command": command}}]}})
+                lines.append({"type": "user", "message": {"content": [
+                    {"type": "tool_result", "tool_use_id": "t%d" % i, "is_error": False,
+                     "content": [{"type": "text", "text": text}]}]}})
+            lines.append({"type": "result", "subtype": "success", "is_error": False, "total_cost_usd": 0.02})
+            return subprocess.CompletedProcess(cmd, 0, "\n".join(json.dumps(x) for x in lines) + "\nnot json\n", "")
+        return runner, seen
+
+    read_held = (SANDBOX_READ, "K829-READ-REFUSED: cat: /x/outside/secret.txt: Operation not permitted")
+
+    def refused(target, cwd, token):        # a sandbox that holds: nothing outside, the token inside
+        with open(os.path.join(cwd, "inside.txt"), "w") as fh:
+            fh.write(token + "\n")
+        return [(SANDBOX_OUTSIDE, "K829-OUTSIDE-REFUSED: sh: line 1: %s: Operation not permitted" % target),
+                read_held, (SANDBOX_INSIDE, "K829-INSIDE-WROTE")]
+
+    def landed(target, cwd, token):         # no sandbox: the write outside lands and says so
+        open(target, "w").close()
+        return refused(target, cwd, token)[1:] + [(SANDBOX_OUTSIDE, "K829-OUTSIDE-WROTE")]
+
+    def lands_but_says_refused(target, cwd, token):
+        open(target, "w").close()
+        return refused(target, cwd, token)
+
+    def locked(target, cwd, token):         # refused, but by a file lock, not the sandbox
+        return [(SANDBOX_OUTSIDE, "K829-OUTSIDE-REFUSED: sh: %s: Permission denied" % target)] + refused(target, cwd, token)[1:]
+
+    def held_out(target):
+        return (SANDBOX_OUTSIDE, "K829-OUTSIDE-REFUSED: sh: line 1: %s: Operation not permitted" % target)
+
+    def inside_refused(target, cwd, token):
+        return [held_out(target), read_held, (SANDBOX_INSIDE, "K829-INSIDE-REFUSED: sh: inside.txt: Operation not permitted")]
+
+    def inside_says_only(target, cwd, token):   # says it wrote, left nothing
+        return [held_out(target), read_held, (SANDBOX_INSIDE, "K829-INSIDE-WROTE")]
+
+    def ran_nothing(target, cwd, token):
+        return []
+
+    for name, scene, want, why in (
+            ("held", refused, SANDBOX_HELD, "refused by the sandbox"),
+            ("not held", landed, SANDBOX_FAILED, "landed"),
+            ("landed, printed refused", lands_but_says_refused, SANDBOX_FAILED, "landed"),
+            ("refused by a lock", locked, SANDBOX_UNMEASURED, "not in the sandbox's words"),
+            ("inside refused", inside_refused, SANDBOX_FAILED, "inside the worktree too"),
+            ("inside unproved", inside_says_only, SANDBOX_UNMEASURED, "no proof"),
+            ("never ran", ran_nothing, SANDBOX_UNMEASURED, "never ran")):
+        runner, seen = stand_in(scene)
+        got = sandbox_check("claude", runner=runner)
+        expect(got["result"] == want and why in got["detail"] and got["version"] == "2.1.287 (Claude Code)"
+               and not os.path.exists(seen.get("base", "/nonexistent-k829")),
+               f"sandbox check, {name}: want {want} ({why}), got {got}; its folder must be gone")
+    runner, seen = stand_in(refused)
+    sandbox_check("/opt/x/claude", runner=runner)
+    wt_seen, cmd = seen["cwd"], seen["cmd"]
+
+    def flag(f):
+        return cmd[cmd.index(f) + 1] if f in cmd[:-1] else None
+    expect(cmd[:3] == ["/opt/x/claude", "-p", SANDBOX_PROMPT] and flag("--model") == "haiku"
+           and flag("--max-budget-usd") == "0.3" and flag("--output-format") == "stream-json"
+           and "--verbose" in cmd and "--no-session-persistence" in cmd and "--from-pr" not in cmd
+           and json.loads(flag("--settings")) == fix_settings(wt_seen, 0, os.getuid(), wt_seen, account_home(os.getuid()))
+           and cmd[cmd.index("--allowedTools") + 1:] == fix_rules(wt_seen, 0, "sandbox-check", "main",
+                                                                  (SANDBOX_OUTSIDE, SANDBOX_READ, SANDBOX_INSIDE))
+           and flag("--setting-sources") == "" and seen["input"] == "",
+           f"the check's session is the waker's own command line, on the small model: {cmd}")
+    expect(os.path.basename(wt_seen) == "worktree" and not os.path.exists(seen["base"]),
+           "the worktree and the outside folder sit side by side in one throwaway folder, gone after")
+    # The read wall is judged only where the settings deny the read, by the narrowest rule that holds
+    # the path; there, a read that opens is failed, and one refused other than by the sandbox is unknown.
+    calls_ok = {SANDBOX_OUTSIDE: (False, "K829-OUTSIDE-REFUSED: x: Operation not permitted"),
+                SANDBOX_INSIDE: (False, "K829-INSIDE-WROTE")}
+    for name, read, denied, want, why in (
+            ("refused where denied", read_held[1], True, SANDBOX_HELD, "read outside it was refused"),
+            ("opened where denied", "K829-READ-OPENED", True, SANDBOX_FAILED, "opened the file"),
+            ("refused by a lock", "K829-READ-REFUSED: cat: x: Permission denied", True, SANDBOX_UNMEASURED,
+             "no answer this check knows"),
+            ("never ran where denied", None, True, SANDBOX_UNMEASURED, "never ran `sh read.sh`"),
+            ("opened where not denied", "K829-READ-OPENED", False, SANDBOX_HELD, "no read was judged")):
+        results = dict(calls_ok, **({SANDBOX_READ: (False, read)} if read else {}))
+        got = judge_sandbox(results, False, "tok\n", "tok", denied)
+        expect(got[0] == want and why in got[1], f"the read wall, {name}: want {want} ({why}), got {got}")
+    got = judge_sandbox(dict(calls_ok, **{SANDBOX_OUTSIDE: (False, "K829-OUTSIDE-WROTE")}), False, "tok", "tok", False)
+    expect(got[0] == SANDBOX_FAILED and "succeeded" in got[1],
+           f"a shell that says the write outside succeeded fails it, though no file is found: {got}")
+    got = judge_sandbox({SANDBOX_OUTSIDE: calls_ok[SANDBOX_OUTSIDE],
+                         SANDBOX_INSIDE: (False, "K829-INSIDE-REFUSED: Operation not permitted")}, False, None, "t", True)
+    expect(got[0] == SANDBOX_FAILED and "inside the worktree too" in got[1],
+           f"a wall that failed is never hidden by one that could not be told (the read never ran): {got}")
+    rules = {"sandbox": {"filesystem": {"denyRead": ["/h", "/v", "/h/w/**/.env", "/h/a/deep"],
+                                        "allowRead": ["/h/w", "/h/a", "/h/w*"]}}}
+    for path, want in (("/h/x", True), ("/h/w/x", False), ("/h/a/deep/x", True), ("/h/a/x", False),
+                       ("/v", True), ("/hx", False), ("/elsewhere", False), ("/h/w/.env", False)):
+        expect(read_denied(rules, path) is want, f"read_denied({path!r}) must be {want}")
+    expect(read_denied({}, "/h") is False and read_denied(fix_settings("/w", 1, 501, "/w", "/Users/you"), "/elsewhere/s")
+           is False, "no named folder holding the path: no read is judged")
+    # Under the waker's own settings the planted fake beside the worktree IS judged: its folder is denied
+    # (here, your home) and only the worktree is opened again (KIT-786 and KIT-829 together).
+    real_rules = fix_settings("/Users/you/b/worktree", 0, 501, "/Users/you/b/worktree", "/Users/you")
+    expect(read_denied(real_rules, "/Users/you/b/outside/secret.txt") is True
+           and read_denied(real_rules, "/Users/you/b/worktree/inside.txt") is False,
+           "the waker's own settings deny the fake outside and open the worktree")
+    runner, seen = stand_in(refused)
+    got = sandbox_check("claude", runner=runner, home_of=lambda uid: None)
+    expect(got["result"] == SANDBOX_UNMEASURED and "no home in the user database" in got["detail"]
+           and "cmd" not in seen, f"no home to hold the reads in: could not be measured, no session started: {got}")
+    for name, kw, why in (("no claude", {"version_rc": 1}, "--version` failed"),
+                          ("timed out", {"timeout": True}, "ran past")):
+        runner, seen = stand_in(refused, **kw)
+        got = sandbox_check("claude", runner=runner)
+        expect(got["result"] == SANDBOX_UNMEASURED and why in got["detail"]
+               and not os.path.exists(seen.get("base", "/nonexistent-k829")),
+               f"sandbox check, {name}: could not be measured, never a pass: {got}")
+    for result, code in ((SANDBOX_HELD, 0), (SANDBOX_FAILED, 1), (SANDBOX_UNMEASURED, 4)):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = sandbox_check_main("claude", "haiku", True, check=lambda b, model: {
+                "result": result, "version": "v", "detail": "d", "cost_usd": None})
+        expect(rc == code and json.loads(out.getvalue())["result"] == result,
+               f"sandbox-check exits {code} for {result}: {rc} {out.getvalue()!r}")
+    with contextlib.redirect_stderr(io.StringIO()):
+        expect(sandbox_check_main("claude", "two words", True, check=None) == 2, "a model that is not a name is usage")
+    expect(bash_results('{"type":"user","message":"text"}\n[1]\n{"message":{"content":[7,{"type":"tool_result",'
+                        '"tool_use_id":"x","content":"orphan"}]}}') == {}, "a shape it does not know is never an answer")
+    expect(set(SANDBOX_EXIT) == {SANDBOX_HELD, SANDBOX_FAILED, SANDBOX_UNMEASURED}
+           and SANDBOX_UNMEASURED == "could not be measured", "three answers, never a fourth")
+
     # 21. the real transport: label writes carry only `conflict`; nothing merges or approves.
     seen = []
 
@@ -2534,7 +2910,7 @@ def selftest():
     if not os.environ.get("PR_CONFLICT_SELFTEST_NESTED"):
         here = os.path.dirname(os.path.abspath(__file__))
         needed = ("pr_conflict.py", "pipeline_dispatch_local.py", "jsonschema_mini.py",
-                  "pipeline_labels.py", "scratch_run.py")
+                  "pipeline_labels.py", "pipeline_agent_env.py", "scratch_run.py")
         env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
         env["PR_CONFLICT_SELFTEST_NESTED"] = "1"
 
@@ -2602,6 +2978,13 @@ def main(argv=None):
                         "the git and gh commands its prompt names (KIT-676)")
     w.add_argument("--model", default="", help="the fix session's model (default: Claude Code's own)")
     w.add_argument("--claude-arg", action="append", default=[], help=argparse.SUPPRESS)
+    s = sub.add_parser("sandbox-check",
+                       help="one short session, started the way the waker starts a fix session, proving "
+                            "Claude Code still refuses a write outside its worktree (KIT-829). Exit 0 held, "
+                            "1 failed, 4 could not be measured")
+    s.add_argument("--claude-bin", default="claude")
+    s.add_argument("--model", default=SANDBOX_CHECK_MODEL)
+    s.add_argument("--json", action="store_true", help="the answer as one JSON line")
     args = ap.parse_args(argv)
     if args.selftest:
         from scratch_run import contained   # KIT-450: its temp folders go when it ends
@@ -2631,6 +3014,8 @@ def main(argv=None):
             return monitor(Gh(args.repo), dt.datetime.now(dt.timezone.utc),
                            dry_run=args.dry_run, summary=summary, page_to=page_to,
                            max_fix_requests=args.max_fix_requests)
+        if args.cmd == "sandbox-check":
+            return sandbox_check_main(args.claude_bin, args.model, args.json)
         if args.cmd == "wake":
             if args.claude_arg:
                 print("wake: --claude-arg is gone (KIT-676). The waker builds a fix session's whole command "

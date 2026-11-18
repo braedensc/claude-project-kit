@@ -5,7 +5,8 @@ validator's app are made the same way.
 
     from pipeline_github_app import (manifest, ManifestFlow, convert, make_jwt, openssl_signer,
                                      app_info, installation_for, installation_token, bot_login,
-                                     post_comment, read_comment, post_check_run, write_key_argv)
+                                     post_comment, read_comment, post_check_run, write_key_argv,
+                                     update_branch, auto_merge)
 
     python3 scripts/pipeline_github_app.py --selftest
 
@@ -23,6 +24,10 @@ THE RULES, each one tested.
   * One host each way. API calls go to https://api.github.com only, every path is in ENDPOINTS, and a
     redirect is refused, so a key or token is never sent anywhere else. Nothing in ENDPOINTS can merge,
     approve, label or change a setting.
+  * The validator's merge path (KIT-539) may ask two things of GitHub, and nothing more: its own
+    update-branch, for one pull request while its head is still the one asked about; and its own
+    auto-merge, on for one pull request at exactly one head, or off, through one of two pinned GraphQL
+    documents (GRAPHQL_DOCUMENTS). Neither merges: GitHub merges, if and when its own rules pass.
   * A credential is never printed, logged, put in an argument list, or kept past the call that uses
     it. The key is written to its file from stdin; an error never carries a token.
   * The callback takes a code only with this run's state, on 127.0.0.1, and only once.
@@ -52,7 +57,23 @@ ENDPOINTS = {
     "comment-read": ("GET", "/repos/{owner}/{repo}/issues/comments/{comment_id}"),
     # The validator's verdict as a check run on one commit (KIT-540): a check, never a merge.
     "check-run-create": ("POST", "/repos/{owner}/{repo}/check-runs"),
+    # The validator's merge path (KIT-539): GitHub's own update-branch, for one pull request while
+    # its head is still the one asked about, and the GraphQL endpoint, which takes only the two
+    # pinned documents below. Neither merges: GitHub merges, if and when its own rules pass.
+    "update-branch": ("PUT", "/repos/{owner}/{repo}/pulls/{number}/update-branch"),
+    "graphql": ("POST", "/graphql"),
 }
+# The only GraphQL documents this file sends (KIT-539): GitHub's own auto-merge turned on for one
+# pull request at exactly one head, or turned off. --selftest asserts these are all.
+AUTO_MERGE_ON = ("mutation($id: ID!, $head: GitObjectID!, $method: PullRequestMergeMethod!) { "
+                 "enablePullRequestAutoMerge(input: {pullRequestId: $id, expectedHeadOid: $head, "
+                 "mergeMethod: $method}) { pullRequest { number autoMergeRequest { enabledAt } } } }")
+AUTO_MERGE_OFF = ("mutation($id: ID!) { disablePullRequestAutoMerge(input: {pullRequestId: $id}) "
+                  "{ pullRequest { number autoMergeRequest { enabledAt } } } }")
+GRAPHQL_DOCUMENTS = (AUTO_MERGE_ON, AUTO_MERGE_OFF)
+MERGE_METHODS = ("SQUASH", "MERGE", "REBASE")
+NODE_RE = re.compile(r"[A-Za-z0-9_=-]{1,100}")
+ERROR_TYPE_RE = re.compile(r"[A-Z][A-Z_]{0,39}")
 CODE_RE = re.compile(r"[A-Za-z0-9_-]{1,100}")
 REPO_RE = re.compile(r"[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}")
 SLUG_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
@@ -340,6 +361,53 @@ def post_check_run(owner_repo, head, name, conclusion, title, summary, token, ca
     return {"id": doc["id"], "app": (doc.get("app") or {}).get("slug")}
 
 
+def update_branch(owner_repo, number, head, token, call=_call):
+    """Ask GitHub to merge the base branch into pull request `number` (its own update-branch), only
+    while the pull request's head is still `head`. Returns True once GitHub accepted it. The new head
+    comes later, from GitHub; nothing here merges the pull request."""
+    if not isinstance(owner_repo, str) or not REPO_RE.fullmatch(owner_repo):
+        raise GitHubAppError("not OWNER/NAME")
+    if isinstance(number, bool) or not isinstance(number, int) or number < 1:
+        raise GitHubAppError("not a pull request number")
+    if not isinstance(head, str) or not HEAD_RE.fullmatch(head):
+        raise GitHubAppError("the head is not a full commit id")
+    owner, repo = owner_repo.split("/", 1)
+    method, path = _path("update-branch", owner=owner, repo=repo, number=number)
+    status, _doc = call(method, path, auth="token " + token, body={"expected_head_sha": head})
+    if status != 202:
+        raise GitHubAppError("GitHub would not update the branch (HTTP %s)" % status)
+    return True
+
+
+def auto_merge(node_id, on, token, head=None, method="SQUASH", call=_call):
+    """Turn GitHub's own auto-merge on for one pull request (its GraphQL `node_id`) at exactly `head`,
+    or off. One of the two pinned documents, and nothing else. It never merges: GitHub merges, if and
+    when its own rules pass, and only that head. Returns True once GitHub did it."""
+    if not isinstance(node_id, str) or not NODE_RE.fullmatch(node_id):
+        raise GitHubAppError("not a pull request's node id")
+    if on:
+        if not isinstance(head, str) or not HEAD_RE.fullmatch(head):
+            raise GitHubAppError("auto-merge is turned on only at a full commit id")
+        if method not in MERGE_METHODS:
+            raise GitHubAppError("the merge method is not one GitHub knows")
+        document, variables = AUTO_MERGE_ON, {"id": node_id, "head": head, "method": method}
+    else:
+        document, variables = AUTO_MERGE_OFF, {"id": node_id}
+    verb, path = _path("graphql")
+    status, doc = call(verb, path, auth="token " + token,
+                       body={"query": document, "variables": variables})
+    field = "enablePullRequestAutoMerge" if on else "disablePullRequestAutoMerge"
+    data = doc.get("data") if isinstance(doc, dict) else None
+    errors = doc.get("errors") if isinstance(doc, dict) else None
+    if status != 200 or errors or not isinstance(data, dict) or not isinstance(data.get(field), dict):
+        kinds = sorted(set(e.get("type") for e in errors or () if isinstance(e, dict)
+                           and isinstance(e.get("type"), str) and ERROR_TYPE_RE.fullmatch(e["type"])))
+        raise GitHubAppError("GitHub would not turn auto-merge %s (HTTP %s%s)"
+                             % ("on" if on else "off", status,
+                                ", %s" % ", ".join(kinds) if kinds else ""))
+    return True
+
+
 def write_key_argv(account, path):
     """The command that writes a key, given on stdin, to `path` as `account`: mode 600 from the
     first byte (umask 077), through a temporary file and one rename. The key is never an argument."""
@@ -386,8 +454,16 @@ def selftest():
 
     # 1. Only these paths, and none can merge, approve, label or change a setting.
     check("the paths it can build", sorted(ENDPOINTS),
-          ["app", "check-run-create", "comment-create", "comment-read", "convert",
-           "repo-installation", "token"])
+          ["app", "check-run-create", "comment-create", "comment-read", "convert", "graphql",
+           "repo-installation", "token", "update-branch"])
+    check("the only GraphQL it sends turns GitHub's own auto-merge on at one head, or off",
+          ([("AutoMerge" in d, "expectedHeadOid" in d) for d in GRAPHQL_DOCUMENTS],
+           [w for w in ("mergePullRequest", "Review", "Label", "Protection", "Ruleset", "update")
+            if any(w in d for d in GRAPHQL_DOCUMENTS)]),
+          ([(True, True), (True, False)], []))
+    with open(os.path.abspath(__file__), encoding="utf-8") as fh:
+        own = fh.read().split("\ndef selftest():", 1)[0]
+    check("...and nothing else in this file sends a GraphQL document", own.count('"query":'), 1)
     words = " ".join(p for _m, p in ENDPOINTS.values())
     check("no path merges, approves, labels or changes a setting",
           [w for w in ("merge", "review", "label", "protection", "rules", "settings", "hooks")
@@ -511,6 +587,39 @@ def selftest():
     check("post_check_run: a run GitHub will not take is said, never a quiet None",
           raises(lambda: post_check_run("acme/app", head, "Validator", "success", "approved",
                                         "x", tok, fake({}))), True)
+    # The merge path's two asks (KIT-539): update-branch at one head, and auto-merge on or off.
+    upd = fake({("PUT", "/repos/acme/app/pulls/12/update-branch"): (202, {"message": "Updating"})})
+    del sent[:]
+    check("update_branch: GitHub's own update-branch, only while the head is the one asked about",
+          (update_branch("acme/app", 12, head, tok, upd), sent[-1][:2], sent[-1][3]),
+          (True, ("PUT", "/repos/acme/app/pulls/12/update-branch"), {"expected_head_sha": head}))
+    check("update_branch: a short head, or one GitHub will not update, is refused or said",
+          (raises(lambda: update_branch("acme/app", 12, "abc", tok, upd)),
+           raises(lambda: update_branch("acme/app", 12, head, tok, fake({})))), (True, True))
+    gql = fake({("POST", "/graphql"): (200, {"data": {
+        "enablePullRequestAutoMerge": {"pullRequest": {"number": 12}},
+        "disablePullRequestAutoMerge": {"pullRequest": {"number": 12}}}})})
+    del sent[:]
+    on_ = auto_merge("PR_kw12", True, tok, head, "SQUASH", gql)
+    off_ = auto_merge("PR_kw12", False, tok, call=gql)
+    check("auto_merge: one pinned document each way, on only at one head",
+          (on_, off_, [s[3]["query"] for s in sent], sent[0][3]["variables"], sent[1][3]["variables"]),
+          (True, True, [AUTO_MERGE_ON, AUTO_MERGE_OFF],
+           {"id": "PR_kw12", "head": head, "method": "SQUASH"}, {"id": "PR_kw12"}))
+    refused = fake({("POST", "/graphql"): (200, {"errors": [{"type": "FORBIDDEN", "message": "x"}]})})
+    try:
+        auto_merge("PR_kw12", True, tok, head, "SQUASH", refused)
+        said = ""
+    except GitHubAppError as exc:
+        said = str(exc)
+    check("auto_merge: GitHub's refusal is said with its closed error type, never its words",
+          said, "GitHub would not turn auto-merge on (HTTP 200, FORBIDDEN)")
+    check("auto_merge: no head, a method GitHub does not know, or a node id of another shape is "
+          "refused before any call",
+          (raises(lambda: auto_merge("PR_kw12", True, tok, None, "SQUASH", gql)),
+           raises(lambda: auto_merge("PR_kw12", True, tok, head, "OCTOPUS", gql)),
+           raises(lambda: auto_merge("PR kw/12", False, tok, call=gql)), len(sent)),
+          (True, True, True, 3))
     for label, fn in (("an app that will not say what it is", lambda: app_info("J", fake({}))),
                       ("a token GitHub will not give", lambda: installation_token(7, "J", fake({}))),
                       ("an installation GitHub will not show",

@@ -20,7 +20,8 @@ words, asks for one typed `yes`, does it, and checks again. A second run changes
 
 WHAT `run` DOES, IN ORDER, skipping what is done
   1. Opens GitHub's page to create the app. You click GitHub's own Create button. The app may write
-     check runs, and nothing else.
+     check runs, and, for the merge path (KIT-539), turn GitHub's own auto-merge on or off and ask
+     GitHub to update a pull request's branch. Nothing else: it never merges, approves or labels.
   2. Writes its private key to the file you name with --key-file: mode 600, a file that must not
      exist yet, outside every repository. GitHub hands the key over once. It is never printed,
      never an argument, and never kept anywhere else.
@@ -85,8 +86,11 @@ import pipeline_validator_settings as vsettings  # noqa: E402
 
 SCHEMA = "validator-app/1"
 LEDGER = "~/.validator-app/state.json"
-PERMISSIONS = {"checks": "write"}
-DESCRIPTION = "The validator's verdict, as a check run. It writes check runs, and nothing else."
+# Checks: the verdict as a check run. Contents and pull requests: GitHub asks both of an app that
+# turns its own auto-merge on or off, or updates a pull request's branch (KIT-539).
+PERMISSIONS = {"checks": "write", "contents": "write", "pull_requests": "write"}
+DESCRIPTION = ("The validator's verdict, as a check run; and GitHub's own auto-merge, on or off for "
+               "one pull request at a time. It never merges, approves or labels.")
 NAME_MAX = 34
 WAIT_SECONDS = 600
 POLL_SECONDS = 5

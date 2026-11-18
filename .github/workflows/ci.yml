@@ -124,6 +124,12 @@ jobs:
           python3 scripts/check_label_gate.py
       - name: Label gate policy selftest (the owner's allow for pull_request_target)
         run: python3 scripts/pipeline_gate_policy.py --selftest
+      # KIT-788. The stack template's label gate runs the default branch's workflow, never the PR's.
+      - name: Template label gate check (the gate runs from the default branch)
+        run: |
+          python3 -m pip install --quiet pyyaml
+          python3 scripts/check_template_label_gate.py --selftest
+          python3 scripts/check_template_label_gate.py
 
       # KIT-652. The kit's Python imports only the standard library, bar a short named list,
       # because its jobs and hooks run on a Python with nothing added to it.
@@ -217,6 +223,10 @@ jobs:
       # absent and `/work` fails closed for a reason nobody can see.
       - name: Local dispatcher selftest (contract §2, §3)
         run: python3 scripts/pipeline_dispatch_local.py --selftest
+
+      # The one list of agent-environment markers: copies pinned, refusals pinned (KIT-690).
+      - name: Agent-environment markers selftest (KIT-690)
+        run: python3 scripts/pipeline_agent_env.py --selftest
 
       # The autonomy gates and the telemetry pipeline. Same posture as the two
       # above: inert in this repo (no delivery.json, no store), so the selftests
@@ -416,6 +426,12 @@ jobs:
       # and never a retry, the run folder always removed, and no script but its callers names it.
       - name: Validator run selftest (one read-only call; a failure holds; only its job starts it)
         run: python3 scripts/pipeline_validator_run.py --selftest
+      # The validator's merge path (KIT-539): GitHub's own auto-merge on for one pull request at a
+      # time, each on the latest main. Offline, against a stood-in code host: one in flight, the
+      # next updated and judged again from scratch, the floor held, a stale review never approved
+      # (KIT-792), off and held said, and it never merges, approves or labels.
+      - name: Validator merge path selftest (one in flight; never merges, approves or labels)
+        run: python3 scripts/pipeline_validator_merge.py --selftest
       # The validator's hard limits (KIT-538): layer 1, plain code with no model. Offline, in a
       # temp folder: one case per rule and every reason reached; each fact read by the part of
       # the kit that owns it; the safety-system floor is never a switch; closed words only.
@@ -440,6 +456,12 @@ jobs:
       # conform is never written, and no message text reaches the file or its output.
       - name: Stage E usage job selftest (the week, exit codes, refusals, fields only)
         run: python3 scripts/pipeline_usage_local.py --selftest
+      # The spend ledgers (KIT-844, contract §30): one row per model call that no dispatcher log
+      # records, one writer and one reader. Offline, in a temp folder only: a row from the CLI's
+      # output keeps no word of its text, an unknown cost is null and never zero, a ledger that
+      # cannot be read gives no calls at all, and the hand rules agree with the schema.
+      - name: Spend ledger selftest (one row per call, one writer, one reader, unknown never zero)
+        run: python3 scripts/pipeline_spend_ledger.py --selftest
       # The queue's pool (KIT-433, MVP 2 part 2a): which tickets may start without the owner. A
       # pure function, so the selftest stands in for everything it is given: the owner by actor
       # in the history, never the dispatcher's user; a history or record it cannot read held and
@@ -595,6 +617,11 @@ jobs:
       # the yes. Real settings files in a folder of its own; the terminal scripted.
       - name: One-command asking selftest (missing values, one yes, written and read back)
         run: python3 scripts/pipeline_ask.py --selftest
+      # The settings folder (KIT-853): one machine.conf under the user's Library, each shared value
+      # written to every part file the map names, shown first and written only with --apply (refused
+      # in a session), and a checker that fails on secrets, other readers, links and repositories.
+      - name: Settings folder selftest (typed once, shown first, no secret, private)
+        run: python3 scripts/pipeline_settings.py --selftest
       # Every part listed once, as data (KIT-624): each installer and job writer owned, needs
       # acyclic, cards real, commands from a fixed list, and docs/PARTS.md equal to its render.
       - name: Parts list (one row per part, guides named, the page in step)
@@ -805,6 +832,7 @@ jobs:
           python3 scripts/pipeline_machine_tickets.py --selftest
           python3 scripts/check_repo_setup.py --selftest
           python3 scripts/pipeline_root_guard.py --selftest
+          python3 scripts/pipeline_pass_lock.py --selftest
           python3 scripts/pipeline_routing_tags.py --selftest
           python3 .claude/skills/sync-kit/compare.py --selftest
           python3 scripts/pipeline_acceptance_run.py --selftest

@@ -6,7 +6,11 @@
 #   cp notifier.conf.example notifier.conf && chmod 600 notifier.conf
 #   $EDITOR notifier.conf                      # seven values to fill in, none of them secret
 #   python3 scripts/pipeline_notifier_setup.py run --dry-run    # read it first
-#   python3 scripts/pipeline_notifier_setup.py run              # the only command that changes anything
+#   python3 scripts/pipeline_notifier_setup.py run              # changes things; never loads the job
+#
+# In Automatic, the one command (scripts/pipeline_install.py) runs this installer's
+# `check` and `apply` instead, and `apply` loads the job itself when its first pass
+# would send no more messages than its ceiling (docs/NOTIFIER-OPERATOR.md, KIT-850).
 #
 # The installer validates this file before it touches anything, and reports
 # EVERY bad value in one pass. Fix them all, then run it again.

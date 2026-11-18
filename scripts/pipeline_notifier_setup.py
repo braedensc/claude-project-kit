@@ -2,7 +2,10 @@
 """Notifier installer — the human-action notifier, activated with one command, run until it stops asking.
 
     python3 scripts/pipeline_notifier_setup.py run --dry-run    # read it first
-    python3 scripts/pipeline_notifier_setup.py run              # the only command that changes anything
+    python3 scripts/pipeline_notifier_setup.py run              # a person's: changes, never loads
+
+    python3 scripts/pipeline_notifier_setup.py check            # a program's: rows, asks nothing
+    <answers> | python3 scripts/pipeline_notifier_setup.py apply   # a program's, after the consent
 
 Same contract as the Stage E installer (scripts/pipeline_stage_e_setup.py), whose exit codes,
 step outcomes, runner, ledger shape, placeholder list and plist shape it imports rather than
@@ -18,8 +21,11 @@ WHAT IT BUILDS, AS THE DISPATCHER'S ROLE ACCOUNT, BESIDE AN EXISTING STAGE E INS
     <NOTIFIER_CONFIG>   the notifier's JSON config, mode 600. Env var NAMES and ids only.
     /Library/LaunchDaemons/<JOB_LABEL>.plist
                         one system LaunchDaemon running `pipeline_notify_local.py run
-                        --config <NOTIFIER_CONFIG>` every INTERVAL_SECONDS. INSTALLED, NEVER
-                        LOADED: loading is the moment real pings start, and that is card CK-N3.
+                        --config <NOTIFIER_CONFIG>` every INTERVAL_SECONDS. Loading it is the
+                        moment real pings start. `run` never loads it: that is card CK-N3.
+                        `apply` loads it itself, after the consent, when its first pass would
+                        send at most its ceiling of messages (KIT-850). While the job is off
+                        its label is DISABLED, so a restart cannot start it.
 
 It needs Stage E first: the role account, its clone of this kit, and its env file holding the
 tracker key. It creates none of them.
@@ -46,12 +52,16 @@ THE STEPS, IN ORDER — each reports exactly one outcome from the Stage E vocabu
                  loader before anything is written. The writer's keys are composed only with
                  WRITER=yes, so a conf without it composes the same config as before
     job          the LaunchDaemon plist, installed and not loaded — and never over another
-                 job's plist, whatever JOB_LABEL says
+                 job's plist, whatever JOB_LABEL says. Written while the job is off, its label
+                 is disabled in the same step, so a restart cannot start it (KIT-850)
     dry-run      the notifier run once as the role account with --dry-run, through the job's
                  own shell command, so the env-file sourcing is exercised
-    enable       CK-N3: you load it. This measures three things, not one — that launchd has
-                 it, that what launchd holds is THIS plist, and that the loaded job's own
-                 passes are getting through
+    enable       CK-N3: under `run`, you load it. Under `apply`, a job never on before is
+                 switched on here when the rehearsal's count of messages is at or below the
+                 ceiling, and left off and disabled above it; a job that was on and is not
+                 loaded now was paused by a person, and is never switched back on. Loaded,
+                 this measures three things, not one — that launchd has it, that what launchd
+                 holds is THIS plist, and that the loaded job's own passes are getting through
     first-ping   CK-N4: one throwaway escalation watched end to end
     handover     what is on, what is off, and what is not proven — each with a ticket id.
                  The daemon-health page is measured at BOTH ends: this notifier's config, and
@@ -76,7 +86,27 @@ SUBCOMMANDS
     attest <A-id> --initials YOUR-INITIALS --note "..."
                         record something no computer can check. YOUR-INITIALS is a placeholder
                         and is refused as typed
+    check               for a program (KIT-850): every step measured as `apply` would see it,
+                        nothing changed or recorded, and NOTHING ASKED — no password, no token,
+                        no initials, no terminal needed. Without a live administrator session
+                        its root rows say NOT MEASURED. Prints ONE JSON document of rows on
+                        stdout; every human word goes to stderr
+    apply               for a program, after the person's consent (KIT-850): one answers
+                        document on stdin, through a PIPE — never a terminal, a file or an
+                        argument — `{"schema": "notifier-answers/1", "consent": "yes"}`, and
+                        optionally the chat token as "token". Anything but consent "yes" changes
+                        and records nothing and exits 10. It asks nothing, the Mac password
+                        included: the caller holds the administrator session first. It stops at
+                        the first step only a person can clear and names its card without
+                        printing it. Prints the same JSON document as `check`
     --selftest          offline battery; every transport stubbed
+
+  THE FIRST-PASS CEILING (KIT-850). `pipeline-parts.json` gives this installer's part a ceiling:
+  the most messages a first pass may send with nobody reading the number first. `apply` counts
+  the rehearsal's WOULD SEND lines in the same pass. At or below the ceiling it enables and loads
+  the job, then waits one whole pass for the job's own first heartbeat. Above it — or with a
+  rehearsal that declined something, or no ceiling it can read — the job stays installed,
+  disabled and off, and the row (and the JSON's `left_off`) says why in one line.
 
   The commands they print for you to run next — a card's lines, a key hand-off, a remedy, the
   command to run again — name this file as you reached it and repeat the --conf and --state
@@ -98,10 +128,11 @@ THE AGENT-ENVIRONMENT POLICY — the Stage E installer's, stated here in full
   The markers are `pipeline_dispatch_local.AGENT_ENV_MARKERS`, IMPORTED, never copied, and a
   marker set to the empty string counts as set.
 
-  * REFUSED under a model, with no override flag: `run` without --dry-run, and `attest`. A
-    session that installs its own supervision — or signs a person's sign-off — is the thing
-    the refusal exists to prevent. The refusal happens before the conf is read.
-  * ALLOWED under a model: `run --dry-run`, `verify`, `status`, `card`.
+  * REFUSED under a model, with no override flag: `run` without --dry-run, `apply`, and
+    `attest`. A session that installs its own supervision — or signs a person's sign-off — is
+    the thing the refusal exists to prevent. The refusal happens before the conf is read, and
+    for `apply` before its standard input is read.
+  * ALLOWED under a model: `run --dry-run`, `check`, `verify`, `status`, `card`.
   * Under a model NOTHING IS ACQUIRED OR ASKED FOR: no administrator password, no credential
     prompt.
   * Under a model NOTHING NEEDING THE ROLE ACCOUNT OR ROOT IS ATTEMPTED. Every such measurement
@@ -123,18 +154,20 @@ WHAT IT NEVER DOES
   It never merges, approves or enables auto-merge. It never writes a label, moves a ticket,
   creates a ticket or posts a comment: its tracker transport sends read queries only, to one
   fixed HTTPS endpoint, and refuses a redirect, which would carry the key wherever it named.
-  It never creates a label — a missing one is a failure naming the setup that creates it. It
-  never loads the job. It never reads the Slack token into this process: the token's length
-  and shape are judged inside the role account's shell, which prints a verdict. A token typed
-  at the hidden prompt goes to that shell on stdin, never argv. `--selftest` asserts all of
-  this against this file's own source.
+  It never creates a label — a missing one is a failure naming the setup that creates it.
+  `run` never loads the job; only `apply` does, in one function, after the consent. It never
+  switches a paused job back on. It never reads the Slack token out of the env file: the
+  token's length and shape are judged inside the role account's shell, which prints a verdict.
+  A token typed at the hidden prompt, or carried in `apply`'s answers, goes to that shell on
+  stdin, never argv, and is never printed or recorded. `--selftest` asserts all of this
+  against this file's own source.
 
 THE LEDGER
 
   `~/.notifier-setup/state.json` under YOUR home (directory 700, file 600): step outcomes, the
-  ids the labels step resolved, and your sign-offs. Never a credential. `run` and a person's
-  `run --dry-run` record into it; `verify` and anything under a model record nothing. `status`
-  replays it in a fresh process.
+  ids the labels step resolved, and your sign-offs. Never a credential. `run`, `apply` and a
+  person's `run --dry-run` record into it; `verify`, `check`, an `apply` without consent and
+  anything under a model record nothing. `status` replays it in a fresh process.
 
 TWO SIGN-OFFS ARE BOUND TO WHAT THEY SIGNED
 
@@ -153,6 +186,7 @@ import os
 import plistlib
 import re
 import shlex
+import stat
 import subprocess
 import sys
 import tempfile
@@ -237,6 +271,98 @@ A_PRIVATE = "A-PRIVATE-CHANNEL"
 A_FIRST_PING = "A-FIRST-PING"
 NOTE_CONFIG = "config_sha256"
 NOTE_DRY_RUN = "dry_run"
+# KIT-850: set once the job has been on — switched on by `apply`, or seen loaded and passing.
+# A job that was on and is not loaded now was paused by a person, and `apply` leaves it so.
+NOTE_SWITCHED_ON = "switched_on"
+
+# --------------------------------------------------------------------------- #
+# KIT-850: the two commands a program calls. `check` measures and asks nothing; `apply` takes
+# its answers through a pipe, after the person's consent, and asks nothing either. Both print
+# one JSON document on stdout, and every human word on stderr.
+# --------------------------------------------------------------------------- #
+MACHINE_COMMANDS = ("check", "apply")
+ROWS_SCHEMA = "notifier-setup-rows/1"
+ANSWERS_SCHEMA = "notifier-answers/1"
+ANSWERS_KEYS = frozenset(("schema", "consent", "token"))
+ANSWERS_MAX_BYTES = 64 * 1024
+# The one list of parts, where this installer's first-pass ceiling is declared. Read from this
+# checkout, beside the code it was reviewed with; a caller cannot pass another number in.
+PARTS_LIST = os.path.join(os.path.dirname(HERE), "pipeline-parts.json")
+# How often `apply` looks for the loaded job's first heartbeat, and for how long: one whole pass
+# (RUN_TIMEOUT_SECONDS) and a minute more. The battery's pause does nothing, so it walks the
+# same polls without the wait.
+FIRST_PASS_POLL_SECONDS = 5
+FIRST_PASS_SLACK_SECONDS = 60
+
+
+def first_pass_ceiling(path=None):
+    """(ceiling, None), or (None, why). The ceiling of the one part whose installer is this file:
+    the most messages the job's first pass may send and still be switched on with no question.
+    An unreadable list, no such part, two of them, or a ceiling that is not a whole number is no
+    ceiling — and no ceiling is never "no limit": `apply` then leaves the job off."""
+    path = path or PARTS_LIST
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError) as exc:
+        return None, "the parts list %s could not be read (%s)" % (path, type(exc).__name__)
+    parts = doc.get("parts") if isinstance(doc, dict) else None
+    mine = [p for p in (parts if isinstance(parts, list) else []) if isinstance(p, dict)
+            and os.path.basename(str(p.get("installer") or "")) == os.path.basename(__file__)]
+    if len(mine) != 1:
+        return None, ("the parts list names %d part(s) whose installer is %s, not one"
+                      % (len(mine), os.path.basename(__file__)))
+    ceiling = mine[0].get("ceiling")
+    if not (isinstance(ceiling, int) and not isinstance(ceiling, bool) and ceiling >= 0):
+        return None, "its part %r has the ceiling %r, not a whole number" % (mine[0].get("id"), ceiling)
+    return ceiling, None
+
+
+def read_answers(stream=None):
+    """(answers, None), or (None, why) — `apply`'s answers, from the program that called it.
+
+    THROUGH A PIPE, AND ONLY A PIPE. A terminal would make `apply` a question. A file on standard
+    input is a file a session could have written: the plant this whole design refuses. An
+    argument is visible to every process on the machine, and a token among the answers would be
+    too. So standard input must be a pipe, read once, to its end, and at most ANSWERS_MAX_BYTES.
+
+    One JSON object: `schema` is ANSWERS_SCHEMA, `consent` a string, and `token`, when present,
+    a string. Any other key is refused, so a misspelt answer is never silently ignored. No reason
+    given here ever quotes what was read: a token may be in it."""
+    stream = sys.stdin if stream is None else stream
+    try:
+        mode = os.fstat(stream.fileno()).st_mode
+    except (OSError, ValueError, AttributeError):
+        return None, "standard input could not be looked at, so no answers were read"
+    if not stat.S_ISFIFO(mode):
+        kind = ("a terminal" if os.isatty(stream.fileno()) else
+                "a file" if stat.S_ISREG(mode) else "not a pipe")
+        return None, ("standard input is %s. `apply` takes its answers through a pipe from the "
+                      "program that calls it, never from a terminal, a file or an argument. A "
+                      "person runs `run` instead" % kind)
+    try:
+        raw = stream.read(ANSWERS_MAX_BYTES + 1)
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None, "standard input could not be read as text"
+    if len(raw) > ANSWERS_MAX_BYTES:
+        return None, "the answers are longer than %d bytes" % ANSWERS_MAX_BYTES
+    try:
+        answers = json.loads(raw)
+    except ValueError:
+        return None, "the answers are not one JSON document"
+    if not isinstance(answers, dict):
+        return None, "the answers are not a JSON object"
+    unknown = sorted(k if re.match(r"^[a-z_]{1,20}$", k) else "(a key that is not a plain name)"
+                     for k in answers if k not in ANSWERS_KEYS)
+    if unknown:
+        return None, "the answers carry a key `apply` does not take: %s" % ", ".join(unknown)
+    if answers.get("schema") != ANSWERS_SCHEMA:
+        return None, "the answers are not a %s document" % ANSWERS_SCHEMA
+    if not isinstance(answers.get("consent"), str):
+        return None, "the answers carry no consent"
+    if "token" in answers and not isinstance(answers["token"], str):
+        return None, "the answers' token is not a string"
+    return answers, None
 
 
 # --------------------------------------------------------------------------- #
@@ -1249,11 +1375,15 @@ CARDS = {
     "CK-N3": {
         "title": "Load the notifier job",
         "why": ("Loading is the moment real pings start and real labels land on real tickets. The "
-                "dry run above is what you read first; turning it on is yours. This installer "
-                "measures whether the job is loaded and never loads it."),
+                "dry run above is what you read first; turning it on is yours. `run` measures "
+                "whether the job is loaded and never loads it. In Automatic, the one command's "
+                "`apply` loads it itself when its first pass would send at most its ceiling of "
+                "messages (KIT-850). This card is for a job left off above that, a job you "
+                "paused, and Manual."),
         "do": ["Read the dry-run row above. Then load the job. The enable line comes first: it",
-               "does nothing to a job that was never disabled, and a job paused with `disable`",
-               "(card CK-N5) will not load without it, not even after a restart.",
+               "does nothing to a job that was never disabled. A job this installer left off,",
+               "and one paused with `disable` (card CK-N5), will not load without it, not even",
+               "after a restart.",
                "    sudo launchctl enable system/${JOB_LABEL}",
                "    sudo launchctl bootstrap system ${PLIST}",
                "If it was already loaded and the plist changed, unload it FIRST — launchd keeps",
@@ -1362,7 +1492,8 @@ CARDS = {
                "Paused looks like this:",
                "  - `sudo launchctl print system/${JOB_LABEL}` answers",
                "    `Could not find service`;",
-               "  - a later `run` does not load it again: this installer never loads it;",
+               "  - a later `run` does not load it again, and nor does `apply`: a job",
+               "    that was on is never switched back on by this installer;",
                "  - `verify` reports the `enable` step BLOCKED on CK-N3, so it cannot say",
                "    `No drift` until you resume;",
                "  - if your Stage E install watches the notifier (NOTIFIER_JOB_LABEL in",
@@ -1592,6 +1723,17 @@ class SudoOnce(object):
         self._hold()
         return True
 
+    def hold_if_live(self):
+        """True — held, and kept fresh — when an administrator session is already live in this
+        terminal; False when none is. NEVER ASKS: `check` and `apply` ask nothing, the Mac
+        password included, so they come here and never to `acquire` (KIT-850)."""
+        if self.held:
+            return True
+        if self._live():
+            self._hold()
+            return True
+        return False
+
     def _hold(self):
         self.held = True
         self._stop = threading.Event()
@@ -1671,15 +1813,40 @@ class Ctx(object):
         self.command = "run"
         # This checkout's scripts, which preflight holds the role account's clone to.
         self.checkout_scripts = HERE
+        # KIT-850. `auto` is `check` and `apply`: the enable step may switch a job on, and a
+        # person step is named, never printed as a card. `answer_token` is the chat token from
+        # `apply`'s answers, held for scrubbing like a typed one. `ceiling` is the first-pass
+        # ceiling from the parts list (None with `ceiling_why`). `first_pass` is (messages,
+        # exit) from a rehearsal run in THIS pass. `left_off` is the one line saying why a job
+        # stays off. `no_sudo_why` says why `check` holds no administrator session: every row
+        # that needs one is then NOT MEASURED. `row_cards` is each blocked row's card.
+        self.auto = False
+        self.answer_token = None
+        self.ceiling, self.ceiling_why = None, "not read on this pass"
+        self.first_pass = None
+        self.left_off = None
+        self.no_sudo_why = None
+        self.row_cards = {}
 
     @property
     def account(self):
         return self.conf["ROLE_ACCOUNT"]
 
+    @property
+    def cannot_sudo(self):
+        """Nothing that needs `sudo` is attempted: under a model, or in a `check` that holds no
+        administrator session and never asks for one."""
+        return bool(self.agent) or bool(self.no_sudo_why)
+
     def scrub(self, text):
         return scrub(text, self.held)
 
     def not_measured(self, what):
+        if not self.agent and self.no_sudo_why:
+            return Unknown(
+                "NOT MEASURED — %s needs `sudo`, and %s." % (what, self.no_sudo_why),
+                "hold an administrator session in this terminal first (`sudo -v`), then run the "
+                "same command again")
         return Unknown(
             "NOT MEASURED — this is an agent environment (%s set), and %s needs `sudo`, which "
             "nothing here runs under a model. A person running the same command measures it."
@@ -1687,13 +1854,13 @@ class Ctx(object):
             "run the same command in your own terminal")
 
     def as_role(self, script, what, stdin=None, why=None, secret_stdin=False, timeout=300):
-        if self.agent:
+        if self.cannot_sudo:
             raise self.not_measured(what)
         return self.runner.as_role(self.account, script, stdin=stdin, why=why, timeout=timeout,
                                    secret_stdin=secret_stdin)
 
     def as_root(self, argv, what, why=None):
-        if self.agent:
+        if self.cannot_sudo:
             raise self.not_measured(what)
         return self.runner.as_root(argv, why=why)
 
@@ -1786,7 +1953,7 @@ def step_preflight(ctx, apply_it):
                          "notifier.conf to have it checked." % (key, rule))
 
     clone = conf["ROLE_KIT_CLONE"].rstrip("/")
-    if ctx.agent:
+    if ctx.cannot_sudo:
         unmeasured.append("whether %s/scripts carries %s, byte for byte as this checkout does, and "
                           "whether %s can run /usr/bin/python3 — both need `sudo -u %s`"
                           % (clone, ", ".join(REQUIRED_SCRIPTS), ctx.account, ctx.account))
@@ -1856,7 +2023,8 @@ def step_preflight(ctx, apply_it):
     if unmeasured:
         raise Unknown("measured: %s. NOT MEASURED%s: %s.%s"
                       % ("; ".join(measured),
-                         " (agent environment: %s set)" % ", ".join(ctx.agent) if ctx.agent else "",
+                         " (agent environment: %s set)" % ", ".join(ctx.agent) if ctx.agent else
+                         " (%s)" % ctx.no_sudo_why if ctx.no_sudo_why else "",
                          "; ".join(unmeasured), "".join(" NOT CHECKED: " + n for n in notes)),
                       "a person runs the same command in their own terminal")
     return True, "; ".join(measured), notes
@@ -2065,6 +2233,12 @@ def step_credentials(ctx, apply_it):
     if facts.get("chat") == "ok":
         if conf.get("PAGE_IMAGES") == "yes":
             notes.append(page_images_scope(ctx))
+        if ctx.answer_token is not None:
+            # Parity with the hidden prompt, which asks only for a token that is missing: a
+            # usable one is never replaced by an answer. Said, so the answer is not silently lost.
+            notes.append("the answers carried a %s, and %s already holds a usable one, so it was "
+                         "not written. Nothing here replaces a working token."
+                         % (chat_env, conf["ENV_FILE"]))
         if facts.get("mode") == "600":
             return True, ("%s: mode 600, owned by %s; %s and %s both set — shapes judged in that "
                           "account's shell, no value read" % (conf["ENV_FILE"], ctx.account,
@@ -2080,21 +2254,38 @@ def step_credentials(ctx, apply_it):
 
     verdict = _VERDICT.get(facts.get("chat"), "is not usable")
     if not apply_it:
+        if ctx.auto:
+            # `check` speaks for `apply`, which asks nothing: the token comes in its answers or
+            # it is a person's. The one command passes none today, so this is a card, not work.
+            raise Blocked("CK-N2", "%s %s. `apply` writes it only when its answers carry it; "
+                                   "otherwise it is yours" % (chat_env, verdict))
         return False, ("%s %s — `run` would ask for it at a hidden prompt and write it, mode 600"
                        % (chat_env, verdict)), notes
-    if not (ctx.tty and ctx.may_prompt):
-        raise Blocked("CK-N2", "%s %s, and this run has no terminal to ask at" % (chat_env, verdict))
+    if ctx.auto:
+        # KIT-850: from the answers on standard input, never a prompt. Already held for
+        # scrubbing since the answers were read, so an echo of it anywhere is withheld.
+        if ctx.answer_token is None:
+            raise Blocked("CK-N2", "%s %s, and `apply`'s answers carried no token"
+                          % (chat_env, verdict))
+        val = ctx.answer_token.strip()
+        say("")
+        say("  %s %s. The token in the answers goes to the role account's shell on stdin," % (chat_env, verdict))
+        say("  which writes it into %s at mode 600 and keeps every other line." % conf["ENV_FILE"])
+        say("  Nothing is echoed or kept here.")
+    else:
+        if not (ctx.tty and ctx.may_prompt):
+            raise Blocked("CK-N2", "%s %s, and this run has no terminal to ask at" % (chat_env, verdict))
 
-    say("")
-    say("  %s %s. It goes to the role account's shell on stdin, which writes it into" % (chat_env, verdict))
-    say("  %s at mode 600 and keeps every other line. Never into the dispatcher's own env" % conf["ENV_FILE"])
-    say("  file, which is copied unscrubbed into every session; never under the dispatcher's")
-    say("  state root, where session readability is unmeasured. Nothing is echoed or kept here.")
-    # KIT-296: in DM mode the token is the Slack bridge app's, which the pages go through.
-    whose = ("the tech lead's Slack app's bot token" if split_list(conf.get("DM_USER_IDS"))
-             else "the notifier's OWN bot token")
-    val = (ctx.token_reader("  paste %s — %s, xoxb-... (hidden): " % (chat_env, whose))
-           or "").strip()
+        say("")
+        say("  %s %s. It goes to the role account's shell on stdin, which writes it into" % (chat_env, verdict))
+        say("  %s at mode 600 and keeps every other line. Never into the dispatcher's own env" % conf["ENV_FILE"])
+        say("  file, which is copied unscrubbed into every session; never under the dispatcher's")
+        say("  state root, where session readability is unmeasured. Nothing is echoed or kept here.")
+        # KIT-296: in DM mode the token is the Slack bridge app's, which the pages go through.
+        whose = ("the tech lead's Slack app's bot token" if split_list(conf.get("DM_USER_IDS"))
+                 else "the notifier's OWN bot token")
+        val = (ctx.token_reader("  paste %s — %s, xoxb-... (hidden): " % (chat_env, whose))
+               or "").strip()
     say("  %s: %d chars, %s" % (chat_env, len(val), "starts %s" % TOKEN_PREFIX
                                 if val.startswith(TOKEN_PREFIX) else "does NOT start %s" % TOKEN_PREFIX))
     if len(val) < TOKEN_MIN_LEN or not _TOKEN_RE.match(val):
@@ -2488,7 +2679,8 @@ def step_job(ctx, apply_it):
                       "run the same command again")
     if have == body:
         ctx.job_current = True
-        return True, "%s is installed and current; this installer never loads it (CK-N3)" % path, []
+        return True, ("%s is installed and current; the enable step says whether it is on"
+                      % path), []
     # WHOSE PLIST IS THIS? `install` as root would replace whatever is there, and JOB_LABEL is
     # free-typed: one wrong label and the file replaced is the dispatcher's own, or a Stage E
     # daemon's — destroyed with no backup, and CK-N3 would then walk the operator through
@@ -2504,7 +2696,7 @@ def step_job(ctx, apply_it):
     why = "absent" if have is None else "differs"
     if not apply_it:
         return False, "would install %s (%s), not loaded" % (path, why), []
-    if ctx.agent:
+    if ctx.cannot_sudo:
         raise ctx.not_measured("installing %s" % path)
     se._install_plist(ctx.runner, conf["JOB_LABEL"], body)
     got = ctx.runner.read(["cat", path])
@@ -2512,7 +2704,16 @@ def step_job(ctx, apply_it):
         raise SetupError("%s was installed, and reading it back does not match" % path)
     ctx.job_current = True
     ctx.plist_changed = True
-    return False, "installed %s (%s), root:wheel 644 — NOT loaded (CK-N3)" % (path, why), []
+    # KIT-850: launchd loads every plist in /Library/LaunchDaemons at boot. A job file written
+    # while the job is off is disabled in this same step, so no restart starts what nobody
+    # switched on. A loaded job is on, and is left as it is: the enable step reloads it.
+    if job_loaded(ctx)[0]:
+        return False, ("installed %s (%s), root:wheel 644. The job is loaded: the enable step "
+                       "compares what launchd holds with it" % (path, why)), []
+    if not job_disabled(ctx):
+        disable_job(ctx)
+    return False, ("installed %s (%s), root:wheel 644 — NOT loaded, and disabled, so a restart "
+                   "does not start it (CK-N3)" % (path, why)), []
 
 
 def heartbeat_file(conf):
@@ -2565,6 +2766,19 @@ def step_dry_run(ctx, apply_it):
                       % (ctx.account, str(note.get("at"))[:16], note.get("exit"))), []
     if not apply_it:
         return False, "would run the notifier once as %s: %s" % (ctx.account, command), []
+    lines, rc = rehearse(ctx)
+    ctx.notes_out[NOTE_DRY_RUN] = dict(bind, exit=rc, at=se.now_iso())
+    return False, ("the notifier's dry run exited %d as %s: %s"
+                   % (rc, ctx.account, (lines[-1] if lines else "(no output)")[:120])), []
+
+
+def rehearse(ctx):
+    """The notifier once, as the role account, through the job's own command plus `--dry-run`:
+    (its lines, scrubbed; its exit). Exit 0 or 3 ran; 1, 2 or 4 raises, with the notifier's own
+    words. It also counts the messages the first real pass would send — one WOULD SEND line each
+    — into `ctx.first_pass`, the number the first-pass ceiling is held to (KIT-850)."""
+    conf = ctx.conf
+    command = job_command(conf) + " --dry-run"
     res = ctx.as_role(command, what="running the notifier's dry run",
                       timeout=int(conf["RUN_TIMEOUT_SECONDS"]) + 60)
     ctx.rehearsed = True
@@ -2584,9 +2798,8 @@ def step_dry_run(ctx, apply_it):
             say("  Exit 3 is a DECLINE the notifier names in its summary above: a page that")
             say("  still carries a credential shape, or events over the per-pass cap. It ran;")
             say("  read them.")
-        ctx.notes_out[NOTE_DRY_RUN] = dict(bind, exit=res.rc, at=se.now_iso())
-        return False, ("the notifier's dry run exited %d as %s: %s"
-                       % (res.rc, ctx.account, (lines[-1] if lines else "(no output)")[:120])), []
+        ctx.first_pass = (len(would), res.rc)
+        return lines, res.rc
     raise SetupError("the notifier's dry run FAILED (exit %d) as %s. Its own words:\n%s"
                      % (res.rc, ctx.account,
                         "\n".join("  " + l[:200] for l in lines[-8:]) or "  (it printed nothing)"))
@@ -2674,6 +2887,238 @@ def heartbeat_awake_age(ctx, beat):
                               ctx.awake_clock(), ctx.boot_wall())
 
 
+def job_loaded(ctx):
+    """(loaded, launchd's own words) for the job's label. Raises Unknown when launchd could not
+    be asked: a print that failed is never "not loaded"."""
+    label = ctx.conf["JOB_LABEL"]
+    res = ctx.as_root(["launchctl", "print", "system/" + label],
+                      what="asking launchd what it is running for system/%s" % label)
+    text = (res.out or "") + (res.err or "")
+    if res.ok:
+        return True, text
+    if res.rc == 113 or "Could not find service" in text:
+        return False, text
+    raise Unknown("could not ask launchd about system/%s (exit %d): %s"
+                  % (label, res.rc, text.strip()[:160]), "run the same command again")
+
+
+# How `launchctl print-disabled system` lists a label it keeps disabled: `=> disabled` on recent
+# macOS, `=> true` on older ones. The Stage E installer reads it the same way.
+_DISABLED_LINE = r'"%s"\s*=>\s*(disabled|true)\b'
+
+
+def job_disabled(ctx):
+    """True when launchd keeps the label disabled, so a restart does not start the job; False
+    when a restart would load its plist. Raises Unknown when launchd could not be asked."""
+    label = ctx.conf["JOB_LABEL"]
+    res = ctx.as_root(["launchctl", "print-disabled", "system"],
+                      what="asking launchd whether a restart starts system/%s" % label)
+    if not res.ok:
+        raise Unknown("could not ask launchd whether a restart starts system/%s (exit %d): %s"
+                      % (label, res.rc, ((res.err or res.out) or "").strip()[:160]),
+                      "run the same command again")
+    return bool(re.search(_DISABLED_LINE % re.escape(label), res.out or ""))
+
+
+def disable_job(ctx):
+    """Disable the label, so the plist on disk cannot start at the next boot while the job is
+    off, and ask launchd again: a disable that does not show is a failure, never a pass."""
+    label = ctx.conf["JOB_LABEL"]
+    res = ctx.as_root(["launchctl", "disable", "system/" + label],
+                      what="disabling system/%s" % label,
+                      why="disable system/%s, so a restart does not start it while it is off" % label)
+    if res.skipped:
+        return
+    if not res.ok:
+        raise SetupError("could not disable system/%s (exit %d): %s. Its plist is installed and "
+                         "the job is off, and a restart would start it."
+                         % (label, res.rc, ((res.err or res.out) or "").strip()[:160]))
+    if not job_disabled(ctx):
+        raise SetupError("system/%s was disabled, and launchd does not list it as disabled: a "
+                         "restart would start it" % label)
+
+
+def _bootstrap(ctx, label, plist):
+    """'' once launchd holds the job, else what launchd said. `Input/output error` is what a
+    domain still letting an older job go answers, so that one is tried again, with the Stage E
+    installer's numbers; any other answer is a fact about the plist or the domain. "launchctl
+    accepted it" is not "it is loaded", so the domain is asked."""
+    said = ""
+    for attempt in range(1, se.BOOTSTRAP_ATTEMPTS + 1):
+        if attempt > 1:
+            se._pause(se.BOOTSTRAP_RETRY_SECONDS)
+        boot = ctx.runner.as_root(["launchctl", "bootstrap", "system", plist],
+                                  why="load system/%s from %s" % (label, plist))
+        if boot.skipped or se._service_in_domain(ctx.runner, label):
+            return ""
+        said = ((boot.err or boot.out).strip() or "launchctl accepted the load, and launchd "
+                "does not hold the job")[:160]
+        if not se._EIO.search(said):
+            break
+    return said
+
+
+def load_job(ctx, reload_it=False):
+    """THE ONE PLACE THIS INSTALLER LOADS ITS JOB (KIT-850). Reached only under `apply`, which
+    the calling program runs after the person's consent: `run` never comes here, and card CK-N3
+    stays the person's there. Enable first — a label disabled while the job was off will not load
+    without it — then load. A reload unloads the older job and waits for launchd to let it go.
+    A load that does not take is disabled again: off stays off, through a restart too."""
+    r, label, plist = ctx.runner, ctx.conf["JOB_LABEL"], plist_path(ctx.conf)
+    if not ctx.auto:
+        raise SetupError("BUG: only `apply` loads the job, and this is not `apply`")
+    if ctx.cannot_sudo:
+        raise ctx.not_measured("loading system/%s" % label)
+    if reload_it:
+        out = ctx.as_root(["launchctl", "bootout", "system/" + label],
+                          what="unloading system/%s" % label,
+                          why="unload system/%s, which holds an older command, before loading "
+                              "this plist" % label)
+        if not out.ok and not out.skipped:
+            raise SetupError("could not unload system/%s to load the new plist (exit %d): %s"
+                             % (label, out.rc, ((out.err or out.out) or "").strip()[:160]))
+        if not out.skipped:
+            gone, waited = se._wait_until_gone(r, label, se._exit_timeout(r, plist)
+                                               + se.EXIT_TIMEOUT_HEADROOM)
+            if not gone:
+                raise SetupError("system/%s was unloaded, and launchd still held it after %d s, "
+                                 "so it was not loaded again. Run the one command again."
+                                 % (label, waited))
+    en = ctx.as_root(["launchctl", "enable", "system/" + label], what="enabling system/%s" % label,
+                     why="enable system/%s, so launchd loads it now and at every restart" % label)
+    if not en.ok and not en.skipped:
+        raise SetupError("could not enable system/%s (exit %d): %s"
+                         % (label, en.rc, ((en.err or en.out) or "").strip()[:160]))
+    said = _bootstrap(ctx, label, plist)
+    if said:
+        disable_job(ctx)
+        raise SetupError("launchd would not load system/%s: %s. It is disabled again, so a "
+                         "restart does not start it either." % (label, said))
+    ctx.loaded = True
+
+
+def was_on(ctx):
+    """True when the ledger says this job has been on: `apply` switched it on, a run saw it
+    loaded and passing, or a person signed the first ping it sent. A job that was on and is not
+    loaded now was paused by a person (card CK-N5), and nothing here switches it back on."""
+    data = ctx.state.data
+    if (data.get("notes") or {}).get(NOTE_SWITCHED_ON):
+        return True
+    if (data.get("attestations") or {}).get(A_FIRST_PING):
+        return True
+    return ((data.get("steps") or {}).get("enable") or {}).get("outcome") in (ALREADY_DONE, DONE)
+
+
+def await_first_pass(ctx, loaded_at):
+    """The beat of the first pass the job finished after it was loaded, or None. RunAtLoad starts
+    a pass at once and the job writes its beat when a pass ENDS, so the wait is one whole pass and
+    a minute more, polled. A beat older than the load, or a rehearsal's, says nothing here."""
+    limit = int(ctx.conf["RUN_TIMEOUT_SECONDS"]) + FIRST_PASS_SLACK_SECONDS
+    polls = max(1, limit // FIRST_PASS_POLL_SECONDS + 1)
+    for n in range(polls):
+        beat, _why = read_heartbeat(ctx)
+        when = _beat_epoch(beat) if beat else None
+        if beat and not beat.get("dry") and when is not None and when >= int(loaded_at) - 1:
+            return beat
+        if n < polls - 1:
+            se._pause(FIRST_PASS_POLL_SECONDS)
+    return None
+
+
+def passes_after_load(ctx, what, loaded_at):
+    """After `apply` loaded the job: its own first pass, waited for and judged like any other.
+    A pass that has not finished in time is NOT MEASURED, never "on and working"."""
+    label, conf = ctx.conf["JOB_LABEL"], ctx.conf
+    limit = int(conf["RUN_TIMEOUT_SECONDS"]) + FIRST_PASS_SLACK_SECONDS
+    say("")
+    say("  %s." % what)
+    say("  waiting for its first pass, which starts at load: up to %d s" % limit)
+    if await_first_pass(ctx, loaded_at) is None:
+        raise Unknown("%s; launchd holds it, and no pass of it finished within %d s, so whether "
+                      "its passes get through is NOT MEASURED" % (what, limit),
+                      "read its log and heartbeat, then run the one command again:\n    %s"
+                      % invoke("card CK-N5", ctx.flags))
+    loaded, text = job_loaded(ctx)
+    running = loaded_job(text) if loaded else None
+    if running is None:
+        raise Unknown("%s; and launchd's own print does not show it loaded with its arguments "
+                      "or interval" % what, "read it yourself:\n    sudo launchctl print system/%s"
+                      % label)
+    _ok, detail, notes = judge_passes(ctx, label, running)
+    return False, "%s. %s" % (what, detail), notes
+
+
+def job_off(ctx, apply_it):
+    """The job is not loaded. Paused by a person: left as it is. Never on: the part is off, and
+    its job file must not start at the next boot — under `run` it is disabled and the card is the
+    person's; under `apply` the first-pass ceiling decides."""
+    label = ctx.conf["JOB_LABEL"]
+    if was_on(ctx):
+        # A pause is the person's (card CK-N5): a bootout alone, or kept through a restart with
+        # `disable`. launchd's print answers the same for both, and nothing here changes either.
+        raise Blocked("CK-N3", "system/%s is not loaded, and it was on before: a person paused "
+                               "it (card CK-N5). A job paused with `disable` reads the same. "
+                               "%sCK-N3 enables it, then loads it"
+                      % (label, "`apply` never switches a paused job back on. " if ctx.auto else ""))
+    disabled = job_disabled(ctx)
+    if ctx.auto:
+        return first_switch_on(ctx, apply_it, disabled)
+    if not disabled and apply_it:
+        disable_job(ctx)
+        disabled = True
+    raise Blocked("CK-N3", "system/%s is not loaded; `run` never loads it. %s"
+                  % (label, "It is disabled, so a restart does not start it: CK-N3 enables it, "
+                            "then loads it" if disabled else
+                     "It is NOT disabled, so a restart would start it: `run` disables it"))
+
+
+def first_switch_on(ctx, apply_it, disabled):
+    """A job never on before, under `check` or `apply` (KIT-850). `check` says what `apply` would
+    do. `apply` disables it first, so a restart never starts it while this pass decides, then
+    counts what its first pass would send, from a rehearsal run in THIS pass. At or below the
+    ceiling it switches the job on and waits for its first pass. Above it, or with no ceiling it
+    can read, or with a rehearsal that declined something, the job stays installed, disabled and
+    off, and `left_off` says why in one line."""
+    label, ceiling = ctx.conf["JOB_LABEL"], ctx.ceiling
+    if not apply_it:
+        if ceiling is None:
+            raise Unknown("its first-pass ceiling could not be read (%s), so `apply` would leave "
+                          "it off" % ctx.ceiling_why,
+                          "fix pipeline-parts.json in this checkout, then run the same command again")
+        return False, ("would switch it on if its first pass sends at most %d message%s, its "
+                       "ceiling, and leave it off above that%s"
+                       % (ceiling, "" if ceiling == 1 else "s",
+                          "" if disabled else ". It is NOT disabled, so a restart would start it: "
+                          "`apply` disables it first")), []
+    if not disabled:
+        disable_job(ctx)
+    if ceiling is None:
+        ctx.left_off = "left off: its first-pass ceiling could not be read"
+        raise Unknown("%s (%s). It is installed and disabled, so a restart does not start it"
+                      % (ctx.left_off, ctx.ceiling_why),
+                      "fix pipeline-parts.json in this checkout, then run the one command again")
+    if ctx.first_pass is None:
+        rehearse(ctx)
+    count, rc = ctx.first_pass
+    if rc != notify.EXIT_OK:
+        ctx.left_off = ("left off: its rehearsal declined something (exit %d), so how many "
+                        "messages its first pass would send is not known" % rc)
+    elif count > ceiling:
+        ctx.left_off = ("left off: its first pass would send %d message%s, above its ceiling of %d"
+                        % (count, "" if count == 1 else "s", ceiling))
+    if ctx.left_off:
+        raise Blocked("CK-N3", "%s. It is installed and disabled, so a restart does not start it. "
+                               "Read the rehearsal's lines above; card CK-N3 switches it on "
+                               "yourself" % ctx.left_off)
+    loaded_at = ctx.clock()
+    load_job(ctx)
+    ctx.notes_out[NOTE_SWITCHED_ON] = {"at": se.now_iso(), "by": "apply", "first_pass": count,
+                                       "ceiling": ceiling}
+    return passes_after_load(ctx, "switched it on: its first pass would send %d message%s, at or "
+                                  "below its ceiling of %d" % (count, "" if count == 1 else "s",
+                                                               ceiling), loaded_at)
+
+
 def step_enable(ctx, apply_it):
     """Loaded, running THIS plist, and getting through its passes — three questions, not one.
 
@@ -2684,26 +3129,16 @@ def step_enable(ctx, apply_it):
 
     Then the heartbeat, which only means something here: a loaded job that has finished no real
     pass, whose last pass is older than a pass may take, or whose last real pass could not
-    deliver what it found, is NOT a working job — and each of those is a different sentence."""
+    deliver what it found, is NOT a working job — and each of those is a different sentence.
+
+    KIT-850: not loaded is `job_off`. Under `apply`, a job never on is switched on against the
+    first-pass ceiling, and a loaded job holding an older plist is reloaded; under `run` both
+    stay card CK-N3, the person's."""
     conf, label = ctx.conf, ctx.conf["JOB_LABEL"]
-    res = ctx.as_root(["launchctl", "print", "system/" + label],
-                      what="asking launchd what it is running for system/%s" % label)
-    text = (res.out or "") + (res.err or "")
-    if res.ok:
-        loaded = True
-    elif res.rc == 113 or "Could not find service" in text:
-        loaded = False
-    else:
-        raise Unknown("could not ask launchd about system/%s (exit %d): %s"
-                      % (label, res.rc, text.strip()[:160]), "run the same command again")
+    loaded, text = job_loaded(ctx)
     ctx.loaded = loaded
     if not loaded:
-        # launchd's print answers the same for a job only booted out and one also DISABLED (a
-        # CK-N5 pause kept through a restart), and this step does not ask which. It does not
-        # need to: CK-N3 enables before it loads, which does nothing to a job never disabled.
-        raise Blocked("CK-N3", "system/%s is not loaded; this installer never loads it. A job "
-                               "paused with `disable` reads the same: CK-N3 enables it, then "
-                               "loads it" % label)
+        return job_off(ctx, apply_it)
 
     # WHAT IS LOADED, not what is on disk.
     want = plistlib.loads(render_plist(conf, ctx.role_home).encode("utf-8")) if ctx.role_home else {}
@@ -2715,18 +3150,31 @@ def step_enable(ctx, apply_it):
             "job and a current plist are different facts." % label,
             "read it yourself and compare it with %s:\n    sudo launchctl print system/%s"
             % (plist_path(conf), label))
+    stale_words = None
     if want and running["arguments"] and running["arguments"] != [str(a) for a in
                                                                  want.get("ProgramArguments") or []]:
-        raise Blocked("CK-N3", "system/%s is loaded and running a DIFFERENT command from the plist "
-                               "on disk — launchd keeps what it was given until it is told again. "
-                               "Unload it, then load it" % label)
-    if want and running["interval"] is not None and running["interval"] != int(
+        stale_words = ("system/%s is loaded and running a DIFFERENT command from the plist "
+                       "on disk — launchd keeps what it was given until it is told again" % label)
+    elif want and running["interval"] is not None and running["interval"] != int(
             conf["INTERVAL_SECONDS"]):
-        raise Blocked("CK-N3", "system/%s is loaded with a %s s interval and the plist on disk says "
-                               "%s s — launchd keeps what it was given. Unload it, then load it"
-                      % (label, running["interval"], conf["INTERVAL_SECONDS"]))
+        stale_words = ("system/%s is loaded with a %s s interval and the plist on disk says "
+                       "%s s — launchd keeps what it was given"
+                       % (label, running["interval"], conf["INTERVAL_SECONDS"]))
+    if stale_words:
+        if not ctx.auto:
+            raise Blocked("CK-N3", stale_words + ". Unload it, then load it")
+        if not apply_it:
+            return False, "would reload it: %s" % stale_words, []
+        loaded_at = ctx.clock()
+        load_job(ctx, reload_it=True)
+        return passes_after_load(ctx, "reloaded it, because %s" % stale_words, loaded_at)
+    return judge_passes(ctx, label, running)
 
-    # THE LOADED JOB'S OWN PASSES.
+
+def judge_passes(ctx, label, running):
+    """THE LOADED JOB'S OWN PASSES, from its heartbeat: (True, detail, notes), or a raise naming
+    which of the ways a loaded job can be not working this is."""
+    conf = ctx.conf
     beat, why_not = read_heartbeat(ctx)
     if beat is None:
         if why_not == "absent":
@@ -2809,6 +3257,10 @@ def step_enable(ctx, apply_it):
                          % (label, "%d s" % int(age), exit_code,
                             ctx.scrub(str(beat.get("summary")))[:400]))
     ctx.loaded_interval = running["interval"]
+    if not (ctx.state.data.get("notes") or {}).get(NOTE_SWITCHED_ON):
+        # KIT-850: seen on, and passing. Recorded once, so a later unload reads as a person's
+        # pause, which `apply` leaves alone, and never as a job that was never switched on.
+        ctx.notes_out.setdefault(NOTE_SWITCHED_ON, {"at": se.now_iso(), "by": "seen loaded"})
     return True, ("system/%s is loaded, running this plist's command%s; its last real pass was %d s "
                   "ago%s and exited 0 (%s)"
                   % (label, " every %s s" % running["interval"] if running["interval"] else "",
@@ -3623,9 +4075,9 @@ STEPS = (
     ("credentials", "the Slack token in the role account's env file", step_credentials),
     ("labels", "the two lifecycle label ids, and `self`", step_labels),
     ("config", "the notifier's config, accepted by its own loader", step_config),
-    ("job", "the LaunchDaemon plist, installed and not loaded", step_job),
+    ("job", "the LaunchDaemon plist, installed; disabled while the job is off", step_job),
     ("dry-run", "the notifier once, as the role account, with --dry-run", step_dry_run),
-    ("enable", "the job loaded — by you (CK-N3)", step_enable),
+    ("enable", "the job loaded — by you (CK-N3), or by `apply` under its ceiling", step_enable),
     ("first-ping", "one throwaway escalation, watched (CK-N4)", step_first_ping),
     ("handover", "what is on, off, and not proven", step_handover),
 )
@@ -3681,12 +4133,21 @@ def run_steps(ctx, apply_it, keep_going=False, resume="run", steps=None):
         except Blocked as exc:
             extra = ctx.scrub(exc.extra) if exc.extra else CARDS[exc.card_id]["title"]
             rows.append((sid, BLOCKED, extra))
+            ctx.row_cards[sid] = exc.card_id
             _record(ctx, sid, BLOCKED, extra, exc.card_id)
             if keep_going:
                 deferred.append(("card", exc.card_id, sid))
                 continue
             _finish(ctx, resume)
             _print_rows(rows, row_notes)
+            if ctx.auto:
+                # KIT-850: `apply` asks nothing and prints no card to sign mid-run. The card is
+                # named, here and in its rows, for the end of the run, where the caller lists it.
+                say("")
+                say("Step `%s` waits on you: card %s, %s. Nothing was asked. Read the card with:"
+                    % (sid, exc.card_id, CARDS[exc.card_id]["title"]))
+                say("    " + invoke("card %s" % exc.card_id, ctx.flags))
+                return EX_BLOCKED, rows
             print_card(exc.card_id, ctx.conf, flags=ctx.flags)
             say("Do that, then run the same command again — it checks your work and carries on:")
             say("    " + invoke(resume, ctx.flags))
@@ -3745,7 +4206,11 @@ def _banner(ctx, title):
     say(title)
     say("  conf          %s" % conf.get("__source__", DEFAULT_CONF))
     say("  role account  %s" % ctx.account)
-    say("  job           system/%s (%s) — never loaded by this installer" % (conf["JOB_LABEL"], plist_path(conf)))
+    say("  job           system/%s (%s) — %s" % (
+        conf["JOB_LABEL"], plist_path(conf),
+        "loaded by `apply` only at or below its first-pass ceiling (%s)"
+        % (ctx.ceiling if ctx.ceiling is not None else "not read: " + ctx.ceiling_why)
+        if ctx.auto else "never loaded by `run`"))
     dms = split_list(conf.get("DM_USER_IDS"))
     if dms:
         say("  pages to      the direct messages of %s at %s, through the tech lead's Slack app"
@@ -3831,6 +4296,167 @@ def cmd_verify(ctx):
     except Exception as exc:                                      # noqa: BLE001
         say("BUG: verify raised %s: %s" % (type(exc).__name__, scrub(str(exc), ctx.held)))
         return EX_FAILED
+
+
+def cmd_check(ctx):
+    """KIT-850. Every step measured as `apply` would see it — the enable row says whether
+    `apply` would switch the job on — with nothing changed, recorded or asked. (code, rows), and
+    it never raises: an escaped exception is exit 1 with its name."""
+    rows = []
+    try:
+        ctx.command = "check" + ctx.flags
+        ctx.auto = True
+        ctx.may_prompt = False
+        ctx.tty = False
+        ctx.record = False
+        ctx.runner.dry_run = True
+        _banner(ctx, "Notifier check — for a program. Nothing is changed, recorded or asked; the "
+                     "rows go to standard output as one JSON document.")
+        if ctx.no_sudo_why:
+            say("  NO ADMINISTRATOR SESSION: %s. Every row that needs one says NOT MEASURED."
+                % ctx.no_sudo_why)
+        code, rows = run_steps(ctx, apply_it=False, keep_going=True, resume="check")
+        if ctx.runner.writes:
+            say("BUG: check recorded %d write(s); that is a defect in this file." % len(ctx.runner.writes))
+            return EX_FAILED, rows
+        return code, rows
+    except Exception as exc:                                      # noqa: BLE001
+        say("BUG: check raised %s: %s" % (type(exc).__name__, scrub(str(exc), ctx.held)))
+        return EX_FAILED, rows
+
+
+def cmd_apply(ctx):
+    """KIT-850. The person's consent was read by the caller, and `main` held it before coming
+    here. Every step applied in order, asking nothing; the first a person must clear stops it,
+    named by its card. (code, rows)."""
+    refuse_if_agent("apply", ctx.env)
+    ctx.command = "apply" + ctx.flags
+    ctx.auto = True
+    ctx.may_prompt = False
+    ctx.tty = False
+    _banner(ctx, "Notifier apply — the answers came through a pipe, after your consent. It asks "
+                 "nothing.")
+    code, rows = run_steps(ctx, apply_it=True, keep_going=False, resume="apply")
+    if code == EX_OK:
+        say("")
+        say("DONE — every step holds. Nothing merged, nothing approved, no label applied by this "
+            "installer.")
+    return code, rows
+
+
+def rows_document(command, code, rows=(), ctx=None, why=None):
+    """The one JSON document `check` and `apply` print on stdout, whatever their exit. Each row is
+    a step, its outcome word, its detail (scrubbed, as printed) and, when blocked, its card. No
+    credential is in it: every detail passed the same scrub as every printed line."""
+    cards = ctx.row_cards if ctx is not None else {}
+    return {
+        "schema": ROWS_SCHEMA, "command": command, "exit": code,
+        "rows": [{"step": sid, "outcome": outcome, "detail": (detail or "")[:400],
+                  "card": cards.get(sid) if outcome == BLOCKED else None}
+                 for sid, outcome, detail in rows],
+        "ceiling": ctx.ceiling if ctx is not None else None,
+        "first_pass": ctx.first_pass[0] if ctx is not None and ctx.first_pass else None,
+        "left_off": ctx.left_off if ctx is not None else None,
+        "why": why,
+    }
+
+
+def machine_command(args, stdin=None, make=None):
+    """`check` and `apply`. Every human word goes to stderr and stdout carries ONE JSON document,
+    on every exit past argument parsing — a refusal and a usage error included — so the program
+    reading it never has to tell prose from rows. Returns the exit code. `make` builds the
+    context (`make_ctx`); the battery hands in one over its fake machine."""
+    real_out = sys.stdout
+    sys.stdout = sys.stderr
+    box = {"ctx": None, "held": []}
+    code, rows, why = EX_FAILED, [], None
+    try:
+        code, rows, why = _machine(args, stdin, box, make or make_ctx)
+    except Exception as exc:                                      # noqa: BLE001
+        why = "unexpected %s" % type(exc).__name__
+        say("BUG: %s raised %s: %s" % (args.command, type(exc).__name__,
+                                       scrub(str(exc), box["held"])))
+        code = EX_FAILED
+    finally:
+        sys.stdout = real_out
+    doc = rows_document(args.command, code, rows, box["ctx"],
+                        scrub(why, box["held"]) if why else None)
+    real_out.write(json.dumps(doc, sort_keys=True) + "\n")
+    real_out.flush()
+    return code
+
+
+def _machine(args, stdin, box, make):
+    """(code, rows, why). The order is the contract: the root refusal, then the agent refusal
+    (`apply`), then standard input and its consent (`apply`), then the conf — so a session is
+    refused before it learns anything, and a "no" touches nothing. `box` carries the context and
+    the values held for scrubbing back to `machine_command`, whatever happens here."""
+    import pipeline_root_guard as _rg   # KIT-693: the one refusal every installer shares
+    _root = _rg.refusal()
+    if _root:
+        say(_root)
+        return EX_REFUSED, [], "refused: run as root"
+    if args.command == "apply":
+        try:
+            refuse_if_agent("apply")
+        except Refusal as exc:
+            say(str(exc))
+            return EX_REFUSED, [], "refused: an agent environment"
+    if args.dry_run:
+        # `check` is already the dry run of `apply`; an `apply` that only pretends would report
+        # a load that never happened. Neither takes --dry-run.
+        say("FAILED: %s takes no --dry-run: `check` is the read-only one. Nothing was done."
+            % args.command)
+        return EX_USAGE, [], "%s takes no --dry-run" % args.command
+    answers = None
+    if args.command == "apply":
+        answers, why = read_answers(stdin)
+        if answers is None:
+            say("FAILED: %s. Nothing was changed." % why)
+            return EX_USAGE, [], why
+        if answers.get("token") is not None:
+            # Held before anything else runs, so an echo of it anywhere is withheld by value.
+            box["held"].append(answers["token"])
+        if answers.get("consent") != "yes":
+            # A "no", or anything that is not a yes, is never recorded as done: nothing is
+            # attempted, nothing is written, not even the ledger, and the exit says waiting.
+            say("NO CONSENT: the answers do not say yes, so nothing was changed or recorded.")
+            return EX_BLOCKED, [], "no consent: the answers do not say yes"
+    try:
+        conf, errors = load_conf(args.conf, invoking_user())
+    except SetupError as exc:
+        say("FAILED: " + str(exc))
+        return EX_USAGE, [], str(exc).splitlines()[0][:200]
+    if errors:
+        say("Your conf has %d problem(s). Every one of them, in one pass:" % len(errors))
+        for e in errors:
+            say("  - " + e)
+        return EX_USAGE, [], "%d problem(s) in the conf, the first: %s" % (len(errors), errors[0])
+    ctx = make(args, conf, State(args.state))
+    ctx.held.extend(box["held"])
+    box["ctx"], box["held"] = ctx, ctx.held
+    ctx.ceiling, ctx.ceiling_why = first_pass_ceiling()
+    if answers is not None and answers.get("token") is not None:
+        ctx.answer_token = answers["token"]
+    if ctx.agent:
+        ctx.no_sudo_why = None          # the agent's own NOT MEASURED words say why
+    elif not ctx.sudo.hold_if_live():
+        if args.command == "apply":
+            say("NO ADMINISTRATOR SESSION — nothing was attempted, and nothing was changed.\n"
+                "  `apply` asks nothing, the Mac password included. The program that calls it\n"
+                "  holds the administrator session first (`sudo -v`), then pipes the answers in.")
+            return EX_NOPRIV, [], "no administrator session, and `apply` never asks for one"
+        ctx.no_sudo_why = ("no administrator session is live in this terminal, and `check` never "
+                           "asks for the password")
+    try:
+        if args.command == "check":
+            code, rows = cmd_check(ctx)
+        else:
+            code, rows = cmd_apply(ctx)
+    except Refusal as exc:
+        say(str(exc))
+        return EX_REFUSED, [], "refused: an agent environment"
+    return code, rows, None
 
 
 def cmd_status(state, flags=""):
@@ -4543,11 +5169,45 @@ def _selftest_body():
             # (script, stdout) -> stdout: a case that needs the role shell to say LESS than it
             # did edits its answer here, after the real /bin/sh ran.
             self.stdout_filter = None
+            # KIT-850: launchd's overrides, {label: True disabled / False enabled}; absent is a
+            # label a restart loads. `run_at_load` is what the job's first pass leaves behind,
+            # called when a load takes. `boot_answer` is (rc, err) a load answers instead.
+            # `disabled_rc` is what `print-disabled` exits with.
+            self.disabled = {}
+            self.run_at_load = None
+            self.boot_answer = None
+            self.disabled_rc = 0
 
         def bootstrap(self, path):
             """What a person does at CK-N3: launchd takes a COPY of the file as it is now."""
             self.loaded_body = self.plists.get(path)
             self.loaded = True
+
+        def _launchctl(self, argv):
+            """`sudo launchctl` print-disabled, disable, enable, bootstrap and bootout, as
+            launchd answers them: a disabled label will not load, whatever its plist says."""
+            verb = argv[2]
+            if verb == "print-disabled":
+                if self.disabled_rc:
+                    return se.Result(self.disabled_rc, "", "Operation not permitted")
+                body = "".join('\t"%s" => %s\n' % (lab, "disabled" if off else "enabled")
+                               for lab, off in sorted(self.disabled.items()))
+                return se.Result(0, "disabled services = {\n%s}\n" % body)
+            if verb in ("disable", "enable"):
+                self.disabled[argv[3].split("/", 1)[1]] = verb == "disable"
+                return se.Result(0)
+            if verb == "bootout":
+                self.loaded = False
+                return se.Result(0)
+            label = os.path.basename(argv[4])[:-len(".plist")]
+            if self.boot_answer:
+                return se.Result(*self.boot_answer)
+            if self.disabled.get(label):
+                return se.Result(5, "", "Bootstrap failed: 5: Input/output error")
+            self.bootstrap(argv[4])
+            if self.run_at_load:
+                self.run_at_load()
+            return se.Result(0)
 
         def _print_text(self, label):
             """`launchctl print` as macOS 26 prints it: the arguments one per line, and the run
@@ -4604,6 +5264,9 @@ def _selftest_body():
                 if not self.loaded:
                     return se.Result(113, "", "Could not find service")
                 return se.Result(0, self._print_text(argv[3].split("/", 1)[-1]))
+            if argv[:2] == ["sudo", "launchctl"] and argv[2] in (
+                    "print-disabled", "disable", "enable", "bootstrap", "bootout"):
+                return self._launchctl(argv)
             return se.Result(1, "", "FakeMachine: nothing scripted for %s" % se._fmt(argv)[:120])
 
     class FakeTracker(object):
@@ -7196,6 +7859,20 @@ def _selftest_body():
            "files:write" in out and "the notifier's own app (card CK-N1)" in out and "${" not in out,
            out[:600])
 
+        # ── 18. KIT-850: `check` and `apply` — rows for a program, answers through a pipe, the
+        #        first-pass ceiling, and a job that is off cannot start at the next boot ───────
+        saved_pause, saved_max = se._pause, ANSWERS_MAX_BYTES
+        se._pause = lambda _seconds: None
+        try:
+            _kit850(locals_for_850={
+                "ok": ok, "quiet": quiet, "attempt": attempt, "tmp_root": tmp_root,
+                "new_home": new_home, "machine_ctx": machine_ctx, "real_pass": real_pass,
+                "rows_of": rows_of, "good_conf": good_conf, "good_text": good_text,
+                "token": token, "key": key, "with_env": with_env, "FakeTracker": FakeTracker})
+        finally:
+            se._pause = saved_pause
+            globals()["ANSWERS_MAX_BYTES"] = saved_max
+
         # ── 17. what this file can never do, read from its own source ──────────────────
         with open(os.path.abspath(__file__), encoding="utf-8") as fh:
             source = fh.read()
@@ -7209,9 +7886,25 @@ def _selftest_body():
         for token_ in banned:
             ok("source: never names %r" % token_, token_ not in body_only)
         tree = ast.parse(body_only)
-        lists = [n for n in ast.walk(tree) if isinstance(n, ast.List)
-                 and any(isinstance(e, ast.Constant) and e.value == "boot" + "strap" for e in n.elts)]
-        ok("source: no command list that loads a job", not lists)
+
+        def loads_a_job(n):
+            return isinstance(n, ast.List) and any(
+                isinstance(e, ast.Constant) and e.value == "boot" + "strap" for e in n.elts)
+        funcs = dict((n.name, n) for n in tree.body if isinstance(n, ast.FunctionDef))
+
+        def callers(name):
+            return sorted(f for f, node in funcs.items() for n in ast.walk(node)
+                          if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                          and n.func.id == name)
+        lists = [n for n in ast.walk(tree) if loads_a_job(n)]
+        ok("source: ONE command list loads a job, inside `_bootstrap` (KIT-850)",
+           len(lists) == 1 and "_bootstrap" in funcs
+           and [n for n in ast.walk(funcs["_bootstrap"]) if loads_a_job(n)] == lists, len(lists))
+        ok("source: `_bootstrap` is reached only through `load_job`, and `load_job` only from the "
+           "first switch-on and the reload",
+           (callers("_bootstrap"), callers("load_job")) == (["load_job"],
+                                                            ["first_switch_on", "step_enable"]),
+           (callers("_bootstrap"), callers("load_job")))
         queries = [v for k, v in vars(TrackerReader).items() if k.startswith("Q_")]
         ok("source: every tracker document is a read query",
            queries and all(re.match(r"^\s*query\s", q) for q in queries))
@@ -7232,6 +7925,487 @@ def _selftest_body():
     return EX_OK if not failed else EX_FAILED
 
 
+def _kit850(locals_for_850):
+    """Section 18 of the battery (KIT-850): `check` and `apply`. Every launchd answer is the fake
+    machine's, every role-account command runs through a real /bin/sh in a temporary home, and
+    no real sudo or launchctl is ever called: the administrator session is a stand-in."""
+    import contextlib
+    import io
+    g = locals_for_850
+    ok, quiet, attempt, tmp_root = g["ok"], g["quiet"], g["attempt"], g["tmp_root"]
+    new_home, machine_ctx, real_pass = g["new_home"], g["machine_ctx"], g["real_pass"]
+    rows_of, good_conf, good_text = g["rows_of"], g["good_conf"], g["good_text"]
+    token, key, with_env = g["token"], g["key"], g["with_env"]
+    label = "com.example.notifier"
+    root = os.path.join(tmp_root, "kit850")
+    os.makedirs(root)
+    # An obviously fake token that arrives on standard input, built at run time so no file holds
+    # a credential shape. It must never reach stdout, stderr, the ledger or any argv.
+    piped = "xo" + "xb-" + "1111111111-FAKEPIPEDTOKENNOTREAL"
+
+    def split_quiet(fn):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            value = fn()
+        return value, out.getvalue(), err.getvalue()
+
+    def never(what):
+        def boom(*_a, **_k):
+            raise AssertionError("it asked for " + what)
+        return boom
+
+    def pipe_of(text):
+        rfd, wfd = os.pipe()
+        os.write(wfd, text.encode("utf-8"))
+        os.close(wfd)
+        return os.fdopen(rfd, "r", encoding="utf-8")
+
+    def answers(**over):
+        doc = {"schema": ANSWERS_SCHEMA, "consent": "yes"}
+        doc.update(over)
+        return json.dumps(doc)
+
+    def place(name, would=0, rc=0, with_token=True, conf_extra=""):
+        """A role home whose notifier rehearsal sends `would` messages and exits `rc`, a conf
+        file, and a ledger with the private channel signed: everything up to `enable` holds."""
+        base = os.path.join(root, name)
+        os.makedirs(base)
+        home = new_home(base, with_token=with_token)
+        with open(os.path.join(home, ".fake-would"), "w", encoding="utf-8") as fh:
+            fh.write(str(would))
+        if rc:
+            with open(os.path.join(home, ".fake-exit"), "w", encoding="utf-8") as fh:
+                fh.write(str(rc))
+        conf_path = os.path.join(base, "notifier.conf")
+        with open(conf_path, "w", encoding="utf-8") as fh:
+            fh.write(good_text + conf_extra)
+        ledger = os.path.join(base, "ledger")
+        quiet(lambda: cmd_attest(State(ledger), A_PRIVATE, "pq", "private; a second account "
+                                 "could not join", conf=good_conf(conf_extra), env={}))
+        return base, home, conf_path, ledger
+
+    def ctx_for(base, home, conf, ledger, ceiling=5, live=True, env=None):
+        c, f = machine_ctx(base, conf=conf, home=home, state=State(ledger), env=env,
+                           reader=never("the token at a hidden prompt"))
+        c.sudo = SudoOnce(validate=never("the Mac password"), refresh=lambda: 0,
+                          probe=lambda: 0 if live else 1)
+        c.ceiling = ceiling
+        c.ceiling_why = None if ceiling is not None else "the parts list could not be read"
+        f.run_at_load = lambda: real_pass(home, ago=0)
+        return c, f
+
+    def launchctl(f, verb):
+        return [a for a in f.sudo_argv if a[:3] == ["sudo", "launchctl", verb]]
+
+    def place_ctx(name, conf_extra="", **kw):
+        ceiling = kw.pop("ceiling", 5)
+        base, home, _conf, ledger = place(name, conf_extra=conf_extra, **kw)
+        c, f = ctx_for(base, home, good_conf(conf_extra), ledger, ceiling=ceiling)
+        return c, f, home, ledger
+
+    # ── R4. THE CEILING: at or below it the job is switched on, above it left off ──────────
+    c, f, home, ledger = place_ctx("at", would=2)
+    (code, rows), out, err = split_quiet(lambda: cmd_apply(c))
+    got = rows_of(rows)
+    seq = [a[2] for a in f.sudo_argv if a[:2] == ["sudo", "launchctl"]
+           and a[2] in ("disable", "enable", "bootstrap")]
+    ok("apply: at or below the ceiling (2 messages, ceiling 5) it enables and loads the job "
+       "itself, after disabling the file it wrote, and waits for its first real pass",
+       got.get("enable") == DONE and f.loaded and f.disabled.get(label) is False
+       and seq == ["disable", "enable", "bootstrap"] and c.first_pass == (2, 0)
+       and "switched it on" in out + err and c.left_off is None and c.sudo.acquisitions == 0,
+       "%s %s %s\n%s" % (got, seq, c.first_pass, (out + err)[-1500:]))
+    ok("apply: it then stops at the first-ping card, named and not printed, and asks nothing",
+       code == EX_BLOCKED and got.get("first-ping") == BLOCKED and c.row_cards.get("first-ping")
+       == "CK-N4" and "WHAT TO DO" not in out + err and "card CK-N4" in out + err,
+       "%s %s\n%s" % (code, got, (out + err)[-900:]))
+    with open(os.path.join(ledger, "state.json"), encoding="utf-8") as fh:
+        led = json.load(fh)
+    ok("apply: the switch-on is recorded, so a later unload reads as a pause",
+       (led.get("notes") or {}).get(NOTE_SWITCHED_ON, {}).get("by") == "apply"
+       and led["steps"]["enable"]["outcome"] == DONE
+       and led.get("recorded_by", {}).get("command") == "apply", led.get("notes"))
+
+    c, f, _h, _l = place_ctx("edge", would=5)
+    (code, rows), out, err = split_quiet(lambda: cmd_apply(c))
+    ok("apply: exactly at the ceiling (5 of 5) is switched on — the ceiling is a most, not a less",
+       rows_of(rows).get("enable") == DONE and f.loaded and launchctl(f, "bootstrap"),
+       "%s\n%s" % (rows_of(rows), (out + err)[-900:]))
+
+    c, f, _h, _l = place_ctx("above", would=7)
+    (code, rows), out, err = split_quiet(lambda: cmd_apply(c))
+    doc = rows_document("apply", code, rows, c)
+    enable_row = [r for r in doc["rows"] if r["step"] == "enable"]
+    ok("apply: above the ceiling (7 of 5) the job is installed, left off and disabled, never "
+       "loaded, and one line says why",
+       code == EX_BLOCKED and enable_row and enable_row[0]["outcome"] == BLOCKED
+       and enable_row[0]["card"] == "CK-N3" and not launchctl(f, "bootstrap") and not f.loaded
+       and f.disabled.get(label) is True
+       and doc["left_off"] == "left off: its first pass would send 7 messages, above its ceiling of 5"
+       and doc["first_pass"] == 7 and doc["ceiling"] == 5,
+       "%s\n%s" % (json.dumps(doc)[:900], (out + err)[-900:]))
+    ok("apply: the left-off line is one line, and the row's detail starts with it",
+       "\n" not in doc["left_off"] and enable_row[0]["detail"].startswith(doc["left_off"]),
+       enable_row[0]["detail"] if enable_row else "")
+
+    c, f, _h, _l = place_ctx("declined", would=1, rc=3)
+    (code, rows), out, err = split_quiet(lambda: cmd_apply(c))
+    ok("apply: a rehearsal that declined something (exit 3) leaves it off: its count is not known",
+       rows_of(rows).get("enable") == BLOCKED and not launchctl(f, "bootstrap")
+       and "declined something" in (c.left_off or "") and f.disabled.get(label) is True,
+       "%s %s" % (rows_of(rows), c.left_off))
+
+    c, f, _h, _l = place_ctx("noceiling", would=0, ceiling=None)
+    (code, rows), out, err = split_quiet(lambda: cmd_apply(c))
+    ok("apply: no ceiling it can read is never 'no limit': left off, disabled, NOT MEASURED",
+       code == EX_UNKNOWN and rows_of(rows).get("enable") == UNKNOWN
+       and not launchctl(f, "bootstrap") and f.disabled.get(label) is True,
+       "%s %s\n%s" % (code, rows_of(rows), (out + err)[-600:]))
+
+    # ── R1. `check`: changes nothing, records nothing, asks nothing, prints rows ────────────
+    base, home, conf_path, ledger = place("check", would=2)
+    made = []
+
+    def make_for(home_, live=True, env=None, ceiling_from_list=True):
+        def make(args, conf, state):
+            c_, f_ = machine_ctx(os.path.dirname(home_), conf=conf, home=home_, state=state,
+                                 env=env, reader=never("the token at a hidden prompt"))
+            c_.sudo = SudoOnce(validate=never("the Mac password"), refresh=lambda: 0,
+                               probe=lambda: 0 if live else 1)
+            c_.flags = invocation_flags(args.conf, args.state)
+            f_.run_at_load = lambda: real_pass(home_, ago=0)
+            made.append((c_, f_))
+            return c_
+        return make
+
+    def machine(argv, stdin=None, make=None):
+        before = len(made)
+        try:
+            return split_quiet(lambda: machine_command(build_parser().parse_args(argv), stdin, make))
+        finally:
+            for c_, _f in made[before:]:
+                c_.sudo.release()
+
+    code, out, err = machine(["check", "--conf", conf_path, "--state", ledger],
+                             make=make_for(home))
+    c, f = made[-1]
+    parsed, exc = attempt(lambda: json.loads(out))
+    rows = dict((r["step"], r) for r in (parsed or {}).get("rows") or [])
+    ok("check: stdout is ONE JSON document of rows, and every human word went to stderr",
+       exc is None and out.count("\n") == 1 and parsed["schema"] == ROWS_SCHEMA
+       and parsed["command"] == "check" and parsed["exit"] == code
+       and [r["step"] for r in parsed["rows"]] == [s for s, _t, _f in STEPS]
+       and "Notifier check" in err and "-- steps --" in err,
+       "%r %s\n%s" % (exc, out[:600], err[-600:]))
+    listed = first_pass_ceiling()[0]
+    ok("check: a job never on says what `apply` would do — switch it on at or below the ceiling "
+       "of the parts list — as work, exit 10",
+       code == EX_BLOCKED and rows.get("enable", {}).get("outcome") == WOULD_CHANGE
+       and isinstance(listed, int) and parsed["ceiling"] == listed
+       and ("at most %d message" % listed) in rows.get("enable", {}).get("detail", ""),
+       json.dumps(parsed)[:1200])
+    with open(os.path.join(ledger, "state.json"), encoding="utf-8") as fh:
+        steps_after = json.load(fh).get("steps") or {}
+    ok("check: it changed nothing and recorded nothing — no write planned, no launchctl change, "
+       "no ledger file",
+       not f.writes and not [a for a in f.sudo_argv if a[:2] == ["sudo", "launchctl"]
+                             and a[2] in ("disable", "enable", "bootstrap", "bootout")]
+       and not os.path.exists(os.path.join(ledger, "state.json.tmp")) and steps_after == {},
+       repr(f.writes)[:400])
+
+    code, out, err = machine(["check", "--conf", conf_path, "--state", ledger],
+                             make=make_for(home, live=False))
+    c, f = made[-1]
+    parsed, _exc = attempt(lambda: json.loads(out))
+    outcomes = dict((r["step"], r["outcome"]) for r in (parsed or {}).get("rows") or [])
+    ok("check: with no live administrator session it never asks for one, attempts no sudo, and "
+       "its sudo rows are NOT MEASURED — exit 4, never up to date",
+       code == EX_UNKNOWN and parsed and parsed["exit"] == EX_UNKNOWN and not f.sudo_argv
+       and all(outcomes.get(s) == UNKNOWN for s in ("preflight", "credentials", "enable"))
+       and "never asks for the password" in err,
+       "%s %s %s\n%s" % (code, outcomes, f.sudo_argv[:2], err[-900:]))
+
+    # ── R2. `apply` takes its answers through a pipe, and nothing else ───────────────────
+    got_ok, why_ok = read_answers(pipe_of(answers()))
+    ok("answers: a pipe carrying one answers document is read",
+       why_ok is None and got_ok.get("consent") == "yes", why_ok)
+    as_file = os.path.join(root, "answers.json")
+    with open(as_file, "w", encoding="utf-8") as fh:
+        fh.write(answers())
+    with open(as_file, encoding="utf-8") as fh:
+        refused_file = read_answers(fh)
+    ok("answers: a FILE on standard input is refused — a session could have written it",
+       refused_file[0] is None and "is a file" in (refused_file[1] or ""), refused_file)
+    try:
+        import pty
+        master, slave = pty.openpty()
+        with os.fdopen(slave, "r", encoding="utf-8") as tty_in:
+            refused_tty = read_answers(tty_in)
+        os.close(master)
+    except (ImportError, OSError) as exc_:
+        refused_tty = (None, "is a terminal (no pty here: %s)" % exc_)
+    ok("answers: a TERMINAL on standard input is refused — that would make `apply` a question",
+       refused_tty[0] is None and "a terminal" in (refused_tty[1] or ""), refused_tty)
+    for name, text, needle in (
+            ("not JSON", "consent=yes", "not one JSON document"),
+            ("a list", "[]", "not a JSON object"),
+            ("another schema", json.dumps({"schema": "x/1", "consent": "yes"}), "not a notifier"),
+            ("an unknown key", answers(yes=True), "does not take: yes"),
+            ("no consent", json.dumps({"schema": ANSWERS_SCHEMA}), "carry no consent"),
+            ("a token that is no string", answers(token=5), "not a string")):
+        got_bad = read_answers(pipe_of(text))
+        ok("answers: %s is refused, and the reason quotes nothing it read" % name,
+           got_bad[0] is None and needle in (got_bad[1] or ""), got_bad)
+    globals()["ANSWERS_MAX_BYTES"] = 10
+    got_big = read_answers(pipe_of(answers()))
+    globals()["ANSWERS_MAX_BYTES"] = 64 * 1024
+    ok("answers: more than the limit is refused", got_big[0] is None
+       and "longer than" in (got_big[1] or ""), got_big)
+    leaky = read_answers(pipe_of(json.dumps({"schema": ANSWERS_SCHEMA, "consent": "yes",
+                                             piped: "x"})))
+    ok("answers: an unknown key shaped like a token is not quoted back",
+       leaky[0] is None and piped not in (leaky[1] or ""), leaky)
+
+    # ── R3. A secret on standard input: written, and never echoed, logged or in argv ──────
+    # No message waiting, so this switches on under any ceiling the parts list may say.
+    base, home, conf_path, ledger = place("secret", would=0, with_token=False)
+    del made[:]
+    code, out, err = machine(["apply", "--conf", conf_path, "--state", ledger],
+                             stdin=pipe_of(answers(token=piped)), make=make_for(home))
+    c, f = made[-1]
+    with open(os.path.join(home, ".stage-e", "env"), encoding="utf-8") as fh:
+        env_text = fh.read()
+    with open(os.path.join(ledger, "state.json"), encoding="utf-8") as fh:
+        ledger_text = fh.read()
+    argvs = [" ".join(a) for a in f.sudo_argv] + list(f.role_scripts) + [
+        " ".join(r) for r in f.reads]
+    # Every file this pass could have left anywhere — the ledger, the config, the heartbeat, a
+    # log — holds no copy of it. The env file is the one place it belongs.
+    kept_in = []
+    for top, _dirs, names in os.walk(base):
+        for name in names:
+            where = os.path.join(top, name)
+            if where != os.path.join(home, ".stage-e", "env"):
+                with open(where, "rb") as fh:
+                    if piped.encode("utf-8") in fh.read():
+                        kept_in.append(where)
+    parsed, _exc = attempt(lambda: json.loads(out))
+    ok("secret: a token piped in with the answers is written into the role account's env file, "
+       "and the install goes on to switch the job on",
+       ("NOTIFIER_SLACK_BOT_TOKEN=" + piped) in env_text and parsed
+       and dict((r["step"], r["outcome"]) for r in parsed["rows"]).get("credentials") == DONE
+       and dict((r["step"], r["outcome"]) for r in parsed["rows"]).get("enable") == DONE,
+       "%s\n%s" % (out[:900], err[-900:]))
+    ok("secret: it never reaches stdout, stderr, the ledger, any other file, or any command's "
+       "arguments — and a component that echoed it is withheld",
+       piped not in out and piped not in err and piped not in ledger_text and not kept_in
+       and not [a for a in argvs if piped in a]
+       and ("\u00abredacted\u00bb" in err or "withheld" in err),
+       "out %s err %s ledger %s files %s argv %s" % (
+           piped in out, piped in err, piped in ledger_text, kept_in,
+           [a[:80] for a in argvs if piped in a]))
+    ok("secret: the runner recorded its stdin as hidden, never the value",
+       [w["stdin"] for w in f.writes if "write" in w["why"] and "NOTIFIER_SLACK_BOT_TOKEN" in w["why"]]
+       == ["<hidden>"], [w["why"] for w in f.writes][:6])
+    ok("secret: nothing asked for it — no prompt, no Mac password — and it was said only by length",
+       c.sudo.acquisitions == 0 and ("NOTIFIER_SLACK_BOT_TOKEN: %d chars" % len(piped)) in err,
+       err[-600:])
+
+    # ── R6. a "no", a refusal, and an unmeasured step are never done ──────────────────────
+    base, home, conf_path, ledger = place("no", would=0)
+    os.remove(os.path.join(ledger, "state.json"))
+    del made[:]
+    code, out, err = machine(["apply", "--conf", conf_path, "--state", ledger],
+                             stdin=pipe_of(answers(consent="no")), make=make_for(home))
+    parsed, _exc = attempt(lambda: json.loads(out))
+    ok("no: an answer that is not yes changes nothing, records nothing, exits 10 — never done",
+       code == EX_BLOCKED and not made and not os.path.exists(os.path.join(ledger, "state.json"))
+       and parsed and parsed["rows"] == [] and "no consent" in (parsed["why"] or ""),
+       "%s %s %s" % (code, len(made), out[:400]))
+    stream = pipe_of(answers())
+    code, out, err = split_quiet(lambda: with_env({"CLAUDECODE": ""}, lambda: main(
+        ["apply", "--conf", conf_path, "--state", ledger], stdin=stream)))
+    left = stream.read()
+    stream.close()
+    parsed, _exc = attempt(lambda: json.loads(out))
+    ok("agent: `apply` is refused with exit 3 before its standard input or the conf is read, "
+       "with the run refusal's own words, and records nothing",
+       code == EX_REFUSED and left == answers() and parsed and parsed["exit"] == EX_REFUSED
+       and "REFUSED" in err and "There is no override flag" in err
+       and not os.path.exists(os.path.join(ledger, "state.json")),
+       "%s %r %s" % (code, left[:20], err[-400:]))
+    agent_env = {"CLAUDECODE": "", "STAGE_E_LINEAR_API_KEY": key}
+    code, out, err = with_env({"CLAUDECODE": ""}, lambda: machine(
+        ["check", "--conf", conf_path, "--state", os.path.join(base, "agent-ledger")],
+        make=make_for(home, env=agent_env)))
+    c, f = made[-1]
+    parsed, _exc = attempt(lambda: json.loads(out))
+    ok("agent: `check` is allowed under a model: it prints its rows, its sudo rows NOT MEASURED, "
+       "with no sudo and no ledger",
+       code == EX_UNKNOWN and parsed and parsed["exit"] == EX_UNKNOWN and not f.sudo_argv
+       and "agent environment" in err
+       and not os.path.exists(os.path.join(base, "agent-ledger", "state.json")),
+       "%s %s\n%s" % (code, f.sudo_argv[:2], err[-500:]))
+    del made[:]
+    code, out, err = machine(["apply", "--conf", conf_path, "--state", ledger],
+                             stdin=pipe_of(answers()), make=make_for(home, live=False))
+    c, f = made[-1]
+    ok("apply: with no live administrator session it asks for none and attempts nothing: exit 5",
+       code == EX_NOPRIV and not f.sudo_argv and not f.writes
+       and not os.path.exists(os.path.join(ledger, "state.json"))
+       and "asks nothing, the Mac password included" in err, "%s\n%s" % (code, err[-500:]))
+    with open(as_file, encoding="utf-8") as from_file:
+        code, out, err = split_quiet(lambda: main(
+            ["apply", "--conf", conf_path, "--state", ledger], stdin=from_file))
+    ok("apply: answers from a file are refused with exit 2, nothing read further",
+       code == EX_USAGE and "is a file" in err and not os.path.exists(
+           os.path.join(ledger, "state.json")), err[-300:])
+    del made[:]
+    for sub in ("check", "apply"):
+        code, out, err = machine([sub, "--dry-run", "--conf", conf_path, "--state", ledger],
+                                 stdin=pipe_of(answers()), make=make_for(home))
+        ok("%s --dry-run is refused with exit 2 before anything is built: an apply that only "
+           "pretends would report a load that never happened" % sub,
+           code == EX_USAGE and not made and "takes no --dry-run" in err, err[-300:])
+
+    # ── R5. the installer loads its job itself only after the consent; off stays off ──────
+    c, f, home, ledger = place_ctx("person", would=1)
+    c.auto = False
+    code, out = quiet(lambda: cmd_run(c, dry_run=False))
+    got = rows_of(run_steps_rows(c))
+    details = dict((s, d) for s, _o, d in run_steps_rows(c))
+    ok("run: a person's `run` installs the job file and disables it in the same step, so a "
+       "restart cannot start it — and never loads it",
+       got.get("job") == DONE and f.disabled.get(label) is True and not launchctl(f, "bootstrap")
+       and not launchctl(f, "enable") and got.get("enable") == BLOCKED and code == EX_BLOCKED
+       and "disabled, so a restart does not start it" in details.get("job", ""),
+       "%s %s\n%s" % (got, f.disabled, details.get("job")))
+    # The disable is the job step's own, not the enable step's: a run that stops in between —
+    # here a rehearsal that fails — still leaves a job file no restart can start.
+    for sub, run_it in (("run", lambda c_: quiet(lambda: cmd_run(c_, dry_run=False))),
+                        ("apply", lambda c_: quiet(lambda: cmd_apply(c_)))):
+        c3, f3, _h3, _l3 = place_ctx("stops-%s" % sub, would=0, rc=1)
+        run_it(c3)
+        got3 = rows_of(run_steps_rows(c3))
+        ok("%s: a pass that stops after the job step (a failed rehearsal) leaves the job file "
+           "disabled, never loaded" % sub,
+           got3.get("job") == DONE and got3.get("dry-run") == FAILED and "enable" not in got3
+           and f3.disabled.get(label) is True and not launchctl(f3, "bootstrap"),
+           "%s %s" % (got3, f3.disabled))
+    c2, f2 = ctx_for(os.path.dirname(home), home, good_conf(), ledger)
+    f2.plists = f.plists
+    c2.auto = False
+    code, out = quiet(lambda: cmd_verify(c2))
+    ok("verify: a job file left enabled while the job is off is named: a restart would start it",
+       rows_of(run_steps_rows(c2)).get("enable") == BLOCKED and not f2.writes
+       and "a restart would start it" in dict((s, d) for s, _o, d in run_steps_rows(c2)).get(
+           "enable", ""), out[-700:])
+    c2, f2 = ctx_for(os.path.dirname(home), home, good_conf(), ledger)
+    f2.plists = f.plists
+    c2.auto = False
+    code, out = quiet(lambda: cmd_run(c2, dry_run=False))
+    ok("run: …and `run` disables it, still without loading it",
+       f2.disabled.get(label) is True and not launchctl(f2, "bootstrap"), f2.sudo_argv[-3:])
+
+    # A job that was on, and is not loaded now, was paused by a person: `apply` leaves it so.
+    c, f, home, ledger = place_ctx("paused", would=0)
+    split_quiet(lambda: cmd_apply(c))
+    plists = f.plists
+    c2, f2 = ctx_for(os.path.dirname(home), home, good_conf(), ledger)
+    f2.plists = plists                       # installed, and NOT loaded: a person's bootout
+    (code, rows), out, err = split_quiet(lambda: cmd_apply(c2))
+    ok("apply: a job that was on and is now unloaded is a person's pause — never switched back "
+       "on, and its restart setting left as the person left it",
+       rows_of(rows).get("enable") == BLOCKED and not launchctl(f2, "bootstrap")
+       and not launchctl(f2, "disable") and not launchctl(f2, "enable")
+       and "paused" in dict((s, d) for s, _o, d in rows).get("enable", ""),
+       "%s\n%s" % (rows_of(rows), (out + err)[-700:]))
+    c3, f3 = ctx_for(os.path.dirname(home), home, good_conf(), ledger)
+    f3.plists = plists
+    (code, rows), out, err = split_quiet(lambda: cmd_check(c3))
+    ok("check: a paused job is a card for a person, never work for `apply`",
+       rows_of(rows).get("enable") == BLOCKED and c3.row_cards.get("enable") == "CK-N3"
+       and not f3.writes, rows_of(rows))
+
+    # A loaded job holding an older plist: `apply` reloads it itself; `run` leaves it the card.
+    c, f, home, ledger = place_ctx("reload", would=0)
+    split_quiet(lambda: cmd_apply(c))
+    with open(os.path.join(ledger, "state.json"), encoding="utf-8") as fh:
+        first = json.load(fh)
+    quiet(lambda: cmd_attest(State(ledger), A_FIRST_PING, "pq", "KIT-0: pinged, link opened, "
+                             "label landed", env={}))
+    c2, f2 = ctx_for(os.path.dirname(home), home, good_conf("INTERVAL_SECONDS=600\n"), ledger)
+    f2.plists, f2.loaded_body, f2.loaded = f.plists, f.loaded_body, True
+    (code, rows), out, err = split_quiet(lambda: cmd_apply(c2))
+    seq = [a[2] for a in f2.sudo_argv if a[:2] == ["sudo", "launchctl"]
+           and a[2] in ("bootout", "disable", "enable", "bootstrap")]
+    ok("apply: a loaded job holding an older plist is reloaded by the installer — unload, enable, "
+       "load — and its next pass is judged, never assumed",
+       rows_of(rows).get("enable") == DONE and seq == ["bootout", "enable", "bootstrap"]
+       and "reloaded it" in out + err and code == EX_OK and first["steps"]["enable"]["outcome"] == DONE,
+       "%s %s %s\n%s" % (code, rows_of(rows), seq, (out + err)[-900:]))
+
+    c, f, home, ledger = place_ctx("refused-load", would=0)
+    c.runner.boot_answer = (1, "", "Bootstrap failed: 1: Operation not permitted")
+    (code, rows), out, err = split_quiet(lambda: cmd_apply(c))
+    ok("apply: a load launchd refuses is FAILED, and the job is disabled again — off stays off",
+       code == EX_FAILED and rows_of(rows).get("enable") == FAILED and not f.loaded
+       and f.disabled.get(label) is True and "disabled again" in out + err,
+       "%s %s\n%s" % (code, rows_of(rows), (out + err)[-600:]))
+
+    c, f, home, ledger = place_ctx("no-pass", would=0)
+    f.run_at_load = None                     # loaded, and its first pass never finishes
+    (code, rows), out, err = split_quiet(lambda: cmd_apply(c))
+    ok("apply: a job loaded whose first pass never finishes is NOT MEASURED, never 'on'",
+       code == EX_UNKNOWN and rows_of(rows).get("enable") == UNKNOWN and f.loaded,
+       "%s %s\n%s" % (code, rows_of(rows), (out + err)[-600:]))
+
+    ok("load: only `apply` can reach the one function that loads, whatever calls it",
+       isinstance(attempt(lambda: load_job(machine_ctx(os.path.join(root, "person"),
+                                                       home=home)[0]))[1], SetupError), "")
+
+    # ── the ceiling comes from the parts list, and only from it ───────────────────────────
+    real_ceiling = first_pass_ceiling()
+    ok("ceiling: this checkout's parts list gives this installer's part a whole-number ceiling",
+       isinstance(real_ceiling[0], int) and real_ceiling[1] is None, real_ceiling)
+    parts_file = os.path.join(root, "parts.json")
+    for name, doc, needle in (
+            ("a null ceiling", {"parts": [{"id": "paging", "ceiling": None,
+                                           "installer": "scripts/" + os.path.basename(__file__)}]},
+             "not a whole number"),
+            ("a true ceiling", {"parts": [{"id": "paging", "ceiling": True,
+                                           "installer": "scripts/" + os.path.basename(__file__)}]},
+             "not a whole number"),
+            ("two parts", {"parts": [{"id": "a", "ceiling": 1, "installer": os.path.basename(__file__)},
+                                     {"id": "b", "ceiling": 1, "installer": os.path.basename(__file__)}]},
+             "2 part(s)"),
+            ("no file", None, "could not be read")):
+        if doc is None:
+            if os.path.exists(parts_file):
+                os.remove(parts_file)
+        else:
+            with open(parts_file, "w", encoding="utf-8") as fh:
+                json.dump(doc, fh)
+        got_c = first_pass_ceiling(parts_file)
+        ok("ceiling: %s is no ceiling, never 'no limit'" % name,
+           got_c[0] is None and needle in (got_c[1] or ""), got_c)
+
+    import pipeline_root_guard as rg_
+    saved_uid = rg_._uid
+    rg_._uid = lambda: 0
+    try:
+        del made[:]
+        code, out, err = machine(["apply", "--conf", conf_path, "--state", ledger],
+                                 stdin=pipe_of(answers()), make=make_for(home))
+    finally:
+        rg_._uid = saved_uid
+    parsed, _exc = attempt(lambda: json.loads(out))
+    ok("root: `apply` as root is refused first, with the shared message, and still prints its "
+       "one JSON document",
+       code == EX_REFUSED and not made and parsed and parsed["exit"] == EX_REFUSED
+       and rg_.MESSAGE in err, "%s %s" % (code, err[-300:]))
+
+
 def run_steps_rows(ctx):
     """The rows the last pass recorded on this context, as (step, outcome, detail)."""
     steps = ctx.state.data.get("steps") or {}
@@ -7246,7 +8420,7 @@ def build_parser():
         prog="pipeline_notifier_setup.py",
         description="Activate the human-action notifier: one command, run until it stops asking.")
     p.add_argument("command", nargs="?", default="run",
-                   choices=["run", "status", "verify", "card", "attest"])
+                   choices=["run", "status", "verify", "card", "attest", "check", "apply"])
     p.add_argument("target", nargs="?", help="a CK-id for `card`, an A-id for `attest`")
     p.add_argument("--conf", default=DEFAULT_CONF)
     p.add_argument("--state", default=DEFAULT_STATE_HOME)
@@ -7261,19 +8435,25 @@ def build_parser():
 
 
 def make_ctx(args, conf, state):
-    """The context `run` and `verify` are handed, carrying the options this run was given."""
-    ctx = Ctx(conf, se.Runner(dry_run=args.dry_run or args.command == "verify"), state,
-              tty=sys.stdin.isatty() and sys.stdout.isatty())
+    """The context `run`, `verify`, `check` and `apply` are handed, carrying the options this run
+    was given. `check` and `apply` never prompt, so they are never given a terminal."""
+    machine = args.command in MACHINE_COMMANDS
+    ctx = Ctx(conf, se.Runner(dry_run=args.dry_run or args.command in ("verify", "check")), state,
+              tty=not machine and sys.stdin.isatty() and sys.stdout.isatty())
     ctx.flags = invocation_flags(args.conf, args.state)
     return ctx
 
 
-def main(argv=None):
+def main(argv=None, stdin=None):
     args = build_parser().parse_args(argv)
     if args.selftest:
         from scratch_run import contained   # KIT-450: its temp folders go when it ends
         import pipeline_root_guard as _rg   # KIT-693: the root case ends every installer's own selftest
         return contained(selftest, "notifier-setup-selftest-run-") or _rg.root_case_rc(main, ["run"])
+    if args.command in MACHINE_COMMANDS:
+        # KIT-850: rows for a program. Its refusals — root, then an agent for `apply` — come
+        # first inside, in the same order as below, and print the same words, on stderr.
+        return machine_command(args, stdin)
     import pipeline_root_guard as _rg   # KIT-693: the one refusal every installer shares
     _root = _rg.refusal()
     if _root:

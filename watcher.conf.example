@@ -37,10 +37,22 @@ LIMIT_PIECE_USD=
 LIMIT_DAY_RUNS=
 LIMIT_PIECE_RUNS=
 
+# Optional (KIT-782): the queue's, the morning job's and the sweep's heartbeat files, as the workers write them (the
+# SOURCES: absolute, outside INSTALL_DIR and STATE_DIR).  The same copier copies each into root's copy folder, and the
+# one command points the health check's QUEUE_/MORNING_/SWEEP_HEARTBEAT_FILE at the copies, so the health watch can say
+# one stopped.  Where each job writes it: the queue's is queue-heartbeat.json in the bridge's state folder; the morning
+# job's is morning-heartbeat.json beside its day plan; the sweep's is the file its sweep.json names as heartbeat_file
+# (the sweep installer sets it to heartbeat.json beside sweep.json).  Empty = that job is off here, not watched.
+QUEUE_HEARTBEAT=
+MORNING_HEARTBEAT=
+SWEEP_HEARTBEAT=
+
 # Optional: the validator's ledger (docs/WATCHER.md, approval-rate).  With it, every merge into a watched
 # repository is checked against the validator's approvals.  This account must be able to read the file.
 # OWNER_LOGINS: your own GitHub logins, comma-separated: your own merges need no approval.  Leave yours out,
 # and each of your merges holds new starts.  LIMIT_DAY_APPROVALS: the most approvals in 24 hours, a runaway's.
+# LIMIT_APPROVALS_IN_A_ROW: the most decisions in a row that may all be approvals before you are paged, a runaway's.
 VALIDATOR_LEDGER=
 OWNER_LOGINS=
 LIMIT_DAY_APPROVALS=
+LIMIT_APPROVALS_IN_A_ROW=

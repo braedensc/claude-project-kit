@@ -412,6 +412,19 @@ used by the file that relies on it.
 Good: you run `npm run check:repo-setup` on a new copy and create what it lists.
 Not: you find the missing label when the first guarded PR will not go green.
 
+## One pass at a time (KIT-681)
+
+The review poller, the notifier, the bounce driver and the Stage E installer take one lock for a
+pass that writes anything, and the queue's starter takes it around each ledger row. The lock is
+`scripts/pipeline_pass_lock.py`, one file in the job's own state folder. A second pass started
+while the first runs does nothing, says "already running", and exits with the job's own declined
+code (3 for the three jobs, 6 for the installer). It never waits. A dry run writes nothing, so it
+takes no lock. `npm run test:pass-lock` tests the helper; each job's own selftest has its
+two-at-once case.
+
+Good: you start a pass by hand while the scheduled one runs, and it says it did nothing.
+Not: both passes run and a review is posted twice.
+
 ## Installers refuse to run as root (KIT-693)
 
 An installer run as root writes files owned by root in the owner's or the role account's folders,

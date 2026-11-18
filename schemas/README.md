@@ -20,6 +20,7 @@ second *rendering* of the one that already existed.
 | [`pipeline-validator-settings.schema.json`](pipeline-validator-settings.schema.json) | §23 validator settings file | the owner, by hand | the validator, through `scripts/pipeline_validator_settings.py` (KIT-533) |
 | [`pipeline-parts.schema.json`](pipeline-parts.schema.json) | no section: the kit's own list of its parts, `pipeline-parts.json` | a person, in a reviewed pull request | `scripts/pipeline_parts.py`, which writes `docs/PARTS.md` from it (KIT-624) |
 | [`pipeline-validator-ledger.schema.json`](pipeline-validator-ledger.schema.json) | §24 validator ledger | the validator, by one writer function (KIT-535) | the stand-up, the recap and the watcher, through `read()` |
+| [`pipeline-spend-ledger.schema.json`](pipeline-spend-ledger.schema.json) | §30 spend ledgers, one row | the four callers whose model calls no dispatcher log records, through `scripts/pipeline_spend_ledger.py`'s `append()` (KIT-844) | the usage job, through the same module's `read()` |
 
 **Every one of them is enforced at write time, not only in CI.** A producer validates
 what it is about to write and refuses to write a document that does not conform — see
@@ -58,7 +59,7 @@ python3 scripts/check_schemas.py --instance delivery.json --schema delivery
 ```
 
 `--schema` takes `delivery`, `pin`, `telemetry-block`, `safe-outputs`,
-`review-findings`, `browser-check`, `pipeline-status`, `pipeline-usage`, `pipeline-day-plan`, `pipeline-acceptance` or `pipeline-validator-settings`; `--list` prints the table above. A bare run validates this repo's own instances and the contract⇄schema
+`review-findings`, `browser-check`, `pipeline-status`, `pipeline-usage`, `pipeline-day-plan`, `pipeline-acceptance`, `pipeline-validator-settings` or `pipeline-spend-ledger`; `--list` prints the table above. A bare run validates this repo's own instances and the contract⇄schema
 parity, and `--selftest` is what CI runs.
 
 ## Generating a document

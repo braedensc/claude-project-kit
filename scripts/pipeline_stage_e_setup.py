@@ -227,6 +227,7 @@ from pipeline_dispatch_local import AGENT_ENV_MARKERS  # noqa: E402
 # Stage E's own GitHub app (KIT-578). The `github-app` step proves it with the same helper the
 # review poller posts with, so the two cannot disagree about what the app is.
 import pipeline_github_app as gha  # noqa: E402
+import pipeline_pass_lock as pass_lock  # noqa: E402  (one run at a time — KIT-681)
 # What the review lane shares with the idea gate: the routing sign-off and the stop file,
 # by their place under the role account's home (KIT-599).
 import pipeline_machine_tickets as machine  # noqa: E402
@@ -244,6 +245,9 @@ EX_UNKNOWN = 4
 # on purpose: "give me your password" and "your install is broken" are opposite
 # problems and sharing a number would make the first look like the second.
 EX_NOPRIV = 5
+# Another run of this installer holds its lock, so NOTHING was attempted (KIT-681). Its own code, as
+# 5 is: "someone else is running" is not "your install is broken", and a rerun later is the answer.
+EX_BUSY = 6
 EX_BLOCKED = 10
 
 # Step outcomes. DONE and ALREADY_DONE both exit 0 and are never printed the
@@ -432,6 +436,8 @@ REQUIRED_SCRIPTS = ("pipeline_review_poller.py", "pipeline_bounce_local.py",
                     "pipeline_catchup_poller.py", "pipeline_review_local.py",
                     "pipeline_review_basis.py", "pipeline_telemetry_local.py", "pipeline_criteria_snapshot.py",
                     "gh_fallback.py", "pr_conflict.py", "pipeline_dispatch_local.py",
+                    # The one list of agent-environment markers the dispatcher imports (KIT-690).
+                    "pipeline_agent_env.py",
                     "pipeline_labels.py", "check_schemas.py", "check_ticket_dor.py",
                     "check_grader_paths.py",
                     "jsonschema_mini.py", "telemetry_block.py", "telemetry_scrape.py",
@@ -445,8 +451,12 @@ REQUIRED_SCRIPTS = ("pipeline_review_poller.py", "pipeline_bounce_local.py",
                     # The validator's ledger, whose send-backs the bounce driver reads (KIT-542).
                     "pipeline_validator_ledger.py",
                     # The runner's store, where the bounce driver asks the runner for a fix on the
-                    # runner lane (KIT-765), and the usage kinds its own battery checks.
+                    # runner lane (KIT-765), and the usage kinds its own battery checks, with the
+                    # spend ledgers' one reader the usage runs import (KIT-844).
                     "pipeline_runner_store.py", "pipeline_usage_runs.py",
+                    "pipeline_spend_ledger.py",
+                    # The one lock a pass of the review poller and the bounce driver takes (KIT-681).
+                    "pipeline_pass_lock.py",
                     # Their `--selftest` runs inside one run folder it removes (KIT-450).
                     "scratch_run.py")
 
@@ -5676,6 +5686,58 @@ def entry_signoff_holds(state, want):
                        % signed.get("at", "undated"))
     return True, None
 
+# THE SETTINGS A DRY-RUN COUNT DEPENDS ON (KIT-790). A-DRY-RUN signs "the count is the number
+# you meant", and the count is the pull requests of the repositories the poller scans, matched
+# to the tickets of the teams it manages, plus the repositories on the runner lane. Change one of
+# these after the sign-off and the number no longer belongs to what was signed, so it asks again.
+# Any other setting leaves the count where it was. This list is the whole rule: add a key here
+# when it starts to change the count. `attest` has no conf, so it binds from the note the
+# dry-run step writes before it stops at CK-5; a sign-off made before this binding has no
+# fingerprint, so a machine upgraded to this code asks once, on purpose.
+DRY_RUN_COUNT_SETTINGS = ("REVIEW_REPOS", "MANAGED_TEAM_KEYS", "RUNNER_LANE_REPOS")
+DRY_RUN_NOTE = "dry-run-count-settings"
+ATTESTATIONS_BOUND_TO_DRY_RUN = frozenset(("A-DRY-RUN",))
+
+
+def _dry_run_shape(conf):
+    shape = {}
+    for key in DRY_RUN_COUNT_SETTINGS:
+        shape[key] = sorted(x.upper() if key == "MANAGED_TEAM_KEYS" else x
+                            for x in split_list((conf or {}).get(key, "") or ""))
+    return shape
+
+
+def dry_run_fingerprint(conf):
+    """sha256 of the settings the count depends on; a list in any order is one list."""
+    return hashlib.sha256(json.dumps(_dry_run_shape(conf), sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def dry_run_parts(conf):
+    """One short sha256 per setting, so a sign-off can say WHICH setting changed."""
+    return dict((k, hashlib.sha256(json.dumps(v).encode("utf-8")).hexdigest()[:16])
+                for k, v in _dry_run_shape(conf).items())
+
+
+def dry_run_signoff_holds(state, conf):
+    """(holds, why_not). The sign-off of the dry-run count counts only for the settings it was
+    made against. `why_not` is None when there is no sign-off at all."""
+    signed = (state.data.get("attestations") or {}).get("A-DRY-RUN")
+    if not signed:
+        return False, None
+    signed = signed if isinstance(signed, dict) else {}
+    bound = signed.get("dry_run_sha256")
+    if not bound:
+        return False, ("the sign-off of the count (%s) names no settings, so it predates the "
+                       "binding: read the count above and sign it once more"
+                       % signed.get("at", "undated"))
+    if bound != dry_run_fingerprint(conf):
+        now, then = dry_run_parts(conf), signed.get("dry_run_parts") or {}
+        names = [k for k in DRY_RUN_COUNT_SETTINGS if now.get(k) != then.get(k)]
+        return False, ("%s changed since the count was signed (%s): read the count above and "
+                       "sign it again" % (" and ".join(names), signed.get("at", "undated")))
+    return True, None
+
+
 # THE BANNER IS A REGION, NOT A LINE, and reading it as a line is what made
 # this step unclearable. A dispatcher prints what it loaded as a header with
 # the count, then one bullet per entry:
@@ -6215,6 +6277,14 @@ def paused_only_for_the_probe(said):
 def step_dry_run(ctx, apply_it):
     """Every component's own dry run, shape-checked. This is what CK-5 reads."""
     r, notes = ctx.runner, []
+    # RECORDED ONLY ON AN APPLY PASS (Stage E's review of KIT-790). The count below comes from
+    # the poller config already on the machine, and only an apply pass has just written it from
+    # this conf (the `configs` step runs first). A `verify` after a conf edit counts the old
+    # config, and a note taken from the new conf would sign that old count as the new one's.
+    if apply_it:
+        ctx.state.data.setdefault("notes", {})[DRY_RUN_NOTE] = {
+            "sha256": dry_run_fingerprint(ctx.conf), "parts": dry_run_parts(ctx.conf),
+            "settings": list(DRY_RUN_COUNT_SETTINGS)}
     env = 'set -a; . %s/env; set +a; ' % ctx.stage_home
     poller = r.as_role(ctx.account,
                        env + "/usr/bin/python3 %s/kit/scripts/pipeline_review_poller.py "
@@ -6428,8 +6498,9 @@ def step_dry_run(ctx, apply_it):
             "signed again (%s), so this dry run counted none of their pull requests. That is "
             "expected, not a failed install: the idea gate's installer asks \"Run the probe "
             "now?\" after this one." % (", ".join(sorted(waits_on_probe)), "; ".join(why)))
-    if not ctx.state.attested("A-DRY-RUN"):
-        raise Blocked("CK-5", "the counts above have not been signed off"
+    holds, why_not = dry_run_signoff_holds(ctx.state, ctx.conf)
+    if not holds:
+        raise Blocked("CK-5", (why_not or "the counts above have not been signed off")
                               + ("; the poller counted nothing while its reviews are paused"
                                  if waits_on_probe else ""))
     # EVERY candidate, not the WOULD lines: those are only what one pass posts under the cap,
@@ -6793,10 +6864,13 @@ MONITOR_HEARTBEAT_POLL_SECONDS = 5
 # finding its run, then watching it), plus the checks, plus up to 60 s counting temp space
 # (KIT-461). Ten kinds send one (the conflict waker's and the watcher page's are Slack only, KIT-339;
 # the notifier and monitor kinds do send, KIT-286, and so does `credentials`, KIT-579), which makes that
-# 4260 s, so 4300 s is added to its interval (`memory` and `burn`, KIT-609, send nothing, and their reads add at most 30 s to a pass), as each daemon's pass clock is to its own. The minimum interval is the watch's own floor. The battery asserts both against the
-# watch when that script is in the checkout.
+# 4260 s (`memory` and `burn`, KIT-609, send nothing, and their reads add at most 30 s to a pass). The
+# waker's sandbox check (KIT-829) sends nothing either, but its one short session may run up to 420 s
+# after a 60 s version read, which makes 4740 s, so 4800 s is added to its interval, as each daemon's
+# pass clock is to its own. The minimum interval is the watch's own floor. The battery asserts both
+# against the watch when that script is in the checkout.
 HEALTH_WATCH_JOB = "health-watch"
-HEALTH_WATCH_PASS_SECONDS = 4300
+HEALTH_WATCH_PASS_SECONDS = 4800
 HEALTH_WATCH_MIN_INTERVAL = 600
 # The notifier, as the fourth watched job (KIT-156). Its config is read at the notifier
 # installer's default path, as the role account; what the notifier's own loader assumes
@@ -8609,6 +8683,16 @@ def cmd_attest(state, aid, initials, note):
                 "are recorded yet.\n  Run `verify` (or `run`) until the dispatcher-entry step "
                 "has measured them, then sign." % aid)
         bound["entries_sha256"] = shape
+    if aid in ATTESTATIONS_BOUND_TO_DRY_RUN:
+        # A SIGN-OFF OF THE COUNT NAMES THE SETTINGS THE COUNT WAS MADE FROM (KIT-790).
+        note_ = (state.data.get("notes") or {}).get(DRY_RUN_NOTE) or {}
+        if not note_.get("sha256"):
+            raise SetupError(
+                "%s records that you read the dry-run count, and no count is recorded yet.\n"
+                "  Run `run` until the dry-run step has counted (a `verify` counts the config "
+                "already on the machine, so it records nothing), then sign." % aid)
+        bound["dry_run_sha256"] = note_["sha256"]
+        bound["dry_run_parts"] = note_.get("parts") or {}
     state.attest(aid, initials.lower(), note or "", **bound)
     state.save()
     say("recorded: %s  %s  %s  %s" % (aid, initials.lower(), now_iso(), note or ""))
@@ -8616,6 +8700,9 @@ def cmd_attest(state, aid, initials, note):
     if bound.get("fence_sha256"):
         say("  under the fence %s… — change the fence and this sign-off stops counting"
             % bound["fence_sha256"][:12])
+    if bound.get("dry_run_sha256"):
+        say("  for %s as they are now — change one and this sign-off stops counting"
+            % ", ".join(DRY_RUN_COUNT_SETTINGS))
     if bound.get("entries_sha256"):
         say("  for the entries %s… — change the entries and this sign-off stops counting"
             % bound["entries_sha256"][:12])
@@ -9164,8 +9251,32 @@ def _selftest_body():
     # -- 5. §13: every outcome has its OWN exit code ------------------------
     cases += 1
     expect("exit-codes-distinct", len({EX_OK, EX_FAILED, EX_USAGE, EX_REFUSED,
-                                       EX_UNKNOWN, EX_NOPRIV, EX_BLOCKED}) == 7,
+                                       EX_UNKNOWN, EX_NOPRIV, EX_BLOCKED, EX_BUSY}) == 8,
            "two outcomes share an exit code")
+    # KIT-681: a second run at once is told so, with its own code, and changes nothing; a dry run, which
+    # changes nothing, runs beside the first.
+    import io as _io
+    import tempfile as _tf
+    with _tf.TemporaryDirectory() as busy_tmp:
+        busy_state = os.path.join(busy_tmp, "state")
+        busy_held = pass_lock.take(busy_state, "stage-e-setup")
+        busy_out, busy_real = _io.StringIO(), sys.stdout
+        sys.stdout = busy_out
+        busy_markers = globals()["agent_env_markers_present"]
+        globals()["agent_env_markers_present"] = lambda env=None: []     # a session runs this too: reach the lock
+        try:
+            busy_rc = main(["run", "--conf", os.path.join(busy_tmp, "none.conf"), "--state", busy_state])
+            attest_rc = main(["attest", "x", "--state", busy_state])
+        finally:
+            globals()["agent_env_markers_present"] = busy_markers
+            sys.stdout = busy_real
+        expect("a second run at once exits busy", busy_rc == EX_BUSY, repr(busy_rc))
+        expect("a second attest at once exits busy", attest_rc == EX_BUSY, repr(attest_rc))
+        expect("...and says it is already running", "already running" in busy_out.getvalue(),
+               busy_out.getvalue())
+        expect("...and wrote no state", not os.path.exists(os.path.join(busy_state, "state.json")))
+        pass_lock.release(busy_held)
+        expect("the lock is free once the first run ends", pass_lock.take(busy_state, "stage-e-setup") is not None)
     expect("exit-codes-distinct", EX_NOPRIV not in (EX_OK, EX_UNKNOWN, EX_BLOCKED),
            "`no administrator access` shares a code with nothing-to-do, could-not-measure "
            "or drifted — the three §13 says must never arrive as the same red")
@@ -10353,6 +10464,7 @@ def _selftest_body():
         # …and a real sign-off still lands, note and all.
         cases += 1
         st_ok = State(tempfile.mkdtemp(prefix="stage-e-attest-ok."))
+        st_ok.data["notes"][DRY_RUN_NOTE] = {"sha256": dry_run_fingerprint(conf)}
         rc_at, printed_at = _quiet(
             lambda: cmd_attest(st_ok, "A-DRY-RUN", "BC", "count read: 7"))
         expect("attest-accepts", rc_at == EX_OK and st_ok.attested("A-DRY-RUN"),
@@ -10361,6 +10473,57 @@ def _selftest_body():
                (st_ok.data["attestations"]["A-DRY-RUN"]["initials"] == "bc"
                 and st_ok.data["attestations"]["A-DRY-RUN"]["note"] == "count read: 7"),
                "the record is not what was signed: %s" % st_ok.data["attestations"])
+
+        # KIT-790: THE COUNT'S SIGN-OFF IS BOUND TO THE SETTINGS THE COUNT DEPENDS ON.
+        # One case per rule: no count recorded, no sign-off; a change to each listed setting
+        # asks again; a change to any other setting does not; a sign-off from before the
+        # binding asks once and is then bound; the list is the data the fingerprint reads.
+        base = dict(conf, RUNNER_LANE_REPOS="")
+        cases += 1
+        st_nn = State(tempfile.mkdtemp(prefix="stage-e-attest-dry-nonote."))
+        try:
+            _quiet(lambda: cmd_attest(st_nn, "A-DRY-RUN", "BC", "count read: 1"))
+            expect("dry-run-bound", False, "signed with no count recorded")
+        except SetupError:
+            expect("dry-run-bound", not st_nn.attested("A-DRY-RUN"), "recorded anyway")
+        st_b = State(tempfile.mkdtemp(prefix="stage-e-attest-dry-bound."))
+        st_b.data["notes"][DRY_RUN_NOTE] = {"sha256": dry_run_fingerprint(base), "parts": dry_run_parts(base)}
+        _quiet(lambda: cmd_attest(st_b, "A-DRY-RUN", "BC", "count read: 1"))
+        expect("dry-run-bound", dry_run_signoff_holds(st_b, base) == (True, None),
+               "a sign-off does not hold for the settings it was made against")
+        changed = {"REVIEW_REPOS": "example-org/kit, example-org/app",
+                   "MANAGED_TEAM_KEYS": "KIT,TOD,NEW",
+                   "RUNNER_LANE_REPOS": "example-org/kit:KIT:kit"}
+        expect("dry-run-bound", set(changed) == set(DRY_RUN_COUNT_SETTINGS),
+               "the selftest and DRY_RUN_COUNT_SETTINGS name different settings")
+        for key in DRY_RUN_COUNT_SETTINGS:
+            held, why = dry_run_signoff_holds(st_b, dict(base, **{key: changed[key]}))
+            others = [k for k in DRY_RUN_COUNT_SETTINGS if k != key]
+            expect("dry-run-bound", not held and key in (why or "")
+                   and not any(k in (why or "") for k in others),
+                   "changing %s did not ask again, or named the wrong setting (%s)" % (key, why))
+        for key in ("POLL_INTERVAL_SECONDS", "SEVERITY_THRESHOLD", "DIFF_CAP_CHARS"):
+            expect("dry-run-bound",
+                   dry_run_signoff_holds(st_b, dict(base, **{key: "zz"})) == (True, None),
+                   "changing %s, which the count does not depend on, asked again" % key)
+        expect("dry-run-bound",
+               dry_run_signoff_holds(st_b, dict(base, REVIEW_REPOS=base["REVIEW_REPOS"] + ","))
+               == (True, None)
+               and dry_run_signoff_holds(
+                   st_b, dict(base, MANAGED_TEAM_KEYS=" ,".join(reversed(
+                       base["MANAGED_TEAM_KEYS"].lower().split(","))))) == (True, None),
+               "spacing, case or order of a list changed the fingerprint")
+        st_old = State(tempfile.mkdtemp(prefix="stage-e-attest-dry-old."))
+        st_old.attest("A-DRY-RUN", "bc", "count read: 1")
+        held, why = dry_run_signoff_holds(st_old, base)
+        expect("dry-run-bound", not held and "predates" in (why or ""),
+               "a sign-off from before the binding still counted: %s" % (why,))
+        st_old.data["notes"][DRY_RUN_NOTE] = {"sha256": dry_run_fingerprint(base), "parts": dry_run_parts(base)}
+        _quiet(lambda: cmd_attest(st_old, "A-DRY-RUN", "BC", "count read: 1"))
+        expect("dry-run-bound", dry_run_signoff_holds(st_old, base) == (True, None),
+               "signing once more did not bind it")
+        expect("dry-run-bound", dry_run_signoff_holds(State(tempfile.mkdtemp(
+            prefix="stage-e-attest-dry-none.")), base) == (False, None), "no sign-off held")
 
         # THE END-TO-END SIGN-OFF CARRIES THE FENCE IT WATCHED, copied from the note
         # the entry step wrote — and with no note there is no fence to sign under.
@@ -12078,6 +12241,24 @@ def _selftest_body():
            and "count it out of the number you sign off" in printedD1,
            "CK-5 was asked to sign a count with the declines invisible: %r"
            % printedD1[-400:])
+    # KIT-790: the step itself asks again when a setting the count depends on changed after the
+    # sign-off, and not when another one did.
+    ctxD1.conf = dict(ctxD1.conf, POLL_INTERVAL_SECONDS="999")
+    rowD1b, _pD1b = _quiet(lambda: _dry_run_row(ctxD1))
+    expect("dry-run-bound", isinstance(rowD1b, tuple), "an unrelated setting asked again: %r" % (rowD1b,))
+    # A pass that applies nothing counts the config on the machine, not this conf, so it
+    # records no new fingerprint: a note taken from an edited conf would sign the old count.
+    noteD1 = dict(ctxD1.state.data["notes"].get(DRY_RUN_NOTE) or {})
+    ctxD1.conf = dict(ctxD1.conf, REVIEW_REPOS="example-org/kit, example-org/app")
+    try:
+        _quiet(lambda: step_dry_run(ctxD1, apply_it=False))
+    except (SetupError, Unknown, Blocked):
+        pass
+    expect("dry-run-bound", ctxD1.state.data["notes"].get(DRY_RUN_NOTE, {}) == noteD1,
+           "a pass that applied nothing recorded a count note from the edited conf")
+    rowD1c, _pD1c = _quiet(lambda: _dry_run_row(ctxD1))
+    expect("dry-run-bound", isinstance(rowD1c, Blocked) and rowD1c.card_id == "CK-5"
+           and "REVIEW_REPOS" in rowD1c.extra, "a changed REVIEW_REPOS did not stop at CK-5: %r" % (rowD1c,))
     # …while a real failure is still a failure, in both spellings.
     for rc, what in ((1, "error"), (2, "usage")):
         cases += 1
@@ -16702,6 +16883,11 @@ def _selftest_body():
     # KIT-280: the clone runs more than those five. Every installer that execs a job out of
     # ROLE_KIT_CLONE names its entry script the same way, so the entries are read out of the
     # installers themselves: one that names the clone and no entry fails here, never passes.
+    # The settings folder (KIT-853) names ROLE_KIT_CLONE only as a setting it writes into the part
+    # files, and starts nothing. It is passed over only while that stays true: once it names an
+    # entry or imports subprocess, it fails here like any other.
+    key_only = ("pipeline_settings.py",)
+
     def _kit280_closure():
         nonlocal cases
         cases += 1
@@ -16714,6 +16900,10 @@ def _selftest_body():
             if "ROLE_KIT_CLONE" not in src:
                 continue
             named = re.findall(r'ROLE_KIT_CLONE"\]\.rstrip\("/"\) \+ "/scripts/" \+ (\w+)', src)
+            if fname in key_only:
+                if named or "import subprocess" in src:
+                    silent.append(fname + " (it names the key only, yet it can start a job)")
+                continue
             values = [re.search(r'^%s = "([\w.]+\.py)"$' % n, src, re.M) for n in named]
             if not named or not all(values):
                 silent.append(fname)
@@ -16861,7 +17051,7 @@ def _selftest_body():
     expect("health-watch-config", _hdoc["watch"][-1] == HEALTH_WATCH_JOB
            and _hdoc["intervals"][HEALTH_WATCH_JOB] == 3600 + HEALTH_WATCH_PASS_SECONDS
            and _hdoc["health_status_file"] == _hfile
-           and "7900 s" in _health_watch_note(_ch),
+           and "8400 s" in _health_watch_note(_ch),
            "a set HEALTH_STATUS_FILE must make the watch a watched job: %s" % _hdoc)
     _hpath = os.path.join(_mdir, "monitor-health.json")
     with open(_hpath, "w", encoding="utf-8") as fh:
@@ -16884,7 +17074,8 @@ def _selftest_body():
                # Only a kind that sends a GitHub alert can wait on its run (KIT-339); the temp
                # count adds its own walk (KIT-461).
                >= len(set(_pw.KINDS) - set(_pw.SLACK_ONLY_KINDS))
-               * (60 + 30 + _pw.RUN_WATCH_TIMEOUT) + 300 + _pw.TEMP_WALK_SECONDS,
+               * (60 + 30 + _pw.RUN_WATCH_TIMEOUT) + 300 + _pw.TEMP_WALK_SECONDS
+               + 60 + _pw.SANDBOX_TIMEOUT,     # the waker's sandbox check: a version read, one session
                "the health watch's schema or worst pass no longer matches what is held here")
 
         def _floor_errs(seconds):
@@ -18721,7 +18912,8 @@ def _dry_run_ctx(conf, poller=_CLEAN_POLLER, bounce=_CLEAN_BOUNCE):
                     (" ".join(BOUNCE_DRY_RUN_ARGS), bounce[0], bounce[1])] + [
         a for a in fake.answers
         if a[0] not in ("scan --dry-run", " ".join(BOUNCE_DRY_RUN_ARGS))]
-    ctx.state.attest("A-DRY-RUN", "xx", "count read: 2")
+    ctx.state.attest("A-DRY-RUN", "xx", "count read: 2",
+                      dry_run_sha256=dry_run_fingerprint(ctx.conf))
     ctx.state.attest("A-CATCHUP-COUNT", "xx", "count read: 0")
     return ctx, fake
 
@@ -18820,7 +19012,8 @@ def _healthy_ctx(conf, linear=None, stored_env=True):
     ctx.state.data.setdefault("notes", {})[ENTRY_PROOF_NOTE] = _proof_note(ctx)
     if stored_env:
         _with_stored_env(ctx, fake, conf)
-    ctx.state.attest("A-DRY-RUN", "xx", "count read: 0")
+    ctx.state.attest("A-DRY-RUN", "xx", "count read: 0",
+                      dry_run_sha256=dry_run_fingerprint(ctx.conf))
     ctx.state.attest("A-CATCHUP-COUNT", "xx", "count read: 0")
     # …signed under the fence the entries carry, which the entry step records again
     # on every pass.
@@ -18901,6 +19094,26 @@ def main(argv=None):
     except Refusal as exc:
         say(str(exc))
         return EX_REFUSED
+    # KIT-681: one run at a time. Everything below changes the machine or its state file; a second run
+    # started beside it would change them twice. A read-only command takes no lock.
+    held = None
+    if args.command == "attest" or (args.command == "run" and not args.dry_run):
+        try:
+            held = pass_lock.take(os.path.expanduser(args.state), "stage-e-setup")
+        except OSError as exc:
+            say("FAILED: the run lock could not be taken (%s). Nothing was changed." % exc)
+            return EX_FAILED
+        if held is None:
+            say(pass_lock.BUSY_SAYS % "this installer" + " (exit %d). Wait for it, then run the same command again."
+                % EX_BUSY)
+            return EX_BUSY
+    try:
+        return _main_locked(args)
+    finally:
+        pass_lock.release(held)
+
+
+def _main_locked(args):
     state = State(args.state)
     try:
         if args.command == "attest":
