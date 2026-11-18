@@ -578,18 +578,18 @@ def render(doc):
         "Each background job, as the installer writes it today. `<KEY>` is that setting's value; "
         "`<dir of KEY>` is its folder.",
         "",
-        "| Job | Part | Runs | As | Command | Log | Switched by |",
-        "|---|---|---|---|---|---|---|",
+        "| Job | Part | Runs | As | Command | Log | Switched by | Watched by |",
+        "|---|---|---|---|---|---|---|---|",
     ]
     runs = {"always-on": "always on", "at-boot": "at boot"}
     for part, job in jobs:
         switch = ("`%s` in `%s`" % (job["switch"]["key"], job["switch"]["example"]) if job["switch"]
                   else _cell(job["switch_reason"]))
-        out.append("| `%s` | %s | %s | %s | `%s` | `%s` | %s |" % (
+        out.append("| `%s` | %s | %s | %s | `%s` | `%s` | %s | %s |" % (
             _cell(job["label"]), part["id"],
             "every `%s` seconds" % job["interval_key"] if job["schedule"] == "interval" else runs[job["schedule"]],
             job["account"], _cell(" ".join([job["command"]["program"]] + job["command"]["args"])).replace("`", "'"),
-            _cell(job["log"]), switch))
+            _cell(job["log"]), switch, job["watched_by"].replace("-", " ")))
     out += [
         "",
         "## What only a person does",
@@ -734,7 +734,8 @@ def _fixture_doc():
         jobs=[{"label": "com.example.alpha", "from_key": "JOB_LABEL", "account": "role", "loaded_by": "person",
                "command": {"program": "/bin/sh", "args": ["-c", "exec /usr/bin/python3 <role home>/alpha.py run"]},
                "schedule": "interval", "interval_key": "INTERVAL", "log": "<dir of JOB_LABEL>/alpha.log",
-               "switch": {"key": "TOKEN_ENV", "example": "alpha.conf.example"}, "switch_reason": None}],
+               "switch": {"key": "TOKEN_ENV", "example": "alpha.conf.example"}, "switch_reason": None,
+               "watched_by": "heartbeat-monitor"}],
         person_steps=[{"card": "CK-A1", "card_in": "scripts/pipeline_alpha_setup.py",
                        "kind": "only-a-person", "words": "Make the app in its own settings page."}])
     beta = _fixture_part("beta", needs=["alpha"], scripts=list(NAMED_INSTALLERS))
@@ -901,6 +902,10 @@ def selftest():
     # jobs: each job is a full row of data
     fails("jobs: a job row missing its command fails", lambda d: a(d)["jobs"][0].pop("command"), "schema:")
     fails("jobs: a job row missing its log fails", lambda d: a(d)["jobs"][0].pop("log"), "schema:")
+    fails("jobs: a job row that names no watcher fails (KIT-689)",
+          lambda d: a(d)["jobs"][0].pop("watched_by"), "schema:")
+    fails("jobs: a watcher that is not one of the three fails (KIT-689)",
+          lambda d: a(d)["jobs"][0].update(watched_by="the owner"), "schema:")
     fails("jobs: an interval with no key fails",
           lambda d: a(d)["jobs"][0].update(interval_key=None), "jobs:")
     fails("jobs: no switch and no reason fails", lambda d: a(d)["jobs"][0].update(switch=None), "jobs:")

@@ -170,6 +170,11 @@ FLOOR = (
     # ignore file would otherwise pass the very scan it changed, and CI is the real gate.
     ".secretlintrc*",
     "**/.secretlintignore*",
+    # The pipeline's credential shapes (KIT-683): the one list the hook battery and the
+    # scan's selftest check the two secret layers against. Neither layer reads it at run
+    # time, but an edit that dropped a shape would let both batteries pass while a layer
+    # forgot it, so it needs the same label as the tests that import it.
+    "scripts/secret_shapes.py",
 )
 
 # Every file in the two directories FLOOR reaches into must be either gated or
@@ -477,6 +482,8 @@ def _selftest():
            gated("docs/deep/.secretlintignore"), True)
     expect("floor leaves a file only named like one alone", gated("docs/secretlintignore.md"),
            False)
+    expect("floor gates the credential shapes both secret layers are checked against (KIT-683)",
+           gated("scripts/secret_shapes.py"), True)
     expect("floor leaves src alone", gated("src/app.ts"), False)
     expect("floor gates the parts list", gated("pipeline-parts.json"), True)
 

@@ -40,10 +40,20 @@ A diff over the size cap is reviewed in parts. The job withholds whole files, la
 
 ### 3. The route check: right after filing
 
-On a work team, a failed routing read falls back to the coding setup, which can edit and run anything. So the job checks. The session runner posts a routing note at the start of each session. The job reads the earliest one. It waits up to two minutes, or five and a half while a repository setup hook runs.
+On a work team, a failed routing read falls back to the coding setup, which can edit and run anything. So the job checks. The session runner posts a routing note at the start of each session. The job reads the earliest one.
+
+How long it waits for the note:
+
+- Two minutes, when no other review ticket is in flight.
+- One minute more for each review ticket still in flight when this one was filed. In flight means filed and not yet collected. A busy session runner posts its notes later.
+- Fifteen minutes at most.
+- At least five and a half minutes while a repository setup hook runs.
+
+One pass waits no longer than the plain wait: two minutes by default, five and a half while a setup hook runs. A longer wait goes on in later passes, which check the note once each. So a missing note can pause reviews up to one pass after its wait ends.
 
 - The note names the review setup: the review is collected.
-- Anything else, or no note: the job cancels the ticket, writes the evidence and pages you.
+- The note names anything else: the job cancels the ticket at once, writes the evidence and pages you.
+- No note by the end of the wait: the same.
 
 Reviews pause for that repository until you sign the routing probe again. Each waiting pull request gets one comment saying reviews are paused and why.
 

@@ -7272,7 +7272,13 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
     if args.selftest:
         from scratch_run import contained   # KIT-450: its temp folders go when it ends
-        return contained(selftest, "notifier-setup-selftest-run-")
+        import pipeline_root_guard as _rg   # KIT-693: the root case ends every installer's own selftest
+        return contained(selftest, "notifier-setup-selftest-run-") or _rg.root_case_rc(main, ["run"])
+    import pipeline_root_guard as _rg   # KIT-693: the one refusal every installer shares
+    _root = _rg.refusal()
+    if _root:
+        say(_root)
+        return EX_REFUSED
     try:
         # BEFORE the conf is read and before the ledger is touched: a session must not get as far
         # as discovering what it would have installed.

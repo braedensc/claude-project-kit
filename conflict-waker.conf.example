@@ -81,7 +81,9 @@ RESUME_MODE=from-pr
 # worktree, and its commands run in Claude Code's sandbox (KIT-676).
 # A check left out here is never run, and the fix is pushed with only CI to
 # test it.  The installer finds each check's program on your PATH now and puts
-# its folder on the job's PATH.  In this kit the gate is:
+# its folder on the job's PATH.  A program in your home must be in ~/.nvm or
+# ~/.pyenv: a fix session's commands read nothing else there (KIT-786), so the
+# installer refuses one that lives elsewhere.  In this kit the gate is:
 #   CHECK_COMMANDS=npm run test:hooks, python3 scripts/check_placeholders.py
 # RULE: one plain command each.  No `*`, and no `;` `&` `|` `<` `>` `$` or
 # backquote: the session is allowed each check by its exact words, and nothing

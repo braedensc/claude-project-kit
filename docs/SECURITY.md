@@ -290,7 +290,9 @@ CI, which re-runs both batteries against the committed hook.
 missing/broken hook *script* blocks every tool call (python exits 2 = the block
 signal). A missing *interpreter* would have failed open (shell exit 127 is treated as
 a non-blocking error), so the PreToolUse wiring guards it explicitly:
-`command -v python3 … || exit 2` — no python3, no tools, rather than no guards.
+`command -v python3 … || exit 2` — no python3, no tools, rather than no guards. A hook
+that runs past its settings `timeout` is a non-blocking error as well, so the hook keeps a
+7-second deadline of its own and refuses a call it could not judge in time (KIT-684).
 Operationally: **create hook scripts before wiring `settings.json`** (see
 docs/LESSONS.md — this kit hit both variants of that deadlock).
 
