@@ -426,6 +426,8 @@ npm run test:label-gate      # the label gate runs the default branch's workflow
                              #   pull_request_target, never the PR's: one closed reason per rule (KIT-668)
 npm run test:gate-policy     # the owner's Actions policy that lets the gate run after 2 Dec 2026:
                              #   check, show, one typed yes, one POST, read back; refused under a model
+npm run test:template-label-gate  # the stack template's label gate runs the default branch's workflow on
+                             #   pull_request_target, never the PR's: one closed reason per rule (KIT-788)
 npm run test:alert-pages     # alert templates page a person (ALERT_PAGE_TO, else a user
                              #   owner) or fail their run; runs each copy under node
 npm run lint:secrets    # secretlint over every tracked file, read as git stores it

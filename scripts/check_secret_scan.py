@@ -554,7 +554,7 @@ def scan_steps():
 def template_guard():
     """(the `grep -E` pattern the template's hooks-change guard flags paths with, its text)."""
     try:
-        with open(os.path.join(ROOT, "templates/workflows/ci.yml"), encoding="utf-8") as fh:
+        with open(os.path.join(ROOT, "templates/workflows/hooks-change-guard.yml"), encoding="utf-8") as fh:
             text = fh.read()
     except OSError:
         return None, ""
@@ -641,8 +641,8 @@ def selftest():
     # Both label gates judge the PR against the default branch, never a base its author
     # named: such a base could carry its own gate, and a retarget re-runs nothing.
     gates = {}
-    # The kit's own gate has a workflow of its own (KIT-317); the stack template keeps it in ci.yml.
-    for rel in (".github/workflows/hooks-change-guard.yml", "templates/workflows/ci.yml"):
+    # Both gates have a workflow of their own (KIT-317, KIT-788).
+    for rel in (".github/workflows/hooks-change-guard.yml", "templates/workflows/hooks-change-guard.yml"):
         try:
             with open(os.path.join(ROOT, rel), encoding="utf-8") as fh:
                 guard = fh.read().split("hooks-change-guard:", 1)[-1]
