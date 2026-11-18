@@ -422,6 +422,12 @@ jobs:
       # and never a retry, the run folder always removed, and no script but its callers names it.
       - name: Validator run selftest (one read-only call; a failure holds; only its job starts it)
         run: python3 scripts/pipeline_validator_run.py --selftest
+      # The validator's merge path (KIT-539): GitHub's own auto-merge on for one pull request at a
+      # time, each on the latest main. Offline, against a stood-in code host: one in flight, the
+      # next updated and judged again from scratch, the floor held, a stale review never approved
+      # (KIT-792), off and held said, and it never merges, approves or labels.
+      - name: Validator merge path selftest (one in flight; never merges, approves or labels)
+        run: python3 scripts/pipeline_validator_merge.py --selftest
       # The validator's hard limits (KIT-538): layer 1, plain code with no model. Offline, in a
       # temp folder: one case per rule and every reason reached; each fact read by the part of
       # the kit that owns it; the safety-system floor is never a switch; closed words only.
