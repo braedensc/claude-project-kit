@@ -419,7 +419,7 @@ def selftest():
             with open(tpid) as fh:
                 os.kill(int(fh.read()), 0)
             talive = True
-        except (ProcessLookupError, OSError, ValueError):
+        except ProcessLookupError:
             talive = False
         expect("a command that ignores the signal is killed 10 s later, and the folder goes",
                (rc, os.path.exists(run), took >= 10, talive), (128 + signal.SIGTERM, False, True, False))
