@@ -273,7 +273,9 @@ npm run test:install         # the one command (scripts/pipeline_install.py): sk
 npm run test:parts           # every part listed once (pipeline-parts.json): owners, needs, cards, docs/PARTS.md
 npm run test:settings        # the settings folder (KIT-853): one machine.conf under ~/Library, a shared
                              #   value written to every part file the map names, shown first, --apply
-                             #   refused under a model; no secret, no other reader, no link, no repo
+                             #   refused under a model; no secret, no other reader, no link, no repo;
+                             #   a file per project composed into the parts' lists, and a first-run
+                             #   gather that copies no secret and writes nothing before a yes (KIT-854)
 npm run test:chat-lane-setup # chat-lane composer: owner's grant, fence keeps defaults, verify agent-refused
 npm run test:model-switch    # the dispatcher's chat-model switch (KIT-385): the pair alone or no
                              #   go, every open pipeline ticket on the default tagged first

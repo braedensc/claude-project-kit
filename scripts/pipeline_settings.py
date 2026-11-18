@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""The pipeline's settings, in one folder on this Mac (KIT-853).
+"""The pipeline's settings, in one folder on this Mac (KIT-853, KIT-854).
 
     python3 scripts/pipeline_settings.py where  [--settings-dir DIR]   # where everything is
     python3 scripts/pipeline_settings.py init   [--settings-dir DIR]   # make the folder and machine.conf
+    python3 scripts/pipeline_settings.py gather [--settings-dir DIR] [--parts-dir DIR] [--apply]
     python3 scripts/pipeline_settings.py check  [--settings-dir DIR]   # the folder's rules, read-only
     python3 scripts/pipeline_settings.py write  [--settings-dir DIR] [--apply]
-    python3 scripts/pipeline_settings.py map                           # where each shared value goes
+    python3 scripts/pipeline_settings.py map                           # where each value goes
     python3 scripts/pipeline_settings.py --selftest
 
 WHY. Eleven settings files repeat the same values: the pipeline's account, the dispatcher, the
 names the keys are stored under, the clone the jobs run from. A value changed in one file and
 missed in another breaks a part quietly. Settings live on the machine, never in a repository.
 So one private folder holds them, each value is typed once, and each part's own settings file is
-written from it. (One file per project, a first run that gathers the files already filled, hand
-edits, and export and import come in the later pieces of this work.)
+written from it. (Hand edits, and export and import, come in the last piece of this work.)
 
 THE FOLDER. `~/Library/Application Support/claude-pipeline/settings`, yours, mode 700. Its own
 place is a setting too: `--settings-dir`, else the PIPELINE_SETTINGS_DIR variable, else that
@@ -27,10 +27,26 @@ section:
              folder. `where` prints each one, and says what reads it.
   [shared]   a value typed once. MAP below names every part file and key it is written to.
   [stage-e.conf], [queue.conf] and the rest: one part file's own values. A key there wins over a
-             shared value for that file, and `check` says so.
+             shared value, and over the projects, for that file, and `check` says so.
 
   KEY=value, one per line, parsed and never sourced, as the part files are. `#` starts a comment
   only at the start of a line. A part's section takes only the keys its example names.
+
+ONE FILE PER PROJECT. `projects/<name>.conf` holds a project's REPO (OWNER/NAME), its TEAM_KEY,
+and PARTS: the parts that cover it, by their ids in the parts list. COMPOSED below names each list
+key the projects fill, such as the repositories the review jobs watch: a part's list is the
+projects it covers. A list is compared as a set, so a new order is no change. A list key no
+project covers is left as it is.
+
+A FIRST RUN: `gather`. On a Mac whose part files are already filled, `gather` reads them and shows
+the folder it would make: a value is shared only when every part file that takes it sets the
+same; the list keys become projects, one per repository and one per team, joined only where
+queue.conf's REPO_BY_TEAM pairs them, never by a guess; everything else goes in each part's own
+section. A value shaped like a secret, a key another tool writes and a key the example does not
+name are never copied: each is named, with why. Before it shows anything it proves the folder
+would change no part file. It writes nothing. `gather --apply`, run by you in your own terminal,
+shows it again and asks for a typed yes, reads the part files once more, and writes the folder
+only where no settings are yet.
 
 WHAT `write` DOES. For each part file on this Mac it works out what the folder changes, and shows
 each change: the file, the key, the value now and the value after. It writes nothing. With
@@ -44,8 +60,9 @@ can leave some files written, and then the output names each file, written or no
 WHAT `check` FAILS ON (`write` runs it first, so a folder that fails it is never written from)
   secret      a value or a comment shaped like a credential (the notifier's scrub, the one the tech
               lead's installer uses on its own settings, plus a Slack app token and a signing
-              secret), a long unbroken run of mixed letters and digits, or a key named like a secret. The folder holds the NAME a key is stored under (a KEY_ENV),
-              never the key. Each problem names the line and the key, never the value.
+              secret), a long unbroken run of mixed letters and digits, or a key named like a
+              secret. The folder holds the NAME a key is stored under (a KEY_ENV), never the key.
+              Each problem names the line and the key, never the value.
   private     the folder or anything in it belongs to another account, or another account can
               read it.
   link        the folder or anything in it is a link.
@@ -53,15 +70,19 @@ WHAT `check` FAILS ON (`write` runs it first, so a folder that fails it is never
   lines       a line that is not KEY=value or a section; an unknown section or key; a key twice; a
               place that is not a full path; or a key another tool writes (TOOL_KEYS), which the
               folder would undo.
+  projects    a project file with another key, a REPO or TEAM_KEY of the wrong shape, a part that
+              takes no list, neither a REPO nor a TEAM_KEY, a REPO or TEAM_KEY two projects share,
+              or a file in projects/ that is not <name>.conf.
 
 WHAT IT NEVER DOES (asserted in --selftest). It runs no installer and no other program, loads no
 job, and opens no connection. It reads the folder, the kit's parts list and examples, and the part
-files. Only `init` and `write --apply` write, and only to the folder and the part files.
+files. Only `init`, `gather --apply` and `write --apply` write: the first two the folder, the last
+the part files.
 
 Exit: 0 done, or nothing to do (the words say which) · 1 a write failed (the file is named)
       · 2 the folder or a part file needs fixing first, or a usage error · 3 refused (inside a
-      Claude session, or as root) · 4 something could not be read · 10 `write` found changes and
-      wrote none.
+      Claude session, or as root) · 4 something could not be read · 10 `write` or `gather` found
+      something to write and wrote none, or the yes was not given.
 """
 import argparse
 import json
@@ -140,6 +161,31 @@ TOOL_KEYS = {
     ("queue.conf", "LANES_PER_REPO"): "the tech lead changes it when you ask in your DM",
 }
 
+# The list keys the projects fill: (part id in the parts list, its file, the key, what each item is).
+# "repo" is OWNER/NAME, "team" a team key, "team=repo" TEAM=OWNER/NAME; a list is comma-separated.
+# A list whose meaning is narrower stays each part's own: the stand-up's STANDUP_REPOS, the bridge's
+# ACCEPTANCE_REPOS, the watcher's TRACKER_TEAMS, RUNNER_LANE_REPOS, REPO_BY_LABEL, REVIEWS_TEAM_KEY.
+COMPOSED = (
+    ("review", "stage-e.conf", "REVIEW_REPOS", "repo"),
+    ("review", "stage-e.conf", "MANAGED_TEAM_KEYS", "team"),
+    ("idea-gate", "stage-a.conf", "PLANNED_REPOS", "repo"),
+    ("work-queue", "queue.conf", "TEAM_KEYS", "team"),
+    ("work-queue", "queue.conf", "REPO_BY_TEAM", "team=repo"),
+    ("tech-lead", "bridge.conf", "TEAM_KEYS", "team"),
+    ("paging", "notifier.conf", "TEAM_KEYS", "team"),
+    ("cleanup", "sweep.conf", "TEAM_KEYS", "team"),
+    ("watcher", "watcher.conf", "WATCH_REPOS", "repo"),
+    ("acceptance-check", "acceptance.conf", "ACCEPTANCE_REPOS", "repo"),
+)
+COMPOSED_PARTS = tuple(sorted(set(entry[0] for entry in COMPOSED)))
+LIST_KEYS = frozenset((entry[1], entry[2]) for entry in COMPOSED)
+KIND_WORDS = {"repo": "OWNER/NAME repositories", "team": "team keys", "team=repo": "TEAM=OWNER/NAME pairs"}
+PROJECTS = "projects"
+PROJECT_KEYS = ("REPO", "TEAM_KEY", "PARTS")
+PROJECT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}\Z")
+REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
+TEAM_RE = re.compile(r"^[A-Z0-9]{1,10}\Z")
+
 # The places, besides the part files. (key, what it is, its default, what reads it today.)
 STATE_DEFAULT = "~/.stage-e"
 PLACES = (
@@ -215,10 +261,10 @@ class Kit(object):
 
 
 class Folder(object):
-    """machine.conf, read: each section as a map, and the line each key is on."""
+    """machine.conf, read: each section as a map, and the line each key is on; and each project."""
 
     def __init__(self):
-        self.places, self.shared, self.parts, self.line = {}, {}, {}, {}
+        self.places, self.shared, self.parts, self.line, self.projects = {}, {}, {}, {}, {}
 
 
 def read_text(path):
@@ -320,6 +366,106 @@ def place_problems(folder, kit):
         if not ok or not PATH_RE.match(value) or ".." in value.split("/"):
             out.append("line %d: %s must be %s" % (folder.line[("places", key)], key, rule))
     return out
+
+
+def parse_project(name, text):
+    """(project, problems): its REPO, TEAM_KEY and PARTS. Each problem names the file, the line and
+    the key, never a value."""
+    project, problems, seen, where = {"REPO": "", "TEAM_KEY": "", "PARTS": []}, [], set(), \
+        "projects/%s.conf" % name
+    for n, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, eq, value = line.partition("=")
+        key, value = key.strip(), value.strip().strip('"').strip("'")
+        if not eq or key not in PROJECT_KEYS:
+            problems.append("%s line %d: a project's file holds only REPO, TEAM_KEY and PARTS" % (where, n))
+        elif key in seen:
+            problems.append("%s line %d: %s is set twice" % (where, n, key))
+        elif key == "PARTS":
+            parts = [p for p in re.split(r"[\s,]+", value) if p]
+            if [p for p in parts if p not in COMPOSED_PARTS]:
+                problems.append("%s line %d: PARTS names a part that takes no list from a project. It may "
+                                "name: %s" % (where, n, ", ".join(COMPOSED_PARTS)))
+            project["PARTS"] = sorted(set(p for p in parts if p in COMPOSED_PARTS))
+        elif value and not (REPO_RE if key == "REPO" else TEAM_RE).match(value):
+            problems.append("%s line %d: %s must be %s" % (where, n, key, "OWNER/NAME" if key == "REPO" else
+                                                            "a team key: 1 to 10 capital letters or digits"))
+        else:
+            project[key] = value
+        seen.add(key)
+    if not project["REPO"] and not project["TEAM_KEY"]:
+        problems.append("%s names neither a REPO nor a TEAM_KEY" % where)
+    return project, problems
+
+
+def entry_problem(entry, path):
+    """Why an entry in projects/ is not a project's file, or None."""
+    stem = entry[:-len(".conf")] if entry.endswith(".conf") else ""
+    if not PROJECT_NAME_RE.match(stem) or os.path.islink(path) or not os.path.isfile(path):
+        return ("projects/%s is not a project's file: a plain <name>.conf, the name in lower-case letters, "
+                "digits and dashes" % entry)
+    return None
+
+
+def duplicate_problems(projects):
+    """Two projects that name the same REPO or the same TEAM_KEY."""
+    out = []
+    for key in ("REPO", "TEAM_KEY"):
+        owners = {}
+        for name in sorted(projects):
+            if projects[name][key]:
+                owners.setdefault(projects[name][key], []).append(name)
+        out += ["the projects %s name the same %s" % (" and ".join(names), key)
+                for _value, names in sorted(owners.items()) if len(names) > 1]
+    return out
+
+
+def read_projects(pdir):
+    """({name: project}, problems) from projects/. Raises OSError or ValueError when a file cannot be read."""
+    projects, problems = {}, []
+    if not os.path.isdir(pdir) or os.path.islink(pdir):
+        return projects, ["projects is not a folder"]
+    for entry in sorted(os.listdir(pdir)):
+        path = os.path.join(pdir, entry)
+        why = entry_problem(entry, path)
+        if why:
+            problems.append(why)
+            continue
+        text = read_text(path)
+        problems += ["projects/%s %s" % (entry, p) for p in secret_problems(text)]
+        project, found = parse_project(entry[:-len(".conf")], text)
+        projects[entry[:-len(".conf")]] = project
+        problems += found
+    return projects, problems + duplicate_problems(projects)
+
+
+def composed(projects, entry):
+    """(a part's list, the projects in it): every project the part covers that has what the list takes."""
+    part, _file, _key, kind = entry
+    items, names = [], []
+    for name in sorted(projects):
+        p = projects[name]
+        if part not in p["PARTS"]:
+            continue
+        item = p["REPO"] if kind == "repo" else p["TEAM_KEY"] if kind == "team" else (
+            "%s=%s" % (p["TEAM_KEY"], p["REPO"]) if p["TEAM_KEY"] and p["REPO"] else "")
+        if item and item not in items:
+            items.append(item)
+            names.append(name)
+    return items, names
+
+
+def as_list(value):
+    return sorted(x.strip() for x in (value or "").split(",") if x.strip())
+
+
+def same_value(name, key, have, want):
+    """A list key is the same when it holds the same items, in any order; any other key, the same text."""
+    if (name, key) in LIST_KEYS:
+        return as_list(have) == as_list(want)
+    return have == want
 
 
 # --------------------------------------------------------------------------- #
@@ -434,14 +580,17 @@ def tree_problems(top, uid):
 
 
 def overrides(folder):
-    """Notes: a part's own value that stops a shared one reaching that file."""
+    """Notes: a part's own value that stops a shared one, or the projects, reaching that file."""
     out = []
     for entry in MAP:
         if entry[0] in folder.shared:
             for name, key in targets(entry):
-                if key in folder.parts.get(name, {}):
+                if own_wins(folder.parts.get(name, {}), key):
                     out.append("%s sets %s itself, so the shared %s does not reach it there"
                                % (name, key, entry[0]))
+    for entry in COMPOSED:
+        if own_wins(folder.parts.get(entry[1], {}), entry[2]) and composed(folder.projects, entry)[0]:
+            out.append("%s sets %s itself, so the projects do not reach it there" % (entry[1], entry[2]))
     return out
 
 
@@ -463,7 +612,12 @@ def load(settings_dir, kit, uid, stop=None):
     text = read_text(machine)
     problems += secret_problems(text)
     folder, parse = parse_machine(text, kit)
-    return "read", folder, problems + parse, overrides(folder)
+    problems += parse
+    pdir = os.path.join(settings_dir, PROJECTS)
+    if os.path.lexists(pdir):
+        folder.projects, found = read_projects(pdir)
+        problems += found
+    return "read", folder, problems, overrides(folder)
 
 
 # --------------------------------------------------------------------------- #
@@ -486,14 +640,29 @@ def part_path(folder, kit, name):
         os.path.join(kit.root, name), "this kit folder")
 
 
+def own_wins(own, key):
+    """A key a part's own section sets is that part's, whatever [shared] or the projects say."""
+    return key in own
+
+
+def feeds(items):
+    """A list key is written only when some project gives it an item: one no project covers stays as it is."""
+    return bool(items)
+
+
 def part_values(folder, name):
-    """[(key, value, from)] the folder gives one part file. Its own section wins over [shared]."""
+    """[(key, value, from)] the folder gives one part file: [shared], the projects' lists, its own section."""
     own, out = folder.parts.get(name, {}), []
     for entry in MAP:
         if entry[0] in folder.shared:
             for file_name, key in targets(entry):
-                if file_name == name and key not in own:
+                if file_name == name and not own_wins(own, key):
                     out.append((key, folder.shared[entry[0]], "[shared] " + entry[0]))
+    for entry in COMPOSED:
+        if entry[1] == name and not own_wins(own, entry[2]):
+            items, names = composed(folder.projects, entry)
+            if feeds(items):
+                out.append((entry[2], ",".join(items), "projects: " + ", ".join(names)))
     out += [(key, value, "[%s]" % name) for key, value in own.items()]
     return out
 
@@ -540,7 +709,7 @@ def plan_file(folder, kit, name, uid):
         return plan
     have, plan.new = conf_values(plan.old), plan.old
     for key, value, src in wanted:
-        if have.get(key) != value:
+        if not same_value(name, key, have.get(key), value):
             plan.new = set_line(plan.new, key, value)
             plan.changes.append((key, have.get(key), value, src))
     together = TOGETHER.get(name, ())
@@ -637,6 +806,239 @@ def shown(value):
     return "(shaped like a secret, not shown)" if hidden else value
 
 
+def put_file(path, text, mode):
+    """One whole small file of the folder's: made new beside it, then swapped in, never through a link."""
+    if os.path.islink(path):
+        raise OSError("%s is a link" % path)
+    tmp, done = "%s.new.%d" % (path, os.getpid()), False
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            os.fchmod(fh.fileno(), mode)
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        done = True
+    finally:
+        if not done:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+# --------------------------------------------------------------------------- #
+# A first run: gather what the part files already say
+# --------------------------------------------------------------------------- #
+class Gathered(object):
+    """What `gather` found: the folder it would write (machine.conf's text and each project's), what it
+    says about it, what it left in the part files, and what stops it."""
+
+    def __init__(self):
+        self.machine, self.projects, self.lines, self.left, self.stops = "", {}, [], [], []
+        self.found, self.unread = [], False
+
+
+def copy_problem(kit, name, key, value):
+    """Why a part file's line is never copied into the folder, or None."""
+    labels = secret_labels(value) if value else []
+    if value and SECRET_NAME_RE.search(key):
+        labels.append("a key named like a secret")
+    if labels:
+        return "it is shaped like %s, so it was not copied" % "; ".join(labels)
+    if (name, key) in TOOL_KEYS:
+        return "another tool writes it: %s" % TOOL_KEYS[(name, key)]
+    if key not in kit.keys[name]:
+        return "%s does not name it" % os.path.basename(kit.examples[name])
+    return None
+
+
+def agree(present, have):
+    """A value is shared only when every part file that takes it sets it, and all to the same."""
+    return len(have) == len(present) and len(set(v for _f, _k, v in have)) == 1
+
+
+def item_ok(kind, item):
+    if kind == "team=repo":
+        team, eq, repo = item.partition("=")
+        return bool(eq) and bool(TEAM_RE.match(team.strip())) and bool(REPO_RE.match(repo.strip()))
+    return bool((REPO_RE if kind == "repo" else TEAM_RE).match(item))
+
+
+def lists_match(entry, projects, value):
+    """The projects give a part's list exactly the items it holds now."""
+    return as_list(",".join(composed(projects, entry)[0])) == as_list(value)
+
+
+def slug(text):
+    return re.sub(r"-+", "-", re.sub(r"[^a-z0-9]", "-", text.lower())).strip("-")[:36] or "project"
+
+
+def unique(name, taken):
+    out, n = name, 1
+    while out in taken:
+        n += 1
+        out = "%s-%d" % (name, n)
+    return out
+
+
+def projects_from(values, g):
+    """(projects, the list keys they came from). One project per repository and one per team, joined
+    only where a file pairs them (REPO_BY_TEAM)."""
+    repos, teams, pairs, lists = {}, {}, {}, []
+    for entry in COMPOSED:
+        part, f, k, kind = entry
+        if k not in values.get(f, {}):
+            continue
+        items = [x.strip() for x in values[f][k].split(",") if x.strip()]
+        if not all(item_ok(kind, x) for x in items):
+            g.lines.append("%s %s is not a list of %s, so it stays in [%s] as it is." % (f, k, KIND_WORDS[kind], f))
+            continue
+        lists.append(entry)
+        for x in items:
+            if kind == "repo":
+                repos.setdefault(x, set()).add(part)
+            elif kind == "team":
+                teams.setdefault(x, set()).add(part)
+            else:
+                team, repo = (p.strip() for p in x.split("=", 1))
+                repos.setdefault(repo, set()).add(part)
+                teams.setdefault(team, set()).add(part)
+                if pairs.get(team, repo) != repo or repo in [r for t, r in pairs.items() if t != team]:
+                    g.lines.append("%s pairs a team or a repository twice, so %s is not joined to %s."
+                                   % (f, team, repo))
+                else:
+                    pairs[team] = repo
+    projects, team_of = {}, dict((r, t) for t, r in pairs.items())
+    for repo in sorted(repos):
+        base = slug(repo.split("/", 1)[1])
+        name = unique(slug(repo) if base in projects else base, projects)
+        team = team_of.get(repo, "")
+        projects[name] = {"REPO": repo, "TEAM_KEY": team, "PARTS": sorted(repos[repo] | teams.get(team, set()))}
+    for team in sorted(t for t in teams if t not in pairs):
+        name = unique("team-" + slug(team) if slug(team) in projects else slug(team), projects)
+        projects[name] = {"REPO": "", "TEAM_KEY": team, "PARTS": sorted(teams[team])}
+    return projects, lists
+
+
+def round_trip(kit, g, parts_dir, uid):
+    """What the gathered folder would change in the part files: [] when nothing, or each change named.
+    It is read back the way `check` and `write` read the folder."""
+    folder, out = parse_machine(g.machine, kit)
+    out = list(out) + secret_problems(g.machine)
+    for name, text in sorted(g.projects.items()):
+        folder.projects[name], found = parse_project(name, text)
+        out += found + ["projects/%s.conf %s" % (name, p) for p in secret_problems(text)]
+    out += duplicate_problems(folder.projects)
+    folder.places.setdefault("PARTS_DIR", parts_dir)
+    for name in kit.files:
+        plan = plan_file(folder, kit, name, uid)
+        if plan.state == "change":
+            out.append("it would change %s %s" % (name, ", ".join(k for k, _o, _n, _s in plan.changes)))
+        elif plan.state in ("held", "unread"):
+            out.append("%s %s" % (name, plan.why))
+    return out
+
+
+def gather(kit, parts_dir, uid):
+    """Read the part files in `parts_dir`, and work out the folder they make. Writes nothing."""
+    g, values = Gathered(), {}
+    for name in kit.files:
+        path = os.path.join(parts_dir, name)
+        try:
+            why = unsafe_part(os.lstat(path), uid)
+            text = None if why else read_text(path)
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError) as exc:
+            why, g.unread = "could not be read (%s)" % type(exc).__name__, True
+        if why:
+            g.stops.append("%s %s" % (path, why))
+            continue
+        g.found.append(name)
+        values[name] = {}
+        for key, value in conf_values(text).items():
+            why = copy_problem(kit, name, key, value)
+            if why:
+                g.left.append("%s %s: %s" % (name, key, why))
+            else:
+                values[name][key] = value
+    shared, used = {}, set()
+    for entry in MAP:
+        present = [(f, k) for f, k in targets(entry) if f in values]
+        have = [(f, k, values[f][k]) for f, k in present if k in values[f]]
+        if not have:
+            continue
+        if agree(present, have):
+            shared[entry[0]] = have[0][2]
+            used |= set((f, k) for f, k, _v in have)
+        else:
+            said = ["%s %s says %s" % (f, k, shown(v)) for f, k, v in have]
+            unset = ["%s %s" % (f, k) for f, k in present if k not in values[f]]
+            said += ["%s does not set it" % u for u in unset]
+            hint = "" if len(set(v for _f, _k, v in have)) > 1 else (
+                " They agree where they set it: to share it, put it once under [shared] and delete their "
+                "lines, and `write` then sets %s too." % " and ".join(unset))
+            g.lines.append("%s is not shared, so each file keeps its own: %s.%s" % (entry[0], "; ".join(said), hint))
+    projects, lists = projects_from(values, g)
+    for entry in lists:
+        if lists_match(entry, projects, values[entry[1]][entry[2]]):
+            used.add((entry[1], entry[2]))
+        else:
+            g.lines.append("%s %s stays in [%s] as it is: the projects would give it %s." % (
+                entry[1], entry[2], entry[1], ",".join(composed(projects, entry)[0]) or "nothing"))
+    alone = sorted(n for n, p in projects.items() if not (p["REPO"] and p["TEAM_KEY"]))
+    if [n for n in alone if projects[n]["REPO"]] and [n for n in alone if projects[n]["TEAM_KEY"]]:
+        g.lines.append("No file pairs these teams and repositories (queue.conf's REPO_BY_TEAM is the one "
+                       "that does), so each is its own project: %s. To join a team to its repository, put "
+                       "its TEAM_KEY in the repository's file and delete the team's file." % ", ".join(alone))
+    lines = ["# This Mac's pipeline settings, gathered from its part files by `gather`.",
+             "# Names, paths, numbers and switches only: never a key, token or password.", "", "[places]"]
+    if os.path.realpath(parts_dir) != os.path.realpath(kit.root):
+        lines.append("PARTS_DIR=%s" % parts_dir)
+    lines += ["", "[shared]"] + ["%s=%s" % (n, shared[n]) for n in SHARED_NAMES if n in shared]
+    for f in kit.files:
+        rest = [(k, v) for k, v in values.get(f, {}).items() if (f, k) not in used]
+        if rest:
+            lines += ["", "[%s]" % f] + ["%s=%s" % kv for kv in rest]
+    g.machine = "\n".join(lines) + "\n"
+    for name in sorted(projects):
+        p = projects[name]
+        g.projects[name] = "\n".join(
+            ["# The project %s, gathered from the part files by `gather`." % name]
+            + (["REPO=%s" % p["REPO"]] if p["REPO"] else []) + (["TEAM_KEY=%s" % p["TEAM_KEY"]] if p["TEAM_KEY"] else [])
+            + ["PARTS=%s" % " ".join(p["PARTS"])]) + "\n"
+    if g.found and not g.stops:
+        g.stops += ["the folder it gathered fails its own proof: %s" % p for p in round_trip(kit, g, parts_dir, uid)]
+    return g
+
+
+def folder_has_settings(sdir):
+    """The folder already holds settings: a KEY=value line in machine.conf, or anything in projects/."""
+    machine = os.path.join(sdir, MACHINE)
+    if os.path.lexists(machine):
+        try:
+            text = read_text(machine)
+        except (OSError, ValueError):
+            return True                          # one it cannot read is never written over
+        for raw in text.splitlines():
+            line = raw.strip()
+            if line and not line.startswith("#") and not SECTION_RE.match(line):
+                return True
+    pdir = os.path.join(sdir, PROJECTS)
+    return os.path.lexists(pdir) and (not os.path.isdir(pdir) or bool(os.listdir(pdir)))
+
+
+def said_yes(answer):
+    return (answer or "").strip() == "yes"
+
+
+def unchanged(g, again):
+    """The part files still make the folder the person read."""
+    return (g.machine, g.projects, g.stops) == (again.machine, again.projects, again.stops)
+
+
 # --------------------------------------------------------------------------- #
 # The commands
 # --------------------------------------------------------------------------- #
@@ -679,11 +1081,11 @@ def cmd_check(sdir, kit, uid, out, stop=None):
     if problems:
         out("The settings folder needs fixing: %d problem%s above." % (len(problems), "" if len(problems) == 1 else "s"))
         return EX_FIX
-    out("OK: %s is private, holds nothing shaped like a secret, and reads cleanly: %d shared value%s, "
-        "%d part section%s, %d place%s." % (
-            os.path.join(sdir, MACHINE), len(folder.shared), "" if len(folder.shared) == 1 else "s",
-            len(folder.parts), "" if len(folder.parts) == 1 else "s",
-            len(folder.places), "" if len(folder.places) == 1 else "s"))
+    def many(n, word):
+        return "%d %s%s" % (n, word, "" if n == 1 else "s")
+    out("OK: %s is private, holds nothing shaped like a secret, and reads cleanly: %s, %s, %s, %s." % (
+        sdir, many(len(folder.shared), "shared value"), many(len(folder.parts), "part section"),
+        many(len(folder.places), "place"), many(len(folder.projects), "project")))
     return EX_OK
 
 
@@ -762,7 +1164,9 @@ def template(kit):
         lines += ["# %s. Reaches %s." % (entry[1][0].upper() + entry[1][1:], ", ".join(
             "%s %s" % (f, k) for f, k in targets(entry))), "#%s=" % entry[0]]
     lines += ["", "# One section per part file, for its own values, such as [stage-e.conf] or [queue.conf].",
-              "# A key there wins over a shared value for that file."]
+              "# A key there wins over a shared value, and over the projects, for that file.", "",
+              "# Each project has its own file in projects/, such as projects/app.conf, with three lines:",
+              "# REPO=owner/name, TEAM_KEY=ABC, and PARTS= the parts that cover it (`map` lists them)."]
     return "\n".join(lines) + "\n"
 
 
@@ -780,14 +1184,76 @@ def cmd_init(sdir, kit, uid, out, stop=None):
         if not os.path.lexists(sdir):
             os.makedirs(sdir, FOLDER_MODE)
             os.chmod(sdir, FOLDER_MODE)
-        fd = os.open(machine, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, FILE_MODE)
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            os.fchmod(fh.fileno(), FILE_MODE)
-            fh.write(template(kit))
+        put_file(machine, template(kit), FILE_MODE)
     except OSError as exc:
         out("FAILED: %s could not be made (%s)." % (machine, type(exc).__name__))
         return EX_FAILED
     out("Made %s. Type each value once there, then run `check` and `write`." % machine)
+    return cmd_check(sdir, kit, uid, out, stop)
+
+
+def show_gathered(g, sdir, parts_dir, out):
+    out("Gathered from %s: %s." % (parts_dir, ", ".join(g.found) or "no part settings file"))
+    for line in g.stops:
+        out("STOP: %s." % line)
+    for line in g.lines:
+        out("NOTE: %s" % line)
+    if g.left:
+        out("Left in the part files, never copied into the folder:")
+        for line in g.left:
+            out("  %s." % line)
+    if g.found and not g.stops:
+        for path, text in [(os.path.join(sdir, MACHINE), g.machine)] + [
+                (os.path.join(sdir, PROJECTS, name + ".conf"), g.projects[name]) for name in sorted(g.projects)]:
+            out("--- %s would hold:" % path)
+            for line in text.splitlines():
+                out("    " + line)
+
+
+def cmd_gather(sdir, kit, uid, parts_dir, apply, out, ask, stop=None):
+    if folder_has_settings(sdir):
+        out("%s already holds settings, and `gather` only fills a folder that has none. Nothing was changed."
+            % sdir)
+        return EX_OK
+    repo = git_tree(sdir, stop)
+    if repo:
+        out("REFUSED: %s is inside a git working tree (%s). Settings never go in a repository. Nothing was "
+            "written." % (sdir, repo))
+        return EX_FIX
+    g = gather(kit, parts_dir, uid)
+    show_gathered(g, sdir, parts_dir, out)
+    if g.stops:
+        out("Nothing was written: fix what is named above first.")
+        return EX_UNREAD if g.unread else EX_FIX
+    if not g.found:
+        out("No part settings files in %s, so there is nothing to gather. `init` makes an empty folder."
+            % parts_dir)
+        return EX_OK
+    if not apply:
+        out("Nothing was written. `gather --apply` writes it, after your yes.")
+        return EX_WAITING
+    if not said_yes(ask("Write this to %s? Type yes: " % sdir)):
+        out("Nothing was written.")
+        return EX_WAITING
+    if not unchanged(g, gather(kit, parts_dir, uid)) or folder_has_settings(sdir):
+        out("The part files or the folder changed while you read this. Nothing was written. Run gather again.")
+        return EX_FIX
+    try:
+        if not os.path.lexists(sdir):
+            os.makedirs(sdir, FOLDER_MODE)
+            os.chmod(sdir, FOLDER_MODE)
+        put_file(os.path.join(sdir, MACHINE), g.machine, FILE_MODE)
+        pdir = os.path.join(sdir, PROJECTS)
+        if g.projects and not os.path.lexists(pdir):
+            os.mkdir(pdir, FOLDER_MODE)
+            os.chmod(pdir, FOLDER_MODE)
+        for name in sorted(g.projects):
+            put_file(os.path.join(pdir, name + ".conf"), g.projects[name], FILE_MODE)
+    except OSError as exc:
+        out("FAILED: the folder could not be written (%s). Check %s by hand." % (type(exc).__name__, sdir))
+        return EX_FAILED
+    out("Wrote %s and %d project file%s." % (os.path.join(sdir, MACHINE), len(g.projects),
+                                             "" if len(g.projects) == 1 else "s"))
     return cmd_check(sdir, kit, uid, out, stop)
 
 
@@ -823,19 +1289,24 @@ def cmd_map(kit, out):
     for entry in MAP:
         out("%s: %s." % (entry[0], entry[1]))
         out("  written to: %s." % ", ".join("%s %s" % (f, k) for f, k in targets(entry)))
+    out("From the projects' files (PARTS names the part; each project gives its REPO, its TEAM_KEY, or both):")
+    for part, f, k, kind in COMPOSED:
+        out("  %s %s: the %s of every project %s covers." % (f, k, KIND_WORDS[kind], part))
     out("A key in a part file's own section ([stage-e.conf] and the rest) wins over these for that file.")
     return EX_OK
 
 
-def main(argv=None, environ=None, out=print, uid=None, kit_root=KIT, stop=None):
+def main(argv=None, environ=None, out=print, uid=None, kit_root=KIT, stop=None, ask=input):
     ap = argparse.ArgumentParser(description="The pipeline's settings, in one folder on this Mac.")
     ap.add_argument("--selftest", action="store_true")
     sub = ap.add_subparsers(dest="cmd")
-    for name in ("where", "init", "check", "write"):
+    for name in ("where", "init", "gather", "check", "write"):
         p = sub.add_parser(name)
         p.add_argument("--settings-dir")
-        if name == "write":
+        if name in ("write", "gather"):
             p.add_argument("--apply", action="store_true")
+        if name == "gather":
+            p.add_argument("--parts-dir", help="where the part files are (default: this kit folder)")
     sub.add_parser("map")
     args = ap.parse_args(argv)
     if args.selftest:
@@ -846,8 +1317,8 @@ def main(argv=None, environ=None, out=print, uid=None, kit_root=KIT, stop=None):
         return EX_FIX
     environ = os.environ if environ is None else environ
     uid = os.getuid() if uid is None else uid
-    writes = args.cmd == "init" or (args.cmd == "write" and args.apply)
-    if writes and refused("%s%s" % (args.cmd, " --apply" if args.cmd == "write" else ""), environ, uid, out):
+    writes = args.cmd == "init" or (args.cmd in ("write", "gather") and args.apply)
+    if writes and refused("%s%s" % (args.cmd, " --apply" if args.cmd != "init" else ""), environ, uid, out):
         return EX_REFUSED
     try:
         kit = Kit(kit_root)
@@ -866,6 +1337,9 @@ def main(argv=None, environ=None, out=print, uid=None, kit_root=KIT, stop=None):
             return cmd_where(sdir, source, kit, uid, out, stop)
         if args.cmd == "init":
             return cmd_init(sdir, kit, uid, out, stop)
+        if args.cmd == "gather":
+            parts_dir = os.path.abspath(os.path.expanduser(args.parts_dir)) if args.parts_dir else kit.root
+            return cmd_gather(sdir, kit, uid, parts_dir, args.apply, out, ask, stop)
         if args.cmd == "check":
             return cmd_check(sdir, kit, uid, out, stop)
         return cmd_write(sdir, kit, uid, args.apply, out, stop)
@@ -902,7 +1376,7 @@ def battery():
     def run(*argv, **kw):
         said = []
         code = main(list(argv), environ=kw.get("environ", {}), out=said.append, uid=kw.get("uid", me),
-                    stop=stop)
+                    stop=stop, ask=kw.get("ask", lambda prompt: ""))
         return code, said
 
     def put(path, text, mode=0o600):
@@ -1226,6 +1700,189 @@ def battery():
     check("map runs anywhere and lists every shared value",
           len([s for s in run("map")[1] if re.match(r"^[A-Z0-9_]+: ", s)]), len(MAP))
 
+    # 14. One file per project, composed into each part's list keys.
+    for name in kit.files:
+        put(os.path.join(parts, name), get(kit.examples[name]))
+    pdir = os.path.join(sdir, PROJECTS)
+    os.makedirs(pdir, 0o700, exist_ok=True)
+    os.chmod(pdir, 0o700)
+
+    def project(name, body):
+        put(os.path.join(pdir, name + ".conf"), body)
+
+    def now(name):
+        return conf_values(get(os.path.join(parts, name)))
+    settings("")
+    project("app", "REPO=acme/app\nTEAM_KEY=ENG\nPARTS=review work-queue tech-lead\n")
+    project("web", "REPO=acme/web\nTEAM_KEY=WEB\nPARTS=review\n")
+    code, said = run("check", *sd)
+    check("project files pass check, and are counted", (code, any("2 projects" in s for s in said)), (EX_OK, True))
+    run("write", "--apply", *sd)
+    check("each part's list is the projects it covers",
+          (as_list(now("stage-e.conf")["REVIEW_REPOS"]), as_list(now("stage-e.conf")["MANAGED_TEAM_KEYS"]),
+           as_list(now("queue.conf")["TEAM_KEYS"]), as_list(now("queue.conf")["REPO_BY_TEAM"]),
+           as_list(now("bridge.conf")["TEAM_KEYS"])),
+          (["acme/app", "acme/web"], ["ENG", "WEB"], ["ENG"], ["ENG=acme/app"], ["ENG"]))
+    check("a list key no project covers is left as it is", (now("stage-a.conf")["PLANNED_REPOS"],
+          now("notifier.conf")["TEAM_KEYS"]), (conf_values(get(kit.examples["stage-a.conf"]))["PLANNED_REPOS"],
+                                               conf_values(get(kit.examples["notifier.conf"]))["TEAM_KEYS"]))
+    stage_e = os.path.join(parts, "stage-e.conf")
+    put(stage_e, get(stage_e).replace("REVIEW_REPOS=" + now("stage-e.conf")["REVIEW_REPOS"],
+                                      "REVIEW_REPOS=acme/web , acme/app"))
+    check("a list in another order is no change", run("write", *sd)[0], EX_OK)
+    settings("[stage-e.conf]\nREVIEW_REPOS=acme/only\n")
+    check("check says where a part's own list stops the projects", any(
+        "stage-e.conf sets REVIEW_REPOS itself, so the projects do not reach it there" in s
+        for s in run("check", *sd)[1]), True)
+    run("write", "--apply", *sd)
+    check("…and that own list is what is written", now("stage-e.conf")["REVIEW_REPOS"], "acme/only")
+    settings("")
+    for body, words in (("REPO=acme/x\nOTHER=x\nPARTS=review\n", "holds only REPO, TEAM_KEY and PARTS"),
+                        ("REPO=not a repo\nPARTS=review\n", "REPO must be OWNER/NAME"),
+                        ("TEAM_KEY=eng\nPARTS=review\n", "TEAM_KEY must be a team key"),
+                        ("REPO=acme/x\nPARTS=review status\n", "takes no list from a project"),
+                        ("PARTS=review\n", "names neither a REPO nor a TEAM_KEY"),
+                        ("REPO=acme/x\nREPO=acme/y\nPARTS=review\n", "REPO is set twice")):
+        project("bad", body)
+        code, said = run("check", *sd)
+        check("check refuses a project file: %s" % words, (code, any(words in s for s in said)), (EX_FIX, True))
+    os.remove(os.path.join(pdir, "bad.conf"))
+    project("app2", "REPO=acme/app\nPARTS=review\n")
+    check("two projects that name one REPO are refused",
+          any("name the same REPO" in s for s in run("check", *sd)[1]), True)
+    os.remove(os.path.join(pdir, "app2.conf"))
+    put(os.path.join(pdir, "Notes.txt"), "x\n")
+    check("a file in projects/ that is not a project's is refused",
+          any("projects/Notes.txt is not a project's file" in s for s in run("check", *sd)[1]), True)
+    os.remove(os.path.join(pdir, "Notes.txt"))
+    project("leak", "REPO=acme/leak\nPARTS=review\n# %s\n" % samples[1])
+    said = run("check", *sd)[1]
+    check("a secret in a project's file is refused, and never shown",
+          (any("projects/leak.conf" in s and "shaped like" in s for s in said), any(samples[1] in s for s in said)),
+          (True, False))
+    os.remove(os.path.join(pdir, "leak.conf"))
+    check("map lists the keys the projects fill",
+          len([s for s in run("map")[1] if "of every project" in s]), len(COMPOSED))
+
+    # 15. A first run: gather what the part files say, show it, and write nothing until a yes.
+    gparts, gdir = os.path.join(tmp, "gparts"), os.path.join(tmp, "gathered")
+    os.makedirs(gparts)
+
+    def fill(name, folder=gparts, **values):
+        text = get(kit.examples[name])
+        for key, value in values.items():
+            text = set_line(text, key, value)
+        put(os.path.join(folder, name), text)
+    pipe = {"ROLE_ACCOUNT": "_pipe"}
+    for name in kit.files:
+        if name not in ("chat-lane.conf", "conflict-waker.conf"):
+            fill(name, **pipe)
+    fill("stage-a.conf", ROLE_ACCOUNT="_pipe", DISPATCHER_ACCOUNT="_pipe", PLANNED_REPOS="acme/app")
+    fill("stage-e.conf", ROLE_ACCOUNT="_pipe", REVIEW_REPOS="acme/app,acme/kit", MANAGED_TEAM_KEYS="ENG,KIT",
+         GITHUB_APP_LOGIN=samples[0], OLD_KEY="x", OLD_API_TOKEN="abc")
+    fill("queue.conf", ROLE_ACCOUNT="_pipe", TEAM_KEYS="ENG,WEB", REPO_BY_TEAM="ENG=acme/app")
+    fill("bridge.conf", ROLE_ACCOUNT="_pipe", TEAM_KEYS="ENG", APP_NAME="Rex")
+    fill("notifier.conf", ROLE_ACCOUNT="_pipe", TEAM_KEYS="KIT")
+    fill("sweep.conf", ROLE_ACCOUNT="_pipe", TEAM_KEYS="ENG,KIT")
+    fill("watcher.conf", ROLE_ACCOUNT="_pipe", WATCH_REPOS="acme/app")
+    fill("acceptance.conf", ROLE_ACCOUNT="_pipe", ACCEPTANCE_REPOS="acme/app")
+    fill("update.conf", ROLE_ACCOUNT="_pipe", DISPATCHER_PORT="3999")
+    gsd = ("--settings-dir", gdir, "--parts-dir", gparts)
+
+    def block(said, path):              # the lines gather shows for one file it would write
+        out, on = [], False
+        for s in said:
+            if s.startswith("--- "):
+                on = s == "--- %s would hold:" % path
+            elif on and s.startswith("    "):
+                out.append(s[4:])
+        return out
+    before = snapshot(gparts)
+    code, said = run("gather", *gsd)
+    text = "\n".join(said)
+    check("gather shows what it would make, and writes nothing", (code, os.path.lexists(gdir), snapshot(gparts) == before),
+          (EX_WAITING, False, True))
+    machine_shown = block(said, os.path.join(gdir, MACHINE))
+    check("…a value every part file sets the same is shared once", "ROLE_ACCOUNT=_pipe" in machine_shown, True)
+    check("…one the files disagree on stays each file's, and the disagreement is said",
+          ("DISPATCHER_PORT is not shared" in text, "DISPATCHER_PORT=3999" in machine_shown), (True, True))
+    check("…one a file does not set is not shared either, and it says how to share it", (
+        "bridge.conf ENV_FILE does not set it" in text, "put it once under [shared]" in text), (True, True))
+    check("…the queue's pair is one project, with its repository and its team",
+          block(said, os.path.join(gdir, PROJECTS, "app.conf"))[1:],
+          ["REPO=acme/app", "TEAM_KEY=ENG", "PARTS=acceptance-check cleanup idea-gate review tech-lead watcher work-queue"])
+    check("…a team and a repository no file pairs are each their own project, and it says how to join them",
+          (block(said, os.path.join(gdir, PROJECTS, "kit.conf"))[1:],
+           block(said, os.path.join(gdir, PROJECTS, "team-kit.conf"))[1:], "No file pairs these teams" in text),
+          (["REPO=acme/kit", "PARTS=review"], ["TEAM_KEY=KIT", "PARTS=cleanup paging review"], True))
+    check("…the list keys the projects give are not also kept in a section",
+          [s for s in machine_shown if s.split("=")[0] in ("REVIEW_REPOS", "MANAGED_TEAM_KEYS", "REPO_BY_TEAM")], [])
+    check("…a value shaped like a secret is never copied, and is named", (
+        "stage-e.conf GITHUB_APP_LOGIN: it is shaped like" in text, samples[0] in text,
+        "stage-e.conf OLD_API_TOKEN: it is shaped like a key named like a secret" in text), (True, False, True))
+    check("…a key another tool writes stays in its file, and is named",
+          ("bridge.conf APP_NAME: another tool writes it" in text, [s for s in machine_shown if "Rex" in s]),
+          (True, []))
+    check("…a key the example does not name stays in its file, and is named",
+          "stage-e.conf OLD_KEY: stage-e.conf.example does not name it" in text, True)
+    check("gather --apply without a yes writes nothing",
+          (run("gather", "--apply", *gsd, ask=lambda p: "no")[0], os.path.lexists(gdir)), (EX_WAITING, False))
+    for env, uid in (({"CLAUDECODE": ""}, me), ({}, 0)):
+        check("gather --apply is refused in a session, and as root (%s)" % (uid or "session"),
+              (run("gather", "--apply", *gsd, environ=env, uid=uid, ask=lambda p: "yes")[0], os.path.lexists(gdir)),
+              (EX_REFUSED, False))
+    def mode_of(path):                  # None for a path that is not there, so a case fails, never crashes
+        return oct(stat.S_IMODE(os.stat(path).st_mode)) if os.path.exists(path) else None
+    code, said = run("gather", "--apply", *gsd, ask=lambda p: "yes")
+    check("with the yes it writes the folder, private, and the folder passes check", (
+        code, mode_of(gdir), mode_of(os.path.join(gdir, MACHINE)), mode_of(os.path.join(gdir, PROJECTS)),
+        sorted(os.listdir(os.path.join(gdir, PROJECTS))) if os.path.isdir(os.path.join(gdir, PROJECTS)) else None),
+        (EX_OK, "0o700", "0o600", "0o700", ["app.conf", "kit.conf", "team-kit.conf", "web.conf"]))
+    check("…and write then finds nothing to change: the folder says what the part files say",
+          (run("write", "--settings-dir", gdir)[0], snapshot(gparts) == before), (EX_OK, True))
+    if os.path.isdir(gdir):
+        with open(os.path.join(gdir, MACHINE), "a", encoding="utf-8") as fh:
+            fh.write("# a line of the person's own, which a second gather must not lose\n")
+    kept = get(os.path.join(gdir, MACHINE)) if os.path.exists(os.path.join(gdir, MACHINE)) else None
+    code = run("gather", "--apply", *gsd, ask=lambda p: "yes")[0]
+    check("gather never fills a folder that already holds settings", (code, get(os.path.join(gdir, MACHINE))
+          if os.path.exists(os.path.join(gdir, MACHINE)) else None), (EX_OK, kept if kept else "a filled folder"))
+    tdir = os.path.join(tmp, "fresh")
+    run("init", "--settings-dir", tdir)
+    check("…but it fills one that init made and nobody filled",
+          run("gather", "--apply", "--settings-dir", tdir, "--parts-dir", gparts, ask=lambda p: "yes")[0], EX_OK)
+    fill("stage-e.conf", ROLE_ACCOUNT="_pipe", REVIEW_REPOS="acme/kit", MANAGED_TEAM_KEYS="ENG,KIT")
+    code, said = run("gather", "--settings-dir", os.path.join(tmp, "g3"), "--parts-dir", gparts)
+    check("a list the projects would not give exactly stays in its section as it is", (
+        code, any("stage-e.conf REVIEW_REPOS stays in [stage-e.conf] as it is" in s for s in said),
+        "REVIEW_REPOS=acme/kit" in block(said, os.path.join(tmp, "g3", MACHINE))), (EX_WAITING, True, True))
+
+    def edit_then_yes(prompt):          # a part file changes while the person reads
+        fill("sweep.conf", ROLE_ACCOUNT="_pipe", TEAM_KEYS="ENG,KIT", SWEEP_IDLE_DAYS="9")
+        return "yes"
+    check("a part file that changes before the yes stops the write",
+          (run("gather", "--apply", "--settings-dir", os.path.join(tmp, "g4"), "--parts-dir", gparts,
+               ask=edit_then_yes)[0], os.path.lexists(os.path.join(tmp, "g4", MACHINE))), (EX_FIX, False))
+    lparts = os.path.join(tmp, "lparts")
+    os.makedirs(lparts)
+    fill("queue.conf", folder=lparts, **pipe)
+    os.symlink(os.path.join(gparts, "sweep.conf"), os.path.join(lparts, "sweep.conf"))
+    code, said = run("gather", "--settings-dir", os.path.join(tmp, "g5"), "--parts-dir", lparts)
+    check("a part file that is a link stops the gather", (code, any(s.startswith("STOP:") and "link" in s for s in said)),
+          (EX_FIX, True))
+    real_agree = globals()["agree"]
+    globals()["agree"] = lambda present, have: bool(have)         # a gather that shares what the files disagree on
+    try:
+        code, said = run("gather", "--settings-dir", os.path.join(tmp, "g6"), "--parts-dir", gparts)
+    finally:
+        globals()["agree"] = real_agree
+    check("a gathered folder that would change a part file is stopped before it is shown",
+          (code, any("fails its own proof: it would change" in s for s in said)), (EX_FIX, True))
+    empty = os.path.join(tmp, "noparts")
+    os.makedirs(empty)
+    check("no part file at all: nothing to gather, said",
+          run("gather", "--settings-dir", os.path.join(tmp, "g7"), "--parts-dir", empty)[0], EX_OK)
+
     # 13. What it never does.
     with open(os.path.abspath(__file__), encoding="utf-8") as fh:
         src = fh.read()
@@ -1233,8 +1890,8 @@ def battery():
     banned = ("subprocess", "os.system", "Popen", "socket", "urlopen", "sudo", "launchctl", "exec(", "eval(")
     check("it starts no process, opens no connection and calls no installer",
           [b for b in banned if b in above], [])
-    check("a part file is only ever written through apply_plan, and machine.conf only by init",
-          (above.count("os.replace("), above.count("O_CREAT")), (1, 2))
+    check("a part file is only ever written through apply_plan, and the folder's files through put_file",
+          (above.count("os.replace("), above.count("O_CREAT")), (2, 2))
     remove_tree(tmp)
     return failures, total[0]
 
@@ -1261,22 +1918,29 @@ def selftest():
         finally:
             globals().update(saved)
 
-    def shared_too(folder, name):        # part_values without "a part's own value wins"
-        out = []
-        for entry in MAP:
-            if entry[0] in folder.shared:
-                out += [(k, folder.shared[entry[0]], "[shared] " + entry[0]) for f, k in targets(entry) if f == name]
-        return out + [(k, v, "[%s]" % name) for k, v in folder.parts.get(name, {}).items()]
-
     def crlf_lost(text, key, value):
         return o["set_line"](text, key, value).replace("\r\n", "\n")
+
+    def every_part(projects, entry):    # composed() as though each project named every part
+        return o["composed"](dict((n, dict(p, PARTS=list(COMPOSED_PARTS))) for n, p in projects.items()), entry)
+
+    def unpaired(values, g):            # projects_from() that never joins a team to its repository
+        projects, lists = o["projects_from"](values, g)
+        out = {}
+        for n, p in projects.items():
+            if p["REPO"] and p["TEAM_KEY"]:
+                out[n] = dict(p, TEAM_KEY="")
+                out["team-" + n] = dict(p, REPO="")
+            else:
+                out[n] = p
+        return out, lists
 
     mutants = (
         ("the folder's place ignores %s" % DIR_ENV,
          dict(settings_dir_of=lambda flag, environ: o["settings_dir_of"](flag, {}))),
         ("a shared value misses the last part file it reaches",
          dict(targets=lambda entry: o["targets"](entry)[:-1])),
-        ("a part's own value no longer stops the shared one", dict(part_values=shared_too)),
+        ("a part's own value no longer stops the shared one or the projects", dict(own_wins=lambda own, key: False)),
         ("check no longer says where a part's own value wins", dict(overrides=lambda folder: [])),
         ("write without --apply writes",
          dict(cmd_write=lambda sdir, kit, uid, apply, out, stop=None: o["cmd_write"](sdir, kit, uid, True, out, stop))),
@@ -1307,6 +1971,24 @@ def selftest():
         ("an unknown key passes", dict(key_problem=lambda kit, section, key: None)),
         ("another tool's key is kept in the folder", dict(TOOL_KEYS={})),
         ("update.conf's three dispatcher values may split", dict(TOGETHER={})),
+        ("a part's list takes projects it does not cover", dict(composed=every_part)),
+        ("a list in another order reads as a change", dict(same_value=lambda name, key, have, want: have == want)),
+        ("a list key no project covers is written empty", dict(feeds=lambda items: True)),
+        ("a project file's own rules pass anything",
+         dict(parse_project=lambda name, text: (o["parse_project"](name, text)[0], []))),
+        ("two projects may name one repository", dict(duplicate_problems=lambda projects: [])),
+        ("any file in projects/ is read as a project", dict(entry_problem=lambda entry, path: None)),
+        ("gather copies whatever a part file says", dict(copy_problem=lambda kit, name, key, value: None)),
+        ("gather shares a value the files disagree on", dict(agree=lambda present, have: bool(have))),
+        ("gather never joins a team to its repository", dict(projects_from=unpaired)),
+        ("gather drops a list the projects would not give exactly", dict(lists_match=lambda *a: True)),
+        ("gather skips its own proof", dict(round_trip=lambda *a: [])),
+        ("gather writes over a folder that holds settings", dict(folder_has_settings=lambda sdir: False)),
+        ("gather writes without --apply",
+         dict(cmd_gather=lambda sdir, kit, uid, parts_dir, apply, out, ask, stop=None: o["cmd_gather"](
+             sdir, kit, uid, parts_dir, True, out, lambda prompt: "yes", stop))),
+        ("gather takes any answer for a yes", dict(said_yes=lambda answer: True)),
+        ("gather writes what the part files said before they changed", dict(unchanged=lambda g, again: True)),
     )
     missed = [label for label, patched in mutants if not caught(**patched)]
     whole, again = battery()
