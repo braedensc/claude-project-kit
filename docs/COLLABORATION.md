@@ -317,7 +317,8 @@ twice on doc-tail merges before these rules existed:
 
    That is a LaunchAgent, not a loop in a terminal. It writes a heartbeat every pass,
    and `verify` reports a stale one as **not running**. It stops at one card: read the
-   dry-run count and sign it off. It takes only a worktree **your own Claude Code
+   dry-run count and sign it off. The sign-off holds only for the settings that dry run
+   ran with. Change one later and `run` asks again, naming it. It takes only a worktree **your own Claude Code
    worked in**. A dispatcher's PR never qualifies; the bounce driver re-prompts that
    session in its own thread. Each session is capped (`MAX_BUDGET_USD`, `TIMEOUT_MIN`),
    and so is each pass (`MAX_SESSIONS_PER_PASS`). Three automated attempts per PR, and

@@ -2594,7 +2594,8 @@ Then run the installer as usual. Its `conflict-waker` step does the rest, as **y
 1. clones the waker's code to `~/.pr-conflict-waker/code`, level with origin;
 2. writes `~/Library/LaunchAgents/<LABEL>.plist` (no `sudo`, no role account);
 3. runs the waker's own dry run with the job's exact arguments;
-4. stops at **CK-8**: read the `would wake [...]` count and sign it off;
+4. stops at **CK-8**: read the `would wake [...]` count and sign it off. The sign-off holds
+   only for the settings that dry run ran with, so a later change to one asks again;
 5. loads the job and waits for its first heartbeat.
 
 Don't want it on this machine? Set `CONFLICT_WAKER_CONF=off`. The step then says **OFF**
