@@ -3290,7 +3290,7 @@ One JSON file, written whole by `ask()`, mode 0600.
 | `project` | a key of the runner's `projects` | Which repository. |
 | `ticket` | ticket id | The ticket the session is for. |
 | `run` | `run-` and 32 hex characters, or null | The run to resume or stop. Null for a start. |
-| `text` | text of 1 to 20000 characters, or null | A resume's words, or a start's facts, written by the caller's own code (KIT-858). A resume must carry it, a start may, and a stop never does. A review's start may carry 150000: its facts hold the diff (KIT-644). |
+| `text` | text of 1 to 20000 characters, or null | A resume's words, or a start's facts, written by the caller's own code (KIT-858). A resume must carry it, a start may, and a stop never does. A review's start must carry it, up to 150000: its facts hold the diff (KIT-644). |
 | `tier` | `standard` \| `guarded`; absent for any other request | A review's start must say it (KIT-644): `guarded` is a change to a guarded path, which runs on the runner's `guarded_model` (KIT-418). |
 
 **Who may ask, each for its own kinds.**
@@ -3306,7 +3306,9 @@ One JSON file, written whole by `ask()`, mode 0600.
 A caller may start, resume and stop only its own kinds. A `fix` or `conflict` is never a start.
 A request is written as UTF-8, not ASCII escapes, so the largest review's request still fits the
 store's 1 MiB document limit. A caller may withdraw its own request while it still waits
-(`withdraw()`); the runner skips a request whose file is gone when it comes to it.
+(`withdraw()`). The runner holds a lock on a request's file while it judges and answers it, and a
+withdrawal takes the same lock without waiting: it lands before the runner comes to the request,
+which then gets no answer, or it is refused, and the caller reads the run.
 
 **The caller's word is not the authority.** Before anything starts, the runner reads the ticket and
 its whole history from the tracker. It needs the owner's own move into one of the kind's approved

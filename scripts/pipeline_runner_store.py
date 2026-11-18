@@ -39,7 +39,9 @@ REVIEW_TEXT_MAX characters since they hold the diff, and says its tier: `standar
 a change to a guarded path, which gets the stronger model. The job chooses the request's id
 (new_request_id) and records it before ask() writes the request, so a crash between the two never
 asks twice; ask() refuses an id it has seen. A request still waiting can be withdrawn by its caller
-(withdraw). A request is written without ASCII escapes, so the largest still fits DOC_MAX.
+(withdraw). The runner holds a lock on a request's file while it judges and answers it (claimed), and
+a withdrawal takes the same lock without waiting: so it lands before the runner comes to the request,
+which is then skipped, or it is refused and the caller reads the run. A request is written without ASCII escapes, so the largest still fits DOC_MAX.
 
 TEXT AND THE FINAL MESSAGE (KIT-858).  A resume carries its text, and a start may carry one too: the
 facts its caller's own code wrote, which the runner hands the session fenced as data, after the
@@ -58,6 +60,8 @@ the runs folder cannot be listed, and names each record it could not read.
 
 Standard library only. It starts no process and opens no socket.
 """
+import contextlib
+import fcntl
 import json
 import os
 import re
@@ -214,7 +218,9 @@ def request_problems(doc):
         if not text_ok:
             bad.append("a resume carries its text, at most %d characters" % TEXT_MAX)
     elif doc["action"] == "start":
-        if doc["text"] is not None and not text_ok:      # KIT-858: a start's facts, when it has any
+        if review_start and not text_ok:                 # KIT-644: a review's facts are its review
+            bad.append("a review's start carries its facts, 1 to %d characters" % most)
+        elif doc["text"] is not None and not text_ok:    # KIT-858: a start's facts, when it has any
             bad.append("a start's text, when it carries one, is 1 to %d characters" % most)
     elif doc["text"] is not None:
         bad.append("a stop carries no text")
@@ -420,17 +426,53 @@ def ask(store, caller, action, kind, project, ticket, run=None, text=None, now=N
 
 def withdraw(store, request_id):
     """Take back a request the runner has not taken (KIT-644): True when it was waiting and is now
-    gone, False when it was taken already or was never there. The runner skips a request whose
-    file is gone by the time it comes to it."""
+    gone, False when it was taken already, is being judged this moment, or was never there. It
+    takes the lock the runner holds while it judges and answers a request (claimed), without
+    waiting, so a withdrawal and a start can never both happen."""
     if not (isinstance(request_id, str) and REQUEST_RE.match(request_id)):
         raise ValueError("not a request id")
-    if os.path.lexists(os.path.join(store, "taken", request_id + ".json")):
+    path = os.path.join(store, "requests", request_id + ".json")
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
         return False
     try:
-        os.unlink(os.path.join(store, "requests", request_id + ".json"))
-    except FileNotFoundError:
-        return False
-    return True
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return False                    # the runner is judging it this moment
+        if os.path.lexists(os.path.join(store, "taken", request_id + ".json")):
+            return False
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            return False
+        return True
+    finally:
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def claimed(store, request_id):
+    """The runner's hold on one waiting request while it judges and answers it (KIT-644): True
+    while the request is still there, held so that its caller cannot withdraw it meanwhile; False
+    when it is gone, withdrawn before the runner came to it. A lock on the file itself, which a
+    runner that dies lets go of."""
+    path = os.path.join(store, "requests", request_id + ".json")
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        yield False
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            there = os.fstat(fd).st_ino == os.lstat(path).st_ino
+        except OSError:
+            there = False
+        yield there
+    finally:
+        os.close(fd)
 
 
 def pending(store):
@@ -910,6 +952,9 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                                     request_problems(dict((k, v) for k, v in review.items() if k != "tier")),
                                     request_problems(dict(review, tier="strong"))),
            (["a review's start says its tier: standard or guarded"],) * 3)
+    expect("a review's start with no facts is refused: a run with none could only answer blocked",
+           request_problems(dict(review, text=None)),
+           ["a review's start carries its facts, 1 to %d characters" % REVIEW_TEXT_MAX])
     expect("only a review's start says a tier",
            request_problems(dict(doc, tier="standard")), ["only a review's start says a tier"])
     expect("a request written before tiers holds none, and is still well formed",
@@ -918,7 +963,7 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
            (request_problems(dict(review, text="x" * REVIEW_TEXT_MAX)),
             request_problems(dict(review, text="x" * (REVIEW_TEXT_MAX + 1))),
             request_problems(dict(doc, caller="planner", kind="plan", text="x" * (TEXT_MAX + 1)))),
-           ([], ["a start's text, when it carries one, is 1 to %d characters" % REVIEW_TEXT_MAX],
+           ([], ["a review's start carries its facts, 1 to %d characters" % REVIEW_TEXT_MAX],
             ["a start's text, when it carries one, is 1 to %d characters" % TEXT_MAX]))
     rid644 = new_request_id()
     big = "\U0001f600\x01" * (REVIEW_TEXT_MAX // 2)
@@ -947,6 +992,14 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
            (withdraw(store, waiting), withdraw(store, waiting), waiting in [i for i, _, _ in pending(store)]),
            (True, False, False))
     expect("a request the runner took is never withdrawn", withdraw(store, rid644), False)
+    judged = ask(store, REVIEW, "start", REVIEW, "app", "ENG-8", text="x", tier="standard")
+    with claimed(store, judged) as there:
+        racing = withdraw(store, judged)
+    expect("a withdrawal while the runner judges the request is refused, and the request stays",
+           (there, racing, judged in [i for i, _, _ in pending(store)]), (True, False, True))
+    expect("...and once the runner lets go, it lands", withdraw(store, judged), True)
+    with claimed(store, judged) as there:
+        expect("the runner's hold on a withdrawn request finds it gone", there, False)
     expect("withdraw names only a request", refused(lambda: withdraw(store, "../x")), "not a request id")
     write_output(store, "run-" + "4" * 32, False, "success", "ok", 1700000100, model="claude-opus-test",
                  tokens=4321)

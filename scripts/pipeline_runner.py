@@ -1337,16 +1337,22 @@ class Runner(object):
 
     # -- a request -------------------------------------------------------- #
     def take(self, item, out):
+        """Judge and answer one waiting request, holding it so its caller cannot withdraw it
+        meanwhile (KIT-644). One its caller withdrew after this pass listed it gets no answer."""
+        rid = item[0]
+        with store.claimed(self.store_dir(), rid) as there:
+            if not there:
+                self.say("runner: request %s was withdrawn by its caller" % rid)
+                return
+            self.answer_request(item, out)
+
+    def answer_request(self, item, out):
         rid, doc, problems = item
         now = self.clock()
         if problems:
             store.settle(self.store_dir(), rid, doc, False, None, problems[0], now)
             out["refused"].append(rid)
             self.say("runner: request %s refused: %s" % (rid, problems[0]))
-            return
-        if not os.path.lexists(os.path.join(self.store_dir(), "requests", rid + ".json")):
-            # KIT-644: its caller withdrew it after this pass listed it. There is nothing to answer.
-            self.say("runner: request %s was withdrawn by its caller" % rid)
             return
         if doc["action"] == "stop":
             ok, run_id, why = self.stop(doc)
@@ -2812,6 +2818,19 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                "nothing starts", (bool(listed), store.answer(sdir, rq_w), out_w,
                                   any(rq_w in line and "withdrawn" in line for line in said)),
                (True, None, {"started": [], "refused": [], "waiting": []}, True))
+        rq_r = store.ask(sdir, store.REVIEW, "start", store.REVIEW, "app", "ENG-1", tier="standard",
+                         text="x")
+        racing = []
+        runner.start = lambda *a, **k: (racing.append(store.withdraw(sdir, rq_r)),
+                                        ("refused", None, "judged while held"))[1]
+        try:
+            runner.take([i for i in store.pending(sdir) if i[0] == rq_r][0],
+                        {"started": [], "refused": [], "waiting": []})
+        finally:
+            del runner.start
+        expect("a withdrawal that comes while the runner judges the request is refused, and the "
+               "request is answered", (racing, (store.answer(sdir, rq_r) or {}).get("why")),
+               ([False], "judged while held"))
         store.write_run(sdir, code_record(41, "ENG-41"))         # ENG-41's review below follows it
 
         # ---- each kind as data, behind its own walls (KIT-704) ------------------ #
