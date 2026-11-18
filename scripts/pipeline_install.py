@@ -182,6 +182,7 @@ Usage:
                         [--validator-conf validator.conf]
     pipeline_install.py --check [--conf stage-a.conf] [--stage-e-conf stage-e.conf]
                         [--sweep-conf sweep.conf] [--queue-conf queue.conf] [--skip-stage-e]
+                        [--validator-conf validator.conf]
     pipeline_install.py --selftest
 
 Exit: 0 every part is up to date, updated or off · 4 a part could not be measured, or was

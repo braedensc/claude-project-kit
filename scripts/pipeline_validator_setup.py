@@ -1232,6 +1232,11 @@ def run_steps(ctx, apply_it):
                 notes.append((sid, "What clears it: " + exc.remedy))
         except se.SetupError as exc:
             got, detail = FAILED, str(exc)
+        except OSError as exc:
+            # A folder or a file this account may not make or replace: a failed row, never a
+            # traceback in the middle of an apply.
+            got, detail = FAILED, "%s: %s" % (exc.strerror or type(exc).__name__,
+                                              exc.filename or "a file this row writes")
         # A detail is this file's own words and the conf's paths, which hold no credential shape
         # (parse_conf refuses one). What a child said is made safe where it is read: the
         # rehearsal, the log, launchd's answers. The env probe's words are never printed.
@@ -2132,6 +2137,16 @@ def selftest():
     code, got_, words, c, f, q2 = one_row("no-folder", "folder", vfolder=False)
     ok("folder: an absent folder is made, mode 700",
        got_ == DONE and os.stat(os.path.join(q2["home"], FOLDER)).st_mode & 0o777 == 0o700, words)
+    q3 = place("closed-home", vfolder=False)
+    os.chmod(q3["home"], 0o500)
+    try:
+        c, f = ctx_for(q3)
+        (code, rows), out, err = quiet(lambda: cmd_apply(c))
+    finally:
+        os.chmod(q3["home"], 0o700)
+    ok("folder: a folder it may not make is a FAILED row that names why, never a traceback",
+       os.geteuid() == 0 or (code == EX_FAILED and by_step(rows).get("folder") == FAILED
+                             and "ermission" in detail(rows, "folder")), rows)
 
     r2 = place("refused-load")
     c, fake = ctx_for(r2)
