@@ -7,6 +7,8 @@ goes wrong and nothing else would say so (KIT-236, KIT-238).
     python3 scripts/pipeline_watch.py status           # the last pass, per kind
     python3 scripts/pipeline_watch.py install          # a person: load the hourly LaunchAgent
     python3 scripts/pipeline_watch.py uninstall
+    python3 scripts/pipeline_watch.py check            # a program: the installer's rows, asks nothing
+    <answers> | python3 scripts/pipeline_watch.py apply   # a program, after the person's consent
     python3 scripts/pipeline_watch.py --selftest
 
 Settings: the same `update.conf` as scripts/pipeline_update.py (its watch keys are listed in
@@ -105,6 +107,29 @@ THE KEYS' END DATES (KIT-667).  Two commands over the same list, names and dates
         the rows. A person runs it: it is refused in a Claude session before it reads anything.
           0 written and read back   2 a bad line (named by number), nothing written
           1 the write or the read-back failed, or the files could not be read   3 refused
+
+THE INSTALLER, FOR A PROGRAM (KIT-869; the notifier installer's shape, KIT-850).  `install` is a
+person's: it shows a pass and asks for a typed yes. The one command runs these two instead:
+    pipeline_watch.py check --conf update.conf
+        Measures the two steps as `apply` would see them and changes, records and asks nothing:
+        `job`, the LaunchAgent file names this kit, this settings file and this interval; `enable`,
+        launchd holds the job, running that command. Prints ONE JSON document of rows on stdout
+        (`watch-setup-rows/1`: each step, its outcome word, its detail); every word goes to stderr.
+    <answers> | pipeline_watch.py apply --conf update.conf
+        Takes its answers through a PIPE, never a terminal, a file or an argument:
+        {"schema": "watch-answers/1", "consent": "yes"}. Anything but yes changes nothing. It asks
+        nothing, and prints the same JSON document. It writes the job file; a job file written
+        while the job is off is DISABLED in the same step, so a login cannot start it. A job never
+        on is switched on here, by `apply` itself, only when its first pass would raise no more
+        alerts than the ceiling `pipeline-parts.json` gives this part. An alert is one GitHub issue
+        it would open or close, and one Slack page when its status file would read `problem`; they
+        are counted with a pass that sends nothing. Above the ceiling, or with no ceiling it can
+        read, the job stays installed, disabled and off, and `left_off` says why in one line. A job
+        that has run here before (its log is there) and is not loaded was stopped on purpose:
+        `apply` never switches it back on. A loaded job running an older command is reloaded.
+        Refused as root, and in an agent environment before it reads its standard input.
+          0 every row holds   10 a row is work, or a person's   4 a row could not be measured
+          1 a step failed   2 usage, the answers or update.conf   3 refused
 
 EXIT CODES — contract §13.
   0   every kind is ok, and every change was delivered
@@ -1074,12 +1099,18 @@ def send_github(env, conf, kind, state, summary, claimed=None):
     return True, "run %s succeeded" % run_id
 
 
+def outages(findings):
+    """The firing kinds that make the status file a `problem`: what the heartbeat monitor pages
+    Slack about. Upkeep kinds are advisory there, never a page."""
+    return sorted(f["kind"] for f in findings if f["state"] == FIRING and f["kind"] not in UPKEEP_KINDS)
+
+
 def write_status(env, conf, findings, now, github_note, dry_run):
     path = conf.get("HEALTH_STATUS_FILE")
     if not path:
         return "OFF (HEALTH_STATUS_FILE is empty): the heartbeat monitor has nothing to read"
     lit = sorted(f["kind"] for f in findings if f["state"] == FIRING)
-    firing = [k for k in lit if k not in UPKEEP_KINDS]
+    firing = outages(findings)
     advisory = [k for k in lit if k in UPKEEP_KINDS]
     unknown = sorted(f["kind"] for f in findings if f["state"] == UNKNOWN)
     doc = {"schema": STATUS_SCHEMA, "written_at": _iso(now),
@@ -1104,7 +1135,11 @@ def write_status(env, conf, findings, now, github_note, dry_run):
 # --------------------------------------------------------------------------- #
 # One pass
 # --------------------------------------------------------------------------- #
-def run_pass(env, conf, dry_run=False):
+def run_pass(env, conf, dry_run=False, tally=None):
+    """One pass. `tally`, when given, is filled with what the pass sent or, in a dry run, would
+    send: `github`, the kinds whose change went to GitHub, and `page`, whether the status file it
+    writes reads `problem` (the heartbeat monitor turns that into one Slack page). `apply` counts
+    a job's first pass this way (KIT-869)."""
     state = load_state(env)
     now = _now(env)
     findings = [check_hooks(env, conf), check_updates(env, conf, state),
@@ -1132,6 +1167,8 @@ def run_pass(env, conf, dry_run=False):
                 rec["sent"], rec["sent_key"] = f["state"], f.get("key")
             continue
         delivered, detail = send_github(env, conf, f["kind"], f["state"], f["summary"], claimed)
+        if tally is not None:
+            tally.setdefault("github", []).append(f["kind"])
         notes.append("%s is now %s — GitHub: %s" % (f["kind"], f["state"], detail))
         if delivered and not dry_run:
             rec["sent"], rec["sent_key"], rec["since"] = f["state"], f.get("key"), _iso(now)
@@ -1139,6 +1176,8 @@ def run_pass(env, conf, dry_run=False):
             failed.append(f["kind"])
     github_note = ("could not deliver: " + ", ".join(failed)) if failed else (
         "on" if github_on else "OFF")
+    if tally is not None:
+        tally["page"] = bool(conf.get("HEALTH_STATUS_FILE")) and bool(outages(findings))
     status_note = write_status(env, conf, findings, now, github_note, dry_run)
     if not dry_run:
         state["last_run_at"] = _iso(now)
@@ -1211,6 +1250,7 @@ INSTALL_WHY = ("It loads or removes a job that runs as you every hour; a session
 REFUSAL_WORDS = {
     "dates --apply": ("It writes the end dates the health check warns from; a session\n"
                       "  does not set its own warnings.", "dates"),
+    "apply": (INSTALL_WHY, "check"),
 }
 
 
@@ -1227,9 +1267,18 @@ def _load(env, domain, label, plist):
     launchd keeps a booted-out job's record through its SIGTERM-to-SIGKILL window, and a
     bootstrap inside that window answers `Bootstrap failed: 5`. Before KIT-251 a reinstall
     could hit it and leave the watch unloaded. The same rule the update script applies to the
-    dispatcher, in the user's own domain and without root."""
+    dispatcher, in the user's own domain and without root.
+
+    The enable comes before every load (KIT-869). It does nothing to a label that was never
+    disabled. A label `apply` left disabled, so that a login would not start a job it left off,
+    will not load without it."""
     r = env.runner
     target = "%s/%s" % (domain, label)
+    en = r.write("enable %s, so launchd loads it now and at each login" % label,
+                 ["launchctl", "enable", target])
+    if not (en.ok or en.skipped):
+        raise pu.UpdateError("launchctl enable %s failed: %s. The job is NOT loaded; run install "
+                             "again." % (target, ((en.err or en.out).strip() or "it said nothing")[:160]))
     polls = int((se.DEFAULT_EXIT_TIMEOUT + se.EXIT_TIMEOUT_HEADROOM) / se.BOOTOUT_POLL_SECONDS)
     said = ""
     for attempt in range(1, se.BOOTSTRAP_ATTEMPTS + 1):
@@ -1252,6 +1301,27 @@ def _load(env, domain, label, plist):
                          "again." % said.splitlines()[0][:160])
 
 
+def rehearse(env, conf, tally=None):
+    """One pass that sends and writes NOTHING: its runner is put in dry-run mode for the pass, not
+    only the pass's own bookkeeping. Before KIT-249 the install preview dispatched the alert for
+    real, before the yes. `install` shows it before its question; `apply` counts with it what the
+    job's first pass would raise (KIT-869)."""
+    saved, env.runner.dry_run = env.runner.dry_run, True
+    try:
+        return run_pass(env, conf, dry_run=True, tally=tally)
+    finally:
+        env.runner.dry_run = saved
+
+
+def write_agent(plist, doc):
+    """The job file, in your own LaunchAgents folder. launchd does not create the log's folder, and
+    a job whose log cannot be opened does not start (KIT-249), so that folder is made first."""
+    os.makedirs(os.path.dirname(plist), exist_ok=True)
+    os.makedirs(os.path.dirname(doc["StandardOutPath"]), mode=0o700, exist_ok=True)
+    with open(plist, "wb") as fh:
+        plistlib.dump(doc, fh)
+
+
 def install(env, conf, uninstall_only=False):
     refuse_if_agent("uninstall" if uninstall_only else "install", env.environ)
     if sys.platform != "darwin" and not getattr(env, "any_platform", False):
@@ -1268,14 +1338,8 @@ def install(env, conf, uninstall_only=False):
             os.remove(plist)
         say("Uninstalled %s (plist removed: %s)." % (label, plist))
         return EX_OK
-    # The preview sends NOTHING: its runner is put in dry-run mode for the pass, not only the
-    # pass's own bookkeeping. Before KIT-249 it dispatched the alert for real, before the yes.
     say("A dry pass first, so you see what the job will report. It sends nothing:")
-    saved, r.dry_run = r.dry_run, True
-    try:
-        run_pass(env, conf, dry_run=True)
-    finally:
-        r.dry_run = saved
+    rehearse(env, conf)
     doc = agent_plist(conf, sys.executable, KIT, _path_env(), _home(env))
     say("")
     say("The job: %s every %ds, as you, from %s" % (label, doc["StartInterval"], KIT))
@@ -1286,16 +1350,396 @@ def install(env, conf, uninstall_only=False):
     # Only after the yes: a "no" must not leave a working job stopped.
     r.write("stop %s if it is loaded" % label, bootout)
     if not r.dry_run:
-        os.makedirs(os.path.dirname(plist), exist_ok=True)
-        # launchd does not create the log's folder, and a job whose log cannot be opened does
-        # not start (KIT-249).
-        os.makedirs(os.path.dirname(doc["StandardOutPath"]), mode=0o700, exist_ok=True)
-        with open(plist, "wb") as fh:
-            plistlib.dump(doc, fh)
+        write_agent(plist, doc)
     _load(env, domain, label, plist)
     say("Installed. Check it with: launchctl print %s/%s ; python3 scripts/pipeline_watch.py status"
         % (domain, label))
     return EX_OK
+
+
+# --------------------------------------------------------------------------- #
+# `check` and `apply`: the installer, for a program (KIT-869)
+# --------------------------------------------------------------------------- #
+# The notifier installer's shape (KIT-850). `check` measures and asks nothing; `apply` takes its
+# answers through a pipe, after the person's consent, and asks nothing either. Both print ONE JSON
+# document of rows on stdout and every human word on stderr. The answer reader, the ceiling
+# reader, the rows document and the reader of launchd's print are the notifier installer's own,
+# imported only when one of these two runs (`_ns`), so the hourly pass never loads it.
+MACHINE_COMMANDS = ("check", "apply")
+ROWS_SCHEMA = "watch-setup-rows/1"
+ANSWERS_SCHEMA = "watch-answers/1"
+ANSWERS_KEYS = frozenset(("schema", "consent"))
+# A row's outcome words: the Stage E installer's, which the one command reads.
+DONE, ALREADY_DONE, BLOCKED, FAILED, WOULD_CHANGE, NOT_MEASURED = (
+    se.DONE, se.ALREADY_DONE, se.BLOCKED, se.FAILED, se.WOULD_CHANGE, se.UNKNOWN)
+EX_WAITING = 10                       # a row is work, or a person's: EX_FIRING's number
+
+
+def _ns():
+    """The notifier installer, whose helpers `check` and `apply` reuse (KIT-850)."""
+    import pipeline_notifier_setup as ns
+    return ns
+
+
+class Row(Exception):
+    """A step's outcome where it is known: a row that is not a pass."""
+
+    def __init__(self, outcome, detail):
+        Exception.__init__(self, detail)
+        self.outcome, self.detail = outcome, detail
+
+
+class Setup(object):
+    """What one `check` or `apply` knows. `row_cards`, `ceiling`, `first_pass` and `left_off` are
+    the four fields the notifier's rows_document reads; this installer names no card."""
+
+    def __init__(self, env, conf, apply_it):
+        self.env, self.conf, self.apply_it = env, conf, apply_it
+        self.label = conf["WATCH_LABEL"]
+        self.domain = "gui/%d" % os.getuid()
+        self.target = "%s/%s" % (self.domain, self.label)
+        self.plist = os.path.join(_home(env), "Library", "LaunchAgents", self.label + ".plist")
+        self.want = agent_plist(conf, sys.executable, KIT, _path_env(), _home(env))
+        self.again = "python3 scripts/pipeline_watch.py --conf %s install" % conf["__source__"]
+        self.row_cards = {}
+        self.ceiling, self.ceiling_why = None, "it was not read"
+        self.first_pass = None              # (alerts, the counting pass's exit)
+        self.left_off = None                # the one line that says why the job stays off
+
+
+def alerts(n):
+    return "%d alert%s" % (n, "" if n == 1 else "s")
+
+
+def drift(args, interval, sx):
+    """None when a job runs this kit's pass on this settings file every WATCH_INTERVAL_SECONDS: the
+    three facts the one command's own look compares (pipeline_install.watch_level). Else what
+    differs, in words."""
+    if list(args or [])[1:] != sx.want["ProgramArguments"][1:]:
+        return "it runs another kit's pass or another settings file"
+    if interval != sx.want["StartInterval"]:
+        return "it runs every %s s, and the settings say %d s" % (interval, sx.want["StartInterval"])
+    return None
+
+
+def held_drift(running, sx):
+    """`drift` for what launchd holds (`loaded_job`). A print that names no arguments says nothing;
+    one that gives no interval is judged by its arguments alone, as the notifier's installer
+    judges it."""
+    if not running or running["arguments"] is None:
+        return "its print names no arguments"
+    return drift(running["arguments"], sx.want["StartInterval"] if running["interval"] is None
+                 else running["interval"], sx)
+
+
+def job_file(sx):
+    """The job file as a dict, or None when there is none. One that cannot be read is NOT
+    MEASURED, never "absent"."""
+    if not os.path.exists(sx.plist):
+        return None
+    try:
+        with open(sx.plist, "rb") as fh:
+            doc = plistlib.load(fh)
+    except Exception as exc:                                    # noqa: BLE001
+        raise Row(NOT_MEASURED, "%s could not be read (%s)" % (sx.plist, type(exc).__name__))
+    if not isinstance(doc, dict):
+        raise Row(NOT_MEASURED, "%s is not a job file" % sx.plist)
+    return doc
+
+
+def job_loaded(sx):
+    """(loaded, launchd's own words). A print launchd did not answer is NOT MEASURED, never
+    "not loaded"."""
+    res = sx.env.runner.read(["launchctl", "print", sx.target])
+    text = (res.out or "") + (res.err or "")
+    if res.ok:
+        return True, text
+    if res.rc == 113 or "Could not find service" in text:
+        return False, text
+    raise Row(NOT_MEASURED, "launchd could not be asked about %s (exit %d): %s"
+              % (sx.target, res.rc, _one_line(text)[:160]))
+
+
+def job_disabled(sx):
+    """True when launchd keeps the label disabled, so a login does not start the job."""
+    res = sx.env.runner.read(["launchctl", "print-disabled", sx.domain])
+    if not res.ok:
+        raise Row(NOT_MEASURED, "launchd could not say whether a login starts %s (exit %d): %s"
+                  % (sx.target, res.rc, _one_line(res.err or res.out)[:160]))
+    return bool(re.search(_ns()._DISABLED_LINE % re.escape(sx.label), res.out or ""))
+
+
+def disable_job(sx):
+    """Disable the label, so the job file cannot start at the next login while the job is off,
+    then ask launchd again: a disable that does not show is a failure, never a pass."""
+    res = sx.env.runner.write("disable %s, so a login does not start it while it is off" % sx.target,
+                              ["launchctl", "disable", sx.target])
+    if not res.ok:
+        raise pu.UpdateError("could not disable %s (exit %d): %s. Its job file is there, the job is "
+                             "off, and a login would start it" % (sx.target, res.rc,
+                                                                  _one_line(res.err or res.out)[:160]))
+    if not job_disabled(sx):
+        raise pu.UpdateError("%s was disabled, and launchd does not list it as disabled: a login "
+                             "would start it" % sx.target)
+
+
+def disable_again(sx, why):
+    """Raise `why`, a load that did not take, after disabling the job again, so off stays off. A
+    disable that fails too is said WITH it, never instead of it: the row stays FAILED, names why
+    the load failed, and says a login may now start the job."""
+    try:
+        disable_job(sx)
+    except (pu.UpdateError, Row) as exc:
+        raise pu.UpdateError("%s It could not be disabled again either (%s), so a login may start "
+                             "it." % (why, exc))
+    raise pu.UpdateError("%s It is disabled again, so a login does not start it either." % why)
+
+
+def load_job(sx, reload_it=False):
+    """THE ONE PLACE `apply` LOADS THE JOB, after the consent the calling program read. A reload
+    stops the older job first. `_load` enables the label, waits for launchd to let an older job go,
+    and loads the file. Then launchd is asked whether it holds THIS command: "launchctl accepted
+    it" is not "it is loaded". A load that did not take is disabled again: off stays off, through a
+    login too."""
+    if not sx.apply_it:
+        raise pu.UpdateError("BUG: only `apply` loads the job, and this is not `apply`")
+    if reload_it:
+        out = sx.env.runner.write("stop %s, which runs an older command, before loading its job "
+                                  "file" % sx.target, ["launchctl", "bootout", sx.target])
+        if not out.ok:
+            raise pu.UpdateError("could not stop %s to load its new job file (exit %d): %s"
+                                 % (sx.target, out.rc, _one_line(out.err or out.out)[:160]))
+    try:
+        _load(sx.env, sx.domain, sx.label, sx.plist)
+    except pu.UpdateError as exc:
+        disable_again(sx, str(exc))
+    loaded, text = job_loaded(sx)
+    if not loaded:
+        disable_again(sx, "launchd accepted the load of %s and does not hold it." % sx.target)
+    why = held_drift(_ns().loaded_job(text), sx)
+    if why:
+        raise Row(NOT_MEASURED, "launchd holds %s after the load, and %s" % (sx.target, why))
+
+
+def count_first_pass(sx):
+    """(alerts, that pass's exit): what the job's first pass would raise, counted with a pass that
+    sends and writes nothing, in THIS apply. One alert per kind whose change it would send to
+    GitHub, and one Slack page when its status file would read `problem`. Kept in `first_pass`."""
+    tally = {}
+    say("")
+    say("Counting what its first pass would raise, with a pass that sends and writes nothing:")
+    rc = rehearse(sx.env, sx.conf, tally)
+    sx.first_pass = (len(tally.get("github") or []) + (1 if tally.get("page") else 0), rc)
+    return sx.first_pass
+
+
+def step_job(sx):
+    """`job`: the LaunchAgent file runs this kit's pass on this settings file at this interval.
+    Written while the job is off, its label is disabled in the same step, so a login cannot start
+    it. A loaded job is left as it is: the next step compares what launchd holds."""
+    have = job_file(sx)
+    why = "there is none" if have is None else drift(have.get("ProgramArguments"),
+                                                     have.get("StartInterval"), sx)
+    if not why:
+        return ALREADY_DONE, "%s runs this kit's pass every %d s" % (sx.plist, sx.want["StartInterval"])
+    if not sx.apply_it:
+        return WOULD_CHANGE, ("would write %s (%s). While the job is off, it is disabled in the same "
+                              "step, so a login does not start it" % (sx.plist, why))
+    write_agent(sx.plist, sx.want)
+    with open(sx.plist, "rb") as fh:
+        if plistlib.load(fh) != sx.want:
+            raise pu.UpdateError("%s was written, and reading it back does not match" % sx.plist)
+    if job_loaded(sx)[0]:
+        return DONE, ("wrote %s (%s). The job is loaded: the next step compares what launchd holds "
+                      "with it" % (sx.plist, why))
+    if not job_disabled(sx):
+        disable_job(sx)
+    return DONE, ("wrote %s (%s). The job is not loaded, and it is disabled, so a login does not "
+                  "start it" % (sx.plist, why))
+
+
+def step_enable(sx):
+    """`enable`: launchd holds the job, running this kit's pass. Not loaded is `job_off`. Loaded
+    with another command or interval, `apply` reloads it."""
+    loaded, text = job_loaded(sx)
+    if not loaded:
+        return job_off(sx)
+    running = _ns().loaded_job(text)
+    if not running or running["arguments"] is None:
+        raise Row(NOT_MEASURED, "launchd holds %s, and its print names no arguments, so whether it "
+                                "runs this kit's pass is not known" % sx.target)
+    why = held_drift(running, sx)
+    if not why:
+        return ALREADY_DONE, ("launchd holds %s, running this kit's pass every %d s"
+                              % (sx.target, sx.want["StartInterval"]))
+    if not sx.apply_it:
+        return WOULD_CHANGE, "would reload it: launchd holds %s, and %s" % (sx.target, why)
+    load_job(sx, reload_it=True)
+    return DONE, "reloaded it, because %s; launchd now holds it, running this kit's pass" % why
+
+
+def job_off(sx):
+    """The job is not loaded. One that has run here before was stopped on purpose: it is left as it
+    is. One never on is the part off: its file must not start at the next login, and the first-pass
+    ceiling decides whether `apply` switches it on."""
+    if os.path.exists(sx.want["StandardOutPath"]):
+        # launchd alone writes this log, when it runs the job: the job has been on here.
+        raise Row(BLOCKED, "it is not loaded, and it has run here before (its log is there): it was "
+                           "stopped on purpose, and `apply` never switches it back on. To switch it "
+                           "on yourself: %s" % sx.again)
+    disabled = job_disabled(sx)
+    if not sx.apply_it:
+        if sx.ceiling is None:
+            raise Row(NOT_MEASURED, "its first-pass ceiling could not be read (%s), so `apply` would "
+                                    "leave it off" % sx.ceiling_why)
+        return WOULD_CHANGE, ("would switch it on if its first pass raises at most %s, its ceiling, "
+                              "and leave it off above that%s"
+                              % (alerts(sx.ceiling), "" if disabled else ". It is NOT disabled, so "
+                                 "a login would start it: `apply` disables it first"))
+    if not disabled:
+        disable_job(sx)
+    if sx.ceiling is None:
+        sx.left_off = "left off: its first-pass ceiling could not be read"
+        raise Row(NOT_MEASURED, "%s (%s). It is installed and disabled, so a login does not start it"
+                  % (sx.left_off, sx.ceiling_why))
+    count, rc = count_first_pass(sx)
+    if rc not in (EX_OK, EX_UNKNOWN, EX_FIRING):
+        sx.left_off = ("left off: the pass that counts its alerts ended with exit %d, so how many "
+                       "its first pass would raise is not known" % rc)
+        raise Row(NOT_MEASURED, "%s. It is installed and disabled, so a login does not start it"
+                  % sx.left_off)
+    if count > sx.ceiling:
+        sx.left_off = ("left off: its first pass would raise %s, above its ceiling of %d"
+                       % (alerts(count), sx.ceiling))
+        raise Row(BLOCKED, "%s. It is installed and disabled, so a login does not start it. Read the "
+                           "pass above; to switch it on yourself: %s" % (sx.left_off, sx.again))
+    load_job(sx)
+    return DONE, ("switched it on: its first pass would raise %s, at or below its ceiling of %d"
+                  % (alerts(count), sx.ceiling))
+
+
+def run_steps(sx):
+    """Each step as (step, outcome, its detail on one line). `check` runs both; `apply` stops at the
+    first one it could not clear. An exception is that step's FAILED row, never a lost document."""
+    rows = []
+    for sid, step in (("job", step_job), ("enable", step_enable)):
+        try:
+            outcome, detail = step(sx)
+        except Row as row:
+            outcome, detail = row.outcome, row.detail
+        except (pu.UpdateError, OSError) as exc:
+            outcome, detail = FAILED, str(exc)
+        except Exception as exc:                                # noqa: BLE001 (said by name)
+            outcome, detail = FAILED, "BUG: %s: %s" % (type(exc).__name__, exc)
+        rows.append((sid, outcome, _one_line(detail)))
+        if sx.apply_it and outcome not in (DONE, ALREADY_DONE):
+            break
+    say("")
+    for sid, outcome, detail in rows:
+        say("  %-7s %-17s %s" % (sid, outcome, detail))
+    return rows
+
+
+def rows_exit(rows):
+    """A failure first, then a row not measured (contract §13: 4 before 10), then work or a
+    person's step; 0 only when every row holds."""
+    outcomes = set(o for _s, o, _d in rows)
+    if FAILED in outcomes:
+        return EX_FAILED
+    if NOT_MEASURED in outcomes:
+        return EX_UNKNOWN
+    if outcomes & set((BLOCKED, WOULD_CHANGE)):
+        return EX_WAITING
+    return EX_OK
+
+
+def cmd_check(sx):
+    """Both steps, measured as `apply` would see them, with nothing changed, recorded or asked. Its
+    runner is in dry-run mode throughout, and a write it planned is a defect, said by name."""
+    saved, sx.env.runner.dry_run = sx.env.runner.dry_run, True
+    before = len(sx.env.runner.writes)
+    say("Health check, `check`: nothing is changed, recorded or asked. The rows go to standard "
+        "output as one JSON document.")
+    try:
+        rows = run_steps(sx)
+    finally:
+        sx.env.runner.dry_run = saved
+    if len(sx.env.runner.writes) != before:
+        say("BUG: check planned %d write(s); that is a defect in this file."
+            % (len(sx.env.runner.writes) - before))
+        return EX_FAILED, rows
+    return rows_exit(rows), rows
+
+
+def cmd_apply(sx):
+    say("Health check, `apply`: its answers came through a pipe, after your consent. It asks nothing.")
+    rows = run_steps(sx)
+    code = rows_exit(rows)
+    if code == EX_OK:
+        say("DONE: the job file is current, and launchd holds the job.")
+    return code, rows
+
+
+def rows_document(command, code, rows=(), sx=None, why=None):
+    """The one JSON document `check` and `apply` print: the notifier installer's, under this
+    installer's own schema. Each row is a step, its outcome word, its detail and its card (none)."""
+    return _ns().rows_document(command, code, rows, sx, why, schema=ROWS_SCHEMA)
+
+
+def machine_command(env, args, stdin=None):
+    """`check` and `apply`: every human word on stderr, and ONE JSON document on stdout, on every
+    exit past argument parsing, a refusal and a usage error included, so the program reading it
+    never has to tell words from rows."""
+    real_out = sys.stdout
+    sys.stdout = sys.stderr
+    box = {"sx": None}
+    try:
+        code, rows, why = _machine(env, args, stdin, box)
+    except Exception as exc:                                    # noqa: BLE001 (said by name)
+        code, rows, why = EX_FAILED, [], "unexpected %s" % type(exc).__name__
+        say("BUG: %s raised %s: %s" % (args.cmd, type(exc).__name__, exc))
+    finally:
+        sys.stdout = real_out
+    doc = rows_document(args.cmd, code, rows, box["sx"], why)
+    real_out.write(json.dumps(doc, sort_keys=True) + "\n")
+    real_out.flush()
+    return code
+
+
+def _machine(env, args, stdin, box):
+    """(code, rows, why). The order is the contract: the root refusal; for `apply`, the agent
+    refusal and then its answers; then the conf. So a session is refused before it reads anything,
+    and a "no" touches nothing."""
+    import pipeline_root_guard as rg   # KIT-693: the one refusal every installer shares
+    root = rg.refusal()
+    if root:
+        say(root)
+        return EX_REFUSED, [], "refused: run as root"
+    if args.cmd == "apply":
+        try:
+            refuse_if_agent("apply", env.environ)
+        except pu.Refusal as exc:
+            say(str(exc))
+            return EX_REFUSED, [], "refused: an agent environment"
+        answers, why = _ns().read_answers(stdin, schema=ANSWERS_SCHEMA, keys=ANSWERS_KEYS,
+                                          person="install")
+        if answers is None:
+            say("FAILED: %s. Nothing was changed." % why)
+            return EX_USAGE, [], why
+        if answers["consent"] != "yes":
+            say("NO CONSENT: the answers do not say yes, so nothing was changed.")
+            return EX_WAITING, [], "no consent: the answers do not say yes"
+    try:
+        conf = pu.load_conf(args.conf)
+    except pu.ConfError as exc:
+        say("CONFIG: %s" % exc)
+        return EX_USAGE, [], str(exc).splitlines()[0][:200]
+    sx = box["sx"] = Setup(env, conf, apply_it=args.cmd == "apply")
+    # The ceiling is read from the parts list beside this code, never from the caller.
+    sx.ceiling, sx.ceiling_why = _ns().first_pass_ceiling(
+        os.path.join(getattr(env, "kit", KIT), "pipeline-parts.json"), installer=__file__)
+    code, rows = (cmd_apply if sx.apply_it else cmd_check)(sx)
+    return code, rows, None
 
 
 # --------------------------------------------------------------------------- #
@@ -1536,6 +1980,10 @@ def main(argv=None, env=None, stdin=None):
     sub.add_parser("uninstall")
     dates = sub.add_parser("dates")
     dates.add_argument("--apply", action="store_true")
+    for name in MACHINE_COMMANDS:
+        # `--conf` after the command as well, the way the one command and the parts list give it
+        # to every installer; without it here, the top-level one stands (KIT-869).
+        sub.add_parser(name).add_argument("--conf", default=argparse.SUPPRESS)
     args = p.parse_args(argv)
     if args.selftest:
         from scratch_run import contained   # KIT-450: its temp folders go when it ends
@@ -1544,6 +1992,8 @@ def main(argv=None, env=None, stdin=None):
         p.print_help()
         return EX_USAGE
     env = env or pu.Env()
+    if args.cmd in MACHINE_COMMANDS:
+        return machine_command(env, args, stdin)
     if args.cmd == "dates":
         return cmd_dates(env, args.conf, args.apply, stdin or sys.stdin)
     try:
@@ -1583,7 +2033,7 @@ def selftest():
             fails.append(name)
 
     quiet = []
-    se.say = lambda msg="": quiet.append(msg)
+    real_say, se.say = se.say, lambda msg="": quiet.append(msg)
     pauses = []
     se._pause = lambda seconds: pauses.append(seconds)   # waits are walked, never slept
     T = 1791700000.0
@@ -1638,7 +2088,7 @@ def selftest():
                     self.linger -= 1
                     return se.Result(0, "state = running", "")
                 return se.Result(113, "", "Could not find service")
-            if line.startswith("launchctl bootout gui/"):
+            if line.startswith(("launchctl bootout gui/", "launchctl enable gui/")):
                 return se.Result(0, "", "")
             if line.startswith("launchctl bootstrap gui/"):
                 rc = self.boots[min(self.attempts, len(self.boots) - 1)]
@@ -2691,7 +3141,7 @@ def selftest():
         # nothing closes, and a "yes" paged twice.
         preview_home = os.path.join(home, "preview")
         os.makedirs(preview_home)
-        launchd = [("launchctl bootout", 0, ""), ("launchctl bootstrap", 0, "")]
+        launchd = [("launchctl bootout", 0, ""), ("launchctl enable", 0, ""), ("launchctl bootstrap", 0, "")]
         firing_conf = conf(KIT_CHECKOUT=kit)
         firing_conf["__source__"] = "/kit/update.conf"
         for answer in ("no", "yes"):
@@ -2699,10 +3149,11 @@ def selftest():
             install(env, firing_conf)
             check("the install preview sends no alert, answered %s" % answer,
                   "gh workflow run" in env.runner.applied, False)
-        # A fresh home, so the folder is the install's doing and not an earlier pass's.
-        check("…a yes stops any old job, then loads the new one",
+        # A fresh home, so the folder is the install's doing and not an earlier pass's. The enable
+        # comes before the load (KIT-869): a job `apply` left off is disabled, and loads only so.
+        check("…a yes stops any old job, enables it, then loads the new one",
               [a for a in env.runner.applied if a.startswith("launchctl")],
-              ["launchctl bootout", "launchctl bootstrap"])
+              ["launchctl bootout", "launchctl enable", "launchctl bootstrap"])
         check("…and creates the folder the job's log goes in (launchd will not)",
               os.path.isdir(os.path.join(preview_home, ".pipeline-update")), True)
         env = make_env(preview_home, gh=launchd, answer="no")
@@ -2728,7 +3179,7 @@ def selftest():
         code, attempts, _, said = reinstall(linger=10 ** 6)
         check("…and a job launchd never lets go of stops it before any bootstrap",
               (code, attempts, "still holds" in said), (None, 0, True))
-        env = make_env(home, gh=[("launchctl bootout", 0, ""), ("launchctl bootstrap", 0, "")])
+        env = make_env(home, gh=launchd)
         code = install(env, c)
         plist = os.path.join(home, "Library", "LaunchAgents", c["WATCH_LABEL"] + ".plist")
         doc = plistlib.load(open(plist, "rb"))
@@ -2763,9 +3214,7 @@ def selftest():
         here = os.getcwd()
         try:
             os.chdir(home)
-            code = main(["--conf", "watch-rel.conf", "install"],
-                        env=make_env(home, gh=[("launchctl bootout", 0, ""),
-                                               ("launchctl bootstrap", 0, "")]))
+            code = main(["--conf", "watch-rel.conf", "install"], env=make_env(home, gh=launchd))
         finally:
             os.chdir(here)
         doc = plistlib.load(open(plist, "rb"))
@@ -2773,6 +3222,8 @@ def selftest():
               (code, os.path.isabs(doc["ProgramArguments"][3]),
                os.path.realpath(doc["ProgramArguments"][3])),
               (EX_OK, True, os.path.realpath(os.path.join(home, "watch-rel.conf"))))
+
+        _kit869(check, conf, make_env, FakeGitHub, home, kit, real_say)
 
         # -- the stored keys' end dates (KIT-667): `dates` reads, `dates --apply` writes ------------------
         import io as _io
@@ -2938,6 +3389,356 @@ def selftest():
 
     print("\n%d/%d checks passed" % (ran[0] - len(fails), ran[0]))
     return 1 if fails else 0
+
+
+def _kit869(check, conf, make_env, FakeGitHub, home, kit, real_say):
+    """The installer for a program (KIT-869): `check` and `apply`, against a launchd that keeps state
+    in the user's own domain. No real launchctl runs: every answer is the fake's."""
+    import contextlib
+    import io
+    import pipeline_root_guard as rg
+
+    class GuiDomain(FakeGitHub):
+        """launchd in the user's domain, with state. A disabled label does not load; a load holds a
+        COPY of the job file as it is then; the job's run at load leaves its log, as launchd's does.
+        `refuse` is what a load answers instead; `print_rc` what every print answers; `blind` makes
+        a print fail once the job is loaded; `no_interval` leaves the interval out of a print;
+        `disable_rcs` answers each disable in turn (then 0). Every command that ran is in `ran`."""
+
+        def __init__(self, answers):
+            FakeGitHub.__init__(self, answers)
+            self.held, self.disabled, self.ran = None, {}, []
+            self.refuse, self.print_rc, self.blind, self.no_interval = None, None, False, False
+            self.disable_rcs = []
+
+        def _exec(self, argv, stdin, timeout, cwd=None):
+            self.ran.append(list(argv))
+            if argv[:1] != ["launchctl"] or not argv[2:3] or not argv[2].startswith("gui/"):
+                return FakeGitHub._exec(self, argv, stdin, timeout, cwd)
+            verb, label = argv[1], argv[-1].split("/")[-1]
+            if verb == "print":
+                if self.print_rc is not None or (self.blind and self.held):
+                    return se.Result(self.print_rc or 5, "", "launchctl: busy")
+                if self.held is None:
+                    return se.Result(113, "", 'Could not find service "%s" in domain' % label)
+                return se.Result(0, "%s = {\n\tprogram = %s\n\targuments = {\n%s\t}\n%s}\n" % (
+                    argv[2], self.held["ProgramArguments"][0], "".join(
+                        "\t\t%s\n" % a for a in self.held["ProgramArguments"]),
+                    "" if self.no_interval else "\trun interval = %d seconds\n" % self.held["StartInterval"]))
+            if verb == "print-disabled":
+                return se.Result(0, "disabled services = {\n%s}\n" % "".join(
+                    '\t"%s" => %s\n' % (k, "disabled" if v else "enabled")
+                    for k, v in sorted(self.disabled.items())))
+            if verb == "disable" and self.disable_rcs and self.disable_rcs[0]:
+                return se.Result(self.disable_rcs.pop(0), "", "Operation not permitted")
+            if verb in ("disable", "enable"):
+                if verb == "disable" and self.disable_rcs:
+                    self.disable_rcs.pop(0)
+                self.disabled[label] = verb == "disable"
+                return se.Result(0)
+            if verb == "bootout":
+                self.held = None
+                return se.Result(0)
+            if verb == "bootstrap":
+                if self.refuse:
+                    return se.Result(*self.refuse)
+                if self.disabled.get(os.path.basename(argv[3])[:-len(".plist")]):
+                    return se.Result(5, "", "Bootstrap failed: 5: Input/output error")
+                with open(argv[3], "rb") as fh:
+                    self.held = plistlib.load(fh)
+                os.makedirs(os.path.dirname(self.held["StandardOutPath"]), exist_ok=True)
+                open(self.held["StandardOutPath"], "a").close()
+                return se.Result(0)
+            return se.Result(1, "", "GuiDomain: nothing scripted for %s" % se._fmt(argv))
+
+    label = pu.CONF_DEFAULTS["WATCH_LABEL"]
+    yes = json.dumps({"schema": ANSWERS_SCHEMA, "consent": "yes"})
+
+    def never(*_a):
+        raise AssertionError("it asked a question")
+
+    def pipe_of(text):
+        rfd, wfd = os.pipe()
+        os.write(wfd, text.encode("utf-8"))
+        os.close(wfd)
+        return os.fdopen(rfd, "r", encoding="utf-8")
+
+    def place(name, ceiling=3, parts=None, conf_over=None, **knobs):
+        """(env, settings file, home) for one case: a home of its own, an update.conf in it, and a
+        kit folder whose parts list gives this part `ceiling` (or is `parts`)."""
+        h = os.path.join(home, "kit869", name)
+        os.makedirs(h)
+        over = {"KIT_CHECKOUT": kit, "HEALTH_STATUS_FILE": os.path.join(h, "status.json")}
+        over.update(conf_over or {})
+        values = conf(**over)
+        path = os.path.join(h, "update.conf")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("".join("%s=%s\n" % (k, v) for k, v in values.items() if not k.startswith("__")))
+        env_ = make_env(h, runner=GuiDomain, **knobs)
+        env_.ask = never
+        env_.kit = os.path.join(h, "kit")
+        os.makedirs(env_.kit)
+        with open(os.path.join(env_.kit, "pipeline-parts.json"), "w", encoding="utf-8") as fh:
+            json.dump(parts if parts is not None else {"parts": [
+                {"id": "health-check", "installer": "scripts/pipeline_watch.py", "ceiling": ceiling}]}, fh)
+        return env_, path, h
+
+    def run(env_, argv, stdin=None, loud=False):
+        """(exit, the document on stdout or None, stdout, stderr). `loud`: the real `say`."""
+        out, err = io.StringIO(), io.StringIO()
+        saved = se.say
+        se.say = real_say if loud else saved
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = main(argv, env=env_, stdin=stdin)
+        finally:
+            se.say = saved
+        try:
+            doc = json.loads(out.getvalue())
+        except ValueError:
+            doc = None
+        return code, doc, out.getvalue(), err.getvalue()
+
+    def apply_(env_, path, text=yes):
+        stream = pipe_of(text)
+        try:
+            return run(env_, ["apply", "--conf", path], stdin=stream)
+        finally:
+            stream.close()
+
+    def rows(doc):
+        return dict((r["step"], r["outcome"]) for r in (doc or {}).get("rows") or [])
+
+    def details(doc):
+        return dict((r["step"], r["detail"]) for r in (doc or {}).get("rows") or [])
+
+    def plist_of(h):
+        return os.path.join(h, "Library", "LaunchAgents", label + ".plist")
+
+    def launchctl_writes(env_, since=0):
+        return [w["argv"][1] for w in env_.runner.writes[since:] if w["argv"][:1] == ["launchctl"]]
+
+    # ── R1. `check`: one document of rows, and nothing changed, recorded or asked ─────────────────
+    env_, path, h = place("check")
+    code, doc, out, err = run(env_, ["check", "--conf", path], loud=True)
+    check("check: stdout is ONE JSON document of rows, in the notifier's shape, and the words went to stderr",
+          (code, (doc or {}).get("schema"), (doc or {}).get("command"), (doc or {}).get("exit"),
+           sorted(((doc or {}).get("rows") or [{}])[0]), out.count("\n"), "Health check, `check`" in err),
+          (EX_WAITING, ROWS_SCHEMA, "check", EX_WAITING, ["card", "detail", "outcome", "step"], 1, True))
+    check("check: a job never on is work: its file to write, and switched on at or below the ceiling",
+          (rows(doc), doc["ceiling"], "at most 3 alerts" in details(doc)["enable"]),
+          ({"job": WOULD_CHANGE, "enable": WOULD_CHANGE}, 3, True))
+    check("check: it changed nothing and planned no write: no job file, no launchd change",
+          (os.path.exists(plist_of(h)), env_.runner.writes, env_.runner.disabled, env_.runner.held),
+          (False, [], {}, None))
+    del env_.kit
+    code, doc, _o, _e = run(env_, ["--conf", path, "check"])
+    with open(os.path.join(KIT, "pipeline-parts.json"), encoding="utf-8") as fh:
+        listed = [p for p in json.load(fh)["parts"] if p["id"] == "health-check"][0]["ceiling"]
+    check("check: the ceiling is the kit's own parts list's, a whole number, and --conf may come first",
+          (code, doc["ceiling"], isinstance(listed, int) and not isinstance(listed, bool)),
+          (EX_WAITING, listed, True))
+    env_, path, h = place("check-blind")
+    env_.runner.print_rc = 5
+    code, doc, _o, _e = run(env_, ["check", "--conf", path])
+    check("check: launchd that cannot be asked is NOT MEASURED, exit 4, never up to date",
+          (code, rows(doc).get("enable")), (EX_UNKNOWN, NOT_MEASURED))
+
+    # ── R3 and R4. the ceiling decides, and `apply` loads the job itself ─────────────────────────────
+    env_, path, h = place("count", free_gb=1)               # disk fires: one issue, and one page
+    tally = {}
+    rehearse(env_, pu.load_conf(path), tally)
+    check("count: one alert per kind sent to GitHub, and one for the page its status file causes",
+          (tally.get("github"), tally.get("page")), (["disk"], True))
+    env_, path, h = place("count-off", free_gb=1, conf_over={"ALERT_REPO": "", "HEALTH_STATUS_FILE": ""})
+    tally = {}
+    rehearse(env_, pu.load_conf(path), tally)
+    check("count: with GitHub and the status file off, the same pass raises nothing",
+          (tally.get("github"), tally.get("page")), (None, False))
+
+    env_, path, h = place("on", free_gb=1)
+    code, doc, _o, _e = apply_(env_, path)
+    check("apply: 2 alerts under a ceiling of 3: it writes the file, disables it while off, then enables "
+          "and loads it itself",
+          (code, rows(doc), doc["first_pass"], doc["left_off"], launchctl_writes(env_),
+           env_.runner.held is not None, env_.runner.disabled.get(label)),
+          (EX_OK, {"job": DONE, "enable": DONE}, 2, None, ["disable", "enable", "bootstrap"], True, False))
+    check("apply: the pass that counted sent and wrote nothing",
+          (any(a[:3] == ["gh", "workflow", "run"] for a in env_.runner.ran),
+           os.path.exists(os.path.join(h, "status.json"))), (False, False))
+    code, doc, _o, _e = run(env_, ["check", "--conf", path])
+    check("check: after it, every row holds: exit 0", (code, rows(doc)),
+          (EX_OK, {"job": ALREADY_DONE, "enable": ALREADY_DONE}))
+    env_.runner.no_interval = True
+    code, doc, _o, _e = run(env_, ["check", "--conf", path])
+    check("check: a print that gives no interval is judged by its arguments, never a reload each run",
+          (code, rows(doc)), (EX_OK, {"job": ALREADY_DONE, "enable": ALREADY_DONE}))
+    env_, path, h = place("edge", ceiling=2, free_gb=1)
+    code, doc, _o, _e = apply_(env_, path)
+    check("apply: exactly at the ceiling (2 of 2) is switched on: the ceiling is a most",
+          (code, rows(doc).get("enable"), env_.runner.held is not None), (EX_OK, DONE, True))
+    env_, path, h = place("above", ceiling=1, free_gb=1)
+    code, doc, _o, _e = apply_(env_, path)
+    check("apply: above the ceiling (2 of 1) the job is installed, disabled and never loaded",
+          (code, rows(doc), "bootstrap" in launchctl_writes(env_), env_.runner.held,
+           env_.runner.disabled.get(label), os.path.exists(plist_of(h))),
+          (EX_WAITING, {"job": DONE, "enable": BLOCKED}, False, None, True, True))
+    check("apply: …and one line says why, which starts its row",
+          (doc["left_off"], "\n" in doc["left_off"], details(doc)["enable"].startswith(doc["left_off"]),
+           doc["first_pass"], doc["ceiling"]),
+          ("left off: its first pass would raise 2 alerts, above its ceiling of 1", False, True, 2, 1))
+    env_, path, h = place("no-ceiling", parts={"parts": [
+        {"id": "health-check", "installer": "scripts/pipeline_watch.py", "ceiling": None}]})
+    code, doc, _o, _e = run(env_, ["check", "--conf", path])
+    check("check: no ceiling it can read is NOT MEASURED, never 'no limit'",
+          (code, rows(doc).get("enable"), doc["ceiling"]), (EX_UNKNOWN, NOT_MEASURED, None))
+    code, doc, _o, _e = apply_(env_, path)
+    check("apply: no ceiling it can read leaves it off and disabled, exit 4",
+          (code, rows(doc).get("enable"), doc["left_off"], env_.runner.held, env_.runner.disabled.get(label)),
+          (EX_UNKNOWN, NOT_MEASURED, "left off: its first-pass ceiling could not be read", None, True))
+    saved_rehearse = globals()["rehearse"]
+    globals()["rehearse"] = lambda env, conf, tally=None: EX_FAILED
+    try:
+        env_, path, h = place("bad-count")
+        code, doc, _o, _e = apply_(env_, path)
+    finally:
+        globals()["rehearse"] = saved_rehearse
+    check("apply: a count that did not end as a pass ends is not known: off, disabled, exit 4",
+          (code, rows(doc).get("enable"), (doc["left_off"] or "").startswith("left off: the pass that counts"),
+           env_.runner.held, env_.runner.disabled.get(label)),
+          (EX_UNKNOWN, NOT_MEASURED, True, None, True))
+
+    # A job file written while the job is off cannot start at the next login.
+    env_, path, h = place("enabled-file", ceiling=1, free_gb=1)
+    write_agent(plist_of(h), Setup(env_, pu.load_conf(path), False).want)     # current, never on
+    code, doc, _o, _e = run(env_, ["check", "--conf", path])
+    check("check: a current file left enabled while off is named: a login would start it",
+          "It is NOT disabled" in details(doc).get("enable", ""), True)
+    code, doc, _o, _e = apply_(env_, path)
+    check("apply: …and apply disables it, even when it then leaves it off",
+          (rows(doc), env_.runner.disabled.get(label), env_.runner.held),
+          ({"job": ALREADY_DONE, "enable": BLOCKED}, True, None))
+
+    # A job that has run before and is not loaded was stopped on purpose: never switched back on.
+    env_, path, h = place("paused")
+    apply_(env_, path)
+    env_.runner.held = None                                   # a person's `launchctl bootout`
+    mark = len(env_.runner.writes)
+    code, doc, _o, _e = apply_(env_, path)
+    check("apply: a job that ran before and is not loaded is never switched back on, nor its login "
+          "setting touched",
+          (code, rows(doc), launchctl_writes(env_, mark), "stopped on purpose" in details(doc)["enable"],
+           "install" in details(doc)["enable"]),
+          (EX_WAITING, {"job": ALREADY_DONE, "enable": BLOCKED}, [], True, True))
+    code, doc, _o, _e = run(env_, ["check", "--conf", path])
+    check("check: a paused job is a person's step, never work for apply",
+          (code, rows(doc)), (EX_WAITING, {"job": ALREADY_DONE, "enable": BLOCKED}))
+    os.remove(plist_of(h))                                    # and its file removed, as `uninstall` does
+    env_.runner.disabled.pop(label, None)
+    code, doc, _o, _e = apply_(env_, path)
+    check("apply: a job file it writes while the job is off is disabled in that same step, even when the "
+          "next step stops",
+          (rows(doc), env_.runner.disabled.get(label), env_.runner.held),
+          ({"job": DONE, "enable": BLOCKED}, True, None))
+
+    # A loaded job running another interval is reloaded; a load launchd refuses stays off.
+    env_, path, h = place("reload")
+    apply_(env_, path)
+    with open(path, encoding="utf-8") as fh:
+        text = fh.read()
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text.replace("WATCH_INTERVAL_SECONDS=3600\n", "WATCH_INTERVAL_SECONDS=7200\n"))
+    code, doc, _o, _e = run(env_, ["check", "--conf", path])
+    check("check: a loaded job on another interval is work: write the file, reload the job",
+          (code, rows(doc), "would reload it" in details(doc)["enable"]),
+          (EX_WAITING, {"job": WOULD_CHANGE, "enable": WOULD_CHANGE}, True))
+    mark = len(env_.runner.writes)
+    code, doc, _o, _e = apply_(env_, path)
+    check("apply: it reloads it itself: stop, enable, load; launchd then holds the new interval",
+          (code, rows(doc), launchctl_writes(env_, mark), (env_.runner.held or {}).get("StartInterval")),
+          (EX_OK, {"job": DONE, "enable": DONE}, ["bootout", "enable", "bootstrap"], 7200))
+    env_, path, h = place("refused")
+    env_.runner.refuse = (1, "", "Bootstrap failed: 1: Operation not permitted")
+    code, doc, _o, _e = apply_(env_, path)
+    check("apply: a load launchd refuses is FAILED, and the job is disabled again",
+          (code, rows(doc).get("enable"), "disabled again" in details(doc)["enable"],
+           env_.runner.disabled.get(label), env_.runner.held), (EX_FAILED, FAILED, True, True, None))
+    env_, path, h = place("refused-twice")
+    env_.runner.refuse = (1, "", "Bootstrap failed: 1: Operation not permitted")
+    env_.runner.disable_rcs = [0, 1]          # the job step's disable holds; the one after the load fails
+    code, doc, _o, _e = apply_(env_, path)
+    check("apply: a refused load whose disable fails too stays FAILED, and says both",
+          (code, rows(doc).get("enable"), "Bootstrap failed" in details(doc)["enable"],
+           "could not be disabled again" in details(doc)["enable"],
+           "a login may start it" in details(doc)["enable"]),
+          (EX_FAILED, FAILED, True, True, True))
+    env_, path, h = place("blind")
+    env_.runner.blind = True
+    code, doc, _o, _e = apply_(env_, path)
+    check("apply: a load launchd cannot then be asked about is NOT MEASURED, never on",
+          (code, rows(doc).get("enable")), (EX_UNKNOWN, NOT_MEASURED))
+    sx = Setup(env_, pu.load_conf(path), False)
+    try:
+        load_job(sx)
+        said = ""
+    except pu.UpdateError as exc:
+        said = str(exc)
+    check("load: only `apply` reaches the one function that loads", "only `apply` loads" in said, True)
+
+    # ── R2 and R5. answers through a pipe only; a "no" or a refusal changes nothing ──────────────────
+    env_, path, h = place("answers")
+    with open(os.path.join(h, "answers.json"), "w", encoding="utf-8") as fh:
+        fh.write(yes)
+    with open(os.path.join(h, "answers.json"), encoding="utf-8") as as_file:
+        from_file = run(env_, ["apply", "--conf", path], stdin=as_file)
+    bad = [apply_(env_, path, text) for text in (
+        json.dumps({"schema": "notifier-answers/1", "consent": "yes"}),
+        json.dumps({"schema": ANSWERS_SCHEMA, "consent": "yes", "token": "x"}),
+        "consent=yes")]
+    not_a_pipe = run(env_, ["apply", "--conf", path], stdin=io.StringIO(yes))
+    check("answers: a file, another installer's answers, a key it does not take, or no pipe: exit 2, "
+          "nothing changed",
+          ([r[0] for r in [from_file] + bad + [not_a_pipe]], "is a file" in from_file[1]["why"],
+           os.path.exists(plist_of(h)), env_.runner.writes),
+          ([EX_USAGE] * 5, True, False, []))
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            main(["apply", "--conf", path, yes], env=env_)
+        on_line = None
+    except SystemExit as exc:
+        on_line = exc.code
+    check("answers: there is no argument they could come in", on_line, 2)
+    code, doc, _o, _e = apply_(env_, path, json.dumps({"schema": ANSWERS_SCHEMA, "consent": "no"}))
+    check("no: an answer that is not yes changes nothing and exits 10, never done",
+          (code, doc["rows"], "no consent" in doc["why"], os.path.exists(plist_of(h)), env_.runner.writes),
+          (EX_WAITING, [], True, False, []))
+    env_, path, h = place("agent", environ={"CLAUDECODE": "1"})
+    stream = pipe_of(yes)
+    code, doc, _o, _e = run(env_, ["apply", "--conf", path], stdin=stream)
+    left = stream.read()
+    stream.close()
+    check("agent: apply is refused with exit 3 before it reads its answers, and changes nothing",
+          (code, doc["exit"], left, os.path.exists(plist_of(h)), env_.runner.writes),
+          (EX_REFUSED, EX_REFUSED, yes, False, []))
+    try:
+        refuse_if_agent("apply", {"CLAUDECODE": "1"})
+        said = ""
+    except pu.Refusal as exc:
+        said = str(exc)
+    check("agent: …its refusal names the read-only `check`", "pipeline_watch.py check" in said, True)
+    code, doc, _o, _e = run(env_, ["check", "--conf", path])
+    check("agent: check still runs under a model, and changes nothing",
+          (code, rows(doc), env_.runner.writes), (EX_WAITING, {"job": WOULD_CHANGE, "enable": WOULD_CHANGE}, []))
+    saved_uid = rg._uid
+    rg._uid = lambda: 0
+    try:
+        env_, path, h = place("root")
+        refused = [apply_(env_, path)[:2], run(env_, ["check", "--conf", path])[:2]]
+    finally:
+        rg._uid = saved_uid
+    check("root: check and apply refuse first, with exit 3, and still print their one document",
+          [(c, (d or {}).get("why")) for c, d in refused] + [env_.runner.writes],
+          [(EX_REFUSED, "refused: run as root")] * 2 + [[]])
 
 
 if __name__ == "__main__":

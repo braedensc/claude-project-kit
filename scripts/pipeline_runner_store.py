@@ -16,6 +16,9 @@ move into it; until then this is the whole store.
     <store>/trees/<run>.json       the processes the runner remembered of a run, to kill what is
                                    left when it ends: the runner's alone, never in the run's own
                                    folder, which the run's processes write (KIT-739)
+    <store>/outputs/<run>.json     the session's final message, kept by the runner when the run
+                                   ends, for the caller that asked for it (KIT-858): the runner's
+                                   alone, for the same reason
 
 WHO MAY ASK.  Five jobs, each for its own kinds of session (CALLERS):
 
@@ -35,6 +38,13 @@ EACH PROJECT'S LANES (KIT-866, KIT-645).  lane_flags() is the one reading of a p
 absent is every lane off. The runner reads its settings through it, and so does a caller asking
 caller_lane() whether to ask the runner or keep to its old way. A caller that cannot read the
 runner's settings is held, never sent the old way: could not read is not off.
+
+TEXT AND THE FINAL MESSAGE (KIT-858).  A resume carries its text, and a start may carry one too: the
+facts its caller's own code wrote, which the runner hands the session fenced as data, after the
+ticket. A stop carries none. When a run ends, the runner keeps the session's final message, its last
+OUTPUT_MAX characters, in outputs/<run>.json. The caller reads it with run_output(): a document,
+None when the run left no result at all, or StoreError when one is there and cannot be read. The
+message is the session's own words, so it is data to its caller and never part of a run's record.
 
 THE WALLS.  A session must never write here: a request it wrote could start a session nobody
 approved. So the store must be an absolute path, outside every git working tree, a real folder
@@ -110,9 +120,16 @@ UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]
 TIME_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\Z")
 ACTOR_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}\Z")
 BRANCH_RE = re.compile(r"^(feat|fix|chore|refactor|docs)/[a-z0-9][a-z0-9-]*\Z")
-TEXT_MAX = 20000          # a resume's text, written by the caller's own code
+TEXT_MAX = 20000          # a start's or a resume's text, written by the caller's own code
 WHY_MAX = 300
 DOC_MAX = 1 << 20         # no request or record is larger than this
+# KIT-858: the session's final message, as the runner keeps it. Written without ASCII escapes, each
+# character takes at most 6 bytes (a control character's \u escape), so even the worst message
+# keeps its document under DOC_MAX.
+OUTPUT_SCHEMA = "pipeline-runner-output/1"
+OUTPUT_MAX = 150000
+OUTPUT_KEYS = ("schema", "run", "at", "is_error", "subtype", "text", "cut")
+SUBTYPE_RE = re.compile(r"^[a-z_]{0,40}\Z")
 REQUEST_KEYS = ("schema", "id", "at", "caller", "action", "kind", "project", "ticket", "run",
                 "text")
 RUN_KEYS = ("schema", "run", "request", "caller", "kind", "project", "ticket", "resumes",
@@ -221,12 +238,16 @@ def request_problems(doc):
             bad.append("a start names no run")
     elif not (isinstance(doc["run"], str) and RUN_RE.match(doc["run"])):
         bad.append("a %s names the run it is for" % doc["action"])
+    text_ok = (isinstance(doc["text"], str) and 0 < len(doc["text"]) <= TEXT_MAX
+               and "\0" not in doc["text"])
     if doc["action"] == "resume":
-        if not (isinstance(doc["text"], str) and 0 < len(doc["text"]) <= TEXT_MAX
-                and "\0" not in doc["text"]):
+        if not text_ok:
             bad.append("a resume carries its text, at most %d characters" % TEXT_MAX)
+    elif doc["action"] == "start":
+        if doc["text"] is not None and not text_ok:      # KIT-858: a start's facts, when it has any
+            bad.append("a start's text, when it carries one, is 1 to %d characters" % TEXT_MAX)
     elif doc["text"] is not None:
-        bad.append("only a resume carries text")
+        bad.append("a stop carries no text")
     if not bad and not may(doc["caller"], doc["action"], doc["kind"]):
         bad.append("the %s job may not ask to %s a %s session"
                    % (doc["caller"], doc["action"], doc["kind"]))
@@ -332,11 +353,11 @@ def walls(path):
     return []
 
 
-FOLDERS = ("requests", "taken", "runs", "trees")
+FOLDERS = ("requests", "taken", "runs", "trees", "outputs")
 
 
 def prepare(store):
-    """Make the store and its four folders, mode 0700, and check every one. Returns problems."""
+    """Make the store and its five folders, mode 0700, and check every one. Returns problems."""
     for path in (store,) + tuple(os.path.join(store, name) for name in FOLDERS):
         if not os.path.lexists(path):
             try:
@@ -349,13 +370,14 @@ def prepare(store):
     return []
 
 
-def write_json(path, doc):
-    """One file, whole or not at all, mode 0600, never through a link."""
+def write_json(path, doc, ensure_ascii=True):
+    """One file, whole or not at all, mode 0600, never through a link. `ensure_ascii` False writes
+    text as UTF-8 rather than escapes, for a document whose size is bounded by its characters."""
     tmp = "%s.%s.tmp" % (path, uuid.uuid4().hex[:12])
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(doc, fh, indent=1, sort_keys=True)
+            json.dump(doc, fh, indent=1, sort_keys=True, ensure_ascii=ensure_ascii)
             fh.write("\n")
             fh.flush()
             os.fsync(fh.fileno())
@@ -542,6 +564,74 @@ def read_runs(store):
 
 
 # --------------------------------------------------------------------------- #
+# The session's final message (KIT-858)
+# --------------------------------------------------------------------------- #
+def output_path(store, run_id):
+    """Where the runner keeps a run's final message: in its own folder, never the run's, whose
+    files the run's own processes write."""
+    if not (isinstance(run_id, str) and RUN_RE.match(run_id)):
+        raise ValueError("not a run id")
+    return os.path.join(store, "outputs", run_id + ".json")
+
+
+def output_problems(doc):
+    """Everything wrong with a kept final message's shape, in words. Empty when it is well formed."""
+    if not isinstance(doc, dict):
+        return ["the output is not an object"]
+    if sorted(doc) != sorted(OUTPUT_KEYS):
+        return ["the output's fields are not an output's"]
+    text = doc["text"]
+    checks = (
+        ("schema", doc["schema"] == OUTPUT_SCHEMA),
+        ("run", isinstance(doc["run"], str) and bool(RUN_RE.match(doc["run"]))),
+        ("at", isinstance(doc["at"], str) and bool(TIME_RE.match(doc["at"]))),
+        ("is_error", isinstance(doc["is_error"], bool)),
+        ("subtype", isinstance(doc["subtype"], str) and bool(SUBTYPE_RE.match(doc["subtype"]))),
+        ("text", text is None or (isinstance(text, str) and len(text) <= OUTPUT_MAX)),
+        ("cut", isinstance(doc["cut"], bool) and not (doc["cut"] and text is None)),
+    )
+    return ["the output's %s is not valid" % name for name, ok in checks if not ok]
+
+
+def write_output(store, run_id, is_error, subtype, text, now):
+    """Keep a run's final message: the runner's one way to write it, when the run ends. `text` is
+    the program's result text, or None when its result carried none. A longer one keeps its last
+    OUTPUT_MAX characters and says it was cut, since the block a caller reads ends the message. A
+    character UTF-8 cannot carry (a lone surrogate) becomes '?'. ValueError when the run id or a
+    field is not an output's."""
+    cut = isinstance(text, str) and len(text) > OUTPUT_MAX
+    if isinstance(text, str):
+        text = text[-OUTPUT_MAX:].encode("utf-8", "replace").decode("utf-8")
+    else:
+        text = None
+    doc = {"schema": OUTPUT_SCHEMA, "run": run_id, "at": iso(now), "is_error": bool(is_error),
+           "subtype": subtype if isinstance(subtype, str) and SUBTYPE_RE.match(subtype) else "",
+           "text": text, "cut": cut}
+    bad = output_problems(doc)
+    if bad:
+        raise ValueError(bad[0])
+    write_json(output_path(store, run_id), doc, ensure_ascii=False)
+    return doc
+
+
+def run_output(store, run_id):
+    """A run's final message, as the runner kept it: the document, or None when there is none (the
+    run has not ended, or it left no result at all). StoreError when one is there and cannot be
+    read, or is not an output: "could not read it" is never "none" (contract section 13). Read it
+    once the run's record says it has ended."""
+    path = output_path(store, run_id)
+    if not os.path.lexists(path):
+        return None
+    doc = read_json(path)
+    bad = output_problems(doc)
+    if bad:
+        raise StoreError(bad[0])
+    if doc["run"] != run_id:
+        raise StoreError("the output is another run's")
+    return doc
+
+
+# --------------------------------------------------------------------------- #
 # Selftest
 # --------------------------------------------------------------------------- #
 def selftest():
@@ -610,6 +700,8 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
     expect("ask writes one waiting request", [i[0] for i in pending(store)], [rid])
     doc = pending(store)[0][1]
     expect("the request is well formed", request_problems(doc), [])
+    expect("a start may carry its caller's text, up to the limit (KIT-858)",
+           request_problems(dict(doc, caller="planner", kind="plan", text="x" * TEXT_MAX)), [])
     expect("the caller's own clock is not asked for: the time is the writer's", doc["at"],
            "2023-11-14T22:13:20Z")
     expect("a request file is mode 0600",
@@ -632,8 +724,15 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                                                  text="x"), "a resume names the run it is for"),
             ("a resume with no text", lambda: ask(store, "fix-driver", "resume", "fix", "app", "ENG-1",
                                                   run="run-" + "a" * 32), "a resume carries its text, at most 20000 characters"),
-            ("a start with text", lambda: ask(store, "queue", "start", "code", "app", "ENG-1", text="x"),
-             "only a resume carries text"),
+            ("a stop with text", lambda: ask(store, "queue", "stop", "code", "app", "ENG-1",
+                                             run="run-" + "a" * 32, text="x"),
+             "a stop carries no text"),
+            ("a start's text too long", lambda: ask(store, "planner", "start", "plan", "app", "ENG-1",
+                                                    text="x" * (TEXT_MAX + 1)),
+             "a start's text, when it carries one, is 1 to 20000 characters"),
+            ("a start's text that is empty", lambda: ask(store, "planner", "start", "plan", "app",
+                                                         "ENG-1", text=""),
+             "a start's text, when it carries one, is 1 to 20000 characters"),
             ("a text too long", lambda: ask(store, "fix-driver", "resume", "fix", "app", "ENG-1",
                                             run="run-" + "a" * 32, text="x" * (TEXT_MAX + 1)),
              "a resume carries its text, at most 20000 characters"),
@@ -795,6 +894,55 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
     lane_of(on)
     os.symlink(settings, link)
     expect("caller: settings read through a link are held", caller_lane(link, "app", "code")[0], "held")
+
+    # The session's final message, kept by the runner when a run ends (KIT-858).
+    one, two = "run-" + "5" * 32, "run-" + "6" * 32
+    expect("a final message is kept in the runner's own folder, never the run's",
+           (output_path(store, one), output_path(store, one).startswith(run_dir(store, one))),
+           (os.path.join(store, "outputs", one + ".json"), False))
+    expect("an output path is only ever a run's", refused(lambda: output_path(store, "../x")),
+           "not a run id")
+    expect("a run that left no result has none: None, never an empty message",
+           run_output(store, one), None)
+    message = "Here is the plan.\n```json\n{\"x\": \"é ✓ </untrusted-x>\"}\n```"
+    write_output(store, one, False, "success", message, 1700000100)
+    expect("the final message reads back exactly, whole and not cut", run_output(store, one),
+           {"schema": OUTPUT_SCHEMA, "run": one, "at": "2023-11-14T22:15:00Z", "is_error": False,
+            "subtype": "success", "text": message, "cut": False})
+    expect("an output file is mode 0600", stat.S_IMODE(os.stat(output_path(store, one)).st_mode), 0o600)
+    write_output(store, two, False, "success", "x" * OUTPUT_MAX + "the block at the end", 1700000100)
+    got = run_output(store, two)
+    expect("a longer message keeps its end, where its block is, and says it was cut",
+           (len(got["text"]), got["text"].endswith("the block at the end"), got["cut"]),
+           (OUTPUT_MAX, True, True))
+    for name, text in (("control characters", "\x01" * OUTPUT_MAX),
+                       ("characters past the first plane", "\U0001f600" * OUTPUT_MAX)):
+        write_output(store, two, False, "success", text, 1700000100)
+        expect("the largest message of %s still fits a document the store reads back" % name,
+               (os.path.getsize(output_path(store, two)) <= DOC_MAX, run_output(store, two)["text"] == text),
+               (True, True))
+    write_output(store, two, True, "error_max_turns", None, 1700000100)
+    got = run_output(store, two)
+    expect("a result that carried no message is kept as one with none, never an empty one",
+           (got["text"], got["is_error"], got["subtype"], got["cut"]), (None, True, "error_max_turns", False))
+    write_output(store, two, False, "success", "a\ud800b", 1700000100)
+    expect("a character UTF-8 cannot carry becomes '?', never a crash", run_output(store, two)["text"], "a?b")
+    write_output(store, two, False, "Not A Subtype", "x", 1700000100)
+    expect("a subtype that is not one is kept as none", run_output(store, two)["subtype"], "")
+    expect("an output for no run is refused", refused(lambda: write_output(store, "run-x", False, "", "x", 0)),
+           "the output's run is not valid")
+    with open(output_path(store, two), "w") as fh:
+        fh.write("{not json")
+    expect("an output that cannot be read is an error, never none",
+           refused(lambda: run_output(store, two)), "it could not be read (JSONDecodeError)")
+    write_json(output_path(store, two), run_output(store, one))
+    expect("an output filed under another run is an error", refused(lambda: run_output(store, two)),
+           "the output is another run's")
+    write_json(output_path(store, two), dict(run_output(store, one), run=two, extra=1))
+    expect("an output with a field it may not hold is an error",
+           refused(lambda: run_output(store, two)), "the output's fields are not an output's")
+    expect("an output cut with no text is not one",
+           output_problems(dict(run_output(store, one), text=None, cut=True)), ["the output's cut is not valid"])
 
     if failures:
         print("FAIL: pipeline_runner_store selftest")
