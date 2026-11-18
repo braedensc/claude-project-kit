@@ -1278,6 +1278,10 @@ pipeline's, oldest first. The tech lead reads them as a record of what was said,
 - A message shaped like a key is left out, and the block says how many were.
 - If Slack cannot be read, or is slow, the turn still answers with what was read, and the log
   says so. It reads no thread after 10 seconds.
+- The reads come out of the turn's own time. If they leave too little of a pass for the turn, the
+  message waits for the next pass, and the log says so.
+- A conversation too long even for Claude Code's own summary starts again with the DM's recent
+  messages only. Its older turns are dropped, not summarised, and the log says that too.
 - The tech lead never says it has no memory. If you mention something it does not have, it asks.
 
 Good: `the tech lead's new conversation was given 12 of the DM's recent messages`, right after

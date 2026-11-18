@@ -89,9 +89,12 @@ SEED_MESSAGES = 30
 SEED_CHARS = 8000
 SEED_LINE_MAX = 600
 SEED_THREADS_MAX = 10
-# The reads come out of the turn's own time, so no thread is read once this long has passed: a
-# slow Slack costs the seed some threads, never the pass its margin to say a turn failed.
+# The reads come out of the turn's own time: no thread is read once this long has passed, and
+# the turn's run gets only what is left after them (time_left, Stage E on #588). A slow Slack
+# costs the turn time, never the pass its margin to say a turn failed.
 SEED_READ_SECONDS = 10
+# KIT-751: what the log adds when a conversation was too long even for Claude Code's own summary.
+TOO_LONG_DROPPED = "; only the DM's recent messages carry over, and its older turns are dropped"
 SEED_LEFT_OUT = {"credential": "carried a credential shape",
                  "unsafe": "could not be made plain text"}
 # KIT-343's last check, landed with KIT-353: a line of the tech lead's answer that tells him to
@@ -729,6 +732,8 @@ class TechLeadMixin(object):
         # or the saved one could not be resumed), so that one never starts blank.
         self.seed_note = None
         more["seed"] = lambda: self.recent_conversation(channel, msg)
+        # Stage E on #588: asked before each run, so the seed's reads come out of the turn's time.
+        more["time_left"] = self.turn_seconds
         # Everything from the turn to the stream's ending is under one guard: a fault anywhere in it
         # (the turn, the outbox, the checks, the redaction) removes the half-written message
         # instead of leaving a stream open in the thread.
@@ -736,13 +741,25 @@ class TechLeadMixin(object):
             res = self.run_turn(dict(self.cfg, turn_timeout_seconds=seconds), text,
                                 sessions.get(skey), self.now, **more)
             if res.get("began_again"):
-                # KIT-759: the one way a DM's conversation begins again, said in the log.
-                self.say("  the tech lead's conversation began again: %s" % res["began_again"])
+                # KIT-759: the one way a DM's conversation begins again, said in the log. Past
+                # Claude Code's own summary, the older turns are dropped, and that is said too.
+                self.say("  the tech lead's conversation began again: %s%s" % (
+                    res["began_again"],
+                    TOO_LONG_DROPPED if res["began_again"] == turn.BEGAN_TOO_LONG else ""))
             if self.seed_note is not None:
                 self.say(self.seed_said())     # KIT-751: what the new conversation was given
             # Read once, whatever the turn did: a turn that failed after the tools ran leaves no
             # action waiting. What it recorded is asked about only after its reply is posted.
             acts, left_out = self.read_outbox()
+            if res.get("later"):
+                # Stage E on #588: the seed's reads used the pass's time up, so no run started.
+                # The message is left for the next pass, as one is when too little is left before.
+                if stream:
+                    stream.discard()
+                self.drop_recorded(acts, left_out)
+                self.say("  left a DM message for the next pass: %s" % res["why"])
+                self.save()
+                return
             hosts = self.cfg["tech_lead_link_hosts"]
             words, made, held, removed = "", 0, "", 0
             if res["text"]:
@@ -1693,6 +1710,12 @@ def cases_tech_lead(kit):
               ["  the tech lead's conversation began again: the saved conversation could not be "
                "found",
                "  answered a DM message from %s with a turn" % ALICE])
+        # Stage E on #588: past Claude Code's own summary the older turns are dropped, and said.
+        check("turn-the-log-says-a-conversation-too-long-to-resume-drops-its-older-turns",
+              outcome(lambda: case_turn_log({"began_again": turn.BEGAN_TOO_LONG})),
+              ["  the tech lead's conversation began again: the saved conversation was too long to "
+               "resume; only the DM's recent messages carry over, and its older turns are dropped",
+               "  answered a DM message from %s with a turn" % ALICE])
         check("turn-the-log-names-an-ignored-turn_session_hours-and-only-when-it-is-above-zero",
               [outcome(lambda: [ln for ln in case_turn_log({}, **over) if "turn_session_hours" in ln])
                for over in ({"turn_session_hours": 12}, {"turn_session_hours": 0}, {})],
@@ -1883,6 +1906,51 @@ def cases_tech_lead(kit):
               (["your manager (T): question 0?", "your manager (T): question 1?",
                 "your manager (T): question 2?", "you (T): Answer 2."],
                ["stopped reading its threads after %d seconds" % SEED_READ_SECONDS], 1))
+
+        # Stage E on #588: the seed's reads come out of the turn's own time. A pass of 120
+        # seconds whose Slack takes 40 to answer gives the run 55 (120 - 40 - 25), not 90.
+        def case_seed_time_counts():
+            c, s, t = seed_world("turn-seed-time", [(ALICE, "an earlier word", {})])
+            st, _first = load_state(c)
+            p = Pass(c, s, t, st, False, False, now, io.StringIO())
+            p.me = {"user_id": ME, "team_id": TEAM, "bot_id": BOT}
+            ticks = [0.0]
+            p.clock, p.deadline = (lambda: ticks[0]), 120.0
+            reads = s.recent
+
+            def slow_recent(*args):
+                ticks[0] += 40.0                           # Slack took 40 seconds to answer
+                return reads(*args)
+            s.recent = slow_recent
+            seen = []
+
+            def stand_in(cfg, text, session, now_, **kw):
+                seen.append(cfg["turn_timeout_seconds"])
+                kw["seed"]()
+                seen.append(kw["time_left"]())
+                return {"text": None, "why": turn.TOO_LITTLE_TIME, "session_id": None,
+                        "resumed": False, "later": True}
+            p.run_turn = stand_in                          # on the instance: never bound
+            msg = {"ts": s.add(ALICE, "and now?", channel=DM), "user": ALICE, "text": "and now?"}
+            p.take_turn(DM, msg, "and now?")
+            return seen, dm_lines(s), key_of(DM, msg["ts"]) in p.state["handled"]
+        check("turn-the-seeds-reads-come-out-of-the-turns-time-and-the-run-gets-what-is-left",
+              outcome(case_seed_time_counts), ([90, 55], [], False))
+
+        def case_later():
+            c, s, t = seed_world("turn-later")
+            fake = FakeTurn({"text": None, "why": turn.TOO_LITTLE_TIME, "later": True},
+                            {"text": "Here now.", "session_id": t_sid})
+            s.add(ALICE, "are you there?", channel=DM)
+            _code, out = with_turn(fake, lambda: run(c, s, t))
+            first = dm_lines(s)
+            with_turn(fake, lambda: run(c, s, t, at=now + 60))
+            return (first, [ln for ln in out.splitlines() if "next pass" in ln], dm_lines(s),
+                    len(fake.calls))
+        check("turn-with-too-little-left-after-the-seed-the-message-waits-for-the-next-pass",
+              outcome(case_later),
+              ([], ["  left a DM message for the next pass: too little of the pass was left to run "
+                    "the turn"], ["Here now."], 2))
 
         def case_turn_config():
             base = dict(EXAMPLE_CONFIG, channel_ids=[CHAN], owner_user_id=OWNER,

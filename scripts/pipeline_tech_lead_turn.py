@@ -143,6 +143,14 @@ _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f
 _NO_SESSION_RE = re.compile(r"no conversation found|session.{0,40}not found", re.IGNORECASE)
 # KIT-759: with no time limit, a conversation too long to send even after Claude Code's own
 # compaction would fail every turn, so that too begins it again.
+# Why a resumed conversation had to begin again, in fixed words. For the second, the bridge's log
+# also says that only the DM's recent messages carry over (KIT-751): Claude Code's own summary
+# could not keep it short enough, and the older turns are dropped.
+BEGAN_LOST = "the saved conversation could not be found"
+BEGAN_TOO_LONG = "the saved conversation was too long to resume"
+# Stage E on #588: what a run that never started says when the caller's time ran out first. The
+# seed's reads come out of the turn's own time, so the pass keeps its margin to say a turn failed.
+TOO_LITTLE_TIME = "too little of the pass was left to run the turn"
 _TOO_LONG_RE = re.compile(r"prompt is too long|context (?:window|length)|too many tokens",
                           re.IGNORECASE)
 RESULT_MAX_CHARS = 20000                  # what is read of the model's text, before the bridge cuts
@@ -535,10 +543,11 @@ def _result(text=None, why="", session_id=None, resumed=False, cost=None, turns=
     """`cache_share` (KIT-759) is the share of the turn's input read from the prompt cache;
     `began_again` is why a resumed conversation had to begin again, in fixed words, or "";
     `seeded` (KIT-751) is how many lines of the DM's recent messages a new conversation was
-    given, or None when the turn asked for none."""
+    given, or None when the turn asked for none; `later` is True when no run started because
+    the caller's time ran out first, so the message is for the caller to try again."""
     return {"text": text, "why": why, "session_id": session_id, "resumed": resumed,
             "cost": cost, "turns": turns, "denials": denials, "cache_share": cache_share,
-            "began_again": "", "seeded": None}
+            "began_again": "", "seeded": None, "later": False}
 
 
 def _cache_share(doc):
@@ -594,14 +603,17 @@ def read_result(proc, session_id, resumed):
 
 
 def run_turn(cfg, text, session, now, runner=None, new_id=None, environ=None, note="",
-             on_text=None, earlier="", seed=None):
+             on_text=None, earlier="", seed=None, time_left=None):
     """One turn. `session` is this DM's record ({"id", "last_at"}) or None. Returns a dict:
     text (None when there is none), why (fixed words), session_id (what to keep), resumed,
     cost and turns. Never raises for a failed run. With `on_text` (KIT-565) the run is the CLI's
     stream, and each piece of text the model writes is handed to it as it arrives; the result
     is the same. A fault in `on_text` is never the turn's. `seed` (KIT-751) is asked at most
     once, and only when the run starts a new conversation: its lines, the DM's recent messages,
-    go in the prompt (seed_lines, build_prompt), and `seeded` in the result says how many."""
+    go in the prompt (seed_lines, build_prompt), and `seeded` in the result says how many.
+    `time_left` (Stage E on #588) is the caller's seconds left, asked before each run, after
+    the seed's reads and any earlier try: a run's timeout is never more, and with less than
+    TURN_MIN_SECONDS no run starts and the result is `later`."""
     environ = os.environ if environ is None else environ
     runner = runner or (_stream_runner if on_text else _runner)
     new_id = new_id or (lambda: str(uuid.uuid4()))
@@ -669,14 +681,23 @@ def run_turn(cfg, text, session, now, runner=None, new_id=None, environ=None, no
             recent = seed_lines(seed)            # KIT-751: a new conversation never starts blank
         given = recent if not resumed else None
         prompt = build_prompt(text, note, earlier, "\n".join(given or []))
+        # Stage E on #588: the run gets what is left of the caller's time now, after the seed's
+        # reads and any earlier try, never a figure taken before them.
+        limit = s["turn_timeout_seconds"]
+        if time_left is not None:
+            limit = min(limit, time_left())
+            if limit < TURN_MIN_SECONDS:
+                res = done(_result(why=TOO_LITTLE_TIME, session_id=sid, resumed=resumed))
+                res["later"] = True
+                return res
         argv = build_argv(s, tcfg, mcp_path, rules_path, sid, resumed, stream=bool(on_text))
         try:
             more = {"on_event": on_event} if on_text else {}
             proc = runner(argv, cwd=fld["work"], env=child_env(fld["home"], fld["tmp"], token),
-                          input=prompt, timeout=s["turn_timeout_seconds"], **more)
+                          input=prompt, timeout=limit, **more)
         except subprocess.TimeoutExpired:
-            return done(_result(why="the turn took longer than %g seconds"
-                                % s["turn_timeout_seconds"], session_id=sid, resumed=resumed))
+            return done(_result(why="the turn took longer than %g seconds" % limit,
+                                session_id=sid, resumed=resumed))
         except (OSError, ValueError) as exc:
             return done(_result(why="could not start %s: %s" % (
                 s["turn_bin"], getattr(exc, "strerror", None) or type(exc).__name__)))
@@ -685,9 +706,8 @@ def run_turn(cfg, text, session, now, runner=None, new_id=None, environ=None, no
         res, said = read_result(proc, sid, resumed)
         lost = ""
         if res["text"] is None and resumed:
-            lost = ("the saved conversation could not be found" if _NO_SESSION_RE.search(said)
-                    else "the saved conversation was too long to resume"
-                    if _TOO_LONG_RE.search(said) else "")
+            lost = (BEGAN_LOST if _NO_SESSION_RE.search(said)
+                    else BEGAN_TOO_LONG if _TOO_LONG_RE.search(said) else "")
         if lost:
             sid, resumed, began = new_id(), False, lost    # it cannot be resumed: begin again, once
             continue
@@ -1042,7 +1062,7 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
     expect("result: the reply, the session to keep, the cost and the rounds",
            res, {"text": "Two plans are open.", "why": "", "session_id": SID, "resumed": False,
                  "cost": 0.02, "turns": 3, "denials": 0, "cache_share": None,
-                 "began_again": "", "seeded": None})
+                 "began_again": "", "seeded": None, "later": False})
     expect("a turn runs in its own empty working folder, with a timeout",
            (c["cwd"], c["timeout"], os.listdir(c["cwd"])), (fld["work"], 90, []))
 
@@ -1431,6 +1451,33 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
     res = turn(r)
     expect("seed: a turn given no seed, as a stand-up's or a plan note's, starts with none",
            (res["seeded"], "recent-conversation" in r.calls[0]["input"]), (None, False))
+    # Stage E on #588: the seed's reads come out of the turn's own time. A run's timeout is what
+    # the caller has left after them, and with too little left no run starts.
+    left = {"now": 90}
+
+    def slow_seed(after):
+        def seed():
+            left["now"] = after                  # the reads took the rest of the time
+            return list(RECENT)
+        return seed
+    r = Runner(ok())
+    res = turn(r, seed=slow_seed(35), time_left=lambda: left["now"])
+    expect("time: the run's timeout is what is left after the seed's reads, not the figure "
+           "taken before them", (r.calls[0]["timeout"], res["text"], res["later"]),
+           (35, "Two plans are open.", False))
+    left["now"] = 90
+    r = Runner(ok())
+    res = turn(r, seed=slow_seed(TURN_MIN_SECONDS - 1), time_left=lambda: left["now"])
+    expect("time: with too little left after the seed, no run starts and the turn says to try "
+           "later", (len(r.calls), res["text"], res["why"], res["later"], res["seeded"]),
+           (0, None, TOO_LITTLE_TIME, True, 3))
+    ticks = iter([90, 50])
+    r = Runner(lost, ok(sid=SID2))
+    res = turn(r, session={"id": SID, "last_at": 900.0}, ids_=[SID2], seed=seed_of(RECENT),
+               time_left=lambda: next(ticks))
+    expect("time: a try that begins again gets what is left after the first one, never the "
+           "whole timeout again", ([c["timeout"] for c in r.calls], res["text"]),
+           ([90, 50], "Two plans are open."))
 
     def boom():
         raise RuntimeError("Slack could not be read")
