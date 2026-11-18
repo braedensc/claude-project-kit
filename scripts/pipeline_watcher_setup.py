@@ -86,7 +86,25 @@ CONF_DEFAULTS = {
     "LIMIT_DAY_USD": "", "LIMIT_PIECE_USD": "", "LIMIT_DAY_RUNS": "", "LIMIT_PIECE_RUNS": "",
     # KIT-546: the validator's ledger, the owner's own GitHub logins, and the day's approvals limit.
     "VALIDATOR_LEDGER": "", "OWNER_LOGINS": "", "LIMIT_DAY_APPROVALS": "",
+    # KIT-782: the queue's, the morning job's and the sweep's heartbeats, the workers' files the copier also copies
+    # so the health watch can read them. Empty: that job is off here.
+    "QUEUE_HEARTBEAT": "", "MORNING_HEARTBEAT": "", "SWEEP_HEARTBEAT": "",
 }
+# The three heartbeat sources: conf key -> (the copy's name in root's copy folder, the health check's update.conf key).
+# The one command writes that update.conf key with the copy's path.
+BEATS = {"QUEUE_HEARTBEAT": ("queue-heartbeat.json", "QUEUE_HEARTBEAT_FILE"),
+         "MORNING_HEARTBEAT": ("morning-heartbeat.json", "MORNING_HEARTBEAT_FILE"),
+         "SWEEP_HEARTBEAT": ("sweep-heartbeat.json", "SWEEP_HEARTBEAT_FILE")}
+BEAT_MAX_BYTES = 65536          # a heartbeat is a few lines; a bigger file is refused
+
+
+def copies_wanted(c):
+    """Whether the copier has anything to copy: the usage file or any heartbeat."""
+    return bool(c["USAGE_FILE"]) or any(c[k] for k in BEATS)
+
+
+def beat_copy_path(c, key):
+    return "%s/copy/%s" % (c["INSTALL_DIR"].rstrip("/"), BEATS[key][0])
 CONF_KEYS = set(CONF_REQUIRED) | set(CONF_DEFAULTS)
 ACCOUNT_RE = re.compile(r"^_?[a-z][a-z0-9_-]{1,30}\Z")
 RDNS_RE = re.compile(r"^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+\Z")
@@ -175,6 +193,12 @@ def validate_conf(values, user=None):
     need(not c.get("USAGE_FILE") or not any(c.get("USAGE_FILE", "").startswith(d.rstrip("/") + "/")
                                             for d in (c.get("INSTALL_DIR", ""), c.get("STATE_DIR", "")) if d.rstrip("/")),
          "USAGE_FILE is the workers' file: it must be outside INSTALL_DIR and STATE_DIR")
+    for k in sorted(BEATS):
+        v = c.get(k, "")
+        need(v == "" or bool(PATH_RE.match(v)), "%s must be an absolute path, or empty" % k)
+        need(not v or not any(v.startswith(d.rstrip("/") + "/")
+                              for d in (c.get("INSTALL_DIR", ""), c.get("STATE_DIR", "")) if d.rstrip("/")),
+             "%s is the workers' file: it must be outside INSTALL_DIR and STATE_DIR" % k)
     need(c.get("KIT_CHECKOUT") and os.path.isabs(c["KIT_CHECKOUT"]), "KIT_CHECKOUT must be an absolute path")
     need(ENV_RE.match(c.get("GITHUB_TOKEN_ENV", "")), "GITHUB_TOKEN_ENV must be the NAME of an environment variable")
     need(c.get("LINEAR_KEY_ENV") == "" or ENV_RE.match(c["LINEAR_KEY_ENV"]),
@@ -268,14 +292,20 @@ def compose_rules(c, watcher):
 
 
 def compose_copier_rules(c):
-    """The copier's rules, judged by the copier's own loader; None when there is no usage file to copy."""
-    if not c["USAGE_FILE"]:
+    """The copier's rules, judged by the copier's own loader; None when there is nothing to copy."""
+    if not copies_wanted(c):
         return None
     import pipeline_watcher_copy as copier  # noqa: PLC0415 -- this checkout's, which preflight proved is the commit's
     p = paths(c)
-    doc = {"schema": copier.RULES_SCHEMA, "status_file": p["copy_status"],
-           "copies": [{"source": c["USAGE_FILE"], "owner": c["ROLE_ACCOUNT"], "dest": p["copy"],
-                       "max_bytes": copier.DEFAULT_MAX_BYTES}]}
+    copies = []
+    if c["USAGE_FILE"]:
+        copies.append({"source": c["USAGE_FILE"], "owner": c["ROLE_ACCOUNT"], "dest": p["copy"],
+                       "max_bytes": copier.DEFAULT_MAX_BYTES})
+    for key in sorted(BEATS):          # KIT-782: the same refusals as the usage file's: a link, a stranger's file, oversize
+        if c[key]:
+            copies.append({"source": c[key], "owner": c["ROLE_ACCOUNT"], "dest": beat_copy_path(c, key),
+                           "max_bytes": BEAT_MAX_BYTES})
+    doc = {"schema": copier.RULES_SCHEMA, "status_file": p["copy_status"], "copies": copies}
     _rules, errors = copier.validate_rules(doc)
     if errors:
         raise SetupError("REFUSED by the copier's own loader: %s" % "; ".join(errors))
@@ -545,7 +575,7 @@ def step_folders(ctx, apply_it):
     h, p = ctx.host, ctx.p
     want = [(d, "root") for d in (p["install"], p["install"] + "/scripts", p["install"] + "/schemas",
                                   p["install"] + "/etc")] + (
-        [(p["copy_dir"], "root")] if ctx.conf["USAGE_FILE"] else []) + [(p["state"], ctx.conf["WATCHER_ACCOUNT"])]
+        [(p["copy_dir"], "root")] if copies_wanted(ctx.conf) else []) + [(p["state"], ctx.conf["WATCHER_ACCOUNT"])]
     todo = []
     for path, owner in want:
         st = h.lstat(path)
@@ -635,7 +665,8 @@ def step_permissions(ctx, apply_it):
     who = [c["ROLE_ACCOUNT"], h.user]
     guarded = [p["install"]] + ["%s/%s" % (p["install"], d) for d in ("scripts", "schemas", "etc")] + [
         p["rules"], p["manifest"], p["state"]] + ["%s/%s" % (p["install"], rel) for rel in INSTALLED_FILES] + (
-        [p["copy_dir"], p["copy"], p["copy_status"], p["copier_rules"]] if c["USAGE_FILE"] else [])
+        [p["copy_dir"], p["copy"], p["copy_status"], p["copier_rules"]]
+        + [beat_copy_path(c, k) for k in sorted(BEATS) if c[k]] if copies_wanted(c) else [])
     bad, unknown = [], []
     for path in guarded:
         if h.lstat(path) is None:
@@ -651,7 +682,7 @@ def step_permissions(ctx, apply_it):
     if unknown:
         raise NotMeasured("could not tell: %s" % "; ".join(unknown))
     return False, "neither the role account (%s) nor you can write the install folder, the rules, the manifest%s" % (
-        c["ROLE_ACCOUNT"], ", the copy and its status, the copier's rules or the state folder" if c["USAGE_FILE"]
+        c["ROLE_ACCOUNT"], ", the copies and their status, the copier's rules or the state folder" if copies_wanted(c)
         else " or the state folder")
 
 
@@ -660,7 +691,7 @@ def job_list(ctx):
     watcher never reads a copy that is not there yet."""
     c, p = ctx.conf, ctx.p
     jobs = []
-    if c["USAGE_FILE"]:
+    if copies_wanted(c):
         jobs.append((copier_label(c), p["copier_plist"], copier_job_body(c), p["copier_entry"], "root"))
     jobs.append((c["JOB_LABEL"], p["plist"], job_body(c), p["entry"], c["WATCHER_ACCOUNT"]))
     return jobs
@@ -724,15 +755,21 @@ def step_first_pass(ctx, apply_it):
     if not apply_it:
         return False, "would run the job once and read its first pass back"
     copied = ""
-    if c["USAGE_FILE"]:
+    if copies_wanted(c):
         began = h.now()
         h.kickstart(copier_label(c))
         cdoc = _wait_for(ctx, p["copy_status"], began, "copier status file", p["copier_log"])
         rows = cdoc.get("copies") if isinstance(cdoc.get("copies"), list) else []
         bad = [r.get("reason") for r in rows if not isinstance(r, dict) or r.get("state") != "copied"]
-        copied = "the copier %s; " % ("made the usage copy" if rows and not bad else
-                                      "REFUSED the usage file (%s): spend and runs stay blind until that is fixed" % (
-                                          "; ".join(str(b) for b in bad) or "no copy was reported"))
+        usage_only = not any(c[k] for k in BEATS)
+        why = "; ".join(str(b) for b in bad) or "no copy was reported"
+        if rows and not bad:
+            says = "made the usage copy" if usage_only else "made its %d copies" % len(rows)
+        elif usage_only:
+            says = "REFUSED the usage file (%s): spend and runs stay blind until that is fixed" % why
+        else:
+            says = "REFUSED a file (%s): what reads that copy stays blind until that is fixed" % why
+        copied = "the copier %s; " % says
     started = h.now()
     h.kickstart(c["JOB_LABEL"])
     doc = _wait_for(ctx, p["status"], started, "status file", p["log"])
@@ -874,6 +911,16 @@ LIMIT_DAY_USD=
 LIMIT_PIECE_USD=
 LIMIT_DAY_RUNS=
 LIMIT_PIECE_RUNS=
+
+# Optional (KIT-782): the queue's, the morning job's and the sweep's heartbeat files, as the workers write them (the
+# SOURCES: absolute, outside INSTALL_DIR and STATE_DIR).  The same copier copies each into root's copy folder, and the
+# one command points the health check's QUEUE_/MORNING_/SWEEP_HEARTBEAT_FILE at the copies, so the health watch can say
+# one stopped.  Where each job writes it: the queue's is queue-heartbeat.json in the bridge's state folder; the morning
+# job's is morning-heartbeat.json beside its day plan; the sweep's is the file its sweep.json names as heartbeat_file
+# (the sweep installer sets it to heartbeat.json beside sweep.json).  Empty = that job is off here, not watched.
+QUEUE_HEARTBEAT=
+MORNING_HEARTBEAT=
+SWEEP_HEARTBEAT=
 
 # Optional: the validator's ledger (docs/WATCHER.md, approval-rate).  With it, every merge into a watched
 # repository is checked against the validator's approvals.  This account must be able to read the file.
@@ -1528,6 +1575,59 @@ def selftest():
         rc, out9, _a = go(h9)
         check("a copier that leaves no status is a failure, said, with where to look",
               (rc, "no copier status file appeared" in out9), (EX_FAILED, True))
+        # KIT-782: the queue's, the morning job's and the sweep's heartbeats go through the same copier, with no
+        # usage file at all, and a link or a stranger's file is refused the way the usage file's is.
+        beat_dir = os.path.join(tmp, "beats")
+        beat_src = dict((k, os.path.join(beat_dir, n)) for k, n in (("QUEUE_HEARTBEAT", "q.json"),
+                                                                    ("MORNING_HEARTBEAT", "m.json"),
+                                                                    ("SWEEP_HEARTBEAT", "s.json")))
+
+        def put_beats(links=()):
+            shutil.rmtree(beat_dir, ignore_errors=True)
+            os.makedirs(beat_dir)
+            for key_, src_ in beat_src.items():
+                if key_ in links:
+                    with open(os.path.join(tmp, "elsewhere-beat.json"), "w", encoding="utf-8") as fh:
+                        fh.write("{}")
+                    os.symlink(os.path.join(tmp, "elsewhere-beat.json"), src_)
+                else:
+                    with open(src_, "w", encoding="utf-8") as fh:
+                        fh.write('{"schema": "pipeline-queue-heartbeat/1"}')
+        for key_, src_ in beat_src.items():
+            _c, e = validate_conf(dict(values, KIT_CHECKOUT=REPO, **{key_: inst + "/b.json"}), "alice")
+            check("conf: a %s inside the install folder is refused" % key_, any("outside INSTALL_DIR" in x for x in e), True)
+            _c, e = validate_conf(dict(values, KIT_CHECKOUT=REPO, **{key_: "relative.json"}), "alice")
+            check("conf: a relative %s is refused" % key_, any(key_ in x and "absolute" in x for x in e), True)
+        put_conf(KIT_CHECKOUT=REPO, **beat_src)
+        hb = machine()
+        put_beats()
+        rc, outb, askedb = go(hb)
+        crb = json.loads(hb.read(inst + "/" + COPIER_RULES_NAME))
+        check("heartbeats alone give a copier whose rules name each source, the role account and its copy, small",
+              [(c_["source"], c_["owner"], c_["dest"], c_["max_bytes"]) for c_ in crb["copies"]],
+              [(beat_src[k], "_clawdispatch", "%s/copy/%s" % (inst, BEATS[k][0]), BEAT_MAX_BYTES)
+               for k in ("MORNING_HEARTBEAT", "QUEUE_HEARTBEAT", "SWEEP_HEARTBEAT")])
+        check("...a full run ends fine and says the copier made three copies",
+              (rc, hb.copier_rc, "made its 3 copies" in outb), (EX_OK, EX_OK, True))
+        check("...each copy is the source, whole",
+              [open(hb._real("%s/copy/%s" % (inst, BEATS[k][0])), "rb").read() == open(beat_src[k], "rb").read()
+               for k in sorted(BEATS)], [True, True, True])
+        check("...and the watcher's rules name no usage file",
+              "usage_file" in json.loads(hb.read(inst + "/" + RULES_NAME)), False)
+        hl = machine()
+        put_beats(links=("SWEEP_HEARTBEAT",))
+        rc, outl, _a = go(hl)
+        check("a heartbeat that is a link is refused, said, and no copy of it exists; the others are made",
+              (rc, hl.copier_rc, "REFUSED a file (the source is a link)" in outl,
+               os.path.exists(hl._real("%s/copy/%s" % (inst, BEATS["SWEEP_HEARTBEAT"][0]))),
+               os.path.exists(hl._real("%s/copy/%s" % (inst, BEATS["QUEUE_HEARTBEAT"][0])))),
+              (EX_OK, 4, True, False, True))
+        hs = machine()
+        put_beats()
+        hs.source_uid = os.getuid() + 1
+        rc, outs, _a = go(hs)
+        check("a heartbeat of another account is refused the same way",
+              (rc, "not owned by the account that is meant to write it" in outs), (EX_OK, True))
         # the copier is stdlib only: it runs as root with -I, so it can import nothing of ours
         with open(os.path.join(HERE, "pipeline_watcher_copy.py"), encoding="utf-8") as fh:
             tree = ast.parse(fh.read())
