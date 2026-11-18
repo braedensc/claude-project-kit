@@ -59,8 +59,8 @@ import time
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TIMEOUT = 900
 # Seconds a battery has to end after its SIGTERM (KIT-755). Measured: 0.1 to 0.2 s for the
-# slowest battery on a Mac, at five signal times (1, 2, 4, 8, 12 s in); once 15.1 s on a busy
-# hosted runner. 30 s is twice the worst seen; a battery that never ends still fails.
+# slowest battery on a Mac, at five signal times (1, 2, 4, 8, 12 s in), and 0.1 s in each of
+# five runs with ten busy loops running beside it; once 15.1 s on a busy hosted runner. 30 s is twice the worst seen; a battery that never ends still fails.
 TERM_GRACE = 30
 TERM_GRACE_CEILING = 60               # the selftest pins the limit finite and under this
 # The random tail tempfile (8 of [a-z0-9_]) or mktemp (6+ alphanumerics) adds after a
@@ -216,7 +216,7 @@ def _term(proc, grace):
     return False
 
 
-def run_battery(name, command, repo, work, timeout, term_after=None, term_grace=TERM_GRACE):
+def run_battery(name, command, repo, work, timeout, term_after=None, term_grace=None):
     """Run one battery with its own empty TMPDIR; return what it left behind.
 
     term_after: send SIGTERM this many seconds in, if it is still running (--sigterm)."""
@@ -243,7 +243,8 @@ def run_battery(name, command, repo, work, timeout, term_after=None, term_grace=
                     result["rc"] = proc.wait(timeout=term_after)
                 except subprocess.TimeoutExpired:
                     result["termed"] = True
-                    result["ignored_term"] = not _term(proc, term_grace)
+                    result["ignored_term"] = not _term(
+                        proc, TERM_GRACE if term_grace is None else term_grace)
                     result["rc"] = proc.returncode
             else:
                 result["rc"] = proc.wait(timeout=timeout)
@@ -320,7 +321,7 @@ def describe(r, strict_tmp):
 
 
 def run_check(repo, batteries, timeout=TIMEOUT, parent=None, out=None, strict_tmp=None,
-              term_after=None, term_grace=TERM_GRACE):
+              term_after=None, term_grace=None):
     """Run each battery in turn; return the exit code. Removes everything it made.
 
     strict_tmp: count new /tmp entries as leaks. Default: only in CI, where nothing else
@@ -408,7 +409,7 @@ def selftest():
         parent = os.path.join(outer, "parent")
         os.makedirs(parent)
 
-        def check(batteries, timeout=60, strict_tmp=False, term_after=None, term_grace=TERM_GRACE):
+        def check(batteries, timeout=60, strict_tmp=False, term_after=None, term_grace=None):
             lines = []
             code = run_check(repo, batteries, timeout=timeout, parent=parent,
                              out=lines.append, strict_tmp=strict_tmp, term_after=term_after,
@@ -484,7 +485,16 @@ def selftest():
         expect("--sigterm: a battery that does not end on its SIGTERM fails, and is killed",
                (code, "NO-END" in text, "did not end" in text), (1, True, True))
         expect("--sigterm: the limit is finite (a mutant that lifts it to infinity is red)",
-               0 < TERM_GRACE <= TERM_GRACE_CEILING and TERM_GRACE >= 15, True)
+               0 < TERM_GRACE <= TERM_GRACE_CEILING, True)
+        # The limit the sweep really applies: no grace passed, so the default path decides.
+        saved_grace = TERM_GRACE
+        globals()["TERM_GRACE"] = 1
+        try:
+            code, text = check([("test:stubborn-default", "trap '' TERM; sleep 30")], term_after=1)
+        finally:
+            globals()["TERM_GRACE"] = saved_grace
+        expect("--sigterm: the default limit ends a battery that ignores its SIGTERM",
+               (code, "NO-END" in text), (1, True))
         code, text = check([("test:quick", "true")], term_after=5)
         expect("--sigterm: a battery that ends before the signal is judged as it ended",
                (code, "stopped by SIGTERM" in text), (0, False))
