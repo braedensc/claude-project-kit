@@ -82,7 +82,7 @@ ALLOWED_ARGS = frozenset({
     "merge", "push", "--dry-run", "--apply", "--conf", "--json",
     "stage-e.conf", "stage-a.conf", "notifier.conf", "bridge.conf", "chat-lane.conf",
     "conflict-waker.conf", "queue.conf", "sweep.conf", "watcher.conf", "update.conf",
-    "acceptance.conf",
+    "acceptance.conf", "validator.conf",
 })
 
 # (earlier, later): the later part must need the earlier one, directly or through others.

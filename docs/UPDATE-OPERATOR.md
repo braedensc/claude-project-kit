@@ -264,7 +264,7 @@ python3 scripts/pipeline_watch.py install          # shows a pass that sends not
 python3 scripts/pipeline_watch.py status           # the last pass, per kind
 ```
 
-**The one command checks it too** (`python3 scripts/pipeline_install.py`, step 3f) when this Mac has an `update.conf`.
+**The one command checks it too** (`python3 scripts/pipeline_install.py`, step 3g) when this Mac has an `update.conf`.
 It looks, and changes nothing, at whether the job file is there, names this kit, this settings file and this interval,
 and is held by launchd. If not, it asks, then runs the `install` above, which still shows its dry pass and asks for its
 own `yes`. It looks again after, and a job it did not see loaded reads "could not be measured", never "updated".

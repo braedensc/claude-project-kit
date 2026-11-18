@@ -90,7 +90,17 @@ WHAT IT DOES, IN ORDER
      ended with any other code, is never "up to date". A `run` that ends on a card stops the
      command in Manual and is carried past in Automatic. With no `queue.conf` the part is "off
      on this Mac" and nothing runs.
-  3f. The hourly health check (`scripts/pipeline_watch.py install`), when this Mac has an
+  3f. The validator's job (`scripts/pipeline_validator_setup.py`, KIT-547), optional, when this Mac
+     has a `validator.conf` (`--validator-conf` names another). It runs under your own login: no
+     account, and no Mac password is held for it. In Manual it runs the installer's own
+     `run --dry-run`, and on a yes its `run`, which shows its plan and asks its own typed yes. In
+     Automatic it runs the installer's `check`, then its `apply` with {"consent": "yes"} piped in,
+     as for the notifier. The settings are written once, with every switch off, and never again.
+     The job is switched on only when its first pass would decide nothing (its ceiling, 0); above
+     that it stays off, and its one line says why. With no `validator.conf` the part is "off on
+     this Mac" and nothing runs. Under a model this command refuses before it reads anything, and
+     so does the validator's installer.
+  3g. The hourly health check (`scripts/pipeline_watch.py install`), when this Mac has an
      `update.conf`. It reads, and never changes, whether the LaunchAgent is there, names this
      kit, this settings file and this interval, and is held by launchd. Level is "up to date".
      Missing or behind asks, then runs the installer, which shows a dry pass and asks for its own
@@ -169,6 +179,7 @@ TO ONLY LOOK: --check (KIT-736)
 Usage:
     pipeline_install.py [--conf stage-a.conf] [--stage-e-conf stage-e.conf]
                         [--no-pull] [--skip-stage-e] [--notifier-conf notifier.conf] [--queue-conf queue.conf]
+                        [--validator-conf validator.conf]
     pipeline_install.py --check [--conf stage-a.conf] [--stage-e-conf stage-e.conf]
                         [--sweep-conf sweep.conf] [--queue-conf queue.conf] [--skip-stage-e]
     pipeline_install.py --selftest
@@ -220,6 +231,7 @@ SWEEP_SETUP = os.path.join(HERE, "pipeline_sweep_setup.py")
 BRIDGE_SETUP = os.path.join(HERE, "pipeline_bridge_setup.py")
 NOTIFIER_SETUP = os.path.join(HERE, "pipeline_notifier_setup.py")
 QUEUE_SETUP = os.path.join(HERE, "pipeline_queue_setup.py")
+VALIDATOR_SETUP = os.path.join(HERE, "pipeline_validator_setup.py")
 WATCH = os.path.join(HERE, "pipeline_watch.py")
 
 # What each installer's exit code means, in a sentence a person can act on. The codes are
@@ -932,6 +944,21 @@ JOB_STEPS = (
      "look": ["run", "--dry-run"], "apply": ["run"],
      "note": "It writes the queue's settings and its two job files (the usage reader and the morning "
              "job) as the role account; it never loads them."},
+    # KIT-547: optional. The validator's job, under your own login: no role account, so no Mac
+    # password is held for it (`sudo`: False). Its program-facing pair is the notifier's shape.
+    {"key": "validator", "number": "3f", "title": "The validator's job, every switch off",
+     "noun": "The validator", "conf": "validator.conf", "script": VALIDATOR_SETUP,
+     "look": ["run", "--dry-run"], "apply": ["run"],
+     "note": "It writes the validator's settings (once, every switch off), its config and its job "
+             "file, under your own login. It shows them and asks its own typed yes.",
+     "auto_check": ["check"], "auto_apply": ["apply"],
+     "rows_schema": "validator-setup-rows/1",
+     "answers": {"schema": "validator-answers/1", "consent": "yes"},
+     "sudo": False,
+     "auto_note": "It writes the validator's settings (once, every switch off), its config and its "
+                  "job file, under your own login. It switches the job on itself only when the "
+                  "job's first pass would decide nothing; above that the job stays off, and the "
+                  "end says why."},
 )
 
 
@@ -991,8 +1018,10 @@ def step_job_auto(io, spec, base, conf, rep):
     the run. A check or apply whose rows cannot be read is never up to date. None to carry on, or
     an exit code."""
     key, noun = spec["key"], spec["noun"]
-    if not io.sudo_once("%s's check and apply read and change it as the role account and as "
-                        "root. They ask for nothing themselves." % noun):
+    # A part that runs under your own login (the validator, KIT-547) needs no Mac password.
+    if spec.get("sudo", True) and not io.sudo_once(
+            "%s's check and apply read and change it as the role account and as root. They ask "
+            "for nothing themselves." % noun):
         rep.note(key, OUT_WAITING, "it needs your Mac password")
         return stop(io, "%s needs your Mac password and did not get it. Nothing was changed. "
                         "Run this again and type it at the prompt." % noun, 5)
@@ -1149,7 +1178,7 @@ def step_watch(io, conf, rep):
     """The hourly health check's job, when `update.conf` exists. It is a LaunchAgent that runs as
     you; its own installer shows a dry pass and asks for a typed yes before it loads anything."""
     key = "watch"
-    heading(io, "3f. The hourly health check")
+    heading(io, "3g. The hourly health check")
     if not io.exists(conf):
         rep.note(key, OUT_OFF, missing(conf))
         io.say("No %s, so the health check is not set up on this Mac. Copy update.conf.example to "
@@ -1602,7 +1631,8 @@ STEP_OF_SCRIPT = {"sync_user_skills.py": "skills", "pipeline_stage_e_setup.py": 
                   "pipeline_sweep_setup.py": "sweep", "pipeline_stage_a_setup.py": "stage_a",
                   "pipeline_bridge_setup.py": "bridge",
                   "pipeline_notifier_setup.py": "notifier",
-                  "pipeline_queue_setup.py": "queue", "pipeline_watch.py": "watch"}
+                  "pipeline_queue_setup.py": "queue", "pipeline_watch.py": "watch",
+                  "pipeline_validator_setup.py": "validator"}
 
 
 def step_of(part):
@@ -1998,6 +2028,7 @@ def look_only(io, args):
              "bridge.conf": os.path.abspath(args.bridge_conf),
              "notifier.conf": os.path.abspath(args.notifier_conf),
              "queue.conf": os.path.abspath(args.queue_conf),
+             "validator.conf": os.path.abspath(args.validator_conf),
              "update.conf": os.path.abspath(args.update_conf)}
     rep, parts, unreadable = Report(), [], None
     try:
@@ -2055,6 +2086,9 @@ def main(argv=None, io=None):
     parser.add_argument("--queue-conf", default=os.path.join(KIT, "queue.conf"),
                         help="the usage job and the queue's settings (default: queue.conf in the kit; "
                              "absent skips it)")
+    parser.add_argument("--validator-conf", default=os.path.join(KIT, "validator.conf"),
+                        help="the validator's job settings (default: validator.conf in the kit; "
+                             "absent skips it)")
     parser.add_argument("--skip-stage-e", action="store_true",
                         help="do not check or update the review jobs")
     parser.add_argument("--check", action="store_true", help="only look: change nothing, ask nothing, no terminal needed")
@@ -2107,6 +2141,7 @@ def main(argv=None, io=None):
              "bridge.conf": os.path.abspath(args.bridge_conf),
              "notifier.conf": os.path.abspath(args.notifier_conf),
              "queue.conf": os.path.abspath(args.queue_conf),
+             "validator.conf": os.path.abspath(args.validator_conf),
              "update.conf": os.path.abspath(args.update_conf)}
     rep = Report()
     parts, unreadable = [], None
@@ -3212,6 +3247,82 @@ def selftest():
     check("notifier-ctrl-c-in-its-check-stops-the-run",
           (code, "pipeline_stage_a_setup.py run" in io.ran), (EX_BLOCKED, False))
 
+    # 6d. THE VALIDATOR (KIT-547): optional, under your own login, so no Mac password is held for it.
+    #     Manual: its own dry run, then its `run` on a yes. Automatic: its `check`, then its `apply`
+    #     with only the consent piped in. Its documents are built by the installer's own function.
+    import pipeline_validator_setup as validator_setup
+    validator_conf = os.path.join(tmp, "validator.conf")              # absent: the validator is off
+    vlook, vrun_ = "pipeline_validator_setup.py run --dry-run", "pipeline_validator_setup.py run"
+    vchk, vapp = "pipeline_validator_setup.py check", "pipeline_validator_setup.py apply"
+    vspec = [s for s in JOB_STEPS if s["key"] == "validator"][0]
+    VW, VB, VD, VA = (validator_setup.WOULD_CHANGE, validator_setup.BLOCKED, validator_setup.DONE,
+                      validator_setup.ALREADY_DONE)
+
+    class OnePassword(FakeIo):
+        """The consent's record gets the Mac password; any later ask is refused."""
+        def sudo_once(self, why):
+            self.events.append("sudo")
+            return self.events.count("sudo") < 2
+
+    def validator(codes=None, seen=None, rows_out=None, typed=None, answers=(), cls=OnePassword):
+        io = cls(codes=dict(healthy, **(codes or {})), answers=answers, typed=typed)
+        io.seen_out = dict(seen or {})
+        io.rows_out = dict(io.rows_out, **(rows_out or {}))
+        return main(base + ["--validator-conf", validator_conf], io=io), io
+
+    def vdoc(command, code_, rows_, left=None):
+        doc = validator_setup.rows_document(command, code_, rows_)
+        doc["left_off"] = left
+        return json.dumps(doc)
+
+    def vout(io):
+        return outcome(io, "validator")
+
+    check("validator-spec-uses-the-installers-own-schemas-and-holds-no-mac-password",
+          (vspec["rows_schema"], vspec["answers"]["schema"], sorted(vspec["answers"]), vspec["sudo"],
+           vspec["number"], STEP_OF_SCRIPT[os.path.basename(vspec["script"])]),
+          (validator_setup.ROWS_SCHEMA, validator_setup.ANSWERS_SCHEMA, ["consent", "schema"], False,
+           "3f", "validator"))
+    code, io = validator()
+    check("validator-no-conf-is-off-and-not-run",
+          (code, [k for k in io.ran if "validator" in k], vout(io)),
+          (EX_OK, [], [(OUT_OFF, "no validator.conf in %s" % tmp)]))
+    with open(validator_conf, "w") as fh:
+        fh.write("HOLD_FILE=/w/hold.json\n")
+    vwork = vdoc("check", 10, [("settings", VW, "would write it"), ("enable", VW, "would switch it on")])
+    code, io = validator({vchk: 10, vapp: 0}, rows_out={
+        vchk: vwork, vapp: vdoc("apply", 0, [("settings", VD, "wrote it"), ("enable", VD, "on")])},
+        typed=["1", "yes"])
+    check("validator-auto-check-then-apply-with-only-the-consent-and-no-mac-password",
+          ([k for k in io.ran if "validator" in k], [x for x in io.piped if "validator" in x[0]],
+           vout(io), io.events.count("sudo"), "pipeline_stage_a_setup.py run" in io.ran),
+          ([vchk, vapp], [(vchk, None), (vapp, json.dumps(vspec["answers"]))], [(OUT_UPDATED, "")],
+           1, True))
+    left = "left off: its first pass would decide 2 things, above its ceiling of 0"
+    code, io = validator({vchk: 10, vapp: 10}, rows_out={
+        vchk: vwork, vapp: vdoc("apply", 10, [("settings", VD, "wrote it"), ("enable", VB, left)], left)},
+        typed=["1", "yes"])
+    check("validator-auto-above-its-ceiling-is-left-off-and-its-one-line-is-the-end-line",
+          (vout(io), "pipeline_stage_a_setup.py run" in io.ran), ([(OUT_WAITING, left)], True))
+    code, io = validator({vchk: 0}, rows_out={vchk: vdoc("check", 0, [("settings", VA, "kept")])},
+                         typed=["1", "yes"])
+    check("validator-auto-clean-check-is-up-to-date-and-applies-nothing",
+          (vout(io), io.ran.count(vapp)), ([(OUT_OK, "")], 0))
+    code, io = validator({vchk: 4}, rows_out={vchk: vdoc("check", 4, [("env-file", "UNKNOWN", "x")])},
+                         typed=["1", "yes"])
+    check("validator-auto-a-check-that-could-not-measure-is-never-up-to-date-and-stops",
+          (code, [o for o, _d in vout(io)], "pipeline_stage_a_setup.py run" in io.ran),
+          (4, [OUT_UNMEASURED], False))
+    buf = stdio.StringIO()
+    with contextlib.redirect_stdout(buf):
+        validator_setup.se._print_rows([("settings", VW, "would write it"), ("enable", VW, "would")])
+    vtable = buf.getvalue()
+    code, io = validator({vlook: 10, vrun_: 0}, seen={vlook: vtable}, answers=[True])
+    check("validator-manual-its-own-dry-run-then-its-run-on-a-yes-never-check-or-apply",
+          ([k for k in io.ran if "validator" in k], [x for x in io.piped if "validator" in x[0]],
+           vout(io)), ([vlook, vrun_], [], [(OUT_UPDATED, "")]))
+    os.unlink(validator_conf)
+
     # 6e. THE USAGE JOB AND THE QUEUE (KIT-585): the installer's dry run first, a question only when a step would
     #     change something, its `run` on a yes. Unmeasured is never up to date.
     import inspect
@@ -3862,7 +3973,8 @@ def selftest():
     check("lines-steps-are-found-from-the-list",
           (keys["one-command"], keys["skills"], keys["cleanup"], keys["idea-gate"],
            set(k for k in keys.values() if k) == set(["checkout", "skills", "stage_e",
-                                                      "sweep", "stage_a", "bridge", "notifier", "queue", "watch"]),
+                                                      "sweep", "stage_a", "bridge", "notifier", "queue", "watch",
+                                                      "validator"]),
            all(keys[pt["id"]] == "stage_e" for pt in real
                if pt["check"] and pt["check"]["script"].endswith("pipeline_stage_e_setup.py"))),
           ("checkout", "skills", "sweep", "stage_a", True, True))
@@ -4074,13 +4186,14 @@ def selftest():
           (got["settings"]["jobs"][status_job],
            got["settings"]["jobs"]["review/" + review["jobs"][0]["label"]]),
           ({"key": "STATUS_INTERVAL_SECONDS", "value": "900"}, {"key": None, "value": None}))
-    # KIT-850: the notifier's part is the first to declare one; the record keeps the list's number.
-    paging_ceiling = [p for p in real_parts if p["id"] == "paging"][0]["ceiling"]
+    # KIT-850, KIT-547: the notifier's and the validator's parts declare one; the record keeps each
+    # part's number from the list, and every other part's empty one.
+    listed = dict((p["id"], p["ceiling"]) for p in real_parts)
     check("kit717-record-has-each-ceiling-from-the-parts-list",
-          (got["settings"]["ceilings"]["paging"], isinstance(paging_ceiling, int),
-           set(v for k, v in got["settings"]["ceilings"].items() if k != "paging"),
+          (got["settings"]["ceilings"]["paging"], isinstance(listed["paging"], int),
+           dict((k, v) for k, v in got["settings"]["ceilings"].items() if v != listed.get(k, "none")),
            "review" in got["settings"]["ceilings"]),
-          (paging_ceiling, True, {None}, True))
+          (listed["paging"], True, {}, True))
     check("kit717-a-switch-that-looks-like-a-secret-is-never-recorded-by-value",
           (switch_value("LINEAR_API_KEY", {"LINEAR_API_KEY": "abc"}),
            switch_value("LINEAR_API_KEY", {}), switch_value("STATUS_FILE", {"STATUS_FILE": "x"})),

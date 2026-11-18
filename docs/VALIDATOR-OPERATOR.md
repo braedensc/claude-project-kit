@@ -57,6 +57,9 @@ it comes from. `merge_repos` lists repositories, `[]` for none.
 Keep it in your own home, outside every repository. Good: `~/.validator/settings.json`, mode 600.
 Not that: a file inside a checkout. A session can write there, so the file is not obeyed.
 
+The install (section 10) writes this file for you, once, with every switch off. It never writes it
+again, so no update can turn a switch on.
+
 ### When every switch reads off
 
 Absent is every switch off. So is any file the validator cannot trust. It never means on:
@@ -94,8 +97,40 @@ absolute.
 
 ### Turn a switch on
 
-Edit the file by hand, then run `show`. Turn on one switch at a time. Turn it off the same way.
-Nothing else changes a switch: the validator has no way to write this file.
+Turn on one switch at a time, then run `show` and check its line says `on`:
+
+- **Merges:** run `merges on --repo OWNER/NAME` (section 2). It sets the ruleset, then lists the
+  repository and turns `approve.merges` on, last.
+- **Plans, pieces, and the four classes:** edit the file by hand. Set the one key to `true`.
+- **The size limits:** edit the file by hand. Set each to the most you will let through.
+
+Turn one off the same way. The validator itself has no way to write this file. Only you change
+it, by hand or with your own scripts, each after your typed yes.
+
+Good: `approve.merges` on through `merges on`, then `show` says `approve merges: on`. Not that: two
+switches on in one edit. When something goes wrong, you cannot tell which one did it.
+
+### Turn every switch off at once
+
+One command, in a terminal, as yourself. It reads no conf, and it is refused in an agent's
+environment:
+
+```bash
+python3 scripts/pipeline_validator_setup.py off
+```
+
+It names each switch that is on and asks for one typed `yes`. Then every `approve` and `allow`
+switch goes off, and it reads the file back. Your limits, Stage E's login and the repository list
+stay, so each switch comes back with one edit. A file it does not obey already reads as every
+switch off; `off` replaces it with one that has every switch off.
+
+The job keeps running and says `OFF:` on every pass. A pull request already in flight may still
+merge: GitHub's own auto-merge stays on for it. `off` prints the `merges off --repo` command for
+each listed repository, which turns that off too.
+
+Good: `Done: every switch in ~/.validator/settings.json is off, read back`. Not that: deleting the
+settings file. Every switch reads off, but the next install writes a fresh file, and your limits
+and list are gone.
 
 ### List a repository for merges
 
@@ -117,10 +152,10 @@ The list alone approves nothing. With `"merges": false`, no merge is approved, l
 List each repository once, and at most 100. Write it in lower case, even when GitHub shows
 capitals. GitHub's names ignore case, so `acme/app` covers a pull request in `Acme/App`.
 
-### Until the rest is built
+### What is built
 
-This guide grows as the validator is built, one section per piece. Until the pieces that decide
-are built, nothing is approved for you.
+The merge path decides (section 9), and the install runs it (section 10). Approving a plan, and a
+piece starting, are their own pieces. Until each is built, its switch decides nothing.
 
 ## 2. The ledger
 
@@ -151,10 +186,11 @@ own words, never the agent's. The agent's reason is kept apart, as its words.
 **The agent's words are quoted, never obeyed.** Its reason is one line of at most 300 characters,
 with nothing hidden in it. It is the only text in the ledger.
 
-**A ledger it cannot trust approves nothing.** It must be a plain file in your own home, outside
-every repository, that only you can write. Anything else gives no rows, and says why. Good: no
-ledger yet, which means nothing has been decided. Not that: `the ledger is inside a git working
-tree, where a session can write, so no approval stands`. The install will set where it lives.
+**A ledger it cannot trust approves nothing.** It must be a plain file outside every repository,
+that only you can write. Anything else gives no rows, and says why. Good: no ledger yet, which
+means nothing has been decided. Not that: `the ledger is inside a git working tree, where a
+session can write, so no approval stands`. The install sets where it lives: `LEDGER_FILE` in
+`validator.conf` (section 10).
 
 ### The check on the pull request
 
@@ -448,8 +484,8 @@ one that touches `.github/workflows/ci.yml` passing. It fails with `risk-path`, 
 ## 6. The agent's run
 
 The agent is one run of the `claude` CLI. It reads the brief from section 4 and answers in two
-lines. It can do nothing else. The code is `scripts/pipeline_validator_run.py`. Nothing calls it
-yet: the validator's own job is its own piece.
+lines. It can do nothing else. The code is `scripts/pipeline_validator_run.py`. The merge path
+calls it (section 9), from the validator's own job (section 10).
 
 **What it can do.** Read the brief, and answer. It has no tools, so it cannot read a file, run a
 command, or reach the tracker or GitHub. It loads none of your settings, hooks, plugins or skills.
@@ -593,7 +629,7 @@ Not that: a pull request approved because its ticket could not be read.
 **Its sources are yours to point it at.** Its config names the tracker key's variable (a read-only
 key), the work teams, the queue's config, Stage E's ledger and snapshot folder, the acceptance
 ledger, and the watcher's status and hold files. One left empty is a source it does not read, and
-every fact from it is said as unread. The install (a later piece) sets them.
+every fact from it is said as unread. The install sets them, from `validator.conf` (section 10).
 
 **Read one pull request's facts yourself.** It prints the facts as fields, with the criteria and the
 diff as sizes only, and changes nothing:
@@ -613,8 +649,8 @@ verdict, and is not read here: such work's provenance is said as unread, so it w
 
 The validator's own job turns on GitHub's own auto-merge for one pull request at a time, each on
 the latest main. It never merges, approves a review or labels: GitHub merges, once its own rules
-pass. The code is `scripts/pipeline_validator_merge.py`. Nothing schedules it yet: the install is
-a later piece.
+pass. The code is `scripts/pipeline_validator_merge.py`. The validator's own job runs one pass every
+few minutes, once installed (section 10).
 
 **What one pass does.**
 
@@ -663,15 +699,17 @@ until Stage E reviews the new head. Stage E re-reviews a moved head once per pul
 updated a second time waits, and each pass says why. It is never approved on a stale review.
 
 **Its config** is `~/.validator/config.json`: `settings_file`, `ledger_file`, the `merge` section
-(`review_bar`, `merge_method`, `max_pages`), and the `facts`, `agent` and `check` sections. Print
-one to start from:
+(`review_bar`, `merge_method`, `max_pages`), and the `facts`, `agent` and `check` sections. The
+install writes it from `validator.conf` (section 10). Change the conf, then run the install
+again: an edit to the config by hand is put back on the next install. To see the shape:
 
 ```bash
 python3 scripts/pipeline_validator_merge.py --example-config
 ```
 
 **Try one pass that writes nothing.** It reads and judges, runs no agent, and changes nothing. Run
-it in a terminal, as yourself: it is refused in an agent's environment.
+it in a terminal, as yourself: it is refused in an agent's environment. The install's own
+rehearsal runs the same pass this way, with your env file read in first.
 
 ```bash
 python3 scripts/pipeline_validator_merge.py run --config ~/.validator/config.json --dry-run
@@ -684,3 +722,184 @@ only a person can land.
 
 Exit 0: the pass ran and said what it did, or that it was off or held. 1: a write failed. 2: the
 config needs fixing, or this is an agent's environment. 3: something could not be read.
+
+## 10. Install it
+
+The validator's job runs under your own login: one LaunchAgent, as you, every few minutes. It makes
+no account and runs no `sudo`. After a fresh install every switch is off, and the job says so on
+every pass. The code is `scripts/pipeline_validator_setup.py`.
+
+### Before you start
+
+Three things come first. The installer checks each, and names the card when one is missing.
+
+1. **The validator's own app and its key file** (section 2, *Make the check required*). Card
+   `CK-V1`. The installer reads the app's id from that script's record, `~/.validator-app/state.json`.
+2. **The watcher, with its hold file** (`docs/WATCHER.md`). Every pass reads that hold.
+3. **An env file**, mode 600, with two lines: a read-only tracker key and a token from
+   `claude setup-token`, each under the name `validator.conf` gives. Card `CK-V2`.
+
+### The conf
+
+```bash
+cp validator.conf.example validator.conf && chmod 600 validator.conf
+$EDITOR validator.conf
+```
+
+`HOLD_FILE` and `WATCHER_STATUS` are required: the watcher's own two files, outside your home. Every
+other key has a default. No value in the conf is a secret. The keys go in the env file, and the
+app's key stays in its own file. A value shaped like a credential is refused. Every bad value is
+named in one pass.
+
+Good: `HOLD_FILE=/var/claw-watcher/hold.json`, the watcher's own. Not that: a hold file in your home.
+You could remove it, so it holds nothing, and the conf is refused.
+
+### Run it
+
+```bash
+python3 scripts/pipeline_validator_setup.py run --dry-run   # read it first: changes nothing
+python3 scripts/pipeline_validator_setup.py run             # shows, asks one typed yes, applies
+```
+
+`run` looks, shows what it will change, and asks for one typed `yes`. Then it applies each row in
+order and looks again. A row only you can clear stops it and prints its card. A second run changes
+nothing and says `Nothing to change: every row holds.`
+
+What it builds, all yours:
+
+| File | What it is |
+|---|---|
+| `~/.validator/settings.json` | The switches. Written once, when absent, with every switch off. Never written again. |
+| `~/.validator/config.json` | The job's config, from `validator.conf`: the settings, the ledger, the hold and the facts' sources. |
+| `~/Library/LaunchAgents/<JOB_LABEL>.plist` | The job: each pass reads your env file, then runs the merge path. |
+| `~/.validator/validator.log` | What each pass said. While every switch is off: `OFF: the merges switch is off ...`. |
+| `~/.validator/last-pass.json` | When the last pass ended, and its exit code. |
+| `~/.validator/setup.json` | One fact: the job has been on. A job that was on and is not loaded now, you paused. |
+
+Its rows, in order:
+
+| Row | Holds when | Stops on |
+|---|---|---|
+| `preflight` | macOS; this is a main checkout, never a linked worktree; Python, `claude` and `gh` run | anything missing, named |
+| `folder` | `~/.validator` is yours, outside every repository, and nobody else can write it | a folder others can write: you run `chmod 700` |
+| `settings` | written with every switch off, or kept as you left it | never: a file it cannot obey reads as every switch off, and is said |
+| `ledger` | its folder is yours, and its own reader trusts it | a ledger it cannot trust |
+| `app` | the app's id is recorded, and its key file is only yours | card `CK-V1`, or a key file others can read |
+| `env-file` | it is yours, mode 600, and sets each name | card `CK-V2`, or a file others can read |
+| `hold` | the job can read the watcher's hold | a hold it cannot read: every pass would hold |
+| `config` | the job's own loader accepts it | a value it would refuse |
+| `job` | the job file is current | a job file at that label that runs something else |
+| `enable` | loaded, running this job file, and its last pass exited 0 | card `CK-V3`: left off, or paused |
+
+**The key is never opened.** The `app` row looks at the key file's mode and owner, and nothing
+else. The job's `openssl` is the only reader.
+
+**No value leaves the env file.** The `env-file` row asks a shell that reads the file whether each
+name is set. Only `NAME=set` or `NAME=unset` comes back.
+
+### When the job is switched on
+
+`pipeline-parts.json` gives the validator's part a first-pass ceiling: the most things its first
+pass may decide with nobody reading the number first. It is 0.
+
+Before it switches the job on, the installer rehearses the job's own command with `--dry-run`. It
+counts the `[dry-run]` lines: what a real pass would record, post or turn on.
+
+- **At or below 0,** it enables and loads the job, then waits for its first pass and judges it. A
+  pass that has not finished in time is NOT MEASURED, never "on".
+- **Above 0,** the job stays installed, disabled and off. One line says why, for example `left off:
+  its first pass would decide 2 things, above its ceiling of 0`. Read the rehearsal's lines, then
+  switch it on yourself with card `CK-V3`.
+- **A rehearsal that does not exit 0,** or a ceiling it cannot read, also leaves it off.
+
+With every switch off, the first pass decides nothing, so a fresh install switches the job on.
+
+Good: `enable  DONE  switched it on ... its first pass exited 0 and said: OFF: the merges switch is
+off`. Not that: turning `merges` on before the first install. The rehearsal then finds work, and
+the job stays off until you read it.
+
+### Pause it, and resume it
+
+To pause the job, so that a new login does not start it either:
+
+```bash
+launchctl bootout gui/$(id -u)/local.validator
+launchctl disable gui/$(id -u)/local.validator
+```
+
+Use your `JOB_LABEL` if you changed it. A paused job stays paused: neither `run` nor `apply` loads
+it again. The `enable` row says `you paused it` and names card `CK-V3`, which resumes it.
+
+To stop approvals and keep the job running, use `off` instead (section 1). The job then says `OFF:`
+on every pass.
+
+### For a program: `check` and `apply`
+
+The one command (`scripts/pipeline_install.py`, step 3f) runs this when the Mac has a
+`validator.conf`. It asks for no Mac password for it.
+
+- **`check`** prints one JSON document of rows on stdout and its words on stderr. It changes,
+  records and asks nothing.
+- **`apply`** reads its answers from a pipe on stdin: `{"schema": "validator-answers/1", "consent":
+  "yes"}`. A terminal, a file or an argument is refused. Anything but `"consent": "yes"` changes
+  nothing and exits 10.
+
+In Manual the one command runs `run --dry-run`, then `run` on your yes, which asks its own typed yes.
+
+### Under a model
+
+`run`, `apply` and `off` are refused in an agent's environment, before the conf is read. `apply` is
+refused before its stdin is read. There is no override. `check`, `verify`, `run --dry-run` and
+`card` still work. They never read the env file under a model, so that row says NOT MEASURED, and
+they exit 4.
+
+Exit 0: every row holds. 1: a row failed. 2: the conf or the command line needs fixing. 3: refused.
+4: a row could not measure itself. 10: a row would change something, a card is yours, or you did
+not type yes.
+
+### What its independence costs under your own login
+
+You chose this (decision V1 in the design): no new account, so it ports simply. The cost is
+plain. A session runs as you too. So it could, in principle, edit what the job reads: the settings
+file, the config, the job file, or this checkout's scripts. The watcher runs as its own account in a
+folder only root can write. The validator cannot be made that hard to edit.
+
+What holds the line instead:
+
+- **The safety floor is code.** No switch approves a change to hooks, guards, workflows, settings or
+  the validator's own limits. A settings file that names one is refused.
+- **The check comes from its own app.** Your branch rules accept `Validator` only from that app. Its
+  key is outside every repository.
+- **The watcher checks every merge** against the ledger, from its own account, and pauses new work
+  on a merge with no approval.
+- **The job runs a main checkout only.** Sessions work in linked worktrees. The job's code changes
+  when you pull, never when a session edits a worktree.
+- **A settings file a session could have written is not obeyed:** one in a repository, a link, or
+  one in a folder others can write.
+
+Good: you read each approval in the stand-up, and turn a switch off when one surprises you. Not
+that: trusting the switches alone. Anything that can act as you can edit them.
+
+### Who else reads the ledger
+
+The watcher's approval check (`VALIDATOR_LEDGER` in `watcher.conf`) and the stand-up
+(`STANDUP_VALIDATOR_LEDGER` in `bridge.conf`) read the ledger from their own accounts. A Mac's home
+folder lets no other account in, so a ledger under it is out of their reach. The `ledger` row says
+which folder stops them.
+
+To let them read it, name a `LEDGER_FILE` in a folder of yours that they can reach. Then name the
+same path in their settings. The ledger itself is written readable by all, and only you can write
+it.
+
+### What is not proven
+
+- **Live launchd calls in your own domain.** The selftest drives a fake launchd. No live install
+  has run yet.
+- **That launchd's print of a LaunchAgent lists its arguments and interval** the way the notifier's
+  installer reads them for its daemon. The `enable` row compares them.
+- **That `gh` and `claude` find your logins under launchd.** A LaunchAgent runs in your login
+  session, so your keychain is open while you are logged in. Logged out, the job does not run.
+- **The piece pass** (KIT-543) joins the job's pass list when it lands. Until then, the job runs the
+  merge path alone.
+- **A copy of the ledger for other accounts,** written by root, as the watcher's copier does for the
+  usage file. Not built: until it is, choose the ledger's folder as above.

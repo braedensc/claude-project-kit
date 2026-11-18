@@ -295,12 +295,14 @@ FIRST_PASS_POLL_SECONDS = 5
 FIRST_PASS_SLACK_SECONDS = 60
 
 
-def first_pass_ceiling(path=None):
+def first_pass_ceiling(path=None, installer=None):
     """(ceiling, None), or (None, why). The ceiling of the one part whose installer is this file:
     the most messages the job's first pass may send and still be switched on with no question.
     An unreadable list, no such part, two of them, or a ceiling that is not a whole number is no
-    ceiling — and no ceiling is never "no limit": `apply` then leaves the job off."""
+    ceiling — and no ceiling is never "no limit": `apply` then leaves the job off. `installer`
+    names another installer's file, for its own part (the validator's, KIT-547)."""
     path = path or PARTS_LIST
+    mine_name = os.path.basename(installer or __file__)
     try:
         with open(path, encoding="utf-8") as fh:
             doc = json.load(fh)
@@ -308,17 +310,17 @@ def first_pass_ceiling(path=None):
         return None, "the parts list %s could not be read (%s)" % (path, type(exc).__name__)
     parts = doc.get("parts") if isinstance(doc, dict) else None
     mine = [p for p in (parts if isinstance(parts, list) else []) if isinstance(p, dict)
-            and os.path.basename(str(p.get("installer") or "")) == os.path.basename(__file__)]
+            and os.path.basename(str(p.get("installer") or "")) == mine_name]
     if len(mine) != 1:
         return None, ("the parts list names %d part(s) whose installer is %s, not one"
-                      % (len(mine), os.path.basename(__file__)))
+                      % (len(mine), mine_name))
     ceiling = mine[0].get("ceiling")
     if not (isinstance(ceiling, int) and not isinstance(ceiling, bool) and ceiling >= 0):
         return None, "its part %r has the ceiling %r, not a whole number" % (mine[0].get("id"), ceiling)
     return ceiling, None
 
 
-def read_answers(stream=None):
+def read_answers(stream=None, schema=None, keys=None):
     """(answers, None), or (None, why) — `apply`'s answers, from the program that called it.
 
     THROUGH A PIPE, AND ONLY A PIPE. A terminal would make `apply` a question. A file on standard
@@ -328,7 +330,10 @@ def read_answers(stream=None):
 
     One JSON object: `schema` is ANSWERS_SCHEMA, `consent` a string, and `token`, when present,
     a string. Any other key is refused, so a misspelt answer is never silently ignored. No reason
-    given here ever quotes what was read: a token may be in it."""
+    given here ever quotes what was read: a token may be in it. Another installer that takes its
+    answers the same way passes its own `schema` and `keys` (the validator's, KIT-547)."""
+    schema = ANSWERS_SCHEMA if schema is None else schema
+    keys = ANSWERS_KEYS if keys is None else keys
     stream = sys.stdin if stream is None else stream
     try:
         mode = os.fstat(stream.fileno()).st_mode
@@ -353,11 +358,11 @@ def read_answers(stream=None):
     if not isinstance(answers, dict):
         return None, "the answers are not a JSON object"
     unknown = sorted(k if re.match(r"^[a-z_]{1,20}$", k) else "(a key that is not a plain name)"
-                     for k in answers if k not in ANSWERS_KEYS)
+                     for k in answers if k not in keys)
     if unknown:
         return None, "the answers carry a key `apply` does not take: %s" % ", ".join(unknown)
-    if answers.get("schema") != ANSWERS_SCHEMA:
-        return None, "the answers are not a %s document" % ANSWERS_SCHEMA
+    if answers.get("schema") != schema:
+        return None, "the answers are not a %s document" % schema
     if not isinstance(answers.get("consent"), str):
         return None, "the answers carry no consent"
     if "token" in answers and not isinstance(answers["token"], str):

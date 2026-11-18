@@ -52,6 +52,7 @@ INSTALLERS = (
     ("pipeline_stage_a_setup", ["run"]),
     ("pipeline_stage_e_setup", ["run"]),
     ("pipeline_chat_lane_setup", ["verify"]),
+    ("pipeline_validator_setup", ["run"]),
 )
 SEAMED = ("pipeline_install", "pipeline_model_switch", "pipeline_stage_e_app", "pipeline_conflict_waker_setup",
           "pipeline_validator_app")
