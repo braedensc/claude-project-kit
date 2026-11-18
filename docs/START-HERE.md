@@ -107,6 +107,7 @@ there is no override.
    `docs/SESSION-BRIEF.md` for what a session is told and what it can do.
 
 7. **Stage E, the review layer.** Copy `stage-e.conf.example` to `stage-e.conf` and fill it in.
+   Values that several parts share can be typed once in the settings folder (`docs/SETTINGS.md`).
    Then run `python3 scripts/pipeline_stage_e_setup.py run` and repeat it until it stops asking.
    Guide: `docs/STAGE-E-OPERATOR.md`. It also installs the finding poller
    (`docs/FINDING-POLLER.md`), the catch-up poller (`docs/CATCH-UP.md`), the heartbeat monitor
