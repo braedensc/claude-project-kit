@@ -29,7 +29,13 @@ THE MONITORS.  Ten, in a fixed order. Each ends in one of four states, and the f
                 first line from an author who is not trusted. The tracker's newest 100 tickets and
                 100 comments, by the one fixed read-only query in pipeline_watcher_tracker.py.
                                                                                           first-hand
-  guard-blocks, egress, outside-files, approval-rate
+  approval-rate the validator's ledger (KIT-546): every pull request merged into a watched
+                repository's default branch needs an `approved` row for its head, unless the owner
+                merged it himself; an approval still unmerged a day later; the day's approvals
+                against the watcher's own limit; and each urgent escalation, which is how the
+                validator's urgent page reaches the owner. GitHub's merges and the ledger, read
+                through its own reader.                                                   second-hand
+  guard-blocks, egress, outside-files
                 OFF, each with its reason: a producer does not exist yet.
 
 THE FOUR STATES (contract section 13).
@@ -48,7 +54,7 @@ WHAT THIS PIECE DOES ABOUT INDEPENDENCE, AND WHAT IT DOES NOT.  Its limits and l
 rules file named by --config. A pass judges that file BEFORE it obeys anything in it. A rules file
 that is inside a git working tree, is a link, is writable by group or other, is owned by another
 account, or sits in a folder others can write is not trusted, and nothing in it is obeyed, not its
-"on", not what it names to watch, not whether it parses: the five monitors that could be on are
+"on", not what it names to watch, not whether it parses: the seven monitors that could be on are
 blind, by name, and the pass exits 4. No file at all is off, said so. It reads GitHub with a
 credential named by `github_token_env` and sends nothing but GET. It listens on nothing and takes no
 message. What it does NOT do: its own account, a root-owned install and a manifest of its own files
@@ -73,7 +79,8 @@ credential. One credential is read from the
 environment, by the name the config gives; it is never printed or written.
 
 TO RUN FROM A COPY (KIT-517 does this properly): the files it needs are this one,
-scripts/pipeline_watcher_tracker.py, scripts/pipeline_hold.py, scripts/check_schemas.py, scripts/jsonschema_mini.py and schemas/pipeline-watcher.schema.json.
+scripts/pipeline_watcher_tracker.py, scripts/pipeline_hold.py, scripts/pipeline_validator_ledger.py,
+scripts/check_schemas.py, scripts/jsonschema_mini.py and schemas/pipeline-watcher.schema.json.
 """
 import argparse
 import calendar
@@ -95,6 +102,7 @@ if HERE not in sys.path:
 import check_schemas  # noqa: E402  (the one definition of "conforms", contract section 12)
 import pipeline_hold  # noqa: E402  (the hold, contract section 20: the watcher's one power)
 import pipeline_watcher_tracker as tracker_reader  # noqa: E402  (the one POST: a fixed read-only query)
+import pipeline_validator_ledger as validator_ledger  # noqa: E402  (its rows, by its own reader: KIT-546)
 
 WATCHER_SCHEMA = "pipeline-watcher/1"
 SCHEMA_NAME = "pipeline-watcher"
@@ -111,12 +119,14 @@ LEVEL_ORDER = {RECORD: 1, PAGE: 2, PAUSE: 3}
 MONITORS = ("spend", "runs", "labels", "markers", "injection", "tracker-text", "guard-blocks",
             "egress", "outside-files", "approval-rate")
 KIND = {"spend": "second-hand", "runs": "second-hand", "labels": "first-hand",
-        "markers": "first-hand", "injection": "first-hand", "tracker-text": "first-hand"}
+        "markers": "first-hand", "injection": "first-hand", "tracker-text": "first-hand",
+        # The merges are GitHub's, but whoever writes the ledger could add a row that hides one:
+        # it can only under-report, so it is second-hand (KIT-546).
+        "approval-rate": "second-hand"}
 OFF_BY_DESIGN = {
     "guard-blocks": "no producer: nothing records a guard block yet (KIT-11)",
     "egress": "no producer: the proxy's refusal line is unconfirmed (KIT-88)",
     "outside-files": "needs each ticket's declared files (KIT-518)",
-    "approval-rate": "no producer: the validator does not exist yet (KIT-510)",
 }
 
 DEFAULT_STATUS_FILE = "~/.watcher/watcher-status.json"
@@ -128,7 +138,11 @@ DEFAULT_PROTECTED_PREFIXES = ("agent:", "blocked:", "provenance:")
 BOT_LOGIN = "github-actions[bot]"       # scripts/pr_conflict.py's BOT_LOGIN: the workflow bot
 # A GitHub App's bot login, as a trusted_bots entry: Stage E's own app (KIT-578).
 TRUSTED_BOT_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}\[bot\]\Z")
-LIMIT_KEYS = ("day_usd", "piece_usd", "day_runs", "piece_runs")
+LIMIT_KEYS = ("day_usd", "piece_usd", "day_runs", "piece_runs", "day_approvals")
+APPROVAL_STALE_SECONDS = 86400          # an approval with no merge, newer row or close a day later
+APPROVAL_FOLLOW_SECONDS = 7 * 86400     # how far back an approval is followed to its merge
+RATE_WINDOW_SECONDS = 86400             # the approvals counted against day_approvals
+GAP_CAP_SECONDS = 30 * 86400            # how far back a pass reads merges the watcher missed while down
 
 DEFAULT_LOOKBACK_HOURS = 26
 DEFAULT_MAX_PAGES = 3
@@ -180,7 +194,13 @@ CONFIG_KEYS = {
                              "dispatcher's agent. Empty turns tracker-text off, since every marker "
                              "would look forged",
     "limits": "the watcher's OWN limits, set by the owner (a decision, ADR D5): day_usd, "
-              "piece_usd, day_runs, piece_runs. A monitor with none of its limits is off",
+              "piece_usd, day_runs, piece_runs, and day_approvals (the validator's approvals in "
+              "24 hours, a runaway's limit). A monitor with none of its limits is off",
+    "validator_ledger": "optional: the validator's ledger (contract section 24), an absolute path "
+                        "this account can read. With `repos`, it turns approval-rate on: every "
+                        "merge checked against it. Empty: approval-rate is off",
+    "owner_logins": "GitHub logins whose own merges need no validator approval: the owner's. A "
+                    "merge by anyone else with no `approved` row is a pause (default none)",
     "trusted_actors": "GitHub logins that may apply or remove a protected label",
     "trusted_associations": "author associations a marker or text from is trusted (default %s)"
                             % ", ".join(DEFAULT_TRUSTED_ASSOCIATIONS),
@@ -468,6 +488,7 @@ def validate_config(raw):
     hold_file = _path(raw, "hold_file", "", errors, allow_empty=True)
     install_manifest = _path(raw, "install_manifest", "", errors, allow_empty=True)
     usage_copy_status = _path(raw, "usage_copy_status", "", errors, allow_empty=True)
+    validator_ledger_path = _path(raw, "validator_ledger", "", errors, allow_empty=True)
     if usage_copy_status and not usage_file:
         errors.append("config 'usage_copy_status' needs a usage_file: it is the status of that file's copy")
     if hold_file and inside_git_worktree(os.path.dirname(hold_file)):
@@ -488,15 +509,19 @@ def validate_config(raw):
         if key not in limits_raw:
             continue
         v = limits_raw[key]
-        if _number(v) is None or v <= 0 or (key.endswith("_runs") and not isinstance(v, int)):
+        whole = key.endswith(("_runs", "_approvals"))
+        if _number(v) is None or v <= 0 or (whole and not isinstance(v, int)):
             errors.append("limit %r must be a positive %s" % (
-                key, "whole number" if key.endswith("_runs") else "number"))
+                key, "whole number" if whole else "number"))
         else:
             limits[key] = v
     cfg = {
         "on": on, "github_token_env": token_env, "repos": repos, "status_file": status_file,
         "usage_file": usage_file, "hold_file": hold_file, "limits": limits,
         "install_manifest": install_manifest, "usage_copy_status": usage_copy_status,
+        "validator_ledger": validator_ledger_path,
+        "owner_logins": _strings(raw, "owner_logins", (), lambda v: bool(LOGIN_RE.match(v)), errors,
+                                 "GitHub logins"),
         "linear_key_env": linear_env,
         "tracker_teams": _strings(raw, "tracker_teams", (), lambda v: bool(TEAM_RE.match(v)), errors,
                                   "tracker team keys"),
@@ -560,6 +585,10 @@ def which_on(cfg):
         "no tracker_teams are named" if not cfg["tracker_teams"] else
         "no tracker_trusted_users are named: without them every marker would look forged"
         if not cfg["tracker_trusted_users"] else None)
+    off["approval-rate"] = (
+        "no validator_ledger is named" if not cfg["validator_ledger"] else
+        "no repository is named in `repos`, so no merge could be checked" if not cfg["repos"]
+        else None)
     for m, why in OFF_BY_DESIGN.items():
         off[m] = why
     return off
@@ -1215,6 +1244,153 @@ def monitor_tracker_text(cfg, tr, now):
 
 
 # --------------------------------------------------------------------------- #
+# The validator's ledger: every merge against its approvals (KIT-546)
+# --------------------------------------------------------------------------- #
+SHA_RE = re.compile(r"^[0-9a-f]{40}\Z")
+
+
+def _pr_of(ref):
+    """(repo, number) of a ledger merge row's `owner/name#N`, or (None, None)."""
+    repo, _, number = (ref or "").rpartition("#")
+    return (repo, int(number)) if REPO_RE.match(repo) and number.isdigit() else (None, None)
+
+
+def previous_pass(cfg):
+    """When this watcher last wrote its status file, or None when there is none it can read. Only
+    ever used to read FURTHER back, never less: a file that says a later time changes nothing."""
+    try:
+        with open(cfg["status_file"], encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError, RecursionError):
+        return None
+    if not isinstance(doc, dict) or doc.get("schema") != WATCHER_SCHEMA:
+        return None
+    return _epoch(doc.get("written_at"))
+
+
+def monitor_approvals(cfg, gh, now):
+    """The validator's ledger against GitHub. Each pull request merged into a watched repository's
+    default branch inside the lookback needs an `approved` row for its head; one without is a
+    pause, naming who merged it from GitHub's own `merged_by`, unless that login is the owner's. An
+    approval still open a day later is a page, and so is each urgent escalation, which is how the
+    validator's urgent page reaches the owner. The day's approvals over `day_approvals` is a pause.
+    A ledger or a merge list that cannot be read is never clear."""
+    name, found, incomplete, since = "approval-rate", [], [], _since(cfg, now)
+    last = previous_pass(cfg)
+    if last is not None and last < since:
+        # The watcher was down longer than its lookback. Every merge since its last pass is read, so
+        # none in the gap goes unchecked; past GAP_CAP_SECONDS the rest is said as a gap.
+        since = max(int(last), int(now - GAP_CAP_SECONDS))
+        if last < now - GAP_CAP_SECONDS:
+            incomplete.append(("the watcher", "its last pass was more than %d days ago, so merges "
+                               "before %s were not checked" % (GAP_CAP_SECONDS // 86400,
+                                                               _iso(since))))
+    got = validator_ledger.read(cfg["validator_ledger"])
+    if got["rows"] is None:
+        return blind(name, _line("the validator's ledger: %s" % got["why"]), 1, 0)
+    rows = got["rows"]
+    watched = dict((r.lower(), r) for r in cfg["repos"])
+    owners = set(x.lower() for x in cfg["owner_logins"])
+    approved = set((row["ref"].lower(), row["head"]) for row in rows
+                   if row["subject"] == "merge" and row["kind"] == "approved")
+    merged = with_row = owners_own = 0
+    for repo in cfg["repos"]:
+        try:
+            info = gh.ask("merges", "/repos/%s" % repo)
+            base = info.get("default_branch") if isinstance(info, dict) else None
+            if not isinstance(base, str) or not base:
+                raise SourceError("GitHub named no default branch", whole=False)
+        except SourceError as exc:
+            incomplete.append((repo, _line(str(exc))))
+            continue
+        pulls, complete, why = read_pages(
+            gh, "merges", lambda n, r=repo: ("/repos/%s/pulls?state=closed&sort=updated&direction=desc"
+                                             "&per_page=%d&page=%d" % (r, PAGE_SIZE, n)),
+            cfg["max_pages"],
+            stop=lambda batch: (_epoch((batch[-1] or {}).get("updated_at")) or since + 1) < since
+            if batch and isinstance(batch[-1], dict) else False)
+        if not complete:
+            incomplete.append((repo, why))
+        for p in pulls:
+            at, number = _epoch(p.get("merged_at")), p.get("number")
+            into = p["base"].get("ref") if isinstance(p.get("base"), dict) else None
+            if at is None or at < since or at > now or into != base:
+                continue
+            if not isinstance(number, int) or isinstance(number, bool) or number < 1:
+                incomplete.append((repo, "a merged pull request carried no number"))
+                continue
+            merged += 1
+            head = (p.get("head") or {}).get("sha") if isinstance(p.get("head"), dict) else None
+            ref = _ref(repo, number)
+            if isinstance(head, str) and SHA_RE.match(head) and (
+                    "%s#%d" % (repo.lower(), number), head) in approved:
+                with_row += 1
+                continue
+            try:
+                full = gh.ask("merges", "/repos/%s/pulls/%d" % (repo, number))
+                who = _login(((full or {}).get("merged_by") or {}).get("login")
+                             if isinstance(full, dict) and isinstance(full.get("merged_by"), dict)
+                             else None)
+                if who is None:
+                    raise SourceError("GitHub did not say who merged it", whole=False)
+            except SourceError as exc:
+                incomplete.append((repo, _line("who merged %s: %s" % (ref, exc))))
+                who = None
+            if who is not None and who.lower() in owners:
+                owners_own += 1
+                continue
+            found.append(finding(PAUSE, "merge-without-approval", ref, actor=who,
+                                 at=p.get("merged_at"), url=_url(repo, "pull", number)))
+    # An approval a day old with no merge, no newer row and no close.
+    stale = 0
+    for i, row in enumerate(rows):
+        at = _epoch(row["at"])
+        if (row["subject"] != "merge" or row["kind"] != "approved" or at is None
+                or not now - APPROVAL_FOLLOW_SECONDS <= at <= now - APPROVAL_STALE_SECONDS):
+            continue
+        if any(later["ref"].lower() == row["ref"].lower() for later in rows[i + 1:]):
+            continue
+        repo, number = _pr_of(row["ref"])
+        if repo is None or repo.lower() not in watched:
+            continue
+        repo = watched[repo.lower()]
+        try:
+            full = gh.ask("merges", "/repos/%s/pulls/%d" % (repo, number))
+            if not isinstance(full, dict):
+                raise SourceError("GitHub's answer held no pull request", whole=False)
+        except SourceError as exc:
+            incomplete.append((repo, _line("whether %s merged: %s" % (_ref(repo, number), exc))))
+            continue
+        if full.get("merged_at") or full.get("state") == "closed":
+            continue
+        stale += 1
+        found.append(finding(PAGE, "approval-without-merge", _ref(repo, number), at=row["at"],
+                             url=_url(repo, "pull", number)))
+    # The day's approvals against the watcher's own limit, and each urgent escalation.
+    day = sum(1 for row in rows if row["kind"] == "approved"
+              and now - RATE_WINDOW_SECONDS < (_epoch(row["at"]) or 0) <= now)
+    limit = cfg["limits"].get("day_approvals")
+    if limit and day > limit:
+        found.append(finding(PAUSE, "approval-rate", _today(now), value=day, limit=limit))
+    urgent = 0
+    for row in rows:
+        at = _epoch(row["at"])
+        if row["kind"] == "escalated-urgent" and at is not None and since <= at <= now:
+            urgent += 1
+            found.append(finding(PAGE, "urgent-escalation", REF_BAD_RE.sub("?", row["ref"])[:200],
+                                 at=row["at"]))
+    asked, answered, read_at = gh.feed_stats("merges")
+    said = ("read %d ledger row(s) and %d merge(s) into the default branch of %d repositor%s since %s: "
+            "%d approved, %d the owner's, %d without an approval; %d approval(s) a day old and "
+            "unmerged; %d approval(s) in 24 hours (%s); %d urgent escalation(s)"
+            % (len(rows), merged, len(cfg["repos"]), "y" if len(cfg["repos"]) == 1 else "ies",
+               _iso(since), with_row, owners_own, sum(1 for f in found
+                                                     if f["what"] == "merge-without-approval"),
+               stale, day, "limit %d" % limit if limit else "no day_approvals limit set", urgent))
+    return judged(name, found, said, _gaps(incomplete), asked + 1, answered + 1, read_at)
+
+
+# --------------------------------------------------------------------------- #
 # One pass
 # --------------------------------------------------------------------------- #
 def credential(environ, name):
@@ -1260,7 +1436,7 @@ def build(cfg, environ=None, gh=None, now=None, clock=None, tracker=None):
     off = which_on(cfg)
     results = []
     token = token_why = None
-    if any(off[m] is None for m in ("labels", "markers", "injection")):
+    if any(off[m] is None for m in ("labels", "markers", "injection", "approval-rate")):
         token, token_why = credential(environ, cfg["github_token_env"])
     # No credential means no GitHub, whatever transport a caller stood in for it.
     get = None if not token else (gh if gh is not None else (lambda path: github_get(path, token)))
@@ -1287,7 +1463,8 @@ def build(cfg, environ=None, gh=None, now=None, clock=None, tracker=None):
                "labels": lambda: monitor_labels(cfg, github, started),
                "markers": lambda: monitor_markers(cfg, github, started),
                "injection": lambda: monitor_injection(cfg, github, started),
-               "tracker-text": lambda: monitor_tracker_text(cfg, tracker_gh, started)}
+               "tracker-text": lambda: monitor_tracker_text(cfg, tracker_gh, started),
+               "approval-rate": lambda: monitor_approvals(cfg, github, started)}
     for name in MONITORS:
         if off[name] is not None:
             results.append(monitor(name, OFF, "not on", off[name]))
@@ -1749,7 +1926,7 @@ def selftest():
             on = [m for m in doc["monitors"] if m["state"] != OFF]
             check("rules file %s: every monitor that is on is blind, by name, exit 4" % label,
                   (code, doc["result"], len(on), all(m["state"] == BLIND and why in m["reason"]
-                                                      for m in on)), (EXIT_BLIND, "blind", 6, True))
+                                                      for m in on)), (EXIT_BLIND, "blind", 7, True))
             if os.path.islink(cfg_path):
                 os.unlink(cfg_path)
         # An unsafe rules file also names where the output goes: it may replace only a file this
@@ -2357,7 +2534,7 @@ def selftest():
         check("install: a mismatch makes every monitor that could be on blind, by name, and the pass exit 4",
               (code_i, len(on_i), all(m["state"] == BLIND and "do not match" in m["reason"] and
                                       "scripts/check_schemas.py" in m["reason"] for m in on_i)),
-              (EXIT_BLIND, 6, True))
+              (EXIT_BLIND, 7, True))
         check("install: ...and it is said, loud, in the pass's own output",
               any("do not match" in line for line in said_i), True)
         try:
@@ -2710,6 +2887,202 @@ def selftest():
         check("the monitors are fixed and in order", tuple(ids), MONITORS)
         check("every monitor with no producer has its reason", sorted(OFF_BY_DESIGN),
               sorted(set(MONITORS) - set(KIND)))
+
+        # -- KIT-546: approval-rate, the validator's ledger against every merge -------------------------
+        vfold = os.path.join(tmp, "validator")
+        os.makedirs(vfold, mode=0o755, exist_ok=True)
+        os.chmod(vfold, 0o755)
+        vpath = os.path.join(vfold, "ledger.json")
+        H = ["%040x" % (0xa00 + i) for i in range(20)]
+
+        def vrow(subject, ref, head, kind, **over):
+            row = {"subject": subject, "ref": ref, "head": head, "kind": kind,
+                   "layers": {"hard_limits": "pass", "evidence": "pass",
+                              "agent": "pass" if kind == "approved" else "fail"},
+                   "settings_on": ["approve-merges", "approve-pieces", "approve-plans"],
+                   "size_limits": {"max_changed_lines": 400, "max_files": 20},
+                   "agent_says": "Fine."}
+            if "reasons" in validator_ledger.ROW_KEYS:      # the ledger's /2 rows carry closed reasons
+                row["reasons"] = []
+            row.update(over)
+            return row
+
+        def ledger_of(*rows_at):
+            if os.path.exists(vpath):
+                os.unlink(vpath)
+            for row, minutes in rows_at:
+                validator_ledger.append(vpath, row, lambda m=minutes: NOW - m * 60)
+
+        def merged(n, head, minutes=30, base="main"):
+            return {"number": n, "merged_at": ago(minutes), "updated_at": ago(minutes),
+                    "state": "closed", "base": {"ref": base}, "head": {"sha": head}}
+
+        def one_pr(merged_by=None, state="closed", merged_at=True):
+            return {"merged_by": {"login": merged_by} if merged_by else None, "state": state,
+                    "merged_at": ago(30) if merged_at else None}
+
+        def vgh(closed=(), prs=None, repo_answer=None, closed_answer=None):
+            prs = prs or {}
+
+            def pr_answer(path):
+                n = int(path.rsplit("/", 1)[1])
+                if n not in prs:
+                    raise SourceError("GitHub answered HTTP 404", whole=False)
+                return prs[n]
+            return FakeGH([("/repos/%s/pulls?state=closed" % R,
+                            closed_answer if closed_answer is not None else list(closed)),
+                           ("/repos/%s/pulls/" % R, pr_answer),
+                           ("/repos/%s/pulls?" % R, []),
+                           ("/repos/%s/issues/" % R, []),
+                           ("/repos/%s" % R, repo_answer if repo_answer is not None
+                            else {"default_branch": "main"})])
+
+        def approvals(gh, **over):
+            c = cfg_with(validator_ledger=vpath, owner_logins=["the-owner"], **over)
+            door = GitHub(gh, None, 200, lambda: False, lambda: NOW)
+            return monitor_approvals(c, door, NOW)
+
+        def whats(m):
+            return sorted((f["level"], f["what"], f["ref"], f["actor"]) for f in m["findings"])
+
+        check("approval-rate is off until the rules name the ledger, and says why",
+              (which_on(cfg_with())["approval-rate"],
+               which_on(cfg_with(validator_ledger=vpath, repos=[]))["approval-rate"],
+               which_on(cfg_with(validator_ledger=vpath))["approval-rate"]),
+              ("no validator_ledger is named",
+               "no repository is named in `repos`, so no merge could be checked", None))
+        quiet_gh = vgh()
+        go(gh=quiet_gh, usage=usage_doc())
+        check("...and off, it asks GitHub nothing about merges and reads no ledger",
+              [x for x in quiet_gh.paths if "state=closed" in x or "/pulls/" in x], [])
+
+        ledger_of((vrow("merge", "acme/app#12", H[1], "approved"), 60),
+                  (vrow("merge", "acme/app#17", H[2], "approved"), 60))
+        m = approvals(vgh(closed=[merged(12, H[1]), merged(13, H[3]), merged(14, H[4]),
+                                  merged(15, H[5], base="dev"), merged(16, H[6], minutes=60 * 30),
+                                  merged(17, H[7])],
+                          prs={13: one_pr("the-owner"), 14: one_pr("someone-else"),
+                               17: one_pr("someone-else")}))
+        check("a merge with an approved row for its head is clear; the owner's own merge is not a finding; "
+              "a merge by anyone else with no approval at its head is a pause, naming who merged it",
+              (m["state"], whats(m)),
+              (FLAGGED, [(PAUSE, "merge-without-approval", "acme/app#14", "someone-else"),
+                         (PAUSE, "merge-without-approval", "acme/app#17", "someone-else")]))
+        ok("...a merge into another branch, or before the lookback, is not counted",
+           "6 merge(s)" not in m["said"] and "4 merge(s)" in m["said"], m["said"])
+        ok("...and it says what it read and found", "1 approved, 1 the owner's, 2 without an approval"
+           in m["said"], m["said"])
+        m = approvals(vgh(closed=[merged(14, H[4])], prs={}))
+        check("a merge whose merger cannot be read is still a pause, with no name, and the gap is said",
+              (m["state"], whats(m), bool(m["reason"])),
+              (FLAGGED, [(PAUSE, "merge-without-approval", "acme/app#14", None)], True))
+        ledger_of((vrow("merge", "acme/app#20", H[8], "approved"), 60 * 48),
+                  (vrow("merge", "acme/app#21", H[9], "approved"), 60 * 48),
+                  (vrow("merge", "acme/app#22", H[10], "approved"), 60 * 48),
+                  (vrow("merge", "acme/app#22", H[11], "held", layers={
+                      "hard_limits": "fail", "evidence": "pass", "agent": "not-run"},
+                      agent_says=None), 60 * 30),
+                  (vrow("merge", "acme/app#23", H[12], "approved"), 120))
+        m = approvals(vgh(prs={20: one_pr(state="open", merged_at=False),
+                               21: one_pr("the-owner"), 22: one_pr(state="open", merged_at=False),
+                               23: one_pr(state="open", merged_at=False)}))
+        check("an approval a day old, still open with no newer row, is a page; a merged one, a newer row "
+              "and an approval of two hours are not",
+              whats(m), [(PAGE, "approval-without-merge", "acme/app#20", None)])
+        ledger_of((vrow("plan", "KIT-1", None, "approved"), 60),
+                  (vrow("piece", "KIT-2", None, "approved"), 50),
+                  (vrow("merge", "acme/app#30", H[13], "approved"), 40))
+        m = approvals(vgh(), limits={"day_approvals": 2})
+        check("the day's approvals over the watcher's own limit are a pause, with the figures",
+              [(f["what"], f["value"], f["limit"]) for f in m["findings"]], [("approval-rate", 3, 2)])
+        check("...and within it, nothing", approvals(vgh(), limits={"day_approvals": 3})["findings"], [])
+        check("...and with no limit set the rate is said, never judged",
+              ("no day_approvals limit set" in approvals(vgh())["said"],
+               approvals(vgh())["findings"]), (True, []))
+        ledger_of((vrow("merge", "acme/app#40", H[14], "escalated-urgent", layers={
+                      "hard_limits": "pass", "evidence": "pass", "agent": "fail"}), 60),
+                  (vrow("piece", "KIT-9", None, "escalated-urgent", layers={
+                      "hard_limits": "pass", "evidence": "pass", "agent": "fail"}), 30),
+                  (vrow("merge", "acme/app#41", H[15], "escalated-urgent", layers={
+                      "hard_limits": "pass", "evidence": "pass", "agent": "fail"}), 60 * 72))
+        m = approvals(vgh())
+        check("each urgent escalation inside the lookback is a page: the validator's urgent route",
+              whats(m), [(PAGE, "urgent-escalation", "KIT-9", None),
+                         (PAGE, "urgent-escalation", "acme/app#40", None)])
+
+        # A watcher that was down longer than its lookback reads back to its last pass.
+        with open(status_path, encoding="utf-8") as fh:
+            kept_status = fh.read()
+        put(status_path, {"schema": WATCHER_SCHEMA, "written_at": _iso(NOW - 40 * 3600)}, 0o644)
+        ledger_of((vrow("merge", "acme/app#12", H[1], "approved"), 60))
+        gap_gh = vgh(closed=[merged(14, H[4], minutes=30 * 60)], prs={14: one_pr("someone-else")})
+        check("a merge in the gap since the watcher's last pass, beyond the lookback, is still checked",
+              whats(approvals(gap_gh)), [(PAUSE, "merge-without-approval", "acme/app#14", "someone-else")])
+        put(status_path, {"schema": WATCHER_SCHEMA, "written_at": _iso(NOW - 40 * 86400)}, 0o644)
+        m = approvals(vgh(closed=[merged(14, H[4], minutes=30 * 60)], prs={14: one_pr("someone-else")}))
+        check("...a last pass beyond the gap's cap reads back that far, and says what it did not read",
+              (whats(m), "were not checked" in (m["reason"] or "")),
+              ([(PAUSE, "merge-without-approval", "acme/app#14", "someone-else")], True))
+        put(status_path, {"schema": WATCHER_SCHEMA, "written_at": _iso(NOW + 3600)}, 0o644)
+        check("...and a last pass that claims a later time never narrows the lookback",
+              whats(approvals(vgh(closed=[merged(14, H[4], minutes=60)], prs={14: one_pr("someone-else")}))),
+              [(PAUSE, "merge-without-approval", "acme/app#14", "someone-else")])
+        with open(status_path, "w", encoding="utf-8") as fh:
+            fh.write(kept_status)
+        ledger_of((vrow("merge", "acme/app#20", H[8], "approved"), 60 * 48))
+        m = approvals(vgh(prs={}))
+        check("a stale approval whose pull request GitHub would not give is blind, never clear",
+              (m["state"], m["findings"], "whether acme/app#20 merged" in (m["reason"] or "")),
+              (BLIND, [], True))
+        full = [merged(100 + i, H[0], base="dev") for i in range(100)]
+        m = approvals(vgh(closed=full), max_pages=1)
+        check("a merge list cut short at max_pages is blind, never clear",
+              (m["state"], "max_pages" in (m["reason"] or "")), (BLIND, True))
+
+        # A ledger or a merge list it cannot read is never clear.
+        with open(vpath, "w", encoding="utf-8") as fh:
+            fh.write("{ not a ledger")
+        m = approvals(vgh())
+        check("a ledger it cannot read is blind, never clear", (m["state"], m["findings"]), (BLIND, []))
+        ledger_of((vrow("merge", "acme/app#12", H[1], "approved"), 60))
+        os.chmod(vpath, 0o666)
+        check("a ledger a session could have written is blind", approvals(vgh())["state"], BLIND)
+        os.chmod(vpath, 0o644)
+        check("a merge list GitHub would not give is blind",
+              approvals(vgh(closed_answer=SourceError("GitHub answered HTTP 502", whole=True)))["state"],
+              BLIND)
+        check("a repository GitHub named no default branch for is blind",
+              approvals(vgh(repo_answer={"name": "app"}))["state"], BLIND)
+        check("an absent ledger is an empty one: a merge by someone else is then a pause",
+              (os.unlink(vpath), whats(approvals(vgh(closed=[merged(14, H[4])],
+                                                     prs={14: one_pr("someone-else")}))))[1],
+              [(PAUSE, "merge-without-approval", "acme/app#14", "someone-else")])
+
+        # End to end: the file conforms, the merge without an approval holds, and the page has words.
+        ledger_of((vrow("merge", "acme/app#12", H[1], "approved"), 60))
+        hold2 = os.path.join(tmp, "holdfolder", "hold-546.json")
+        code, said_ = go(gh=vgh(closed=[merged(14, H[4])], prs={14: one_pr("someone-else")}),
+                         usage=usage_doc(), validator_ledger=vpath, owner_logins=["the-owner"],
+                         hold_file=hold2)
+        doc = written()
+        got_hold = pipeline_hold.read(hold2)
+        check("end to end: the file conforms, approval-rate is flagged, and a merge with no approval holds",
+              (check_schemas.document_problems(doc, SCHEMA_NAME), mon(doc, "approval-rate")["state"],
+               mon(doc, "approval-rate")["kind"],
+               [(h["monitor"], h["what"], h["ref"]) for h in got_hold["holds"] or []]),
+              ([], FLAGGED, "second-hand", [("approval-rate", "merge-without-approval", "acme/app#14")]))
+        if os.path.exists(hold2):
+            os.unlink(hold2)
+        for label, over, want in (
+                ("day_approvals that is not whole", {"limits": {"day_approvals": 2.5}}, "day_approvals"),
+                ("an owner login that is not one", {"owner_logins": ["not a login"]}, "owner_logins"),
+                ("a relative ledger path", {"validator_ledger": "ledger.json"}, "validator_ledger")):
+            try:
+                cfg_with(**over)
+                said_err = ""
+            except ConfigError as exc:
+                said_err = str(exc)
+            check("config: %s is refused, by name" % label, want in said_err, True)
 
         # -- the contract and the schema agree --------------------------------------------------------------------------------
         contract = os.path.join(os.path.dirname(HERE), "docs", "PIPELINE-CONTRACT.md")
