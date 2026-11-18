@@ -38,8 +38,9 @@ ITS LAST CHANGE.  The newest `updatedAt` of the plan, of its pieces and of its i
 read them. A row is stamped with the moment before the plan's last read: for the agent's decision,
 the read again after the run, and for a hold, the one read. Any change after that moment is caught
 by that read, or dated after the row. So a row newer than the plan's last change, and than its open
-question, is about the plan as it stands and as the owner was asked about it. The bridge acts on a
-row by the same rule.
+question, is about the plan as it stands and as the owner was asked about it. It counts only under
+the switches it was made under: a switch turned on or off since is a reason to judge again. The
+bridge acts on a row by the same rules.
 
 HOW A PLAN IS APPROVED.  Never here. The bridge approves it on its next pass
 (scripts/pipeline_bridge_plans.py, validator_approvals): its own open question, an `approved` row
@@ -97,7 +98,8 @@ class Host(object):
         self.environ = os.environ if environ is None else environ
 
     def waiting(self):
-        """{plan: when it was first asked}, the bridge's open approve questions, or facts.Unread."""
+        """{plan: when its newest open question was asked}, the bridge's open approve questions, or
+        facts.Unread."""
         rcfg, bad = queue_read.reader_config(facts._queue_raw(self.cfg["facts"]).get("reader") or {})
         if bad or not rcfg["bridge_state_file"]:
             raise facts.Unread("the queue's reader names no bridge state file "
@@ -182,10 +184,17 @@ def run_pass(cfg, host, now=None, dry=False, say=print, clock=time.time):
         l2 = {"verdict": "yes", "reasons": []}      # the bridge's own open question: only you wait
         decision = route.decide("plan", l1, l2, None, None)
         latest, last = _latest(rows, plan), doc.get("last_change")
+        if last is None and (decision["record"] or decision["wait"] == ["agent-not-run"]):
+            # No row could ever be matched to the plan as it stands: recording or judging it
+            # would only do it again on every pass.
+            say("  %s: waits: its last change could not be read, so no decision could be matched "
+                "to it." % plan)
+            continue
         # A row about the plan as it stands, and as you were asked about it: stamped after its
-        # last change and after the question (Stage E on #638).
+        # last change and after the question, under the switches on now (Stage E on #638).
         fresh = (latest is not None and last is not None
-                 and (pool.epoch(latest["at"]) or 0) > max(last, asked[plan]))
+                 and (pool.epoch(latest["at"]) or 0) > max(last, asked[plan])
+                 and set(latest["settings_on"]) == set(route.switches_on(settings)))
         if decision["record"]:
             if fresh and (latest["kind"], latest["reasons"]) == (decision["kind"], decision["reasons"]):
                 say("  %s: still held for you (already recorded, unchanged since)." % plan)
@@ -443,6 +452,11 @@ def selftest():
         code, said = go(host)
         check("...but a decision older than the plan's open question is not its answer: judged again",
               (kinds()[2:], host.log), ([("TOD-10", "approved", [])], ["agent"] * 3))
+        put_settings(dict(on, approve=dict(on["approve"], pieces=True)))
+        go(host)
+        check("...and so is one made under other switches than are on now (Stage E on #638)",
+              (kinds()[3:], host.log), ([("TOD-10", "approved", [])], ["agent"] * 4))
+        put_settings(on)
 
         # 3. The provenance rule: an idea not certified as the owner's is never approved, whatever
         #    the switches, and no agent is run on it.
@@ -483,6 +497,10 @@ def selftest():
         check("...and with it allowed, the agent judges it", (kinds(), host.log),
               ([("TOD-41", "approved", [])], ["agent"]))
         put_settings(on)
+        go(host)
+        check("...and once that switch is off again, its approval is judged again, and held "
+              "(Stage E on #638)", (kinds(), host.log),
+              ([("TOD-41", "approved", []), ("TOD-41", "held", ["deleting-data"])], ["agent"]))
 
         # 5. The agent's no: a send-back has no dev session, so it is an escalation; an answer
         #    that cannot be used is held; an escalated plan unchanged since is not judged again.
@@ -528,6 +546,11 @@ def selftest():
         code, said = go(host)
         check("a fact not read waits, unwritten, and is said in closed words",
               (code, kinds(), host.log, "TOD-73: waits: paths-unknown" in said), (EXIT_OK, [], [], True))
+        host = fresh(**{"TOD-74": {"changed": None}, "TOD-75": {"changed": None, "paths": FLOOR}})
+        code, said = go(host)
+        check("a plan whose last change cannot be read is neither judged nor held, pass after pass",
+              (code, kinds(), host.log, said.count("its last change could not be read")),
+              (EXIT_OK, [], [], 2))
 
     # 8. The config, and the refusal under an agent.
     _c, problems = config({"schema": "x", "settings_file": "rel.json", "agent": {}, "x": 1})

@@ -458,7 +458,8 @@ the validator's settings and ledger where the queue's config names them
 (`reader.validator_settings_file` and `reader.validator_ledger_file`). On each pass, after your own
 messages, an open approve question is approved when the validator's newest decision about that
 plan approves it. The plan and its idea must not have changed since the validator read them, the
-decision must be newer than the question, and the idea must be yours. Every check your yes gets still applies. The bridge records the approval as the
+decision must be newer than the question and made under the switches on now, and the idea must
+be yours. When the bridge can't act on it, it says why, once, and your question stays open. Every check your yes gets still applies. The bridge records the approval as the
 validator's, never yours, and says so where it asked: *The validator approved PROD-50 in your
 place.* Your own answer comes first, and a plan you declined stays declined. To stop a plan it
 approved, say `pause` or `cancel`, as for any plan. With the switch off, or either file unnamed or

@@ -193,16 +193,9 @@ def answer_of(run, built):
     return brief.read_answer(run["text"], built)
 
 
-def switches_on(settings):
-    """The ledger's words for the validator's switches that are on, from the settings' load()."""
-    if not isinstance(settings, dict) or settings.get("state") != "read":
-        return []
-    on = ["approve-%s" % k for k in ("plans", "pieces", "merges")
-          if (settings.get("approve") or {}).get(k) is True]
-    on += ["allow-%s" % k.replace("_", "-") for k in ("credentials", "billing_and_accounts",
-                                                       "production_deploy", "deleting_data")
-           if (settings.get("allow") or {}).get(k) is True]
-    return on
+# The ledger's words for the switches that are on live with the ledger's reader (KIT-544), so the
+# bridge, which never loads this file, matches a row against the switches on now. The same object.
+switches_on = ledger.switches_on
 
 
 def row_for(subject, ref, head, decision, settings):

@@ -762,7 +762,8 @@ asked about is not judged. Nor is one that has left the backlog.
 | Pieces that touch the safety system, or a human-only class you have not allowed | A `held` row, once. It waits for you. An unchanged hold is not written again. |
 | A fact not read, or the window closed | Nothing written. It waits, and says why. |
 | The limits pass | One agent run and its row. A send-back becomes an escalation: a plan has no dev session yet. |
-| A plan it already decided, unchanged since | No second run. The plans after it get their turn. |
+| A plan it already decided, unchanged since, under the same switches | No second run. The plans after it get their turn. |
+| A plan whose last change can't be read | Nothing written, and no run. It waits, and says so. |
 | A plan edited while the agent judged it | Nothing written. A later pass judges it as it stands. |
 
 At most one agent run per pass. A row carries the moment before the plan's last read: after the
@@ -779,6 +780,7 @@ when all of these hold:
 
 - the plans switch is still on, in the settings the queue's reader names
   (`reader.validator_settings_file`), and the ledger it names can be trusted;
+- the switches on now are the ones it decided under. Turn one on or off, and it decides again;
 - the plan, its pieces and its idea have not changed since the validator read them, and it
   decided after you were asked;
 - its idea is yours: filed with your key, marked `provenance:human`, with no parent;
@@ -789,7 +791,8 @@ Then the bridge approves the plan as the validator's, never yours. Its record sa
 comment name the validator, and no person.
 
 **Your choice always stands.** Your own answer is read first. A plan you declined stays declined.
-You can still approve a plan yourself at any time. You can pause or cancel a plan the validator
+When the bridge can't act on the validator's approval, it says why where it asked you, once, and
+your question stays open. You can still approve a plan yourself at any time. You can pause or cancel a plan the validator
 approved, as any other: `pause <plan>` or `cancel <plan>`.
 
 **A hold** is a blocker in the stand-up, with the reply that clears it: `approve <plan>`.

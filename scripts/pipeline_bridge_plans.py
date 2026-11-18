@@ -1568,7 +1568,9 @@ class PlansMixin(object):
         the validator approves in the owner's place, on every check his yes gets, and the
         record, the comment and the reply name the validator, never him. Its approval counts
         only for the plan as it stands, and only for a plan from an idea he filed: otherwise
-        nothing is done, and the question stays his. Its caller has checked the action limit."""
+        nothing is done, and the question stays his. A refusal is said where he was asked, and
+        his question stays open too (Stage E on #638). Either way that decision is not tried
+        again (`validator_tried`). Its caller has checked the action limit."""
         by_validator = validator is not None
 
         def finish(status, text, what, kind="approve-refused", bind=""):
@@ -1578,7 +1580,10 @@ class PlansMixin(object):
             self.post(channel, thread, text, kind=kind, bind=bind, join=" ",
                       facts={"ticket": q["ticket"]})
             if by_validator:
-                q.update(status=status, answered_by=VALIDATOR, answered_ts=None)
+                if kind == "approve-done":
+                    q.update(status=status, answered_by=VALIDATOR, answered_ts=None)
+                else:
+                    q["validator_tried"] = validator          # his question stays open
                 self.say("  validator: %s: %s" % (q["ticket"], what))
                 return
             q.update(status=status, answered_by=msg["user"], answered_ts=msg.get("ts"))
@@ -1602,6 +1607,7 @@ class PlansMixin(object):
         if by_validator:
             waits = self.validator_waits(epic, validator, q.get("asked_at"))
             if waits:
+                q["validator_tried"] = validator              # its next decision is tried
                 self.say("  validator: %s: %s, so its approval does nothing" % (q["ticket"], waits))
                 return
         changed = changes_since(q.get("children") or {}, epic)
@@ -1674,34 +1680,36 @@ class PlansMixin(object):
 
     # -- The validator approves a plan in the owner's place (KIT-544) ------------------------
     def validator_record(self):
-        """(rows, why): the validator's ledger rows, while its plans switch is on, from the two
-        files the queue's reader names (`reader.validator_settings_file` and
+        """(rows, switches, why): the validator's ledger rows, while its plans switch is on, from
+        the two files the queue's reader names (`reader.validator_settings_file` and
         `reader.validator_ledger_file`, KIT-543): one place names them for the whole pipeline.
-        Each is read by its own reader. Rows None, with why in words, when its approval cannot
-        count: no queue config or no file named, settings not read, the plans switch off, or a
-        ledger its reader does not trust. Then the owner's `approve` decides, as before."""
+        Each is read by its own reader. `switches` are the ledger's words for the switches on now:
+        a decision counts only under the switches it was made under. Rows None, with why in
+        words, when its approval cannot count: no queue config or no file named, settings not
+        read, the plans switch off, or a ledger its reader does not trust. Then the owner's
+        `approve` decides, as before."""
         if not self.cfg["queue_config"]:
-            return None, "no queue config names the validator's files"
+            return None, (), "no queue config names the validator's files"
         try:
             with open(self.cfg["queue_config"], encoding="utf-8") as fh:
                 qcfg, bad = starter.load(json.load(fh))
         except (OSError, ValueError, RecursionError) as exc:
-            return None, "the queue's settings could not be read (%s)" % type(exc).__name__
+            return None, (), "the queue's settings could not be read (%s)" % type(exc).__name__
         if bad:
-            return None, "the queue's settings are not usable"
+            return None, (), "the queue's settings are not usable"
         spath = qcfg["reader"]["validator_settings_file"]
         lpath = qcfg["reader"]["validator_ledger_file"]
         if not spath or not lpath:
-            return None, "the queue's reader names no validator settings and ledger"
+            return None, (), "the queue's reader names no validator settings and ledger"
         settings = vsettings.load(spath)
         if settings["state"] != vsettings.READ:
-            return None, "the validator's settings were not read (%s)" % settings["why"]
+            return None, (), "the validator's settings were not read (%s)" % settings["why"]
         if settings["approve"].get("plans") is not True:
-            return None, "the validator's plans switch is off"
+            return None, (), "the validator's plans switch is off"
         got = vledger.read(lpath)
         if got["rows"] is None:
-            return None, got["why"]
-        return got["rows"], ""
+            return None, (), got["why"]
+        return got["rows"], tuple(sorted(vledger.switches_on(settings))), ""
 
     def owners_idea(self, idea):
         """Nothing ("") when the plan's idea is one the owner filed himself, by the parts of the
@@ -1747,13 +1755,15 @@ class PlansMixin(object):
         under the validator's name, never his. Only the newest row about the plan counts. The
         owner's own answer comes first: this runs after every message is read, so a question he
         answered, approved or declined is no longer open, and a plan already approved is left
-        alone. The switch off or unreadable, a question past its time, settings changed since it
-        was asked, acting off, or the hour's action limit reached: nothing is done, and the pass
-        log says which. A tracker that fails is said, and the next pass tries again."""
+        alone. The switch off or unreadable, a decision made under other switches than are on now
+        (Stage E on #638), a question past its time, settings changed since it was asked, acting
+        off, or the hour's action limit reached: nothing is done, and the pass log says which. A
+        decision that waited or was refused is not tried again: the validator's next one is. A
+        tracker that fails is said, and the next pass tries again."""
         asked = open_approvals(self.state)
         if not asked:
             return
-        rows, why = self.validator_record()
+        rows, switches, why = self.validator_record()
         if rows is None:
             self.say("  validator: %s, so no plan is approved in your place" % why)
             return
@@ -1771,10 +1781,15 @@ class PlansMixin(object):
             row = latest.get(q.get("ticket"))
             if (q.get("kind") != "approve" or q.get("status") != OPEN
                     or q.get("ticket") not in asked or q["ticket"] in approved
-                    or not row or row["kind"] != "approved" or epoch(row["at"]) is None):
+                    or not row or row["kind"] != "approved" or epoch(row["at"]) is None
+                    or q.get("validator_tried") == epoch(row["at"])):
                 continue
             if self.now - (q.get("asked_at") or 0) > self.cfg["question_ttl_hours"] * 3600:
                 continue                          # its time is up: the expiry closes it this pass
+            if tuple(sorted(row["settings_on"])) != switches:
+                self.say("  validator: %s: it decided under switches that have changed since, so "
+                         "it waits for a new decision" % q["ticket"])
+                continue
             if q.get("promised") != self.promised("approve"):
                 self.say("  validator: %s: my settings changed since I asked, so its approval "
                          "does nothing" % q["ticket"])
@@ -8393,12 +8408,14 @@ def cases_validator(kit):
                     ("val-idea-a-finding", {"parent": {"id": "uuid-5"}}, "has a parent ticket")):
                 c, s, t, root, lpath = vworld(
                     name, idea=idea, settings=json.dumps(settings_doc(everything=True)))
-                decide(lpath, ROW)
+                decide(lpath, dict(ROW, settings_on=list(vledger.SWITCHES)))
                 said = len(posted(s))
                 code, out = run(c, s, t, at=now + 1000)
-                check("validator-provenance-%s-is-never-approved-by-it-whatever-the-switches" % name,
-                      (t.moves, record(c), status_of(c), why in out, posted(s)[said:]),
-                      ([], None, [OPEN], True, []))
+                _code, again = run(c, s, t, at=now + 1100)
+                check("validator-provenance-%s-is-never-approved-by-it-whatever-the-switches-"
+                      "said-once" % name,
+                      (t.moves, record(c), status_of(c), why in out, why in again, posted(s)[said:]),
+                      ([], None, [OPEN], True, False, []))
 
             # 4. ONLY THE PLAN AS IT STANDS: an approval older than its last change waits for a
             #    new one; only its newest decision counts; a plan changed since you were asked
@@ -8442,11 +8459,28 @@ def cases_validator(kit):
             decide(lpath, ROW)
             said = len(posted(s))
             run(c, s, t, at=now + 1000)
-            check("validator-a-plan-changed-since-you-were-asked-is-not-approved-and-that-is-said",
+            run(c, s, t, at=now + 1100)
+            # Stage E on #638: the refusal is said once, where you were asked, and your question
+            # stays open: the validator's refusal is never your answer.
+            check("validator-a-plan-changed-since-you-were-asked-is-not-approved-said-once-and-"
+                  "your-question-stays-open",
                   (t.moves, record(c), status_of(c),
                    [p.split(" (")[0] for p in posted(s)[said:]]),
-                  ([], None, [REFUSED], ["The validator approved PROD-50 in your place, but "
-                                         "PROD-50's pieces changed since I asked"]))
+                  ([], None, [OPEN], ["The validator approved PROD-50 in your place, but "
+                                      "PROD-50's pieces changed since I asked"]))
+            # A decision made under other switches than are on now waits for a new one: here the
+            # pieces switch was turned on after it.
+            c, s, t, root, lpath = vworld("val-switches", settings=json.dumps(dict(
+                settings_doc(), approve={"plans": True, "pieces": True, "merges": False})))
+            decide(lpath, ROW)
+            code, out = run(c, s, t, at=now + 1000)
+            first = (list(t.moves), record(c), "decided under switches that have changed" in out)
+            vledger.append(lpath, dict(ROW, settings_on=["approve-plans", "approve-pieces"]),
+                           lambda: now + 1200)
+            run(c, s, t, at=now + 1500)
+            check("validator-a-decision-under-other-switches-than-now-waits-for-a-new-one",
+                  (first, t.moves, (record(c) or {}).get("approved_by")),
+                  (([], None, True), [("uuid-50", "st-todo")], starter.pool.VALIDATOR))
 
             # 5. YOUR CHOICE STANDS: a plan you declined stays declined, your own yes in the
             #    same pass is yours, and with acting off nothing moves.

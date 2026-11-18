@@ -918,9 +918,10 @@ def plan_run(node, owner):
 
 
 def open_approvals(state):
-    """KIT-544: the plans an open `approve` question of the bridge's waits on, as {plan id: when it
-    was first asked, in seconds}, read from the bridge's state as it is saved. The validator's plan
-    pass judges only these plans, and the bridge acts on its approval only while one is open: a plan
+    """KIT-544: the plans an open `approve` question of the bridge's waits on, as {plan id: when its
+    newest open question was asked, in seconds}, read from the bridge's state as it is saved. The
+    validator's plan pass judges only these plans, and judges one again when it was asked about it
+    after its decision; the bridge acts on that approval only while a question is open: a plan
     approved, declined, expired or never asked about is none of them. A record that is not a question
     is passed over. Raises ValueError for a state with no questions record."""
     questions = state.get("questions") if isinstance(state, dict) else None
@@ -933,7 +934,7 @@ def open_approvals(state):
         ticket, asked = q.get("ticket"), q.get("asked_at")
         if (isinstance(ticket, str) and re.match(r"^%s$" % TICKET_RE, ticket)
                 and isinstance(asked, (int, float)) and not isinstance(asked, bool)):
-            out[ticket] = min(asked, out.get(ticket, asked))
+            out[ticket] = max(asked, out.get(ticket, asked))
     return out
 
 
@@ -1073,7 +1074,7 @@ def cases_config(kit):
                        "question_ttl_hours",
                        "git working tree"):
             check("config-names:" + needle, needle in errs, True)
-        # KIT-544: the plans an open approve question waits on, the earliest ask of each; a plan
+        # KIT-544: the plans an open approve question waits on, the newest ask of each; a plan
         # approved, declined, expired or asked something else is none of them.
         qs = {"a": {"kind": "approve", "ticket": "PROD-50", "status": OPEN, "asked_at": 200.0},
               "b": {"kind": "approve", "ticket": "PROD-50", "status": OPEN, "asked_at": 100.0},
@@ -1084,8 +1085,8 @@ def cases_config(kit):
               "g": {"kind": "approve", "ticket": "not a ticket", "status": OPEN, "asked_at": 1.0},
               "h": {"kind": "approve", "ticket": "PROD-64", "status": OPEN, "asked_at": True},
               "i": "not a question"}
-        check("config-open-approvals-are-the-open-approve-questions-earliest-first",
-              open_approvals({"questions": qs}), {"PROD-50": 100.0})
+        check("config-open-approvals-are-the-open-approve-questions-newest-ask",
+              open_approvals({"questions": qs}), {"PROD-50": 200.0})
         try:
             open_approvals({"epics": {}})
             no_record = "read"
