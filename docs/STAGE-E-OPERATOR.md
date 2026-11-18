@@ -726,7 +726,7 @@ check catches it, and nothing is collected from it, but the session ran.
 | Coding session | The same account, sandboxed, the managed-repo entry | Unchanged. Receives bounces, and conflict fixes, as thread comments. |
 | Catch-up poller | The same account, a fourth system LaunchDaemon, installed only once you sign its first count (`CK-11`), unless `CATCHUP_INTERVAL_SECONDS=off` | Same env file, same clone, **its own** state directory and config. Reads one tracker key and the dispatcher's local status. Its only tracker write is one reply under a delegation the dispatcher never answered (`docs/CATCH-UP.md`). Not a session. |
 | Heartbeat monitor | The same account, a fifth system LaunchDaemon, unless `HEARTBEAT_MONITOR_TICKET=off` | Reads the daemons' heartbeats (the catch-up poller's once it is installed) — and the notifier's, when `NOTIFIER_JOB_LABEL` names it, and the health watch's status file, when `HEALTH_STATUS_FILE` names it — and one tracker key. Posts one comment per incident on one ticket, and nothing else. Its comments carry a mark the notifier pings on; its code reads no chat token. Not a session. |
-| Conflict waker | **You**, a user LaunchAgent, only while you are logged in | Uses your own `claude` and `gh` logins. Starts fix sessions **outside** any sandbox, so it takes only worktrees your own Claude Code worked in, and refuses to run as the role account. |
+| Conflict waker | **You**, a user LaunchAgent, only while you are logged in | Uses your own `claude` and `gh` logins. Each fix session is held to its worktree in Claude Code's sandbox and reads none of your home but what its tools need (KIT-676, KIT-786). It still pushes with your GitHub login, so the waker takes only worktrees your own Claude Code worked in, and refuses to run as the role account. |
 | State | `<role-account home>/.stage-e/state`, `…/.stage-e/finding` for the finding poller, and `…/.stage-e/catchup` for the catch-up poller | The sandbox denies sessions every read under that home. Same uid, so the sandbox is the whole boundary — see *Accepted risks*. |
 
 ### Why the role account and not yours
@@ -2618,6 +2618,29 @@ none of your settings. It may run only the git and gh steps of its prompt and yo
 - Not: an empty `CHECK_COMMANDS` on a project that has a local gate. The session merges, runs
   no check, and pushes with only CI to test it.
 - Not: `CLAUDE_ARGS`. It is gone, and a conf that still sets it is refused by name.
+
+**What a fix session can read (KIT-786).** Its commands read nothing in your home, `/Users`,
+`/Volumes`, the temp folders, or other sessions' scratchpads. These stay readable, each for
+one reason:
+
+| Stays readable | Why |
+|---|---|
+| The worktree and its checkout | The session's own files, git's objects and hooks, and the pre-commit hook's scanner |
+| `/tmp/claude-<uid>` | The sandbox's temp folder. Each command's output is kept there |
+| `~/.gitconfig` and `~/.config/git` | git's settings: the name and email on the merge commit |
+| `~/.nvm` and `~/.pyenv` | Node, npm and Python, where those managers install them |
+| `~/Library/Keychains/login.keychain-db` | git's `osxkeychain` helper reads it to push |
+| System folders and Homebrew | They hold programs, not your files |
+
+The kit's secret files (`.env`, `*.pem`, `credentials` and the rest) stay refused inside each
+folder above. npm's cache, `~/.npm`, stays closed: `npm run` does not need it.
+
+- Good: checks whose programs come from Homebrew, the system, `~/.nvm` or `~/.pyenv`.
+- Not: a check whose program lives elsewhere in your home, such as `~/.cargo/bin`. Preflight
+  refuses it and names the folder.
+- Not held: your GitHub login. The push needs it, so any command in the session can ask git
+  for it. The measured table is in
+  `docs/adr/2026-11-18-the-conflict-fix-session-reads-only-what-it-needs.md`.
 
 **Is it running?** Read the heartbeat, not the log:
 

@@ -93,12 +93,16 @@ THE FIX SESSION'S WALLS (KIT-676)
       worktree, its git folder (never its hooks or config) and Claude Code's own temp
       folder; github.com its only host; no unsandboxed retry; and no start at all where
       the sandbox cannot run (`failIfUnavailable`);
-    * the kit's secret-file denials, for the file tools and for every command's reads.
+    * the kit's secret-file denials, for the file tools and for every command's reads;
+    * no reads in the owner's home, /Users, /Volumes, the temp folders or other sessions'
+      scratchpads, except where its tools need them (KIT-786, FIX_READ_DENY and the two
+      tables after it, each row with its reason).
 
   Each wall was measured on this Mac with a scripted stand-in for the API, so no model ran
-  (docs/adr/2026-11-17-the-conflict-fix-session-is-held-to-its-worktree.md). Not held:
-  reads elsewhere on the machine (KIT-786), and the owner's GitHub login, which the push
-  needs. `wake --dry-run` prints the list, and the installer's CK-W1 sign-off reads it.
+  (docs/adr/2026-11-17-the-conflict-fix-session-is-held-to-its-worktree.md and
+  docs/adr/2026-11-18-the-conflict-fix-session-reads-only-what-it-needs.md). Not held: the
+  owner's GitHub login, which the push needs. `wake --dry-run` prints the list, and the
+  installer's CK-W1 sign-off reads it.
 
 WHAT A PASS IS BOUNDED BY
 
@@ -194,6 +198,7 @@ import fcntl
 import hashlib
 import json
 import os
+import pwd
 import re
 import shlex
 import shutil
@@ -840,6 +845,48 @@ FIX_HOSTS = ("github.com",)        # git over HTTPS; gh runs outside the sandbox
 # they would be gone, so the waker carries them: for the file tools, and for every command's reads.
 SECRET_FILES = (".env", ".env.local", ".env.development", ".env.production", ".env.staging",
                 ".env.test", ".env.*.local", "secrets/**", "*.pem", "*.key", "id_rsa", "credentials")
+
+# ── what a fix session's commands may read (KIT-786) ────────────────────────
+#
+# The sandbox fences writes, but it fenced reads only where a rule denied them. So a check's child
+# could read a secret anywhere you can, write it into the worktree, and push it. Now every
+# command's reads are denied where people and programs keep files, and opened again only where
+# the session's own tools need them. On a Mac, Claude Code's own block on reads outside a
+# session's folders denies two of the same places, /Users and /Volumes. `{home}` is your account's
+# home from the user database, never $HOME: a variable is not where the files are. `{tmp}` is
+# /tmp by its real path. Each row was measured on Claude Code 2.1.287 with a scripted stand-in
+# for the API, so no model ran (docs/adr/2026-11-18-the-conflict-fix-session-reads-only-what-it-needs.md).
+FIX_READ_DENY = (
+    ("{home}", "your own files: keys, logins, mail, and every other project"),
+    ("/Users", "every account's files on this Mac, and /Users/Shared"),
+    ("/Volumes", "other disks, where backups and copies of the same files live"),
+    ("/private/var/folders", "every account's own temp and cache folders, which other programs fill"),
+    ("{tmp}", "the shared temp folder, where any program may leave a file"),
+    ("{claude_tmp}/-*/*/scratchpad", "other Claude Code sessions' scratchpads"),
+)
+# Opened again, and why. Each folder here keeps the kit's secret-file denials (SECRET_FILES), so a
+# `.env` or a `credentials` file inside one is still denied: the narrower deny wins (measured), as
+# the scratchpad deny wins inside Claude Code's temp folder. Everything else under your home stays
+# denied, npm's cache (~/.npm) included: `npm run` and `npx` of an installed tool need none of it,
+# and npm only says it could not write its log (measured).
+FIX_READ_FOLDERS = (
+    ("{worktree}", "the session's own files"),
+    ("{checkout}", "the checkout the worktree belongs to: git's shared objects, refs and hooks, "
+                   "and the scanner the pre-commit hook runs from its node_modules"),
+    ("{claude_tmp}", "Claude Code's own temp folder: the TMPDIR its sandbox gives every command, and "
+                     "where each command's output is kept. With it unreadable, cat and node fail to "
+                     "write their output (measured)"),
+    ("{home}/.config/git", "git's second settings folder: its config, ignore and attributes files"),
+    ("{home}/.nvm", "Node and npm where nvm installs them: a check runs them, and the kit's "
+                    "pre-commit hook looks there for Node 20 or newer"),
+    ("{home}/.pyenv", "Python where pyenv installs it: its shims and its versions"),
+)
+FIX_READ_FILES = (
+    ("{home}/.gitconfig", "git's own settings: the name and email the merge commit carries"),
+    ("{home}/Library/Keychains/login.keychain-db",
+     "your login keychain, which git's osxkeychain helper reads itself to push: without it the push "
+     "fails with `could not read Username` (measured)"),
+)
 # A check is allowed by its exact words. Each of these would make it a wildcard, a compound command,
 # a substitution or a redirect, which Claude Code judges part by part, so the whole would never match.
 CHECK_FORBIDDEN = frozenset(";&|<>$`()*\\\n\r\t")
@@ -881,11 +928,71 @@ def fix_rules(home, number, branch, base, checks):
     return ["Bash(%s)" % c for c in commands] + ["%s(/%s/**)" % (t, home) for t in ("Read", "Edit", "Write")]
 
 
-def fix_settings(home, number, uid):
+def claude_tmp(uid):
+    """Claude Code's own temp root for this uid, by its real path."""
+    return os.path.join(os.path.realpath("/tmp"), "claude-%d" % uid)
+
+
+def account_home(uid):
+    """This uid's home from the user database, by its real path, or None when it has no entry.
+    Never $HOME: the fix session's reads are denied where the files are, not where a variable
+    points (KIT-786)."""
+    try:
+        home = pwd.getpwuid(uid).pw_dir
+    except KeyError:
+        return None
+    return os.path.realpath(home) if home and home.startswith("/") and home != "/" else None
+
+
+def opens_home(paths, home):
+    """The first of `paths` that is your home or holds it, else None. Opening one again would undo
+    the deny on your home, so a session in it is declined (KIT-786)."""
+    for path in paths:
+        if path == home or home.startswith(path.rstrip("/") + "/"):
+            return path
+    return None
+
+
+def fix_read_paths(worktree, checkout, home, uid):
+    """(denyRead, allowRead) for a fix session's commands (KIT-786): every place in FIX_READ_DENY,
+    then each folder and file its tools need, opened again. Each folder opened again keeps the
+    kit's secret-file denials. `home` is account_home(), never $HOME."""
+    values = {"home": home, "worktree": worktree, "checkout": checkout, "claude_tmp": claude_tmp(uid),
+              "tmp": os.path.realpath("/tmp")}
+    folders = list(dict.fromkeys(path.format(**values) for path, _why in FIX_READ_FOLDERS))
+    files = [path.format(**values) for path, _why in FIX_READ_FILES]
+    deny = [path.format(**values) for path, _why in FIX_READ_DENY]
+    deny += ["%s/**/%s" % (folder, name) for folder in folders for name in SECRET_FILES]
+    return deny, folders + files
+
+
+def _under(path, root):
+    return path == root or path.startswith(root.rstrip("/") + "/")
+
+
+def program_unreadable(path, home, uid):
+    """The denied place that keeps a fix session's commands from reading `path`, or None when they
+    can (KIT-786). The installer asks it of each check's program. A session's worktree and checkout
+    differ per PR, so only the folders and files opened for its tools count here."""
+    values = {"home": home, "claude_tmp": claude_tmp(uid), "tmp": os.path.realpath("/tmp")}
+    for row, _why in FIX_READ_FOLDERS + FIX_READ_FILES:
+        if "{worktree}" not in row and "{checkout}" not in row and _under(path, row.format(**values)):
+            return None
+    for row, _why in FIX_READ_DENY:
+        root = row.format(**values)
+        if "*" not in root and _under(path, root):
+            return root
+    return None
+
+
+def fix_settings(home, number, uid, checkout, account):
     """--settings: Claude Code's sandbox for every command but `gh pr checks`, with no unsandboxed
     retry and no start without it. Only these keys: in -p, Claude Code ignores a settings file that
-    fails its validation, silently, so a key it does not know would take the sandbox with it."""
+    fails its validation, silently, so a key it does not know would take the sandbox with it.
+    `home` is the worktree, `checkout` the REPO_DIRS entry it belongs to, `account` the account's
+    home (account_home)."""
     secrets = ["%s/**/%s" % (home, name) for name in SECRET_FILES]
+    deny_read, allow_read = fix_read_paths(home, checkout, account, uid)
     return {
         "permissions": {"deny": ["Read(/%s)" % p for p in secrets]},
         "sandbox": {
@@ -894,8 +1001,8 @@ def fix_settings(home, number, uid):
             "excludedCommands": ["gh pr checks %d --watch" % number, "gh pr checks %d" % number],
             # Claude Code's own temp root stays writable (its shell keeps its working folder there),
             # but the per-project folders in it are other sessions' scratchpads and task output.
-            "filesystem": {"denyWrite": [os.path.join(os.path.realpath("/tmp"), "claude-%d" % uid, "-*")],
-                           "denyRead": secrets},
+            "filesystem": {"denyWrite": [claude_tmp(uid) + "/-*"],
+                           "denyRead": deny_read, "allowRead": allow_read},
             "network": {"allowedDomains": list(FIX_HOSTS)},
         },
     }
@@ -926,9 +1033,32 @@ def describe_fix_session(checks, model):
         "fix session: sandbox   every command but gh pr checks runs in Claude Code's sandbox. It writes "
         "only in the worktree, its git folder and Claude Code's own temp folder, and reaches only "
         "%s. No unsandboxed retry; no start without the sandbox" % ", ".join(FIX_HOSTS),
+        describe_reads(),
         "fix session: loads     none of your settings, none of the worktree's settings or hooks, no MCP servers",
         "fix session: model     " + (model or "Claude Code's default"),
     ]
+
+
+def describe_reads(uid=None):
+    """The read walls as one line of the dry run's list (KIT-786): the same tables the settings are
+    built from, with the session's own folders as placeholders and your home as ~."""
+    values = {"home": "~", "worktree": "<worktree>", "checkout": "<checkout>",
+              "claude_tmp": claude_tmp(os.getuid() if uid is None else uid), "tmp": os.path.realpath("/tmp")}
+    deny = [path.format(**values) for path, _why in FIX_READ_DENY]
+    opened = [path.format(**values) for path, _why in FIX_READ_FOLDERS + FIX_READ_FILES]
+    return ("fix session: reads     every command reads nothing in %s. Opened again for its tools: %s. "
+            "The kit's secret files stay denied inside each folder opened again"
+            % (", ".join(deny), ", ".join(opened)))
+
+
+def held_home(home_of, uid, dry_run):
+    """The home a fix session's reads are denied in (KIT-786), or Refusal: without one, no session
+    can start with its reads held, so none starts. A dry run starts nothing and is never refused."""
+    home = home_of(uid)
+    if not home and not dry_run:
+        raise Refusal(f"REFUSED: uid {uid} has no home in the user database, so a fix session's reads\n"
+                      "  could not be denied there (KIT-786). Nothing was read and no session started.")
+    return home
 
 
 def agent_env_markers_present(env):
@@ -1028,7 +1158,7 @@ def new_tally():
 def wake(gh, repo_dir, now, *, runner=run, env=None, sleep=time.sleep, dry_run=False,
          claude_bin="claude", resume_mode="from-pr", checks=(), model=None, budget_usd=DEFAULT_BUDGET_USD,
          timeout_min=DEFAULT_TIMEOUT_MIN, lock_dir=None, sessions_left=DEFAULT_MAX_SESSIONS,
-         claude_dir=None, uid=None, dispatcher_env=DISPATCHER_ENV_FILE):
+         claude_dir=None, uid=None, dispatcher_env=DISPATCHER_ENV_FILE, home_of=account_home):
     """One repository's share of a pass. Returns its tally; raises CouldNotTell when the
     repository cannot be read at all, and Refusal before anything is read. A check no rule could
     name is a ValueError, raised before anything is read too: `main` refuses it as usage first."""
@@ -1038,6 +1168,7 @@ def wake(gh, repo_dir, now, *, runner=run, env=None, sleep=time.sleep, dry_run=F
     for check in checks:
         if check_command_problem(check):
             raise ValueError(check_command_problem(check))
+    account = held_home(home_of, uid, dry_run)
     lock_dir = lock_dir or os.path.join(tempfile.gettempdir(), "pr-conflict-waker")
     claude_dir = claude_dir or env.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
     trees = worktrees_by_branch(repo_dir, runner)
@@ -1091,6 +1222,9 @@ def wake(gh, repo_dir, now, *, runner=run, env=None, sleep=time.sleep, dry_run=F
                 reason = "`git status` failed in the worktree"
             elif dirty.stdout.strip():
                 reason = "the worktree has uncommitted changes — a session may be mid-work there"
+            elif account and opens_home([os.path.realpath(wt), os.path.realpath(repo_dir)], account):
+                reason = ("the worktree or its checkout is your home or holds it, so a fix session could "
+                          "not be kept from reading your home (KIT-786)")
             if reason:
                 lock.close()
                 tally["declined"].append(n)
@@ -1135,7 +1269,8 @@ def wake(gh, repo_dir, now, *, runner=run, env=None, sleep=time.sleep, dry_run=F
             home = os.path.realpath(wt)
             prompt = FIX_PROMPT.format(number=n, branch=branch, base=base, checks=checks_step(checks))
             cmd = fix_argv(claude_bin, prompt, n, budget_usd, resume_mode, model,
-                           fix_rules(home, n, branch, base, checks), fix_settings(home, n, uid))
+                           fix_rules(home, n, branch, base, checks),
+                           fix_settings(home, n, uid, os.path.realpath(repo_dir), account))
             timed_out, rc, output = False, None, ""
             try:
                 r = runner(cmd, cwd=home, timeout=timeout_min * 60)
@@ -1220,6 +1355,7 @@ def wake_pass(repo_dirs, gh_for, now, *, state_dir, dry_run=False, max_sessions=
     env = os.environ if env is None else env
     uid = os.getuid() if uid is None else uid
     refuse_waker(env, dry_run, uid, os.path.expanduser(dispatcher_env) if dispatcher_env else None)
+    held_home(wake_kw.get("home_of", account_home), uid, dry_run)
     state_dir = os.path.expanduser(state_dir)
     wake_kw.setdefault("lock_dir", os.path.join(state_dir, "locks"))
     if dry_run:   # what a fix session may do, said before any PR is: the installer's card signs it
@@ -2144,17 +2280,110 @@ def selftest():
         settings = json.loads(after("--settings") or "{}")
         secrets = ["%s/**/%s" % (home, name) for name in SECRET_FILES]
         tmp_glob = os.path.join(os.path.realpath("/tmp"), "claude-%d" % os.getuid(), "-*")
+        # KIT-786: every command's reads are denied where people keep files, your home taken from the
+        # user database, and opened again only where the session's tools need them. Spelled out here,
+        # never rebuilt from the tables, so a row dropped from one is a failure, not a match.
+        acct = os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir)
+        ctmp = os.path.join(os.path.realpath("/tmp"), "claude-%d" % os.getuid())
+        opened = [home, os.path.realpath(repo), ctmp, acct + "/.config/git", acct + "/.nvm", acct + "/.pyenv"]
+        deny_read = ([acct, "/Users", "/Volumes", "/private/var/folders", os.path.realpath("/tmp"),
+                      ctmp + "/-*/*/scratchpad"] + ["%s/**/%s" % (f, n) for f in opened for n in SECRET_FILES])
+        allow_read = opened + [acct + "/.gitconfig", acct + "/Library/Keychains/login.keychain-db"]
         expect(settings == {
             "permissions": {"deny": ["Read(/%s)" % p for p in secrets]},
             "sandbox": {"enabled": True, "failIfUnavailable": True, "allowUnsandboxedCommands": False,
                         "autoAllowBashIfSandboxed": False,
                         "excludedCommands": ["gh pr checks 7 --watch", "gh pr checks 7"],
-                        "filesystem": {"denyWrite": [tmp_glob], "denyRead": secrets},
+                        "filesystem": {"denyWrite": [tmp_glob], "denyRead": deny_read, "allowRead": allow_read},
                         "network": {"allowedDomains": ["github.com"]}}},
                f"the sandbox settings are pinned key by key (in -p Claude Code ignores a whole settings "
                f"file it cannot validate, silently): {settings}")
+        expect(len(deny_read) == 6 + 6 * len(SECRET_FILES) and set(secrets) <= set(deny_read)
+               and not any(p.startswith(acct + "/.npm") for p in allow_read),
+               f"the worktree keeps its secret files denied, and npm's cache stays closed: {allow_read}")
         expect(".env" in SECRET_FILES and "*.pem" in SECRET_FILES and ".env.example" not in SECRET_FILES
                and all(p.startswith(home + "/**/") for p in secrets), f"the kit's secret files, under the worktree: {secrets}")
+
+        # 31b. THE READ TABLES (KIT-786): each row is a path and the reason it is there, pinned row by
+        #      row. Every reason names what it is for; the keychain is the one file push needs, never
+        #      the whole folder; nothing opened again holds your home, /Users or a temp folder whole.
+        expect([p for p, _w in FIX_READ_DENY] == ["{home}", "/Users", "/Volumes", "/private/var/folders", "{tmp}",
+                                                  "{claude_tmp}/-*/*/scratchpad"]
+               and [p for p, _w in FIX_READ_FOLDERS] == ["{worktree}", "{checkout}", "{claude_tmp}",
+                                                          "{home}/.config/git", "{home}/.nvm", "{home}/.pyenv"]
+               and [p for p, _w in FIX_READ_FILES] == ["{home}/.gitconfig", "{home}/Library/Keychains/login.keychain-db"],
+               "the read tables, row by row")
+        reasons = dict(FIX_READ_DENY + FIX_READ_FOLDERS + FIX_READ_FILES)
+        for path, words in (("{home}", ("keys", "logins")), ("/Users", ("every account",)),
+                            ("/Volumes", ("disks", "backups")), ("/private/var/folders", ("temp", "cache")),
+                            ("{tmp}", ("shared temp",)), ("{claude_tmp}/-*/*/scratchpad", ("other", "scratchpads")),
+                            ("{worktree}", ("own files",)), ("{checkout}", ("git", "pre-commit")),
+                            ("{claude_tmp}", ("TMPDIR", "output", "measured")), ("{home}/.config/git", ("git",)),
+                            ("{home}/.nvm", ("Node", "npm", "pre-commit")), ("{home}/.pyenv", ("Python",)),
+                            ("{home}/.gitconfig", ("git", "name and email")),
+                            ("{home}/Library/Keychains/login.keychain-db", ("osxkeychain", "to push",
+                                                                            "could not read Username"))):
+            expect(all(w in reasons.get(path, "") for w in words), f"the reason for {path} must say {words}: "
+                   f"{reasons.get(path)!r}")
+        expect(len(reasons) == len(FIX_READ_DENY) + len(FIX_READ_FOLDERS) + len(FIX_READ_FILES)
+               and all(isinstance(w, str) and len(w) >= 20 for w in reasons.values()),
+               "every row has its own path and a reason")
+        ff = fix_read_paths("/w/t", "/w", "/Users/you", 501)
+        expect(not any(p in ("/Users/you", "/Users", "/Volumes", "/private/var/folders", os.path.realpath("/tmp"))
+                       or "/Users/you".startswith(p.rstrip("/") + "/") for p in ff[1]),
+               f"nothing opened again may hold a denied place whole: {ff[1]}")
+        # Your home is the user database's, never $HOME: a variable is not where the files are.
+        saved_home = os.environ.get("HOME")
+        os.environ["HOME"] = os.path.join(tmp, "a-moved-home")
+        try:
+            calls.clear()
+            gh = FakeGh([_pr(7, labels=[LABEL])], {7: [_bot(marker("request", 1), 2)]})
+            wake(gh, repo, NOW, env={"HOME": os.environ["HOME"]}, **common)
+            moved = json.loads(calls[0][0][calls[0][0].index("--settings") + 1]) if calls else {}
+            got = moved.get("sandbox", {}).get("filesystem", {})
+            expect(account_home(os.getuid()) == acct and got.get("denyRead", [""])[0] == acct
+                   and not any("a-moved-home" in p for p in got.get("denyRead", []) + got.get("allowRead", [])),
+                   f"a moved $HOME must not move the denied home: {got.get('denyRead', [])[:2]}")
+        finally:
+            if saved_home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = saved_home
+        # No home to deny means no session: refused before anything is read, written or started; a dry
+        # run starts nothing and goes on. A pass is refused before its heartbeat.
+        calls.clear()
+        read_seen = []
+
+        class Watched(FakeGh):
+            def open_prs(self):
+                read_seen.append("open_prs")
+                return FakeGh.open_prs(self)
+        gh = Watched([_pr(7, labels=[LABEL])], {7: [_bot(marker("request", 1), 2)]})
+        try:
+            wake(gh, repo, NOW, env={}, home_of=lambda uid: None, **common)
+            expect(False, "wake with no home to deny must refuse")
+        except Refusal as e:
+            expect(gh.writes == [] and read_seen == [] and calls == [] and "KIT-786" in str(e),
+                   f"…writing, reading and starting nothing: {gh.writes} {read_seen} {calls}")
+        wake(fresh_gh(), repo, NOW, env={}, dry_run=True, home_of=lambda uid: None, **common)
+        expect(calls == [], "a dry run with no home starts nothing and is not refused")
+        homeless_state = os.path.join(tmp, "homeless-state")
+        try:
+            wake_pass([repo], lambda d: FakeGh([]), NOW, state_dir=homeless_state, env={},
+                      home_of=lambda uid: None, **{k: v for k, v in common.items() if k != "lock_dir"})
+            expect(False, "a pass with no home to deny must refuse")
+        except Refusal:
+            expect(not os.path.exists(homeless_state), "…before its heartbeat is written")
+        # A checkout that IS your home, or holds it, would open it all again: declined, said on the PR.
+        calls.clear()
+        gh = FakeGh([_pr(7, labels=[LABEL])], {7: [_bot(marker("request", 1), 2)]})
+        tally = wake(gh, repo, NOW, env={}, home_of=lambda uid: os.path.realpath(repo), **common)
+        expect(calls == [] and tally["declined"] == [7]
+               and any(w[0] == "comment" and "your home" in w[2] for w in gh.writes),
+               f"a checkout holding your home must be declined, never opened: {gh.writes} {calls}")
+        expect(opens_home(["/Users/you/src/app"], "/Users/you") is None and opens_home(["/Users"], "/Users/you") == "/Users"
+               and opens_home(["/Users/you"], "/Users/you") == "/Users/you" and opens_home(["/"], "/Users/you") == "/"
+               and opens_home(["/Users/someone"], "/Users/you") is None, "opens_home")
         rules = argv[argv.index("--allowedTools") + 1:] if "--allowedTools" in argv else []
         bash = [r[len("Bash("):-1] for r in rules if r.startswith("Bash(") and r.endswith(")")]
         expect(rules[-3:] == ["Read(/%s/**)" % home, "Edit(/%s/**)" % home, "Write(/%s/**)" % home]
@@ -2179,6 +2408,19 @@ def selftest():
                "the prompt names each check, exactly as the rule allows it")
         # The list the dry run prints (and CK-W1 signs) covers every command the session is given.
         desc = describe_fix_session(checks, "sonnet")
+        reads = [ln for ln in desc if ln.startswith("fix session: reads")]
+        expect(len(reads) == 1 and all(w in reads[0] for w in (
+            "nothing in ~, /Users, /Volumes, /private/var/folders, " + os.path.realpath("/tmp"), "scratchpad",
+            "<worktree>, <checkout>, " + ctmp, "~/.config/git", "~/.nvm", "~/.pyenv", "~/.gitconfig",
+            "~/Library/Keychains/login.keychain-db", "secret files stay denied")),
+               f"the dry run names every read wall, from the same tables (KIT-786): {reads}")
+        for program, want in (("/Users/you/.nvm/versions/node/v22/bin/npm", None), ("/Users/you/.pyenv/shims/python3", None),
+                              ("/opt/homebrew/bin/npm", None), ("/usr/bin/python3", None),
+                              ("/Users/you/.cargo/bin/cargo", "/Users/you"), ("/Users/you/bin/check", "/Users/you"),
+                              ("/Users/someone/bin/x", "/Users"), ("/Volumes/ext/bin/x", "/Volumes"),
+                              ("/Users/you/.nvm", None), ("/Users/you/.nvmx/bin/node", "/Users/you")):
+            got = program_unreadable(program, "/Users/you", 501)
+            expect(got == want, f"program_unreadable({program!r}) = {got!r}, not {want!r}")
         placeholders = fix_rules("/w", "<number>", "<branch>", "<base>", checks)
         expect(all(r[len("Bash("):-1] in desc[0] + desc[1] for r in placeholders if r.startswith("Bash("))
                and desc[-1].endswith("sonnet"), f"the signed list must name every command a session gets: {desc}")

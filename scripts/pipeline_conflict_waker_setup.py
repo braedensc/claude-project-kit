@@ -77,10 +77,12 @@ conflicted local PR, each capped, never an unbounded retry.
 WHAT HOLDS EACH FIX SESSION (KIT-676).  It loads none of your settings and none of the
 worktree's. It may run only the commands its prompt names, and CHECK_COMMANDS by their
 exact words. Its file tools reach only its worktree, and its commands run in Claude
-Code's sandbox (scripts/pr_conflict.py, THE FIX SESSION'S WALLS). The dry run prints that
+Code's sandbox (scripts/pr_conflict.py, THE FIX SESSION'S WALLS). Those commands read
+nothing in your home but the folders their tools need (KIT-786). The dry run prints that
 list, and CK-W1 signs it with the count. Preflight puts each check's program folder on the
-job's PATH, because nothing from your settings reaches the session. It also refuses an
-SSH origin: git cannot use SSH inside the sandbox on macOS.
+job's PATH, because nothing from your settings reaches the session, and refuses a program
+the session could not read. It also refuses an SSH origin: git cannot use SSH inside the
+sandbox on macOS.
 """
 import argparse
 import json
@@ -446,6 +448,20 @@ def ssh_url(url):
     return colon > 0 and (slash == -1 or colon < slash)
 
 
+def unreadable_program(ctx, check, path):
+    """The problem line when a fix session's commands may not read `check`'s program at `path`, by
+    the name found or its real path, else None (KIT-786)."""
+    for p in (path, os.path.realpath(path)):
+        blocked = prc.program_unreadable(p, ctx.home, ctx.uid)
+        if blocked:
+            opened = [row.replace("{home}", "~") for row, _why in prc.FIX_READ_FOLDERS if row.startswith("{home}/")]
+            return ("CHECK_COMMANDS names `%s`, and its program %s is in %s, where a fix session's commands "
+                    "may not read (KIT-786), so it could not run there. Install it outside your home "
+                    "(Homebrew, for one), or in a folder a fix session may read: %s"
+                    % (check, path, "your home" if blocked == ctx.home else blocked, ", ".join(opened)))
+    return None
+
+
 def gh_helper(value):
     """True for a git credential helper that runs gh, as `gh auth setup-git` writes it."""
     words = (value or "").strip().lstrip("!").split()
@@ -520,6 +536,8 @@ def step_preflight(ctx, apply_it):
         if program.startswith("/"):
             if not r.read(["test", "-x", program]).ok:
                 problems.append("CHECK_COMMANDS names `%s`, and %s is not a program that runs" % (check, program))
+            elif unreadable_program(ctx, check, program):
+                problems.append(unreadable_program(ctx, check, program))
             continue
         if "/" in program:
             continue                  # relative to the worktree, where the session runs it
@@ -527,6 +545,8 @@ def step_preflight(ctx, apply_it):
         if not found.startswith("/"):
             problems.append("CHECK_COMMANDS names `%s`, and `%s` is not on your PATH, so a fix session "
                             "could not run it" % (check, program))
+        elif unreadable_program(ctx, check, found):
+            problems.append(unreadable_program(ctx, check, found))
         elif os.path.dirname(found) not in ctx.check_dirs:
             ctx.check_dirs.append(os.path.dirname(found))
     for d in ctx.repo_dirs:
@@ -1524,6 +1544,19 @@ def _selftest_body():
     expect("preflight-check-found", rows and rows[0][1] == ALREADY_DONE and c.check_dirs == [os.path.dirname(nvm_npm)]
            and os.path.dirname(nvm_npm) in plistlib.loads(render_plist(c).encode())["EnvironmentVariables"]["PATH"],
            "%s %s" % (rows[:1], c.check_dirs))
+    # KIT-786: a check whose program a fix session's commands may not read is refused, by name, with
+    # where it may live instead. One in ~/.nvm (opened for the session's tools) passes, as one outside
+    # your home would.
+    c, f = _fake_ctx(GOOD_CONF + "CHECK_COMMANDS=cargo test, npm run test:hooks, /Users/you/bin/check --all\n")
+    f.answers = [("command -v cargo", 0, "/Users/you/.cargo/bin/cargo\n"), ("command -v npm", 0, nvm_npm + "\n"),
+                 ("test -x /Users/you/bin/check", 0, "")] + _settled_answers(c)
+    rows, _ = quiet(lambda: measure(c, apply_it=False))
+    detail = rows[0][2] if rows else ""
+    expect("preflight-check-unreadable", rows and rows[0][1] == FAILED
+           and "`cargo test`, and its program /Users/you/.cargo/bin/cargo is in your home" in detail
+           and "`/Users/you/bin/check --all`, and its program /Users/you/bin/check is in your home" in detail
+           and "~/.config/git, ~/.nvm, ~/.pyenv" in detail and "test:hooks`, and" not in detail
+           and c.check_dirs == [os.path.dirname(nvm_npm)], detail)
     # Every host here is example.invalid: the provenance scan reads a real host after a user as an email.
     for url, want in (("git@example.invalid:o/n.git", True), ("ssh://git@example.invalid/o/n", True),
                       ("example.invalid:o/n.git", True), ("myalias:o/n", True),
