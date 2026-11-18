@@ -42,7 +42,8 @@ credential_shape, scrub = ns.credential_shape, ns.scrub
 _s = lambda text: scrub(text, ())      # noqa: E731  (everything printed passes through the notifier's scrub)
 DEFAULT_CONF = "sweep.conf"
 SWEEP_SCRIPT = "pipeline_sweep.py"
-REQUIRED_SCRIPTS = (SWEEP_SCRIPT, "scratch_run.py")
+# pipeline_agent_env.py: the sweep imports its list of agent-environment markers (KIT-690).
+REQUIRED_SCRIPTS = (SWEEP_SCRIPT, "scratch_run.py", "pipeline_agent_env.py")
 SELFTESTS = (SWEEP_SCRIPT,)
 DRY_OK = (0, 4)                  # the sweep's own: 0 ran, 4 ran and left something it could not judge
 
@@ -141,6 +142,11 @@ def load_conf(path, user=None):
     return conf, errors + more
 
 
+# KIT-782: the sweep's heartbeat sits beside its config, in the role's own folder. The health watch cannot read that
+# folder, so the watcher's copier copies it (watcher.conf's SWEEP_HEARTBEAT names this file) and the watch reads the copy.
+HEARTBEAT_NAME = "heartbeat.json"
+
+
 # ── what it composes: one document, judged by the sweep's own loader ──────────────────────────────────────────
 def compose(c, home):
     """The sweep's config, `~` made absolute under the role's home. Raises SetupError in the sweep's own words."""
@@ -153,6 +159,8 @@ def compose(c, home):
                    log_keep=whole(c["SWEEP_LOG_KEEP"]))
     if c.get("SWEEP_LOOK_RECORD_DIR"):       # written only when set, so a config without it is today's, byte for byte
         doc["look_record_dir"] = c["SWEEP_LOOK_RECORD_DIR"].rstrip("/")
+    if "heartbeat_file" in sweep.CONFIG_KEYS:     # KIT-782: a sweep before KIT-689 cannot write one, and refuses the key
+        doc["heartbeat_file"] = os.path.dirname(ns.resolve_path(c["SWEEP_CONFIG"].rstrip("/"), home)) + "/" + HEARTBEAT_NAME
     body = json.dumps(doc, indent=2, sort_keys=True) + "\n"
     with tempfile.TemporaryDirectory(prefix="sweep-setup-judge-") as tmp:
         path = os.path.join(tmp, "sweep.json")
@@ -748,6 +756,19 @@ def _cases(check, tmp):
           ("look_record_dir" in doc, with_look.get("look_record_dir") == fake_l.root + "/look-records",
            sorted(set(with_look) - set(doc))),
           (False, True, ["look_record_dir"]))
+    check("compose: the sweep is told where to leave its heartbeat, beside its config, absolute (KIT-782)",
+          (doc.get("heartbeat_file"), doc.get("heartbeat_file") == fake.home + "/.stage-e/sweep/" + HEARTBEAT_NAME),
+          (fake.home + "/.stage-e/sweep/heartbeat.json", True))
+    check("compose: a rerun of the composition is byte for byte the same, so the config reads as current",
+          compose(conf, fake.home) == compose(conf, fake.home), True)
+    saved_keys, saved_load = sweep.CONFIG_KEYS, sweep.load_config
+    sweep.CONFIG_KEYS = dict((k, v) for k, v in saved_keys.items() if k != "heartbeat_file")
+    sweep.load_config = lambda path: json.load(open(path))
+    try:
+        older = json.loads(compose(conf, fake.home))
+    finally:
+        sweep.CONFIG_KEYS, sweep.load_config = saved_keys, saved_load
+    check("compose: a sweep from before KIT-689 is not given a key it would refuse", "heartbeat_file" in older, False)
     check("compose: a composition the sweep's loader refuses is refused in its words",
           str(quiet(lambda: compose(dict(conf, SWEEP_WORKSPACE_DIR=conf["SWEEP_DISPATCHER_HOME"]), fake.home))[0])[:40],
           "REFUSED by the sweep's own loader: confi")

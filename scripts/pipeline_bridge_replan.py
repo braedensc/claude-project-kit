@@ -366,7 +366,7 @@ class ReplanMixin(object):
         by = rec.get("by")
         name = self.name_of(by)
         who = "**%s** (Slack user %s)" % (name, by) if name != by else "Slack user %s" % by
-        body = ("The Slack bridge moved this idea out of %s to %s for %s, who said yes in "
+        body = ("The tech lead moved this idea out of %s to %s for %s, who said yes in "
                 "Slack at %s, to plan it again."
                 % (self.cfg["plan_it_state"], rec.get("park_name") or "the backlog", who,
                    iso(ts_float(rec.get("said_at")))))
@@ -615,7 +615,7 @@ class ReplanMixin(object):
             self.state["epics"].pop(epic["id"], None)
             self.save()
             self.note_plan_move(epic["id"], epic["identifier"], "Cancelled in Slack by **%s** "
-                                "(Slack user %s) at %s, through the Slack bridge, to plan %s "
+                                "(Slack user %s) at %s, through the tech lead, to plan %s "
                                 "again.\n\nIts pieces were left as they are, so one already at "
                                 "work keeps going." % (name, msg["user"], when, q["ticket"]))
         if epics:
@@ -646,10 +646,10 @@ class ReplanMixin(object):
             return self.owed_line(q, any(o.get("ticket") == q["ticket"]
                                          for o in self.state["owed"]))
         by, said_at = replan_yes(q, msg)
-        body = ("The Slack bridge is planning this idea again for **%s** (Slack user %s), "
+        body = ("The tech lead is planning this idea again for **%s** (Slack user %s), "
                 "who %s in Slack at %s. It moves the idea out of %s to %s and straight "
                 "back in, so the planner starts a new planning run."
-                % (self.name_of(by), by, "asked for it, with no question asked: the bridge "
+                % (self.name_of(by), by, "asked for it, with no question asked: the tech lead "
                    "said what it would do and waited %d seconds for a stop first, " % q[
                        "grace"] if q.get("direct") else "said yes", iso(ts_float(said_at)),
                    self.cfg["plan_it_state"], rec.get("park_name") or "the backlog"))

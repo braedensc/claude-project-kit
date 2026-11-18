@@ -224,6 +224,10 @@ jobs:
       - name: Local dispatcher selftest (contract §2, §3)
         run: python3 scripts/pipeline_dispatch_local.py --selftest
 
+      # The one list of agent-environment markers: copies pinned, refusals pinned (KIT-690).
+      - name: Agent-environment markers selftest (KIT-690)
+        run: python3 scripts/pipeline_agent_env.py --selftest
+
       # The autonomy gates and the telemetry pipeline. Same posture as the two
       # above: inert in this repo (no delivery.json, no store), so the selftests
       # are what has teeth. Each asserts its own contract rows against synthetic
@@ -612,6 +616,11 @@ jobs:
       # the yes. Real settings files in a folder of its own; the terminal scripted.
       - name: One-command asking selftest (missing values, one yes, written and read back)
         run: python3 scripts/pipeline_ask.py --selftest
+      # The settings folder (KIT-853): one machine.conf under the user's Library, each shared value
+      # written to every part file the map names, shown first and written only with --apply (refused
+      # in a session), and a checker that fails on secrets, other readers, links and repositories.
+      - name: Settings folder selftest (typed once, shown first, no secret, private)
+        run: python3 scripts/pipeline_settings.py --selftest
       # Every part listed once, as data (KIT-624): each installer and job writer owned, needs
       # acyclic, cards real, commands from a fixed list, and docs/PARTS.md equal to its render.
       - name: Parts list (one row per part, guides named, the page in step)
@@ -822,6 +831,7 @@ jobs:
           python3 scripts/pipeline_machine_tickets.py --selftest
           python3 scripts/check_repo_setup.py --selftest
           python3 scripts/pipeline_root_guard.py --selftest
+          python3 scripts/pipeline_pass_lock.py --selftest
           python3 scripts/pipeline_routing_tags.py --selftest
           python3 .claude/skills/sync-kit/compare.py --selftest
           python3 scripts/pipeline_acceptance_run.py --selftest

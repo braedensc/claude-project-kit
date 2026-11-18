@@ -154,6 +154,19 @@ PUSH_HEARTBEAT_FILE=
 WATCHER_PAGE_HEARTBEAT_FILE=
 WATCHER_PAGE_MAX_AGE_MINUTES=120
 
+# The queue's pass, the morning job and the sweep (KIT-689): each leaves a small heartbeat file after a pass, and the
+# watch says one stopped. The role account's folders stay closed to you, so the watcher's copier (watcher.conf's
+# QUEUE_HEARTBEAT, MORNING_HEARTBEAT and SWEEP_HEARTBEAT, KIT-782) copies each file, and these three lines name the COPIES.
+# You do not write them: `python3 scripts/pipeline_install.py` lists them on its consent page and sets them, and a rerun
+# changes nothing. Empty: that job is off here, and the row says "off". The limits are minutes: a job that runs less often
+# than that needs a longer one (5 to 10080).
+QUEUE_HEARTBEAT_FILE=
+MORNING_HEARTBEAT_FILE=
+SWEEP_HEARTBEAT_FILE=
+QUEUE_HEARTBEAT_MAX_AGE_MINUTES=60
+MORNING_HEARTBEAT_MAX_AGE_MINUTES=60
+SWEEP_HEARTBEAT_MAX_AGE_MINUTES=180
+
 # The yearly credentials' end dates (KIT-579): name:YYYY-MM-DD, comma separated. Names and
 # dates ONLY, never a token. The `credentials` kind opens a GitHub issue once a date is within
 # CREDENTIAL_WARN_DAYS (14 to 365) of today, or past; it never pages Slack. Empty: not watched.
