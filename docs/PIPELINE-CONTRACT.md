@@ -3073,7 +3073,7 @@ Each is `pass`, `fail`, `unsure` or `not-run`. `unsure` holds, as `fail` does. `
 
 ### Who reads it
 
-Stage E's bounce driver reads a `sent-back` row for a pull request at its current head, when its config names the ledger (`validator_ledger_file`, KIT-542). It re-prompts the dev session from its own ledger and budget. The watcher's `approval-rate` monitor (§19, KIT-546) reads it through `read()`: every merge against the `approved` rows, an approval still unmerged a day later, the day's approvals, and each urgent escalation. The stand-up and the recap read the ledger in their own pieces.
+Stage E's bounce driver reads a `sent-back` row for a pull request at its current head, when its config names the ledger (`validator_ledger_file`, KIT-542). It re-prompts the dev session from its own ledger and budget. The watcher's `approval-rate` monitor (§19, KIT-546) reads it through `read()`: every merge against the `approved` rows, an approval still unmerged a day later, the day's approvals, and each urgent escalation. The queue's reader reads the latest `piece` row for each ticket while the validator's pieces switch is on (`reader.validator_settings_file` and `reader.validator_ledger_file`, KIT-543), and its pool admits a held piece of an approved plan `via` "validator" when an `approved` row is newer than the piece's last change. The stand-up and the recap read the ledger in their own pieces.
 
 ---
 

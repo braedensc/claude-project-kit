@@ -100,6 +100,8 @@ WHY = {"todo": "you moved it into the ready state{at}",
        "backlog": "you filed it in the backlog, and the backlog may start",
        "plan": "it is a piece of {plan}, which you approved{at}",
        "agent_filed": "it is an agent-filed finding small enough to start by itself"}
+# KIT-543: a piece of an approved plan whose start the validator approved, in the owner's place.
+WHY_VALIDATOR = "it is a piece of {plan}, which you approved, and the validator approved its start{at}"
 # The room (KIT-457): the settings' defaults, the pressure words, and the fixed commands.
 ROOM_DEFAULTS = {"min_free_disk_gb": 25, "max_pressure": "critical", "max_swap_gb": 4}
 PRESSURE_LEVEL = {"warn": 2, "critical": 4}         # kern.memorystatus_vm_pressure_level
@@ -316,10 +318,12 @@ def stop_words(decision):
 
 
 def decide(raw_config, gql, now, clock=time.time, say=None, room=None):
-    """{"state", "why", "window", "inputs", "decision"}. `state` is "closed" (`why` is the
+    """{"state", "why", "window", "inputs", "decision", "verdicts"}. `state` is "closed" (`why` is the
     window's word), "no-room" (`why` names each line the machine is over, or could not be read
     for, and `lines` holds their names: "pressure", "disk", "swap"), "unread" (the reader's pass failed; `why` is its reason) or "decided"
-    (`decision` is the order's; `why` is "partial" when a source was read in part, else None).
+    (`decision` is the order's, and `verdicts` the pool's, which the validator's piece pass reads
+    for what waits on the owner's start, KIT-543; `why` is "partial" when a source was read in part,
+    else None).
     Raises ValueError for a config that is not usable."""
     cfg, bad = load(raw_config)
     if bad:
@@ -345,9 +349,10 @@ def decide(raw_config, gql, now, clock=time.time, say=None, room=None):
     if read_failed(inputs):
         return dict(out, state="unread", why=inputs["sources"]["tracker"]["reason"]
                     or "the tracker was not read")
+    # KIT-543: the validator's approvals of held pieces, read only while its pieces switch is on.
     verdicts = pool.decide(cfg["pool"], now, inputs["tickets"], inputs["epics"],
                            inputs["histories"], inputs["busy"], inputs["findings"],
-                           inputs["plans"], inputs["ledger"])
+                           inputs["plans"], inputs["ledger"], inputs.get("validator"))
     usage = read_usage(cfg["usage_file"])
     paced, why_paced = order.pace(cfg["order"], usage, now, lambda until: window.windows_left(
         cfg["window"], now, until))
@@ -357,7 +362,7 @@ def decide(raw_config, gql, now, clock=time.time, say=None, room=None):
     paced = dict(paced, sprint_planned=sprint_plan.planned_for_usage(cfg["sprint_plan_file"], usage))
     decision = order.order(paced, now, with_extras(verdicts, inputs["extras"]),
                            inputs["running"], usage, inputs["ledger"])
-    return dict(out, state="decided", decision=decision,
+    return dict(out, state="decided", decision=decision, verdicts=verdicts,
                 why="partial" if inputs["result"] == "partial" else None)
 
 
@@ -420,7 +425,8 @@ def attribution(entry):
         raise ValueError("not a start the order made")
     at = TIME_RE.match(entry["at"]) if isinstance(entry.get("at"), str) else None
     plan = entry.get("plan")
-    return "Started by the queue, in lane %s: %s." % (lane, WHY[source].format(
+    why = WHY_VALIDATOR if source == "plan" and entry.get("by") == "validator" else WHY[source]
+    return "Started by the queue, in lane %s: %s." % (lane, why.format(
         at=" at %s %s UTC" % at.groups() if at else "",
         plan=plan if isinstance(plan, str) and TICKET_RE.match(plan) else "a plan"))
 
@@ -964,6 +970,10 @@ def _cases(check, tmp, home):
               "enough to start by itself.",
               "Started by the queue, in lane acme/app:1: it is a piece of a plan, which you "
               "approved at 2026-11-03 10:00 UTC."]),
+            ("attribution: a piece whose start the validator approved says so, never that you did",
+             say(source="plan", plan="ENG-10", by="validator"),
+             "Started by the queue, in lane acme/app:1: it is a piece of ENG-10, which you approved, "
+             "and the validator approved its start at 2026-11-03 10:00 UTC."),
             ("attribution: not one of the order's starts is refused",
              [say(source="none"), say(lane="acme"), say(ticket="ENG-1 " + LEAK)],
              ["refused"] * 3),

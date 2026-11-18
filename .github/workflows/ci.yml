@@ -416,6 +416,11 @@ jobs:
       # and never a retry, the run folder always removed, and no script but its callers names it.
       - name: Validator run selftest (one read-only call; a failure holds; only its job starts it)
         run: python3 scripts/pipeline_validator_run.py --selftest
+      # The validator approves a piece starting (KIT-543). Offline: only a piece of an approved plan
+      # waiting for the owner's start is judged; the floor is held once; the agent judges the ticket
+      # as written; one agent run a pass; off and held said; it never starts a piece itself.
+      - name: Validator piece pass selftest (judges, records, starts nothing)
+        run: python3 scripts/pipeline_validator_pieces.py --selftest
       # The validator's hard limits (KIT-538): layer 1, plain code with no model. Offline, in a
       # temp folder: one case per rule and every reason reached; each fact read by the part of
       # the kit that owns it; the safety-system floor is never a switch; closed words only.
