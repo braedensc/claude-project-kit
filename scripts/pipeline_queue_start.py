@@ -297,6 +297,24 @@ def read_usage(path):
         return None
 
 
+def stop_words(decision):
+    """KIT-695: the runaway stops a decision names, as fixed words and numbers only, sorted: the
+    stop's code, the ref (a window name, a ticket id or a repository) and its value against its
+    limit. [] for a decision with none, or no decision. The bridge ends its pass loud for as long as
+    this list is not empty, so a stop that holds every start reaches the owner as a page."""
+    out = []
+    for item in (decision or {}).get("stops") or []:
+        if not isinstance(item, dict) or not isinstance(item.get("stop"), str):
+            continue
+        words = item["stop"]
+        if isinstance(item.get("ref"), str):
+            words += " " + item["ref"]
+        if isinstance(item.get("value"), (int, float)) and isinstance(item.get("limit"), (int, float)):
+            words += " (%s against %s)" % (item["value"], item["limit"])
+        out.append(words)
+    return sorted(out)
+
+
 def decide(raw_config, gql, now, clock=time.time, say=None, room=None):
     """{"state", "why", "window", "inputs", "decision"}. `state` is "closed" (`why` is the
     window's word), "no-room" (`why` names each line the machine is over, or could not be read
@@ -925,6 +943,13 @@ def _cases(check, tmp, home):
             ("ledger: a folder inside a git working tree is refused",
              _refused(lambda: record_start(os.path.join(GIT, "l.json"), NOW, "ENG-1", "todo")),
              True),
+            ("stop_words: each stop as code, ref and value against limit, sorted; none is []",
+             [stop_words(None), stop_words({"stops": []}),
+              stop_words({"stops": [{"stop": "plan-near-limit", "ref": "five_hour", "value": None,
+                                     "limit": None},
+                                    {"stop": "day-hard-stop", "ref": None, "value": 61.5,
+                                     "limit": 60}, "junk", {"stop": 5}]})],
+             [[], [], ["day-hard-stop (61.5 against 60)", "plan-near-limit five_hour"]]),
             ("attribution: a fixed sentence for each source, ids and a time only",
              [say(), say(at=None), say(source="plan", plan="ENG-10"),
               say(source="backlog"), say(source="agent_filed"), say(source="plan", plan="x")],
@@ -1131,7 +1156,7 @@ def _cases(check, tmp, home):
     o = dict((k, g[k]) for k in ("with_extras", "read_ledger", "counted", "attribution",
                                  "write", "SOURCES", "load", "read_failed", "room_short",
                                  "ROOM_DEFAULTS", "SWAP_UNIT", "room_config", "DATA_VOLUME",
-                                 "resumable", "RESUME_LAPSE", "USAGE_FRESH", "LEDGER_SOURCES"))
+                                 "resumable", "RESUME_LAPSE", "USAGE_FRESH", "LEDGER_SOURCES", "stop_words"))
     base = [x[1] for x in got]
 
     def caught(**patched):

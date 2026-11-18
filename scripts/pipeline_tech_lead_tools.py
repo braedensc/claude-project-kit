@@ -101,7 +101,7 @@ from pipeline_bridge_transport import _http_json  # noqa: E402
 # the role account's clone, so it cannot be imported here: the selftest holds these equal to it.
 KIT_DOCS_DEFAULT = "~/.stage-e/kit/docs"
 KIT_GUIDES = (
-    ("BRIDGE-OPERATOR.md", "the bridge: the one chat, the commands a member types, and the "
+    ("BRIDGE-OPERATOR.md", "the tech lead: the one chat, the commands a member types, and the "
                            "stand-up"),
     ("CHAT-LANE-OPERATOR.md", "the dispatcher's own chat lane, which stays off since the "
                               "cutover"),

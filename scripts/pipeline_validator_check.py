@@ -203,7 +203,7 @@ def selftest():
     approved = {"subject": "merge", "ref": "acme/app#12", "head": H, "kind": "approved",
                 "layers": {"hard_limits": "pass", "evidence": "pass", "agent": "pass"},
                 "settings_on": ["approve-merges"],
-                "size_limits": {"max_changed_lines": 400, "max_files": 20},
+                "size_limits": {"max_changed_lines": 400, "max_files": 20}, "reasons": [],
                 "agent_says": "SECRET-AGENT-WORDS: the diff does what the criteria ask."}
     sent_back = dict(approved, head=H2, kind="sent-back",
                      layers={"hard_limits": "pass", "evidence": "pass", "agent": "fail"},
@@ -273,7 +273,7 @@ def selftest():
                                    "summary": "hard limits pass, evidence pass, agent fail"}))
         for kind in ("escalated", "escalated-urgent", "held"):
             other = os.path.join(tmp, "ledger-%s.json" % kind)
-            ledger.append(other, dict(approved, kind=kind, agent_says=None,
+            ledger.append(other, dict(approved, kind=kind, agent_says=None, reasons=["check-failed"],
                                       layers={"hard_limits": "pass", "evidence": "fail",
                                               "agent": "not-run"}), lambda: 1_800_000_000)
             got = post(ledger_path=other)

@@ -171,6 +171,15 @@ def selftest():
            "a secret in a job that sees the PR")
     mutant("  pull_request:\n    types", "  push:\n    branches: [main]\n  pull_request:\n    types",
            "trigger-other", "an extra trigger")
+    mutant("          ref: ${{ github.event.repository.default_branch }}\n",
+           "          ref: ${{ github.event.repository.default_branch }}\n          repository: other/repo\n",
+           "checkout-not-default", "a checkout of another repository")
+    mutant("          HEAD_SHA: ${{ github.event.pull_request.head.sha }}\n", "", "head-not-event",
+           "no head commit named at all")
+    mutant("          LABELS:", "          GITHUB_TOKEN: x\n          LABELS:", "secret-used",
+           "the token handed to the step")
+    mutant("    runs-on: ubuntu-24.04\n", "    runs-on: ubuntu-24.04\n    concurrency: gate\n", "job-shape",
+           "a concurrency group can cancel the default branch's run")
     found = reasons(real, ci + "\n  hooks-change-guard:\n    name: Hooks change guard\n    runs-on: ubuntu-24.04\n")
     if "gate-in-ci" not in found:
         failures.append("a second copy of the gate in the app CI template is not refused: %s" % found)
