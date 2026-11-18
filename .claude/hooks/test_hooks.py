@@ -4107,7 +4107,11 @@ def main():
             ("a pins root it cannot search", pl_freed_pins, 0o700, pl_freed,
              "could not be checked, which counts as the lane"),
             ("a ledger it cannot read", os.path.join(pl_elsewhere_pins, "ledger.jsonl"), 0o644,
-             pl_elsewhere, "Dispatcher pin store could not be read")):
+             pl_elsewhere, "Dispatcher pin store could not be read"),
+            # KIT-645 (G4): beside the lane a pin store it cannot read adds nothing, so the
+            # lane's own could-not-check still blocks, in its own words.
+            ("a pins root it cannot search, beside a runner's pin on the lane", pl_runpin_pins,
+             0o700, pl_runpin, "could not be checked, which counts as the lane")):
         _label = "unreadable pin store: %s blocks writes and names it (KIT-674)" % _name
         if os.geteuid() == 0:
             print(f"[SKIP] {_label} (as root nothing is unreadable, so this was not run)")
@@ -4120,6 +4124,27 @@ def main():
         finally:
             os.chmod(_target, _mode)
         ok = (_r.returncode == 2 and _why in _r.stderr and _target in _r.stderr)
+        print(f"[{'PASS' if ok else 'FAIL'}] {_label}"
+              + ("" if ok else f"  (exit {_r.returncode}: {_r.stderr[-300:]!r})"))
+        failures += 0 if ok else 1
+
+    # KIT-645 (G4): …and the lane's rules hold as they did, no more: an ordinary source edit
+    # stays allowed, as on the lane with no pin. Failing closed here would stop every session
+    # of the lane on a read error, and no session can make the store unreadable past its walls.
+    _label = ("unreadable pin store beside the lane: an ordinary edit stays allowed, the lane's "
+              "rules hold as they did (KIT-645)")
+    if os.geteuid() == 0:
+        print(f"[SKIP] {_label} (as root nothing is unreadable, so this was not run)")
+    else:
+        seq_ran += 1
+        _starting(_label)
+        os.chmod(pl_runpin_pins, 0)
+        try:
+            _r = run_hook_proc(edit(os.path.join(pl_runpin_root, "src/app.ts"), "x"),
+                               hook_path=pl_runpin)
+        finally:
+            os.chmod(pl_runpin_pins, 0o700)
+        ok = _r.returncode == 0
         print(f"[{'PASS' if ok else 'FAIL'}] {_label}"
               + ("" if ok else f"  (exit {_r.returncode}: {_r.stderr[-300:]!r})"))
         failures += 0 if ok else 1
