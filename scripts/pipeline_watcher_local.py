@@ -1439,10 +1439,11 @@ MAX_RISK_PATHS = 200          # riskPaths patterns read from one repository's de
 
 def scope_tokens(text):
     """The files and areas a ticket's text names: words that hold a `/` or end in a file extension,
-    with no `..`, no leading `/` and no web link. Words are read, never run, and capped."""
+    with no `..`, no leading `/` and no web link. Words are read, never run, and capped. A sentence's
+    full stop is dropped from the end only: a leading dot is part of a path such as `.github/`."""
     found = []
     for raw in SCOPE_SPLIT_RE.split(text[:SCAN_CAP] if isinstance(text, str) else ""):
-        word = raw.strip(".")
+        word = raw.rstrip(".")
         if word.startswith("./"):
             word = word[2:]
         if (not word or not SCOPE_WORD_RE.match(word) or ".." in word or word.startswith("/")
@@ -1487,6 +1488,22 @@ def named_by(path, tokens):
     return False
 
 
+def names_guarded(path, tokens):
+    """Whether a ticket names a GUARDED file closely enough to count: its exact path, or a glob whose
+    folder is written out in full, holds no `*`, and is the file's own folder, with `*` inside the one
+    file name. A bare name, a folder, a companion, or a glob such as `*.yml` or `**/*.py` never names
+    guard machinery: a branch can claim any ticket, and words that loose are too easy to borrow."""
+    folder, _sep, name = path.rpartition("/")
+    for t in tokens:
+        if t == path:
+            return True
+        t_folder, _sep, t_name = t.rpartition("/")
+        if ("*" in t_name and t_folder and "*" not in t_folder and t_folder == folder and re.match(
+                "^" + "[^/]*".join(re.escape(x) for x in t_name.split("*")) + r"\Z", name)):
+            return True
+    return False
+
+
 def _pr_files(gh, repo, number, max_pages):
     """(file names, why not). The names are what was read, even when the list was cut short."""
     files = []
@@ -1511,12 +1528,13 @@ def _pr_files(gh, repo, number, max_pages):
 
 
 def guard_list(gh, repo):
-    """(patterns, why not whole): the Hooks change guard's list for one repository, built as its gate
-    builds it (scripts/check_grader_paths.py). The kit's FLOOR, imported, so it is the same list; and
-    the `autonomy.riskPaths` of the repository's own delivery.json on its default branch, by one GET.
-    No delivery.json is the floor alone, as it is for the gate. One that cannot be read or does not
-    parse leaves the floor, and says so: a list the watcher could not finish is never a whole one."""
-    globs, why = list(grader_paths.FLOOR), None
+    """(patterns, why not whole, absent): the Hooks change guard's list for one repository, built as its
+    gate builds it (scripts/check_grader_paths.py). The kit's FLOOR, imported, so it is the same list;
+    and the `autonomy.riskPaths` of the repository's own delivery.json on its default branch, by one
+    GET. A 404 is no delivery.json, the floor alone, as it is for the gate; `absent` says so, and the
+    monitor counts it aloud, since a token that cannot see the file may get the same 404. One that
+    cannot be read or does not parse leaves the floor, and says so: never a whole list."""
+    globs, why, absent = list(grader_paths.FLOOR), None, False
     try:
         doc = gh.ask("files", "/repos/%s/contents/%s" % (repo, grader_paths.DELIVERY_FILE))
         if not isinstance(doc, dict) or doc.get("encoding") != "base64" or not isinstance(
@@ -1532,12 +1550,13 @@ def guard_list(gh, repo):
                 MAX_RISK_PATHS, MAX_RISK_PATHS)
         globs += risk[:MAX_RISK_PATHS]
     except SourceError as exc:
-        if exc.code != 404:
+        absent = exc.code == 404
+        if not absent:
             why = "its riskPaths could not be read (%s), so only the kit's floor was checked" % _line(
                 str(exc), 80)
     except (ValueError, TypeError, AttributeError, RecursionError):
         why = "its delivery.json does not parse, so only the kit's floor was checked"
-    return [re.compile(grader_paths.glob_to_re(g)) for g in globs], why
+    return [re.compile(grader_paths.glob_to_re(g)) for g in globs], why, absent
 
 
 def _nameable(ref, paths):
@@ -1552,7 +1571,7 @@ def monitor_outside_files(cfg, gh, tr, now):
     names no ticket, a ticket that names nothing or was not written by a trusted user, and a file list
     that could not be read all say so: none of them is clear. Every pull request's files are read,
     with a ticket or without, because a guarded path can hide in any of them: a guarded file its
-    ticket does not name is a page, whatever the count."""
+    ticket does not name exactly (`names_guarded`) is a page, whatever the count."""
     name, found, incomplete, since = "outside-files", [], [], _since(cfg, now)
     trusted, teams = set(cfg["tracker_trusted_users"]), set(cfg["tracker_teams"])
     try:
@@ -1561,7 +1580,7 @@ def monitor_outside_files(cfg, gh, tr, now):
         return blind(name, _line(str(exc)), *tr.feed_stats("tracker"))
     by_ident = dict((i["identifier"], i) for i in issues
                     if isinstance(i, dict) and isinstance(i.get("identifier"), str))
-    judged_n = unjudged = untied = read_n = 0
+    judged_n = unjudged = untied = read_n = floor_only = 0
     for repo in cfg["repos"]:
         pulls, complete, why = read_pages(
             gh, "pulls", lambda n, r=repo: ("/repos/%s/pulls?state=all&sort=updated&direction=desc"
@@ -1609,11 +1628,12 @@ def monitor_outside_files(cfg, gh, tr, now):
                 continue
             read_n += 1
             if guard is None:
-                guard, guard_why = guard_list(gh, repo)
+                guard, guard_why, absent = guard_list(gh, repo)
                 if guard_why:
                     incomplete.append((repo, guard_why))
+                floor_only += 1 if absent else 0
             guarded = sorted(set(f for f in files if any(rx.match(f) for rx in guard)))
-            loose = [f for f in guarded if not (tokens and named_by(f, tokens))]
+            loose = [f for f in guarded if not (tokens and names_guarded(f, tokens))]
             if guarded:
                 found.append(finding(PAGE if loose else RECORD, "guarded-path", ref, actor=who, at=when,
                                      url=url, count=len(guarded)))
@@ -1633,12 +1653,13 @@ def monitor_outside_files(cfg, gh, tr, now):
         incomplete.append(("all", "no pull request could be judged: none named a ticket that names files or "
                                   "areas, so nothing was compared"))
     asked, answered, read_at = gh.feed_stats("pulls", "files")
-    said = ("read the files of %d pull request(s) in %d repositor%s since %s: %d judged against their ticket, "
-            "%d changed files outside what it names, %d could not be judged (no files or areas named, or "
-            "the ticket's writer not trusted), %d named no ticket; %d guarded file(s) changed"
-            % (read_n, len(cfg["repos"]), "y" if len(cfg["repos"]) == 1 else "ies", _iso(since), judged_n,
+    # Short, so the whole line fits the 300 characters a said line holds.
+    said = ("read the files of %d pull request(s) in %d repo(s) since %s: %d judged against a ticket, "
+            "with %d changed files outside it; %d could not be judged (no trusted scope), %d named no "
+            "ticket; %d guarded file(s) changed; %d repo(s) with no delivery.json (floor only)"
+            % (read_n, len(cfg["repos"]), _iso(since), judged_n,
                sum(f["count"] for f in found if f["what"] == "outside-files"), unjudged, untied,
-               sum(f["count"] for f in found if f["what"] == "guarded-path")))
+               sum(f["count"] for f in found if f["what"] == "guarded-path"), floor_only))
     return judged(name, found, said, _gaps(incomplete), asked, answered, read_at)
 
 
@@ -2811,6 +2832,9 @@ def selftest():
         check("outside-files: scope words are files and areas, never a link or a path out of the repository",
               scope_tokens("see https://x.io/a/b and ../etc/passwd and /abs/p.py and `docs/` and foo.py, e.g."),
               ["docs/", "foo.py"])
+        check("outside-files: a path that starts with a dot keeps it, and a leading ./ is dropped",
+              scope_tokens("Edit .github/workflows/ci.yml and ./docs/a.md, then .claude/hooks/x.py."),
+              [".github/workflows/ci.yml", "docs/a.md", ".claude/hooks/x.py"])
         check("outside-files: the glob, bare name, folder and sibling rules",
               [named_by(p, ["scripts/*.py"]) for p in ("scripts/a.py", "scripts/a/b.py", "docs/a.py")]
               + [named_by("a/b/NOTES.md", ["NOTES.md"]), named_by("docs/z.md", ["docs/"]),
@@ -2835,6 +2859,24 @@ def selftest():
         code, m = go_o([tissue("KIT-1", desc="Edit scripts/pipeline_x.py only")], [opr(7)], {7: ["scripts/pipeline_x.py"]})
         check("guarded: a guarded file its ticket names is recorded, never paged",
               (m["state"], guarded_of(m)), (CLEAR, [("guarded-path", RECORD, "%s#7" % R, 1)]))
+        code, m = go_o([tissue("KIT-1", desc="Edit the CI in .github/workflows/*.yml")], [opr(7)],
+                       {7: [".github/workflows/ci.yml"]})
+        check("guarded: ...and so is one a glob names in its own folder, written out in full",
+              (m["state"], guarded_of(m)), (CLEAR, [("guarded-path", RECORD, "%s#7" % R, 1)]))
+        for words, path in (("Tidy ci.yml", ".github/workflows/ci.yml"), ("Every *.yml file", ".github/workflows/ci.yml"),
+                            ("All of **/*.py", "scripts/pipeline_x.py"), ("The scripts/ folder", "scripts/pipeline_x.py"),
+                            ("See scripts/*/x.py", "scripts/pipeline_x.py"), ("And .claude/", ".claude/settings.json")):
+            code, m = go_o([tissue("KIT-1", desc=words)], [opr(7)], {7: [path]})
+            check("guarded: a ticket that says %r does not name %s, so it is still a page" % (words, path),
+                  (m["state"], [(w, lv) for w, lv, _r, _c in guarded_of(m)]),
+                  (FLAGGED, [("guarded-file", PAGE), ("guarded-path", PAGE)]))
+        check("guarded: the exact path, or a glob in the file's own folder, written out; nothing looser",
+              [names_guarded(p, t) for p, t in (
+                  ("scripts/pipeline_x.py", ["scripts/pipeline_x.py"]), ("scripts/pipeline_x.py", ["scripts/pipeline_*.py"]),
+                  ("delivery.json", ["delivery.json"]), ("scripts/pipeline_x.py", ["pipeline_x.py"]),
+                  ("scripts/pipeline_x.py", ["scripts/"]), ("scripts/a/pipeline_x.py", ["scripts/*.py"]),
+                  ("scripts/pipeline_x.py", ["*/pipeline_x.py"]), ("scripts/pipeline_x.py", ["scripts/test_pipeline_x.py"]))],
+              [True, True, True, False, False, False, False, False])
         code, m = go_o([SCOPED], [opr(7, "my-branch")], {7: ["src/a.py", ".claude/hooks/pre-tool-use.py"]})
         check("guarded: a pull request that names no ticket and changes a guarded path is a page",
               (m["state"], [w for w, _l, _r, _c in guarded_of(m)]), (FLAGGED, ["guarded-file", "guarded-path"]))
@@ -2862,10 +2904,12 @@ def selftest():
               (m["state"], guarded_of(m)),
               (FLAGGED, [("guarded-file", PAGE, "%s#7:src/billing/pay.py" % R, 1), ("guarded-path", PAGE, "%s#7" % R, 1)]))
         check("guarded: ...read by one GET of that file on the default branch, once per repository",
-              [p for p in last_gh[0].paths if "/contents/" in p], ["/repos/%s/contents/delivery.json" % R])
+              ([p for p in last_gh[0].paths if "/contents/" in p], "0 repo(s) with no delivery.json" in m["said"]),
+              (["/repos/%s/contents/delivery.json" % R], True))
         code, m = go_o([SCOPED], [opr(7, "my-branch")], {7: ["src/billing/pay.py"]})
-        check("guarded: ...and with no delivery.json the floor alone is checked, and nothing is missing",
-              (m["state"], guarded_of(m), m["reason"]), (CLEAR, [], ""))
+        check("guarded: ...and with no delivery.json the floor alone is checked, and the said line counts it",
+              (m["state"], guarded_of(m), m["reason"], "1 repo(s) with no delivery.json (floor only)" in m["said"]),
+              (CLEAR, [], "", True))
         for label, contents, needle in (
                 ("a delivery.json that does not parse", blob(b"{not json"), "does not parse"),
                 ("riskPaths that are not a list", blob({"autonomy": {"riskPaths": "src/**"}}), "does not parse"),
@@ -2879,14 +2923,14 @@ def selftest():
         code, m = go_o([SCOPED], [opr(7, "my-branch")], {7: SourceError("GitHub answered HTTP 500", whole=False)})
         check("guarded: a pull request with no ticket whose files could not be read is blind, never clear",
               (m["state"], "not all read" in m["reason"]), (BLIND, True))
-        floor, why = guard_list(GitHub(FakeGH({}), None, 9, lambda: False, lambda: NOW), R)
+        floor, why, absent = guard_list(GitHub(FakeGH({}), None, 9, lambda: False, lambda: NOW), R)
         check("guarded: the floor is the Hooks change guard's own list",
-              (len(floor), why, [any(rx.match(p) for rx in floor) for p in (
+              (len(floor), why, absent, [any(rx.match(p) for rx in floor) for p in (
                   ".claude/hooks/pre-tool-use.py", ".claude/settings.local.json", ".github/workflows/ci.yml",
                   "scripts/check_grader_paths.py", "scripts/pipeline_hold.py", "scripts/secret_shapes.py",
                   "delivery.json", "a/b/.secretlintignore", "src/a.py", "docs/WATCHER.md", "scripts/foo.py",
                   "scripts/telemetry_block.py")]),
-              (len(grader_paths.FLOOR), None, [True] * 8 + [False] * 4))
+              (len(grader_paths.FLOOR), None, True, [True] * 8 + [False] * 4))
 
         # -- KIT-517: the watcher checks its own files against the manifest, every pass ------------------------------------------
         inst = os.path.join(tmp, "install")

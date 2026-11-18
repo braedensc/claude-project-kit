@@ -23,7 +23,8 @@ its job are KIT-517. The way it pauses the system is KIT-515, and its urgent pag
 | `approval-rate` | Every merge against the validator's approvals: a merge with no approval that you did not make, an approval still unmerged a day later, too many approvals in a day, too many in a row, and the validator's urgent escalations. | GitHub's merges and the validator's ledger |
 
 **What `outside-files` counts as named (KIT-831).** The files and areas a ticket names are the path-like words in
-its title and description: a word with a `/` or a file extension, such as `scripts/foo.py`, `docs/` or `*.md`. A
+its title and description: a word with a `/` or a file extension, such as `scripts/foo.py`,
+`.github/workflows/ci.yml`, `docs/` or `*.md`. A
 changed file is named if it is one of them, is under a named folder, matches a named glob, has a named bare file
 name, or is a test companion of a named file (same folder, with the same name, a `test_` prefix or a `_test`
 suffix). The ticket is the one the pull request's branch name claims, and a branch is the worker's own word, so
@@ -48,12 +49,19 @@ without a ticket, and checks each one against the Hooks change guard's own list.
 | `guarded-path` | `page` | A pull request changes a guarded file its ticket does not name. This includes a pull request with no ticket, and one whose ticket names nothing or was written by a stranger. `count` is how many guarded files it changes. Up to five `guarded-file` findings name the files that are not named. |
 | `guarded-path` | `record` | Every guarded file it changes is one its ticket names. It is said, never paged. |
 
+**A guarded file is named only exactly.** The ticket must give its exact path, or a glob in the file's own folder,
+written out in full, such as `.github/workflows/*.yml`. A bare name (`ci.yml`), a folder (`scripts/`) or a looser
+glob (`*.yml`, `**/*.py`) never names one. A branch can claim any ticket, so words that loose are too easy to borrow.
+
 - A guarded file moved away counts by its old path.
-- No `delivery.json` means the floor alone, as it does for the guard.
+- No `delivery.json` means the floor alone, as it does for the guard. `said` counts the repositories read that way,
+  because a token that cannot see the file can get the same 404.
 - A `delivery.json` it cannot read, or whose `riskPaths` do not parse, makes the monitor `blind`, with the reason. So
   does a file list it cannot read, with or without a ticket. Any of these is never `clear`.
 - The watcher's GitHub token must be able to read each repository's contents, as well as its issues and pull
   requests.
+- Each pull request in the lookback costs at least one GitHub request. If a busy day makes the monitor blind with
+  the cap's reason, raise `max_requests`.
 
 Good: `guarded-path` at `page` on a pull request whose ticket is about `src/` and which also changes
 `.github/workflows/ci.yml`. Not that: a pull request with no ticket that changes `.claude/hooks/` and is passed over
