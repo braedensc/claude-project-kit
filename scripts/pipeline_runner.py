@@ -1017,13 +1017,20 @@ class Runner(object):
         """Keep each process of the run's tree, with its start time, in the runner's own store:
         a process that leaves the tree, or outlives its parent, is still killed when the run
         ends. Returns (limit:memory, words) when more of its processes are alive at once than
-        are remembered: then the newest are kept, and the run is past its memory limit."""
+        are remembered: then the newest are kept, and the run is past its memory limit.
+        A record that lacks its leader, because it could not be read or its leader's start could
+        not be read at spawn, gets the leader back while the run's lock is held: the wrapper is
+        then alive, so the run's own pid is still its own process."""
         record, over, unread = limits.remember(self.read_tree(rec["run"]), pids)
         if unread:
             self.tell("%s:unremembered" % rec["run"], "Run %s (%s, %s): its processes' start times "
                       "could not be read, so what it leaves behind may not be found." % (
                           rec["run"], rec["kind"], rec["ticket"]))
             return None
+        if not record["leader"] and rec["pid"] and lock_held(self.rdir(rec["run"])):
+            got = limits.start_times([rec["pid"]], record["method"]) or {}
+            if got.get(str(rec["pid"])):
+                record["leader"] = [str(rec["pid"]), got[str(rec["pid"])]]
         self.write_tree(rec["run"], record)
         return over
 
@@ -1606,6 +1613,7 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
     ticket("ENG-19", "A forged record beside it STANDIN:sleep=2", [move("owner-1", "st-ready")])
     ticket("ENG-20", "Leave children behind STANDIN:orphans", [move("owner-1", "st-ready")])
     ticket("ENG-21", "Keep many alive STANDIN:spawn", [move("owner-1", "st-ready")])
+    ticket("ENG-22", "Its record goes bad STANDIN:sleep=5", [move("owner-1", "st-ready")])
 
     class Tracker(object):
         down = False
@@ -2050,6 +2058,21 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
         expect("remembered processes it cannot check are never killed, and that is said once",
                (cleared, rec19["run"] + ":unchecked" in _load(os.path.join(sdir, "incidents.json"))["open"]),
                (True, True))
+        store.ask(sdir, "queue", "start", "code", "app", "ENG-22")
+        runner.pass_once()
+        rec22 = [r for r in runner.runs() if r["ticket"] == "ENG-22"][0]
+        rd22 = store.run_dir(sdir, rec22["run"])
+        _wait(lambda: lock_held(rd22) and os.path.exists(os.path.join(rd22, "wrapper.json")), 10)
+        with open(store.tree_path(sdir, rec22["run"]), "w") as fh:
+            fh.write("{ not a record")                           # the record goes bad mid-run
+        runner.remember(rec22, [])
+        healed = _load(store.tree_path(sdir, rec22["run"]))
+        expect("a record gone bad gets its leader back while the run lives, and that is said "
+               "(Stage E on #585)",
+               (healed["leader"], rec22["run"] + ":tree-unread" in _load(os.path.join(sdir, "incidents.json"))["open"]),
+               ([str(rec22["pid"]), (limits.start_times([rec22["pid"]]) or {}).get(str(rec22["pid"]))], True))
+        store.ask(sdir, "queue", "stop", "code", "app", "ENG-22", run=rec22["run"])
+        _wait(lambda: runner.pass_once() and store.read_run(sdir, rec22["run"])["state"] == "stopped", 15)
         store.ask(sdir, "queue", "start", "code", "app", "ENG-20")
         runner.pass_once()
         rec20 = [r for r in runner.runs() if r["ticket"] == "ENG-20"][0]
