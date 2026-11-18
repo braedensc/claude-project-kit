@@ -432,6 +432,11 @@ jobs:
       # (KIT-792), off and held said, and it never merges, approves or labels.
       - name: Validator merge path selftest (one in flight; never merges, approves or labels)
         run: python3 scripts/pipeline_validator_merge.py --selftest
+      # The validator approves a piece starting (KIT-543). Offline: only a piece of an approved plan
+      # waiting for the owner's start is judged; the floor is held once; the agent judges the ticket
+      # as written; one agent run a pass; off and held said; it never starts a piece itself.
+      - name: Validator piece pass selftest (judges, records, starts nothing)
+        run: python3 scripts/pipeline_validator_pieces.py --selftest
       # The validator's hard limits (KIT-538): layer 1, plain code with no model. Offline, in a
       # temp folder: one case per rule and every reason reached; each fact read by the part of
       # the kit that owns it; the safety-system floor is never a switch; closed words only.
@@ -478,6 +483,23 @@ jobs:
       # nothing, a ledger it cannot count on refuses, a mutant for each rule.
       - name: Queue starter selftest (inside the window, the order's start list, the ledger first)
         run: python3 scripts/pipeline_queue_start.py --selftest
+      # Each kind of session the runner starts, as data (KIT-704), and the one adapter that turns a
+      # kind into the program's command line. Offline: every kind's line, settings and environment
+      # pinned; a mode that skips the checks, a file tool allowed by name and Bash inside our own
+      # sandbox each refused. Our own sandbox's profile runs for real only on a Mac (the Mac job).
+      - name: Session kinds selftest (each kind as data; what no kind may say)
+        run: |
+          python3 scripts/pipeline_session_kinds.py --selftest
+          python3 scripts/pipeline_session_kinds.py --check
+      - name: Claude adapter selftest (every kind's full command line, settings and environment)
+        run: python3 scripts/pipeline_harness_claude.py --selftest
+      # The guards' launcher (KIT-704): the kit's guard from the engine's own folder, refusing when
+      # it cannot tell which folder it guards. The real guard refuses an edit on main through it.
+      - name: Runner guard launcher selftest (which folder it guards, a crash is a refusal)
+        run: python3 scripts/pipeline_runner_guard.py --selftest
+      # The live probe of each kind's walls (KIT-704), run here only against a stand-in program.
+      - name: Runner probe selftest (walls that hold pass, leaks fail, no call is NOT MEASURED)
+        run: python3 scripts/pipeline_runner_probe.py --selftest
       # The queue's installer (KIT-456). Offline, every command stood in for; a mutant for each rule.
       - name: Queue installer selftest (the jobs' own loaders, no plist overwritten, nothing loaded)
         run: python3 scripts/pipeline_queue_setup.py --selftest

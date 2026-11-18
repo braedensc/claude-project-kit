@@ -68,9 +68,12 @@ try:
     from pipeline_finding_poller import PollerError, load_seen
     from pipeline_queue_order import config as order_config
     from pipeline_queue_pool import (GATE_EPIC_LABEL, HISTORY_KEYS, TEAM_RE, config as pool_config,
-                                     dig, has_children, iso, label_names, local_date, pointer_lines)
+                                     dig, epoch as pool_epoch, has_children, iso, label_names,
+                                     local_date, pointer_lines)
     from pipeline_status_local import (ENV_NAME_RE, PR_URL_RE, REPO_RE, SourceError, credential,
                                        inside_git_worktree, linear_graphql)
+    import pipeline_validator_ledger as vledger      # KIT-543: the validator's piece approvals
+    import pipeline_validator_settings as vsettings  # ...read only while its pieces switch is on
 except ImportError as exc:  # a packaging accident, never a state to run in
     sys.exit("FAIL: %s. The reader uses those files' own definitions and keeps no copy." % exc)
 
@@ -78,7 +81,7 @@ SCHEMA = "pipeline-queue-inputs/1"
 EXIT_OK, EXIT_ERROR, EXIT_USAGE, EXIT_PARTIAL = 0, 1, 2, 3
 OK, PARTIAL, FAILED = "ok", "partial", "failed"
 READ, PARTLY, COULD_NOT, OFF = "read", "partly-read", "could-not-read", "off"
-SOURCES = ("tracker", "findings", "plans", "ledger")
+SOURCES = ("tracker", "findings", "plans", "ledger", "validator")
 # The sections of the queue's one config file. The morning job writes the same list: the two
 # modules do not import each other.
 SECTIONS = ("pool", "order", "planner", "window", "reader", "morning", "room", "hold")
@@ -98,6 +101,10 @@ DEFAULTS = {
     "bridge_state_file": "",                        # the bridge's bridge-state.json; "" is off
     "ledger_file": "~/.stage-e/queue/ledger.json",  # the queue's ledger of starts; "" is off
     "inputs_file": "~/.stage-e/queue/inputs.json",  # where the inputs file is written
+    # KIT-543: the validator's settings and its ledger. "" for either is off: the owner's start
+    # decides, as before. This account must be able to read and trust both.
+    "validator_settings_file": "",
+    "validator_ledger_file": "",
     "max_requests": 1000,                           # tracker requests in one pass
     "max_tickets": 300,                             # candidates read in one pass
     "max_pages": 40,                                # pages of any one list (400 tickets)
@@ -105,7 +112,8 @@ DEFAULTS = {
 }
 LIMITS = {"max_requests": (1, 10000), "max_tickets": (1, 2000), "max_pages": (1, 200),
           "run_timeout_seconds": (30, 3600)}
-PATH_KEYS = ("findings_file", "bridge_state_file", "ledger_file", "inputs_file")
+PATH_KEYS = ("findings_file", "bridge_state_file", "ledger_file", "inputs_file",
+             "validator_settings_file", "validator_ledger_file")
 
 # -- The queries: all of them `query`, none a mutation. Linear refuses a query whose complexity is
 # over 10,000 points, and a nested list multiplies it, so the sizes are the bridge's own (20 labels,
@@ -628,6 +636,28 @@ def read_ledger(path, today, say):
     return dict((k, doc[k]) for k in ("date", "starts", "agent_filed_starts")), READ, None
 
 
+def read_validator(settings_path, ledger_path, say):
+    """(record, state, reason): the validator's latest decision on each piece, `{ticket: {"kind",
+    "at"}}` with `at` in seconds, for the pool (KIT-543). Off unless both files are named and the
+    settings, read and trusted by their own reader, have the pieces switch on: then the owner's start
+    decides, as before. A ledger that cannot be read or trusted is said, and gives no approval."""
+    if not settings_path or not ledger_path:
+        return None, OFF, None
+    settings = vsettings.load(settings_path)
+    if settings["state"] != vsettings.READ or settings["approve"].get("pieces") is not True:
+        return None, OFF, "the validator's pieces switch is off"
+    got = vledger.read(ledger_path)
+    if got["rows"] is None:
+        say("validator: its ledger could not be read or trusted")
+        return None, COULD_NOT, "the validator's ledger could not be read or trusted"
+    out = {}
+    for row in got["rows"]:
+        at = pool_epoch(row["at"])
+        if row["subject"] == "piece" and at is not None:
+            out[row["ref"]] = {"kind": row["kind"], "at": at}
+    return out, READ, None
+
+
 # -- The document
 def result_of(sources):
     if sources["tracker"]["state"] == COULD_NOT:
@@ -635,12 +665,13 @@ def result_of(sources):
     return PARTIAL if any(s["state"] in (PARTLY, COULD_NOT) for s in sources.values()) else OK
 
 
-def document(now, sources, tickets=(), epics=(), histories=None, busy=(), records=(None,) * 3,
+def document(now, sources, tickets=(), epics=(), histories=None, busy=(), records=(None,) * 4,
              extras=None, running=()):
     return {"schema": SCHEMA, "read_at": iso(now), "date": local_date(now),
             "result": result_of(sources), "sources": sources, "tickets": list(tickets),
             "epics": list(epics), "histories": histories or {}, "busy": list(busy),
             "findings": records[0], "plans": records[1], "ledger": records[2],
+            "validator": records[3],
             "extras": extras or {}, "running": list(running)}
 
 
@@ -648,7 +679,7 @@ def failed(cfg, now, why):
     """A pass that cannot be trusted for anything: every list empty, no record read."""
     sources = {"tracker": {"state": COULD_NOT, "reason": why}}
     for name, key in (("findings", "findings_file"), ("plans", "bridge_state_file"),
-                      ("ledger", "ledger_file")):
+                      ("ledger", "ledger_file"), ("validator", "validator_ledger_file")):
         sources[name] = ({"state": COULD_NOT, "reason": NOT_READ} if cfg["reader"][key]
                          else {"state": OFF, "reason": None})
     return document(now, sources)
@@ -665,7 +696,9 @@ def collect(cfg, gql, now, clock, say):
         return failed(cfg, now, str(exc))
     records = (read_findings(reader["findings_file"], say),
                read_plans(reader["bridge_state_file"], say),
-               read_ledger(reader["ledger_file"], today, say))
+               read_ledger(reader["ledger_file"], today, say),
+               read_validator(reader["validator_settings_file"], reader["validator_ledger_file"],
+                              say))
     epics, left = read_epics(budget, cfg, tickets, records[1][0], problems)
     pieces = [k for e in epics for k in dig(e, "children", "nodes")]
     histories, busy = read_histories(budget, cfg, epics + tickets + pieces, problems)
@@ -861,6 +894,50 @@ def _cases(check, tmp, blocked):
     os.makedirs(os.path.join(GIT, ".git"))
     os.mkdir(FILES)
     NEED = pool.TICKET_KEYS + ("id", "identifier", "priority", "inverseRelations")
+
+    # KIT-543: the validator's record, read only while its pieces switch is on, through the
+    # settings' and the ledger's own readers. Anything else is off, or said: never an approval.
+    vdir = os.path.join(RT, "validator")
+    hush = lambda line: None   # noqa: E731
+    os.makedirs(vdir, mode=0o755)
+    spath, lpath = os.path.join(vdir, "settings.json"), os.path.join(vdir, "ledger.json")
+
+    def v_settings(pieces):
+        with open(spath, "w", encoding="utf-8") as fh:
+            json.dump({"schema": vsettings.SETTINGS_SCHEMA,
+                       "approve": {"plans": False, "pieces": pieces, "merges": False},
+                       "limits": {"max_changed_lines": 0, "max_files": 0},
+                       "allow": dict((k, False) for k in vsettings.ALLOW),
+                       "stage_e_login": None, "merge_repos": []}, fh)
+        os.chmod(spath, 0o600)
+
+    def v_row(ref, kind, at):
+        vledger.append(lpath, {
+            "subject": "piece", "ref": ref, "head": None, "kind": kind,
+            "layers": dict((k, "pass" if kind == "approved" else "fail") for k in vledger.LAYERS),
+            "settings_on": ["approve-pieces"], "size_limits": {"max_changed_lines": 0, "max_files": 0},
+            "reasons": [] if kind == "approved" else ["risk-path"], "agent_says": None},
+            lambda: at)
+    check("validator: off unless both its settings and its ledger are named",
+          (read_validator("", lpath, hush)[1:], read_validator(spath, "", hush)[1:]),
+          ((OFF, None), (OFF, None)))
+    check("validator: no settings file, or the pieces switch off, is off and said",
+          (read_validator(spath, lpath, hush), v_settings(False), read_validator(spath, lpath, hush)),
+          ((None, OFF, "the validator's pieces switch is off"), None,
+           (None, OFF, "the validator's pieces switch is off")))
+    v_settings(True)
+    v_row("ENG-11", "held", NOW - 300)
+    v_row("ENG-12", "approved", NOW - 200)
+    v_row("ENG-11", "approved", NOW - 100)
+    check("validator: on, the latest decision on each piece, with its time in seconds",
+          read_validator(spath, lpath, hush),
+          ({"ENG-11": {"kind": "approved", "at": NOW - 100},
+            "ENG-12": {"kind": "approved", "at": NOW - 200}}, READ, None))
+    with open(lpath, "w", encoding="utf-8") as fh:
+        fh.write("{not a ledger")
+    check("validator: a ledger it cannot read gives no approval, and is said",
+          read_validator(spath, lpath, hush),
+          (None, COULD_NOT, "the validator's ledger could not be read or trusted"))
 
     @contextlib.contextmanager
     def patch(**kw):
@@ -1113,7 +1190,7 @@ def _cases(check, tmp, blocked):
                     len(QS), sorted(set(d["W"].calls))))
     case("document: keys, schema, time, local day; ok when all is read",
          (sorted("schema read_at date result sources tickets epics histories busy findings plans "
-                 "ledger extras running".split()), SCHEMA, "2026-11-05T22:30:00Z", TODAY, "ok"),
+                 "ledger validator extras running".split()), SCHEMA, "2026-11-05T22:30:00Z", TODAY, "ok"),
          lambda d: (sorted(W(d)), W(d)["schema"], W(d)["read_at"], W(d)["date"], d["OK"].doc["result"]))
     case("paging; plans from tickets and the record; a history for each",
          ([5, 3, 3], ["ENG-%d" % n for n in (1, 2, 3, 4, 5, 6, 10, 11, 12, 13)],
@@ -1207,7 +1284,7 @@ def _cases(check, tmp, blocked):
     case("a good run: exit 0, counts only, a private file",
          (0, ["queue reader: 2026-11-05T22:30:00Z", "  tickets 2, epics 0, histories unread 0, busy 1, running 0",
               "  result: ok", "  written to <home>/q/in.json"], "", [0o600, 0o700]),
-         lambda d: (d["OK"].code, [l for i, l in enumerate(d["OK"].out.splitlines()) if i in (0, 5, 6, 7)],
+         lambda d: (d["OK"].code, [l for i, l in enumerate(d["OK"].out.splitlines()) if i in (0, 6, 7, 8)],
                     d["OK"].err, [stat.S_IMODE(os.stat(p).st_mode) for p in (
                         d["OK"].path, os.path.dirname(d["OK"].path))]))
     case("exits: dry run, partial 3, no network, a bug, no key (no request)",

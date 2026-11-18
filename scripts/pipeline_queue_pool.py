@@ -50,6 +50,12 @@ WHAT IT IS GIVEN (all of it data; nothing is fetched).
   findings   the finding poller's seen-set map, or None. Names each filed finding and its source.
   plans      the bridge's record of plans approved in Slack (`state["epics"]`), or None.
   ledger     today's counts, `{"date", "starts", "agent_filed_starts"}`, or None.
+  validator  the validator's latest decision on each piece, `{ticket: {"kind", "at"}}` (`at` in
+             seconds), read only while its pieces switch is on (KIT-543); None when it is off or
+             not read. A held piece of an approved plan that waits only for the owner's `start`,
+             because it was added or changed after the approval, is admitted `via` "validator"
+             when its latest decision is `approved` and newer than the piece's last change. None
+             is today's rule exactly: the owner's start decides.
   A record that is None cannot be read, and what depends on it is held and said.
 
 WHAT IT RETURNS.  A list of verdicts, fields only: `id`, `ticket`, `team`, `plan` (the epic's
@@ -99,7 +105,7 @@ except ImportError as exc:  # a packaging accident, never a state to run in
 
 EXIT_USAGE = 2
 SOURCES = ("todo", "backlog", "plan", "agent_filed", "none")
-VIAS = ("move", "creation", "slack", "limits")
+VIAS = ("move", "creation", "slack", "limits", "validator")
 REASONS = (
     "admitted",
     # never, whatever anyone approved or the owner taps
@@ -572,19 +578,41 @@ def lane_plan(cfg, t, ctx, epic, hist, created, v):
         return v("plan-paused")
     if at is None:
         return v(by, tap=APPROVE % epic.get("identifier") if via else None)
+    held = None
     if via == "slack":
         if t.get("id") not in approved:
-            return v("added-after-approval", tap=True)
-        if fingerprint(t) != approved[t["id"]]:
-            return v("changed", tap=True)
+            held = "added-after-approval"
+        elif fingerprint(t) != approved[t["id"]]:
+            held = "changed"
     elif created > at or any(e["toParentId"] == epic.get("id") and when >= at
                              for when, e in hist):
-        return v("added-after-approval", tap=True)
-    if changed_since(cfg, hist, at):
-        return v("changed", tap=True)
+        held = "added-after-approval"
+    if held is None and changed_since(cfg, hist, at):
+        held = "changed"
+    if held is not None:
+        # KIT-543: the validator may give the start the owner's tap would, for this piece as it
+        # stands now; never for a piece changed after it judged. Without its approval the hold is
+        # today's, word for word.
+        vat = validator_approved(ctx, t, created, hist)
+        if vat is None:
+            return v(held, tap=True)
+        if plan_wait_open(rec, t, epic):
+            return v("plan-waits")
+        return v("admitted", by="validator", at=iso(vat), via="validator")
     if plan_wait_open(rec, t, epic):
         return v("plan-waits")
     return v("admitted", by=by, at=iso(at), via=via)
+
+
+def validator_approved(ctx, t, created, hist):
+    """When the validator approved this piece's start after its last change (KIT-543), in seconds,
+    else None. Its decision reaches the pool only while its pieces switch is on."""
+    row = (ctx.validator or {}).get(dig(t, "identifier"))
+    at = row.get("at") if isinstance(row, dict) and row.get("kind") == "approved" else None
+    if isinstance(at, bool) or not isinstance(at, (int, float)):
+        return None
+    last = max([created] + [when for when, _e in hist])
+    return at if at > last else None
 
 
 def plan_wait_open(rec, t, epic):
@@ -656,7 +684,7 @@ def apply_cap(cfg, ctx, verdicts):
                      reply=START % v["ticket"])
 
 
-def decide(cfg, now, tickets, epics, histories, busy, findings, plans, ledger):
+def decide(cfg, now, tickets, epics, histories, busy, findings, plans, ledger, validator=None):
     """One verdict per candidate, flat tickets first, then each epic's pieces in order. A
     candidate this module cannot read is held as `malformed`, never guessed and never dropped."""
     cfg, bad = config(cfg)
@@ -678,6 +706,7 @@ def decide(cfg, now, tickets, epics, histories, busy, findings, plans, ledger):
         busy=set(b for b in busy if sid(b)), by_ident=by_ident, filed=findings
         if isinstance(findings, dict) else None, plans=plans if isinstance(plans, dict) else None,
         histories=histories if isinstance(histories, dict) else {},
+        validator=validator if isinstance(validator, dict) else None,
         epic_ids=set(e["id"] for e in epics) | set(plans if isinstance(plans, dict) else ()),
         agent_starts=starts if isinstance(starts, int) and not isinstance(starts, bool)
         and starts >= 0 else None,
@@ -780,11 +809,13 @@ def _cases(check):
 
     MOVE = to_todo(T1, OWNER)
 
-    def run(ts, hists, cfg=None, epics=(), busy=(), findings={}, plans={}, ledger=LEDGER):
+    def run(ts, hists, cfg=None, epics=(), busy=(), findings={}, plans={}, ledger=LEDGER,
+            validator=None):
         def read(x):
             return None if x is UNREAD else x
+        extra = {} if validator is None else {"validator": validator}
         return decide(dict(CFG, **(cfg or {})), NOW, ts, list(epics), hists, busy,
-                      read(findings), read(plans), read(ledger))
+                      read(findings), read(plans), read(ledger), **extra)
 
     def sig(v):
         return (v["source"], v["reason"], v["reply"])
@@ -953,7 +984,8 @@ def _cases(check):
         return issue(n, state=state, labels=("effort:S", "provenance:epic"), **kw)
 
     def planworld(epic_state="Todo", slack=True, approver=SLACK, epic_hist=None, pieces=None,
-                  hists=None, approved_from=None, cfg=None, plans={}, tickets=(), waits=None):
+                  hists=None, approved_from=None, cfg=None, plans={}, tickets=(), waits=None,
+                  validator=None):
         kids = [piece(11), piece(12)] if pieces is None else pieces
         epic = issue(10, state=epic_state, labels=("provenance:agent",),
                      children={"nodes": kids, "pageInfo": {"hasNextPage": False}})
@@ -965,7 +997,8 @@ def _cases(check):
         hs = {"id-10": [to_todo(T1, OWNER)] if epic_hist is None else epic_hist}
         hs.update(dict((k["id"], []) for k in kids))
         hs.update(hists or {})
-        return run(list(tickets), hs, cfg=cfg, epics=[epic], plans=rec if slack else plans)
+        return run(list(tickets), hs, cfg=cfg, epics=[epic], plans=rec if slack else plans,
+                   validator=validator)
 
     PA, PLAN = ("plan", "admitted", None), []
 
@@ -984,6 +1017,44 @@ def _cases(check):
       [PA, PA, ("plan", "added-after-approval", "start ENG-13")],
       pieces=[piece(11), piece(12), piece(13)], approved_from=[piece(11), piece(12)])
     P("a plan the owner paused", tap("plan-paused", None), epic_state="Backlog")
+
+    # KIT-543: the validator may give a held piece's start, only after the piece's last change, only
+    # while its pieces switch is on (a record at all), and never past a rule that holds for good.
+    def vworld(row, pieces=None, **kw):
+        kids = pieces or [piece(11, description=GOOD + "\nMore."), piece(12)]
+        return planworld(pieces=kids, approved_from=[piece(11), piece(12)], validator=row, **kw)
+
+    def first(vs):
+        v = vs[0]
+        return (v["admitted"], v["reason"], v["via"], v["by"], v["reply"])
+    later, sooner = epoch(T3), epoch(T0) - 60
+    check("validator: an approval after a changed piece's last change starts it, as the validator's",
+          first(vworld({"ENG-11": {"kind": "approved", "at": later}})),
+          (True, "admitted", "validator", "validator", None))
+    check("validator: ...and a piece added after the plan's approval too",
+          [(v["ticket"], v["via"]) for v in vworld(
+              {"ENG-13": {"kind": "approved", "at": later}},
+              pieces=[piece(11), piece(12), piece(13)]) if v["ticket"] == "ENG-13"],
+          [("ENG-13", "validator")])
+    check("validator: an approval from before the piece's last change is stale: the owner's tap",
+          first(vworld({"ENG-11": {"kind": "approved", "at": sooner}})),
+          (False, "changed", None, None, "start ENG-11"))
+    check("validator: a hold, an escalation or no row leaves the owner's tap",
+          [first(vworld(row)) for row in ({"ENG-11": {"kind": "held", "at": later}},
+                                          {"ENG-11": {"kind": "escalated", "at": later}}, {})],
+          [(False, "changed", None, None, "start ENG-11")] * 3)
+    check("validator: off (no record) is today's rule, word for word",
+          [sig(v) for v in vworld(None)], [("plan", "changed", "start ENG-11"), PA])
+    check("validator: a piece waiting on another piece of its plan still waits",
+          first(vworld({"ENG-11": {"kind": "approved", "at": later}}, waits={"id-11": ["id-12"]})),
+          (False, "plan-waits", None, None, None))
+    check("validator: never a piece of a plan the owner paused, nor one held for good",
+          (first(vworld({"ENG-11": {"kind": "approved", "at": later}}, epic_state="Backlog")),
+           first(vworld({"ENG-11": {"kind": "approved", "at": later}},
+                        pieces=[issue(11, state="Backlog", description=GOOD + "\nMore.",
+                                      labels=("effort:S", "provenance:epic", "hooks-change")),
+                                piece(12)]))[:2]),
+          ((False, "plan-paused", None, None, None), (False, "hooks-change")))
     # KIT-320: a change the bridge made inside the plan has one piece wait for another. The queue
     # holds it as the bridge's own pass does, until that piece is done.
     P("a piece a change inside the plan has wait for one not done",

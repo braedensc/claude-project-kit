@@ -499,8 +499,8 @@ SIBLING_JOBS = (
                             "pipeline_sprint.py", "pipeline_sprint_changes.py", "pipeline_sprint_plan.py",
                             "pipeline_sprint_review.py", "pipeline_standup.py",
                             "pipeline_tech_lead_tools.py",
-                            "pipeline_tech_lead_turn.py", "pipeline_voice.py",
-                            "pipeline_window.py")),
+                            "pipeline_tech_lead_turn.py", "pipeline_validator_settings.py",
+                            "pipeline_voice.py", "pipeline_window.py")),
     # The bridge's always-on job (KIT-561): Slack's push connection, run by its own LaunchDaemon from
     # the same clone. It loads the bridge, and the standard-library WebSocket client it reads Slack with.
     ("pipeline_bridge_push.py", ("pipeline_bridge.py", "pipeline_bridge_answers.py",
@@ -518,7 +518,8 @@ SIBLING_JOBS = (
                                 "pipeline_sprint.py", "pipeline_sprint_changes.py", "pipeline_sprint_plan.py",
                                 "pipeline_sprint_review.py", "pipeline_standup.py",
                                 "pipeline_tech_lead_tools.py", "pipeline_tech_lead_turn.py",
-                                "pipeline_voice.py", "pipeline_window.py",
+                                "pipeline_validator_settings.py", "pipeline_voice.py",
+                                "pipeline_window.py",
                                 "pipeline_ws_client.py")),
     # The queue's two jobs (KIT-456): the usage job, and the morning job.
     ("pipeline_usage_local.py", ("pipeline_usage_local.py",)),
@@ -539,7 +540,8 @@ SIBLING_JOBS = (
                              "pipeline_sprint_review.py", "pipeline_standup.py",
                              "pipeline_tech_lead_tools.py",
                              "pipeline_tech_lead_turn.py", "pipeline_usage_local.py",
-                             "pipeline_voice.py", "pipeline_window.py")),
+                             "pipeline_validator_settings.py", "pipeline_voice.py",
+                             "pipeline_window.py")),
     # The bridge installer's verify runs the writer's probe from the clone (KIT-297).
     ("pipeline_voice.py", ("pipeline_voice.py", "pipeline_notify_events.py",
                            "pipeline_notify_local.py")),
@@ -562,14 +564,15 @@ SIBLING_JOBS = (
                             "pipeline_bridge_config.py", "pipeline_bridge_direct.py", "pipeline_bridge_handover.py",
                             "pipeline_bridge_pings.py", "pipeline_bridge_plans.py", "pipeline_bridge_replan.py",
                             "pipeline_bridge_requests.py", "pipeline_bridge_tech_lead.py", "pipeline_bridge_tracker.py",
-                            "pipeline_bridge_transport.py", "pipeline_bridge_watch.py", "pipeline_notify_events.py",
-                            "pipeline_notify_local.py", "pipeline_plan_executor.py", "pipeline_plan_poller.py",
-                            "pipeline_queue_order.py", "pipeline_queue_pool.py", "pipeline_queue_read.py",
-                            "pipeline_queue_settings.py", "pipeline_queue_start.py", "pipeline_runner.py",
-                            "pipeline_runner_limits.py", "pipeline_session_tools.py", "pipeline_sprint.py",
+                            "pipeline_bridge_transport.py", "pipeline_bridge_watch.py", "pipeline_harness_claude.py",
+                            "pipeline_notify_events.py", "pipeline_notify_local.py", "pipeline_plan_executor.py",
+                            "pipeline_plan_poller.py", "pipeline_queue_order.py", "pipeline_queue_pool.py",
+                            "pipeline_queue_read.py", "pipeline_queue_settings.py", "pipeline_queue_start.py",
+                            "pipeline_runner.py", "pipeline_runner_guard.py", "pipeline_runner_limits.py",
+                            "pipeline_session_kinds.py", "pipeline_session_tools.py", "pipeline_sprint.py",
                             "pipeline_sprint_changes.py", "pipeline_sprint_plan.py", "pipeline_sprint_review.py",
                             "pipeline_standup.py", "pipeline_tech_lead_tools.py", "pipeline_tech_lead_turn.py",
-                            "pipeline_voice.py", "pipeline_window.py")),
+                            "pipeline_validator_settings.py", "pipeline_voice.py", "pipeline_window.py")),
 )
 SIBLING_ENTRY_SCRIPTS = tuple(entry for entry, _files in SIBLING_JOBS)
 
