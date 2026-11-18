@@ -480,7 +480,9 @@ def read_planner(cfg, now):
     tickets = set()
     for rec in triggers.values():
         ticket = rec.get("run_ticket") if isinstance(rec, dict) else None
-        if isinstance(ticket, str) and TICKET_RE.match(ticket):
+        # KIT-705: on our own runner's lane a trigger's run_ticket is the idea itself, and its run
+        # is the runner's own record, never a dispatcher session to tell apart here.
+        if isinstance(ticket, str) and TICKET_RE.match(ticket) and rec.get("lane") != "runner":
             tickets.add(ticket)
     return tickets, src
 
@@ -1025,7 +1027,9 @@ def selftest_kit():
         with open(os.path.join(a_dir, "seen.json"), "w") as fh:
             json.dump({"triggers": {
                 "ENG-19": {"idea": "ENG-19", "run_ticket": "ENG-20", "note": LEAK},
-                "ENG-29": {"idea": "ENG-29", "run_ticket": "not a ticket " + LEAK}}}, fh)
+                "ENG-29": {"idea": "ENG-29", "run_ticket": "not a ticket " + LEAK},
+                # KIT-705: a run on our own runner's lane names the idea, and is not one here.
+                "ENG-39": {"idea": "ENG-39", "run_ticket": "ENG-39", "lane": "runner"}}}, fh)
         cfg = {"dispatcher_home": os.path.join(root, "disp"), "stage_e_state_dir": e_dir,
                "stage_a_state_dir": a_dir, "reviews_team_key": "REV",
                "out": os.path.join(root, "out", "usage.json"), "lookback_days": 8}
@@ -1305,6 +1309,8 @@ def _cases(check):
               [("logs", READ, 48, 48, "2026-11-03T12:00:00Z"),
                ("ledger", READ, 4, 4, "2026-11-03T12:00:00Z"),   # KIT-596: + the review record
                ("planner", READ, 1, 1, "2026-11-03T12:00:00Z")])
+        check("KIT-705 the idea gate's planning runs are its planning tickets: a run on our own "
+              "runner's lane names the idea, and is never one", scanned["planners"], {"ENG-20"})
         check("a placeholder no run follows is a run that never reached the model: three of the "
               "25 read, one of them with no start, and none of the 22 that match",
               (sorted(str(p["started"]) for p in unmatched_placeholders(scanned)),

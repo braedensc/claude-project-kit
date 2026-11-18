@@ -1017,7 +1017,9 @@ MCP session) must still never create a ticket itself; that path is closed by the
 
 A **planning session** (the idea gate: the owner moves an idea to Plan it on the project's
 own work team, and a planner job files a clean planning ticket on that team and delegates it;
-the dispatcher runs it sandboxed) does not file findings — it proposes a whole **epic tree**.
+the dispatcher runs it sandboxed. Where the project's `lanes.plan` is on, the planner instead
+asks our own runner for a plan run on the idea itself, §28, KIT-705) does not file findings — it
+proposes a whole **epic tree**.
 It holds no tracker tool and no tool that writes a file — its entry's deny list removes
 both — so it cannot write to the board or to its own supervision; its only output is a
 proposed tree, in its final message, which a credential-holding executor validates and
@@ -1123,7 +1125,9 @@ backlog — and the tree shape adds these:
   never from the tree: a run that can write refuses without it, because a pin defaulted from
   `source_ticket_id` would compare the session's claim with itself. The **planner job**
   (`scripts/pipeline_plan_poller.py`) supplies it: it writes the planning ticket the session is
-  delegated, so the pinned id is a value the session never chose.
+  delegated, so the pinned id is a value the session never chose. On our own runner's lane
+  (KIT-705) the pinned id is the idea itself, the ticket the planner asked the runner to run:
+  still never the session's choice. The receipt then names the idea, and so does every note.
 
 **The planning session's only channel is this document, so a QUESTION rides it too.** Because the
 session holds no tracker tool, every way it reaches the owner travels through the executor. A
@@ -1149,8 +1153,8 @@ a rejection report is posted without its mark, so the job that started the run c
 after it decides what to do (KIT-373). A summary, a question and a partial filing's report
 always keep theirs. The planner job passes the flag on every run, with automatic re-runs on
 or off (KIT-338), and pages for itself: once, when a move ends without a plan, on the last
-run's planning ticket, naming every run of the move and how each ended; and once, on the
-idea, for each refusal before a run. Each such page carries the planner job's own
+run's planning ticket (on the idea itself, on our own runner's lane, KIT-705), naming every run
+of the move and how each ended; and once, on the idea, for each refusal before a run. Each such page carries the planner job's own
 `planning-failed` mark, and its line 2 is the exact-shape line
 `Ended: <how>[; runs: <n>]; filed: nothing|not certain[; replan: <idea>]` the notifier
 builds its page from. A plan's summary carries the executor's own exact-shape line on its
@@ -2245,7 +2249,7 @@ dispatcher and the role account and sit outside every worktree, so a session can
 |---|---|---|
 | `logs` | Every run: `<dispatcher_home>/logs/<workspace>/session-<session id>-<UTC start>.jsonl`, for each file modified within `lookback_days` plus one day. From its `sdk-message` lines: the last `result` line's running totals, the first and last timestamped line, the `init` line's sign-in source, the kind of the first prompt, and the `rate_limit_event` lines. From its first `session-metadata` line: when it started. A `session-pending-<UTC start>.jsonl` file is a run's placeholder. | The file system, as the role account |
 | `ledger` | Stage E's `<stage_e_state_dir>/bounce-ledger.jsonl`, the rows whose outcome is `delivered` or `conflict-delivered`, and `<stage_e_state_dir>/outcomes/*.json`, which say each pull request's ticket. | The file system, as the role account |
-| `planner` | The idea gate's `<stage_a_state_dir>/seen.json`. Each trigger's `run_ticket` is a planning run. | The file system, as the role account |
+| `planner` | The idea gate's `<stage_a_state_dir>/seen.json`. Each trigger's `run_ticket` is a planning run, except on our own runner's lane, where it names the idea and the run is the runner's own record (KIT-705). | The file system, as the role account |
 
 A line that is not JSON, or is longer than 8 MiB, is passed over. A workspace is a folder under
 `logs/`: a ticket's id, or `slack-` and a thread's id for a chat. A *run* is one log file in it:
@@ -3259,8 +3263,9 @@ The runner is our own dispatcher's one always-on job (`scripts/pipeline_runner.p
 `docs/adr/2026-11-11-our-own-dispatcher-built-new-beside-the-old-one.md`. Guide: `docs/RUNNER.md`.
 When the tracker on the machine is built, these records move into it.
 
-**Built beside the old dispatcher, and off.** No lane asks the runner for anything yet. Each lane
-moves on the owner's yes, behind its own setting.
+**Built beside the old dispatcher, and off.** One caller is built to ask it: the planner job, for a
+project whose `lanes.plan` is on (KIT-705). Each lane moves on the owner's yes, behind its own
+setting.
 
 **Where it lives.** One folder, the runner's `store_dir`: an absolute path, outside every git
 working tree, a real folder owned by the runner's account, writable by no one else (mode 0700).
@@ -3320,6 +3325,23 @@ text, whoever wrote it, reaches the session only fenced as data.
 did not answer, git could not fetch, or the watcher's hold (§20) is set. Everything else is answered
 `ok: false` with the reason in words. A start refused after its workspace was made removes the
 workspace and its branch. Off (`enabled` false), the runner takes no request and resumes nothing.
+
+**A caller reads back its own requests (KIT-705).** `asked(store, caller, kind, since)` gives every
+request one caller made for one of its kinds, waiting or answered, oldest first, each with its answer
+once it has one. A file it cannot read is counted in `unread`, never passed over, and a folder it
+cannot list is an error, never "none asked" (§13). `withdraw(store, id)` takes back a request the
+runner has not taken: true when it was waiting, false when it was taken or was never there. A runner
+that read it a moment before may still act on it, so the caller reads its answer afterwards, and
+stops a run that started anyway.
+
+**The planner's start (KIT-705).** A `plan` start names the idea itself as its `ticket`: no planning
+ticket is made. Its `text` opens with three lines, `Planning-run trigger: <the move's id>`,
+`Idea: <ticket>` and `Repository: <owner>/<repo>`, then one sentence, then any earlier attempts and
+the owner's note in the planner's own fences. The planner finds a request whose record it lost by
+that first line, read from the head alone, and counts its day's starts from `asked()`. The runner
+gives a plan run the planning brief (`scripts/pipeline_plan_brief.py`) in its rules, before the
+project's instructions. The planner reads the run back from its record and its final message, and
+runs the plan executor pinned to the idea.
 
 **Each project's lanes (KIT-866).** A project's `lanes` say, for each kind, whether the runner takes
 it for that project. Absent is off. A start or resume for a lane that is off, the runner's own

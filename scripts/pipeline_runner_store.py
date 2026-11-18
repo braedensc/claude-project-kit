@@ -41,6 +41,11 @@ OUTPUT_MAX characters, in outputs/<run>.json. The caller reads it with run_outpu
 None when the run left no result at all, or StoreError when one is there and cannot be read. The
 message is the session's own words, so it is data to its caller and never part of a run's record.
 
+A CALLER'S OWN REQUESTS (KIT-705).  asked() gives a caller every request it made for one kind,
+waiting or answered, so it can count its starts and find a request whose record it lost.
+withdraw() takes back one the runner has not answered; a runner that read it a moment before may
+still act on it, so the caller reads its answer afterwards.
+
 THE WALLS.  A session must never write here: a request it wrote could start a session nobody
 approved. So the store must be an absolute path, outside every git working tree, a real folder
 (not a link), owned by this account, and writable by no one else. walls() says what is wrong, and
@@ -378,6 +383,28 @@ def ask(store, caller, action, kind, project, ticket, run=None, text=None, now=N
     return doc["id"]
 
 
+def withdraw(store, request_id):
+    """Take back a request the runner has not taken (KIT-705): True when it was waiting and is now
+    gone, False when it was taken already or was never there. A runner that read it a moment
+    before may still act on it, so the caller reads its answer afterwards, and stops a run that
+    started anyway."""
+    if not (isinstance(request_id, str) and REQUEST_RE.match(request_id)):
+        raise ValueError("not a request id")
+    folder = os.path.join(store, "requests")
+    bad = walls(folder)
+    if bad:
+        raise StoreError(bad[0])
+    if os.path.lexists(os.path.join(store, "taken", request_id + ".json")):
+        return False
+    try:
+        os.unlink(os.path.join(folder, request_id + ".json"))
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise StoreError("the request could not be taken back (%s)" % type(exc).__name__)
+    return True
+
+
 def pending(store):
     """[(id, doc or None, problems)] oldest first. StoreError when the folder cannot be listed."""
     folder = os.path.join(store, "requests")
@@ -444,6 +471,61 @@ def answer(store, request_id):
     if not isinstance(doc, dict) or not isinstance(doc.get("answer"), dict):
         raise StoreError("the answer is not an object")
     return doc["answer"]
+
+
+def asked(store, caller, kind, since=None):
+    """Every request one caller made for one kind, waiting or answered, for that caller to read
+    back (KIT-705): {"asked": [{"id", "request", "answer"}], "unread": n}, oldest first. `answer`
+    is None while it waits. `since` (seconds) passes over requests asked before it, judged first
+    by each file's time, which is never earlier than its asking, so a long-lived store is not
+    read whole each time. A file that cannot be read, or holds no well-formed request of this
+    caller's, is counted in `unread`, never passed over in silence. StoreError when a folder
+    cannot be listed: "could not read" is never "none asked" (contract section 13)."""
+    if caller not in CALLERS or kind not in CALLERS[caller]:
+        raise ValueError("the %s job asks for no %s session" % (caller, kind))
+    found, unread = {}, set()
+    # The waiting ones first: the runner writes a request's answer before it removes the request,
+    # so one answered between the two listings is in the second, and never in neither.
+    for folder in ("requests", "taken"):
+        path = os.path.join(store, folder)
+        bad = walls(path)
+        if bad:
+            raise StoreError(bad[0])
+        try:
+            names = sorted(os.listdir(path))
+        except OSError as exc:
+            raise StoreError("the %s could not be listed (%s)" % (folder, type(exc).__name__))
+        for name in names:
+            rid = name[:-5] if name.endswith(".json") else ""
+            if not REQUEST_RE.match(rid):
+                continue
+            full = os.path.join(path, name)
+            try:
+                if since is not None and os.lstat(full).st_mtime < since:
+                    continue
+                doc = read_json(full)
+            except FileNotFoundError:
+                continue                     # answered between the list and the read
+            except (OSError, StoreError):
+                unread.add(rid)
+                continue
+            req, ans = (doc.get("request"), doc.get("answer")) if folder == "taken" and \
+                isinstance(doc, dict) else (doc, None)
+            try:
+                ok = (isinstance(req, dict) and not request_problems(req) and req["id"] == rid
+                      and (folder == "requests" or isinstance(ans, dict)))
+            except (TypeError, ValueError, AttributeError):
+                ok = False
+            if not ok:
+                unread.add(rid)
+                continue
+            unread.discard(rid)
+            found.pop(rid, None)
+            if (req["caller"], req["kind"]) == (caller, kind) and (
+                    since is None or req["at"] >= iso(since)):
+                found[rid] = {"id": rid, "request": req, "answer": ans}
+    rows = sorted(found.values(), key=lambda r: (r["request"]["at"], r["id"]))
+    return {"asked": rows, "unread": len(unread)}
 
 
 # --------------------------------------------------------------------------- #
@@ -717,6 +799,51 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                {"request": dict(doc, caller="session"), "answer": {}})
     expect("…never one that is not a request a caller may make",
            taken_request(store, "rq-" + "9" * 32), None)
+
+    # KIT-705: a caller reads back its own requests, waiting or answered, and takes one back.
+    mine = os.path.join(root, "mine")
+    prepare(mine)
+    p1 = ask(mine, "planner", "start", "plan", "app", "ENG-7", text="Idea: ENG-7", now=1700000000)
+    p2 = ask(mine, "planner", "start", "plan", "app", "ENG-8", now=1700086400)
+    ask(mine, "queue", "start", "code", "app", "ENG-7", now=1700000000)
+    settle(mine, p1, read_json(os.path.join(mine, "requests", p1 + ".json")), True,
+           "run-" + "7" * 32, "", 1700000005)
+    got = asked(mine, "planner", "plan")
+    expect("asked gives the caller's own requests of that kind, oldest first, answered or waiting",
+           ([(r["id"], (r["answer"] or {}).get("run")) for r in got["asked"]], got["unread"]),
+           ([(p1, "run-" + "7" * 32), (p2, None)], 0))
+    expect("…its text and ticket as asked", (got["asked"][0]["request"]["text"],
+                                            got["asked"][1]["request"]["ticket"]), ("Idea: ENG-7", "ENG-8"))
+    os.utime(os.path.join(mine, "taken", p1 + ".json"), (1700000005, 1700000005))
+    expect("`since` passes over what was asked before it, by the file's time and then the request's",
+           [r["id"] for r in asked(mine, "planner", "plan", since=1700080000)["asked"]], [p2])
+    with open(os.path.join(mine, "requests", "rq-" + "8" * 32 + ".json"), "w") as fh:
+        fh.write("{not json")
+    write_json(os.path.join(mine, "taken", "rq-" + "6" * 32 + ".json"), {"request": {"id": "x"}})
+    got = asked(mine, "planner", "plan")
+    expect("a file it cannot read, or that holds no request, is counted, never passed over in silence",
+           (len(got["asked"]), got["unread"]), (2, 2))
+    expect("a caller asks only for its own kinds", refused(lambda: asked(mine, "planner", "code")),
+           "the planner job asks for no code session")
+    os.chmod(os.path.join(mine, "taken"), 0o777)
+    expect("a folder that fails its walls is an error, never none asked",
+           refused(lambda: asked(mine, "planner", "plan")),
+           "others can read or write the store: it must be mode 0700")
+    os.chmod(os.path.join(mine, "taken"), 0o700)
+    expect("withdraw takes back a waiting request, once",
+           (withdraw(mine, p2), withdraw(mine, p2), answer(mine, p2),
+            [r["id"] for r in asked(mine, "planner", "plan")["asked"]]), (True, False, None, [p1]))
+    expect("…never an answered one: its answer stays", (withdraw(mine, p1), answer(mine, p1)["run"]),
+           (False, "run-" + "7" * 32))
+    # The moment between the runner's two writes: its answer is there, and the waiting file still.
+    p3 = ask(mine, "planner", "start", "plan", "app", "ENG-9", now=1700090000)
+    write_json(os.path.join(mine, "taken", p3 + ".json"),
+               {"request": read_json(os.path.join(mine, "requests", p3 + ".json")),
+                "answer": {"at": iso(1700090001), "ok": True, "run": "run-" + "5" * 32, "why": ""}})
+    expect("…nor one the runner has answered and not yet removed from the waiting ones",
+           (withdraw(mine, p3), os.path.exists(os.path.join(mine, "requests", p3 + ".json"))),
+           (False, True))
+    expect("…and only by a request id", refused(lambda: withdraw(mine, "../x")), "not a request id")
 
     # Run records.
     rec = dict((k, None) for k in RUN_KEYS)

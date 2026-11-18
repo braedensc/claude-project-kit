@@ -10,7 +10,9 @@ The formats it reads and writes: `docs/PIPELINE-CONTRACT.md` section 28, and sec
 ## Where it stands
 
 - **Built, and off.** It is built beside the third-party dispatcher, which still runs every session.
-- **No lane uses it yet.** Each lane moves later, one at a time, on the owner's yes, a drill repository first.
+- **One lane is built: planning (KIT-705).** The planner job asks the runner for a plan run when a
+  project's `lanes.plan` is on ("The planning lane", below). Every lane is off until the owner's
+  yes, one project at a time, a drill repository first.
 - **Nothing installs it yet.** Its installer comes with the first lane that moves.
 - **No real session goes through it yet.** Its selftest runs it against a stand-in program.
 
@@ -156,6 +158,8 @@ The files sit behind the `hooks-change` label: a change to one changes what a se
 
 - **Nothing from its workspace.** No settings, hooks, tool servers or `CLAUDE.md` load from it.
 - **The project's instructions,** read from its default branch by the runner, handed in as a file.
+- **A plan run's brief** comes before them, in the same file: how to plan, what one document to
+  answer with, and that the idea is its ticket (`scripts/pipeline_plan_brief.py`, KIT-705).
 - **The ticket,** as the runner read it, fenced as data. A resume's text is fenced the same way.
 - **Its kind's tools, each file tool by the workspace's path.** None is allowed by its bare name.
 - **Deny rules** for the runner's store, the pins and the tracker key, for every file tool. In the
@@ -312,6 +316,40 @@ through `file_finding`, where the cap of three holds.
 role account's, mode 0600, outside the work and home folders. The readers must trust that user. The
 finding filer's `agent_user_id` and the bridge's agent user must both name it.
 
+## The planning lane
+
+The planner job (`scripts/pipeline_plan_poller.py`) is the first caller (KIT-705). When the owner
+moves an idea to Plan it, the planner asks the runner for one `plan` start on the idea itself.
+
+- **The switch is the runner's.** A repository plans here when `lanes.plan` is on for the runner's
+  project whose committed `delivery.json` names it. The planner's `runner_settings`
+  (`RUNNER_SETTINGS` in `stage-a.conf`) only says where this file is. Empty, every repository plans
+  on the old dispatcher.
+- **No planning ticket, no routing label.** The request names the idea. Its text opens with three
+  lines, `Planning-run trigger:`, `Idea:` and `Repository:`, then any earlier attempts and the
+  owner's note. The session gets that text and the idea, each fenced as data.
+- **The owner's move still decides.** The runner checks the idea's own history for his newest move
+  into an approved plan state. So the team's Plan it state must be in the project's
+  `approval_states.plan`. Until it is, the planner starts nothing on this lane, and says why.
+- **The same plan document.** The session ends with the one fenced block it always did. The
+  planner reads the run's record and final message, then runs the plan executor unchanged, pinned
+  to the idea. The plan's receipt names the idea.
+- **Notes and pages land on the idea.** Nothing is moved, because no ticket was made.
+- **The caps count from the store.** A day's runs and re-runs are the planner's own requests here,
+  added to the old lane's. A store the planner cannot read starts nothing.
+- **Past the planner's time-out,** a request still waiting is taken back, and a run still going is
+  asked to stop, once. A request the runner refuses ends the attempt with the runner's reason.
+
+The old lane's probe sign-off, its version check and its routing stop do not hold this lane:
+nothing here is routed. Settings the planner cannot read start nothing on either lane.
+
+**The way back.** Turn `lanes.plan` off, or empty `RUNNER_SETTINGS`. A run already asked finishes
+on the runner, and the planner still reads it back.
+
+Good: `"lanes": {"plan": true}` for the drill repository. Its next idea becomes one plan run, and
+the plan lands on the idea.
+Not: a planning ticket for that idea on the work team. On this lane none is made.
+
 ## Settings
 
 One JSON file. The example is `runner.example.json`. `~/` means the account's own home.
@@ -423,3 +461,6 @@ The runner refuses to start from inside a Claude session, or as root.
 - How the owner's answer to a session's question reaches the work again on this lane. The
   notifier pages the question as today. Taking the answer back to the session by resume is
   KIT-707's.
+- That a plan run through the runner files a plan live. The planner's selftest runs every case on
+  both lanes against a stand-in runner over a real store. The first live run is its own ticket
+  (KIT-887), once the runner is installed.

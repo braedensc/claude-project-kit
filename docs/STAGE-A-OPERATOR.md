@@ -100,6 +100,10 @@ Never both on one ticket.
     0.2.73 those prompts hand each child to the agent themselves, and a `graphite` child
     is cut from the branch of the ticket it waits on: a stack again.
 
+**On our own runner's lane** (section 5, KIT-705), steps 3 to 5 are one request to our own
+runner for a plan run on your idea itself, and step 9 moves nothing. Steps 1, 2 and 6 to 8, and
+10, are the same.
+
 ## 3. Why routing is checked, and what happens when it goes wrong
 
 The dispatcher picks which setup runs a ticket in this order: a route it remembers, the
@@ -431,6 +435,28 @@ repository's entry is never read.
   and hand to the agent yourself is not tagged, and runs on the default unless it carries a
   model label.
 
+**Planning on our own runner (optional, KIT-705).** Set `RUNNER_SETTINGS` in `stage-a.conf` to
+the runner's settings file: an absolute path, or `~/` for the role account's home. Then a
+repository plans through our own runner (`docs/RUNNER.md`, "The planning lane") when the runner's
+project whose committed `delivery.json` names it has `lanes.plan` on. That setting is the switch;
+the planner keeps none of its own.
+
+- **Empty (the default):** every repository plans on the dispatcher, as above.
+- **What changes:** your idea itself is the run's ticket. No planning ticket, no routing label
+  and no routing check. Notes and pages land on the idea, and nothing is moved. The probe
+  sign-off and the dispatcher's version gate the old lane only.
+- **What stays:** your move, the fresh-idea checks, the caps, the hold, the brief's rules and the
+  executor with every check it makes.
+- **What it needs:** the team's Plan it state among the project's `approval_states.plan` in the
+  runner's settings. Until then no run starts on this lane, and each pass says why.
+- **The way back:** turn `lanes.plan` off. A run already asked finishes, and is read back.
+- **An older clone:** the installer refuses to write the key until the role account's clone
+  knows it.
+
+Good: `asked the runner for a plan run of ENG-7 (project app): request rq-…`. Its plan lands on
+ENG-7.
+Not: a planning ticket for ENG-7 on the work team, with `lanes.plan` on.
+
 **When the watcher holds new starts (optional).** Set `HOLD_FILE` in `stage-a.conf` to the
 watcher's hold file (`docs/WATCHER.md`): an absolute path, or `~/` for the role account's home,
 in a folder no worker can write. While that file exists, no planning run starts, new or again.
@@ -635,6 +661,9 @@ else happened (`created`, `already-filed`, `asked`, `no-proposal`, `no-message`,
   are the stop notice's stored shape, and the state read with `trashed` that finds a
   stopped run (KIT-373): neither has been seen on a live planning ticket.
 - **A misrouted ticket runs for seconds.** The check catches it; nothing prevents it.
+- **Planning on our own runner has not run live.** The planner's selftest runs every case on
+  both lanes, against a stand-in runner over a real store. The first live run is its own
+  ticket (KIT-887), once the runner is installed.
 - **Team agent guidance reaches planners, and the brief outranks it.** It cannot be read
   through the API, so the probe asks a person to check it once. Since KIT-193 the planning
   brief also says, in its own words, that it takes precedence over team guidance, so a coding
