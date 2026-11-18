@@ -1033,12 +1033,17 @@ class Runner(object):
         taken as the end, since it can miss a process the group's leader is forking at that
         instant (measured on CI, 12 Nov). True once the run's lock is free, its group is empty
         and none of its remembered processes is alive. False when something is still there after
-        CLEAR_TRIES: the next pass tries again, and the run is not finished while any of it runs."""
+        CLEAR_TRIES: the next pass tries again, and the run is not finished while any of it runs.
+        Remembered processes whose start times cannot be read are never killed, and that is said."""
         record = self.read_tree(rec["run"])
         ours = limits.leader_is_gone_or_same(record, pid)
         for attempt in range(CLEAR_TRIES + 1):
             self.reap()
             left = limits.remembered_alive(record) if record else []
+            if left is None:
+                self.tell("%s:unchecked" % rec["run"], "Run %s (%s, %s) ended, but the start times "
+                          "of the processes it remembered could not be read, so any of them left "
+                          "running was not stopped." % (rec["run"], rec["kind"], rec["ticket"]))
             if not lock_held(rdir) and not (ours and group_alive(pid)) and not left:
                 return True
             if attempt == CLEAR_TRIES:
@@ -2036,6 +2041,15 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
         expect("a forged entry in the run's folder is ignored: the process it names lives on",
                (store.read_run(sdir, rec19["run"])["state"], bool(forged), victim.poll()),
                ("ended", True, None))
+        real_starts = limits.start_times
+        limits.start_times = lambda *_a, **_k: None          # the start times cannot be read
+        try:
+            cleared = runner.clear_run(rec19, store.run_dir(sdir, rec19["run"]), rec19["pid"])
+        finally:
+            limits.start_times = real_starts
+        expect("remembered processes it cannot check are never killed, and that is said once",
+               (cleared, rec19["run"] + ":unchecked" in _load(os.path.join(sdir, "incidents.json"))["open"]),
+               (True, True))
         store.ask(sdir, "queue", "start", "code", "app", "ENG-20")
         runner.pass_once()
         rec20 = [r for r in runner.runs() if r["ticket"] == "ENG-20"][0]
