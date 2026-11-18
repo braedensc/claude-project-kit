@@ -399,6 +399,14 @@ npm run test:queue-read      # the queue's reader (KIT-445): the tracker and thr
                              #   a history whole or null, what it could not read said
 npm run test:queue-start     # the queue's starter (KIT-452): what may start now, inside the window
                              #   only; the ledger row written before each start, never a title
+npm run test:session-kinds   # each kind of session as data (KIT-704): every kind loads; a mode that skips
+                             #   checks, a file tool by name, Bash in our own sandbox each refused
+npm run test:harness-claude  # the one adapter (KIT-704): every kind's full command line, settings and
+                             #   environment pinned; our own sandbox's profile run for real on a Mac
+npm run test:runner-guard    # the guards' launcher (KIT-704): no folder named or two named is a refusal;
+                             #   a crash is a refusal; the engine's folder this account could change
+npm run test:runner-probe    # the live probe of each kind's walls (KIT-704), against a stand-in: walls
+                             #   that hold pass, leaks fail, a model that declines is NOT MEASURED
 npm run test:runner-store    # the runner's store (KIT-642): requests and run records behind
                              #   walls, each caller for its own kinds; unreadable runs are None
 npm run test:runner          # the runner (KIT-642): start, resume, stop and a restart against a

@@ -3379,7 +3379,8 @@ words come from the program's own output. A session that printed them itself wou
 fresh start of the same request, and never a second.
 
 **Its limits (KIT-643).** Each run is held to a wall-clock limit, a memory limit for its whole
-process tree and a disk limit for its own folders, from the runner's `limits` settings. Past one,
+process tree and a disk limit for its own folders, from the runner's `limits` settings, each held to
+its kind's own ceiling in `session-kinds/<kind>.json` (KIT-704): the smaller wins. Past one,
 its tree is stopped and the record says `stopped` with that `limit:` reason. Below the machine's floor
 no new session starts. Each incident is recorded once, in plain words, in `<store>/incidents.json`
 (`{"schema": "pipeline-runner-incidents/1", "open", "told"}`), which the runner alone writes.

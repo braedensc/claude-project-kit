@@ -1,0 +1,20 @@
+{
+  "schema": "pipeline-session-kind/1",
+  "kind": "conflict",
+  "about": "A resume of a code run after main moved under its pull request, on the same branch.",
+  "brief": "Main moved under your pull request. Merge main into this branch, resolve, push.",
+  "mode": "ticket",
+  "branch": null,
+  "approval": {"newest_move": false, "states": "code"},
+  "permissions": "deny-unlisted",
+  "tools": ["Bash", "Read", "Edit", "Write"],
+  "allow": {"Bash": "name", "Read": "workspace", "Edit": "workspace", "Write": "workspace"},
+  "deny": ["store", "pins", "keys", "home"],
+  "wall": "built-in-sandbox",
+  "hosts": "project",
+  "env": ["PATH", "HOME", "TMPDIR", "LANG", "CLAUDE_CODE_OAUTH_TOKEN", "DISABLE_AUTOUPDATER",
+          "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "GIT_CONFIG_GLOBAL"],
+  "guards": ["pre-tool-use"],
+  "tool_servers": ["ticket"],
+  "limits": {"wall_minutes": 360, "memory_mb": 8192, "disk_mb": 20480}
+}
