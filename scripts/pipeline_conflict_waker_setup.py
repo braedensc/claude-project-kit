@@ -375,6 +375,10 @@ class Ctx(object):
         self.conf, self.runner, self.state = conf, runner, state
         self.home = home or os.path.expanduser("~")
         self.uid = os.getuid() if uid is None else uid
+        # The home a fix session's reads are denied in: the user database's, as the waker reads it
+        # (pr_conflict.account_home), never $HOME. Where the database has none, the waker refuses
+        # to start sessions at all, and preflight judges against this shell's home instead.
+        self.account_home = prc.account_home(self.uid) or self.home
         self.env = os.environ if env is None else env
         self.platform = sys.platform
         self.claude_bin = None
@@ -452,13 +456,13 @@ def unreadable_program(ctx, check, path):
     """The problem line when a fix session's commands may not read `check`'s program at `path`, by
     the name found or its real path, else None (KIT-786)."""
     for p in (path, os.path.realpath(path)):
-        blocked = prc.program_unreadable(p, ctx.home, ctx.uid)
+        blocked = prc.program_unreadable(p, ctx.account_home, ctx.uid)
         if blocked:
             opened = [row.replace("{home}", "~") for row, _why in prc.FIX_READ_FOLDERS if row.startswith("{home}/")]
             return ("CHECK_COMMANDS names `%s`, and its program %s is in %s, where a fix session's commands "
                     "may not read (KIT-786), so it could not run there. Install it outside your home "
                     "(Homebrew, for one), or in a folder a fix session may read: %s"
-                    % (check, path, "your home" if blocked == ctx.home else blocked, ", ".join(opened)))
+                    % (check, path, "your home" if blocked == ctx.account_home else blocked, ", ".join(opened)))
     return None
 
 
@@ -1090,6 +1094,7 @@ def _fake_ctx(conf_text=GOOD_CONF, answers=(), dry_run=False, attested=True, uid
         state.attest("A-WAKE-DRY-RUN", "ab", "count read: 1")
     runner = se.FakeRunner(list(answers), dry_run=dry_run)
     ctx = Ctx(conf, runner, state, home=HOME, uid=uid, env={})
+    ctx.account_home = HOME    # the user database's home for this fake account (KIT-786)
     ctx.platform = "darwin"
     ctx.sleep = lambda s: None
     return ctx, runner
@@ -1557,6 +1562,18 @@ def _selftest_body():
            and "`/Users/you/bin/check --all`, and its program /Users/you/bin/check is in your home" in detail
            and "~/.config/git, ~/.nvm, ~/.pyenv" in detail and "test:hooks`, and" not in detail
            and c.check_dirs == [os.path.dirname(nvm_npm)], detail)
+    # …judged against the home the waker denies, the user database's, never $HOME: where they
+    # differ, the same program passes or is refused as the session would find it (review of #615).
+    for shell_home, db_home, want in (("/Users/you", "/Users/someone", FAILED), ("/Users/me", "/Users/you", ALREADY_DONE)):
+        c, f = _fake_ctx(GOOD_CONF + "CHECK_COMMANDS=npm run test:hooks\n")
+        c.home, c.account_home = shell_home, db_home
+        c.env = {"CLAUDE_CONFIG_DIR": "/Users/you/.claude"}    # transcripts where the settled machine has them
+        f.answers = [("command -v npm", 0, nvm_npm + "\n")] + _settled_answers(c)
+        rows, _ = quiet(lambda: measure(c, apply_it=False))
+        expect("preflight-home-is-the-databases-%s" % db_home, rows and rows[0][1] == want
+               and (want != FAILED or "%s is in /Users," % nvm_npm in rows[0][2]), "%s" % rows[:1])
+    expect("ctx-home-from-the-database", Ctx({}, None, None, home="/Users/me", uid=os.getuid()).account_home
+           == (prc.account_home(os.getuid()) or "/Users/me"), "Ctx takes the denied home from the user database")
     # Every host here is example.invalid: the provenance scan reads a real host after a user as an email.
     for url, want in (("git@example.invalid:o/n.git", True), ("ssh://git@example.invalid/o/n", True),
                       ("example.invalid:o/n.git", True), ("myalias:o/n", True),
