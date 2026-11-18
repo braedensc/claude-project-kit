@@ -1483,6 +1483,18 @@ def disable_job(sx):
                              "would start it" % sx.target)
 
 
+def disable_again(sx, why):
+    """Raise `why`, a load that did not take, after disabling the job again, so off stays off. A
+    disable that fails too is said WITH it, never instead of it: the row stays FAILED, names why
+    the load failed, and says a login may now start the job."""
+    try:
+        disable_job(sx)
+    except (pu.UpdateError, Row) as exc:
+        raise pu.UpdateError("%s It could not be disabled again either (%s), so a login may start "
+                             "it." % (why, exc))
+    raise pu.UpdateError("%s It is disabled again, so a login does not start it either." % why)
+
+
 def load_job(sx, reload_it=False):
     """THE ONE PLACE `apply` LOADS THE JOB, after the consent the calling program read. A reload
     stops the older job first. `_load` enables the label, waits for launchd to let an older job go,
@@ -1500,13 +1512,10 @@ def load_job(sx, reload_it=False):
     try:
         _load(sx.env, sx.domain, sx.label, sx.plist)
     except pu.UpdateError as exc:
-        disable_job(sx)
-        raise pu.UpdateError("%s It is disabled again, so a login does not start it either." % exc)
+        disable_again(sx, str(exc))
     loaded, text = job_loaded(sx)
     if not loaded:
-        disable_job(sx)
-        raise pu.UpdateError("launchd accepted the load of %s and does not hold it. It is disabled "
-                             "again, so a login does not start it either." % sx.target)
+        disable_again(sx, "launchd accepted the load of %s and does not hold it." % sx.target)
     why = held_drift(_ns().loaded_job(text), sx)
     if why:
         raise Row(NOT_MEASURED, "launchd holds %s after the load, and %s" % (sx.target, why))
@@ -3393,13 +3402,14 @@ def _kit869(check, conf, make_env, FakeGitHub, home, kit, real_say):
         """launchd in the user's domain, with state. A disabled label does not load; a load holds a
         COPY of the job file as it is then; the job's run at load leaves its log, as launchd's does.
         `refuse` is what a load answers instead; `print_rc` what every print answers; `blind` makes
-        a print fail once the job is loaded; `no_interval` leaves the interval out of a print.
-        Every command that ran is in `ran`."""
+        a print fail once the job is loaded; `no_interval` leaves the interval out of a print;
+        `disable_rcs` answers each disable in turn (then 0). Every command that ran is in `ran`."""
 
         def __init__(self, answers):
             FakeGitHub.__init__(self, answers)
             self.held, self.disabled, self.ran = None, {}, []
             self.refuse, self.print_rc, self.blind, self.no_interval = None, None, False, False
+            self.disable_rcs = []
 
         def _exec(self, argv, stdin, timeout, cwd=None):
             self.ran.append(list(argv))
@@ -3419,7 +3429,11 @@ def _kit869(check, conf, make_env, FakeGitHub, home, kit, real_say):
                 return se.Result(0, "disabled services = {\n%s}\n" % "".join(
                     '\t"%s" => %s\n' % (k, "disabled" if v else "enabled")
                     for k, v in sorted(self.disabled.items())))
+            if verb == "disable" and self.disable_rcs and self.disable_rcs[0]:
+                return se.Result(self.disable_rcs.pop(0), "", "Operation not permitted")
             if verb in ("disable", "enable"):
+                if verb == "disable" and self.disable_rcs:
+                    self.disable_rcs.pop(0)
                 self.disabled[label] = verb == "disable"
                 return se.Result(0)
             if verb == "bootout":
@@ -3649,6 +3663,15 @@ def _kit869(check, conf, make_env, FakeGitHub, home, kit, real_say):
     check("apply: a load launchd refuses is FAILED, and the job is disabled again",
           (code, rows(doc).get("enable"), "disabled again" in details(doc)["enable"],
            env_.runner.disabled.get(label), env_.runner.held), (EX_FAILED, FAILED, True, True, None))
+    env_, path, h = place("refused-twice")
+    env_.runner.refuse = (1, "", "Bootstrap failed: 1: Operation not permitted")
+    env_.runner.disable_rcs = [0, 1]          # the job step's disable holds; the one after the load fails
+    code, doc, _o, _e = apply_(env_, path)
+    check("apply: a refused load whose disable fails too stays FAILED, and says both",
+          (code, rows(doc).get("enable"), "Bootstrap failed" in details(doc)["enable"],
+           "could not be disabled again" in details(doc)["enable"],
+           "a login may start it" in details(doc)["enable"]),
+          (EX_FAILED, FAILED, True, True, True))
     env_, path, h = place("blind")
     env_.runner.blind = True
     code, doc, _o, _e = apply_(env_, path)
