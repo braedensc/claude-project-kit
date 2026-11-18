@@ -86,3 +86,14 @@ To bring the idea gate level and skip the review jobs, add `--skip-stage-e`. A r
 - **It has not been run start to finish on a fresh Mac** with every part present (no ticket yet).
 - **Parts with an installer of their own are not moved by it.** `docs/PARTS.md` lists them, and no page yet says when each needs a re-run (no ticket yet).
 - **The review jobs' move onto work teams, and the sweep's first load,** are separate steps that this page does not walk (no ticket yet).
+
+## Telling the one command where a settings file lives
+
+The one command looks for each settings file in the kit folder. If this Mac keeps one somewhere
+else, such as a private folder, it says "off on this Mac" for that part even when the part is
+running. To fix that, have root write one small file,
+`/Library/Application Support/claude-pipeline/settings-places.json`. It is a list of file names
+and the full path of each, for example `{"bridge.conf": "/path/to/the/folder/bridge.conf"}`.
+Only root can own it; a file anyone else could change is ignored. The command reads the names
+and paths only, never what is inside the settings files. A file in the kit folder still wins.
+A part with no file in either place still reads "off", and names both places it looked.

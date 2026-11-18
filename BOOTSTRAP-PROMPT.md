@@ -205,8 +205,8 @@ human-only steps at the end.
 > the repo is org-owned or its PRs are opened by a bot (an org @mention notifies
 > nobody), and install the conflict waker myself — it starts paid sessions, so it
 > refuses to run inside one. On macOS: `cp conflict-waker.conf.example
-> conflict-waker.conf`, set `REPO_DIRS` and `CLAUDE_ARGS` (git, gh and my local gate's
-> runners), then `python3 scripts/pipeline_conflict_waker_setup.py run`. On Linux:
+> conflict-waker.conf`, set `REPO_DIRS` and `CHECK_COMMANDS` (my local gate's commands,
+> each by its exact words), then `python3 scripts/pipeline_conflict_waker_setup.py run`. On Linux:
 > schedule `scripts/pr_conflict.py wake` per docs/COLLABORATION.md item 8.
 >
 > (end of prompt)
