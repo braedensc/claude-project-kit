@@ -990,6 +990,11 @@ ACCEPTANCE_PASSED_LINE = "Its acceptance check passed."
 ACCEPTANCE_LEDGER_SCHEMA = "pipeline-acceptance-ledger/1"
 ACCEPTANCE_HEAD_RE = re.compile(r"[0-9a-f]{40}\Z")
 ACCEPTANCE_WORDS = ("passed", "held", "could-not-check")
+# KIT-610: the live pass's record, next to the ledger, of whether the head a finished plan's last pull request
+# merged at was checked (pipeline_acceptance_run.COVERAGE_SCHEMA, KIT-763). Copies, as with the ledger's schema:
+# importing the live pass here would pull the whole acceptance check into the bridge.
+ACCEPTANCE_COVERAGE_SCHEMA = "pipeline-acceptance-coverage/1"
+ACCEPTANCE_COVERAGE_SUFFIX = ".coverage.json"
 
 
 def _when(text):
@@ -3045,6 +3050,30 @@ class PlansMixin(object):
                 newest = (key, dict(row, started=at))
         return "read", (newest[1] if newest else None)
 
+    def acceptance_coverage(self, ticket):
+        """(how, entry): the live pass's record for `ticket`, from the file next to the acceptance ledger. `how` is
+        "read" (`entry` None when the file holds none for the plan: not looked at yet), "missing" when there is no
+        such file, or "unreadable" for a file that is not the schema, or an entry out of shape: never read as covered."""
+        try:
+            with open(self.cfg["acceptance_ledger"] + ACCEPTANCE_COVERAGE_SUFFIX, encoding="utf-8") as fh:
+                doc = json.load(fh)
+        except FileNotFoundError:
+            return "missing", None
+        except (OSError, ValueError):
+            return "unreadable", None
+        if not isinstance(doc, dict) or doc.get("schema") != ACCEPTANCE_COVERAGE_SCHEMA \
+                or not isinstance(doc.get("plans"), dict):
+            return "unreadable", None
+        entry = doc["plans"].get(ticket)
+        if entry is None:
+            return "read", None
+        by = entry.get("by") if isinstance(entry, dict) else None
+        if (not isinstance(entry, dict) or not isinstance(entry.get("covered"), bool)
+                or not ACCEPTANCE_HEAD_RE.match(str(entry.get("merged_head") or ""))
+                or (entry["covered"] and not ACCEPTANCE_HEAD_RE.match(str(by or "")))):
+            return "unreadable", None
+        return "read", entry
+
     def acceptance_hold(self, rec, epic, read):
         """(note key, words) when the acceptance check holds a finished plan open, or None to close
         it (KIT-325). Off unless one of its pieces' pull requests is in a repository
@@ -3066,6 +3095,22 @@ class PlansMixin(object):
             return ("acceptance-records", "%s is finished, but I can't read the acceptance check's "
                     "records, so I can't tell whether its check is running. I haven't marked it %s, "
                     "and I'll look again." % (ticket, done))
+        # KIT-610: the head the last piece merged at must have been checked. The bridge has no GitHub access, so it
+        # reads the live pass's word on it, and holds until that says covered, whichever job ran first.
+        seen, entry = self.acceptance_coverage(ticket)
+        if seen == "missing":
+            return ("acceptance-coverage-missing", "%s is finished, but the acceptance check hasn't said whether the "
+                    "code that merged was checked, so I haven't marked it %s. I'll look again." % (ticket, done))
+        if seen != "read":
+            return ("acceptance-coverage", "%s is finished, but I can't read what the acceptance check says about "
+                    "the code that merged, so I haven't marked it %s. I'll look again." % (ticket, done))
+        if entry is None:
+            return ("acceptance-coverage-waiting", "%s is finished, but the acceptance check hasn't yet looked at "
+                    "the code that merged, so I haven't marked it %s. I'll look again." % (ticket, done))
+        if not entry["covered"]:
+            return ("acceptance-coverage-uncovered:" + entry["merged_head"][:8], "%s is finished, but no acceptance "
+                    "check has run on the code that merged (%s). The check starts one on its own; I'll mark it %s "
+                    "once that passes." % (ticket, entry["merged_head"][:8], done))
         if row is None:
             return ("acceptance-waiting", "%s is finished, but its acceptance check hasn't run yet, "
                     "so I haven't marked it %s. The check runs on its own; I'll mark it %s once "
@@ -6282,10 +6327,27 @@ def cases_finish(kit):
                 row["verdict"] = {"word": word, "status": vstatus, "at": at}
             return row
 
-        def ledger_of(*rows, raw=None):
+        coverage_file = ledger + ".coverage.json"
+
+        def entry_of(merged=H, covered=True, by=H):
+            """The live pass's entry for the plan (KIT-610): the head its last piece merged at, and whether a check
+            covers it."""
+            return {"merged_head": merged, "merged_pr": 7, "merged_at": "2026-11-10T09:40:00Z",
+                    "covered": covered, "by": by if covered else None, "looked_at": "2026-11-10T09:55:00Z"}
+
+        def coverage_of(entry=None, raw=None, plans=None, schema="pipeline-acceptance-coverage/1"):
+            """The coverage file next to the ledger: by default the plan covered at H."""
+            with open(coverage_file, "w") as fh:
+                fh.write(raw if raw is not None else json.dumps(
+                    {"schema": schema, "plans": plans if plans is not None
+                     else {"PROD-50": entry or entry_of()}}))
+
+        def ledger_of(*rows, raw=None, cover=True):
             with open(ledger, "w") as fh:
                 fh.write(raw if raw is not None else json.dumps(
                     {"schema": "pipeline-acceptance-ledger/1", "rows": list(rows)}))
+            if cover:                       # most cases are about the verdict: the merged head is covered
+                coverage_of()
 
         def verdict(t, word, at, author=OWNER, plan="PROD-50", raw=None, head=H):
             mark = raw or ("<!-- pipeline-acceptance:verdict %s plan=%s head=%s mechanical=yes -->"
@@ -6295,8 +6357,9 @@ def cases_finish(kit):
                  "user": {"id": author}})
 
         def gated(name, setup=None, repos=("acme/app",)):
-            if os.path.exists(ledger):
-                os.unlink(ledger)
+            for stale in (ledger, coverage_file):
+                if os.path.exists(stale):
+                    os.unlink(stale)
             return finished(name, setup=setup, acceptance_repos=list(repos),
                             acceptance_ledger=ledger)
 
@@ -6389,6 +6452,62 @@ def cases_finish(kit):
                 return done_moves(t), len([x for x in holds(s) if needle in x])
             check("acceptance verdict %s: the plan stays open, and says so once" % word,
                   outcome(case_held), ([], 1))
+
+        # 17c. THE MERGED HEAD (KIT-610). The bridge has no GitHub access, so it cannot tell the head the last piece
+        #      merged at. A passed verdict on an earlier head must not close the plan until the live pass's record
+        #      says the merged head is covered, whichever of the two jobs ran first.
+        for word, needle, make in (
+                ("no coverage file", "hasn't said whether the code that merged was checked",
+                 lambda: os.path.exists(coverage_file) and os.unlink(coverage_file)),
+                ("coverage file not json", "can't read what the acceptance check says",
+                 lambda: coverage_of(raw="not json")),
+                ("coverage file of another schema", "can't read what the acceptance check says",
+                 lambda: coverage_of(schema="pipeline-acceptance-coverage/2")),
+                ("coverage file with no plans", "can't read what the acceptance check says",
+                 lambda: coverage_of(raw=json.dumps({"schema": "pipeline-acceptance-coverage/1"}))),
+                ("no entry for the plan", "hasn't yet looked at the code that merged",
+                 lambda: coverage_of(plans={"PROD-99": entry_of()})),
+                ("not covered", "no acceptance check has run on the code that merged (%s)" % H2[:8],
+                 lambda: coverage_of(entry_of(merged=H2, covered=False))),
+                ("covered, naming no check", "can't read what the acceptance check says",
+                 lambda: coverage_of(dict(entry_of(), by=None))),
+                ("merged head not a head", "can't read what the acceptance check says",
+                 lambda: coverage_of(dict(entry_of(), merged_head="abc"))),
+                ("covered not a boolean", "can't read what the acceptance check says",
+                 lambda: coverage_of(dict(entry_of(), covered="yes")))):
+            def case_uncovered(word=word, make=make):
+                def setup(t):
+                    passed_at()(t)          # a passed verdict, on a check that ran before the merge
+                    make()
+                c, s, t, root, code = gated("accov-" + re.sub(r"[^a-z]+", "-", word), setup=setup)
+                run(c, s, t, at=now + FINISH_RECHECK_SECONDS + 1)
+                return done_moves(t), len([x for x in holds(s) if needle in x])
+            check("coverage record, %s: the plan stays open on the earlier pass, and says so once" % word,
+                  outcome(case_uncovered), ([], 1))
+
+        def case_covered_first():
+            # The live pass ran first: the check at the merged head is the one that passed. No second check.
+            c, s, t, root, code = gated("accov-first", setup=passed_at())
+            return done_moves(t)
+        check("the live pass's record says covered by the passed check: the plan closes, with no second check",
+              outcome(case_covered_first), [("uuid-50", "st-done")])
+
+        def case_bridge_first():
+            # The bridge ran first and held. The live pass then starts a check of the merged head, records it, and
+            # the plan closes only on that check's verdict.
+            c, s, t, root, code = gated("accov-second", setup=lambda t: (
+                passed_at()(t), coverage_of(entry_of(merged=H2, covered=False))))
+            first = done_moves(t)
+            coverage_of(entry_of(merged=H2, covered=True, by=H2))
+            ledger_of(ran(), ran(head=H2, at="2026-11-10T11:00:00Z", word=None), cover=False)
+            run(c, s, t, at=now + FINISH_RECHECK_SECONDS + 1)
+            running = done_moves(t)
+            ledger_of(ran(), ran(head=H2, at="2026-11-10T11:00:00Z"), cover=False)
+            verdict(t, "passed", "2026-11-10T12:00:00.000Z", head=H2)
+            run(c, s, t, at=now + 2 * FINISH_RECHECK_SECONDS + 2)
+            return first, running, done_moves(t)
+        check("the bridge ran first and held: it closes only on the verdict of the check of the merged head",
+              outcome(case_bridge_first), ([], [], [("uuid-50", "st-done")]))
 
         def case_later_pass():
             c, s, t, root, code = gated("acc-later", setup=passed_at("held"))

@@ -707,6 +707,9 @@ verdict:
 | The newest check | What the bridge does |
 |---|---|
 | No records file where `ACCEPTANCE_LEDGER` says | Holds the plan, and says it can't find the records. |
+| No coverage file next to it, or one it can't read | Holds it, and says the check hasn't said whether the merged code was checked. |
+| The coverage file has no entry for the plan yet | Holds it. The check looks on its next pass. |
+| The entry says the merged head is not covered | Holds it, names that head, and waits for the check the live pass starts on it. |
 | None yet | Holds it. The check runs on its own after the merge, so one comes. |
 | Still running | Holds it, and says so once in its thread. |
 | Couldn't start | Holds it, and names `check <plan>`. |
@@ -727,10 +730,22 @@ head it checked before. The bridge moves nothing and starts no work itself.
 Good: `check PROD-50` on a plan held at could-not-check, then `yes`.
 Not: `check PROD-51` on a piece. The bridge says it runs no plan for it.
 
-**What it can't see.** The bridge has no GitHub access, so it can't tell the head a piece merged at.
-If a fix is pushed after the check passed, and the piece merges before a new check of it starts, the
-plan closes on the earlier pass. So merge the last piece only at a head the check passed, or send
-`check <plan>` after the merge. KIT-610 tracks closing this gap.
+**The merged head.** The bridge has no GitHub access, so it can't tell the head a piece merged at.
+The acceptance check can. Each pass it compares the head the plan's last pull request merged at with
+its records, and writes one entry per plan to `<ACCEPTANCE_LEDGER>.coverage.json`: covered, or not
+covered with that head (`docs/ACCEPTANCE-POLLER-OPERATOR.md`). The bridge closes a finished plan only
+when its entry says covered. A fix pushed after the check passed and merged before a new check of it
+started is therefore not closed on the earlier pass: the entry says not covered, the check starts one
+on the default branch, and the plan closes on that check's verdict. A plan whose last piece merged at
+the checked head closes as before, with no second check. Either job may run first after the merge.
+
+**Good:** `PROD-50 is finished, but no acceptance check has run on the code that merged (3f9a1c2e).`
+It clears by itself once the check passes.
+**Not:** a plan held for hours with `the acceptance check hasn't said whether the code that merged
+was checked`. The check's live pass isn't writing the coverage file: look at its job.
+
+Turn the live pass's side on first. A bridge with `ACCEPTANCE_REPOS` set holds every finished plan in
+those repositories until the live pass has written its entry.
 
 ### With the queue on (MVP 2)
 
