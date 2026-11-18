@@ -928,6 +928,14 @@ def selftest():
                  "DISPATCHER_SERVICE": "com.test.dispatcher", "DISPATCHER_ENV_FILE": "/opt/test/.env"}.get(
             key, "com.test.notifier")
         check("%s %s holds the shared value" % (name, key), values.get(key), value)
+    literal = [(f, "ROLE_ACCOUNT") for f in ("stage-e", "stage-a", "acceptance", "bridge", "chat-lane", "notifier",
+                                             "queue", "sweep", "update", "watcher")] + [("stage-a", "DISPATCHER_ACCOUNT")]
+    check("ROLE_ACCOUNT, typed once, is in all eleven places that need it",
+          [p for p in literal if conf_values(get(os.path.join(parts, p[0] + ".conf"))).get(p[1]) != "_pipeline"], [])
+    check("…and the notifier's label reaches its three, under their own names",
+          [conf_values(get(os.path.join(parts, f))).get(k) for f, k in (
+              ("notifier.conf", "JOB_LABEL"), ("bridge.conf", "NOTIFIER_JOB_LABEL"), ("stage-e.conf", "NOTIFIER_JOB_LABEL"))],
+          ["com.test.notifier"] * 3)
     old_q, new_q = before[os.path.join(parts, "queue.conf")][0], get(os.path.join(parts, "queue.conf"))
     check("every other byte stays", [a for a, b in zip(old_q.splitlines(), new_q.splitlines()) if a != b],
           ["ROLE_ACCOUNT=_exqueue"])
@@ -935,11 +943,16 @@ def selftest():
     check("a second write has nothing to do", run("write", *sd)[0], EX_OK)
 
     # 4. A part's own value wins, and check says so.
+    put(os.path.join(parts, "stage-a.conf"), get(kit.examples["stage-a.conf"]))
     settings("[shared]\nROLE_ACCOUNT=_pipeline\n[stage-a.conf]\nROLE_ACCOUNT=_planner\n")
     code, said = run("check", *sd)
     check("check notes a part's own value that stops a shared one",
           (code, "NOTE: stage-a.conf sets ROLE_ACCOUNT itself, so the shared ROLE_ACCOUNT does not reach "
                  "it there." in said), (EX_OK, True))
+    said = run("write", *sd)[1]
+    check("the dry run shows stage-a.conf's ROLE_ACCOUNT once, from its own section",
+          [s for s in said if s.startswith("  ROLE_ACCOUNT: ")],
+          ["  ROLE_ACCOUNT: _exdispatch -> _planner   ([stage-a.conf])"])
     run("write", "--apply", *sd)
     check("the part's own value is written there, the shared one everywhere else",
           (conf_values(get(os.path.join(parts, "stage-a.conf"))).get("ROLE_ACCOUNT"),
