@@ -446,6 +446,14 @@ def selftest():
             live.wait()
         expect("EPERM for a group whose child is already reaped is gone, and says nothing",
                (gone_v, said_gone.getvalue()), ("gone", ""))
+        try:
+            os.killpg = eperm
+            with redirect_stderr(io.StringIO()):
+                left = _stop_group(done, signal.SIGTERM)
+        finally:
+            os.killpg = real_killpg
+        expect("a group of only zombies is not a process left running, so nothing is claimed stopped",
+               left, False)
         expect("EPERM for a group whose child is still ours is denied, and said",
                (denied_v, "not allowed to signal" in said_denied.getvalue()), ("denied", True))
         pidfile = os.path.join(kept, "bg.pid")
@@ -530,10 +538,12 @@ def _stop_group(proc, first):
     if not _group_alive(proc.pid):
         proc.poll()
         return False
+    sent = False
     for sig, grace in ((first, 10), (signal.SIGKILL, 5)):
         verdict = _signal_group(proc, sig)
         if verdict == "gone":
-            break
+            return sent         # nothing was left to stop (a group of only zombies is not one)
+        sent = sent or verdict == "sent"
         deadline = time.time() + grace
         while time.time() < deadline:
             proc.poll()
