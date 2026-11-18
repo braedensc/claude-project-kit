@@ -12,7 +12,10 @@ as "block" and ANY OTHER non-zero exit (an uncaught exception → exit 1) as a
 All guards therefore run inside a fail-CLOSED boundary (`_dispatch`, bottom of
 file): if a crafted `tool_input` makes a matcher throw, we block instead of
 allowing. The workflow guards (branch / merged-PR / cross-worktree) swallow
-their own git/gh/network errors and deliberately stay fail-open.
+their own git/gh/network errors and deliberately stay fail-open. A hook that runs
+out of time is Claude Code's non-blocking error too, so the hook keeps a deadline
+of its own below the settings timeout and refuses the call when it hits it
+(HOOK_DEADLINE_SECONDS, KIT-684).
 
 Distilled from a production Claude Code hook suite (v2) — in production
 2026-06-23 → 2026-07-03 across a full build (Stages 0–6). The v2 hardening
@@ -47,9 +50,65 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 from datetime import datetime, timezone
+
+# ── The hook's own deadline (KIT-684) ─────────────────────────────────────────
+# Claude Code gives this hook the `timeout` seconds in .claude/settings.json and, when
+# they run out, treats it as a NON-blocking error: the tool call goes ahead unjudged.
+# One slow git (a locked repository, a stuck network mount) would switch every guard
+# off for that call. Every git and gh call here has its own timeout, but they add up,
+# so the hook keeps a deadline of its own, below the settings timeout, and refuses the
+# call when it hits it. The timer raises a BaseException, so no guard's `except
+# Exception` can swallow it and carry on, and the subprocess it interrupts is killed on
+# the way out. A second, short timer is the backstop: should that unwinding not finish,
+# or should the deadline land before the entry point can catch it, the process writes
+# the reason and exits 2 at once. The battery checks the two together stay under the
+# settings timeout.
+HOOK_DEADLINE_SECONDS = 7
+HOOK_DEADLINE_GRACE_SECONDS = 1
+HOOK_DEADLINE_HELP = (
+    "the hook ran out of time. It judges every tool call within its own deadline of "
+    "{seconds} seconds, under the timeout its wiring in .claude/settings.json allows, "
+    "and a call it could not judge in time is refused, never let through (KIT-684). "
+    "Usually a git call is stuck: a locked repository or a slow mount. Retry; if it "
+    "keeps happening, find what is slow."
+).format(seconds=HOOK_DEADLINE_SECONDS)
+
+
+class _HookDeadline(BaseException):
+    """The deadline's timer fired. A BaseException, so no `except Exception` stops it."""
+
+
+_DEADLINE_CATCHABLE = False      # True once the entry point can catch _HookDeadline
+
+
+def _deadline_hard_stop(_signum=None, _frame=None):
+    try:
+        os.write(2, ("[Security Hook] BLOCKED: %s\n" % HOOK_DEADLINE_HELP).encode("utf-8"))
+    finally:
+        os._exit(2)
+
+
+def _deadline_hit(_signum, _frame):
+    if not _DEADLINE_CATCHABLE:
+        _deadline_hard_stop()
+    signal.signal(signal.SIGALRM, _deadline_hard_stop)
+    signal.setitimer(signal.ITIMER_REAL, HOOK_DEADLINE_GRACE_SECONDS)
+    raise _HookDeadline()
+
+
+def _deadline_disarm():
+    """The call was judged in time: nothing is left for the timer to stop."""
+    if hasattr(signal, "setitimer"):
+        signal.setitimer(signal.ITIMER_REAL, 0)
+
+
+if hasattr(signal, "setitimer"):             # POSIX; there is no SIGALRM on Windows
+    signal.signal(signal.SIGALRM, _deadline_hit)
+    signal.setitimer(signal.ITIMER_REAL, HOOK_DEADLINE_SECONDS)
 
 
 def block(reason: str) -> None:
@@ -3691,28 +3750,37 @@ def _dispatch(data) -> None:
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
+# Everything below runs inside the deadline's catch (KIT-684): a call the hook could not
+# judge in time is refused. Past this line the deadline unwinds, killing the subprocess
+# it interrupts, rather than stopping the process where it stands.
+_DEADLINE_CATCHABLE = True
 try:
-    data = json.load(sys.stdin)
-except Exception:
-    # Fail-open on malformed input: a broken harness payload must not brick
-    # every tool call (the harness — not the model — builds this stdin). The
-    # battery asserts this behavior (case "garbage stdin").
-    sys.exit(0)
+    try:
+        data = json.load(sys.stdin)
+    except Exception:
+        # Fail-open on malformed input: a broken harness payload must not brick
+        # every tool call (the harness — not the model — builds this stdin). The
+        # battery asserts this behavior (case "garbage stdin").
+        _deadline_disarm()
+        sys.exit(0)
 
-# Fail CLOSED on internal errors: Claude Code treats a
-# non-2 nonzero exit as NON-blocking — the tool would run. If a security matcher
-# raises on a crafted/unexpected tool_input, block instead of crashing to exit 1.
-# The workflow guards inside swallow their own errors (fail-open by design), so
-# only genuine security-check failures reach here.
-try:
-    _dispatch(data)
-except SystemExit:
-    raise  # an explicit allow/deny already decided
-except Exception as exc:
-    print(
-        f"[Security Hook] internal error — failing closed ({type(exc).__name__})",
-        file=sys.stderr,
-    )
-    sys.exit(2)
+    # Fail CLOSED on internal errors: Claude Code treats a
+    # non-2 nonzero exit as NON-blocking — the tool would run. If a security matcher
+    # raises on a crafted/unexpected tool_input, block instead of crashing to exit 1.
+    # The workflow guards inside swallow their own errors (fail-open by design), so
+    # only genuine security-check failures reach here.
+    try:
+        _dispatch(data)
+    except SystemExit:
+        raise  # an explicit allow/deny already decided
+    except Exception as exc:
+        print(
+            f"[Security Hook] internal error — failing closed ({type(exc).__name__})",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    _deadline_disarm()
+except _HookDeadline:
+    block(HOOK_DEADLINE_HELP)
 
 sys.exit(0)
