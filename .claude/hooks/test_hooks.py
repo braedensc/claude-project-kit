@@ -111,6 +111,14 @@ def edit(p, new=""):
     return {"tool_name": "Edit", "tool_input": {"file_path": p, "old_string": "a", "new_string": new}}
 
 
+def notebook(p, src=""):
+    """A NotebookEdit payload as Claude Code sends it: the file is `notebook_path` and the
+    cell's text is `new_source`, so a guard that reads only `file_path` and `content` never
+    sees either (KIT-673)."""
+    return {"tool_name": "NotebookEdit",
+            "tool_input": {"notebook_path": p, "cell_id": "cell-1", "new_source": src}}
+
+
 def sub(payload):
     """Mark a payload as coming from a SUBAGENT. The CLI sets `agent_id` only for
     subagent sessions, and the hook widens the session root to the cwd's worktree
@@ -2186,6 +2194,29 @@ def main():
         ("Write OUTSIDE any worktree allowed (scratchpad/tmp)",
          write("/tmp/scratch/x.ts", "x"), ALLOW, wt_hook),
 
+        # ── KIT-673: NotebookEdit is a write, and every write guard judges it ────
+        # It names its file `notebook_path` and its text `new_source`, so the guards
+        # that read only `file_path` and `content` let it through. Each BLOCK here was an
+        # allow on the old hook; the reason cases below say which guard fired.
+        ("NotebookEdit in-project on main blocked (KIT-673)",
+         notebook(os.path.join(main_root, "nb/a.ipynb"), "x = 1"), BLOCK, main_hook),
+        ("NotebookEdit in-project on a feature branch allowed (KIT-673)",
+         notebook(os.path.join(feat_root, "nb/a.ipynb"), "x = 1"), ALLOW, feat_hook),
+        ("NotebookEdit OUTSIDE the project while on main allowed (KIT-673)",
+         notebook("/somewhere/else/a.ipynb", "x = 1"), ALLOW, main_hook),
+        ("NotebookEdit on a claude/<codename> branch blocked (KIT-673)",
+         notebook(os.path.join(codename_root, "nb/a.ipynb"), "x = 1"), BLOCK, codename_hook),
+        ("NotebookEdit into a SIBLING worktree blocked (KIT-673)",
+         notebook(os.path.join(wt_sibling, "nb/a.ipynb"), "x = 1"), BLOCK, wt_hook),
+        ("NotebookEdit into its OWN worktree allowed (KIT-673)",
+         notebook(os.path.join(wt_root, "nb/a.ipynb"), "x = 1"), ALLOW, wt_hook),
+        ("NotebookEdit with a key in the cell blocked (KIT-673)",
+         notebook("/x/a.ipynb", f"key = '{FAKE_ANTHROPIC}'"), BLOCK, HOOK),
+        ("NotebookEdit with a clean cell allowed (KIT-673)",
+         notebook("/x/a.ipynb", "print('reference the key by its env var name')"), ALLOW, HOOK),
+        ("NotebookEdit of a .env-named file blocked (KIT-673)",
+         notebook("/x/.env.ipynb", "x = 1"), BLOCK, HOOK),
+
         # ── item 7: the session root is CLAUDE_PROJECT_DIR, widened to the cwd's
         #    worktree ONLY for a genuine subagent (payload carries `agent_id`) whose
         #    cwd shares a --git-common-dir with the anchor. A subagent in its own SDK
@@ -2763,6 +2794,10 @@ def main():
          edit(os.path.join(pl_lowpin_root, "src/app.ts"), "x"), ALLOW, pl_lowpin),
         ("ticket-branch: git commit on a mismatched branch blocked",
          bash("git commit -F /tmp/msg.txt"), BLOCK, pl_wrongbr),
+        ("ticket-branch: NotebookEdit on a mismatched branch blocked (KIT-673)",
+         notebook(os.path.join(pl_wrongbr_root, "nb/a.ipynb"), "x = 1"), BLOCK, pl_wrongbr),
+        ("ticket-branch: NotebookEdit on the matching branch allowed (KIT-673)",
+         notebook(os.path.join(pl_root, "nb/a.ipynb"), "x = 1"), ALLOW, pl_hook),
         ("ticket-branch: requireTicketId off → a plain slug is fine",
          edit(os.path.join(pl_noreq_root, "src/app.ts"), "x"), ALLOW, pl_noreq),
 
@@ -3518,6 +3553,26 @@ def main():
         ("stderr reason: branch-naming guard fires in the acting worktree",
          sub(edit(os.path.join(wt_codename, "src/x.ts"), "x")), "naming convention",
          wt_hook, subagent_env, wt_codename),
+        # KIT-673: each NotebookEdit block is the guard the same Edit would meet.
+        ("stderr reason: NotebookEdit on main meets the branch guard (KIT-673)",
+         notebook(os.path.join(main_root, "nb/a.ipynb"), "x = 1"),
+         "You're on `main` in this repo, where direct edits/commits are blocked", main_hook),
+        ("stderr reason: NotebookEdit on a codename branch meets the naming guard (KIT-673)",
+         notebook(os.path.join(codename_root, "nb/a.ipynb"), "x = 1"),
+         "doesn't match this repo's naming convention", codename_hook),
+        ("stderr reason: NotebookEdit into a sibling worktree meets the cross-worktree guard "
+         "(KIT-673)",
+         notebook(os.path.join(wt_sibling, "nb/a.ipynb"), "x = 1"),
+         "Cross-worktree write blocked", wt_hook),
+        ("stderr reason: a key in a NotebookEdit cell is named (KIT-673)",
+         notebook("/x/a.ipynb", f"key = '{FAKE_ANTHROPIC}'"),
+         "Secret value pattern detected in file content (Anthropic API key", HOOK),
+        ("stderr reason: a .env-named NotebookEdit target is refused by name (KIT-673)",
+         notebook("/x/.env.ipynb", "x = 1"), "Writing to .env.ipynb is blocked", HOOK),
+        ("stderr reason: NotebookEdit on a mismatched ticket branch names the pinned ticket "
+         "(KIT-673)",
+         notebook(os.path.join(pl_wrongbr_root, "nb/a.ipynb"), "x = 1"),
+         "does not carry this session's pinned ticket ID", pl_wrongbr),
         # pipeline guards: the reason is the product — each names the fix
         ("stderr reason: grader-path block names the path",
          edit(os.path.join(pl_root, ".github/workflows/ci.yml"), "x"),

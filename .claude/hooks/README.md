@@ -59,6 +59,13 @@ widens anything).
 
 ### Universal guards (keep in every project)
 
+**NotebookEdit is a write (KIT-673).** Every row below that names Edit/Write judges a
+NotebookEdit too: the branch and branch-naming guards, the cross-worktree guard, the `.env`
+and credential-file names, and the secret values. A NotebookEdit names its file
+`notebook_path` and its text `new_source`, so a guard that read only `file_path` and the
+content let a notebook edit on `main`, into another checkout, or with a key in a cell
+straight through. The pipeline's ticket-branch guard judges it the same way.
+
 | What it blocks | Tool | Why |
 |---|---|---|
 | **Editing the hooks themselves** — `pre-tool-use.py`, `audit.py`, `stop-pr-check.py`, `session-start.py`, `session-end.py`, `.claude/settings.json`, `.claude/settings.local.json` | Edit/Write/NotebookEdit, **and** Bash mutations (`>`, `tee`, `sed -i`, `cp`/`mv`/`rm`, `chmod`/`chown`/`awk`, `git checkout/restore/reset/clean/stash/apply/rm/mv`, *any* `python`/`node`/`ruby` invocation naming a protected path) | Otherwise every block below is theater — Claude could just rewrite the guard away or unwire it in settings (`settings.local.json` overrides project scalars, so writing it could neutralize every guard for future sessions). `session-start.py` and `session-end.py` are no guards, but each runs after the session could edit it, outside the Bash sandbox: SessionStart on every resume (KIT-463), SessionEnd when the session ends (KIT-460). These files are **human-only**: to change one, Claude composes + validates a scratch copy and prints a terminal command for the human to run. Reads (`cat`/`grep`/Read) are allowed; an unresolvable target path fails **closed**. A first line, not a sandbox — the real backstop is still git + review |

@@ -416,8 +416,8 @@ Stop hook between them:
    > *What the pattern guards actually carry*). A cooperating agent that mistypes is
    > still caught every time; a motivated caller is not. Each block below therefore
    > names what it stops — and where a guarantee has to survive an adversary, the
-   > server-side layer named in item 4 is the one carrying it. The Edit/Write guards
-   > (self-protection, cross-worktree, branch) resolve real paths and refs rather than
+   > server-side layer named in item 4 is the one carrying it. The Edit/Write/NotebookEdit
+   > guards (self-protection, cross-worktree, branch) resolve real paths and refs rather than
    > matching text, and are not in that class.
 
    The blocks themselves:
@@ -430,8 +430,9 @@ Stop hook between them:
      project scalars, so writing it could neutralize every guard), so a guard can't be
      edited away or unwired — changing them is a human-only terminal step. (Reads are
      fine.)
-   - Blocks `Edit`/`Write`/`git commit` while on `main`/`master` — a new task is
-     forced onto a branch. The project's CLAUDE.md (from docs/CLAUDE-template.md)
+   - Blocks `Edit`/`Write`/`NotebookEdit`/`git commit` while on `main`/`master` — a new task is
+     forced onto a branch. A NotebookEdit names its file `notebook_path` and its text
+     `new_source`; every Edit/Write guard reads those too (KIT-673). The project's CLAUDE.md (from docs/CLAUDE-template.md)
      also tells Claude to branch *proactively* before ever hitting the block. A
      commit is also judged by the checkout it lands in (KIT-237): a persisted `cd`, a
      `cd`/`pushd` on the same line, or `git -C <dir> commit` into another worktree of
@@ -463,7 +464,7 @@ Stop hook between them:
      the remote's recorded default (`origin/HEAD`, which the config anchor now protects)
      — widening only, never read from the worktree copy. Advisory like every Bash guard;
      the Stop hook and the `PR base` workflow are the layers that do not read command text.
-   - Blocks `Edit`/`Write` whose path is in a **different worktree** than the acting
+   - Blocks `Edit`/`Write`/`NotebookEdit` whose path is in a **different worktree** than the acting
      session's (resolved via `git worktree list`) — a write into another checkout
      (classically the main checkout on `main`, reached via a stray `cd`) otherwise
      lands there silently, past every branch guard. The session's own worktree is

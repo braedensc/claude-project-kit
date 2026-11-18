@@ -299,8 +299,8 @@ _SESSION_ROOT = PROJECT_ROOT
 
 # ── Branch guard: no edits or commits while on main ─────────────────────────
 # Enforces the feature-branch workflow automatically (see docs/COLLABORATION.md).
-# Edit/Write and `git commit` are blocked whenever this repo is on a protected
-# branch, so starting new work *forces* a branch first. This is what keeps main
+# Edit/Write/NotebookEdit and `git commit` are blocked whenever this repo is on a
+# protected branch, so starting new work *forces* a branch first. This is what keeps main
 # clean and conflict-free when several people (or agents) share the repo.
 PROTECTED_BRANCHES = {"main", "master"}
 BRANCH_HELP = (
@@ -3224,7 +3224,8 @@ def _pipeline_guards(tool, inp) -> None:
     # ── ticket-branch: the branch must carry the PINNED id, case-insensitively ─
     if (cfg.get("branch") or {}).get("requireTicketId") and pinned_id:
         touches_branch = (
-            (tool in ("Edit", "Write") and _in_project(inp.get("file_path", "")))
+            (tool in ("Edit", "Write", "NotebookEdit")
+             and _in_project(inp.get("file_path", "") or inp.get("notebook_path", "")))
             or (tool == "Bash" and re.search(
                 r"\bgit\s+commit\b", _strip_prose(inp.get("command", ""))))
         )
@@ -3379,11 +3380,12 @@ def _dispatch(data) -> None:
         if _in_git_store(_spp):
             block(CONFIG_ANCHOR_HELP)
 
-    # Cross-worktree guard runs for ALL Edit/Write (not just in-project), and BEFORE
-    # the branch guard — a write into another checkout must be caught even though it
-    # is outside PROJECT_ROOT.
-    if tool in ("Edit", "Write"):
-        _fp = inp.get("file_path", "")
+    # Cross-worktree guard runs for ALL Edit/Write/NotebookEdit (not just in-project),
+    # and BEFORE the branch guard — a write into another checkout must be caught even
+    # though it is outside PROJECT_ROOT. A NotebookEdit names its file `notebook_path`,
+    # so a guard reading only `file_path` never saw it (KIT-673).
+    if tool in ("Edit", "Write", "NotebookEdit"):
+        _fp = inp.get("file_path", "") or inp.get("notebook_path", "")
         _owner = _owning_worktree(_fp, _worktree_roots()) if _fp else None
         if _owner and _owner != PROJECT_ROOT:  # both realpath'd
             try:
@@ -3395,7 +3397,8 @@ def _dispatch(data) -> None:
             block(CROSS_WORKTREE_HELP.format(owner=_owner, here=PROJECT_ROOT, suggested=_suggested)
                   + _ROOT_NOTE)
 
-    if tool in ("Edit", "Write") and _in_project(inp.get("file_path", "")):
+    if tool in ("Edit", "Write", "NotebookEdit") and _in_project(
+            inp.get("file_path", "") or inp.get("notebook_path", "")):
         branch = _current_branch()
         if branch in PROTECTED_BRANCHES:
             block(BRANCH_HELP.format(branch=branch) + _ROOT_NOTE)
@@ -3603,8 +3606,10 @@ def _dispatch(data) -> None:
             )
 
     # ── Edit / Write ──────────────────────────────────────────────────────────
-    if tool in ("Edit", "Write"):
-        path = inp.get("file_path", "")
+    # A NotebookEdit is judged here exactly as an Edit is: its file is `notebook_path`
+    # and its text is the cell's `new_source` (KIT-673).
+    if tool in ("Edit", "Write", "NotebookEdit"):
+        path = inp.get("file_path", "") or inp.get("notebook_path", "")
         basename = os.path.basename(path)
 
         # Block writing to real .env files
@@ -3621,7 +3626,8 @@ def _dispatch(data) -> None:
             )
 
         # Block embedding secret values in any file content
-        content = inp.get("new_string", "") or inp.get("content", "")
+        content = (inp.get("new_string", "") or inp.get("content", "")
+                   or inp.get("new_source", ""))
         SECRET_PATTERNS = [
             (r"sk-ant-[a-zA-Z0-9\-_]{20,}", "Anthropic API key (sk-ant-…)"),
             (r"(?:supabase|postgres)://[^:@\s]+:[^@\s]{8,}@", "DB connection string with password"),
