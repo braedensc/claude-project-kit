@@ -25,7 +25,7 @@ its job are KIT-517. The way it pauses the system is KIT-515, and its urgent pag
 **What `outside-files` counts as named (KIT-831).** The files and areas a ticket names are the path-like words in
 its title and description: a word with a `/` or a file extension, such as `scripts/foo.py`, `docs/` or `*.md`. A
 changed file is named if it is one of them, is under a named folder, matches a named glob, has a named bare file
-name, or sits in the same folder as a named file. The ticket is the one the pull request's branch name claims, and
+name, or is a test companion of a named file (same folder, with the same name, a `test_` prefix or a `_test` suffix). The ticket is the one the pull request's branch name claims, and
 a branch is the worker's own word, so this is a tripwire, not a lock. It reads a scope only from a ticket a
 trusted user wrote (`tracker_trusted_users`). It needs `repos`, the three tracker settings and the GitHub token,
 and is on whenever `tracker-text` is.
