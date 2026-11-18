@@ -214,7 +214,11 @@ fails or times out fails the check too: it has not shown that it cleans up.
 **A SIGTERM is checked on its own.** `python3 scripts/check_temp_leaks.py --sigterm 1` runs
 every battery again and sends each one SIGTERM one second in, with nothing gentler first,
 to its whole process group. That is how a session's Bash timeout ends a run. Anything left
-then fails, and so does a battery that does not end within 15 seconds of the signal.
+then fails, and so does a battery that does not end within 30 seconds of the signal. The
+slowest battery (the Stage E installer's) ends in 0.1 to 0.2 s on a Mac at five signal times,
+and in 0.1 s in each of five runs with ten busy loops running beside it (17 Nov 2026). That does
+not reproduce the runner; on 13 Nov 2026 a busy hosted runner once took 15.1 s against the old limit of 15 (KIT-755),
+so the limit is twice that worst case.
 The **Temp-leak sweeps** job runs both passes, beside **Kit checks** (KIT-617).
 
 **A new selftest needs a `test:*` script in package.json.** The check runs only what
