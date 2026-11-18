@@ -2514,8 +2514,14 @@ A pull request that goes `CONFLICTING` after its session stopped skips its requi
 It can sit there looking green. The conflict monitor sees it and posts a **fix request** on
 the pull request. It allows three per pull request, ever, or the number the repository sets with
 `--max-fix-requests`. Then something must answer. The bounce driver stops at the same number, so
-update the role account's clone before you raise it. It reads that number from the request. A forged
-request from the repository's own bot account could raise it, to 20 at most.
+update the role account's clone before you raise it. It reads that number from the requests on the
+pull request and keeps the lowest one, so a later request can lower it but never raise it. A forged
+request from the repository's own bot account can stop fixes, but it cannot buy one.
+
+A raise reaches only pull requests whose first fix request comes after it. A pull request that was
+asked before keeps the old number: the driver stops there, the monitor's next request goes
+unanswered, and the monitor pages a person when its answer deadline passes. A lower number applies
+at the next request.
 
 **Who answers depends on who owns the session. Never both.**
 

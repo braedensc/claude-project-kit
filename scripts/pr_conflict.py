@@ -147,7 +147,9 @@ MARKERS (the whole producer/consumer contract)
 
   A request states its fix limit when that is not the default of 3: `limit=` and the number,
   0 to 20, spelled in letters. The bounce driver cannot read the monitor's argument, so it
-  reads the limit here (`fix_limit`) and a request that states none means 3. Letters, because
+  reads the limit here (`fix_limit`) and a request that states none means 3. It counts against
+  the lowest limit any request on the pull request states (`fix_cap`), so a later request can
+  lower its count but never raise it (KIT-749). Letters, because
   an older copy of this grammar takes none but letters in a value and would drop a request
   with a digit in it. Anything else in the attribute is the default.
 
@@ -210,11 +212,13 @@ MAX_FIX_REQUESTS = 3          # automated attempts per PR, lifetime; the 4th con
 # paths, so it is the only knob that needs to exist for that.
 # ONE SOURCE (KIT-670). The monitor reads the limit once, from its argument. Each request it
 # writes STATES a limit that is not the default (`limit=five`), and the bounce driver reads the
-# limit from that request through `fix_limit`: it holds no number of its own, so the two cannot
+# limit from the requests through `fix_cap`: it holds no number of its own, so the two cannot
 # stop at different counts. A request that states none means MAX_FIX_REQUESTS.
 # The limit is the bot's own word. Only a request the Actions bot wrote is read, and nothing above
-# FIX_LIMIT_MAX is ever stated or counted, but a forged request from the bot account itself could
-# still raise the driver's cap, to that ceiling (KIT-749 tightens it).
+# FIX_LIMIT_MAX is ever stated or counted. The driver keeps the LOWEST limit any request on the
+# pull request states (KIT-749), so a request forged from the bot account itself can lower its cap
+# but never raise it. The cost: a limit raised while a pull request is in flight does not reach
+# that pull request; its next request goes unanswered and the monitor pages at its ack deadline.
 # The number is spelled in letters on purpose. `MARKER_RE` takes only lowercase letters and
 # hyphens in a value, and every copy of this file already deployed (a monitor in another
 # repository, a waker, the role account's clone) runs that grammar until it is updated: `limit=5`
@@ -292,7 +296,8 @@ def limit_attrs(limit):
 
 def fix_limit(mark):
     """The fix limit a parsed request marker states, else MAX_FIX_REQUESTS (KIT-670). THE ONE
-    PLACE A LIMIT IS READ: the bounce driver counts against this and nothing else.
+    PLACE A MARKER'S LIMIT IS READ. The bounce driver counts against the lowest of them
+    (`fix_cap`), never against one request alone.
 
     Only a request marker states one, and `parse_marker` has already refused a request from
     anyone but the Actions bot, so a marker anybody else writes states nothing. The same
@@ -300,13 +305,38 @@ def fix_limit(mark):
     FIX_LIMIT_MAX or not text is the default, never an exception, and never more than the ceiling.
 
     The limit is the bot's own word, so it is only as trustworthy as the bot's comments: a forged
-    request from the bot account itself could state up to FIX_LIMIT_MAX, the most the driver's cap
-    can ever reach (KIT-749 tightens it)."""
+    request from the bot account itself can state up to FIX_LIMIT_MAX. That is why the driver's
+    cap is the lowest limit stated, which such a request can lower but never raise (KIT-749)."""
     if not isinstance(mark, dict) or mark.get("kind") != "request":
         return MAX_FIX_REQUESTS
     attrs = mark.get("attrs")
     word = attrs.get("limit") if isinstance(attrs, dict) else None
     return LIMIT_BY_WORD.get(word, MAX_FIX_REQUESTS) if isinstance(word, str) else MAX_FIX_REQUESTS
+
+
+def fix_cap(state):
+    """The most conflict fixes the bounce driver sends for one pull request (KIT-749): the LOWEST
+    limit any request the Actions bot wrote on it has stated, in any episode, else
+    MAX_FIX_REQUESTS. `state` is `episode_state`'s answer.
+
+    A later request can lower the cap and never raise it. Any workflow holding a write token can
+    post as the Actions bot, so a forged request is possible; it can only stop fixes, never buy one
+    an earlier request did not allow. A forged FIRST request is held to the lowest limit a later
+    one states, and the monitor's own requests state the limit set on the default branch, which
+    no session can change.
+
+    The price, by design: a limit the repository RAISES while a pull request is in flight does not
+    reach that pull request. Its earlier requests stated the old limit, so the driver stops there,
+    the monitor's next request goes unanswered, and the monitor pages a person at its ack deadline
+    (ACK_DEADLINE_MIN). A pull request whose requests all come after the raise gets the new limit.
+    A LOWER limit takes effect at the next request.
+
+    Anything but a state with a list of limits, and a state with no request, is the default,
+    never an exception."""
+    limits = state.get("limits") if isinstance(state, dict) else None
+    stated = [n for n in limits if isinstance(n, int) and not isinstance(n, bool)
+              and 0 <= n <= FIX_LIMIT_MAX] if isinstance(limits, list) else []
+    return min(stated) if stated else MAX_FIX_REQUESTS
 
 
 def _ts(value):
@@ -345,6 +375,9 @@ def episode_state(comments):
     return {
         "requests": sum(1 for m in marks if m["kind"] == "request"),
         "pages": sum(1 for m in marks if m["kind"] == "page"),
+        # The limit each request states, in comment order: the bounce driver's cap is the lowest
+        # of them (`fix_cap`, KIT-749). Only the Actions bot's requests reach `marks`.
+        "limits": [fix_limit(m) for m in marks if m["kind"] == "request"],
         "opened": len(opened),
         "latest": latest,
         "episode": n,
@@ -1581,6 +1614,33 @@ def selftest():
     for kind_, who in (("ack", _human), ("result", _human), ("page", _bot), ("escalated", _bot)):
         m = parse_marker(who(marker(kind_, 1, limit="twenty"), 5))
         expect(m is not None and fix_limit(m) == 3, f"a {kind_} marker states no limit, whatever it carries")
+
+    # 2g. THE DRIVER'S CAP IS THE LOWEST LIMIT STATED (KIT-749). The bounce driver counts against
+    #     `fix_cap`: the lowest limit any request the Actions bot wrote on the pull request states, in
+    #     any episode. A later request can lower it and never raise it, so a request the bot account
+    #     itself forged buys no fix an earlier request did not allow.
+    def cap(*comments):
+        return fix_cap(episode_state(list(comments)))
+    expect((cap(), fix_cap(None), fix_cap({})) == (3, 3, 3) == (MAX_FIX_REQUESTS,) * 3,
+           "no request, or no state at all, must be the default cap")
+    got = (cap(_bot(marker("request", 1), 30), _bot(marker("request", 2, limit="twenty"), 10)),
+           cap(_bot(marker("request", 1, limit="five"), 30), _bot(marker("request", 2, limit="twenty"), 10)))
+    expect(got == (3, 5), f"a later request from the bot stating twenty must not raise the cap: {got}")
+    got = cap(_bot(marker("request", 1, limit="five"), 30), _bot(marker("request", 2, limit="two"), 10))
+    expect(got == 2, f"a later request must be able to lower the cap: five then two is 2, got {got}")
+    got = cap(_bot(marker("request", 1, limit="twenty"), 30), _bot(marker("request", 2), 10))
+    expect(got == 3, f"a forged FIRST request must be held to the lowest a later one states: {got}")
+    got = cap(_bot(marker("request", 1, limit="zero"), 30), _bot(marker("request", 2, limit="five"), 10))
+    expect(got == 0, f"a stated zero must hold, never read as the default: {got}")
+    got = cap(_bot(marker("request", 1, limit="five"), 30), _human(marker("request", 2, limit="one"), 10))
+    expect(got == 5, f"a request anyone but the Actions bot wrote must not lower the cap either: {got}")
+    for odd in ({"limits": None}, {"limits": "five"}, {"limits": [True, False]}, {"limits": [21, -1, "3", 2.5]},
+                {"limits": []}, [], "limits", 3):
+        try:
+            got = fix_cap(odd)
+        except Exception as exc:       # noqa: BLE001  (the point: nothing may raise)
+            got = exc
+        expect(got == 3, f"fix_cap({odd!r}) must be the default, never an exception: {got!r}")
 
     # 2f. A READER SHIPS BEFORE ITS WRITER (KIT-670). Copies of this file already deployed — a monitor
     #     in another repository, a waker, the role account's clone — read markers with the code below.
