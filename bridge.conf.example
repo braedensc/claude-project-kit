@@ -76,6 +76,14 @@ TURN_BIN=/opt/homebrew/bin/claude
 # hand-over of approved plans. How often it asks, in seconds.
 #QUEUE_CONFIG=
 #QUEUE_EVERY_SECONDS=900
+# Our own runner (KIT-645). With both set, a queued start on a listed repository is a code
+# request to the runner, and nothing is handed over, while the runner's own lanes.code for
+# that project is on: that one setting switches a project, and back. The runner's settings
+# file, as the role account sees it, and each OWNER/REPO=project, comma-separated, project
+# being its key in the runner's settings. Needs QUEUE_CONFIG. Empty: every start is a
+# hand-over, as before.
+#RUNNER_SETTINGS=
+#RUNNER_REPOS=
 # The to-do state an approved epic moves to.
 #READY_STATE=Todo
 # The done state an approved epic moves to once every piece of it is merged.

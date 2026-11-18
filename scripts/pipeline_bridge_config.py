@@ -312,9 +312,10 @@ def runner_lane_setting(raw, queue_config):
             and runner_store.PROJECT_RE.match(v) for k, v in repos.items())):
         errors.append("config 'runner_lane.repos' must map each OWNER/REPO to its project key in "
                       "the runner's settings")
-    if not (isinstance(path, str) and path.strip() and "\0" not in path):
-        errors.append("config 'runner_lane.settings_file' must be the path of our own runner's "
-                      "settings file")
+    if not (isinstance(path, str) and path.strip() and "\0" not in path
+            and os.path.isabs(os.path.expanduser(path.strip()))):
+        errors.append("config 'runner_lane.settings_file' must be the full path of our own "
+                      "runner's settings file, or start with ~/")
     if not errors and repos and not queue_config:
         errors.append("config 'runner_lane' needs 'queue_config': the queue's starts are what "
                       "go to the runner")
@@ -1066,7 +1067,7 @@ def cases_config(kit):
                validate_config(dict(EXAMPLE_CONFIG, state_dir=os.path.join(tmp, "r1"), queue_config=queue_file,
                                     runner_lane=wired))["runner_lane"],
                validate_config(dict(EXAMPLE_CONFIG, state_dir=os.path.join(tmp, "r2"),
-                                    runner_lane={"settings_file": "x", "repos": {}}))["runner_lane"]),
+                                    runner_lane={"settings_file": "/x", "repos": {}}))["runner_lane"]),
               ({}, dict(wired, settings_file=os.path.realpath(wired["settings_file"])), {}))
         for name, lane, queue, want in (
                 ("without the queue", wired, "", "'runner_lane' needs 'queue_config'"),
@@ -1075,7 +1076,9 @@ def cases_config(kit):
                 ("a project key that is not one", dict(wired, repos={"acme/app": "App"}), queue_file,
                  "'runner_lane.repos' must map each OWNER/REPO"),
                 ("no settings file", dict(wired, settings_file=""), queue_file,
-                 "'runner_lane.settings_file' must be the path"),
+                 "'runner_lane.settings_file' must be the full path"),
+                ("a relative settings file", dict(wired, settings_file="runner.json"), queue_file,
+                 "'runner_lane.settings_file' must be the full path"),
                 ("a key it does not know", dict(wired, store_dir="/x"), queue_file,
                  "config 'runner_lane' must be {")):
             check("config-runner-lane-refuses-%s" % name.replace(" ", "-"),

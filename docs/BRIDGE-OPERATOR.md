@@ -792,6 +792,28 @@ Good: `acted: the queue handed PROD-7 to the agent (todo)`.
 Not that: `QUEUE: the tracker could not be read (the tracker did not answer); nothing more
 starts this pass`. Check the tracker key, then wait for the next pass.
 
+**On a project that codes on our own runner (KIT-645).** Set `RUNNER_SETTINGS` to the runner's
+settings file and `RUNNER_REPOS` to each `OWNER/REPO=project`, then run `install --apply`.
+Nothing changes until the runner's own `lanes.code` for that project is on (`docs/RUNNER.md`):
+that one setting switches it, and back. Then, on that repository:
+
+- The queue's start is a code request to the runner, and nothing is handed to the agent. A
+  plan's piece goes the same way, and its thread says "Asked our runner to start".
+- The runner judges it with the queue's own judge, moves it to In Progress and starts the
+  session. Each pass reads its answer. A start gets the comment naming who approved it.
+- A refusal, or no answer in 30 minutes, ends the pass loud once, in the runner's words. A
+  refused ticket is asked again only once you approve it again.
+- `start` and `retry` are refused there in words: move the ticket into Todo yourself. A piece the
+  plan's limit stopped is let go, and the log says so.
+- Runner settings it cannot read, or the lane on while the runner is off, start nothing on that
+  repository either way, and the pass ends loud.
+
+Good: `acted: the queue asked our runner to start PROD-7 (todo)`, then, a pass later, `acted: our
+runner started PROD-7 (run run-…)`.
+Not that: `the queue: our runner refused to start PROD-14: the queue's judge admitted PROD-14 by
+its limits, with no named approver …`. PROD-14 is an agent-filed finding nobody approved: move it
+into Todo yourself to start it.
+
 **When the watcher has held new starts (KIT-528).** The watcher can hold every new start
 (contract section 20). The bridge finds the hold file through `QUEUE_CONFIG`, the one place it
 is named, so with no `QUEUE_CONFIG` the bridge knows no hold file and reads none. With it:

@@ -10,7 +10,8 @@ The formats it reads and writes: `docs/PIPELINE-CONTRACT.md` section 28, and sec
 ## Where it stands
 
 - **Built, and off.** It is built beside the third-party dispatcher, which still runs every session.
-- **No lane uses it yet.** Each lane moves later, one at a time, on the owner's yes, a drill repository first.
+- **No lane is on yet.** The coding lane and the fix lane are built. Each lane is switched on later,
+  one project at a time, on the owner's yes, a drill repository first. See "The coding lane".
 - **Nothing installs it yet.** Its installer comes with the first lane that moves.
 - **No real session goes through it yet.** Its selftest runs it against a stand-in program.
 
@@ -42,12 +43,20 @@ any other way keeps its own reason.
 
 Before it starts anything, it checks the request against the tracker:
 
-- The ticket's whole history must show the owner's own move into an approved state for that kind.
-- The newest move counts for a code or plan start. Any of his moves counts for the kinds that follow.
+- **A code start** is judged by the queue's own reader and judge, called as they are (KIT-645). It
+  starts only a ticket the judge admits with a named approver: the owner's move, his creation where
+  the judge counts one, his approval of a plan in Slack, or the validator in his place while its
+  pieces switch is on. One rule, for the queue and the runner.
+- **Any other start** needs the owner's own move into an approved state for that kind, in the
+  ticket's whole history: the newest move for a plan start, any move for the kinds that follow.
+- **A resume** needs any move of the owner's, or the approval the runner recorded for the start of
+  the work it carries on. A piece of a plan approved in Slack has no move of his in its history.
 - The old dispatcher's own user never approves. A history it cannot read whole approves nothing.
 
 Good: the owner moved ENG-12 to Todo. The queue asks for a code session. It starts.
 Not: someone else moved ENG-12 to Todo. The request is refused, and says why.
+Not: the queue's limits admitted ENG-14, an agent-filed finding nobody approved. The runner refuses
+it, and the bridge's pass ends loud once. The owner's own move of it into Todo starts it.
 
 Who asked is reporting, not authority. Under one account any process that can write the store can
 name any caller. The tracker check is the authority. The store's walls and the session's sandbox
@@ -74,7 +83,8 @@ ticket's effort label.
 
 Every run is held to three limits, and the machine to a floor. Each sits far above any real run: a
 limit hit in normal use is a defect. Each kind of session also has its own ceilings (below), and a
-run is held to the smaller of the two.
+run is held to the smaller of the two. Its time is held to its own pin's `maxMinutes` too: the
+project's budget for the ticket's effort (KIT-645). A pin the runner cannot read is told once.
 
 | Limit | What it measures | Default |
 | --- | --- | --- |
@@ -245,9 +255,9 @@ program keeps from Bash (`bash-token` says whether it did).
 
 **No kind needs `gh` in a session.** `gh` fails TLS inside the built-in sandbox (`x509: OSStatus
 -26276`, measured 18 Nov 2026): the sandbox keeps the system's trust service from it, and the fix is
-not a wider network. When coding sessions move (KIT-645), they push with git and open a pull request
-through the kit's plain HTTPS fallback, `scripts/gh_fallback.py`. The probe measures the TLS of both,
-so the `gh` row stays information.
+not a wider network. A coding session will push with git and open its pull request through the kit's
+plain HTTPS fallback, `scripts/gh_fallback.py`, once it has a GitHub credential (see "The coding
+lane"). The probe measures the TLS of both, so the `gh` row stays information.
 
 Before any session, the probe asks the program for its version and its help. If the help lacks an
 option the command line uses, the probe stops and names it: a program that meets an unknown option
@@ -297,6 +307,50 @@ through `file_finding`, where the cap of three holds.
 role account's, mode 0600, outside the work and home folders. The readers must trust that user. The
 finding filer's `agent_user_id` and the bridge's agent user must both name it.
 
+## The coding lane
+
+A coding session runs through the runner when its project's `lanes.code` is on (KIT-645). That one
+setting switches a project, and setting it back to false switches it back.
+
+1. **The queue asks.** The queue's starter decides as before. The bridge does the starting: for a
+   repository its `runner_lane` wires to a runner project whose code lane is on, its one hand-over
+   writes a code request to the runner. Nothing is delegated in the tracker. A plan's piece the
+   queue starts goes the same way.
+2. **The runner judges it** with the queue's own reader and judge, strictly: a named approver, or
+   no start (see "What it does").
+3. **It moves the ticket into its working state** as the program starts: delivery.json's
+   `linear.stateIds.working`, with the session writer's key, checked as the writer's and never an
+   owner's. So the ticket's history says the run began, and the move never reads as an approval.
+   This is the runner's one write to the tracker. Not taken, nothing is left, and the request waits.
+4. **The pin carries the budget, the mode and the criteria.** The program gets `--max-turns` and
+   `--max-budget-usd` from it, and the run is held to its `maxMinutes`. The kit's guard reads the
+   pin beside the lane marker: its rules are added to the lane's, which still hold (contract
+   section 3). That guard change is the owner's to apply, as every hook change is.
+5. **The session uses its five tools** for its ticket, and has no other way to write to the tracker.
+6. **The bridge reads the answer** each pass. A start gets the comment naming who approved it. A
+   refusal ends the bridge's pass loud once, in the runner's words. So does a request with no
+   answer in 30 minutes. A ticket refused for one approval is asked again only on a newer one.
+
+To switch a project on, the runner's settings need `session_tools` and `queue_config`, and the
+bridge's `runner_lane` names the repository's runner project. The fix driver's own setting sends
+its fixes to the runner (KIT-765).
+
+**Not on this lane yet.**
+
+- **Its pull request.** A session holds no GitHub credential yet: the adapter has no source for one.
+  So a code session can commit but not push or open its pull request. The next piece (KIT-886)
+  gives code, fix and conflict runs the dispatcher's push token, read by the runner from a file no
+  session can read. The lane's first live run waits on it.
+- **The tech lead's own start.** On a switched project, the tech lead refuses `start` and `retry`
+  in Slack, in words, and the queue lets go of a piece the plan's limit stopped. The runner starts
+  a ticket only on its approver's move. The runner's own way to start, retry and resume a piece
+  must land before any real project's coding lane is switched on, or the owner loses `start` there.
+
+Good: the owner moves ENG-12 into Todo on a switched project. The queue asks the runner, ENG-12
+moves to In Progress as the session writer, and the session's comments come through its own tools.
+Not: the owner types `start ENG-12` in Slack on a switched project. The tech lead says to move it
+into Todo instead, and nothing is handed to the old dispatcher.
+
 ## Settings
 
 One JSON file. The example is `runner.example.json`. `~/` means the account's own home.
@@ -318,7 +372,8 @@ One JSON file. The example is `runner.example.json`. `~/` means the account's ow
 | `max_starts_per_ticket` | A runaway's limit on starts of one ticket and kind. | `20` |
 | `hold` | The watcher's hold file (contract section 20). Set, nothing starts. | none |
 | `limits` | `wall_minutes`, `memory_mb`, `disk_mb`, `check_seconds` (how often trees and folders are measured) and `room` (the floor). See "Its limits". | above |
-| `session_tools` | `key_file`, the session writer's tracker key, and `writer_user_id`, the user it must belong to, never an owner. See "The session's own tracker tools". Absent, no session gets tracker tools. | none |
+| `session_tools` | `key_file`, the session writer's tracker key, and `writer_user_id`, the user it must belong to, never an owner. See "The session's own tracker tools". Absent, no session gets tracker tools, and no code, fix or conflict lane may be on. | none |
+| `queue_config` | The queue's settings file, whose reader and judge approve each code start. No code lane may be on without it. | none |
 | `projects` | Each project: `repo` (the runner's own clone), `base`, `lanes`, `approval_states` per kind, `allowed_hosts`. | required |
 
 The four folders must not sit inside one another.
@@ -373,6 +428,10 @@ Each refusal says why, in the request's answer (`<store_dir>/taken/<id>.json`).
 | It says | What to do |
 | --- | --- |
 | the ticket's newest move was not the owner's | The owner moves the ticket himself. |
+| the queue's judge does not admit ENG-12 (a reason) | The judge's own reason, from the queue's pool: the owner moves it, or it is not ready. |
+| the queue's judge admitted ENG-12 by its limits, with no named approver | An agent-filed finding: the owner's move into the ready state starts it. |
+| the ticket could not be moved to its working state | Nothing to do: nothing was made, the request waits, and the next pass tries again. |
+| a code lane that is on needs session_tools, or queue_config | Settings: set both before switching a project's code lane on. |
 | a workspace is there already | The sweep removes old workspaces. A new start needs a fresh one. |
 | the project has no committed delivery.json | The project is not set up for the pipeline. |
 | `<name>` is not set | The sign-in token's variable is missing from the job's environment. |
@@ -402,8 +461,11 @@ The runner refuses to start from inside a Claude session, or as root.
   a tool server, started outside Bash's sandbox, so nothing should nest. It joins that kind with
   the acceptance lane (KIT-708), and the probe gains a row for it then.
 - That a real session calls its own tracker tools, and that Linear takes their comments. Their
-  selftest runs the real server over stdio against a stand-in tracker. The first coding lane on
-  the runner (KIT-645) is the first live run.
+  selftest runs the real server over stdio against a stand-in tracker. One real ticket from the
+  owner's yes to a reviewed pull request on the coding lane is the first live run, on the owner's
+  Mac, once the runner is installed.
+- That Linear takes the runner's move as the session writer, and that the queue's judge reads a
+  real board inside a pass. The selftest runs the queue's own reader over a stand-in board.
 - How the owner's answer to a session's question reaches the work again on this lane. The
   notifier pages the question as today. Taking the answer back to the session by resume is
   KIT-707's.
