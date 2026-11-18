@@ -334,6 +334,11 @@ twice on doc-tail merges before these rules existed:
      and none of the worktree's. Its file tools reach only its worktree. Its commands run
      in Claude Code's sandbox, which refuses writes outside the worktree. It may run only
      the git and gh steps its prompt names, plus your `CHECK_COMMANDS`.
+   - **Its commands read none of your home but what their tools need (KIT-786).** Open:
+     the worktree and its checkout, git's settings, `~/.nvm`, `~/.pyenv` and the login
+     keychain file. `/Users`, `/Volumes`, the temp folders and other sessions' scratchpads
+     are refused too. A check whose program lives elsewhere in your home is refused by
+     preflight. The Stage E guide's waker section says what stays readable, and why.
    - **`CHECK_COMMANDS` names your whole local gate**, each check by its exact words
      (`conflict-waker.conf.example` has the kit's line). A check left out is never run, and
      the fix is pushed with only CI to test it. The dry run prints the whole list for you to
