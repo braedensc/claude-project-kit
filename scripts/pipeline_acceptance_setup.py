@@ -1426,6 +1426,8 @@ def _cases(check, tmp):
     check("pins: the entry name, the profile path and the tool's name are the live pass's and the look tool's own",
           (ENTRY_PREFIX == arun.ENTRY_PREFIX, look.PROFILE.endswith("/%s/%s" % (PROFILE_DIR, PROFILE_FILE)), look.TOOL["name"]),
           (True, True, "look_run"))
+    check("pins: Stage E's installer skips the entries named by the live pass's own prefix (KIT-622)",
+          se.ACCEPTANCE_ENTRY_PREFIX, arun.ENTRY_PREFIX)
 
 
 if __name__ == "__main__":
