@@ -328,10 +328,18 @@ twice on doc-tail merges before these rules existed:
 
    - **`REPO_DIRS` names every project.** A checkout left out is never claimed. Parallel
      sessions in two projects means both roots, comma-separated.
-   - **`CLAUDE_ARGS` covers the whole prompt.** A headless session gets only the tools it
-     is given. The prompt uses git, gh, and the local checks your `CLAUDE.md` names, so
-     allow each runner. Missing git or gh ends `failed` and pages you; missing the gate's
-     runners pushes an untested merge. `conflict-waker.conf.example` has the kit's line.
+   - **A fix session is held to its worktree (KIT-676).** It loads none of your settings
+     and none of the worktree's. Its file tools reach only its worktree. Its commands run
+     in Claude Code's sandbox, which refuses writes outside the worktree. It may run only
+     the git and gh steps its prompt names, plus your `CHECK_COMMANDS`.
+   - **`CHECK_COMMANDS` names your whole local gate**, each check by its exact words
+     (`conflict-waker.conf.example` has the kit's line). A check left out is never run, and
+     the fix is pushed with only CI to test it. The dry run prints the whole list for you to
+     sign. `CLAUDE_ARGS` is gone, and a conf that still sets it is refused by name.
+   - **Each `REPO_DIRS` checkout needs an HTTPS origin, and git's own credential helper.**
+     git cannot use SSH inside the sandbox on macOS, and gh cannot hand git its login there.
+     So preflight refuses an SSH origin, and a helper that runs gh (`gh auth setup-git` writes
+     one), naming the fix. macOS's `osxkeychain` helper works.
    - **`CLAUDE_CONFIG_DIR` is read at install.** The job keeps the value your shell had
      then (else `~/.claude`). Change it later and re-run `run`, or the waker finds no
      transcripts and every conflict pages you. Preflight refuses a directory with none.

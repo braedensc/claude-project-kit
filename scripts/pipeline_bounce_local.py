@@ -8254,8 +8254,9 @@ def selftest():
           re.search(r"subprocess\.run\(\[\"(?!gh\"|git\")", src) is None
           and re.search(r"subprocess\.run\(argv", src) is not None, True)
     # The conflict marker grammar is imported from pr_conflict.py, and that module also holds
-    # the local waker — the half that starts sessions OUTSIDE any sandbox. This driver's lane
-    # is the session's own thread, so it may read and write markers and must never wake.
+    # the local waker — the half that starts sessions as the owner, with the owner's GitHub
+    # login. This driver's lane is the session's own thread, so it may read and write markers
+    # and must never wake.
     check("the driver never reaches for the conflict waker (it answers in the session's thread)",
           [name for name in ("wake", "wake_pass", "run", "FIX_PROMPT", "refuse_waker", "Gh")
            if ("prc." + name + "(") in src or ("prc." + name + ")") in src
