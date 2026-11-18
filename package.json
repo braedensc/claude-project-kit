@@ -83,6 +83,7 @@
     "test:validator-brief": "python3 scripts/pipeline_validator_brief.py --selftest",
     "test:validator-run": "python3 scripts/pipeline_validator_run.py --selftest",
     "test:validator-merge": "python3 scripts/pipeline_validator_merge.py --selftest",
+    "test:validator-pieces": "python3 scripts/pipeline_validator_pieces.py --selftest",
     "test:validator-limits": "python3 scripts/pipeline_validator_limits.py --selftest",
     "test:validator-route": "python3 scripts/pipeline_validator_route.py --selftest",
     "test:tech-lead-turn": "python3 scripts/pipeline_tech_lead_turn.py --selftest",

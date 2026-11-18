@@ -597,7 +597,7 @@ def run(cfg, dry_run=False, clock=None, runner=None, say=print):
     paced = dict(paced, sprint_planned=planned_for_sprint(cfg, usage))
     verdicts = pool.decide(cfg["pool"], now, inputs["tickets"], inputs["epics"],
                            inputs["histories"], inputs["busy"], inputs["findings"],
-                           inputs["plans"], inputs["ledger"])
+                           inputs["plans"], inputs["ledger"], inputs.get("validator"))
     pieces = with_extras(verdicts, inputs["extras"])
     result, said, cost = plan_the_day(cfg, pieces, dry_run, runner)
     given = pieces if result["planned_by"] == "queue" else batch(pieces, result["lanes"])

@@ -364,6 +364,8 @@ npm run test:validator-run   # the validator agent's run (KIT-537): one tool-les
                              #   environment pinned, a failure a hold in fixed words, only its job starts it
 npm run test:validator-merge  # the merge path (KIT-539): GitHub's own auto-merge on one pull request at a
                              #   time, the next updated and judged again; never merges, approves or labels
+npm run test:validator-pieces  # the validator approves a piece starting (KIT-543): the ticket as written,
+                             #   against its plan's criteria; it records, and the queue's pool starts it
 npm run test:day-planner     # the day planner (KIT-439): ticket text fenced as data in its brief, one
                              #   answer block read, every pick checked, a failing one dropped with a reason
 npm run test:morning         # the morning job (KIT-446): once a day inside the window, one tool-less call,

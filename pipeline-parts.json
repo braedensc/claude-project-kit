@@ -2223,7 +2223,7 @@
       "id": "validator",
       "name": "Approves and merges in your place, inside hard limits",
       "internal_name": "the validator",
-      "does": "Would approve a plan, a piece or a merge in your place, only inside switches and size limits you set. Its evidence reader, settings, ledger, brief, agent's run and merge path are built; no job is installed to run them.",
+      "does": "Would approve a plan, a piece or a merge in your place, only inside switches and size limits you set. Its evidence reader, settings, ledger, brief, agent's run, merge path and piece pass are built; no job is installed to run them.",
       "scope": "machine",
       "state": "built-off",
       "needs": [
@@ -2241,7 +2241,8 @@
         "scripts/pipeline_validator_check.py",
         "scripts/pipeline_validator_app.py",
         "scripts/pipeline_validator_run.py",
-        "scripts/pipeline_validator_merge.py"
+        "scripts/pipeline_validator_merge.py",
+        "scripts/pipeline_validator_pieces.py"
       ],
       "installer": null,
       "check": null,
