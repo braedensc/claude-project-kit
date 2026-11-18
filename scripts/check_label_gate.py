@@ -23,8 +23,10 @@ WHAT IS CHECKED. Each rule has its own closed reason.
                            `issues` and `pull-requests` for the job
   checkout-not-default     the only action is actions/checkout, of the default branch, from this
                            repository
-  head-on-disk             no step puts a commit on disk (git checkout, switch, worktree, reset,
-                           restore, read-tree, merge, rebase, cherry-pick, apply, am, stash)
+  head-on-disk             nothing the PR wrote enters the job. Git may run only rev-parse, fetch,
+                           `cat-file -e` and the gate's one `git show`, an allow list: checkout,
+                           worktree, archive, diff, a cat-file that prints, and the rest are refused.
+                           And no path is read out of the head (`$HEAD_SHA:x`)
   gate-not-base            the gate script is the default branch's revision, from
                            `git show "$BASE_SHA:scripts/check_grader_paths.py"`, and no working-tree
                            copy of it is run or copied
@@ -50,8 +52,11 @@ DEFAULT_REF = "${{ github.event.repository.default_branch }}"
 HEAD_SHA_EXPR = "${{ github.event.pull_request.head.sha }}"
 GATE_FROM_BASE = 'git show "$BASE_SHA:scripts/check_grader_paths.py"'
 WORKING_COPY = "scripts/check_grader_paths.py"
-ON_DISK_RE = re.compile(r"\bgit\b[^\n;&|]*?\s(checkout|switch|worktree|reset|restore|read-tree|merge|"
-                        r"rebase|cherry-pick|apply|am|stash)\b")
+# Every git call in the run step: its global options (-c x=y, -C dir, --flag[=v]), its
+# subcommand, and whether the next argument is `-e` (cat-file's existence test).
+GIT_RE = re.compile(r"\bgit((?:\s+-[cC]\s+\S+|\s+--?[A-Za-z][\w-]*(?:=\S+)?)*)\s+([a-z][a-z-]*)(\s+-e\b)?")
+GIT_ALLOWED = ("rev-parse", "fetch")       # plus `cat-file -e` and the gate's one `git show`
+HEAD_PATH_RE = re.compile(r'\$\{?HEAD_SHA\}?"?:')     # a path read out of the head: "$HEAD_SHA:x"
 SECRET_RE = re.compile(r"secrets\.([A-Za-z_][A-Za-z0-9_]*)")
 REASONS = ("trigger-not-target", "trigger-head-unfiltered", "trigger-other", "job-shape",
            "permissions", "checkout-not-default", "head-on-disk", "gate-not-base",
@@ -86,6 +91,22 @@ def _strings(value):
 def _commands(run):
     """A run script without its comment lines: a comment may name a command it never runs."""
     return "\n".join(ln for ln in str(run).split("\n") if not ln.strip().startswith("#"))
+
+
+def _head_enters(commands):
+    """Whether the run step can bring anything the PR wrote into the job. Git may run only
+    rev-parse, fetch, `cat-file -e` (an existence test) and the one `git show` of the default
+    branch's gate; and no path is ever read out of the head commit (`$HEAD_SHA:x`). An allow
+    list, so a git call nobody thought of is refused rather than missed."""
+    rest = commands.replace(GATE_FROM_BASE, "")
+    if HEAD_PATH_RE.search(rest):
+        return True
+    for m in GIT_RE.finditer(rest):
+        sub, existence_test = m.group(2), m.group(3)
+        if sub in GIT_ALLOWED or (sub == "cat-file" and existence_test):
+            continue
+        return True
+    return False
 
 
 def _default_checkout(step):
@@ -124,7 +145,7 @@ def judge(doc):
         found.add("checkout-not-default")
     runs = [s for s in steps if "run" in s]
     commands = "\n".join(_commands(s.get("run")) for s in runs)
-    if ON_DISK_RE.search(commands):
+    if _head_enters(commands):
         found.add("head-on-disk")
     if GATE_FROM_BASE not in commands or WORKING_COPY in commands.replace(GATE_FROM_BASE, ""):
         found.add("gate-not-base")
@@ -244,14 +265,29 @@ def selftest():
         ("a reset onto the head", append_run('\ngit reset --hard "$HEAD_SHA"\n'), ["head-on-disk"]),
         ("a comment that names git checkout runs nothing",
          append_run("\n# never git checkout the head here\n"), []),
+        # ...nor read it any other way: git runs only from an allow list, and no path is read
+        # out of the head (Stage E's note on the first review of this file).
+        ("a file of the head piped to python", append_run('\ngit show "$HEAD_SHA:x.py" | python3 -\n'),
+         ["head-on-disk"]),
+        ("an archive of the head unpacked",
+         append_run('\ngit archive "$HEAD_SHA" | tar -x -C "$RUNNER_TEMP/h"\n'), ["head-on-disk"]),
+        ("a blob printed by id with cat-file", append_run('\ngit cat-file blob "$BLOB_ID" | python3 -\n'),
+         ["head-on-disk"]),
+        ("a blob id read out of the head", append_run('\nblob=$(git rev-parse "$HEAD_SHA:x.py")\n'),
+         ["head-on-disk"]),
+        ("the head's diff applied as a patch",
+         append_run('\ngit diff "$BASE_SHA" "$HEAD_SHA" | patch -p1\n'), ["head-on-disk"]),
+        ("an existence test with cat-file -e reads nothing",
+         append_run('\ngit cat-file -e "$BASE_SHA^{commit}"\n'), []),
         # The gate script is the default branch's revision.
         ("the old fallback that copied the working tree's gate",
          append_run('\ncp scripts/check_grader_paths.py "$gate"\n'), ["gate-not-base"]),
         ("the working tree's gate run directly",
          append_run("\npython3 scripts/check_grader_paths.py\n"), ["gate-not-base"]),
-        ("the gate taken from the head instead of the base",
+        ("the gate taken from the head instead of the base: the head's file enters the job too",
          lambda d: run_step(d).__setitem__("run", run_step(d)["run"].replace(
-             GATE_FROM_BASE, 'git show "$HEAD_SHA:scripts/check_grader_paths.py"')), ["gate-not-base"]),
+             GATE_FROM_BASE, 'git show "$HEAD_SHA:scripts/check_grader_paths.py"')),
+         ["head-on-disk", "gate-not-base"]),
         # The head commit is the event's own.
         ("a head from the workflow's own sha",
          lambda d: run_step(d)["env"].__setitem__("HEAD_SHA", "${{ github.sha }}"), ["head-not-event"]),

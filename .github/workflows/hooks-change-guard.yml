@@ -18,7 +18,8 @@ name: Hooks change guard
 # copy cannot turn the check green alone. The default branch's run reports on the same commit,
 # and GitHub blocks a merge while any run of a required check is red: a later green run of the
 # same name does not hide it. GitHub does not document that rule. It was measured on a probe
-# pull request on 17 Nov 2026, so scripts/check_label_gate.py pins this file's shape.
+# pull request on 17 Nov 2026, so scripts/check_label_gate.py pins this file's shape, and
+# docs/OPERATIONS.md ("What is not proven") says how to re-measure it.
 #
 # WHAT IT NEEDS. From 2 Dec 2026 GitHub blocks `pull_request_target` in public repositories
 # unless an Actions policy allows it. Without that allow this job never runs, the required check

@@ -94,6 +94,10 @@ default branch's gate script. Nothing the PR wrote runs, and the token can only 
   with a control PR beside it. A later run of the *same* workflow and event does replace
   the earlier one, which is how a label turns the gate green. The first PR that edits the
   gate's file shows the last case for this repository: it stays red until it is labelled.
+  Because it rests on one measurement, it is listed under *What is not proven* in
+  `docs/OPERATIONS.md`, with how to re-measure it. The fix if it ever fails is a required
+  check bound to an app no workflow can post as. Binding it to GitHub Actions, as now, does
+  not help, since a PR's own jobs are GitHub Actions too.
 - **It needs one allow from the owner.** From 2 Dec 2026 GitHub blocks
   `pull_request_target` in public repositories unless an Actions policy allows it. Without
   the allow the gate never runs and no PR can merge: it fails closed.
