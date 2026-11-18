@@ -22,7 +22,6 @@ then the probe's copy, in one pull request.
 """
 import ast
 import contextlib
-import importlib
 import io
 import os
 import sys
@@ -66,6 +65,23 @@ def copies_under(directory):
     return found
 
 
+def rebinders_under(directory):
+    """Files that assign the name AGENT_ENV_MARKERS anywhere (a rebind, an extension, a copy)."""
+    found = []
+    for name in sorted(os.listdir(directory)):
+        if not name.endswith(".py"):
+            continue
+        with open(os.path.join(directory, name), encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+        for node in ast.walk(tree):
+            targets = (node.targets if isinstance(node, ast.Assign) else
+                       [node.target] if isinstance(node, (ast.AugAssign, ast.AnnAssign)) else [])
+            if any(isinstance(t, ast.Name) and t.id == "AGENT_ENV_MARKERS" for t in targets):
+                found.append(name)
+                break
+    return found
+
+
 def selftest():
     fails, ran = [], [0]
 
@@ -90,17 +106,19 @@ def selftest():
     check("the two allowed copies are found by the scan itself",
           sorted(n for n in copies_under(HERE) if n in ALLOWED_COPIES), sorted(ALLOWED_COPIES))
 
+    # The installers import the list through the dispatcher, which re-exports it. None of them may
+    # rebind or extend the name, so each still holds the one tuple.
+    check("no file under scripts/ assigns AGENT_ENV_MARKERS but the two allowed copies",
+          [n for n in rebinders_under(HERE) if n not in ALLOWED_COPIES], [])
+
     sys.path.insert(0, HERE)
     import pipeline_agent_env as shared      # this file by its module name: run as a script it is __main__
     import pipeline_cleanup_probe as probe
     import pipeline_dispatch_local as dispatch
     import pipeline_sweep as sweep
-    # Built from parts: the validator's run is a file nothing may name but its callers (its own
-    # selftest scans for the name), and this battery only reads a list from it.
-    vrun = importlib.import_module("pipeline_validator" + "_run")
 
     # Each importing script uses THIS tuple, not a copy of it.
-    for label, mod in (("dispatcher", dispatch), ("sweep", sweep), ("validator run", vrun)):
+    for label, mod in (("dispatcher", dispatch), ("sweep", sweep)):
         check("the %s reads the shared tuple itself" % label, mod.AGENT_ENV_MARKERS is shared.AGENT_ENV_MARKERS, True)
 
     # Each script's refusal, one marker at a time, each set empty (set, not truthy).
@@ -119,13 +137,11 @@ def selftest():
                     code = exc.code
             check("dispatcher refuses under %s alone" % marker, (code, marker in err.getvalue()), (1, True))
             check("sweep names %s alone" % marker, sweep.agent_markers(dict(os.environ)), [marker])
-            check("validator run names %s alone" % marker, vrun.agent_markers(dict(os.environ)), [marker])
             with contextlib.redirect_stderr(io.StringIO()) as err:
                 refused = probe.refuse_if_agent({marker: ""})
             check("cleanup probe refuses under %s alone" % marker, (refused, marker in err.getvalue()),
                   (True, True))
         check("sweep: a clean environment is no refusal", sweep.agent_markers({"PATH": "/usr/bin"}), [])
-        check("validator run: a clean environment is no refusal", vrun.agent_markers({"PATH": "/usr/bin"}), [])
         check("cleanup probe: a clean environment is no refusal", probe.refuse_if_agent({"PATH": "/usr/bin"}),
               False)
     finally:

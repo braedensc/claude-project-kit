@@ -438,6 +438,9 @@ def selftest():
           None)
 
     # 5. Who may start it: never an agent's environment, never a selftest without a Stub.
+    import pipeline_agent_env
+    check("it reads the shared list of agent markers, not a copy of it",
+          AGENT_ENV_MARKERS is pipeline_agent_env.AGENT_ENV_MARKERS, True)
     for marker in AGENT_ENV_MARKERS:
         s = Stub(ANSWER)
         got = go(s, environ=dict(ENV, **{marker: ""}))
