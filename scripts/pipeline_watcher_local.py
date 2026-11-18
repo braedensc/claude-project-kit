@@ -142,6 +142,7 @@ LIMIT_KEYS = ("day_usd", "piece_usd", "day_runs", "piece_runs", "day_approvals")
 APPROVAL_STALE_SECONDS = 86400          # an approval with no merge, newer row or close a day later
 APPROVAL_FOLLOW_SECONDS = 7 * 86400     # how far back an approval is followed to its merge
 RATE_WINDOW_SECONDS = 86400             # the approvals counted against day_approvals
+GAP_CAP_SECONDS = 30 * 86400            # how far back a pass reads merges the watcher missed while down
 
 DEFAULT_LOOKBACK_HOURS = 26
 DEFAULT_MAX_PAGES = 3
@@ -1254,6 +1255,19 @@ def _pr_of(ref):
     return (repo, int(number)) if REPO_RE.match(repo) and number.isdigit() else (None, None)
 
 
+def previous_pass(cfg):
+    """When this watcher last wrote its status file, or None when there is none it can read. Only
+    ever used to read FURTHER back, never less: a file that says a later time changes nothing."""
+    try:
+        with open(cfg["status_file"], encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError, RecursionError):
+        return None
+    if not isinstance(doc, dict) or doc.get("schema") != WATCHER_SCHEMA:
+        return None
+    return _epoch(doc.get("written_at"))
+
+
 def monitor_approvals(cfg, gh, now):
     """The validator's ledger against GitHub. Each pull request merged into a watched repository's
     default branch inside the lookback needs an `approved` row for its head; one without is a
@@ -1262,6 +1276,15 @@ def monitor_approvals(cfg, gh, now):
     validator's urgent page reaches the owner. The day's approvals over `day_approvals` is a pause.
     A ledger or a merge list that cannot be read is never clear."""
     name, found, incomplete, since = "approval-rate", [], [], _since(cfg, now)
+    last = previous_pass(cfg)
+    if last is not None and last < since:
+        # The watcher was down longer than its lookback. Every merge since its last pass is read, so
+        # none in the gap goes unchecked; past GAP_CAP_SECONDS the rest is said as a gap.
+        since = max(int(last), int(now - GAP_CAP_SECONDS))
+        if last < now - GAP_CAP_SECONDS:
+            incomplete.append(("the watcher", "its last pass was more than %d days ago, so merges "
+                               "before %s were not checked" % (GAP_CAP_SECONDS // 86400,
+                                                               _iso(since))))
     got = validator_ledger.read(cfg["validator_ledger"])
     if got["rows"] is None:
         return blind(name, _line("the validator's ledger: %s" % got["why"]), 1, 0)
@@ -2986,6 +3009,35 @@ def selftest():
         check("each urgent escalation inside the lookback is a page: the validator's urgent route",
               whats(m), [(PAGE, "urgent-escalation", "KIT-9", None),
                          (PAGE, "urgent-escalation", "acme/app#40", None)])
+
+        # A watcher that was down longer than its lookback reads back to its last pass.
+        with open(status_path, encoding="utf-8") as fh:
+            kept_status = fh.read()
+        put(status_path, {"schema": WATCHER_SCHEMA, "written_at": _iso(NOW - 40 * 3600)}, 0o644)
+        ledger_of((vrow("merge", "acme/app#12", H[1], "approved"), 60))
+        gap_gh = vgh(closed=[merged(14, H[4], minutes=30 * 60)], prs={14: one_pr("someone-else")})
+        check("a merge in the gap since the watcher's last pass, beyond the lookback, is still checked",
+              whats(approvals(gap_gh)), [(PAUSE, "merge-without-approval", "acme/app#14", "someone-else")])
+        put(status_path, {"schema": WATCHER_SCHEMA, "written_at": _iso(NOW - 40 * 86400)}, 0o644)
+        m = approvals(vgh(closed=[merged(14, H[4], minutes=30 * 60)], prs={14: one_pr("someone-else")}))
+        check("...a last pass beyond the gap's cap reads back that far, and says what it did not read",
+              (whats(m), "were not checked" in (m["reason"] or "")),
+              ([(PAUSE, "merge-without-approval", "acme/app#14", "someone-else")], True))
+        put(status_path, {"schema": WATCHER_SCHEMA, "written_at": _iso(NOW + 3600)}, 0o644)
+        check("...and a last pass that claims a later time never narrows the lookback",
+              whats(approvals(vgh(closed=[merged(14, H[4], minutes=60)], prs={14: one_pr("someone-else")}))),
+              [(PAUSE, "merge-without-approval", "acme/app#14", "someone-else")])
+        with open(status_path, "w", encoding="utf-8") as fh:
+            fh.write(kept_status)
+        ledger_of((vrow("merge", "acme/app#20", H[8], "approved"), 60 * 48))
+        m = approvals(vgh(prs={}))
+        check("a stale approval whose pull request GitHub would not give is blind, never clear",
+              (m["state"], m["findings"], "whether acme/app#20 merged" in (m["reason"] or "")),
+              (BLIND, [], True))
+        full = [merged(100 + i, H[0], base="dev") for i in range(100)]
+        m = approvals(vgh(closed=full), max_pages=1)
+        check("a merge list cut short at max_pages is blind, never clear",
+              (m["state"], "max_pages" in (m["reason"] or "")), (BLIND, True))
 
         # A ledger or a merge list it cannot read is never clear.
         with open(vpath, "w", encoding="utf-8") as fh:

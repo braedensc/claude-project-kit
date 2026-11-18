@@ -47,6 +47,10 @@ say is still a `pause`, and the gap is said.
 missing it is `off`, with the reason, and it reads nothing. The watcher's account must be able to read
 the ledger: the validator's install puts it where it can.
 
+**A watcher that was down reads back to its last pass.** When its last status file is older than the
+lookback, it reads every merge since then, up to 30 days back, so none in the gap goes unchecked.
+Beyond 30 days it says what it did not read.
+
 **A ledger or a merge list it cannot read is `blind`, never `clear`.** So is a ledger a session could
 have written: one in a git working tree, a link, or writable by group or other. An absent ledger is
 an empty one: nothing approved, so every merge that is not yours is a finding.
