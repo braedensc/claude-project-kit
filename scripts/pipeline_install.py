@@ -55,13 +55,20 @@ WHAT IT DOES, IN ORDER
      it installs the job that removes what finished dispatcher runs left, and never loads
      it. Its card (CK-S1) is yours and does not hold the idea gate back.
   3c. The notifier (`scripts/pipeline_notifier_setup.py`), when this Mac has a `notifier.conf`
-     (`--notifier-conf` names another). It runs the installer's own `run --dry-run`, shown as
-     it runs. Exit 0 is "up to date". A step table with a WOULD-CHANGE row is work: it asks,
-     then runs `run` on a yes ("updated"). Only a card left (a job to load, a ping to watch)
-     is "waiting on you": nothing is asked, because `run` cannot clear it. A dry run that
+     (`--notifier-conf` names another). In Manual it runs the installer's own `run --dry-run`,
+     shown as it runs. Exit 0 is "up to date". A step table with a WOULD-CHANGE row is work:
+     it asks, then runs `run` on a yes ("updated"). Only a card left (a job to load, a ping to
+     watch) is "waiting on you": nothing is asked, because `run` cannot clear it. A dry run that
      printed no table, or ended with any other code, is never "up to date". A `run` that ends
-     on a card stops the command in Manual and is carried past in Automatic. With no
-     `notifier.conf` the part is "off on this Mac" and nothing runs.
+     on a card stops the command. With no `notifier.conf` the part is "off on this Mac" and
+     nothing runs.
+     In Automatic (KIT-850) it holds the Mac password once, then runs the installer's `check`,
+     whose rows come back as one JSON document while its words are shown. A WOULD-CHANGE row
+     is work, so it runs the installer's `apply` with {"consent": "yes"} piped in. `apply` asks
+     nothing and switches the job on itself when its first pass would send no more messages
+     than the part's ceiling in `pipeline-parts.json`. Above it the job stays installed and
+     off, and that one line ("left off: ...") is the part's line at the end. An `apply` that
+     ends on a card is carried past. Rows it cannot read are never "up to date".
   3d. The Slack bridge and the stand-up (`scripts/pipeline_bridge_setup.py`), when this Mac has a
      `bridge.conf` (`--bridge-conf` names another). It runs `install`, the installer's compare
      without `--apply`: the job's config, its job file and the stand-up's settings file against
@@ -321,6 +328,31 @@ class Io(object):
                     sys.stdout.write(text)
                     sys.stdout.flush()
                 return child.wait(), "".join(kept)
+            finally:
+                signal.signal(signal.SIGINT, previous)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return 127, str(exc)
+
+    def run_rows(self, argv, stdin_text=None):
+        """(exit code, its standard output) of an installer's `check` or `apply` (KIT-850). Its
+        human words reach the person as they come, on the stderr it shares with this program;
+        its standard output — one JSON document of rows — is kept for this program to read.
+        `stdin_text`, when given, goes in through a pipe that is then closed: answers never
+        travel in a file or an argument. Without it, standard input is closed. Ctrl-C belongs
+        to the installer, as in `run`."""
+        import signal
+        try:
+            previous = signal.signal(signal.SIGINT,
+                                     lambda _s, _f: setattr(self, "interrupted", True))
+            try:
+                child = subprocess.Popen(
+                    argv, cwd=KIT, stdout=subprocess.PIPE,
+                    stdin=subprocess.DEVNULL if stdin_text is None else subprocess.PIPE,
+                    env=dict(os.environ, PYTHONUNBUFFERED="1"),
+                    preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL))
+                out, _err = child.communicate(
+                    None if stdin_text is None else stdin_text.encode("utf-8"))
+                return child.returncode, out.decode("utf-8", "replace")
             finally:
                 signal.signal(signal.SIGINT, previous)
         except (OSError, subprocess.SubprocessError) as exc:
@@ -868,7 +900,17 @@ JOB_STEPS = (
      "noun": "The notifier", "conf": "notifier.conf", "script": NOTIFIER_SETUP,
      "look": ["run", "--dry-run"], "apply": ["run"],
      "note": "It writes the notifier's settings and its job file as the role account; it "
-             "never loads the job."},
+             "never loads the job.",
+     # KIT-850: in Automatic, the installer's program-facing pair instead. `check` prints its
+     # rows as one JSON document and asks nothing; `apply` takes the consent through a pipe,
+     # asks nothing, and loads the job itself at or below its first-pass ceiling.
+     "auto_check": ["check"], "auto_apply": ["apply"],
+     "rows_schema": "notifier-setup-rows/1",
+     "answers": {"schema": "notifier-answers/1", "consent": "yes"},
+     "auto_note": "It writes the notifier's settings and its job file as the role account. It "
+                  "switches the job on itself only when the job's first pass would send no "
+                  "more messages than its ceiling; above that the job stays off, and the end "
+                  "says why."},
     {"key": "bridge", "number": "3d", "title": "The Slack bridge and the stand-up",
      "noun": "The bridge", "conf": "bridge.conf", "script": BRIDGE_SETUP,
      # `install` without --apply compares the job's config, its plist and the stand-up's settings
@@ -912,6 +954,104 @@ def job_done(io, spec, base, conf, rep, updated):
                 code)
 
 
+def rows_doc(text, schema):
+    """The one JSON document an installer's `check` or `apply` printed on its standard output
+    (KIT-850), or None. No document, anything around it, another schema or no rows is None,
+    and None is never up to date."""
+    try:
+        doc = json.loads((text or "").strip())
+    except ValueError:
+        return None
+    if (not isinstance(doc, dict) or doc.get("schema") != schema
+            or not isinstance(doc.get("rows"), list)
+            or not all(isinstance(r, dict) for r in doc["rows"])):
+        return None
+    return doc
+
+
+def rows_with(doc, outcome):
+    return [r for r in doc["rows"] if r.get("outcome") == outcome]
+
+
+def cards_of(doc):
+    """The cards its blocked rows name, one per line: what the short list reads for this part."""
+    return "\n".join("%s %s" % (r.get("step"), r.get("card"))
+                     for r in rows_with(doc, "BLOCKED-ON-HUMAN") if r.get("card"))
+
+
+def step_job_auto(io, spec, base, conf, rep):
+    """Automatic (KIT-850): the installer's own `check`, then its `apply` with the consent piped
+    in, when a row is work. Neither asks anything: the Mac password is held here first, once for
+    the run. A check or apply whose rows cannot be read is never up to date. None to carry on, or
+    an exit code."""
+    key, noun = spec["key"], spec["noun"]
+    if not io.sudo_once("%s's check and apply read and change it as the role account and as "
+                        "root. They ask for nothing themselves." % noun):
+        rep.note(key, OUT_WAITING, "it needs your Mac password")
+        return stop(io, "%s needs your Mac password and did not get it. Nothing was changed. "
+                        "Run this again and type it at the prompt." % noun, 5)
+    seen = tuple(rep.checks.get(key) or (base + spec["auto_check"] + ["--conf", conf]))
+    code, out = io.run_rows(base + spec["auto_check"] + ["--conf", conf])
+    if io.interrupted:
+        rep.note(key, OUT_UNMEASURED, "interrupted during its check")
+        return stop(io, INTERRUPTED % (noun + "'s check"), code or EX_BLOCKED)
+    doc = rows_doc(out, spec["rows_schema"])
+    if doc is None:
+        rep.note(key, OUT_UNMEASURED, "its check printed no rows (exit %s)" % code)
+        return stop(io, "%s's check printed no rows this command could read (exit %s). The lines "
+                        "above say why." % (noun, code), code if code not in (None, 0, EX_BLOCKED)
+                    else EX_UNMEASURED)
+    rep.seen[seen] = (code, cards_of(doc))
+    if code == 0:
+        io.say("")
+        io.say("%s's settings are up to date. Nothing to change." % noun)
+        rep.note(key, OUT_OK)
+        return None
+    if code != EX_BLOCKED:
+        rep.note_code(key, code, "its check")
+        return stop(io, "%s's check stopped with exit %d. The lines above say why." % (noun, code),
+                    code)
+    if not rows_with(doc, "WOULD-CHANGE"):
+        io.say("")
+        io.say("%s has nothing to change; what is left is for you, named above." % noun)
+        rep.note(key, OUT_WAITING, "a card is still yours", card_only=True)
+        return None
+    io.say("")
+    io.say("%s is not up to date: the rows above name what would change." % noun)
+    io.say(spec["auto_note"])
+    if not io.ask("Update %s now?" % noun.lower()):
+        rep.note(key, OUT_WAITING, "behind; you did not update it")
+        return None
+    code, out = io.run_rows(base + spec["auto_apply"] + ["--conf", conf],
+                            stdin_text=json.dumps(spec["answers"]))
+    if io.interrupted:
+        rep.note(key, OUT_UNMEASURED, "interrupted during its installer")
+        return stop(io, INTERRUPTED % (noun + "'s installer"), code or EX_BLOCKED)
+    doc = rows_doc(out, spec["rows_schema"])
+    io.say("")
+    if doc is None:
+        rep.note(key, OUT_UNMEASURED, "its apply printed no rows (exit %s)" % code)
+        return stop(io, "%s's apply printed no rows this command could read (exit %s). The lines "
+                        "above say why." % (noun, code), code if code not in (None, 0, EX_BLOCKED)
+                    else EX_UNMEASURED)
+    rep.seen[seen] = (code, cards_of(doc))
+    if code == 0:
+        io.say("%s is up to date." % noun)
+        rep.note(key, OUT_UPDATED)
+        return None
+    if code == EX_BLOCKED:
+        # Above its ceiling the job is installed and left off: its one line is the end line's.
+        changed = bool(rows_with(doc, "DONE"))
+        detail = doc.get("left_off") or ("updated; a card is still yours" if changed
+                                         else "a card is still yours")
+        io.say("%s waits for you: %s. Carrying on; it is on the list at the end." % (noun, detail))
+        rep.note(key, OUT_WAITING, detail)
+        return None
+    rep.note_code(key, code, "its apply")
+    return stop(io, "%s's apply stopped with exit %d. The lines above say why; do what they say, "
+                    "then run this command again." % (noun, code), code)
+
+
 def step_job(io, spec, files, rep):
     """None to carry on, or an exit code. See JOB_STEPS."""
     key, noun = spec["key"], spec["noun"]
@@ -923,6 +1063,8 @@ def step_job(io, spec, files, rep):
                % (os.path.relpath(conf, KIT), noun.lower(), spec["conf"]))
         return None
     base = [sys.executable, spec["script"]]
+    if io.auto and spec.get("auto_check"):
+        return step_job_auto(io, spec, base, conf, rep)
     code, out = io.run_seen(base + spec["look"] + ["--conf", conf])
     if io.interrupted:
         rep.note(key, OUT_UNMEASURED, "interrupted during its check")
@@ -2105,11 +2247,24 @@ class FakeIo(Io):
         return " ".join([script] + [a for a in argv[2:3] if not a.startswith("/")])
 
     seen_out = {}                          # program key -> the lines run_seen returns for it
+    # Program key -> what a `check` or `apply` printed. By default the notifier's check prints a
+    # clean document, so the cases written before KIT-850 keep their meaning in Automatic.
+    rows_out = {"pipeline_notifier_setup.py check": json.dumps(
+        {"schema": [s for s in JOB_STEPS if s["key"] == "notifier"][0]["rows_schema"],
+         "command": "check", "exit": 0, "rows": []})}
+    piped = ()                             # (program key, the text piped into it), in order
 
     def run_seen(self, argv):
         """Scripted like `run`; the lines it returns are `seen_out[key]`."""
         code, _out = self.run(argv)
         return code, self.seen_out.get(self.ran[-1], "")
+
+    def run_rows(self, argv, stdin_text=None):
+        """Scripted like `run`; its standard output is `rows_out[key]`, and what was piped in is
+        kept in `piped` (KIT-850)."""
+        code, _out = self.run(argv)
+        self.piped = tuple(self.piped) + ((self.ran[-1], stdin_text),)
+        return code, self.rows_out.get(self.ran[-1], "")
 
     def run(self, argv, capture=False):
         k = self.key(argv)
@@ -2245,7 +2400,7 @@ def selftest_look(check, base, se_conf, tmp):
     tip_argv = ["git", "-C", KIT, "ls-remote", "--symref", "origin", "HEAD"]
     # A conf path may be any path, so a part's check is known by its argv with those blanked.
     norm = lambda argv: tuple("<conf>" if a.endswith(".conf") else a for a in argv)  # noqa: E731
-    paging = "pipeline_notifier_setup.py run"
+    paging = "pipeline_notifier_setup.py check"
 
     class Untouchable(FakeIo):
         """A FakeIo on which everything that asks, writes, installs or restarts raises, and which
@@ -2636,6 +2791,7 @@ def selftest():
                "pipeline_bridge_setup.py install": 0,         # asked only where bridge.conf is present
                "pipeline_bridge_setup.py verify": 0,
                "pipeline_notifier_setup.py run --dry-run": 0,      # asked only where notifier.conf is present
+               "pipeline_notifier_setup.py check": 0,              # …in Automatic (KIT-850)
                "pipeline_queue_setup.py run --dry-run": 0}        # asked only where queue.conf is present
 
     def go(codes=None, answers=(), argv=None, **kw):
@@ -2934,10 +3090,100 @@ def selftest():
     check("notifier-a-run-ending-on-a-card-stops-in-manual",
           (code, "pipeline_stage_a_setup.py run" in io.ran, [o for o, _d in outcome(io)]),
           (EX_BLOCKED, False, [OUT_WAITING]))
-    code, io = notifier({look: 10, apply_: 10}, {look: work}, typed=["1", "yes"])
-    check("notifier-a-run-ending-on-a-card-is-carried-past-in-automatic",
-          (code, "pipeline_stage_a_setup.py run" in io.ran, [o for o, _d in outcome(io)]),
-          (EX_BLOCKED, True, [OUT_WAITING]))
+    # KIT-850: in Automatic, the installer's own `check`, then its `apply` with the consent piped
+    # in. Its documents are built by the installer's own function, so a change of shape there
+    # turns these red.
+    chk, app = "pipeline_notifier_setup.py check", "pipeline_notifier_setup.py apply"
+    W, B, D, A = (notifier_setup.WOULD_CHANGE, notifier_setup.BLOCKED, notifier_setup.DONE,
+                  notifier_setup.ALREADY_DONE)
+
+    class Said(object):
+        """What a pass of the installer knew, for its own rows_document."""
+        def __init__(self, cards=None, first=None, left=None):
+            self.row_cards, self.ceiling = dict(cards or {}), 5
+            self.first_pass, self.left_off = first, left
+
+    def doc(command, code_, rows_, **kw):
+        return json.dumps(notifier_setup.rows_document(command, code_, rows_, Said(**kw)))
+
+    left_line = "left off: its first pass would send 7 messages, above its ceiling of 5"
+    check_work = doc("check", 10, [("job", W, "would install"), ("enable", W, "would switch it on"),
+                                   ("first-ping", B, "")], cards={"first-ping": "CK-N4"})
+    check_cards = doc("check", 10, [("job", A, "installed"), ("first-ping", B, "")],
+                      cards={"first-ping": "CK-N4"})
+    apply_on = doc("apply", 10, [("job", D, "installed"), ("enable", D, "switched it on"),
+                                 ("first-ping", B, "")], cards={"first-ping": "CK-N4"}, first=(2, 0))
+    apply_off = doc("apply", 10, [("job", D, "installed"), ("enable", B, left_line)],
+                    cards={"enable": "CK-N3"}, first=(7, 0), left=left_line)
+    apply_done = doc("apply", 0, [("job", D, "installed"), ("enable", D, "switched it on")])
+
+    def auto(codes=None, rows_out=None, cls=FakeIo, interrupt=()):
+        io = cls(codes=dict(healthy, **(codes or {})), typed=["1", "yes"])
+        io.rows_out = dict(rows_out or {})
+        io.interrupt_on = set(interrupt)
+        return main(base + ["--notifier-conf", notifier_conf], io=io), io
+
+    spec = [s for s in JOB_STEPS if s["key"] == "notifier"][0]
+    check("notifier-auto-answers-and-rows-are-the-installers-own-schemas",
+          (spec["answers"]["schema"], spec["rows_schema"], sorted(spec["answers"])),
+          (notifier_setup.ANSWERS_SCHEMA, notifier_setup.ROWS_SCHEMA, ["consent", "schema"]))
+    code, io = auto({chk: 10, app: 10}, {chk: check_work, app: apply_on})
+    check("notifier-auto-work-runs-apply-with-only-the-consent-piped-in-and-never-run",
+          ([k for k in io.ran if "notifier" in k], list(io.piped), outcome(io),
+           "pipeline_stage_a_setup.py run" in io.ran, "sudo" in io.events),
+          ([chk, app], [(chk, None), (app, json.dumps(spec["answers"]))],
+           [(OUT_WAITING, "updated; a card is still yours")], True, True))
+    signs_at = io.lines.index("Sign-offs still asked for:") if "Sign-offs still asked for:" in io.lines else -1
+    check("notifier-auto-the-card-its-apply-stopped-on-is-on-the-short-list-with-no-asked-note",
+          (signs_at > 0 and io.lines[signs_at + 1].split()[0] == "CK-N4",
+           ASKED_DETAIL in outcome(io)[0][1]), (True, False))
+    code, io = auto({chk: 10, app: 10}, {chk: check_work, app: apply_off})
+    check("notifier-auto-above-the-ceiling-is-left-off-and-its-one-line-is-the-end-line",
+          (outcome(io), "pipeline_stage_a_setup.py run" in io.ran, code,
+           any(left_line in ln for ln in io.lines if "Messages you" in ln)),
+          ([(OUT_WAITING, left_line)], True, EX_BLOCKED, True))
+    code, io = auto({chk: 10, app: 0}, {chk: check_work, app: apply_done})
+    check("notifier-auto-apply-that-holds-every-step-is-updated",
+          (outcome(io), io.ran.count(app)), ([(OUT_UPDATED, "")], 1))
+    code, io = auto({chk: 0}, {chk: doc("check", 0, [("job", A, "installed")])})
+    check("notifier-auto-clean-check-is-up-to-date-and-applies-nothing",
+          (outcome(io), io.ran.count(app)), ([(OUT_OK, "")], 0))
+    code, io = auto({chk: 10}, {chk: check_cards})
+    check("notifier-auto-cards-only-applies-nothing-and-is-waiting",
+          (outcome(io), io.ran.count(app), "pipeline_stage_a_setup.py run" in io.ran),
+          ([(OUT_WAITING, "a card is still yours")], 0, True))
+    for name, codes, rows_out, want in (
+            ("a-check-with-no-rows-at-exit-0", {chk: 0}, {chk: "all fine, trust me"}, EX_UNMEASURED),
+            ("a-check-of-another-schema", {chk: 0}, {chk: json.dumps({"schema": "x/1", "rows": []})},
+             EX_UNMEASURED),
+            ("an-apply-with-no-rows-at-exit-0", {chk: 10, app: 0}, {chk: check_work, app: ""},
+             EX_UNMEASURED),
+            ("a-check-that-could-not-measure", {chk: 4},
+             {chk: doc("check", 4, [("enable", "UNKNOWN", "NOT MEASURED")])}, 4),
+            ("an-apply-that-was-refused", {chk: 10, app: 3}, {chk: check_work,
+                                                              app: doc("apply", 3, [])}, 3)):
+        code, io = auto(codes, rows_out)
+        check("notifier-auto-%s-is-never-up-to-date-and-stops" % name,
+              (code, [o for o, _d in outcome(io)], "pipeline_stage_a_setup.py run" in io.ran),
+              (want, [OUT_UNMEASURED], False))
+
+    class SecondSudoRefused(FakeIo):
+        """The consent's record gets the password; the notifier's step does not."""
+        def sudo_once(self, why):
+            self.events.append("sudo")
+            return self.events.count("sudo") < 2
+
+    code, io = auto({chk: 10}, {chk: check_work}, cls=SecondSudoRefused)
+    check("notifier-auto-without-the-mac-password-runs-nothing-and-is-waiting",
+          (code, [k for k in io.ran if "notifier" in k], outcome(io)),
+          (5, [], [(OUT_WAITING, "it needs your Mac password")]))
+    code, io = auto({chk: 10, app: 10}, {chk: check_work, app: apply_on}, interrupt={chk})
+    check("notifier-auto-ctrl-c-in-its-check-stops-before-any-apply",
+          (code, io.ran.count(app), "pipeline_stage_a_setup.py run" in io.ran),
+          (EX_BLOCKED, 0, False))
+    code, io = notifier({look: 10, apply_: 10}, {look: work}, answers=[True])
+    check("notifier-manual-still-runs-the-persons-own-dry-run-and-run-never-check-or-apply",
+          ([k for k in io.ran if "notifier" in k], list(io.piped)), ([look, apply_], []))
     for rc in (1, 2, 3, 4, 5, 77):
         code, io = notifier({look: rc})
         check("notifier-check-exit-%d-stops-never-current" % rc,
@@ -3314,7 +3560,7 @@ def selftest():
     check("lines-off-detail-outside-the-kit-names-the-folder",
           [r["detail"] for r in io.records if r["id"] == "cleanup"], ["no sweep.conf in %s" % tmp])
     check("lines-a-part-off-never-runs-its-check",
-          "pipeline_notifier_setup.py run" in io.measured, False)
+          "pipeline_notifier_setup.py check" in io.measured, False)
 
     # 9c. KIT-756: the host. Read-only; a Mac with none puts building it first on the closing
     #     list; one that has it says nothing; one that cannot be told is never "has one".
@@ -3442,8 +3688,8 @@ def selftest():
     io = FakeIo(codes=dict(healthy, **{"pipeline_notifier_setup.py run --dry-run": 10}))
     io.seen_out = {"pipeline_notifier_setup.py run --dry-run": "-- steps --\n  enable   BLOCKED-ON-HUMAN  CK-N3\n"}
     io.present = {paging_conf}
-    io.measure_codes = {"pipeline_notifier_setup.py run": 10}
-    io.measure_out = {"pipeline_notifier_setup.py run": "CK-N1 is yours\nthen CK-N3 and CK-N10"}
+    io.measure_codes = {"pipeline_notifier_setup.py check": 10}
+    io.measure_out = {"pipeline_notifier_setup.py check": "CK-N1 is yours\nthen CK-N3 and CK-N10"}
     code = main(base, io=io)
     check("lines-a-check-at-10-is-waiting",
           (by_id(io)["paging"], code), (OUT_WAITING, EX_BLOCKED))
@@ -3456,7 +3702,7 @@ def selftest():
           (["CK-N1"], ["CK-N3"], False))
     check("lines-card-id-prefix-is-not-a-match",
           (cards_named("see CK-N10", "CK-N1"), cards_named("see CK-N1.", "CK-N1")), (False, True))
-    io.measure_out = {"pipeline_notifier_setup.py run": "something is outstanding"}
+    io.measure_out = {"pipeline_notifier_setup.py check": "something is outstanding"}
     io.lines[:] = []
     io.typed = ["2", "yes"]
     main(base, io=io)
@@ -3814,9 +4060,13 @@ def selftest():
           (got["settings"]["jobs"][status_job],
            got["settings"]["jobs"]["review/" + review["jobs"][0]["label"]]),
           ({"key": "STATUS_INTERVAL_SECONDS", "value": "900"}, {"key": None, "value": None}))
-    check("kit717-record-has-each-ceiling-all-null-today",
-          (set(got["settings"]["ceilings"].values()), "review" in got["settings"]["ceilings"]),
-          ({None}, True))
+    # KIT-850: the notifier's part is the first to declare one; the record keeps the list's number.
+    paging_ceiling = [p for p in real_parts if p["id"] == "paging"][0]["ceiling"]
+    check("kit717-record-has-each-ceiling-from-the-parts-list",
+          (got["settings"]["ceilings"]["paging"], isinstance(paging_ceiling, int),
+           set(v for k, v in got["settings"]["ceilings"].items() if k != "paging"),
+           "review" in got["settings"]["ceilings"]),
+          (paging_ceiling, True, {None}, True))
     check("kit717-a-switch-that-looks-like-a-secret-is-never-recorded-by-value",
           (switch_value("LINEAR_API_KEY", {"LINEAR_API_KEY": "abc"}),
            switch_value("LINEAR_API_KEY", {}), switch_value("STATUS_FILE", {"STATUS_FILE": "x"})),
