@@ -141,7 +141,7 @@ Usage:
     pipeline_install.py [--conf stage-a.conf] [--stage-e-conf stage-e.conf]
                         [--no-pull] [--skip-stage-e] [--queue-conf queue.conf]
     pipeline_install.py --check [--conf stage-a.conf] [--stage-e-conf stage-e.conf]
-                        [--sweep-conf sweep.conf] [--skip-stage-e]
+                        [--sweep-conf sweep.conf] [--queue-conf queue.conf] [--skip-stage-e]
     pipeline_install.py --selftest
 
 Exit: 0 every part is up to date, updated or off · 4 a part could not be measured, or was
@@ -2757,6 +2757,16 @@ def selftest():
     code, io = watch()
     check("watch-level-is-up-to-date-and-asks-nothing",
           (code, io.asked, watch_run in io.ran, wout(io)), (EX_OK, [], False, [(OUT_OK, "")]))
+    # --check judges the job the same way and runs nothing: one case per level.
+    for level_name, answer, want in (("current", ("current", ""), (OUT_OK, "")),
+                                     ("missing", ("missing", "no job file for x"), (OUT_WAITING, "no job file for x")),
+                                     ("behind", ("behind", "another kit"), (OUT_WAITING, "another kit")),
+                                     ("unmeasured", ("unmeasured", "launchctl did not answer"),
+                                      (OUT_UNMEASURED, "launchctl did not answer"))):
+        io = FakeIo(codes=dict(healthy))
+        io.levels = answer
+        main(["--check"] + base + ["--update-conf", update_conf], io=io)
+        check("watch-check-mode-%s" % level_name, (wout(io), watch_run in io.ran), ([want], False))
     code, io = watch([("missing", "no job file for x"), ("current", "")], {watch_run: 0}, answers=[True])
     check("watch-missing-asked-installed-looked-at-again-updated",
           (code, len(io.asked), io.ran.count(watch_run), io.level_asked, wout(io)),

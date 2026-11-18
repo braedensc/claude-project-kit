@@ -266,6 +266,8 @@ python3 scripts/pipeline_watch.py status           # the last pass, per kind
 It looks, and changes nothing, at whether the job file is there, names this kit, this settings file and this interval,
 and is held by launchd. If not, it asks, then runs the `install` above, which still shows its dry pass and asks for its
 own `yes`. It looks again after, and a job it did not see loaded reads "could not be measured", never "updated".
+Its line says whether the job is installed and current, not what a pass finds: run `pipeline_watch.py run --dry-run`
+or `status` for that.
 
 `install` refuses in an agent environment. It records the `brew`, `gh`, `npm` and `git`
 directories your shell has now in the job's `PATH`. Re-run it after moving any of them. A
