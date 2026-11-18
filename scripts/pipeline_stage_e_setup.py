@@ -445,8 +445,10 @@ REQUIRED_SCRIPTS = ("pipeline_review_poller.py", "pipeline_bounce_local.py",
                     # The validator's ledger, whose send-backs the bounce driver reads (KIT-542).
                     "pipeline_validator_ledger.py",
                     # The runner's store, where the bounce driver asks the runner for a fix on the
-                    # runner lane (KIT-765), and the usage kinds its own battery checks.
+                    # runner lane (KIT-765), and the usage kinds its own battery checks, with the
+                    # spend ledgers' one reader the usage runs import (KIT-844).
                     "pipeline_runner_store.py", "pipeline_usage_runs.py",
+                    "pipeline_spend_ledger.py",
                     # Their `--selftest` runs inside one run folder it removes (KIT-450).
                     "scratch_run.py")
 

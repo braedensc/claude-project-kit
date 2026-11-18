@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """The usage runs: the dispatcher's session logs, and the Stage E and idea-gate records beside
-them, read into priced, classified, timed runs (KIT-422, contract §17).
+them, read into priced, classified, timed runs (KIT-422, contract §17). The spend ledgers of the
+model calls no log records are read here too (KIT-844, contract §30).
 
     python3 scripts/pipeline_usage_runs.py --selftest
 
@@ -19,11 +20,16 @@ WHAT IT READS.
   2. Stage E's bounce ledger and review records, and the idea gate's record of planning runs.
      They say which later run was a bounce fix or a conflict fix, and which ticket is a
      planning run. Nothing a session can write decides what a run was.
+  3. Each spend ledger the config names (`spend_ledgers`), through the ledgers' one reader,
+     scripts/pipeline_spend_ledger.py: the morning job's planner calls, the stand-up's turns,
+     the tech lead's turns and the conflict waker's fix sessions. Each call is a run of its
+     caller's kind, priced by the CLI's own total or unpriced, with no length and no ticket.
 
 WHAT IT GIVES.  Each log file is one run: its kind (tech lead, review, planner, coding, bounce
 fix, conflict fix, catch-up or other later), its own spend and tokens, its length in seconds,
 how it signed in, and the usage events it heard. Beside them: the placeholders no run follows,
-and for each source a record of what it was asked and what it answered.
+and for each source a record of what it was asked and what it answered. And for each spend ledger:
+what its one reader said of it, and its calls, or None when it is off or could not be read.
 
 THE SHAPE.  `scan(cfg, now)` reads everything once and returns a dict. `runs` are the runs the
 window holds (`None` when the logs folder could not be listed), each a dict: `workspace`,
@@ -31,7 +37,10 @@ window holds (`None` when the logs folder could not be listed), each a dict: `wo
 `seconds`, `last`, `key_source`, `events`, `weekly` and `event_times`. `baselines` are older
 runs read for their total only and never counted. `pendings` are the placeholders, and
 `unmatched_placeholders(scanned)` picks out the runs that never reached the model. `sources`
-holds a record for each of `logs`, `ledger` and `planner`.
+holds a record for each of `logs`, `ledger` and `planner`. `spend` holds, for each caller in
+pipeline_spend_ledger.CALLERS, {"note", "calls"}: the reader's note, and its calls as runs
+(`last`, `cost`, `seconds` 0, `kind`, `model`, `billing`), or None, never an empty list, for a
+ledger that is off or could not be read.
 
 FIELDS ONLY.  Numbers, ticket ids, model names that match a strict pattern, and words from
 closed lists. No prompt, reply, comment or title is kept, and no error line quotes an
@@ -57,6 +66,9 @@ import time
 import unicodedata
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+import pipeline_spend_ledger as spend_ledger  # noqa: E402  (the spend ledgers' one reader, §30)
 
 EXIT_USAGE = 2
 
@@ -67,6 +79,11 @@ SOURCES = ("logs", "ledger", "planner")
 KINDS = ("tech_lead", "review", "planner", "coding", "bounce_fix", "conflict_fix", "catch_up",
          "other_later")
 CHAT_PREFIX = "slack-"
+# The kind each spend ledger's calls count as (KIT-844, contract §17 and §30). The tech lead's
+# turns and the waker's fixes are the work `tech_lead` and `conflict_fix` already name; the
+# morning job's and the stand-up's calls are kinds of their own, and never a dispatcher run's.
+SPEND_KINDS = {"morning": "morning", "standup": "standup", "tech_lead": "tech_lead",
+               "conflict_waker": "conflict_fix"}
 
 # The SDK's own closed list of sign-in sources, as it names them (init's `apiKeySource`).
 # Anything else is "other". A run whose log names none keeps None.
@@ -705,6 +722,26 @@ def price(runs, baselines):
             prev_usage = dict(prev_usage, **r["usage"])
 
 
+def read_spend(cfg, now):
+    """{caller: {"note", "calls"}} for each spend ledger (contract §30), every one through the
+    ledgers' one reader, back as far as the logs are read. `calls` are runs of the caller's kind,
+    or None when the ledger is off or could not be read: unknown, never an empty list. A missing
+    folder's reason names the config key to check."""
+    since = now() - (cfg["lookback_days"] + 1) * 86400
+    paths = cfg.get("spend_ledgers") or {}
+    out = {}
+    for caller in spend_ledger.CALLERS:
+        note, rows = spend_ledger.read(paths.get(caller) or "", caller, since)
+        if note["reason"] == spend_ledger.NO_FOLDER:
+            note = dict(note, reason="%s: is spend_ledgers.%s right? Set it to \"\" to turn "
+                                     "this ledger off" % (note["reason"], caller))
+        calls = None if rows is None else [
+            {"last": r["epoch"], "cost": r["usd"], "seconds": 0, "kind": SPEND_KINDS[caller],
+             "model": r["model"], "billing": r["billing"]} for r in rows]
+        out[caller] = {"note": note, "calls": calls}
+    return out
+
+
 def scan(cfg, now):
     """Everything one pass reads, priced and classified. Pure over files: --selftest calls
     it, and compares each run with what its log was written to say."""
@@ -716,7 +753,8 @@ def scan(cfg, now):
     scanned = {"planners": planners, "reprompts": reprompts, "runs": None, "baselines": [],
                "reviewers": reviewers or frozenset(),
                "pendings": [], "sources": {"logs": logs_src, "ledger": ledger_src,
-                                           "planner": planner_src}}
+                                           "planner": planner_src},
+               "spend": read_spend(cfg, now)}
     if found is None:
         return scanned
     runs, baselines, pendings, firsts = found
@@ -1018,6 +1056,48 @@ def selftest_kit():
                         '{"rateLimitType": "five_hour", "resetsAt": 1e999, "utilization": NaN}}}'])
         return cfg_x
 
+    # The spend ledgers' world (KIT-844): (time, dollars, model, billing) per call, oldest first,
+    # as they are appended. The morning's first call is before the lookback, its second inside it
+    # but before the week; the stand-up's newest and the waker's only call could not be priced.
+    SPEND_ROWS = {
+        "morning": [("2026-10-20T05:00:00Z", 0.05, SONNET, "plan"),
+                    ("2026-10-29T05:00:00Z", 0.03, SONNET, "plan"),
+                    ("2026-11-03T05:00:00Z", 0.04, SONNET, "plan")],
+        "standup": [("2026-11-02T06:00:00Z", 0.02, SONNET, "plan"),
+                    ("2026-11-03T06:00:00Z", None, None, "plan")],
+        "tech_lead": [("2026-11-03T07:00:00Z", 0.10, SONNET, "plan"),
+                      ("2026-11-03T08:00:00Z", 0.20, OPUS, "plan")],
+        "conflict_waker": [("2026-11-03T09:00:00Z", None, "sonnet", "unknown")],
+    }
+
+    def spend_line(caller, when, usd, model, billing):
+        return json.dumps({"schema": spend_ledger.SCHEMA, "at": when, "caller": caller,
+                           "model": model, "usd": usd, "run_id": None, "billing": billing,
+                           "tokens": {"input": 10, "output": 5, "cache_read": 0,
+                                      "cache_write": 0}})
+
+    def spend_world(root, **over):
+        """A spend ledger for each caller under `root`, each in its own folder, holding its
+        SPEND_ROWS. `over` gives a caller its own lines instead (a row's tuple, or raw text),
+        None for a ledger whose folder does not exist, or "" for one the config does not name.
+        Returns the config's `spend_ledgers`."""
+        ledgers = {}
+        for caller in spend_ledger.CALLERS:
+            lines = over.get(caller, SPEND_ROWS[caller])
+            if lines == "":
+                ledgers[caller] = ""
+                continue
+            folder = os.path.join(root, "spend-" + caller)
+            ledgers[caller] = spend_ledger.path_in(folder, caller)
+            if lines is None:
+                continue
+            os.makedirs(folder)
+            with open(ledgers[caller], "w", encoding="utf-8") as fh:
+                for item in lines:
+                    fh.write((item if isinstance(item, str) else spend_line(caller, *item))
+                             + "\n")
+        return ledgers
+
     class Watch(object):
         """While open, notes every path written and every socket tried: the proof of what a
         pass never does."""
@@ -1080,7 +1160,8 @@ def selftest_kit():
         T=T, LEAK=LEAK, OPUS=OPUS, SONNET=SONNET, U=U, sid=sid, write_run=write_run, ms=ms,
         figures=figures,
         week_event=week_event, std_world=std_world, hostile_world=hostile_world,
-        CONFLICT=CONFLICT, BOUNCE=BOUNCE, CATCHUP=CATCHUP, Watch=Watch)
+        CONFLICT=CONFLICT, BOUNCE=BOUNCE, CATCHUP=CATCHUP, Watch=Watch,
+        SPEND_ROWS=SPEND_ROWS, spend_line=spend_line, spend_world=spend_world)
 
 
 def _cases(check):
@@ -1576,6 +1657,64 @@ def _cases(check):
         check("a run file's name is the one the chat lane's own reader parses",
               (head in chat, tail in chat, head in RUN_FILE.pattern, tail in RUN_FILE.pattern),
               (True, True, True, True))
+
+        # -- the spend ledgers (KIT-844): each read through the ledgers' one reader -----------
+        spend_world, SPEND_ROWS = kit.spend_world, kit.SPEND_ROWS
+        cfg_s, _ = std_world(os.path.join(tmp, "spend"))
+        cfg_s["spend_ledgers"] = spend_world(os.path.join(tmp, "spend"))
+        with Watch() as w:
+            got = scan(cfg_s, lambda: T)["spend"]
+
+        def calls_of(entry):
+            return None if entry["calls"] is None else [
+                (r["kind"], r["cost"], r["model"], r["billing"], _iso(r["last"]), r["seconds"])
+                for r in entry["calls"]]
+        check("each spend ledger is read, and each call is a run of its caller's kind, oldest "
+              "first, with no length",
+              [(c, got[c]["note"], calls_of(got[c])) for c in spend_ledger.CALLERS],
+              [("morning", {"state": READ, "reason": None},
+                [("morning", 0.03, kit.SONNET, "plan", "2026-10-29T05:00:00Z", 0),
+                 ("morning", 0.04, kit.SONNET, "plan", "2026-11-03T05:00:00Z", 0)]),
+               ("standup", {"state": READ, "reason": None},
+                [("standup", 0.02, kit.SONNET, "plan", "2026-11-02T06:00:00Z", 0),
+                 ("standup", None, None, "plan", "2026-11-03T06:00:00Z", 0)]),
+               ("tech_lead", {"state": READ, "reason": None},
+                [("tech_lead", 0.1, kit.SONNET, "plan", "2026-11-03T07:00:00Z", 0),
+                 ("tech_lead", 0.2, OPUS, "plan", "2026-11-03T08:00:00Z", 0)]),
+               ("conflict_waker", {"state": READ, "reason": None},
+                [("conflict_fix", None, "sonnet", "unknown", "2026-11-03T09:00:00Z", 0)])])
+        check("…a call from before the logs' reach is not read, and an unpriced one is None, "
+              "never zero", (len(SPEND_ROWS["morning"]), [r["cost"] for r in
+                                                         got["standup"]["calls"]]),
+              (3, [0.02, None]))
+        check("…and reading them writes nothing and opens no socket", (w.wrote, w.net), ([], []))
+        check("…the dispatcher's runs are read as they were without them",
+              len(scan(cfg_s, lambda: T)["runs"]), len(scan(std_world(os.path.join(
+                  tmp, "no-spend"))[0], lambda: T)["runs"]))
+        off = scan(std_world(os.path.join(tmp, "spend-off"))[0], lambda: T)["spend"]
+        check("a config that names no spend ledger: each is off, with no calls, never an empty "
+              "list", [(c, off[c]) for c in spend_ledger.CALLERS],
+              [(c, {"note": {"state": OFF, "reason": None}, "calls": None})
+               for c in spend_ledger.CALLERS])
+        for caller in spend_ledger.CALLERS:
+            root_c = os.path.join(tmp, "spend-gone-" + caller)
+            cfg_c, _ = std_world(root_c, spend_ledgers=spend_world(root_c, **{caller: None}))
+            got_c = scan(cfg_c, lambda: T)["spend"]
+            check("%s's ledger in a folder that does not exist could not be read: said by name "
+                  "with its config key, and no calls, never zero; the others are read" % caller,
+                  (got_c[caller], sorted(c for c in spend_ledger.CALLERS
+                                         if got_c[c]["note"]["state"] == READ)),
+                  ({"note": {"state": COULD_NOT,
+                             "reason": "%s: is spend_ledgers.%s right? Set it to \"\" to turn "
+                                       "this ledger off" % (spend_ledger.NO_FOLDER, caller)},
+                    "calls": None},
+                   sorted(c for c in spend_ledger.CALLERS if c != caller)))
+        root_p = os.path.join(tmp, "spend-partly")
+        cfg_p, _ = std_world(root_p, spend_ledgers=spend_world(
+            root_p, tech_lead=SPEND_ROWS["tech_lead"] + ["{\"schema\": \"pipeline-sp"]))
+        got_p = scan(cfg_p, lambda: T)["spend"]["tech_lead"]
+        check("a ledger with a line that is not a row is partly read: said, and the rows it "
+              "read are its calls", (got_p["note"]["state"], len(got_p["calls"])), (PARTLY, 2))
 
         # -- the reader opens no socket, starts no process and writes nothing -----------------
         source = inspect.getsource(sys.modules[__name__]).split("\ndef selftest():")[0]

@@ -93,6 +93,7 @@
     "test:queue-order": "python3 scripts/pipeline_queue_order.py --selftest",
     "test:usage-runs": "python3 scripts/pipeline_usage_runs.py --selftest",
     "test:usage": "python3 scripts/pipeline_usage_local.py --selftest",
+    "test:spend-ledger": "python3 scripts/pipeline_spend_ledger.py --selftest",
     "test:queue-pool": "python3 scripts/pipeline_queue_pool.py --selftest",
     "test:queue-read": "python3 scripts/pipeline_queue_read.py --selftest",
     "test:queue-start": "python3 scripts/pipeline_queue_start.py --selftest",

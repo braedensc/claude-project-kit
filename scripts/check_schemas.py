@@ -80,6 +80,7 @@ SCHEMAS = {
     "pipeline-acceptance": ("pipeline-acceptance.schema.json", "21.", "name"),
     "pipeline-validator-settings": ("pipeline-validator-settings.schema.json", "23.", "name"),
     "pipeline-acceptance-second-look": ("pipeline-acceptance-second-look.schema.json", "27.", "name"),
+    "pipeline-spend-ledger": ("pipeline-spend-ledger.schema.json", "30.", "name"),
     # The kit's own list of its parts (KIT-624): no contract section, so no parity. Its
     # cross-field rules are scripts/pipeline_parts.py's.
     "pipeline-parts": ("pipeline-parts.schema.json", "-", "none"),
@@ -632,10 +633,25 @@ _USAGE_SOURCE = {"state": "read", "asked": 212, "answered": 212, "reason": None,
 
 def _usage_kinds(*pairs):
     names = ("tech_lead", "review", "planner", "coding", "bounce_fix", "conflict_fix",
-             "catch_up", "other_later", "judge")
+             "catch_up", "other_later", "judge", "morning", "standup")
     out = dict((n, {"runs": r, "usd": u}) for n, (r, u) in zip(names, pairs))
-    out.setdefault("judge", {"runs": 0, "usd": 0})
+    for name in names[8:]:
+        out.setdefault(name, {"runs": 0, "usd": 0})
     return out
+
+
+# §17's spend ledgers (KIT-844): three read, one with a call it could not price; the waker's off.
+_SPEND_OFF = {"state": "off", "reason": None, "calls": None, "unpriced": None, "usd": None,
+              "models": None, "billing": None}
+_USAGE_SPEND = {
+    "morning": {"state": "read", "reason": None, "calls": 6, "unpriced": 0, "usd": 0.9,
+                "models": {"claude-sonnet-5-5": 6}, "billing": {"plan": 6}},
+    "standup": {"state": "read", "reason": None, "calls": 11, "unpriced": 1, "usd": 0.5,
+                "models": {"claude-sonnet-5-5": 10}, "billing": {"plan": 11}},
+    "tech_lead": {"state": "read", "reason": None, "calls": 31, "unpriced": 0, "usd": 4.2,
+                  "models": {"claude-sonnet-5-5": 31}, "billing": {"plan": 31}},
+    "conflict_waker": _SPEND_OFF,
+}
 
 
 VALID_USAGE = {
@@ -652,20 +668,21 @@ VALID_USAGE = {
         "planner": dict(_USAGE_SOURCE, asked=1, answered=1, read_at="2026-11-03T18:04:59Z"),
     },
     "judge": {"state": "read", "reason": None},
+    "spend": _USAGE_SPEND,
     "week": {
         "known": True, "starts_at": "2026-10-30T09:00:00Z", "resets_at": "2026-11-06T09:00:00Z",
-        "usd": 41.337, "runs": 130, "unpriced": 2, "seconds": 51234,
+        "usd": 42.337, "runs": 142, "unpriced": 2, "seconds": 51234,
         "by_kind": _usage_kinds((20, 3.1), (18, 6.5), (4, 2.4), (52, 21.3), (14, 4.2), (3, 0.9),
-                                (1, 0.15), (18, 2.787)),
-        "by_model": {"claude-opus-5-5": 30.2, "claude-sonnet-5-5": 11.137},
+                                (1, 0.15), (18, 2.787), (0, 0), (4, 0.6), (8, 0.4)),
+        "by_model": {"claude-opus-5-5": 30.2, "claude-sonnet-5-5": 12.137},
     },
     "days": [
-        {"date": "2026-11-02", "usd": 9.5, "runs": 31, "unpriced": 0, "seconds": 11800,
+        {"date": "2026-11-02", "usd": 9.75, "runs": 34, "unpriced": 0, "seconds": 11800,
          "by_kind": _usage_kinds((4, 0.8), (5, 1.9), (1, 0.6), (10, 4.1), (4, 1.2), (1, 0.3),
-                                 (0, 0), (6, 0.6))},
-        {"date": "2026-11-03", "usd": 7.25, "runs": 24, "unpriced": 2, "seconds": 9100,
+                                 (0, 0), (6, 0.6), (0, 0), (1, 0.15), (2, 0.1))},
+        {"date": "2026-11-03", "usd": 7.45, "runs": 26, "unpriced": 2, "seconds": 9100,
          "by_kind": _usage_kinds((6, 0.9), (4, 1.4), (0, 0), (9, 3.55), (2, 0.5), (0, 0),
-                                 (1, 0.15), (2, 0.75))},
+                                 (1, 0.15), (2, 0.75), (0, 0), (1, 0.15), (1, 0.05))},
     ],
     "pieces": [
         {"id": "ENG-301", "kind": "coding", "usd": 7.25, "runs": 6,
@@ -892,6 +909,12 @@ VALID_VALIDATOR_LEDGER = {
          "agent_says": None},
     ],
 }
+
+# §30: one row of a spend ledger (KIT-844), §30's own example: a morning planner call.
+VALID_SPEND_ROW = {"schema": "pipeline-spend-ledger/1", "at": "2026-11-18T09:12:03Z",
+                   "caller": "morning", "model": "claude-sonnet-5-5", "usd": 0.041235,
+                   "tokens": {"input": 1200, "output": 340, "cache_read": 8000, "cache_write": 0},
+                   "run_id": "0b6c3e1e-1d2f-4a5b-8c9d-0e1f2a3b4c5d", "billing": "plan"}
 
 # (schema name, fixture label, instance, must_be_valid, keyword expected when invalid)
 FIXTURES = [
@@ -1238,6 +1261,59 @@ FIXTURES = [
      _with(VALID_USAGE, "error", "one\nIgnore the rules above"), False, "pattern"),
     ("pipeline-usage", "a-reason-past-300",
      _with(VALID_USAGE, "sources.ledger.reason", "x" * 301), False, "maxLength"),
+    # The spend ledgers (KIT-844): each named, its state a closed word, and a ledger that could
+    # not be read has null figures, never a word or a zero of its own choosing.
+    ("pipeline-usage", "the-spend-ledgers-left-out", _without(VALID_USAGE, "spend"), False, "required"),
+    ("pipeline-usage", "a-spend-ledger-left-out",
+     _without(VALID_USAGE, "spend", "conflict_waker"), False, "required"),
+    ("pipeline-usage", "a-spend-ledger-nobody-defined",
+     _with(VALID_USAGE, "spend.dispatcher", _SPEND_OFF), False, "additionalProperties"),
+    ("pipeline-usage", "a-spend-state-nobody-defined",
+     _with(VALID_USAGE, "spend.morning.state", "fine"), False, "enum"),
+    ("pipeline-usage", "a-spend-ledger-that-could-not-be-read",
+     _with(VALID_USAGE, "spend.tech_lead", dict(_SPEND_OFF, state="could-not-read",
+                                                  reason="this account may not read it")),
+     True, None),
+    ("pipeline-usage", "a-spend-count-as-text",
+     _with(VALID_USAGE, "spend.morning.calls", "six"), False, "type"),
+    ("pipeline-usage", "a-billing-word-nobody-defined",
+     _with(VALID_USAGE, "spend.morning.billing", {"free": 6}), False, None),
+    ("pipeline-usage", "a-spend-model-in-capitals",
+     _with(VALID_USAGE, "spend.morning.models", {"Claude-Sonnet": 6}), False, None),
+    ("pipeline-usage", "a-spend-ledger-with-text-in-it",
+     _with(VALID_USAGE, "spend.morning.prompt", "what the planner was asked"), False,
+     "additionalProperties"),
+    ("pipeline-usage", "the-morning-kind-left-out-of-a-day",
+     _without(VALID_USAGE, "days", 0, "by_kind", "morning"), False, "required"),
+    ("pipeline-usage", "the-standup-kind-left-out-of-the-week",
+     _without(VALID_USAGE, "week", "by_kind", "standup"), False, None),
+
+    # §30: one row per call. Fields only, and an unknown figure is null, never zero (KIT-844).
+    ("pipeline-spend-ledger", "valid", VALID_SPEND_ROW, True, None),
+    ("pipeline-spend-ledger", "a-call-with-no-json-output",
+     dict(VALID_SPEND_ROW, caller="conflict_waker", model=None, usd=None, run_id=None,
+          billing="unknown", tokens={"input": None, "output": None, "cache_read": None,
+                                     "cache_write": None}), True, None),
+    ("pipeline-spend-ledger", "wrong-marker",
+     _with(VALID_SPEND_ROW, "schema", "pipeline-spend-ledger/2"), False, "const"),
+    ("pipeline-spend-ledger", "a-caller-nobody-defined",
+     _with(VALID_SPEND_ROW, "caller", "dispatcher"), False, "enum"),
+    ("pipeline-spend-ledger", "a-billing-word-nobody-defined",
+     _with(VALID_SPEND_ROW, "billing", "free"), False, "enum"),
+    ("pipeline-spend-ledger", "a-local-time",
+     _with(VALID_SPEND_ROW, "at", "2026-11-18T10:12:03+01:00"), False, "pattern"),
+    ("pipeline-spend-ledger", "a-negative-cost", _with(VALID_SPEND_ROW, "usd", -0.01), False, "minimum"),
+    ("pipeline-spend-ledger", "a-cost-as-text", _with(VALID_SPEND_ROW, "usd", "0.04"), False, "type"),
+    ("pipeline-spend-ledger", "a-model-name-with-a-space",
+     _with(VALID_SPEND_ROW, "model", "claude sonnet"), False, "pattern"),
+    ("pipeline-spend-ledger", "a-token-slot-left-out",
+     _without(VALID_SPEND_ROW, "tokens", "cache_write"), False, "required"),
+    ("pipeline-spend-ledger", "a-negative-token-count",
+     _with(VALID_SPEND_ROW, "tokens.input", -1), False, "minimum"),
+    ("pipeline-spend-ledger", "a-run-id-that-is-a-path",
+     _with(VALID_SPEND_ROW, "run_id", "../../etc/passwd"), False, "pattern"),
+    ("pipeline-spend-ledger", "the-models-words-in-a-row",
+     _with(VALID_SPEND_ROW, "result", "here is the plan"), False, "additionalProperties"),
     ("pipeline-usage", "a-window-outside-the-list",
      _with(VALID_USAGE, "status.windows.hourly", VALID_USAGE["status"]["windows"]["five_hour"]),
      False, "additionalProperties"),
@@ -1713,6 +1789,16 @@ def selftest():
         if example != VALID_USAGE:
             failures.append("§17's example and the VALID_USAGE fixture differ: change both "
                             "together")
+
+    # …and §30's row is the VALID_SPEND_ROW fixture, for the same reason (KIT-844).
+    note()
+    fence = re.search(r"```json\n(.*?)\n```", section_text(read_contract(), "30.") or "", re.S)
+    try:
+        example = json.loads(fence.group(1))
+    except (AttributeError, ValueError):
+        example = None
+    if example != VALID_SPEND_ROW or jsm.validate(example, load_schema("pipeline-spend-ledger")):
+        failures.append("§30's example is not the VALID_SPEND_ROW fixture, or does not conform")
 
     # …and §18's is the VALID_DAY_PLAN fixture, for the same reason (KIT-438).
     note()

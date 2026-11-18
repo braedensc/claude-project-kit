@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/braedensc/claude-project-kit/schemas/pipeline-spend-ledger.schema.json",
+  "title": "Pipeline spend ledger row",
+  "description": "The machine-readable definition of docs/PIPELINE-CONTRACT.md §30. A spend ledger records the model calls that no dispatcher log records, one row per call: the morning job's planner call, the stand-up's turn, the tech lead's turns and the conflict waker's fix sessions (KIT-844, KIT-687). Each caller keeps its own ledger in its own state folder: a JSON Lines file, one row per line, appended by scripts/pipeline_spend_ledger.py's append(). The usage job reads every ledger through the same module's read() and counts the calls beside the dispatcher's logs (§17).",
+  "$comment": "FIELDS ONLY. Every value is a number, a word from a closed list, a model name that matches a strict pattern, a session id, or a time to the second in UTC. No prompt, reply or error text reaches a row. A figure the CLI did not give is null, never zero: a call whose cost is unknown counts as unpriced. That the row's caller is the ledger's own is checked by the reader, which this schema cannot say.",
+
+  "type": "object",
+  "required": ["schema", "at", "caller", "model", "usd", "tokens", "run_id", "billing"],
+  "additionalProperties": false,
+
+  "properties": {
+    "schema": {
+      "const": "pipeline-spend-ledger/1",
+      "description": "The marker, on every row. The reader leaves a row with any other value out, and says so."
+    },
+    "at": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$(?![\\s\\S])",
+      "description": "When the call ended, in UTC to the second. The writer stamps it as it appends the row; a caller cannot."
+    },
+    "caller": {
+      "enum": ["morning", "standup", "tech_lead", "conflict_waker"],
+      "description": "Who made the call: the morning job's planner, the stand-up's turn, a turn of the tech lead's (a DM, or a plan note), or a fix session the conflict waker started. A ledger holds its own caller's rows only."
+    },
+    "model": {
+      "type": ["string", "null"],
+      "maxLength": 64,
+      "pattern": "^[a-z0-9][a-z0-9._\\[\\]-]{0,63}$(?![\\s\\S])",
+      "description": "The model that carried the call: of the models the CLI's output names, the one it gives the most cost. `other` for a name that is not a plain one. Without such an output, the model the caller asked for, or null when it asked for none."
+    },
+    "usd": {
+      "type": ["number", "null"],
+      "minimum": 0,
+      "description": "The CLI's own estimate of the call's cost at API prices (`total_cost_usd`), to a millionth of a dollar. Null when the caller could not read it: no JSON output, or an error that gave no total. Never 0 for unknown."
+    },
+    "tokens": {
+      "type": "object",
+      "required": ["input", "output", "cache_read", "cache_write"],
+      "additionalProperties": false,
+      "description": "The call's tokens, as the CLI's output reports them in its `usage`. Each is null when the output did not give it.",
+      "properties": {
+        "input": {"$ref": "#/$defs/token_count", "description": "`input_tokens`: input not read from or written to the prompt cache."},
+        "output": {"$ref": "#/$defs/token_count", "description": "`output_tokens`."},
+        "cache_read": {"$ref": "#/$defs/token_count", "description": "`cache_read_input_tokens`: input read from the prompt cache."},
+        "cache_write": {"$ref": "#/$defs/token_count", "description": "`cache_creation_input_tokens`: input written to the prompt cache."}
+      }
+    },
+    "run_id": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$(?![\\s\\S])",
+      "description": "The CLI's session id for the call, when its output gave one. Null otherwise."
+    },
+    "billing": {
+      "enum": ["plan", "key", "unknown"],
+      "description": "How the call was paid for, from the credential the caller handed the CLI. `plan`: a `claude setup-token` token and no key, so the call draws on the plan's usage windows. `key`: an API key, billed by the token. `unknown`: the CLI ran under a sign-in the caller did not choose."
+    }
+  },
+
+  "$defs": {
+    "token_count": {"type": ["integer", "null"], "minimum": 0}
+  }
+}

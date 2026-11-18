@@ -379,6 +379,9 @@ npm run test:usage-runs      # the usage runs (KIT-422): the dispatcher's logs r
 npm run test:usage           # the usage job (KIT-422): the runs counted into one file of spend;
                              #   the week unknown not guessed, a source it could not read said,
                              #   a file that does not conform never written
+npm run test:spend-ledger    # the spend ledgers (KIT-844): one row per model call no dispatcher
+                             #   log records; one writer, one reader; a ledger it cannot read
+                             #   gives no calls, never zero; an unknown cost is null
 npm run test:queue-pool      # the queue's pool (KIT-433): who may start without the owner, by actor
                              #   in the history; a history it cannot read is held and said
 npm run test:queue-read      # the queue's reader (KIT-445): the tracker and three records, one inputs file;

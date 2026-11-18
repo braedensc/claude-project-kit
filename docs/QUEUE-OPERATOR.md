@@ -166,6 +166,20 @@ when the tech lead read it and tried: only your own message counts.
 Good: *Changed the planned load (PLANNED_LOAD) from 40 to 30. ...* Not that: *I didn't change the planned load to 9:
 your own message has to name that setting and the new value*. Ask again in your own words.
 
+## The calls no dispatcher log records
+
+Four callers run the claude CLI themselves: the morning job, the stand-up, the tech lead's turns and the conflict
+waker. None leaves a dispatcher log. Each keeps its own spend ledger instead, one row per call (contract §30). The
+usage job reads every ledger beside the logs and counts its calls into the day and the week (KIT-844).
+
+The usage file's `spend` names each ledger, and the pass's summary says one line for each.
+
+Good: `spend    morning         read, 1 call, $0.04`. Not that: `spend    tech_lead       could-not-read: ...`. The
+reason names what to check. That ledger's calls are not counted, never as zero, and the pass is `partial`.
+
+The three ledgers in the role account's home are read by default. The waker runs as you, so its ledger is in your own
+home, where the role account cannot read. It stays `off`, and the waker's calls are not counted.
+
 ## Pausing it
 
 Unload a job: `sudo launchctl bootout system/<label>`. `disable` it too to survive a restart. The installer never reloads
