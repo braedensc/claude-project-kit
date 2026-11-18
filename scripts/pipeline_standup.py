@@ -62,7 +62,8 @@ how much of today's plan it holds up. "Today's plan" goes first in MORNING_SECTI
 THE VALIDATOR (KIT-545).  With `validator_ledger_file` set, its ledger (contract §24) is read by
 the ledger's own reader, with no model between. Each approval since the last rundown is one line
 in code's words, after the stand-up whoever wrote it; each escalation and hold that still waits is
-a blocker in the ledger's own words, an urgent one first and marked urgent. The agent's reason is
+a blocker in the ledger's own words, an urgent one first and marked urgent; with no status file
+to check against, each since the last rundown is said as not checked. The agent's reason is
 only its own marked line and never in the facts. A ledger that cannot be read is said, never as
 none. The sprint recap lists the week's decisions from the same reader (validator_view).
 
@@ -826,16 +827,41 @@ def _approved_line(row, status, full=False):
     return "%s: %s. %s" % (lead, name, APPROVED_WHY)
 
 
-def _approved_since(status, kind, now, since):
-    """The approval rows in the rundown's window: since the last morning (after it) for the
+def _in_window(row, kind, now, since):
+    """True for a row in the rundown's window: since the last morning (after it) for the
     morning, since midnight for the afternoon, as the rest of each message counts."""
-    out = []
+    at = _parse(row["at"])
+    return at is not None and (since <= at <= now if kind == "afternoon" else since < at <= now)
+
+
+def _approved_since(status, kind, now, since):
+    """The approval rows in the rundown's window."""
+    return [row for row in _validator_rows(status)
+            if row["kind"] == "approved" and _in_window(row, kind, now, since)]
+
+
+VALIDATOR_UNCHECKED = ("The validator sent you these since the last stand-up. With no status file "
+                       "to check them against, some may be settled already:")
+
+
+def validator_unchecked_block(status, kind, now, since):
+    """For a rundown with no status file to read, or a blind one (Stage E on #614): each
+    escalation and hold since the last rundown that is still its plan's, piece's or pull
+    request's latest row, urgent first, in the ledger's own words. None can be checked against
+    the status file, so none is dropped and none is claimed to still wait. "" with none."""
+    latest = {}
     for row in _validator_rows(status):
-        at = _parse(row["at"])
-        if row["kind"] == "approved" and at is not None and (
-                since <= at <= now if kind == "afternoon" else since < at <= now):
-            out.append(row)
-    return out
+        latest[(row["subject"], row["ref"].lower())] = row
+    rows = sorted((r for r in latest.values() if r["kind"] in vledger.BLOCKER_KINDS
+                   and _in_window(r, kind, now, since)),
+                  key=lambda r: (r["kind"] != "escalated-urgent", r["at"]))
+    if not rows:
+        return ""
+    lines = [VALIDATOR_UNCHECKED] + ["- %s." % vledger.blocker(r)["what"]
+                                     for r in rows[:MAX_LINES]]
+    if len(rows) > MAX_LINES:
+        lines.append("- And %d more." % (len(rows) - MAX_LINES))
+    return "\n".join(lines)
 
 
 def validator_block(status, kind, now, since):
@@ -1047,9 +1073,17 @@ def section_today(status, now, since):
 
 def section_shipped(status, now, since):
     lines = ["%s %s" % (_hm(at, now), words) for at, kind, words in _events(status)
-             if kind in ("merged", "plan-finished", "validator-approved")
-             and since <= at <= now]
+             if kind in ("merged", "plan-finished") and since <= at <= now]
     return ("Shipped today:", _capped(lines)) if lines else ("Nothing shipped today.", [])
+
+
+def section_validator_today(status, now, since):
+    """KIT-545: the day's approvals by the validator, in a part of their own. An approval of a
+    plan or of a piece's start ships nothing, and a merge it approved is already under "Shipped
+    today" (Stage E on #614). None with none, so with the validator off nothing changes."""
+    lines = ["%s %s" % (_hm(at, now), words) for at, _kind, words in _validator_events(status)
+             if since <= at <= now]
+    return ("Approved by the validator today:", _capped(lines)) if lines else None
 
 
 def section_started_finished(status, now, since):
@@ -1077,7 +1111,7 @@ def section_started_finished(status, now, since):
 # MVP 2 puts "today's plan" first in the morning, and "spend against the day's limit" in the
 # afternoon.
 MORNING_SECTIONS = [section_done, section_today]
-AFTERNOON_SECTIONS = [section_shipped, section_started_finished]
+AFTERNOON_SECTIONS = [section_shipped, section_validator_today, section_started_finished]
 
 
 # --------------------------------------------------------------------------- #
@@ -1986,8 +2020,11 @@ def compose(kind, now, settings, record=None, teams=None):
     if status is None:
         plain = _slack_safe("%s There's no stand-up this %s: %s. I won't pass on old news." % (
             greeting, kind, problem))
-        after = "".join("\n\n" + _slack_safe(x) for x in unread + [validator_block(
-            {"_validator": validator}, kind, now, since)] if x)
+        # Its escalations and holds too, urgent first, said as not checked (Stage E on #614).
+        mine = {"_validator": validator}
+        after = "".join("\n\n" + _slack_safe(x) for x in unread + [
+            validator_unchecked_block(mine, kind, now, since),
+            validator_block(mine, kind, now, since)] if x)
         return {"kind": kind, "text": plain + after, "plain": plain + after,
                 "full": plain + after, "facts": None, "after": after, "by": "code", "why": None,
                 "cost_usd": None, "problem": problem, "status_written_at": None,
@@ -2017,11 +2054,13 @@ def compose(kind, now, settings, record=None, teams=None):
               "by": "code", "why": None, "cost_usd": None, "repos_in_file": in_file}
     status = dict(status, _validator=validator)
     if blind:
-        approved = validator_block(status, kind, now, since)
-        full = _slack_safe("\n\n".join(lead + ([approved] if approved else [])))
+        # With Linear unread nothing can be checked as still waiting, so the validator's
+        # escalations and holds are said as not checked, urgent first (Stage E on #614).
+        said = [x for x in (validator_unchecked_block(status, kind, now, since),
+                            validator_block(status, kind, now, since)) if x]
+        full = _slack_safe("\n\n".join(lead + said))
         short = _slack_safe("\n\n".join(["%s %s" % (greeting, " ".join(notes))]
-                                         + ([sprint_line] if sprint_line else [])
-                                         + ([approved] if approved else [])))
+                                         + ([sprint_line] if sprint_line else []) + said))
         result.update(text=short, plain=short, full=full)
         return result
     # KIT-483: a report, not a request. Blockers are the only asks, each with the reply that
@@ -2807,6 +2846,16 @@ def _cases_validator(check, tmp, now, ago, record, put, settings_with):
     put(_fx_status(now, plans))
     check("validator-the-afternoon-says-the-days-approvals",
           merged in afternoon["text"] and started not in afternoon["text"], afternoon["text"])
+    # Its full list keeps them in a part of their own: an approval ships nothing, and the merge
+    # it approved is already under "Shipped today" (Stage E on #614).
+    af = afternoon["full"]
+    shipped = af[af.find("Shipped today:"):af.find("Approved by the validator today:")]
+    check("validator-the-afternoons-approvals-are-their-own-part-never-shipped",
+          "pull request #611 merged" in shipped and "Approved" not in shipped
+          and af.find("Shipped today:") < af.find("Approved by the validator today:\n- ")
+          < af.find("Started and finished today:")
+          and "Approved and merged by the validator: pull request #611 in example-org/kit"
+          in af[af.find("Approved by the validator today:"):], af)
     # 5. A ledger that cannot be read or trusted is said, never shown as none.
     with open(path, encoding="utf-8") as fh:
         good = fh.read()
@@ -2834,6 +2883,25 @@ def _cases_validator(check, tmp, now, ago, record, put, settings_with):
           and "Approved and merged" not in none["text"]
           and "Approved for merge by the validator: a pull request in example-org/kit. Its "
           "hard limits" in none["text"] and none["text"].endswith(none["after"]), none["text"])
+    # ...and its escalations and holds since the last one, urgent first, said as not checked
+    # against the status file: none is dropped (Stage E on #614).
+    unchecked = ("%s\n- Urgent: Pull request #612 in example-org/kit was sent to you by the "
+                 "validator, urgently. It believes the dev session may be compromised.\n"
+                 "- Pull request #614 in example-org/kit was held by the validator: it changes "
+                 "the safety system or a risk path.\n- Plan KIT-600 was held by the validator: "
+                 "the idea was not yours.\n" % VALIDATOR_UNCHECKED)
+    check("validator-no-status-file-still-says-each-escalation-urgent-first-as-unchecked",
+          unchecked in none["text"] and "- KIT-613 was held by the validator" in none["text"]
+          and none["text"].index(unchecked) < none["text"].index("Approved to start"),
+          none["text"])
+    put(_fx_status(now, plans, sources={"tracker": {
+        "state": "could-not-read", "asked": 1, "answered": 0, "reason": "HTTP 503",
+        "read_at": None}}))
+    blind = compose("morning", now, s_on, record)
+    put(_fx_status(now, plans))
+    check("validator-a-blind-rundown-says-them-the-same-way",
+          "Linear couldn't be read" in blind["text"] and unchecked in blind["text"]
+          and unchecked in blind["full"] and started in blind["text"], blind["text"])
     # 7. A project's own: another team's and another repository's rows are left out.
     view = validator_view(s_on, teams=["KIT"], repos=["example-org/site"])
     check("validator-a-stand-up-reads-its-own-projects-rows-only",
@@ -5007,7 +5075,7 @@ def _selftest():
                              AFTERNOON_SECTIONS) == (
         [blockers_from_validator, blockers_from_status, blockers_from_day_plan],
         [waiting_from_status, merges_from_day_plan], [section_done, section_today],
-        [section_shipped, section_started_finished]))
+        [section_shipped, section_validator_today, section_started_finished]))
     # The command line, end to end: preview prints the plain rundown and changes nothing; run
     # with no settings file says OFF; settings that are wrong are refused by name.
     on_path, bad_path = os.path.join(tmp, "on.json"), os.path.join(tmp, "bad.json")

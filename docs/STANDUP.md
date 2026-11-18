@@ -83,6 +83,11 @@ prints it.
   that clears it: `approve <plan>` or `start <piece>`. A pull request is yours to merge or close.
 - **An urgent escalation comes first, marked urgent**, whoever words the stand-up: words from the
   tech lead's turn that leave it out are not used.
+- **With no status file to check against** (none can be read, or Linear could not be read), each
+  escalation and hold since the last stand-up is listed after it, urgent first. Each is said as not
+  checked, so none is dropped and none is claimed to still wait.
+- **The afternoon's full list** gives the day's approvals a part of their own. An approved plan or
+  piece start ships nothing, so neither goes under *Shipped today*.
 - **A ledger that can't be read or trusted is said**, and no approval is claimed. It is never shown
   as none.
 
