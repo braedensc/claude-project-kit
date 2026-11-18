@@ -76,6 +76,7 @@ try:
     import pipeline_queue_order as order
     import pipeline_queue_pool as pool
     import pipeline_hold as watcher_hold
+    import pipeline_pass_lock as pass_lock
     import pipeline_queue_read as reader
     import pipeline_sprint_plan as sprint_plan
     import pipeline_status_local as status_job
@@ -396,6 +397,11 @@ def counted(led, ticket, source, now):
                 rows=led["rows"] + [{"ticket": ticket, "source": source, "at": pool.iso(now)}])
 
 
+class QueueBusy(OSError):
+    """Another pass holds the ledger's lock (KIT-681). Nothing was written and nothing may start on this say; it is
+    not a failure, so a caller that can tell it apart says so and ends its step quietly."""
+
+
 def record_start(path, now, ticket, source):
     """Write today's row for a start about to be made, and return the ledger as written. Raises
     ValueError (a ledger that cannot be counted on, a ticket or source of the wrong shape, a
@@ -403,9 +409,21 @@ def record_start(path, now, ticket, source):
     nothing may start."""
     if not (isinstance(ticket, str) and TICKET_RE.match(ticket)) or source not in LEDGER_SOURCES:
         raise ValueError("a start names a ticket id and one of %s" % ", ".join(LEDGER_SOURCES))
-    led = counted(read_ledger(path, pool.local_date(now)), ticket, source, now)
-    write(led, path)
-    return led
+    # KIT-681: one pass writes the ledger at a time. A second one finds it held, writes nothing and
+    # raises, so nothing starts on its say (it is the same "nothing may start" as a bad ledger).
+    folder = os.path.dirname(path)
+    if reader.inside_git_worktree(folder):      # refused before a lock file is made in it
+        raise ValueError("%s is inside a git working tree, where a session can write" % folder)
+    job = "queue-start-" + os.path.basename(path)
+    handle = pass_lock.take(folder, job)
+    if handle is None:
+        raise QueueBusy(pass_lock.BUSY_SAYS % "the queue's starter")
+    try:
+        led = counted(read_ledger(path, pool.local_date(now)), ticket, source, now)
+        write(led, path)
+        return led
+    finally:
+        pass_lock.release(handle)
 
 
 # --------------------------------------------------------------------------- #
@@ -940,6 +958,9 @@ def _cases(check, tmp, home):
              [ledger_case(None, s) for s in (("ENG-1", "none"), ("eng-1", "todo"))],
              [("refused", "a start names a ticket id and one of todo, backlog, plan, "
                "agent_filed, resume", True)] * 2),
+            ("ledger: a second pass at once writes nothing and says it is already running (KIT-681)",
+             _two_at_once(tempfile_dir(), NOW),
+             ("QueueBusy: " + pass_lock.BUSY_SAYS % "the queue's starter", False, 1, True)),
             ("ledger: a folder inside a git working tree is refused",
              _refused(lambda: record_start(os.path.join(GIT, "l.json"), NOW, "ENG-1", "todo")),
              True),
@@ -1216,6 +1237,29 @@ def _cases(check, tmp, home):
         check("mutant: %s is caught" % name, caught(**patch), True)
     check("…and with every mutant undone the starter is as it was",
           [x[1] for x in battery()] == base, True)
+
+
+def _two_at_once(folder, now):
+    """(what the second pass was told, whether it wrote a ledger, the starts once the first let go, whether
+    the lock was let go after that). The second pass is the one that finds the ledger's lock held."""
+    path = os.path.join(folder, "ledger.json")
+    held = pass_lock.take(folder, "queue-start-ledger.json")
+    told = _busy(lambda: record_start(path, now, "ENG-1", "todo"))
+    wrote = os.path.exists(path)
+    pass_lock.release(held)
+    starts = record_start(path, now, "ENG-1", "todo")["starts"]
+    free = pass_lock.take(folder, "queue-start-ledger.json")
+    pass_lock.release(free)
+    return (told, wrote, starts, free is not None)
+
+
+def _busy(fn):
+    """What an OSError said, or None when `fn` raised none."""
+    try:
+        fn()
+    except OSError as exc:
+        return "%s: %s" % (type(exc).__name__, exc)
+    return None
 
 
 def _refused(fn):
