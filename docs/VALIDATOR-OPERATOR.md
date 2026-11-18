@@ -400,7 +400,7 @@ runs the other way: `ESCALATE_URGENT` always reaches you.
 
 The hard limits are the first layer: plain code with no model. They are worked out again at each
 decision, from things no session can write. The code is `scripts/pipeline_validator_limits.py`.
-The merge path calls it (section 9). The approvals of plans and pieces are their own pieces.
+The merge path (section 9) and the piece pass (section 10) call it. Plan approvals are their own piece.
 
 It answers `pass`, or `fail` with every reason, in short fixed words. It never quotes a ticket or a
 pull request.
@@ -492,8 +492,8 @@ agent to see what it would say.
 ## 7. What a no does
 
 When the validator does not approve, code decides what happens next, from the agent's answer and
-the layers. The code is `scripts/pipeline_validator_route.py`. The merge path calls it (section
-9). The approvals of plans and pieces are their own pieces.
+the layers. The code is `scripts/pipeline_validator_route.py`. The merge path (section 9) and the
+piece pass (section 10) call it. Plan approvals are their own piece.
 
 | What happened | What it records | What happens next |
 |---|---|---|
@@ -566,8 +566,8 @@ verdict is the validator's: a send-back has its own path, and an escalation or a
 
 Before it judges anything, the validator reads the facts about it once: who filed the idea, which
 files change, how big the change is, whether the window is open, and so on. The code is
-`scripts/pipeline_validator_facts.py`. It only reads. The merge path calls it (section 9). The
-approvals of plans and pieces are their own pieces.
+`scripts/pipeline_validator_facts.py`. It only reads. The merge path (section 9) and the piece pass
+(section 10) call it. Plan approvals are their own piece.
 
 Each fact comes from the part of the kit that owns it, through that part's own reader:
 
@@ -684,3 +684,55 @@ only a person can land.
 
 Exit 0: the pass ran and said what it did, or that it was off or held. 1: a write failed. 2: the
 config needs fixing, or this is an agent's environment. 3: something could not be read.
+
+## 10. A piece starting
+
+A piece of a plan you approved waits for your `start` when it was added to the plan, or changed,
+after your approval. With the pieces switch on, the validator may give that start in your place
+(KIT-543). The code is `scripts/pipeline_validator_pieces.py`. Nothing schedules it yet: the
+install is a later piece.
+
+**What one pass does.**
+
+1. It reads the switches. The pieces switch off: it stops and says `OFF`.
+2. It reads the watcher's hold. A hold, or a hold file it cannot read: it stops and says `HELD`.
+3. It runs the queue's own pass, with the validator's read-only tracker key, and lists the pieces
+   that wait only for your `start`. Nothing else is judged.
+4. Each, oldest ticket first: its facts, the hard limits, then the agent.
+
+| What it finds | What it does |
+|---|---|
+| A hold no pass can settle: the safety system, a human-only class, an idea you did not file | A `held` row, once. It waits for you. An unchanged hold is not written again. |
+| A fact not read, or the window closed | Nothing written. It waits, and says why. |
+| The limits pass | One agent run and its row. A send-back becomes an escalation: a piece has no dev session yet. |
+| A piece the agent already judged, unchanged since | It waits for you. No second run, so the pieces after it get their turn. |
+| A piece edited while the agent judged it | Nothing written. A later pass judges it as it stands. |
+
+At most one agent run per pass. "Unchanged" is judged by the piece's own history, as the queue
+read it: a row newer than the piece's last change is about the piece as it stands. It never starts a piece itself. The queue's starter does, from the
+ledger (`docs/QUEUE-OPERATOR.md`, "When the validator approves a piece's start").
+
+**The agent's second brief.** A piece has no diff yet, so the agent judges the ticket as written. Its
+brief holds two fenced blocks, each marked as data: the criteria of the piece's plan, and the
+piece's own text. The question is whether the ticket asks for what the criteria ask, and nothing
+else that needs you. The answer's grammar is the same two lines. A ticket over the cap is a hold,
+as an over-sized diff is. The code is `build_ticket_brief` in `scripts/pipeline_validator_brief.py`.
+A plan uses the same brief, with its pieces against its idea's criteria.
+
+**Its config** is the validator's one config, `~/.validator/config.json`: `settings_file`,
+`ledger_file`, and the `facts` and `agent` sections. The facts section names the queue's config
+and the read-only tracker key's variable.
+
+**Try one pass that writes nothing.** It reads and judges, runs no agent, and changes nothing. Run
+it in a terminal, as yourself: it is refused in an agent's environment.
+
+```bash
+python3 scripts/pipeline_validator_pieces.py run --config ~/.validator/config.json --dry-run
+```
+
+Good: `TOD-12: the validator approved its start.`, then the queue's next start says so on the
+ticket. Not that: a piece changed after the validator's approval starting on that approval.
+
+Exit 0: the pass ran and said what it did, or that it was off or held. 1: a ledger row could not
+be written. 2: the config needs fixing, or this is an agent's environment. 3: something could not
+be read.

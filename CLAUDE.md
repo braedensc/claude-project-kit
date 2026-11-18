@@ -274,7 +274,9 @@ npm run test:install         # the one command (scripts/pipeline_install.py): sk
 npm run test:parts           # every part listed once (pipeline-parts.json): owners, needs, cards, docs/PARTS.md
 npm run test:settings        # the settings folder (KIT-853): one machine.conf under ~/Library, a shared
                              #   value written to every part file the map names, shown first, --apply
-                             #   refused under a model; no secret, no other reader, no link, no repo
+                             #   refused under a model; no secret, no other reader, no link, no repo;
+                             #   a file per project composed into the parts' lists, and a first-run
+                             #   gather that copies no secret and writes nothing before a yes (KIT-854)
 npm run test:chat-lane-setup # chat-lane composer: owner's grant, fence keeps defaults, verify agent-refused
 npm run test:model-switch    # the dispatcher's chat-model switch (KIT-385): the pair alone or no
                              #   go, every open pipeline ticket on the default tagged first
@@ -362,6 +364,8 @@ npm run test:validator-run   # the validator agent's run (KIT-537): one tool-les
                              #   environment pinned, a failure a hold in fixed words, only its job starts it
 npm run test:validator-merge  # the merge path (KIT-539): GitHub's own auto-merge on one pull request at a
                              #   time, the next updated and judged again; never merges, approves or labels
+npm run test:validator-pieces  # the validator approves a piece starting (KIT-543): the ticket as written,
+                             #   against its plan's criteria; it records, and the queue's pool starts it
 npm run test:day-planner     # the day planner (KIT-439): ticket text fenced as data in its brief, one
                              #   answer block read, every pick checked, a failing one dropped with a reason
 npm run test:morning         # the morning job (KIT-446): once a day inside the window, one tool-less call,
@@ -396,6 +400,14 @@ npm run test:queue-read      # the queue's reader (KIT-445): the tracker and thr
                              #   a history whole or null, what it could not read said
 npm run test:queue-start     # the queue's starter (KIT-452): what may start now, inside the window
                              #   only; the ledger row written before each start, never a title
+npm run test:session-kinds   # each kind of session as data (KIT-704): every kind loads; a mode that skips
+                             #   checks, a file tool by name, Bash in our own sandbox each refused
+npm run test:harness-claude  # the one adapter (KIT-704): every kind's full command line, settings and
+                             #   environment pinned; our own sandbox's profile run for real on a Mac
+npm run test:runner-guard    # the guards' launcher (KIT-704): no folder named or two named is a refusal;
+                             #   a crash is a refusal; the engine's folder this account could change
+npm run test:runner-probe    # the live probe of each kind's walls (KIT-704), against a stand-in: walls
+                             #   that hold pass, leaks fail, a model that declines is NOT MEASURED
 npm run test:runner-store    # the runner's store (KIT-642): requests and run records behind
                              #   walls, each caller for its own kinds; unreadable runs are None
 npm run test:runner          # the runner (KIT-642): start, resume, stop and a restart against a

@@ -3205,7 +3205,7 @@ Each is `pass`, `fail`, `unsure` or `not-run`. `unsure` holds, as `fail` does. `
 
 ### Who reads it
 
-Stage E's bounce driver reads a `sent-back` row for a pull request at its current head, when its config names the ledger (`validator_ledger_file`, KIT-542). It re-prompts the dev session from its own ledger and budget. The watcher's `approval-rate` monitor (§19, KIT-546) reads it through `read()`: every merge against the `approved` rows, an approval still unmerged a day later, the day's approvals, and each urgent escalation.
+Stage E's bounce driver reads a `sent-back` row for a pull request at its current head, when its config names the ledger (`validator_ledger_file`, KIT-542). It re-prompts the dev session from its own ledger and budget. The watcher's `approval-rate` monitor (§19, KIT-546) reads it through `read()`: every merge against the `approved` rows, an approval still unmerged a day later, the day's approvals, and each urgent escalation. The queue's reader reads the latest `piece` row for each ticket while the validator's pieces switch is on (`reader.validator_settings_file` and `reader.validator_ledger_file`, KIT-543), and its pool admits a held piece of an approved plan `via` "validator" when an `approved` row is newer than the piece's last change.
 
 The stand-up reads it when its settings name it (`validator_ledger_file`, KIT-545), with `read()` and no model between. Each `approved` row since the last rundown is one line in code's words. The latest row for each plan, piece or pull request that is an escalation or a hold, while the status file shows it still waiting, is a blocker in the ledger's own words (`blocker()`), an urgent one first and marked urgent. With no status file to check against (none can be read, or Linear could not be read), each such row since the last rundown is listed instead, urgent first, said as not checked. The agent's reason is only its own marked line, with links made plain, and never in the facts the tech lead's turn reads. A ledger `read()` gives no rows for is said ("no approval is claimed"), never shown as none. Absent, or the setting empty, nothing is said. The sprint recap lists the period's rows from the same reader.
 
@@ -3452,7 +3452,8 @@ words come from the program's own output. A session that printed them itself wou
 fresh start of the same request, and never a second.
 
 **Its limits (KIT-643).** Each run is held to a wall-clock limit, a memory limit for its whole
-process tree and a disk limit for its own folders, from the runner's `limits` settings. Past one,
+process tree and a disk limit for its own folders, from the runner's `limits` settings, each held to
+its kind's own ceiling in `session-kinds/<kind>.json` (KIT-704): the smaller wins. Past one,
 its tree is stopped and the record says `stopped` with that `limit:` reason. Below the machine's floor
 no new session starts. Each incident is recorded once, in plain words, in `<store>/incidents.json`
 (`{"schema": "pipeline-runner-incidents/1", "open", "told"}`), which the runner alone writes.

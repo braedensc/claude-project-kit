@@ -70,6 +70,29 @@ environment.
 Good: `held: the watcher has held new starts: protected-label acme/app#12: nothing would start`.
 Not that: a start after a hold was set. Run `python3 scripts/pipeline_hold.py show --hold-file /path/to/hold.json`.
 
+## When the validator approves a piece's start
+
+A piece of a plan you approved waits for your `start` when it was added to the plan, or changed, after your
+approval. With the validator's pieces switch on, the validator may give that start instead (KIT-543,
+`docs/VALIDATOR-OPERATOR.md`, "A piece starting"). The queue reads its decision from two files, named in the
+`reader` section of the queue's config:
+
+- `validator_settings_file`: the validator's settings. The pieces switch must be on.
+- `validator_ledger_file`: the validator's ledger.
+
+Both empty is the default, and then your `start` decides, as before. The queue's account must be able to read
+and trust both files: a copy owned by root or by that account, outside every repository. The install puts the
+copies in place.
+
+A piece starts on the validator's approval only when the approval is newer than the piece's last change. A piece
+changed after it is held for your `start` again, until the validator judges it again. The watcher's hold still
+stops every start. A piece the validator held, or escalated, waits for you as before. Its start comment says the
+validator approved it, never that you did.
+
+Good: `Started by the queue, in lane acme/app:1: it is a piece of TOD-10, which you approved, and the validator
+approved its start at 2026-11-18 10:00 UTC.` Not that: a piece changed after the validator's approval starting on
+that approval.
+
 ## When the Mac is short of room
 
 Before any start, the queue reads three numbers: memory pressure, free disk on the data volume, and swap in use. Past a

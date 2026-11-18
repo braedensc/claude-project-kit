@@ -33,6 +33,7 @@ import os
 import shutil
 import signal
 import stat
+import sys
 import tempfile
 import threading
 
@@ -423,6 +424,38 @@ def selftest():
             talive = False
         expect("a command that ignores the signal is killed 10 s later, and the folder goes",
                (rc, os.path.exists(run), took >= 10, talive), (128 + signal.SIGTERM, False, True, False))
+        # EPERM from killpg: gone only when our own child is already reaped; else it is said.
+        real_killpg = os.killpg
+        def eperm(pgid, sig):
+            raise PermissionError(1, "Operation not permitted")
+        done = subprocess.Popen(["true"])
+        done.wait()
+        live = subprocess.Popen(["sleep", "30"])
+        import io
+        from contextlib import redirect_stderr
+        said_gone, said_denied = io.StringIO(), io.StringIO()
+        try:
+            os.killpg = eperm
+            with redirect_stderr(said_gone):
+                gone_v = _signal_group(done, signal.SIGTERM)
+            with redirect_stderr(said_denied):
+                denied_v = _signal_group(live, signal.SIGTERM)
+        finally:
+            os.killpg = real_killpg
+            live.kill()
+            live.wait()
+        expect("EPERM for a group whose child is already reaped is gone, and says nothing",
+               (gone_v, said_gone.getvalue()), ("gone", ""))
+        try:
+            os.killpg = eperm
+            with redirect_stderr(io.StringIO()):
+                left = _stop_group(done, signal.SIGTERM)
+        finally:
+            os.killpg = real_killpg
+        expect("a group of only zombies is not a process left running, so nothing is claimed stopped",
+               left, False)
+        expect("EPERM for a group whose child is still ours is denied, and said",
+               (denied_v, "not allowed to signal" in said_denied.getvalue()), ("denied", True))
         pidfile = os.path.join(kept, "bg.pid")
         r = cli("--", "sh", "-c", "sleep 30 >/dev/null 2>&1 & echo $! > %s" % pidfile)
         with open(pidfile) as fh:
@@ -483,17 +516,34 @@ def _group_alive(pgid):
         return True
 
 
+def _signal_group(proc, sig):
+    """Send `sig` to the command's group. "sent", "gone" (no such group, or EPERM with our own
+    child already reaped: macOS says that for a group of only zombies) or "denied" (EPERM while
+    the child is still ours: we may not signal that group, and it is said, not taken as gone)."""
+    try:
+        os.killpg(proc.pid, sig)
+        return "sent"
+    except ProcessLookupError:
+        return "gone"
+    except PermissionError:
+        if proc.poll() is not None:
+            return "gone"
+        print("scratch_run: not allowed to signal the command's group", file=sys.stderr)
+        return "denied"
+
+
 def _stop_group(proc, first):
     """`first` to the command's whole group, then SIGKILL after 10 s. True if any was left."""
     import time
     if not _group_alive(proc.pid):
         proc.poll()
         return False
+    sent = False
     for sig, grace in ((first, 10), (signal.SIGKILL, 5)):
-        try:
-            os.killpg(proc.pid, sig)
-        except ProcessLookupError:
-            break
+        verdict = _signal_group(proc, sig)
+        if verdict == "gone":
+            return sent         # nothing was left to stop (a group of only zombies is not one)
+        sent = sent or verdict == "sent"
         deadline = time.time() + grace
         while time.time() < deadline:
             proc.poll()
@@ -539,10 +589,7 @@ def main(argv):
     def forward(signum, frame):
         received.append(signum)
         if proc is not None:
-            try:
-                os.killpg(proc.pid, signum)
-            except ProcessLookupError:
-                pass
+            _signal_group(proc, signum)
     proc = None
     with scratch_run(label + "-run-", parent=parent) as run:
         # Handlers of its own while the command runs: a signal is passed to the whole
@@ -581,10 +628,7 @@ def main(argv):
                 print("scratch_run: could not start %s: %s" % (command[0], exc), file=sys.stderr)
                 return 2
             if received:                       # it came while the command started: pass it on
-                try:
-                    os.killpg(proc.pid, received[0])
-                except ProcessLookupError:
-                    pass
+                _signal_group(proc, received[0])
             # A command that ignores the signal it was passed is killed 10 s later, so the
             # folder never waits on it forever.
             import time
@@ -597,10 +641,7 @@ def main(argv):
                     if received and signalled is None:
                         signalled = time.time()
                     if signalled is not None and time.time() - signalled > 10:
-                        try:
-                            os.killpg(proc.pid, signal.SIGKILL)
-                        except ProcessLookupError:
-                            pass
+                        _signal_group(proc, signal.SIGKILL)
             if _stop_group(proc, signal.SIGTERM):
                 print("scratch_run: the command left a process running; it was stopped",
                       file=sys.stderr)

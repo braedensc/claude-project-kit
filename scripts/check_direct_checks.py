@@ -42,6 +42,7 @@ DIRECT = (
     "scripts/check_label_gate.py",
     "scripts/check_template_label_gate.py",
     "scripts/check_ci_covers_tests.py",
+    "scripts/pipeline_session_kinds.py --check",
 )
 
 # Direct steps in Kit checks that are deliberately not in DIRECT: command -> reason.
