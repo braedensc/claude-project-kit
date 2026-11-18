@@ -33,9 +33,11 @@
 # CLAUDE_ARGS is gone (KIT-676): a conf that still sets it is refused by name.
 # Move your local gate to CHECK_COMMANDS and a model to MODEL.
 #
-# Each REPO_DIRS checkout needs an HTTPS origin.  A fix session's git runs in
-# Claude Code's sandbox, where SSH cannot connect on macOS, so the installer
-# refuses an SSH origin and prints the command that changes it.
+# Each REPO_DIRS checkout needs an HTTPS origin, and git's own credential
+# helper for github.com.  A fix session's git runs in Claude Code's sandbox,
+# where SSH cannot connect on macOS and gh cannot hand git its login.  So the
+# installer refuses an SSH origin, and a helper that runs gh (`gh auth
+# setup-git` writes one), and names the fix.  macOS's `osxkeychain` works.
 # ---------------------------------------------------------------------------
 
 # The checkouts whose worktrees your sessions run in — the directory you start

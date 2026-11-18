@@ -55,7 +55,8 @@ below was allowed by an exact rule. A refusal is therefore the sandbox's, and it
 | `/tmp/claude-<uid>`, Claude Code's own temp folder | Allowed: its shell keeps its working folder there. Denying it broke every command |
 | The per-project folders inside it, other sessions' scratchpads | Refused once denied by a pattern, and commands still worked |
 | `git fetch`, `git merge`, `git commit` in a worktree | Worked: objects land in the shared git folder |
-| `git ls-remote` and an authenticated `git push --dry-run` over HTTPS | Worked through the sandbox's proxy |
+| `git ls-remote` and an authenticated `git push --dry-run` over HTTPS | Worked through the sandbox's proxy, with git's `osxkeychain` helper |
+| The same push with a gh-backed credential helper (`gh auth git-credential`) | Failed: `could not read Username`. Preflight refuses such a helper |
 | A commit through the kit's real pre-commit hook | Worked |
 | `gh` inside the sandbox | Failed: it could not verify TLS or read its token |
 | `gh pr checks <n>` as an exact excluded command | Worked, outside the sandbox |

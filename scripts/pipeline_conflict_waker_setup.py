@@ -435,9 +435,21 @@ def _first_line(res):
 
 
 def ssh_url(url):
-    """True for a remote git reaches over SSH: `ssh://…` or the `user@host:path` form."""
+    """True for a remote git reaches over SSH: `ssh://…`, or the scp form `[user@]host:path`,
+    whose first `:` comes before any `/` (a host alias from ~/.ssh/config included)."""
     text = (url or "").strip()
-    return text.startswith("ssh://") or ("://" not in text and "@" in text.split(":", 1)[0] and ":" in text)
+    if text.startswith("ssh://"):
+        return True
+    if "://" in text:
+        return False
+    colon, slash = text.find(":"), text.find("/")
+    return colon > 0 and (slash == -1 or colon < slash)
+
+
+def gh_helper(value):
+    """True for a git credential helper that runs gh, as `gh auth setup-git` writes it."""
+    words = (value or "").strip().lstrip("!").split()
+    return bool(words) and os.path.basename(words[0]) == "gh"
 
 
 # --------------------------------------------------------------------------- #
@@ -536,6 +548,20 @@ def step_preflight(ctx, apply_it):
                             "in Claude Code's sandbox, where SSH cannot connect on macOS (KIT-676), so every "
                             "fix there would fail. Give it an HTTPS origin:  git -C %s remote set-url origin "
                             "https://github.com/%s.git" % (d, origin, d, slug))
+        # The push needs git's own credential helper: inside the sandbox gh cannot hand git the
+        # login, so a gh-backed helper fails every push ("could not read Username", measured).
+        helpers = []
+        for key in ("credential.helper", "credential.https://github.com.helper"):
+            got = r.read(["git", "-C", d, "config", "--get-all", key])
+            helpers += [ln.strip() for ln in (got.out or "").splitlines() if got.ok and ln.strip()]
+        ghs = [h for h in helpers if gh_helper(h)]
+        if ghs:
+            problems.append("REPO_DIRS entry %s gives git its GitHub login through gh (%s). A fix session's "
+                            "git runs in Claude Code's sandbox, where gh cannot hand git that login, so every "
+                            "push would fail (KIT-676). Give git its own helper for github.com instead, such as "
+                            "macOS's keychain (`osxkeychain`). `git -C %s config --show-origin --get-all "
+                            "credential.https://github.com.helper` shows where the gh one is set"
+                            % (d, ghs[0], d))
         if ctx.origin_url is None:
             ctx.origin_url = origin
     if not ctx.code_url:
@@ -1500,8 +1526,24 @@ def _selftest_body():
            "%s %s" % (rows[:1], c.check_dirs))
     # Every host here is example.invalid: the provenance scan reads a real host after a user as an email.
     for url, want in (("git@example.invalid:o/n.git", True), ("ssh://git@example.invalid/o/n", True),
-                      ("https://example.invalid/o/n.git", False), ("https://user@example.invalid/o/n", False)):
+                      ("example.invalid:o/n.git", True), ("myalias:o/n", True),
+                      ("https://example.invalid/o/n.git", False), ("https://user@example.invalid/o/n", False),
+                      ("/srv/clones/kit", False), ("./dir:x", False), ("", False)):
         expect("ssh-url-%s" % url, ssh_url(url) is want, url)
+    # A gh-backed credential helper is refused, by name, with where it was set: inside the sandbox gh
+    # cannot hand git the login, so every push would fail (measured). Git's own helper passes.
+    c, f = _fake_ctx()
+    f.answers = [("src/kit config --get-all credential.https://github.com.helper", 0,
+                  "\n!/opt/homebrew/bin/gh auth git-credential\n"),
+                 ("config --get-all credential.helper", 0, "osxkeychain\n")] + _settled_answers(c)
+    rows, _ = quiet(lambda: measure(c, apply_it=False))
+    detail = rows[0][2] if rows else ""
+    expect("preflight-gh-credential-helper", rows and rows[0][1] == FAILED and "through gh" in detail
+           and "/Users/you/src/kit" in detail and "osxkeychain" in detail and "/Users/you/src/app gives" not in detail,
+           detail)
+    for value, want in (("!/opt/homebrew/bin/gh auth git-credential", True), ("!gh auth git-credential", True),
+                        ("osxkeychain", False), ("store", False), ("", False), ("!/usr/bin/ghost x", False)):
+        expect("gh-helper-%s" % value, gh_helper(value) is want, value)
 
     # 14. the clone is `behind` only when a script the job runs changed: a merge elsewhere leaves
     #     it level (said), a changed pr_conflict.py is named, and a missing import is FAILED.

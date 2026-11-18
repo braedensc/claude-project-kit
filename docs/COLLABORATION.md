@@ -336,8 +336,10 @@ twice on doc-tail merges before these rules existed:
      (`conflict-waker.conf.example` has the kit's line). A check left out is never run, and
      the fix is pushed with only CI to test it. The dry run prints the whole list for you to
      sign. `CLAUDE_ARGS` is gone, and a conf that still sets it is refused by name.
-   - **Each `REPO_DIRS` checkout needs an HTTPS origin.** git cannot use SSH inside the
-     sandbox on macOS, so preflight refuses an SSH origin and prints the fix.
+   - **Each `REPO_DIRS` checkout needs an HTTPS origin, and git's own credential helper.**
+     git cannot use SSH inside the sandbox on macOS, and gh cannot hand git its login there.
+     So preflight refuses an SSH origin, and a helper that runs gh (`gh auth setup-git` writes
+     one), naming the fix. macOS's `osxkeychain` helper works.
    - **`CLAUDE_CONFIG_DIR` is read at install.** The job keeps the value your shell had
      then (else `~/.claude`). Change it later and re-run `run`, or the waker finds no
      transcripts and every conflict pages you. Preflight refuses a directory with none.
