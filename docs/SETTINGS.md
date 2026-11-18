@@ -76,7 +76,11 @@ python3 scripts/pipeline_settings.py gather --apply    # show it again, ask for 
 - **It proves the folder first.** If the folder it made would change any part file, it stops and
   says what.
 - **`--apply` asks for a typed `yes`,** reads the part files again, and writes only into a folder
-  with no settings yet. Like `write --apply`, it refuses inside a Claude session.
+  with no settings yet: one that is not there, is empty, or holds the file `init` made, untouched.
+  A note of your own in that file counts as settings. Like `write --apply`, it refuses inside a
+  Claude session.
+- **It writes the whole folder or nothing.** A failure part way, such as a full disk, removes what
+  that run made, so you can simply run it again.
 - `--parts-dir` reads the part files from another folder, and records it as `PARTS_DIR`.
 
 ---
@@ -120,6 +124,8 @@ python3 scripts/pipeline_settings.py where           # where the folder, the par
 - A project file with another key, a `REPO` or `TEAM_KEY` of the wrong shape, a part that takes no
   list, neither a `REPO` nor a `TEAM_KEY`, a `REPO` or `TEAM_KEY` two projects share, or a file in
   `projects/` that is not `<name>.conf`.
+- A project the queue covers (`work-queue`) without a `TEAM_KEY`, or without a `REPO` when
+  `[queue.conf]` sets no `REPO_BY_LABEL`. The queue's own installer refuses a team with no repository.
 
 ---
 

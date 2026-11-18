@@ -46,7 +46,8 @@ section. A value shaped like a secret, a key another tool writes and a key the e
 name are never copied: each is named, with why. Before it shows anything it proves the folder
 would change no part file. It writes nothing. `gather --apply`, run by you in your own terminal,
 shows it again and asks for a typed yes, reads the part files once more, and writes the folder
-only where no settings are yet.
+only where no settings are yet: a folder that is not there, is empty, or holds the file `init` makes,
+untouched. It writes the whole folder or nothing: a failure part way removes what that run made.
 
 WHAT `write` DOES. For each part file on this Mac it works out what the folder changes, and shows
 each change: the file, the key, the value now and the value after. It writes nothing. With
@@ -72,7 +73,9 @@ WHAT `check` FAILS ON (`write` runs it first, so a folder that fails it is never
               folder would undo.
   projects    a project file with another key, a REPO or TEAM_KEY of the wrong shape, a part that
               takes no list, neither a REPO nor a TEAM_KEY, a REPO or TEAM_KEY two projects share,
-              or a file in projects/ that is not <name>.conf.
+              or a file in projects/ that is not <name>.conf. A project the queue covers needs a
+              TEAM_KEY, and a REPO too unless [queue.conf] sets REPO_BY_LABEL: the queue's own
+              installer refuses a team with no repository.
 
 WHAT IT NEVER DOES (asserted in --selftest). It runs no installer and no other program, loads no
 job, and opens no connection. It reads the folder, the kit's parts list and examples, and the part
@@ -245,10 +248,11 @@ class Kit(object):
         self.root = root
         with open(os.path.join(root, PARTS_LIST), encoding="utf-8") as fh:
             doc = json.load(fh)
-        self.examples, self.keys = {}, {}
+        self.examples, self.keys, self.part_file = {}, {}, {}
         for part in doc.get("parts") or []:
             s = part.get("settings") or {}
             name, example = s.get("file") or "", s.get("example") or ""
+            self.part_file[part.get("id")] = name
             if name.endswith(".conf") and example and name not in self.examples:
                 self.examples[name] = os.path.join(root, example)
         if not self.examples:
@@ -419,6 +423,24 @@ def duplicate_problems(projects):
                 owners.setdefault(projects[name][key], []).append(name)
         out += ["the projects %s name the same %s" % (" and ".join(names), key)
                 for _value, names in sorted(owners.items()) if len(names) > 1]
+    return out
+
+
+def queue_problems(folder):
+    """The queue lists teams, and maps each one to a repository unless REPO_BY_LABEL is set (its installer's
+    own rule). So a project the queue covers needs a TEAM_KEY, and a REPO too unless [queue.conf] sets
+    REPO_BY_LABEL: otherwise the queue's settings would be written in a shape its installer refuses, or the
+    project would silently not reach it."""
+    out, by_label = [], (folder.parts.get("queue.conf") or {}).get("REPO_BY_LABEL")
+    for name in sorted(folder.projects):
+        p = folder.projects[name]
+        if "work-queue" not in p["PARTS"]:
+            continue
+        if not p["TEAM_KEY"]:
+            out.append("projects/%s.conf names work-queue but has no TEAM_KEY, and the queue lists teams" % name)
+        elif not p["REPO"] and not by_label:
+            out.append("projects/%s.conf names work-queue with a TEAM_KEY and no REPO, and [queue.conf] sets no "
+                       "REPO_BY_LABEL: the queue maps every team to a repository" % name)
     return out
 
 
@@ -616,7 +638,7 @@ def load(settings_dir, kit, uid, stop=None):
     pdir = os.path.join(settings_dir, PROJECTS)
     if os.path.lexists(pdir):
         folder.projects, found = read_projects(pdir)
-        problems += found
+        problems += found + queue_problems(folder)
     return "read", folder, problems, overrides(folder)
 
 
@@ -806,11 +828,13 @@ def shown(value):
     return "(shaped like a secret, not shown)" if hidden else value
 
 
-def put_file(path, text, mode):
-    """One whole small file of the folder's: made new beside it, then swapped in, never through a link."""
+def put_file(path, text, mode, new=False):
+    """One whole small file of the folder's: made new beside it, then put in place, never through a link.
+    With new=True it never replaces a file that is there, even one made a moment ago: the file appears
+    whole, or the call raises."""
     if os.path.islink(path):
         raise OSError("%s is a link" % path)
-    tmp, done = "%s.new.%d" % (path, os.getpid()), False
+    tmp = "%s.new.%d" % (path, os.getpid())
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -818,14 +842,30 @@ def put_file(path, text, mode):
             fh.write(text)
             fh.flush()
             os.fsync(fh.fileno())
-        os.replace(tmp, path)
-        done = True
+        if new:
+            os.link(tmp, path)             # refuses a path that is there
+        else:
+            os.replace(tmp, path)
     finally:
-        if not done:
+        if os.path.lexists(tmp):
             try:
                 os.unlink(tmp)
             except OSError:
                 pass
+
+
+def undo(made):
+    """Remove what this run made, newest first: never anything else. Returns what could not be removed."""
+    left = []
+    for path in reversed(made):
+        try:
+            if os.path.isdir(path) and not os.path.islink(path):
+                os.rmdir(path)
+            else:
+                os.unlink(path)
+        except OSError:
+            left.append(path)
+    return left
 
 
 # --------------------------------------------------------------------------- #
@@ -930,7 +970,7 @@ def round_trip(kit, g, parts_dir, uid):
     for name, text in sorted(g.projects.items()):
         folder.projects[name], found = parse_project(name, text)
         out += found + ["projects/%s.conf %s" % (name, p) for p in secret_problems(text)]
-    out += duplicate_problems(folder.projects)
+    out += duplicate_problems(folder.projects) + queue_problems(folder)
     folder.places.setdefault("PARTS_DIR", parts_dir)
     for name in kit.files:
         plan = plan_file(folder, kit, name, uid)
@@ -1014,20 +1054,63 @@ def gather(kit, parts_dir, uid):
     return g
 
 
-def folder_has_settings(sdir):
-    """The folder already holds settings: a KEY=value line in machine.conf, or anything in projects/."""
-    machine = os.path.join(sdir, MACHINE)
-    if os.path.lexists(machine):
-        try:
-            text = read_text(machine)
-        except (OSError, ValueError):
-            return True                          # one it cannot read is never written over
-        for raw in text.splitlines():
-            line = raw.strip()
-            if line and not line.startswith("#") and not SECTION_RE.match(line):
-                return True
-    pdir = os.path.join(sdir, PROJECTS)
-    return os.path.lexists(pdir) and (not os.path.isdir(pdir) or bool(os.listdir(pdir)))
+def folder_state(sdir, kit):
+    """("empty", "") when gather may fill the folder: it is not there, holds nothing, or holds only the
+    machine.conf `init` makes, untouched. ("filled", why) when it holds anything else, a comment of the
+    person's included. ("unread", why) when that cannot be told."""
+    try:
+        if not os.path.lexists(sdir):
+            return "empty", ""
+        if os.path.islink(sdir) or not os.path.isdir(sdir):
+            return "filled", "it is a link or not a folder"
+        names = sorted(os.listdir(sdir))
+        if names and names != [MACHINE]:
+            return "filled", "it holds %s" % ", ".join(names)
+        if names and read_text(os.path.join(sdir, MACHINE)) != template(kit):
+            return "filled", "its machine.conf is not the untouched one `init` makes"
+    except (OSError, ValueError) as exc:
+        return "unread", "it could not be read (%s)" % type(exc).__name__
+    return "empty", ""
+
+
+def write_folder(sdir, g, kit):
+    """Write the gathered folder whole, or leave the folder as it was. None, or why not in words.
+    A folder that is not there yet is built beside it and renamed into place. Into init's untouched folder,
+    the projects go first and machine.conf last. A failure part way removes what this run made."""
+    made, fresh, target = [], not os.path.lexists(sdir), sdir
+    try:
+        if fresh:
+            parent = os.path.dirname(sdir)
+            if not os.path.isdir(parent):
+                os.makedirs(parent)
+            target = os.path.join(parent, ".%s.gather.%d" % (os.path.basename(sdir), os.getpid()))
+            os.mkdir(target, FOLDER_MODE)
+            made.append(target)
+            os.chmod(target, FOLDER_MODE)
+        pdir = os.path.join(target, PROJECTS)
+        if g.projects and not os.path.lexists(pdir):
+            os.mkdir(pdir, FOLDER_MODE)
+            made.append(pdir)
+            os.chmod(pdir, FOLDER_MODE)
+        for name in sorted(g.projects):
+            put_file(os.path.join(pdir, name + ".conf"), g.projects[name], FILE_MODE, new=True)
+            made.append(os.path.join(pdir, name + ".conf"))
+        machine = os.path.join(target, MACHINE)
+        if os.path.lexists(machine):
+            if read_text(machine) != template(kit):
+                raise ValueError("machine.conf changed")
+            put_file(machine, g.machine, FILE_MODE)          # init's untouched file, replaced last
+        else:
+            put_file(machine, g.machine, FILE_MODE, new=True)
+            made.append(machine)
+        if fresh:
+            os.rename(target, sdir)
+        return None
+    except (OSError, ValueError) as exc:
+        left = undo(made)
+        return "could not be written (%s). %s" % (type(exc).__name__, (
+            "These could not be removed again; take them away by hand: %s" % ", ".join(left)) if left else
+            "Nothing was left behind: %s is as it was" % sdir)
 
 
 def said_yes(answer):
@@ -1184,7 +1267,7 @@ def cmd_init(sdir, kit, uid, out, stop=None):
         if not os.path.lexists(sdir):
             os.makedirs(sdir, FOLDER_MODE)
             os.chmod(sdir, FOLDER_MODE)
-        put_file(machine, template(kit), FILE_MODE)
+        put_file(machine, template(kit), FILE_MODE, new=True)      # never over one made meanwhile
     except OSError as exc:
         out("FAILED: %s could not be made (%s)." % (machine, type(exc).__name__))
         return EX_FAILED
@@ -1211,9 +1294,13 @@ def show_gathered(g, sdir, parts_dir, out):
 
 
 def cmd_gather(sdir, kit, uid, parts_dir, apply, out, ask, stop=None):
-    if folder_has_settings(sdir):
-        out("%s already holds settings, and `gather` only fills a folder that has none. Nothing was changed."
-            % sdir)
+    state, why = folder_state(sdir, kit)
+    if state == "unread":
+        out("COULD NOT RUN: %s: %s. Nothing was changed." % (sdir, why))
+        return EX_UNREAD
+    if state == "filled":
+        out("%s already holds settings (%s). `gather` only fills a folder that is empty, or holds the file "
+            "`init` makes, untouched. Nothing was changed." % (sdir, why))
         return EX_OK
     repo = git_tree(sdir, stop)
     if repo:
@@ -1235,22 +1322,12 @@ def cmd_gather(sdir, kit, uid, parts_dir, apply, out, ask, stop=None):
     if not said_yes(ask("Write this to %s? Type yes: " % sdir)):
         out("Nothing was written.")
         return EX_WAITING
-    if not unchanged(g, gather(kit, parts_dir, uid)) or folder_has_settings(sdir):
+    if not unchanged(g, gather(kit, parts_dir, uid)) or folder_state(sdir, kit) != ("empty", ""):
         out("The part files or the folder changed while you read this. Nothing was written. Run gather again.")
         return EX_FIX
-    try:
-        if not os.path.lexists(sdir):
-            os.makedirs(sdir, FOLDER_MODE)
-            os.chmod(sdir, FOLDER_MODE)
-        put_file(os.path.join(sdir, MACHINE), g.machine, FILE_MODE)
-        pdir = os.path.join(sdir, PROJECTS)
-        if g.projects and not os.path.lexists(pdir):
-            os.mkdir(pdir, FOLDER_MODE)
-            os.chmod(pdir, FOLDER_MODE)
-        for name in sorted(g.projects):
-            put_file(os.path.join(pdir, name + ".conf"), g.projects[name], FILE_MODE)
-    except OSError as exc:
-        out("FAILED: the folder could not be written (%s). Check %s by hand." % (type(exc).__name__, sdir))
+    why = write_folder(sdir, g, kit)
+    if why:
+        out("FAILED: the folder %s." % why)
         return EX_FAILED
     out("Wrote %s and %d project file%s." % (os.path.join(sdir, MACHINE), len(g.projects),
                                              "" if len(g.projects) == 1 else "s"))
@@ -1763,6 +1840,27 @@ def battery():
     os.remove(os.path.join(pdir, "leak.conf"))
     check("map lists the keys the projects fill",
           len([s for s in run("map")[1] if "of every project" in s]), len(COMPOSED))
+    project("ops", "TEAM_KEY=OPS\nPARTS=work-queue\n")
+    check("a team the queue covers with no repository is refused, as the queue's installer would",
+          any("projects/ops.conf names work-queue with a TEAM_KEY and no REPO" in s for s in run("check", *sd)[1]), True)
+    settings("[queue.conf]\nREPO_BY_LABEL=repo:ops=acme/ops\n")
+    check("…unless [queue.conf] sets REPO_BY_LABEL, as the queue allows", run("check", *sd)[0], EX_OK)
+    os.remove(os.path.join(pdir, "ops.conf"))
+    project("solo", "REPO=acme/solo\nPARTS=work-queue\n")
+    check("a repository the queue covers with no team is refused: it would never reach the queue",
+          any("projects/solo.conf names work-queue but has no TEAM_KEY" in s for s in run("check", *sd)[1]), True)
+    os.remove(os.path.join(pdir, "solo.conf"))
+    settings("")
+    check("each list key belongs to its part in the parts list, and is a key its example names",
+          [e for e in COMPOSED if kit.part_file.get(e[0]) != e[1] or e[2] not in kit.keys.get(e[1], ())], [])
+    there = os.path.join(tmp, "there.conf")
+    put(there, "mine\n")
+    try:
+        put_file(there, "theirs\n", 0o600, new=True)
+        replaced = True
+    except OSError:
+        replaced = False
+    check("a new file is never put over one that is there", (replaced, get(there)), (False, "mine\n"))
 
     # 15. A first run: gather what the part files say, show it, and write nothing until a yes.
     gparts, gdir = os.path.join(tmp, "gparts"), os.path.join(tmp, "gathered")
@@ -1780,7 +1878,8 @@ def battery():
     fill("stage-a.conf", ROLE_ACCOUNT="_pipe", DISPATCHER_ACCOUNT="_pipe", PLANNED_REPOS="acme/app")
     fill("stage-e.conf", ROLE_ACCOUNT="_pipe", REVIEW_REPOS="acme/app,acme/kit", MANAGED_TEAM_KEYS="ENG,KIT",
          GITHUB_APP_LOGIN=samples[0], OLD_KEY="x", OLD_API_TOKEN="abc")
-    fill("queue.conf", ROLE_ACCOUNT="_pipe", TEAM_KEYS="ENG,WEB", REPO_BY_TEAM="ENG=acme/app")
+    fill("queue.conf", ROLE_ACCOUNT="_pipe", TEAM_KEYS="ENG,WEB", REPO_BY_TEAM="ENG=acme/app",
+         REPO_BY_LABEL="repo:web=acme/web")
     fill("bridge.conf", ROLE_ACCOUNT="_pipe", TEAM_KEYS="ENG", APP_NAME="Rex")
     fill("notifier.conf", ROLE_ACCOUNT="_pipe", TEAM_KEYS="KIT")
     fill("sweep.conf", ROLE_ACCOUNT="_pipe", TEAM_KEYS="ENG,KIT")
@@ -1851,6 +1950,42 @@ def battery():
     run("init", "--settings-dir", tdir)
     check("…but it fills one that init made and nobody filled",
           run("gather", "--apply", "--settings-dir", tdir, "--parts-dir", gparts, ask=lambda p: "yes")[0], EX_OK)
+    cdir = os.path.join(tmp, "commented")
+    run("init", "--settings-dir", cdir)
+    with open(os.path.join(cdir, MACHINE), "a", encoding="utf-8") as fh:
+        fh.write("# my own note\n")
+    noted = get(os.path.join(cdir, MACHINE))
+    check("…and never one whose file the person has written in, even a comment",
+          (run("gather", "--apply", "--settings-dir", cdir, "--parts-dir", gparts, ask=lambda p: "yes")[0],
+           get(os.path.join(cdir, MACHINE))), (EX_OK, noted))
+    os.chmod(os.path.join(cdir, MACHINE), 0o000)
+    code, said = run("gather", "--settings-dir", cdir, "--parts-dir", gparts)
+    os.chmod(os.path.join(cdir, MACHINE), 0o600)
+    check("a machine.conf that cannot be read is said as that, never as nothing to do",
+          (code, any("could not be read" in s for s in said)), (EX_UNREAD, True))
+    real_put, calls = globals()["put_file"], [0]
+
+    def fails_second(path, text, mode, new=False):    # a full disk, part way through
+        calls[0] += 1
+        if calls[0] == 2:
+            raise OSError("no space left")
+        return real_put(path, text, mode, new)
+    for label, target in (("a folder not there yet", os.path.join(tmp, "half")),
+                          ("init's untouched folder", os.path.join(tmp, "half-init"))):
+        if "init" in label:
+            run("init", "--settings-dir", target)
+        before_fail = sorted(os.listdir(tmp))
+        calls[0], globals()["put_file"] = 0, fails_second
+        try:
+            code, said = run("gather", "--apply", "--settings-dir", target, "--parts-dir", gparts, ask=lambda p: "yes")
+        finally:
+            globals()["put_file"] = real_put
+        left = sorted(os.listdir(target)) if os.path.isdir(target) else None
+        check("a gather that fails part way into %s leaves it as it was" % label, (
+            code, left, sorted(os.listdir(tmp)) == before_fail, any("Nothing was left behind" in s for s in said)),
+            (EX_FAILED, [MACHINE] if "init" in label else None, True, True))
+        check("…so gather can simply run again (%s)" % label,
+              run("gather", "--apply", "--settings-dir", target, "--parts-dir", gparts, ask=lambda p: "yes")[0], EX_OK)
     fill("stage-e.conf", ROLE_ACCOUNT="_pipe", REVIEW_REPOS="acme/kit", MANAGED_TEAM_KEYS="ENG,KIT")
     code, said = run("gather", "--settings-dir", os.path.join(tmp, "g3"), "--parts-dir", gparts)
     check("a list the projects would not give exactly stays in its section as it is", (
@@ -1983,7 +2118,13 @@ def selftest():
         ("gather never joins a team to its repository", dict(projects_from=unpaired)),
         ("gather drops a list the projects would not give exactly", dict(lists_match=lambda *a: True)),
         ("gather skips its own proof", dict(round_trip=lambda *a: [])),
-        ("gather writes over a folder that holds settings", dict(folder_has_settings=lambda sdir: False)),
+        ("gather writes over a folder that holds settings", dict(folder_state=lambda sdir, kit: ("empty", ""))),
+        ("a project the queue cannot take passes", dict(queue_problems=lambda folder: [])),
+        ("a new file is put over one that is there",
+         dict(put_file=lambda path, text, mode, new=False: o["put_file"](path, text, mode))),
+        ("a gather that fails part way leaves what it made", dict(undo=lambda made: [])),
+        ("a list key goes to another part's file",
+         dict(COMPOSED=(("paging",) + COMPOSED[0][1:],) + COMPOSED[1:])),
         ("gather writes without --apply",
          dict(cmd_gather=lambda sdir, kit, uid, parts_dir, apply, out, ask, stop=None: o["cmd_gather"](
              sdir, kit, uid, parts_dir, True, out, lambda prompt: "yes", stop))),
