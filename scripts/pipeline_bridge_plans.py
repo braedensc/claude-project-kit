@@ -305,7 +305,7 @@ PLAN_PREREQUISITE_COMMENT = (
     "%(piece)s: %(piece)s's note said it needs work no piece of the plan covers, the tech lead "
     "judged the note, and the plan executor filed it in the backlog with `provenance:agent`, "
     "blocking %(piece)s. Nothing starts it by itself: hand it to the agent to start it, or "
-    "cancel it to undo this. It is recorded in the bridge's plan_changes ledger.")
+    "cancel it to undo this. It is recorded in the tech lead's plan_changes ledger.")
 # Why a prerequisite the rules let through is asked of the owner after all, in fixed words by
 # the executor's verdict. Its own reasons go to the log, never into the conversation.
 PREREQUISITE_WHYS = {
@@ -329,8 +329,8 @@ PLAN_PREREQUISITE_PARTIAL = (
 PLAN_CHANGE_COMMENT = (
     "**Changed without the owner, inside the plan they approved (KIT-320).** %s now waits for "
     "%s to be done before it is handed to the agent. %s's note asked for a change, the tech "
-    "lead judged it, and the bridge checked that it removes, cancels and edits nothing in the "
-    "plan. It is recorded in the bridge's plan_changes ledger. To start %s sooner, hand it to "
+    "lead judged it, and it was checked: it removes, cancels and edits nothing in the "
+    "plan. It is recorded in the tech lead's plan_changes ledger. To start %s sooner, hand it to "
     "the agent yourself.")
 PLAN_CHANGES_HEAD = "Changed without you, inside plans you approved:"
 # The one question for a note whose change is not made without the owner. `said` holds the
@@ -625,7 +625,7 @@ def quoted(words):
 def answer_block(name, uid, when, words):
     """What a yes adds to the end of a plan's description (KIT-334): who answered, when, and
     their words, quoted under a rule, so they read as theirs and not the planner's."""
-    return ("\n\n---\n\n**Answer from %s (Slack user %s), %s, through the Slack bridge:**\n\n%s"
+    return ("\n\n---\n\n**Answer from %s (Slack user %s), %s, through the tech lead:**\n\n%s"
             % (name, uid, when, quoted(words)))
 
 
@@ -1079,7 +1079,7 @@ def wrap_up_parts(epic, pieces, notes, done_name, checked=None):
 def closing_comment(rec, pieces, done_name, now):
     """The comment on a plan the bridge closes: who approved it, when it finished, and each
     piece with its pull requests. Names and titles are relayed text."""
-    lines = ["Marked %s by the Slack bridge at %s: every piece of this plan is finished. "
+    lines = ["Marked %s by the tech lead at %s: every piece of this plan is finished. "
              "**%s** (Slack user %s) approved it in Slack at %s."
              % (done_name, iso(now), _relayed(rec.get("approved_name"), 120) or "?",
                 rec.get("approved_by") or "?", rec.get("approved_at") or "?"), ""]
@@ -1132,7 +1132,7 @@ def followup_description(epic, notes, name, uid, when, pieces=()):
     cleaner: this ticket is filed as the owner, and the dispatcher reads routing tags out
     of a description once someone hands it over."""
     lines = ["Review notes left on the pieces of %s “%s” when every piece was finished. Filed "
-             "by the Slack bridge for **%s** (Slack user %s), who said yes in Slack at %s. "
+             "by the tech lead for **%s** (Slack user %s), who said yes in Slack at %s. "
              "Nothing starts on this ticket until someone hands it over."
              % (epic.get("identifier") or "?", _relayed(epic.get("title"), 120),
                 _relayed(name, 120) or uid, uid, when), ""]
@@ -1582,7 +1582,7 @@ class PlansMixin(object):
             "approved_at": when, "started": [], "noted": [],
             "approved": dict(q.get("children") or {}), "started_at": {}, "failures": 0}
         self.save()
-        body = ("Approved in Slack by **%s** (Slack user %s) at %s, through the Slack bridge."
+        body = ("Approved in Slack by **%s** (Slack user %s) at %s, through the tech lead."
                 "\n\nIts children are handed to the agent in dependency order, at most %d at "
                 "once, each once the tickets it waits on are Done. Merging stays the owner's."
                 % (name, msg["user"], when, self.cfg["epic_wip"]))
@@ -1863,7 +1863,7 @@ class PlansMixin(object):
                       "starting its pieces." % (q["ticket"], msg["user"]))
         self.save()
         name = self.name_of(msg["user"])
-        body = ("%s in Slack by **%s** (Slack user %s) at %s, through the Slack bridge."
+        body = ("%s in Slack by **%s** (Slack user %s) at %s, through the tech lead."
                 % ("Moved out of planning" if idea else
                    {"pause": "Paused", "resume": "Resumed", "cancel": "Cancelled"}[kind], name,
                    msg["user"], iso(ts_float(msg.get("ts")))))
@@ -2646,7 +2646,7 @@ class PlansMixin(object):
             self.say("  [dry-run] would hand %s to the agent" % ident)
             return
         after = [b.get("identifier") or "?" for b, _st in blockers_of(child)]
-        body = ("Started by the Slack bridge for **%s** (Slack user %s), who approved %s in "
+        body = ("Started by the tech lead for **%s** (Slack user %s), who approved %s in "
                 "Slack at %s." % (rec["approved_name"], rec["approved_by"], rec["ticket"],
                                   rec["approved_at"]))
         if after:
@@ -3379,7 +3379,7 @@ class PlansMixin(object):
                     % (ticket, _relayed(epic.get("title"), 120)))
             if rec.get("idea_moved"):
                 # Only a move the bridge made is credited to it, and to who approved the plan.
-                body += (" Marked %s by the Slack bridge at %s, after **%s** (Slack user %s) "
+                body += (" Marked %s by the tech lead at %s, after **%s** (Slack user %s) "
                          "approved the plan in Slack."
                          % (self.cfg["done_state"], iso(self.now),
                             _relayed(rec.get("approved_name"), 120) or "?",
@@ -3482,7 +3482,7 @@ class PlansMixin(object):
                      filed_title=followup_title(epic), filed_notes=len(notes),
                      epic_id=epic["id"], filed_body=(
                          "Follow-ups from this plan's reviews are in %s%s: %d note(s) from "
-                         "its pieces, filed by the Slack bridge for **%s** (Slack user %s), "
+                         "its pieces, filed by the tech lead for **%s** (Slack user %s), "
                          "who said yes in Slack at %s."
                          % (made.get("identifier"), " (%s)" % made["url"] if made.get("url")
                             else "", len(notes), name, msg["user"], when)))
@@ -3551,7 +3551,7 @@ def cases_approve(kit):
         check("approve-moves-the-epic-to-ready", t.moves, [("uuid-50", "st-todo")])
         check("the-epic-says-who-approved",
               [b.splitlines()[0] for i, b in t.comments if i == "uuid-50"],
-              ["Approved in Slack by **%s** (Slack user %s) at %s, through the Slack bridge."
+              ["Approved in Slack by **%s** (Slack user %s) at %s, through the tech lead."
                % (BOB, BOB, iso(float([m for m in s.messages if m.get("user") == BOB
                                          and m.get("text") == "yes"][0]["ts"])))])
         check("the-first-child-starts-at-once", delegated(t), ["uuid-51"])
@@ -4849,7 +4849,7 @@ def cases_approve(kit):
                   (["uuid-51", "uuid-7"], [("PROD-51", "plan"), ("PROD-7", "todo")],
                    [("PROD-51", 0), ("PROD-7", 1)], EXIT_OK))
             check("a-plan-piece-names-its-approver-another-ticket-gets-the-queues-words",
-                  (comments["uuid-51"].startswith("Started by the Slack bridge for **"),
+                  (comments["uuid-51"].startswith("Started by the tech lead for **"),
                    comments["uuid-7"], sum("Started PROD-51" in p for p in posted(s))),
                   (True, "Started by the queue, in lane acme/app:2: you moved it into the ready "
                    "state at 2025-10-09 06:00 UTC.", 1))
@@ -5882,7 +5882,7 @@ def cases_finish(kit):
             run(c, s, t)
             owed = json.load(open(state_path(c)))["owed"]
             return (idea_moves(t), followed(c), len(done_moves(t)),
-                    [(o["ticket"], o["issue_id"], "Marked Done by the Slack bridge" in o["body"])
+                    [(o["ticket"], o["issue_id"], "Marked Done by the tech lead" in o["body"])
                      for o in owed])
         check("an-idea-comment-that-fails-is-owed-and-the-move-stands-never-repeated",
               outcome(case_idea_comment_fails),
