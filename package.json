@@ -123,6 +123,8 @@
     "test:runner-pin": "python3 scripts/check_runner_pin.py --selftest && python3 scripts/check_runner_pin.py",
     "test:stdlib-only": "python3 scripts/check_stdlib_only.py --selftest",
     "lint:stdlib-only": "python3 scripts/check_stdlib_only.py",
+    "test:repo-setup": "python3 scripts/check_repo_setup.py --selftest",
+    "check:repo-setup": "python3 scripts/check_repo_setup.py",
     "test:direct-checks": "python3 scripts/check_direct_checks.py --selftest && python3 scripts/check_direct_checks.py --verify",
     "test:ci-covers": "python3 scripts/check_ci_covers_tests.py --selftest",
     "lint:ci-covers": "python3 scripts/check_ci_covers_tests.py",
