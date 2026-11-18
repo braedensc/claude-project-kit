@@ -392,6 +392,7 @@ import pipeline_machine_tickets as machine  # noqa: E402  (what a planning ticke
 import pipeline_routing_tags as routing  # noqa: E402  (what a routing directive is — KIT-381)
 import check_grader_paths as grader_paths  # noqa: E402  (FLOOR + glob_to_re: what is guarded — KIT-418)
 import pipeline_github_app as gha  # noqa: E402  (Stage E's own app: its token — KIT-578)
+import pipeline_pass_lock as pass_lock  # noqa: E402  (one pass at a time — KIT-681)
 
 try:
     import pipeline_review_local as prl  # noqa: E402  (classify / render_comment / post_comment)
@@ -6198,6 +6199,24 @@ def selftest():
             return "raised %s: %s" % (type(exc).__name__, exc)
         return False
 
+    # 0. KIT-681: two passes at once. The second does nothing and exits declined; a dry run and a
+    # lone pass still run; the lock is let go after a pass.
+    with tempfile.TemporaryDirectory() as lock_tmp:
+        real_run_command, ran_passes = globals()["run_command"], []
+        globals()["run_command"] = lambda *a, **k: ran_passes.append(a[1]) or EXIT_OK
+        try:
+            lcfg = {"state_dir": os.path.join(lock_tmp, "state")}
+            held = pass_lock.take(lcfg["state_dir"], "review-poller")
+            check("a second pass at once exits declined",
+                  locked_pass(lcfg, "run", False, 1), EXIT_DECLINED)
+            check("...and runs nothing", ran_passes, [])
+            check("a dry run beside a live pass still runs", locked_pass(lcfg, "run", True, 1), EXIT_OK)
+            pass_lock.release(held)
+            check("a lone pass runs", locked_pass(lcfg, "collect", False, 1), EXIT_OK)
+            check("...and lets go of the lock", pass_lock.take(lcfg["state_dir"], "review-poller") is not None, True)
+        finally:
+            globals()["run_command"] = real_run_command
+
     # 1. Selection: fork, draft, non-ticket, seen, new → exactly the new same-repo ticket PR.
     fixture = [
         {"number": 1, "headRefName": "feat/kit-1-forked", "isCrossRepository": True, "isDraft": False},
@@ -9882,7 +9901,16 @@ def main(argv=None):
     # One pass, then exit: the scheduler owns the interval (a system LaunchDaemon with
     # StartInterval, RunAtLoad and no KeepAlive). A daemon that looped internally would
     # stop polling the moment one pass hung, which is exactly what the timeout prevents.
-    return run_command(cfg, args.command, args.dry_run, args.timeout)
+    return locked_pass(cfg, args.command, args.dry_run, args.timeout)
+
+
+def locked_pass(cfg, command, dry_run, timeout):
+    """One pass under the job's pass lock (KIT-681): a second pass at once does nothing and exits
+    EXIT_DECLINED ("declined" already means nothing was done and nothing failed). A dry run
+    writes nothing, so it takes no lock."""
+    return pass_lock.exclusive(cfg["state_dir"], "review-poller",
+                               lambda: run_command(cfg, command, dry_run, timeout),
+                               busy_rc=EXIT_DECLINED, fail_rc=EXIT_ERROR, say=log, skip=dry_run)
 
 
 if __name__ == "__main__":

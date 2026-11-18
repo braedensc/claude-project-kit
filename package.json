@@ -36,6 +36,7 @@
     "test:review-basis": "python3 scripts/pipeline_review_basis.py --selftest",
     "test:criteria-snapshot": "python3 scripts/pipeline_criteria_snapshot.py --selftest",
     "test:root-guard": "python3 scripts/pipeline_root_guard.py --selftest",
+    "test:pass-lock": "python3 scripts/pipeline_pass_lock.py --selftest",
     "test:stage-e-setup": "python3 scripts/pipeline_stage_e_setup.py --selftest",
     "test:stage-e-app": "python3 scripts/pipeline_stage_e_app.py --selftest",
     "test:github-app": "python3 scripts/pipeline_github_app.py --selftest",

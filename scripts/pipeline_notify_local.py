@@ -423,6 +423,7 @@ import urllib.request
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
+import pipeline_pass_lock as pass_lock  # noqa: E402  (one pass at a time — KIT-681)
 
 # ── Exit vocabulary — the same five names and numbers every sibling job uses. ──────────
 # Redeclared rather than imported so this file stands alone; the selftest asserts they
@@ -4659,6 +4660,26 @@ def selftest():
 
     def ok(name, cond, detail=""):
         checks.append((bool(cond), name, detail))
+
+    # ── §0. KIT-681: two passes at once. ───────────────────────────────────────────────
+    with tempfile.TemporaryDirectory() as lock_tmp:
+        real_run, passes = globals()["run_command"], []
+        globals()["run_command"] = lambda *a, **k: passes.append(1) or EXIT_OK
+        _quiet, sys.stderr = sys.stderr, io.StringIO()
+        try:
+            lcfg = {"state_dir": os.path.join(lock_tmp, "state")}
+            held = pass_lock.take(lcfg["state_dir"], "notifier")
+            ok("a second pass at once exits declined", locked_pass(lcfg, False, 1) == EXIT_DECLINED)
+            ok("...and pings nothing", passes == [])
+            ok("a dry run beside a live pass still runs", locked_pass(lcfg, True, 1) == EXIT_OK)
+            pass_lock.release(held)
+            ok("a lone pass runs", locked_pass(lcfg, False, 1) == EXIT_OK and len(passes) == 2)
+            again = pass_lock.take(lcfg["state_dir"], "notifier")
+            ok("...and lets go of the lock", again is not None)
+            pass_lock.release(again)
+        finally:
+            sys.stderr = _quiet
+            globals()["run_command"] = real_run
 
     def marker(label):
         return "<!-- pipeline-escalation: %s -->" % label
@@ -9817,7 +9838,16 @@ def main(argv=None):
 
     dry = args.dry_run or args.command == "scan"
     timeout = args.timeout if args.timeout is not None else cfg["run_timeout_seconds"]
-    return run_command(cfg, dry, timeout)
+    return locked_pass(cfg, dry, timeout)
+
+
+def locked_pass(cfg, dry_run, timeout):
+    """One pass under the job's pass lock (KIT-681): a second pass at once pings nothing and exits
+    EXIT_DECLINED. A dry run sends nothing, so it takes no lock."""
+    return pass_lock.exclusive(cfg["state_dir"], "notifier",
+                               lambda: run_command(cfg, dry_run, timeout),
+                               busy_rc=EXIT_DECLINED, fail_rc=EXIT_ERROR,
+                               say=lambda line: sys.stderr.write(line + "\n"), skip=dry_run)
 
 
 if __name__ == "__main__":
