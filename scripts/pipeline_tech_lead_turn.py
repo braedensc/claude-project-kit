@@ -92,6 +92,7 @@ if HERE not in sys.path:
 
 import pipeline_voice as voice  # noqa: E402  (the writer's own token, model and refusal rules)
 import pipeline_tech_lead_tools as tools  # noqa: E402  (the tools the turn is allowed)
+import pipeline_spend_ledger as spend_ledger  # noqa: E402  (KIT-687: what a spend row is built from)
 
 NAME = "pipeline-tech-lead-turn"
 SERVER = "techlead"                       # the name the tool server has in --mcp-config
@@ -551,10 +552,22 @@ def _result(text=None, why="", session_id=None, resumed=False, cost=None, turns=
     `began_again` is why a resumed conversation had to begin again, in fixed words, or "";
     `seeded` (KIT-751) is how many lines of the DM's recent messages a new conversation was
     given, or None when the turn asked for none; `later` is True when no run started because
-    the caller's time ran out first, so the message is for the caller to try again."""
+    the caller's time ran out first, so the message is for the caller to try again. `runs`
+    (KIT-687) has one item for each run of the CLI that started: what its output says of its
+    spend (spend_ledger.kept_output), or None when it gave no output to read, as after a
+    timeout. The caller writes one spend row for each."""
     return {"text": text, "why": why, "session_id": session_id, "resumed": resumed,
             "cost": cost, "turns": turns, "denials": denials, "cache_share": cache_share,
-            "began_again": "", "seeded": None, "later": False}
+            "began_again": "", "seeded": None, "later": False, "runs": []}
+
+
+def _output(proc):
+    """The CLI's JSON output of one finished run, as an object, or None."""
+    try:
+        doc = json.loads(getattr(proc, "stdout", None) or "")
+    except (ValueError, RecursionError):
+        return None
+    return doc if isinstance(doc, dict) else None
 
 
 def _cache_share(doc):
@@ -572,11 +585,8 @@ def read_result(proc, session_id, resumed):
     """The model's text out of one finished run, or the reason it cannot be used, in fixed
     words. `said` (the CLI's own words, for the retry rule only) never leaves this module."""
     code = getattr(proc, "returncode", None)
-    try:
-        doc = json.loads(getattr(proc, "stdout", None) or "")
-    except ValueError:
-        doc = None
-    if not isinstance(doc, dict):
+    doc = _output(proc)
+    if doc is None:
         tail = ((getattr(proc, "stderr", None) or "").strip().splitlines() or [""])[-1]
         reason = voice.refusal_reason(tail) or "the claude CLI exited %s with no result" % code
         return _result(why=reason, session_id=session_id, resumed=resumed), tail
@@ -613,9 +623,10 @@ def run_turn(cfg, text, session, now, runner=None, new_id=None, environ=None, no
              on_text=None, earlier="", seed=None, time_left=None):
     """One turn. `session` is this DM's record ({"id", "last_at"}) or None. Returns a dict:
     text (None when there is none), why (fixed words), session_id (what to keep), resumed,
-    cost and turns. Never raises for a failed run. With `on_text` (KIT-565) the run is the CLI's
-    stream, and each piece of text the model writes is handed to it as it arrives; the result
-    is the same. A fault in `on_text` is never the turn's. `seed` (KIT-751) is asked at most
+    cost and turns, and `runs` (KIT-687): one item per run of the CLI that started, for the
+    caller's spend ledger (see _result). Never raises for a failed run. With `on_text`
+    (KIT-565) the run is the CLI's stream, and each piece of text the model writes is handed to
+    it as it arrives; the result is the same. A fault in `on_text` is never the turn's. `seed` (KIT-751) is asked at most
     once, and only when the run starts a new conversation: its lines, the DM's recent messages,
     go in the prompt (seed_lines, build_prompt), and `seeded` in the result says how many.
     `time_left` (Stage E on #588) is the caller's seconds left, asked before each run, after
@@ -677,11 +688,12 @@ def run_turn(cfg, text, session, now, runner=None, new_id=None, environ=None, no
                 on_text(piece)
             except Exception:                                  # noqa: BLE001
                 pass
-    began, recent, given = "", None, None
+    began, recent, given, ran = "", None, None, []
 
     def done(res):
         res["began_again"] = began
         res["seeded"] = None if given is None else len(given)
+        res["runs"] = list(ran)                 # KIT-687: each run that started, for its spend row
         return res
     for _ in (1, 2):
         if not resumed and seed is not None and recent is None:
@@ -703,13 +715,16 @@ def run_turn(cfg, text, session, now, runner=None, new_id=None, environ=None, no
             proc = runner(argv, cwd=fld["work"], env=child_env(fld["home"], fld["tmp"], token),
                           input=prompt, timeout=limit, **more)
         except subprocess.TimeoutExpired:
+            ran.append(None)                    # it ran, and its output was never read
             return done(_result(why="the turn took longer than %g seconds" % limit,
                                 session_id=sid, resumed=resumed))
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError) as exc:    # it never started: no run, so no spend row
             return done(_result(why="could not start %s: %s" % (
                 s["turn_bin"], getattr(exc, "strerror", None) or type(exc).__name__)))
         except subprocess.SubprocessError as exc:
+            ran.append(None)                    # it may have run: unknown, never no call
             return done(_result(why="the turn failed (%s)" % type(exc).__name__))
+        ran.append(spend_ledger.kept_output(_output(proc)))
         res, said = read_result(proc, sid, resumed)
         lost = ""
         if res["text"] is None and resumed:
@@ -1066,10 +1081,13 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
            [a for a in c["cmd"] if a in ("--dangerously-skip-permissions", "--bare",
                                          "--permission-prompt-tool", "--allowedTools=Bash")],
            [])
-    expect("result: the reply, the session to keep, the cost and the rounds",
+    expect("result: the reply, the session to keep, the cost and the rounds, and the run's spend "
+           "fields for the caller's ledger, with no word of the reply (KIT-687)",
            res, {"text": "Two plans are open.", "why": "", "session_id": SID, "resumed": False,
                  "cost": 0.02, "turns": 3, "denials": 0, "cache_share": None,
-                 "began_again": "", "seeded": None, "later": False})
+                 "began_again": "", "seeded": None, "later": False,
+                 "runs": [{"subtype": "success", "is_error": False, "session_id": SID,
+                           "total_cost_usd": 0.02}]})
     expect("a turn runs in its own empty working folder, with a timeout",
            (c["cwd"], c["timeout"], os.listdir(c["cwd"])), (fld["work"], 90, []))
 
@@ -1303,6 +1321,33 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
         expect("failure: %s says nothing of the token or the CLI's words" % name,
                TOKEN in res["why"] or "weird words" in res["why"] or "boom" in res["why"],
                False)
+        expect("failure: %s keeps one run for its spend row, or none when the CLI never started, "
+               "and no word of the CLI's in it (KIT-687)" % name,
+               (len(res["runs"]), [w for w in (TOKEN, "weird words", "boom", "session limit")
+                                   if w in json.dumps(res["runs"])]),
+               (0 if name == "not found" else 1, []))
+
+    # ── KIT-687: one run per start of the CLI, for the caller's spend ledger ─────────────────
+    expect("spend: a run that timed out, or whose output is not JSON, is a run with nothing to "
+           "read, never no run",
+           [turn(Runner(a))["runs"] for a in (sp.TimeoutExpired(["x"], 90),
+                                              Proc(out="garbage", code=1, err="boom"))],
+           [[None], [None]])
+    r = Runner(Proc({"type": "result", "subtype": "error_during_execution", "is_error": True,
+                     "result": "No conversation found with session ID: %s" % SID,
+                     "total_cost_usd": 0.001}), ok(sid=SID2))
+    res = turn(r, session={"id": SID, "last_at": 900.0}, ids_=[SID2])
+    expect("spend: a turn that begins again ran twice, so it has two runs, each its own",
+           (len(r.calls), res["runs"]),
+           (2, [{"subtype": "error_during_execution", "is_error": True, "total_cost_usd": 0.001},
+                {"subtype": "success", "is_error": False, "session_id": SID2,
+                 "total_cost_usd": 0.02}]))
+    expect("spend: each run's row is the row its whole output gives",
+           spend_ledger.row_from_result("tech_lead", res["runs"][1], "plan", "sonnet"),
+           spend_ledger.row_from_result("tech_lead", json.loads(ok(sid=SID2).stdout), "plan",
+                                        "sonnet"))
+    expect("spend: a turn refused before the CLI starts has no run",
+           turn(Runner(ok()), config=dict(cfg, tech_lead_turn=False))["runs"], [])
 
     # ── the switch, the settings and the token ─────────────────────────────────────────────
     r = Runner(ok())

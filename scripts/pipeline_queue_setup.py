@@ -36,6 +36,7 @@ import pipeline_morning as morning  # noqa: E402  (the jobs: their own loaders j
 import pipeline_queue_read as reader  # noqa: E402
 import pipeline_queue_settings as queue_settings  # noqa: E402  (KIT-700: the installed copy of queue.conf, and the carry)
 import pipeline_queue_start as starter  # noqa: E402
+import pipeline_spend_ledger as spend_ledger  # noqa: E402  (KIT-687: each writer's ledger file, contract §30)
 import pipeline_usage_local as usage_job  # noqa: E402
 import pipeline_window as window  # noqa: E402
 
@@ -270,7 +271,20 @@ def compose(c):
                         **({"sprint_plan_file": c["SPRINT_PLAN_FILE"]} if c["SPRINT_PLAN_FILE"] else {})),
     }
     return queue, {"reviews_team_key": c["REVIEWS_TEAM_KEY"], "out": c["USAGE_FILE"],
-                   "runner_store": c["RUNNER_STORE"]}
+                   "spend_ledgers": spend_ledgers_of(queue), "runner_store": c["RUNNER_STORE"]}
+
+
+def spend_ledgers_of(queue):
+    """KIT-687: where the usage job reads each caller's spend ledger (contract §30), from where this composition puts
+    each writer's state, never a guess: the morning job's beside the day plan, the stand-up's and the tech lead's beside
+    the bridge's state file the queue reads, and none when that record is off. Never the conflict waker's: it is in a
+    person's home, which the role account cannot read."""
+    plans = os.path.dirname(queue["morning"]["day_plan_file"])
+    bridge = os.path.dirname(queue["reader"]["bridge_state_file"] or "")
+    return {"morning": spend_ledger.path_in(plans, "morning"),
+            "standup": spend_ledger.path_in(bridge, "standup") if bridge else "",
+            "tech_lead": spend_ledger.path_in(bridge, "tech_lead") if bridge else "",
+            "conflict_waker": ""}
 
 
 def with_home(obj, home):
@@ -923,7 +937,8 @@ def selftest():
 def _cases(check, tmp):
     import ast, contextlib, io  # noqa: E401
     me = sys.modules[__name__]
-    o = dict((k, getattr(me, k)) for k in ("validate_conf", "compose", "render_plist", "runtime_closure"))
+    o = dict((k, getattr(me, k)) for k in ("validate_conf", "compose", "render_plist", "runtime_closure",
+                                           "spend_ledgers_of"))
     key = "lin_" + "api_" + "QUEUESELFTESTNOTREAL0123456789abcdef"      # built at runtime: no fixture looks like a key
     token, person = "sk-ant-" + "oat01-" + "Q" * 40, "selftest-person"
 
@@ -1036,6 +1051,27 @@ def _cases(check, tmp):
                     ["mon", "tue", "wed", "thu", "fri", "sat"], {"start": "10:00", "hours": 4}),
          ("the usage job writes another file than the one the queue reads", {"compose": lambda conf: (lambda q, u: (q, dict(
              u, out="~/.stage-e/usage/other.json")))(*o["compose"](conf))}))
+
+    # KIT-687: the usage job reads each spend ledger where its writer keeps its state, by this conf's own paths
+    def ledgers(**over):
+        conf, errs = parse(text(**over))
+        if errs:
+            return errs
+        queue, usage = compose(conf)
+        validate_composed(queue, usage, None)
+        return usage["spend_ledgers"]
+    case("KIT-687 compose: the morning job's ledger beside its day plan, the stand-up's and the tech lead's beside the "
+         "bridge's state file, none when that record is off, never the waker's; the usage job's own loader accepts each",
+         lambda: [ledgers(), ledgers(BRIDGE_STATE_FILE="~/bridge-elsewhere/bridge-state.json"),
+                  ledgers(BRIDGE_STATE_FILE="")],
+         [{"morning": "~/.stage-e/queue/morning-spend.jsonl", "standup": "~/.stage-e/state/standup-spend.jsonl",
+           "tech_lead": "~/.stage-e/state/tech-lead-spend.jsonl", "conflict_waker": ""},
+          {"morning": "~/.stage-e/queue/morning-spend.jsonl", "standup": "~/bridge-elsewhere/standup-spend.jsonl",
+           "tech_lead": "~/bridge-elsewhere/tech-lead-spend.jsonl", "conflict_waker": ""},
+          {"morning": "~/.stage-e/queue/morning-spend.jsonl", "standup": "", "tech_lead": "", "conflict_waker": ""}],
+         ("the bridge's ledgers guessed at the usage job's defaults", {"spend_ledgers_of": lambda queue: dict(
+             o["spend_ledgers_of"](queue), standup=usage_job.SPEND_LEDGER_PATHS["standup"],
+             tech_lead=usage_job.SPEND_LEDGER_PATHS["tech_lead"])}))
 
     # KIT-860: the runner's store, named in the usage job's config when a lane moves; empty is off
     def runner_store(**over):

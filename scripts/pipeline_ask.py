@@ -1243,7 +1243,9 @@ def run_cases(check):
             "--update-conf", update_conf, "--bridge-conf", bridge_conf]
     healthy = {"sync_user_skills.py": 0, "pipeline_stage_e_setup.py verify": 0,
                "pipeline_stage_a_setup.py run": 0,
-               "pipeline_bridge_setup.py install": 0, "pipeline_bridge_setup.py verify": 0}
+               "pipeline_bridge_setup.py install": 0, "pipeline_bridge_setup.py verify": 0,
+               # KIT-869: update.conf is on this Mac, so Automatic runs the health check's `check`.
+               "pipeline_watch.py check": 0}
 
     def state():
         return (get(update_conf), get(bridge_conf))
@@ -1530,6 +1532,22 @@ def run_cases(check):
     code, io = go(["1", "yes"])
     check("kit735-the-consent-page-says-what-it-writes",
           (all(c in said(io) for c in one["consent"]), code), (True, pi.EX_OK))
+    # KIT-869: with update.conf here, Automatic runs the health check's own `check` once, after the
+    # settings this battery's answers wrote, and reads its rows: a clean document is up to date, and
+    # one it cannot read never is, while the run still carries on to the idea gate.
+    def health(io_):
+        return [r["outcome"] for r in io_.records if r["id"] == "health-check"]
+    reset()
+    code, io = go(["1", "Rex", "2027-05-06", "2027-03-15", "yes"])
+    check("kit869-automatic-runs-the-health-checks-check-once-and-reads-its-rows",
+          (io.ran.count("pipeline_watch.py check"), health(io), code), (1, [pi.OUT_OK], pi.EX_OK))
+    reset()
+    io = Watching(codes=dict(healthy), typed=["1", "Rex", "2027-05-06", "2027-03-15", "yes"])
+    io.rows_out = {"pipeline_watch.py check": "all fine, trust me"}
+    code = pi.main(base, io=io)
+    check("kit869-a-health-check-whose-rows-cannot-be-read-is-never-up-to-date",
+          (health(io), "pipeline_stage_a_setup.py run" in io.ran, code),
+          ([pi.OUT_UNMEASURED], True, pi.EX_UNMEASURED))
 
     # E. THE HEARTBEAT LINES (KIT-782): derived from watcher.conf, asked about nothing, written after the one yes.
     ws = _watcher()
