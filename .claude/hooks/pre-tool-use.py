@@ -2309,7 +2309,33 @@ PIN_BROKEN_HELP = (
     "warning. An expiry is not an absence: this session WAS dispatched with a "
     "binding and that binding has lapsed, so the ticket, scope and branch it "
     "bound can no longer be verified (§2 calls that BROKEN, and broken fails "
-    "closed). Ask the dispatcher to re-dispatch, or delete the stale pin file."
+    "closed). Ask the dispatcher to re-dispatch, or end the binding with its "
+    "release, which records it in the ledger (a pin deleted by hand within a day of "
+    "its writing reads as MISSING, KIT-674):\n"
+    "  python3 scripts/pipeline_dispatch_local.py --release --session-root {root}"
+)
+PIN_MISSING_HELP = (
+    "🔒 Dispatcher pin MISSING for this session root.\n"
+    "  pin file:     {path}\n"
+    "  ledger row:   dispatch {dispatch} for {ticket}, pinned {when}\n"
+    "  ledger:       {ledger}\n"
+    "  session root: {root}\n"
+    "The dispatcher's ledger says a pin was written for this worktree and nothing "
+    "released it, and the pin is not there: it was deleted or moved. A pin that is "
+    "gone is not one that never was, so the ticket, scope and branch it bound cannot "
+    "be checked, and every write fails closed, whatever the mode "
+    "(docs/PIPELINE-CONTRACT.md §3, KIT-674). A session never ends its own binding. "
+    "A person ends it with the dispatcher's release, which records it in the ledger:\n"
+    "  python3 scripts/pipeline_dispatch_local.py --release --session-root {root}"
+)
+PIN_UNREADABLE_HELP = (
+    "🔒 Dispatcher pin store could not be read for this session root.\n"
+    "  could not read: {what}\n"
+    "  session root:   {root}\n"
+    "A pin store the hook cannot read cannot show that nothing bound this worktree. "
+    "Could not check is not absent (docs/PIPELINE-CONTRACT.md §13, KIT-674), so every "
+    "write fails closed. The pins root and its ledger are this account's own: give it "
+    "read access to them again."
 )
 PINS_ROOT_HELP = (
     "🔒 `delivery.json` is BROKEN: `dispatch.pinsRoot` resolves to `{path}`, which "
@@ -2665,8 +2691,92 @@ def _worktree_ticket() -> str:
     return ""
 
 
+# ── a pin that is GONE is not one that never was (KIT-674) ───────────────────
+# Every kit dispatcher appends a row to <pinsRoot>/ledger.jsonl for each pin it writes,
+# and the hand-run dispatcher and the runner one carrying `released_at` for each pin they
+# release (contract §3). The ledger sits beside the pins, outside every worktree, where a
+# session can no more write than it can delete its pin. When an ABSENT pin's worktree has
+# a last ledger row that is a pin row under PIN_LIFE_MAX_SECONDS old, a dispatcher bound
+# this session and nothing released it: the pin was deleted or moved. That is MISSING, and
+# broken. Read as "a person's session", it switched every withholding guard off for the
+# very session that took the pin away. A row older than that names a pin that would have
+# expired by now and reads as absent, so an old dispatch whose release was never recorded
+# does not hold a worktree forever; a row whose age cannot be read still expects its pin.
+# A ledger the hook cannot read is UNREADABLE, never empty (contract §13). Tamper-evident,
+# not tamper-proof: a session that can delete its pin can edit the ledger too.
+PIN_LIFE_MAX_SECONDS = 24 * 60 * 60    # the longest a kit dispatcher lets a pin live
+PIN_LEDGER = "ledger.jsonl"
+PIN_LEDGER_TAIL_BYTES = 256 * 1024     # a day's rows sit at the end; read no more than this
+
+
+def _ledger_row_for_root(pins_root):
+    """(row, error): the LAST ledger row naming this session root's worktree, or None when
+    no row does or there is no ledger. `error` says what could not be read, else ""."""
+    if not pins_root:
+        return None, "the pins root does not resolve"
+    path = os.path.join(pins_root, PIN_LEDGER)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)   # a FIFO there never hangs us
+    except OSError as exc:
+        if exc.errno in (errno.ENOENT, errno.ENOTDIR):
+            return None, ""
+        return None, "%s (%s)" % (path, exc.strerror or exc)
+    try:
+        import stat
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return None, "%s (not a regular file)" % path
+        start = max(0, st.st_size - PIN_LEDGER_TAIL_BYTES)
+        os.lseek(fd, start, os.SEEK_SET)
+        data, chunk = b"", b"-"
+        while chunk and len(data) <= PIN_LEDGER_TAIL_BYTES:
+            chunk = os.read(fd, 65536)
+            data += chunk
+    except OSError as exc:
+        return None, "%s (%s)" % (path, exc.strerror or exc)
+    finally:
+        os.close(fd)
+    lines = data.split(b"\n")
+    if start:
+        lines = lines[1:]                  # the tail cut its first line in two
+    leaf = os.path.basename(PROJECT_ROOT)
+    last = None
+    for line in lines:
+        try:
+            row = json.loads(line.decode("utf-8"))
+            wt = row.get("worktree")
+            if isinstance(wt, str) and wt and (
+                    wt == PROJECT_ROOT or (os.path.basename(wt.rstrip("/")) == leaf
+                                           and os.path.realpath(wt) == PROJECT_ROOT)):
+                last = row
+        except Exception:
+            continue                       # not a row, so it names no worktree
+    return last, ""
+
+
+def _pin_expected(cfg):
+    """(row, error) for an ABSENT pin: the ledger row that says a pin must be here, or None
+    when nothing does (see PIN_LIFE_MAX_SECONDS above)."""
+    row, err = _ledger_row_for_root(_pins_root(cfg))
+    if err or row is None or "released_at" in row:
+        return None, err
+    when = _parse_iso_utc(row.get("pinned_at"))
+    if when is not None and (
+            datetime.now(timezone.utc) - when).total_seconds() >= PIN_LIFE_MAX_SECONDS:
+        return None, ""
+    return row, ""
+
+
+def _ledger_field(row, key):
+    """One ledger value for a block message: printable, short, and "?" when unset."""
+    v = (row or {}).get(key)
+    text = v if isinstance(v, str) else "" if v is None else str(v)
+    return re.sub(r"[^\x20-\x7e]", "?", text)[:80] or "?"
+
+
 def _read_pin(cfg):
-    """(pin, status, path). status ∈ ok | absent | expired | malformed | mismatch.
+    """(pin, status, path). status ∈ ok | absent | missing | unreadable | expired |
+    malformed | mismatch.
 
     **`expired` is not `absent`, and the difference is the whole point.** An absent
     pin means no dispatcher ever bound this session — a human's ad-hoc session in a
@@ -2683,11 +2793,28 @@ def _read_pin(cfg):
     because the worktree check runs FIRST: a lapsed pin we return is provably this
     session's own. A lapsed pin may never GRANT anything, but it must not silently
     WITHDRAW the constraints it was carrying either — an expiry that switched
-    guards off would make waiting an escape."""
+    guards off would make waiting an escape.
+
+    **`missing` is not `absent` either (KIT-674).** An absent pin the ledger still
+    expects was deleted or moved, and the first value returned is then that ledger
+    ROW, never a pin. A pin or ledger the hook could not read is `unreadable`, and the
+    path names what could not be read. Both are broken, whatever the mode."""
     path = _pin_path(cfg)
     try:
-        if not os.path.isfile(path):
-            return None, "absent", path
+        os.stat(path)
+        present = os.path.isfile(path)
+    except OSError as exc:
+        if exc.errno not in (errno.ENOENT, errno.ENOTDIR):
+            return None, "unreadable", "%s (%s)" % (path, exc.strerror or exc)
+        present = False
+    except Exception:
+        present = False
+    if not present:
+        row, err = _pin_expected(cfg)
+        if err:
+            return None, "unreadable", err
+        return (row, "missing", path) if row is not None else (None, "absent", path)
+    try:
         with open(path) as fh:
             pin = json.load(fh)
     except Exception:
@@ -3255,6 +3382,19 @@ def _pipeline_guards(tool, inp) -> None:
         pin, pin_status, pin_file = None, "ignored", ""
     else:
         pin, pin_status, pin_file = _read_pin(cfg)
+    # A pin the ledger says must be here is MISSING, and a pin store the hook cannot read
+    # is UNREADABLE (KIT-674). Either way the binding cannot be checked, so every write
+    # fails closed whatever the mode, which the ledger row does not carry. For `missing`
+    # the first value is that ledger row, never a pin: nothing below may read it as one.
+    if pin_status == "missing":
+        if mutating:
+            block(PIN_MISSING_HELP.format(
+                path=pin_file, dispatch=_ledger_field(pin, "dispatch_id"),
+                ticket=_ledger_field(pin, "ticket"), when=_ledger_field(pin, "pinned_at"),
+                ledger=os.path.join(_pins_root(cfg), PIN_LEDGER), root=PROJECT_ROOT))
+        pin = None
+    elif pin_status == "unreadable" and mutating:
+        block(PIN_UNREADABLE_HELP.format(what=pin_file, root=PROJECT_ROOT))
     ticket = pin.get("ticket") if (pin and isinstance(pin.get("ticket"), dict)) else None
     mode = str((pin or {}).get("session_mode") or "").strip().lower()
     pinned_id = str((ticket or {}).get("id") or "").strip().upper()

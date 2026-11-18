@@ -580,8 +580,10 @@ Stop hook between them:
      that reads in review as just a move); work on a branch
      that doesn't carry the pinned ticket ID when `branch.requireTicketId` is on; a
      `dispatch.pinsRoot` resolving inside the repo (a pins directory the session can
-     write is a pin it can forge); and a malformed, unrecognized, foreign-worktree or
-     — in `ticket` mode — **expired** pin. Write-blocking and approval checks fail
+     write is a pin it can forge); a malformed, unrecognized, foreign-worktree or
+     — in `ticket` mode — **expired** pin; and a pin the dispatcher's ledger says was
+     written and never released that is gone, or a pin store the hook cannot read
+     (KIT-674). Write-blocking and approval checks fail
      **closed**; checks that merely withhold autonomy from an *unpinned* session fail
      **open**, so a human's ad-hoc session in a configured repo is never bricked. A
      session on a dispatcher's lane that writes no pin is not ad-hoc: its account

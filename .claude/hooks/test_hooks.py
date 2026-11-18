@@ -1704,6 +1704,47 @@ def main():
         branch="feat/decompose-the-epic",
         pin={"session_mode": "planning", "ticket": None,
              "expires_at": "2020-01-01T00:00:00Z"})
+    # KIT-674: a pin that is GONE is not one that never was. The dispatcher's ledger,
+    # <pinsRoot>/ledger.jsonl, outside the worktree, holds a row for every pin written and
+    # every release. Its last row for a worktree, a pin row under a day old (no kit
+    # dispatcher lets a pin live longer), says a pin must be there.
+    def _ledger(pins, *rows):
+        with open(os.path.join(pins, "ledger.jsonl"), "a") as fh:
+            for row in rows:
+                fh.write((row if isinstance(row, str) else json.dumps(row)) + "\n")
+
+    def _ago(hours):
+        return (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+    pl_gone_root, pl_gone, pl_gone_pins = make_pipeline_sandbox(pin=None)
+    _ledger(pl_gone_pins,
+            {"dispatch_id": "d_other", "ticket": "ENG-9", "worktree": "/elsewhere/ENG-9",
+             "pinned_at": _ago(1), "stage": "local-dispatch"},
+            {"dispatch_id": "d_gone", "ticket": "ENG-123", "worktree": pl_gone_root,
+             "pinned_at": _ago(1), "pinned_by": "dispatcher:battery",
+             "stage": "local-dispatch"},
+            "a line that is not JSON names nothing")
+    pl_freed_root, pl_freed, pl_freed_pins = make_pipeline_sandbox(pin=None)
+    _ledger(pl_freed_pins,
+            {"dispatch_id": "d_freed", "ticket": "ENG-123", "worktree": pl_freed_root,
+             "pinned_at": _ago(2), "stage": "local-dispatch"},
+            {"dispatch_id": "d_freed", "ticket": "ENG-123", "worktree": pl_freed_root,
+             "released_at": _ago(1), "stage": "local-release"})
+    pl_elsewhere_root, pl_elsewhere, pl_elsewhere_pins = make_pipeline_sandbox(pin=None)
+    _ledger(pl_elsewhere_pins,
+            {"dispatch_id": "d_x", "ticket": "ENG-123", "worktree": pl_elsewhere_root + "-2",
+             "pinned_at": _ago(1), "stage": "runner"})
+    pl_stale_root, pl_stale, pl_stale_pins = make_pipeline_sandbox(pin=None)
+    _ledger(pl_stale_pins,
+            {"dispatch_id": "d_stale", "ticket": "ENG-123", "worktree": pl_stale_root,
+             "pinned_at": _ago(25), "stage": "local-dispatch"})
+    pl_undated_root, pl_undated, pl_undated_pins = make_pipeline_sandbox(pin=None)
+    _ledger(pl_undated_pins,
+            {"dispatch_id": "d_undated", "ticket": "ENG-123", "worktree": pl_undated_root,
+             "stage": "local-dispatch"})
+    _PL_TMP.extend([pl_gone_root, pl_gone_pins, pl_freed_root, pl_freed_pins,
+                    pl_elsewhere_root, pl_elsewhere_pins, pl_stale_root, pl_stale_pins,
+                    pl_undated_root, pl_undated_pins])
     # `dispatch.pinsRoot` pointing inside the worktree — a pin the session can write
     # is not a pin (§3), and §7 makes it a hard config failure.
     pl_pinsin_root, pl_pinsin, pl_pinsin_pins = make_pipeline_sandbox(
@@ -1791,6 +1832,14 @@ def main():
         pl_acct, os.path.join(pl_acct_root, "home"), "in-repo")
     acct_launch["none"] = make_account_launcher(pl_acct, None, "none")
     nopin_noacct = make_account_launcher(pl_nopin, None, "none")
+    # KIT-674: a configured project whose delivery.json names no pins root reads the default,
+    # ~/.claude/pipeline/pins under the account's home. With no ledger there, nothing expects
+    # a pin, so a person's session stays allowed: the ledger check changes nothing for it.
+    pl_defroot_root, pl_defroot, pl_defroot_pins = make_pipeline_sandbox(
+        pin=None, cfg_over={"dispatch": {"pinsRoot": None}})
+    defroot_home = os.path.realpath(tempfile.mkdtemp(prefix="hook-battery-acct-"))
+    defroot_launch = make_account_launcher(pl_defroot, defroot_home, "defroot")
+    _PL_TMP.extend([pl_defroot_root, pl_defroot_pins, defroot_home])
     lane_home_env = {**os.environ, "CLAUDE_PROJECT_DIR": pl_acct_root, "HOME": lane_fakehome}
     # The marker's SYSTEM path, /etc/claude-pipeline/dispatched-lane/<account> (CK-10):
     # folders root owns all the way down, so the role account cannot rename it away the
@@ -2939,6 +2988,35 @@ def main():
          edit(os.path.join(pl_expplan_root, ".github/workflows/ci.yml"), "x"),
          BLOCK, pl_expplan),
 
+        # ── a DELETED pin is broken, not absent (KIT-674) ────────────────────
+        # The ledger says a dispatcher bound this worktree and nothing released it, so a
+        # pin that is not there was taken away. Reading that as "a person's session"
+        # switched every withholding guard off for the session that deleted it.
+        ("deleted pin: a tracker write to another ticket is BLOCKED (KIT-674)",
+         mcp("save_issue", id="ENG-456", stateId=PL_RAW), BLOCK, pl_gone),
+        ("deleted pin: a comment is BLOCKED too (the binding is unverifiable) (KIT-674)",
+         mcp("save_comment", issueId="ENG-123", body="done"), BLOCK, pl_gone),
+        ("deleted pin: an ordinary source edit is BLOCKED (KIT-674)",
+         edit(os.path.join(pl_gone_root, "src/app.ts"), "x"), BLOCK, pl_gone),
+        ("deleted pin: Read stays allowed (diagnosis) (KIT-674)",
+         read(os.path.join(pl_gone_root, "delivery.json")), ALLOW, pl_gone),
+        ("no pin and no ledger: a person's session stays allowed (KIT-674)",
+         mcp("save_issue", id="ENG-456", stateId=PL_RAW), ALLOW, pl_nopin),
+        ("no pins root named, no ledger at the default: a person's session stays allowed "
+         "(KIT-674)",
+         mcp("save_issue", id="ENG-456", stateId=PL_RAW), ALLOW, defroot_launch),
+        ("…and an edit there stays allowed too (KIT-674)",
+         edit(os.path.join(pl_defroot_root, "src/app.ts"), "x"), ALLOW, defroot_launch),
+        ("released pin: the worktree is a person's again (KIT-674)",
+         mcp("save_issue", id="ENG-456", stateId=PL_RAW), ALLOW, pl_freed),
+        ("a ledger row for ANOTHER worktree expects no pin here (KIT-674)",
+         mcp("save_issue", id="ENG-456", stateId=PL_RAW), ALLOW, pl_elsewhere),
+        ("a pin row older than any pin may live expects nothing (stale pin deleted by hand) "
+         "(KIT-674)",
+         mcp("save_issue", id="ENG-456", stateId=PL_RAW), ALLOW, pl_stale),
+        ("a pin row whose age cannot be read still expects its pin (KIT-674)",
+         mcp("save_issue", id="ENG-456", stateId=PL_RAW), BLOCK, pl_undated),
+
         # ── the pin must live where the session cannot reach it (§3, §7) ──────
         ("pinsRoot inside the worktree is BROKEN config (a forgeable pin is not a pin)",
          edit(os.path.join(pl_pinsin_root, "src/app.ts"), "x"), BLOCK, pl_pinsin),
@@ -3589,6 +3667,21 @@ def main():
         ("stderr reason: an expired pin is named as a lapse, not an absence",
          edit(os.path.join(pl_exp_root, "src/app.ts"), "x"),
          "An expiry is not an absence", pl_exp),
+        # KIT-674: the block names the missing pin, the ledger row that expects it, and
+        # the one way to end a binding.
+        ("stderr reason: a deleted pin is named as missing (KIT-674)",
+         mcp("save_issue", id="ENG-456", stateId=PL_RAW),
+         "Dispatcher pin MISSING for this session root", pl_gone),
+        ("stderr reason: a deleted pin's block names the pin file (KIT-674)",
+         mcp("save_issue", id="ENG-456", stateId=PL_RAW),
+         os.path.join(pl_gone_pins, hashlib.sha256(pl_gone_root.encode("utf-8"))
+                      .hexdigest()[:16] + ".json"), pl_gone),
+        ("stderr reason: a deleted pin's block names the ledger row (KIT-674)",
+         mcp("save_issue", id="ENG-456", stateId=PL_RAW),
+         "dispatch d_gone for ENG-123", pl_gone),
+        ("stderr reason: a deleted pin's block says how a binding ends (KIT-674)",
+         mcp("save_issue", id="ENG-456", stateId=PL_RAW),
+         "pipeline_dispatch_local.py --release", pl_gone),
         ("stderr reason: lifecycle-label block names the label it refused",
          mcp("save_issue", id="ENG-123", labels=["agent:needs-human"]),
          "agent:needs-human", pl_hook),
@@ -3896,6 +3989,56 @@ def main():
         print(f"[{'PASS' if ok else 'FAIL'}] pin path: {_name} gives no pin path "
               f"(got {_got!r})")
         failures += 0 if ok else 1
+
+    # KIT-674: a pins root or ledger the hook cannot read is "could not check", never "no
+    # pin". Both sandboxes are allowed while readable (cases above), so a block here is the
+    # unreadability's alone. A pins root it cannot search was already refused before
+    # KIT-674, by the lane marker's own could-not-check (KIT-241), whose reason it keeps. As
+    # root every folder reads, so neither can be staged there, and each says so.
+    for _name, _target, _mode, _sb_hook, _why in (
+            ("a pins root it cannot search", pl_freed_pins, 0o700, pl_freed,
+             "could not be checked, which counts as the lane"),
+            ("a ledger it cannot read", os.path.join(pl_elsewhere_pins, "ledger.jsonl"), 0o644,
+             pl_elsewhere, "Dispatcher pin store could not be read")):
+        _label = "unreadable pin store: %s blocks writes and names it (KIT-674)" % _name
+        if os.geteuid() == 0:
+            print(f"[SKIP] {_label} (as root nothing is unreadable, so this was not run)")
+            continue
+        seq_ran += 1
+        _starting(_label)
+        os.chmod(_target, 0)
+        try:
+            _r = run_hook_proc(mcp("save_issue", id="ENG-456", stateId=PL_RAW), hook_path=_sb_hook)
+        finally:
+            os.chmod(_target, _mode)
+        ok = (_r.returncode == 2 and _why in _r.stderr and _target in _r.stderr)
+        print(f"[{'PASS' if ok else 'FAIL'}] {_label}"
+              + ("" if ok else f"  (exit {_r.returncode}: {_r.stderr[-300:]!r})"))
+        failures += 0 if ok else 1
+
+    # KIT-674: "a pin row under a day old" is the longest any kit dispatcher lets a pin live.
+    # Were a dispatcher's cap to grow past the hook's, a pin deleted late in its life would
+    # read as a person's session, so the three numbers must agree.
+    def _product_const(path, name):
+        with open(path, encoding="utf-8") as fh:
+            m = re.search(r"^%s = ([0-9][0-9 *]*?)\s*(?:#.*)?$" % name, fh.read(), re.M)
+        if not m:
+            return None
+        n = 1
+        for part in m.group(1).split("*"):
+            n *= int(part)
+        return n
+    seq_ran += 1
+    _kit_scripts = os.path.join(os.path.dirname(os.path.dirname(HOOKS_DIR)), "scripts")
+    _lives = (_product_const(HOOK, "PIN_LIFE_MAX_SECONDS"),
+              60 * (_product_const(os.path.join(_kit_scripts, "pipeline_dispatch_local.py"),
+                                   "MAX_EXPIRY_MINUTES") or 0),
+              60 * (_product_const(os.path.join(_kit_scripts, "pipeline_runner.py"),
+                                   "PIN_MAX_MINUTES") or 0))
+    ok = _lives[0] is not None and len(set(_lives)) == 1
+    print(f"[{'PASS' if ok else 'FAIL'}] the hook expects a deleted pin for as long as a "
+          f"dispatcher lets one live (KIT-674) (hook, local, runner seconds: {_lives})")
+    failures += 0 if ok else 1
 
     def _session_start(payload, cwd):
         r = subprocess.run([sys.executable, SESSION_START_HOOK], input=json.dumps(payload),
