@@ -41,8 +41,10 @@ ticket from the tracker and judges it:
     (`approval_states`) in the ticket's whole history: the newest move for a plan start, any move
     for a kind that follows an approved ticket. A ticket the owner made in that state, with no move
     recorded, counts as his move: the tracker never records a creator's first change (KIT-164).
-  - A resume needs any move of the owner's into the kind's approved states, or the approval the
-    runner itself recorded for the start of the work it carries on.
+  - A resume follows its kind's own rule over the history, the session writer's moves left out
+    (the runner's own move into the working state counts neither way), or the approval the runner
+    itself recorded for the start of the work it carries on, while no later move of the owner's
+    took the ticket back out of its approved states.
 The owner is `owner_user_ids`, never the old dispatcher's own user. A history that cannot be read
 whole approves nothing, and the request waits.
 
@@ -226,6 +228,7 @@ INSTRUCTIONS_MAX = 200 << 10                        # the project's CLAUDE.md, r
 # size, far past the final message the store keeps (KIT-858); a longer line reads as no result.
 RESULT_SCAN = 8 << 20
 PIN_EXTRA_MINUTES = 30                              # as the hand-run pin writer does
+BUDGET_MISSES = 3                                   # failed reads of a run's pin in a row, then told
 PIN_MAX_MINUTES = 24 * 60
 
 Q_ISSUE = """query RunnerIssue($id: String!) {
@@ -498,11 +501,12 @@ def _dig(obj, *path):
     return obj
 
 
-def approval(cfg, kind, node, raw_history, states, resumed=False):
+def approval(cfg, kind, node, raw_history, states, ignore=()):
     """({"by", "at", "how"}, "") when the owner approved this ticket for this kind, else (None,
-    why). `raw_history` is the tracker's list; a history that is not whole approves nothing. A
-    resume follows an approval that came earlier: any of his moves counts for it, whatever its kind
-    asks of a start, since the runner's own move of a code start's ticket is newer (KIT-645)."""
+    why). `raw_history` is the tracker's list; a history that is not whole approves nothing. The
+    moves of the users in `ignore` count neither way: the session writer's, whose move of a code
+    start's ticket into its working state is the runner's own (KIT-645). So the newest-move rule
+    still reads the owner's last word, and his move of the ticket back out still withdraws it."""
     if not states:
         return None, "the runner's settings name no approved state for a %s session" % kind
     hist = pool.read_history(raw_history)
@@ -510,8 +514,9 @@ def approval(cfg, kind, node, raw_history, states, resumed=False):
         return None, "the ticket's history could not be read whole"
     owners = {"owner_user_ids": cfg["owner_user_ids"],
               "dispatcher_user_ids": cfg["dispatcher_user_ids"]}
-    moves = [(at, e) for at, e in hist if e["toStateId"] or e["fromStateId"]]
-    newest = KINDS[kind]["approval"]["newest_move"] and not resumed
+    moves = [(at, e) for at, e in hist
+             if (e["toStateId"] or e["fromStateId"]) and e["actorId"] not in ignore]
+    newest = KINDS[kind]["approval"]["newest_move"]
     if moves:
         if newest:
             moves = moves[-1:]
@@ -1045,6 +1050,7 @@ class Runner(object):
         self.cfg, self.tracker = cfg, tracker
         self.room, self.measured, self._floor = room, {}, None    # room: the floor's reader
         self.budget_minutes = {}                  # KIT-645: each live run's own minutes, from its pin
+        self.budget_misses = {}                   # …and how many reads of its pin failed in a row
         # KIT-645: a code start's judge, the queue's own reader and judge unless a test stands one in:
         # ticket -> (approval or None, why, held).
         self.judge = judge or (lambda ticket: queue_judge(self.cfg, self.tracker.gql, ticket,
@@ -1206,6 +1212,7 @@ class Runner(object):
                                result["text"], now)
         remove_pin(rec["pin"], rec["run"])
         self.budget_minutes.pop(rec["run"], None)
+        self.budget_misses.pop(rec["run"], None)
         shutil.rmtree(run_tmp(self.cfg, rec["run"]), ignore_errors=True)
         store.write_run(self.store_dir(), rec)
         self.say("runner: %s %s %s %s: %s" % (rec["run"], rec["kind"], rec["ticket"], state, why))
@@ -1221,17 +1228,22 @@ class Runner(object):
 
     def run_limits(self, rec):
         """The kind's limits, its time held to the run's own budget too (KIT-645): `maxMinutes`
-        from the pin the runner wrote for this run, read once and kept. A pin it cannot read is
-        told once, and the kind's limits hold alone."""
+        from the pin the runner wrote for this run, kept once read. A read that fails is tried
+        again each pass, so one bad read never drops the budget for good; while it fails the kind's
+        limits hold alone, and BUDGET_MISSES failures in a row are told, once."""
         lim = self.kind_limits(rec["kind"])
-        if rec["run"] not in self.budget_minutes and rec["pin"]:
-            minutes = pin_minutes(rec["pin"], rec["run"])
-            self.budget_minutes[rec["run"]] = minutes
-            if minutes is None:
-                self.tell("%s:budget-unread" % rec["run"], "Run %s (%s, %s): its pin could not be read, "
-                          "so its budget's minutes are not held; its other limits are." % (
-                              rec["run"], rec["kind"], rec["ticket"]))
         minutes = self.budget_minutes.get(rec["run"])
+        if minutes is None and rec["pin"]:
+            minutes = pin_minutes(rec["pin"], rec["run"])
+            if minutes is not None:
+                self.budget_minutes[rec["run"]] = minutes
+                self.budget_misses.pop(rec["run"], None)
+            else:
+                missed = self.budget_misses[rec["run"]] = self.budget_misses.get(rec["run"], 0) + 1
+                if missed == BUDGET_MISSES:
+                    self.tell("%s:budget-unread" % rec["run"], "Run %s (%s, %s): its pin could not be "
+                              "read %d times in a row, so its budget's minutes are not held; its other "
+                              "limits are." % (rec["run"], rec["kind"], rec["ticket"], missed))
         if minutes:
             lim["wall_minutes"] = min(lim["wall_minutes"], minutes)
         return lim
@@ -1395,17 +1407,32 @@ class Runner(object):
             out.append(back)
         return out
 
-    def carried_approval(self, rec, limit=50):
-        """The approval the runner recorded at the start of the work `rec` carries on: each run it
-        resumed, back to that start (KIT-645). A piece of a plan approved in Slack has no move of the
-        owner's in its history, and its fix and its resumes still follow his approval. None when a
-        run on the way cannot be read, or that start was not one a named approver let through."""
+    def carried_approval(self, rec, raw_history, states, limit=50):
+        """(approval, why): the approval the runner recorded at the start of the work `rec` carries
+        on, each run it resumed back to that start (KIT-645). A piece of a plan approved in Slack has
+        no move of the owner's in its history, and its fix and its resumes still follow his approval.
+        It stands only while the ticket's history shows no later move of the owner's out of the
+        approved states: that is him taking it back. (None, "") when a run on the way cannot be read,
+        or that start was not one a named approver let through."""
         steps = 0
         while rec is not None and rec["resumes"] and steps < limit:
             rec, steps = store.read_run(self.store_dir(), rec["resumes"]), steps + 1
         if rec is None or rec["resumes"] or rec["how"] not in NAMED_APPROVALS:
-            return None
-        return {"by": rec["approved_by"], "at": rec["approved_at"], "how": rec["how"]}
+            return None, ""
+        owners = {"owner_user_ids": self.cfg["owner_user_ids"],
+                  "dispatcher_user_ids": self.cfg["dispatcher_user_ids"]}
+        since = pool.epoch(rec["approved_at"]) or 0
+        his = [e for at, e in pool.read_history(raw_history) or [] if at > since
+               and (e["toStateId"] or e["fromStateId"]) and pool.is_owner(owners, e["actorId"])]
+        if his and his[-1]["toStateId"] not in states:
+            return None, ("the owner moved the ticket out of its approved states since it was approved, "
+                          "so the approval its run started on no longer stands")
+        return {"by": rec["approved_by"], "at": rec["approved_at"], "how": rec["how"]}, ""
+
+    def writer_ids(self):
+        """The session writer's tracker user, whose moves are the runner's own (KIT-645)."""
+        st = self.cfg.get("session_tools")
+        return (st["writer_user_id"],) if st else ()
 
     def request_text(self, rec):
         """(text, why): the words of the request whose work this run carries on, read back from
@@ -1604,9 +1631,10 @@ class Runner(object):
                 return ("held" if waits else "refused"), None, why
         else:
             states = proj["approval_states"].get(KINDS[kind]["approval"]["states"]) or []
-            ok, why = approval(cfg, kind, node, hist, states, resumed=resumes is not None)
+            ok, why = approval(cfg, kind, node, hist, states, ignore=self.writer_ids())
             if ok is None and resumes is not None:
-                ok = self.carried_approval(resumes)
+                ok, withdrawn = self.carried_approval(resumes, hist, states)
+                why = withdrawn or why
             if ok is None:
                 return "refused", None, why
         try:
@@ -2617,17 +2645,36 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                (afix.get("ok"), rfix.get("approved_by"), rfix.get("how")), (True, "U0OWNER001", "resumed-run"))
         if rfix:
             _wait(lambda: judged.pass_once() and store.read_run(sdir, rfix["run"])["state"] not in store.LIVE, 15)
-        expect("a resume follows any move of the owner's: the runner's own move is the newest one",
-               (approval(cfg, "code", nodes["ENG-51"], [move("owner-1", "st-ready"),
-                                                         move("writer-1", "st-working", "2026-11-01T11:00:00Z",
-                                                              "st-ready")], ["st-ready"], resumed=True)[0],
-                approval(cfg, "code", nodes["ENG-51"], [move("owner-1", "st-ready"),
-                                                         move("writer-1", "st-working", "2026-11-01T11:00:00Z",
-                                                              "st-ready")], ["st-ready"])[0]),
-               ({"by": "owner-1", "at": t1, "how": "move"}, None))
+        # The owner takes it back: a move of his out of the approved states since the approval it
+        # started on (the Slack approval at t1) withdraws the approval the runner recorded.
+        hists["ENG-55"] = [move("owner-1", "st-backlog", "2026-11-02T10:00:00Z", "st-working")]
+        rqback = store.ask(sdir, "fix-driver", "resume", "fix", "app", "ENG-55",
+                           run=rfix.get("run") or run55, text="Fix it again STANDIN:quick")
+        judged.pass_once()
+        aback = store.answer(sdir, rqback) or {}
+        expect("…and once the owner moved it out of its approved states, that approval no longer stands",
+               (aback.get("ok"), aback.get("why")),
+               (False, "the owner moved the ticket out of its approved states since it was approved, so "
+                       "the approval its run started on no longer stands"))
+        hists["ENG-55"] = []
+        # A resume keeps its kind's newest-move rule. The runner's own move into the working state
+        # (the session writer's) counts neither way, so the owner's last word is still read.
+        worked = [move("owner-1", "st-ready"),
+                  move("writer-1", "st-working", "2026-11-01T11:00:00Z", "st-ready")]
+        taken_back = worked + [move("owner-1", "st-backlog", "2026-11-01T12:00:00Z", "st-working")]
+        expect("a code resume keeps the newest-move rule, the session writer's own move left out; the "
+               "owner's later move back out refuses it",
+               (approval(cfg, "code", nodes["ENG-51"], worked, ["st-ready"], ignore=("writer-1",))[0],
+                approval(cfg, "code", nodes["ENG-51"], worked, ["st-ready"])[0],
+                approval(cfg, "code", nodes["ENG-51"], taken_back, ["st-ready"], ignore=("writer-1",))),
+               ({"by": "owner-1", "at": t1, "how": "move"}, None,
+                (None, "the ticket's newest move was not the owner's, into an approved state")))
+        expect("…and the runner leaves out its own writer's moves, and only with session_tools set",
+               (judged.writer_ids(), R(dict(cfg, session_tools=None), tracker).writer_ids()),
+               (("writer-1",), ()))
         lone = dict(rfix or {}, resumes="run-" + "e" * 32)
         expect("a carried approval whose start cannot be read approves nothing",
-               judged.carried_approval(lone) if rfix else None, None)
+               judged.carried_approval(lone, [], ["st-ready"]) if rfix else None, (None, ""))
 
         # ---- the runner's one tracker write, as the session writer (KIT-645) ---------- #
         sent = []
@@ -2751,6 +2798,28 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                    (_load(os.path.join(rdir_r, "mcp.json")),
                     os.path.exists(os.path.join(rdir_r, session_tools.RUN_FILE)),
                     [a for a in _load(os.path.join(rdir_r, "launch.json"))["argv"]
+                     if a in session_tools.ALLOWED]),
+                   ({"mcpServers": {}}, False, []))
+        # With session_tools off, which only a project whose lanes need none allows (KIT-645): a
+        # review-only project, with no session writer and no queue settings.
+        nt_cfg, nt_bad = load_config(dict(raw, session_tools=None, queue_config=None, projects={
+            "app": dict(raw["projects"]["app"], lanes={"review": True})}))
+        expect("session_tools off: a review-only project needs no session writer and no queue settings",
+               nt_bad, [])
+        notools = R(nt_cfg, tracker, environ=environ, git_env=genv, say=said.append, room=roomy, engine=safe)
+        ticket("ENG-46", "Reviewed with no tools", [move("owner-1", "st-ready")])
+        rq = store.ask(sdir, "review", "start", "review", "app", "ENG-46")
+        notools.pass_once()
+        ans_n = store.answer(sdir, rq) or {}
+        expect("session_tools off: a review starts", ans_n.get("ok"), True)
+        if ans_n.get("ok"):
+            rdir_n = store.run_dir(sdir, ans_n["run"])
+            _wait(lambda: notools.pass_once() and store.read_run(sdir, ans_n["run"])["state"] == "ended", 15)
+            expect("with session_tools off, the run lists no tool server, and has no run file and no "
+                   "tracker tool",
+                   (_load(os.path.join(rdir_n, "mcp.json")),
+                    os.path.exists(os.path.join(rdir_n, session_tools.RUN_FILE)),
+                    [a for a in _load(os.path.join(rdir_n, "launch.json"))["argv"]
                      if a in session_tools.ALLOWED]),
                    ({"mcpServers": {}}, False, []))
 
@@ -3120,10 +3189,24 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                ((runner.measure(coded, tmp, None, time.time()) or [None])[0],
                 runner.run_limits(coded)["wall_minutes"]), ("limit:time", 20))
         other = dict(coded, run="run-" + "8" * 32)
-        expect("…a pin that is another run's is no budget: the kind's limits hold, and that is told once",
-               (runner.run_limits(other)["wall_minutes"], runner.measure(other, tmp, None, time.time()),
-                [t["key"] for t in _load(os.path.join(sdir, "incidents.json"))["told"]].count(
-                    other["run"] + ":budget-unread")), (360, None, 1))
+
+        def told_unread(rec):
+            path = os.path.join(sdir, "incidents.json")
+            told = _load(path)["told"] if os.path.exists(path) else []
+            return [t["key"] for t in told].count(rec["run"] + ":budget-unread")
+        first_two = (runner.run_limits(other)["wall_minutes"], runner.measure(other, tmp, None, time.time()),
+                     told_unread(other))
+        expect("…a pin that is another run's is no budget: the kind's limits hold, and two misses in a row "
+               "are not told yet",
+               first_two, (360, None, 0))
+        expect("…the third miss in a row is told once, and a fourth is not told again",
+               ([runner.run_limits(other)["wall_minutes"] for _ in range(2)], told_unread(other)), ([360, 360], 1))
+        flaky = dict(coded, run="run-" + "9" * 32, pin=os.path.join(tmp, "budget-pin-later.json"))
+        missed_once = runner.run_limits(flaky)["wall_minutes"]
+        with open(flaky["pin"], "w") as fh:
+            json.dump({"dispatch_id": flaky["run"], "budget": {"maxMinutes": 20}}, fh)
+        expect("…and a read that failed is tried again on a later pass: one bad read never drops the budget",
+               (missed_once, runner.run_limits(flaky)["wall_minutes"], told_unread(flaky)), (360, 20, 0))
         rq = store.ask(sdir, "review", "start", "review", "app", "ENG-41")
         runner.pass_once()
         run41 = store.answer(sdir, rq)["run"]

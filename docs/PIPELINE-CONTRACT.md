@@ -3332,8 +3332,10 @@ the tracker and judges it.
   ticket's whole history: the newest move for a `plan` start, any move for the kinds that follow an
   approved ticket. A ticket the owner made in such a state, with no move recorded, counts as his
   move.
-- **A resume** needs any move of the owner's into the kind's approved states, or the approval the
-  runner itself recorded for the start of the work it carries on.
+- **A resume** follows its kind's own rule over the history, with the session writer's moves left
+  out, since the runner's own move into the working state counts neither way. Or it follows the
+  approval the runner itself recorded for the start of the work it carries on, while no later move
+  of the owner's took the ticket back out of the approved states.
 
 The old dispatcher's own user never approves. A history that cannot be read whole approves nothing.
 

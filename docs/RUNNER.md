@@ -63,8 +63,11 @@ Before it starts anything, it checks the request against the tracker:
   pieces switch is on. One rule, for the queue and the runner.
 - **Any other start** needs the owner's own move into an approved state for that kind, in the
   ticket's whole history: the newest move for a plan start, any move for the kinds that follow.
-- **A resume** needs any move of the owner's, or the approval the runner recorded for the start of
-  the work it carries on. A piece of a plan approved in Slack has no move of his in its history.
+- **A resume** follows its kind's own rule over the history, with the session writer's moves left
+  out: the runner's own move into the working state counts neither way. Or it follows the approval
+  the runner recorded for the start of the work it carries on, since a piece of a plan approved in
+  Slack has no move of his in its history. That stands only while no later move of the owner's
+  took the ticket back out of its approved states: that is him withdrawing it.
 - The old dispatcher's own user never approves. A history it cannot read whole approves nothing.
 
 Good: the owner moved ENG-12 to Todo. The queue asks for a code session. It starts.
