@@ -18,7 +18,7 @@ be bypassed:
 |---|---|---|---|
 | 1. Claude Code hooks (`.claude/hooks/`) | Claude attempts a tool call | **Invocation: no. Pattern match: yes** — the harness always runs the hook, but its Bash guards match raw command text a motivated caller can respell ([measured](#what-the-pattern-guards-actually-carry)) | Claude reading a secret, `rm -rf`, staging `.env`, embedding a key, editing on `main`, **exfiltrating data to a non-allowlisted host** |
 | 2. Git pre-commit (`.husky/` + secretlint) | `git commit` | Yes (`--no-verify`) | A secret value reaching a commit, in every staged path whose new content is a file or a link: `scripts/check_secret_scan.py --staged`, CI's scanner, reads each as the commit will hold it (the index's blob, not the working-tree copy, which can differ) under a safe name, so a name with a space, a quote, a backslash or a non-ASCII character, a path under `node_modules/`, secretlint's own config names, a `.gitignore` rule and a `.secretlintignore` change nothing (KIT-151, KIT-398); forbidden paths staged; commits on `main`. It runs after lint-staged, so it judges what lint-staged stages too, and it runs the scanner beside the hook, so a worktree running the main checkout's hook does not run its own older scanner. Where secretlint or python3 cannot run, or git cannot list what is staged, the hook refuses the commit and says the scan did not run, never that it found a secret; a commit with nothing to scan, one that only deletes, needs no scanner. It does not find a key that is split, encoded, compressed or encrypted, or one its rules do not know, and it reads a Git LFS file as git stores it: its pointer, not its content. Taking a forbidden path out of the tree is allowed |
-| 3. CI + branch protection | PR targets `main` | **No** — server-side on GitHub | Everything above, re-checked; the real gate. The secret scan is its first step, before any of the PR's code runs. It scans the merge GitHub checks out and, on a PR, the head's own tree too, so a base the PR names cannot drop one of its files. A key split between main and a PR, or across two PRs merged one after the other, is whole only in what lands; main's own run finds it after it has landed (KIT-410). On a PR it also reads the PR's own commits (each blob a commit adds or changes, and its message), so a key in an earlier commit, or in a commit message, is found even when every tree is clean. A merge commit's own conflict resolution is not listed. It uses the default branch's scanner, rules and pinned secretlint (whose own dependencies resolve fresh from the registry), never those of the PR or of the base it names, so nothing the PR adds can change what it sees; the label gate judges against the default branch too (KIT-400, KIT-410). It reads every tracked file as git stores it, whatever its name or folder and whatever a `.gitignore` or `.secretlintignore` says. It also reads a binary-looking file as text, and UTF-16 or UTF-32 in either byte order, and a `secretlint-disable` comment does not silence it. A file secretlint did not read fails the scan as not scanned (`scripts/check_secret_scan.py`). A PR that changes the scan's rules or scanner needs the `hooks-change` label, and the change takes effect once merged (KIT-401); the lockfile needs none, so a pin older than the scanner's floor is refused. It does not find a key that is split, encoded, compressed or encrypted, or one its rules do not know. A PR that edits this workflow runs its own copy of it, the label gate's job included, so for such a PR the label is a person's acknowledgement, not a lock: only a required review, with a workflow run from the base, would make it one |
+| 3. CI + branch protection | PR targets `main` | **No** — server-side on GitHub | Everything above, re-checked; the real gate. The secret scan is its first step, before any of the PR's code runs. It scans the merge GitHub checks out and, on a PR, the head's own tree too, so a base the PR names cannot drop one of its files. A key split between main and a PR, or across two PRs merged one after the other, is whole only in what lands; main's own run finds it after it has landed (KIT-410). On a PR it also reads the PR's own commits (each blob a commit adds or changes, and its message), so a key in an earlier commit, or in a commit message, is found even when every tree is clean. A merge commit's own conflict resolution is not listed. It uses the default branch's scanner, rules and pinned secretlint (whose own dependencies resolve fresh from the registry), never those of the PR or of the base it names, so nothing the PR adds can change what it sees; the label gate judges against the default branch too (KIT-400, KIT-410). It reads every tracked file as git stores it, whatever its name or folder and whatever a `.gitignore` or `.secretlintignore` says. It also reads a binary-looking file as text, and UTF-16 or UTF-32 in either byte order, and a `secretlint-disable` comment does not silence it. A file secretlint did not read fails the scan as not scanned (`scripts/check_secret_scan.py`). A PR that changes the scan's rules or scanner needs the `hooks-change` label, and the change takes effect once merged (KIT-401); the lockfile needs none, so a pin older than the scanner's floor is refused. It does not find a key that is split, encoded, compressed or encrypted, or one its rules do not know. A PR that edits this workflow runs its own copy of it. The label gate does not run from it: it has its own workflow, which runs from the default branch, so no PR can change how it is judged (KIT-668, below) |
 
 Two principles worth keeping verbatim:
 
@@ -76,9 +76,39 @@ meets it. So CI carries the merge-time layer: any PR whose diff touches
 `hooks-change` label — an explicit, human-visible acknowledgment instead of a
 silent merge (adding/removing the label re-runs the check via the
 `labeled`/`unlabeled` PR trigger types of its own workflow, `hooks-change-guard.yml`, so a label no longer re-runs every
-battery in "Kit checks" — KIT-587). One dependency to know: the label only
-becomes a real *gate* once branch protection also requires at least one
-approving review — otherwise the PR author can self-label and merge unseen.
+battery in "Kit checks" — KIT-587).
+
+**Where the gate runs from (KIT-668).** The gate runs on `pull_request_target`, so
+GitHub takes its workflow from the default branch, never from the PR. The job checks out
+the default branch, reads the PR's head commit only as data for the diff, and runs the
+default branch's gate script. Nothing the PR wrote runs, and the token can only read.
+`scripts/check_label_gate.py` pins that shape in CI. What holds now:
+
+- **The judge is the default branch's copy.** A PR that edits the gate's workflow or its
+  script cannot change how it is itself judged.
+- **The PR's own code cannot turn the check green.** A PR that edits the gate's file also
+  runs its own copy, under `pull_request`, and a PR can add any job named "Hooks change
+  guard". Neither hides the default branch's red run: GitHub blocks a merge while any run
+  of a required check is red, and a later green run from another workflow does not replace
+  it. GitHub does not document that rule. It was measured on a probe PR on 17 Nov 2026,
+  with a control PR beside it. A later run of the *same* workflow and event does replace
+  the earlier one, which is how a label turns the gate green. The first PR that edits the
+  gate's file shows the last case for this repository: it stays red until it is labelled.
+  Because it rests on one measurement, it is listed under *What is not proven* in
+  `docs/OPERATIONS.md`, with how to re-measure it. The fix if it ever fails is a required
+  check bound to an app no workflow can post as. Binding it to GitHub Actions, as now, does
+  not help, since a PR's own jobs are GitHub Actions too.
+- **It needs one allow from the owner.** From 2 Dec 2026 GitHub blocks
+  `pull_request_target` in public repositories unless an Actions policy allows it. Without
+  the allow the gate never runs and no PR can merge: it fails closed.
+  `python3 scripts/pipeline_gate_policy.py run` makes the allow, for this one workflow file.
+
+What still needs a person: the label is an acknowledgement, not a lock. The gate checks
+**who** applied it, which tells a person from an agent only when the agent has an identity
+of its own. Under one shared credential the label only becomes a real *gate* once branch
+protection also requires at least one approving review — otherwise the PR author can
+self-label and merge unseen. The stack template's own copy of the gate
+(`templates/workflows/ci.yml`) still runs from the PR.
 
 **Native `permissions.deny` — a layer independent of the Python hook.**
 `.claude/settings.json` also carries platform deny rules

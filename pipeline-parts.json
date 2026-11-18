@@ -1097,7 +1097,9 @@
               "<claude>",
               "--repo-dir",
               "<REPO_DIRS>",
-              "--claude-arg=<CLAUDE_ARGS>"
+              "--check-command=<CHECK_COMMANDS>",
+              "--model",
+              "<MODEL>"
             ]
           },
           "schedule": "interval",
@@ -2214,6 +2216,7 @@
         "scripts/pipeline_validator_ledger.py",
         "scripts/pipeline_validator_brief.py",
         "scripts/pipeline_validator_limits.py",
+        "scripts/pipeline_validator_route.py",
         "scripts/pipeline_validator_check.py",
         "scripts/pipeline_validator_app.py",
         "scripts/pipeline_validator_run.py"
