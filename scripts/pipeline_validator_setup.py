@@ -496,9 +496,10 @@ def owned_plain(ctx, path, st):
 # --------------------------------------------------------------------------- #
 def job_line(ctx, dry=False):
     """The one shell line the job runs: read ENV_FILE into the environment, run each pass, keep the
-    worst exit, then (not in a rehearsal) write the last-pass file and exit with that code."""
+    worst (highest) exit, then (not in a rehearsal) write the last-pass file and exit with that
+    code. Every pass runs, whatever the one before it exited."""
     q = shlex.quote
-    passes = " ".join("%s %s run --config %s%s || rc=$?;" % (
+    passes = " ".join('%s %s run --config %s%s; r=$?; [ "$r" -gt "$rc" ] && rc=$r;' % (
         q(ctx.conf["PYTHON"]), q(os.path.join(ctx.kit, "scripts", p)), q(ctx.config_path),
         " --dry-run" if dry else "") for p in PASSES)
     line = "set -a; . %s; set +a; rc=0; %s" % (q(ctx.conf["ENV_FILE"]), passes)
@@ -2277,6 +2278,39 @@ def selftest():
        len(lists) == 1 and [n for n in ast.walk(funcs["_bootstrap"]) if n in lists] == lists
        and callers("_bootstrap") == ["load_job"] and callers("load_job") == ["switch_on"],
        (len(lists), callers("_bootstrap"), callers("load_job")))
+
+    # ── 15b. The job's line: the parts list holds it as written, and it keeps the worst exit ──
+    with open(os.path.join(KIT, "pipeline-parts.json"), encoding="utf-8") as fh:
+        listed = [pt for pt in json.load(fh)["parts"] if pt["id"] == "validator"][0]["jobs"][0]
+    plain = Ctx({"ENV_FILE": "/e/env", "PYTHON": "/p/python3", "JOB_LABEL": "local.validator"},
+                "/h", None, {}, kit="/k")
+    as_listed = listed["command"]["args"][1]
+    for placeholder, value in (("<ENV_FILE>", "/e/env"), ("<PYTHON>", "/p/python3"),
+                               ("<kit>", "/k"), ("<owner home>", "/h")):
+        as_listed = as_listed.replace(placeholder, value)
+    ok("parts: pipeline-parts.json holds the job's command exactly as this installer writes it",
+       (listed["command"]["program"], listed["command"]["args"][0], as_listed)
+       == ("/bin/sh", "-c", job_line(plain)), (as_listed, job_line(plain)))
+    two = place("two-passes")
+    saved_passes = PASSES
+    for codes in ((1, 4), (4, 1)):
+        kit2 = os.path.join(two["base"], "kit-%d%d" % codes)
+        for name, rc_ in zip(("first.py", "second.py"), codes):
+            write(os.path.join(kit2, "scripts", name), "import sys\nopen(%r, 'w').close()\nsys.exit(%d)\n"
+                  % (os.path.join(kit2, name + ".ran"), rc_), 0o644)
+        globals()["PASSES"] = ("first.py", "second.py")
+        try:
+            c2, _f = ctx_for(two)
+            c2.kit = kit2
+            res = subprocess.run(["/bin/sh", "-c", job_line(c2)], env={"PATH": SYSTEM_PATH},
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd="/")
+            beat2, _w = read_beat(c2)
+        finally:
+            globals()["PASSES"] = saved_passes
+        ok("line: passes that exit %d then %d both run, and the job keeps the worst, 4" % codes,
+           res.returncode == 4 and beat2 and beat2["exit"] == 4
+           and all(os.path.exists(os.path.join(kit2, n + ".ran")) for n in ("first.py", "second.py")),
+           (res.returncode, beat2))
 
     # ── 16. Root: refused first, with the shared words, and still one JSON document ─────────
     saved = rg._uid
