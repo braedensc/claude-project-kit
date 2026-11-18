@@ -1827,6 +1827,19 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                                                                  "SHLVL", "_")],
                sorted(["PATH", "HOME", "TMPDIR", "LANG", "CLAUDE_CODE_OAUTH_TOKEN",
                        "DISABLE_AUTOUPDATER", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"]))
+        rq = store.ask(sdir, "review", "start", "review", "app", "ENG-1")
+        tooled.pass_once()
+        ans_r = store.answer(sdir, rq) or {}
+        expect("session_tools: a review of the same ticket starts", ans_r.get("ok"), True)
+        if ans_r.get("ok"):
+            rdir_r = store.run_dir(sdir, ans_r["run"])
+            _wait(lambda: tooled.pass_once() and store.read_run(sdir, ans_r["run"])["state"] == "ended", 15)
+            expect("session_tools: a review run gets no tool server, no run file and no tracker tool",
+                   (_load(os.path.join(rdir_r, "mcp.json")),
+                    os.path.exists(os.path.join(rdir_r, session_tools.RUN_FILE)),
+                    [a for a in _load(os.path.join(rdir_r, "launch.json"))["argv"]
+                     if a in session_tools.ALLOWED]),
+                   ({"mcpServers": {}}, False, []))
 
         # ---- a stop -------------------------------------------------------- #
         store.ask(sdir, "queue", "start", "code", "app", "ENG-2")
