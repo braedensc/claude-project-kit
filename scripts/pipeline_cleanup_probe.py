@@ -31,6 +31,8 @@ import subprocess
 import sys
 import time
 
+# A COPY, on purpose: a person pipes this file into `python3 -I -` on stdin (docs/CLEANUP-PROOF.md), so it has
+# no sibling to import. scripts/pipeline_agent_env.py is the source, and its selftest fails when this differs (KIT-690).
 AGENT_ENV_MARKERS = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_PROJECT_DIR", "AI_AGENT")
 SCHEMA = "cleanup-probe/1"
 EX_OK, EX_LEFT, EX_USAGE, EX_REFUSED, EX_UNKNOWN = 0, 1, 2, 3, 4

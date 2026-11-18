@@ -432,6 +432,8 @@ REQUIRED_SCRIPTS = ("pipeline_review_poller.py", "pipeline_bounce_local.py",
                     "pipeline_catchup_poller.py", "pipeline_review_local.py",
                     "pipeline_review_basis.py", "pipeline_telemetry_local.py", "pipeline_criteria_snapshot.py",
                     "gh_fallback.py", "pr_conflict.py", "pipeline_dispatch_local.py",
+                    # The one list of agent-environment markers the dispatcher imports (KIT-690).
+                    "pipeline_agent_env.py",
                     "pipeline_labels.py", "check_schemas.py", "check_ticket_dor.py",
                     "check_grader_paths.py",
                     "jsonschema_mini.py", "telemetry_block.py", "telemetry_scrape.py",

@@ -142,7 +142,8 @@ DEFAULT_STATE_HOME = HOME_DIR + "/setup"
 # transitively. The clone is `behind` only when one of these differs from origin — a merge
 # that touches none of them leaves the job's code current. The selftest derives the closure
 # from the sources and fails when this tuple drifts from it.
-REQUIRED_SCRIPTS = ("pr_conflict.py", "pipeline_dispatch_local.py", "pipeline_labels.py", "jsonschema_mini.py")
+REQUIRED_SCRIPTS = ("pr_conflict.py", "pipeline_dispatch_local.py", "pipeline_labels.py", "jsonschema_mini.py",
+                    "pipeline_agent_env.py")
 DAEMON_PATH = se.DAEMON_PATH
 HEARTBEAT_WAIT_SECONDS = 90
 # How far ahead of this machine's clock a heartbeat's stamp may be and still count: ordinary

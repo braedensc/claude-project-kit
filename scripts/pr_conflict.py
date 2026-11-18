@@ -2534,7 +2534,7 @@ def selftest():
     if not os.environ.get("PR_CONFLICT_SELFTEST_NESTED"):
         here = os.path.dirname(os.path.abspath(__file__))
         needed = ("pr_conflict.py", "pipeline_dispatch_local.py", "jsonschema_mini.py",
-                  "pipeline_labels.py", "scratch_run.py")
+                  "pipeline_labels.py", "pipeline_agent_env.py", "scratch_run.py")
         env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
         env["PR_CONFLICT_SELFTEST_NESTED"] = "1"
 

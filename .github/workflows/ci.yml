@@ -218,6 +218,10 @@ jobs:
       - name: Local dispatcher selftest (contract §2, §3)
         run: python3 scripts/pipeline_dispatch_local.py --selftest
 
+      # The one list of agent-environment markers: copies pinned, refusals pinned (KIT-690).
+      - name: Agent-environment markers selftest (KIT-690)
+        run: python3 scripts/pipeline_agent_env.py --selftest
+
       # The autonomy gates and the telemetry pipeline. Same posture as the two
       # above: inert in this repo (no delivery.json, no store), so the selftests
       # are what has teeth. Each asserts its own contract rows against synthetic

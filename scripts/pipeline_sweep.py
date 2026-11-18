@@ -77,6 +77,9 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from pipeline_agent_env import AGENT_ENV_MARKERS  # noqa: E402  (one list, KIT-690)
+
 EXIT_OK, EXIT_FAILED, EXIT_USAGE, EXIT_REFUSED, EXIT_UNKNOWN = 0, 1, 2, 3, 4
 LINEAR_API = "https://api.linear.app/graphql"
 USER_AGENT = "pipeline-sweep/1"             # Cloudflare refuses Python's default agent
@@ -87,7 +90,6 @@ DEFAULT_LOG_MAX_MB = 10
 DEFAULT_LOG_KEEP = 3
 MAX_PAGES = 20                              # 2,000 tickets of one team in one pass
 WALK_LIMIT = 500000                         # entries one folder may hold and still be judged
-AGENT_ENV_MARKERS = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_PROJECT_DIR", "AI_AGENT")
 TICKET_RE = re.compile(r"^([A-Z][A-Z0-9]*)-([1-9][0-9]{0,8})$")
 SESSION_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 # Claude Code names a project's temp folder after its working folder, each "/" a "-".
