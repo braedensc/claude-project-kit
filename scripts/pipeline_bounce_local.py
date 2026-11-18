@@ -504,6 +504,7 @@ import pipeline_validator_ledger as vledger  # noqa: E402  (the validator's send
 import pipeline_runner_store as runner_store  # noqa: E402
 
 EXIT_OK = 0
+EXIT_ERROR = 1          # a pass that could not run (KIT-681: its pass lock could not be taken)
 EXIT_USAGE = 2
 # NOT A FAILURE, AND NOT NOTHING (KIT-112). A pass that deliberately did nothing for a pull
 # request it was never meant to act on, or a whole pass a person paused. The review poller
@@ -8857,7 +8858,7 @@ def main(argv=None):
 def locked(state_dir, read_only, fn):
     """`fn()` under the driver's pass lock (KIT-681): a second pass at once does nothing and exits
     EXIT_DECLINED. A pass that writes nothing (a dry run, `decide`) takes no lock."""
-    return pass_lock.exclusive(state_dir, "bounce-driver", fn, busy_rc=EXIT_DECLINED, fail_rc=EXIT_USAGE,
+    return pass_lock.exclusive(state_dir, "bounce-driver", fn, busy_rc=EXIT_DECLINED, fail_rc=EXIT_ERROR,
                                say=lambda line: sys.stderr.write(line + "\n"), skip=read_only)
 
 

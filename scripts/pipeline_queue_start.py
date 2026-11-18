@@ -397,6 +397,11 @@ def counted(led, ticket, source, now):
                 rows=led["rows"] + [{"ticket": ticket, "source": source, "at": pool.iso(now)}])
 
 
+class QueueBusy(OSError):
+    """Another pass holds the ledger's lock (KIT-681). Nothing was written and nothing may start on this say; it is
+    not a failure, so a caller that can tell it apart says so and ends its step quietly."""
+
+
 def record_start(path, now, ticket, source):
     """Write today's row for a start about to be made, and return the ledger as written. Raises
     ValueError (a ledger that cannot be counted on, a ticket or source of the wrong shape, a
@@ -412,7 +417,7 @@ def record_start(path, now, ticket, source):
     job = "queue-start-" + os.path.basename(path)
     handle = pass_lock.take(folder, job)
     if handle is None:
-        raise OSError(pass_lock.BUSY_SAYS % "the queue's starter")
+        raise QueueBusy(pass_lock.BUSY_SAYS % "the queue's starter")
     try:
         led = counted(read_ledger(path, pool.local_date(now)), ticket, source, now)
         write(led, path)
@@ -955,7 +960,7 @@ def _cases(check, tmp, home):
                "agent_filed, resume", True)] * 2),
             ("ledger: a second pass at once writes nothing and says it is already running (KIT-681)",
              _two_at_once(tempfile_dir(), NOW),
-             (pass_lock.BUSY_SAYS % "the queue's starter", False, 1, True)),
+             ("QueueBusy: " + pass_lock.BUSY_SAYS % "the queue's starter", False, 1, True)),
             ("ledger: a folder inside a git working tree is refused",
              _refused(lambda: record_start(os.path.join(GIT, "l.json"), NOW, "ENG-1", "todo")),
              True),
@@ -1253,7 +1258,7 @@ def _busy(fn):
     try:
         fn()
     except OSError as exc:
-        return str(exc)
+        return "%s: %s" % (type(exc).__name__, exc)
     return None
 
 

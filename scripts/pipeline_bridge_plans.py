@@ -47,6 +47,7 @@ import pipeline_plan_poller as poller  # noqa: E402
 import pipeline_plan_executor as executor  # noqa: E402
 # The queue (MVP 2, KIT-454): what may start now, and the ledger row before each start.
 import pipeline_queue_start as starter  # noqa: E402
+import pipeline_pass_lock as pass_lock  # noqa: E402  (one pass at a time: the queue's ledger lock, KIT-681)
 import pipeline_routing_tags as routing  # noqa: E402  (KIT-405: the follow-up's directive pin)
 import pipeline_voice as voice  # noqa: E402
 # The telemetry reader's own parse of a comment's `pipeline-telemetry/1` blocks: a review's
@@ -2837,6 +2838,8 @@ class PlansMixin(object):
                 return
             try:
                 self.start_queued(entry, agent_id, ledger)
+            except starter.QueueBusy as exc:       # KIT-681: another pass is writing the ledger: not a failure
+                return self.say("  QUEUE: %s; nothing starts from the queue this pass" % exc)
             except (OSError, ValueError) as exc:
                 return self.queue_failed("its ledger refused a start (%s)" % (
                     exc if isinstance(exc, ValueError) else type(exc).__name__))
@@ -2880,6 +2883,9 @@ class PlansMixin(object):
                 break
             try:
                 ok = self.resume_one(stop, agent_id, ledger, done)
+            except starter.QueueBusy as exc:       # KIT-681: not a failure, and nothing more starts this pass
+                self.say("  QUEUE: %s; nothing resumes this pass" % exc)
+                return None
             except (OSError, ValueError) as exc:
                 self.queue_failed("its ledger refused a resume (%s)" % (
                     exc if isinstance(exc, ValueError) else type(exc).__name__))
@@ -5040,6 +5046,13 @@ def cases_approve(kit):
             check("a-ledger-that-refuses-starts-nothing-and-the-pass-ends-loud",
                   (delegated(t), out[0] != EXIT_OK, "its ledger refused a start" in out[1]),
                   ([], True, True))
+            held_lock = []
+            c, s, t, out, ledger = queued("q-busy", decided(start("PROD-51")), setup=lambda _t: held_lock.append(
+                pass_lock.take(os.path.join(tmp, "queue-q-busy"), "queue-start-ledger.json")))
+            check("a-second-pass-finding-the-ledger-locked-starts-nothing-and-does-not-fail-the-pass",
+                  (delegated(t), rows(ledger), out[0], "QUEUE: another pass of the queue's starter is already running" in out[1],
+                   "ledger refused" in out[1]), ([], None, EXIT_OK, True, False))
+            pass_lock.release(held_lock[0])
             c, s, t, out, ledger = queued("q-limit", decided(
                 start("PROD-51"), start("PROD-52", lane="acme/app:2")), max_actions_per_hour=2)
             check("the-action-limit-holds-the-queue-too", (delegated(t), rows(ledger)),

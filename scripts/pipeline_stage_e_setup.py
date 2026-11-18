@@ -9181,10 +9181,13 @@ def _selftest_body():
         busy_held = pass_lock.take(busy_state, "stage-e-setup")
         busy_out, busy_real = _io.StringIO(), sys.stdout
         sys.stdout = busy_out
+        busy_markers = globals()["agent_env_markers_present"]
+        globals()["agent_env_markers_present"] = lambda env=None: []     # a session runs this too: reach the lock
         try:
             busy_rc = main(["run", "--conf", os.path.join(busy_tmp, "none.conf"), "--state", busy_state])
             attest_rc = main(["attest", "x", "--state", busy_state])
         finally:
+            globals()["agent_env_markers_present"] = busy_markers
             sys.stdout = busy_real
         expect("a second run at once exits busy", busy_rc == EX_BUSY, repr(busy_rc))
         expect("a second attest at once exits busy", attest_rc == EX_BUSY, repr(attest_rc))
@@ -18936,7 +18939,7 @@ def main(argv=None):
             held = pass_lock.take(os.path.expanduser(args.state), "stage-e-setup")
         except OSError as exc:
             say("FAILED: the run lock could not be taken (%s). Nothing was changed." % exc)
-            return EX_USAGE
+            return EX_FAILED
         if held is None:
             say(pass_lock.BUSY_SAYS % "this installer" + " (exit %d). Wait for it, then run the same command again."
                 % EX_BUSY)
