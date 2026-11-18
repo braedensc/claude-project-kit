@@ -22,8 +22,9 @@ ONE PASS, in order. Each step says what it did, or which nothing.
   4. Every open pull request of each listed repository. A list not read whole: nothing more, since
      a pull request with auto-merge on could be in the part not read.
   5. ONE IN FLIGHT. A pull request with auto-merge on is in flight:
-       - at a head with an `approved` row, it waits for GitHub to merge it, and one behind its base
-         gets GitHub's own update-branch at that head;
+       - at a head with an `approved` row, it waits for GitHub to merge it. One behind its base has
+         the validator's own auto-merge turned off FIRST, and only then GitHub's own update-branch
+         at that head: the new head is judged from scratch before anything turns auto-merge on;
        - at a head with no `approved` row (a push after it was turned on), it is turned off when the
          validator's app turned it on, and left as it is, said, when someone else did.
      While one is in flight, nothing else is turned on.
@@ -41,6 +42,13 @@ ONE PASS, in order. Each step says what it did, or which nothing.
        - Both layers pass: the brief, ONE agent run, the route's decision, its row, its check, and
          for an approval GitHub's own auto-merge at exactly that head. The pass ends there: at most
          one agent run, and at most one pull request turned on, per pass.
+
+WHAT IS A ROW.  A ledger row is one verdict on one head (contract §24): an approval, a send-back, an
+escalation, or a hold no later pass can settle. A wait spends no verdict, so a skip (a draft, a pull
+request into another branch), a wait (checks running or red, a review not in yet or stale, a fact not
+read), GitHub's own update-branch and turning auto-merge off write no row: each pass says each of
+them, and its output is their record. A pull request never picked because of the floor or a
+human-only class is a `held` row. The selftest pins this.
 
 THE STALE-REVIEW LIMIT (KIT-792).  Updating a pull request moves its head, so its Stage E review is
 stale until Stage E reviews the new head, and Stage E re-reviews a moved head once per pull request.
@@ -393,17 +401,6 @@ def run_pass(cfg, host, now=None, dry=False, say=print):
     in_flight = False
     for pr in [x for x in pulls if x["auto"]]:
         row = _row_at(rows, pr["ref"], pr["head"])
-        if row is not None and row["kind"] == "approved":
-            in_flight = True
-            full = host.pull(pr["repo"], pr["number"])
-            if isinstance(full, dict) and full.get("mergeable_state") == "behind":
-                say("In flight: %s is behind its base." % pr["ref"])
-                p.github("ask GitHub to update its branch at %s" % pr["head"][:12], pr,
-                         lambda pr=pr: host.update(pr["repo"], pr["number"], pr["head"]))
-            else:
-                say("In flight: %s, approved at %s, waits for GitHub to merge it."
-                    % (pr["ref"], pr["head"][:12]))
-            continue
         try:
             ours = (pr["auto_by"] is not None
                     and pr["auto_by"].lower() == host.app_login().lower())
@@ -411,6 +408,25 @@ def run_pass(cfg, host, now=None, dry=False, say=print):
             say("In flight: auto-merge is on for %s, and the validator's app could not say who it "
                 "is (%s), so it is left on." % (pr["ref"], exc))
             p.failed, in_flight = True, True
+            continue
+        if row is not None and row["kind"] == "approved":
+            in_flight = True
+            full = host.pull(pr["repo"], pr["number"])
+            if not (isinstance(full, dict) and full.get("mergeable_state") == "behind"):
+                say("In flight: %s, approved at %s, waits for GitHub to merge it."
+                    % (pr["ref"], pr["head"][:12]))
+            elif not ours:
+                say("In flight: %s is behind its base, and its auto-merge was turned on by %s, "
+                    "not the validator, so it is left as it is." % (pr["ref"], pr["auto_by"]))
+            else:
+                # Its auto-merge goes off FIRST: an update makes a new head, which GitHub could
+                # merge before anything judged it. The new head is judged from scratch.
+                say("In flight: %s is behind its base. Its auto-merge goes off before its branch is "
+                    "updated, and the new head is judged from scratch." % pr["ref"])
+                if p.github("turn its auto-merge off", pr,
+                            lambda pr=pr: host.disable(pr["repo"], pr["node_id"])) or p.dry:
+                    p.github("ask GitHub to update its branch at %s" % pr["head"][:12], pr,
+                             lambda pr=pr: host.update(pr["repo"], pr["number"], pr["head"]))
             continue
         if ours:
             say("Auto-merge on %s has no approval at its head %s (a push after it was turned on)."
@@ -813,14 +829,48 @@ def selftest():
               (code, host.log, "turned on by the-owner, not the validator" in said),
               (EXIT_OK, [], True))
 
-        # 7. An approved one that is behind while in flight gets GitHub's own update-branch.
+        # 7. An approved one in flight that falls behind: its auto-merge off FIRST, then the update,
+        #    so no new head can merge unjudged; the next pass judges the new head from scratch.
         host = fresh()
         host.add(8, "2026-11-01T00:00:00Z")
         go(host)
         host.prs["acme/app#8"]["behind"] = True
         code, said = go(host)
-        check("an approved pull request in flight that falls behind is updated at its head",
-              writes(host), [("enable", "acme/app#8"), ("update", "acme/app#8")])
+        check("an approved pull request in flight that falls behind: auto-merge off, then the update",
+              writes(host), [("enable", "acme/app#8"), ("disable", "acme/app#8"),
+                             ("update", "acme/app#8")])
+        new = host.prs["acme/app#8"]["head"]
+        code, said = go(host)
+        check("...the next pass judges its new head from scratch: it waits, no row, nothing on",
+              (writes(host)[-1], kinds(), "acme/app#8: waits: check-pending" in said,
+               host.prs["acme/app#8"]["auto"]),
+              (("update", "acme/app#8"), [("acme/app#8", "approved")], True, None))
+        host.prs["acme/app#8"].update(checks="green", review=new)
+        code, said = go(host)
+        check("...and only a fresh approval of the new head turns auto-merge on, at that head",
+              (writes(host)[-1], kinds()[-1], host.prs["acme/app#8"]["auto_head"]),
+              (("enable", "acme/app#8"), ("acme/app#8", "approved"), new))
+        host = fresh()
+        host.add(16, "2026-11-01T00:00:00Z")
+        go(host)
+        host.prs["acme/app#16"]["behind"] = True
+        host.refuse.add("disable")
+        code, said = go(host)
+        check("...and when its auto-merge cannot be turned off, its branch is not updated",
+              (code, writes(host)), (EXIT_FAILED, [("enable", "acme/app#16")]))
+
+        # 7b. What is a row: one verdict per head. A skip, a wait and turning auto-merge off write
+        #     none, and each is said (the update in case 4 wrote none either).
+        host = fresh()
+        host.add(18, "2026-11-01T00:00:00Z", draft=True)
+        host.add(19, "2026-11-02T00:00:00Z")
+        host.prs["acme/app#19"]["checks"] = "pending"
+        host.add(20, "2026-11-03T00:00:00Z", by=_FakeHost.APP)
+        code, said = go(host)
+        check("a skip, a wait and turning auto-merge off write no row, and each is said",
+              (kinds(), "acme/app#18: skipped, a draft" in said,
+               "acme/app#19: waits: check-pending" in said,
+               "acme/app#20: turn its auto-merge off" in said), ([], True, True, True))
 
         # 8. An approval whose auto-merge did not get turned on is finished on the next pass.
         host = fresh()

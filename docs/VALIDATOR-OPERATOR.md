@@ -613,8 +613,14 @@ a later piece.
 | Checks running or red, a review not in yet or stale, a fact not read | Nothing written. It waits, and says why. |
 | Both layers pass | One agent run, its row and its check. For an approval, auto-merge on at exactly that head. |
 | Auto-merge on, but no approval at its head | Turned off if the validator turned it on. Left alone, and said, if someone else did. |
+| Approved and in flight, but now behind main | Its auto-merge goes off first, then GitHub's own update-branch. The new head is judged from scratch before anything turns auto-merge on again. |
 
 At most one agent run, and one pull request turned on, per pass.
+
+**What is written down.** The ledger holds one verdict per head: an approval, a send-back, an
+escalation, or a hold no pass can settle. A wait spends no verdict. So a skip (a draft, a pull
+request into another branch), a wait, an update and turning auto-merge off write no row. Each pass
+says each of them, and its output is their record.
 
 **It acts as its own app.** It reads with your `gh` login, and writes only as the validator's app.
 A merge GitHub makes for the app is the app's, so the watcher checks it against the ledger. A merge
