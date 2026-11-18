@@ -183,5 +183,6 @@ AUTO_REPLAN_PER_DAY=20
 # committed delivery.json names it; off or absent, it plans on the old dispatcher as
 # before. Settings the planner cannot read start nothing, and it says why. Leave EMPTY
 # and every repository plans on the old dispatcher. Set it only once origin carries the
-# runner lane: the installer refuses a clone whose planner does not read it.
+# runner lane: the installer refuses a clone whose planner does not read it. To switch a
+# project back, turn its lanes.plan off; empty this only once no run there is in flight.
 RUNNER_SETTINGS=

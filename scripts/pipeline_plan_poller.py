@@ -2088,11 +2088,30 @@ def list_plan_it(cfg, linear, teams, stats):
     return ideas
 
 
+def seen_runner_starts(seen, day):
+    """(first runs, re-runs) this job's own records hold on our own runner for one UTC day
+    (KIT-705): what the caps count when no runner settings are named, so a lane switched back by
+    emptying runner_settings still counts the runs it made there that day. The store, when it is
+    read, counts them instead, a record that was lost included."""
+    first = retry = 0
+    for key, rec in ((seen or {}).get("triggers") or {}).items():
+        if (isinstance(rec, dict) and rec.get("lane") == "runner"
+                and str(rec.get("created_at") or "").startswith(day)):
+            if "#retry-" in str(key):
+                retry += 1
+            else:
+                first += 1
+    return first, retry
+
+
 def _runs_today(seen, clock, lanes=None):
     """The day's new runs on both lanes: the old lane's from this job's record, our own runner's
-    from its store (KIT-705), so a record that was lost still holds the cap there."""
+    from its store (KIT-705), so a record that was lost still holds the cap there. With no store
+    read, our own runner's come from this job's records."""
     held = runner_starts(lanes or {}, clock)
-    return int((seen.get("runs_by_day") or {}).get(clock.day()) or 0) + (held[0] if held else 0)
+    if held is None:
+        held = seen_runner_starts(seen, clock.day())
+    return int((seen.get("runs_by_day") or {}).get(clock.day()) or 0) + held[0]
 
 
 def _count_run(seen, clock, lane="ticket"):
@@ -3046,11 +3065,13 @@ def owed_rows(ledger, idea_id):
             if r.get("idea_id") == idea_id and r.get("state") in OWED]
 
 
-def _reruns_today(ledger, clock, lanes=None):
+def _reruns_today(ledger, clock, lanes=None, seen=None):
     """The day's re-runs on both lanes: the old lane's from the ledger, our own runner's from its
-    store (KIT-705)."""
+    store (KIT-705), or, with no store read, from this job's records."""
     held = runner_starts(lanes or {}, clock)
-    return int((ledger.get("by_day") or {}).get(clock.day()) or 0) + (held[1] if held else 0)
+    if held is None:
+        held = seen_runner_starts(seen, clock.day())
+    return int((ledger.get("by_day") or {}).get(clock.day()) or 0) + held[1]
 
 
 def _count_rerun(ledger, clock, lane="ticket"):
@@ -4035,7 +4056,7 @@ def replan(cfg, linear, ws, teams, seen, ledger, sessions, dry_run, stats, clock
                            % plans_words(standing), dry_run, stats, clock,
                            next_step=PAGE_PLAN_STANDS)
                 continue
-            if _reruns_today(ledger, clock, lanes) >= cfg["auto_replan_per_day"]:
+            if _reruns_today(ledger, clock, lanes, seen) >= cfg["auto_replan_per_day"]:
                 drop_rerun(cfg, linear, seen, ledger, row, "the day's limit of %d re-runs was "
                            "reached" % cfg["auto_replan_per_day"], dry_run, stats, clock)
                 continue
@@ -7149,9 +7170,18 @@ def selftest():
         case("defer-mark-off")
         # This job pages for itself on every run, re-runs on or off (KIT-338): every executor
         # run it made is told to hold its own page back. (Before KIT-338, with re-runs off,
-        # it never was.)
+        # it never was.) The case files a run of its own, re-runs off, so the check never passes
+        # over no executor run at all (Stage E on #644).
+        del calls[:]
+        f = FakeLinear(FakeClock())
+        f.add_idea(74)
+        cd = cfg_for("defer-mark-off", auto_replan=False)
+        one_pass(cd, f)
+        f.finish(runs(f)[0]["id"], final_message(synthetic_plan("PROD-74", 2)))
+        f.clock.advance(120)
+        one_pass(cd, f, runner=fake_executor(0))
         check("every-executor-run-is-told-to-defer-its-mark (KIT-338)",
-              all("--defer-mark" in c["argv"] for c in calls), True)
+              (len(calls), all("--defer-mark" in c["argv"] for c in calls)), (1, True))
 
         import contextlib
         import io
@@ -7639,9 +7669,10 @@ def selftest():
         fnot.add_idea(143, actor="someone-else")
         cnot = cfg_for("never-refused-before-a-run", auto_replan=True)
         one_pass(cnot, fnot)
-        check("never-re-run:a-refusal-before-a-run", (runs(fnot),
+        # No run on either lane, and no ticket of any kind (Stage E on #644).
+        check("never-re-run:a-refusal-before-a-run", (runs(fnot), fnot.issues,
                                                       load_replans(cnot["state_dir"])["moves"]),
-              ([], {}))
+              ([], {}, {}))
 
         case("re-run-checks")
         # THE CHECKS BEFORE FILING (KIT-375). Each failed check drops the re-run and pages
@@ -8083,7 +8114,7 @@ def selftest():
         f.add_idea(92)
         cy = cfg_for("dry")
         one_pass(cy, f, dry_run=True)
-        check("dry-run-created-nothing", (runs(f), f.comments), ([], []))
+        check("dry-run-created-nothing", (runs(f), f.issues, f.comments), ([], {}, []))
         check("dry-run-no-state", os.path.exists(seen_path(cy["state_dir"])), False)
         if rl:
             store_y = runner_of(cy, f).store
@@ -8104,7 +8135,7 @@ def selftest():
             one_pass(cz, f)
         except PollerError:
             code = "stopped"
-        check("corrupt-seen-stops", (code, runs(f)), ("stopped", []))
+        check("corrupt-seen-stops", (code, runs(f), f.issues), ("stopped", [], {}))
 
         # 23. EVERY EXIT WRITES A HEARTBEAT — a config failure included — except a dry run.
         case("heartbeat")
@@ -8523,6 +8554,21 @@ def selftest():
             _code, s = one_pass(c, f)
             check("an-unreadable-request-of-anyone's-takes-one-run-from-the-cap-and-stops-nothing-else",
                   (len(runs(f)), s["waiting_daily_cap"], s["planning_blocked"]), (2, 1, 0))
+            # Switched back by emptying runner_settings mid-day, the day's runs on the runner still
+            # count toward the cap, from this job's own records (Stage E on #644).
+            f = FakeLinear(FakeClock())
+            for n_ in (539, 540, 541):
+                f.add_idea(n_)
+            c = cfg_for("runner-caps-switched-back", max_new_runs=10, max_runs_per_day=2)
+            one_pass(c, f)
+            for n_ in (542, 543):
+                f.add_idea(n_)
+            back = dict(c, runner_settings="")
+            _code, s = one_pass(back, f)
+            check("emptied-settings-mid-day-the-runner's-runs-still-hold-the-daily-cap",
+                  ([r["lane"] for r in runs(f)], s["waiting_daily_cap"] > 0,
+                   seen_runner_starts(load_seen(back["state_dir"]), f.clock.day())),
+                  (["runner", "runner"], True, (2, 0)))
             f = FakeLinear(FakeClock())
             f.add_idea(535)
             c = cfg_for("runner-caps-refused")

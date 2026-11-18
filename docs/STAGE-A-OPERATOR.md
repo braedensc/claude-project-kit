@@ -449,7 +449,8 @@ the planner keeps none of its own.
   executor with every check it makes.
 - **What it needs:** the team's Plan it state among the project's `approval_states.plan` in the
   runner's settings. Until then no run starts on this lane, and each pass says why.
-- **The way back:** turn `lanes.plan` off. A run already asked finishes, and is read back.
+- **The way back:** turn `lanes.plan` off. A run already asked finishes, and is read back. Leave
+  `RUNNER_SETTINGS` set until no run on the runner is in flight.
 - **An older clone:** the installer refuses to write the key until the role account's clone
   knows it.
 

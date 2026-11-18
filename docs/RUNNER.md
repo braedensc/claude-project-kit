@@ -343,8 +343,10 @@ moves an idea to Plan it, the planner asks the runner for one `plan` start on th
 The old lane's probe sign-off, its version check and its routing stop do not hold this lane:
 nothing here is routed. Settings the planner cannot read start nothing on either lane.
 
-**The way back.** Turn `lanes.plan` off, or empty `RUNNER_SETTINGS`. A run already asked finishes
-on the runner, and the planner still reads it back.
+**The way back.** Turn `lanes.plan` off. A run already asked finishes on the runner, and the planner
+still reads it back. Empty `RUNNER_SETTINGS` only once no run there is in flight: the day's caps
+still count the runner's runs from the planner's own records, but a run whose record was lost is
+found again only through the store.
 
 Good: `"lanes": {"plan": true}` for the drill repository. Its next idea becomes one plan run, and
 the plan lands on the idea.
