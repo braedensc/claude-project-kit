@@ -118,7 +118,10 @@ HOOK_CHECKOUTS=
 # --state-dir, by default /Users/<you>/.pr-conflict-waker/state. When it has
 # not checked in for an hour, or reports a problem, two passes running,
 # `conflict-waker` fires and reaches Slack through the status file. It opens
-# no GitHub issue. Empty: no conflict waker is watched (every pass says so).
+# no GitHub issue. Set, it also turns on `waker-sandbox` (KIT-829): one short
+# session on the small model after every Claude Code update and once a day,
+# proving the waker's fix session is still held to its worktree. A few cents
+# a run. Empty: no conflict waker is watched (every pass says so).
 CONFLICT_WAKER_STATE_DIR=
 
 # The role account's heartbeats for the notifier and the heartbeat monitor, as
