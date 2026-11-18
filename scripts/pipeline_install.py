@@ -91,12 +91,21 @@ WHAT IT DOES, IN ORDER
      command in Manual and is carried past in Automatic. With no `queue.conf` the part is "off
      on this Mac" and nothing runs.
   3f. The hourly health check (`scripts/pipeline_watch.py install`), when this Mac has an
-     `update.conf`. It reads, and never changes, whether the LaunchAgent is there, names this
-     kit, this settings file and this interval, and is held by launchd. Level is "up to date".
-     Missing or behind asks, then runs the installer, which shows a dry pass and asks for its own
-     typed yes; the job is looked at again afterwards, and one not seen loaded is "could not be
-     measured", never "updated". A declined or untyped yes is "waiting on you"; a job that could
-     not be looked at is "could not be measured". With no `update.conf` it is "off on this Mac".
+     `update.conf`. In Manual it reads, and never changes, whether the LaunchAgent is there,
+     names this kit, this settings file and this interval, and is held by launchd. Level is "up
+     to date". Missing or behind asks, then runs the installer, which shows a dry pass and asks
+     for its own typed yes; the job is looked at again afterwards, and one not seen loaded is
+     "could not be measured", never "updated". A declined or untyped yes is "waiting on you"; a
+     job that could not be looked at is "could not be measured". With no `update.conf` it is
+     "off on this Mac".
+     In Automatic (KIT-869) it runs the installer's `check` instead, whose rows come back as one
+     JSON document while its words are shown. A WOULD-CHANGE row is work, so it runs the
+     installer's `apply` with {"consent": "yes"} piped in. `apply` asks nothing, needs no Mac
+     password, and switches the job on itself when its first pass would raise no more alerts
+     than the part's ceiling in `pipeline-parts.json`. Above it the job stays installed and off,
+     and that one line ("left off: ...") is the part's line at the end. A job you stopped is a
+     step of yours, never work. Rows it cannot read, or a check that could not measure, are
+     "could not be measured", and the run carries on, as before; an `apply` that failed stops it.
   3g. The runner, with every lane off (`scripts/pipeline_runner_setup.py`), when this Mac has a
      `runner.conf` (`--runner-conf` names another). Its installer has only the program-facing pair,
      so in both modes it runs as the notifier does in Automatic (3c): the Mac password held once,
@@ -1167,7 +1176,8 @@ def watch_level(conf_path, home, uid, measure):
 
 def step_watch(io, conf, rep):
     """The hourly health check's job, when `update.conf` exists. It is a LaunchAgent that runs as
-    you; its own installer shows a dry pass and asks for a typed yes before it loads anything."""
+    you; its own installer shows a dry pass and asks for a typed yes before it loads anything. In
+    Automatic, its program-facing pair instead (step_watch_auto)."""
     key = "watch"
     heading(io, "3f. The hourly health check")
     if not io.exists(conf):
@@ -1175,6 +1185,8 @@ def step_watch(io, conf, rep):
         io.say("No %s, so the health check is not set up on this Mac. Copy update.conf.example to "
                "switch it on." % os.path.relpath(conf, KIT))
         return None
+    if io.auto:
+        return step_watch_auto(io, conf, rep)
     state, why = io.watch_level(conf)
     if state == "current":
         io.say("The hourly health check is installed and loaded, from this kit.")
@@ -1212,6 +1224,88 @@ def step_watch(io, conf, rep):
     io.say("The hourly health check is installed and loaded.")
     rep.note(key, OUT_UPDATED)
     return None
+
+
+# KIT-869: the health check's program-facing pair, for Automatic. `check` prints its rows as one
+# JSON document and asks nothing; `apply` takes the consent through a pipe, asks nothing, and
+# switches the job on itself at or below its first-pass ceiling. The selftest pins both schemas
+# against the installer's own.
+WATCH_ROWS_SCHEMA = "watch-setup-rows/1"
+WATCH_ANSWERS = {"schema": "watch-answers/1", "consent": "yes"}
+
+
+def watch_why(doc, code, what):
+    """The health check's words for rows that are not a pass: its one left-off line, else its first
+    row that failed, could not be measured or is yours, else its own reason, else its exit."""
+    if doc is None:
+        return "its %s printed no rows (exit %s)" % (what, code)
+    if doc.get("left_off"):
+        return doc["left_off"]
+    for outcome in ("FAILED", "UNKNOWN", "BLOCKED-ON-HUMAN"):
+        for row in rows_with(doc, outcome):
+            if row.get("detail"):
+                return row["detail"]
+    return doc.get("why") or "its %s stopped with exit %s" % (what, code)
+
+
+def step_watch_auto(io, conf, rep):
+    """Automatic (KIT-869): the health check's own `check`, then its `apply` with the consent piped
+    in when a row is work. Neither asks anything, and neither needs the Mac password: the job is
+    yours, in your own login. A check whose rows cannot be read, or that could not measure, is
+    "could not be measured" and is carried past, as the look before it was. An apply that failed
+    stops the command, as `install` did. None to carry on, or an exit code."""
+    key, noun = "watch", "The hourly health check"
+    base = [sys.executable, WATCH]
+    seen = tuple(rep.checks.get(key) or (base + ["check", "--conf", conf]))
+    code, out = io.run_rows(base + ["check", "--conf", conf])
+    if io.interrupted:
+        rep.note(key, OUT_UNMEASURED, "interrupted during its check")
+        return stop(io, INTERRUPTED % (noun + "'s check"), code or EX_BLOCKED)
+    doc = rows_doc(out, WATCH_ROWS_SCHEMA)
+    io.say("")
+    if doc is None or code not in (0, EX_BLOCKED):
+        why = watch_why(doc, code, "check")
+        io.say("%s could not be looked at: %s." % (noun, why))
+        rep.note(key, OUT_UNMEASURED, why)
+        return None
+    rep.seen[seen] = (code, cards_of(doc))
+    if code == 0:
+        io.say("%s is installed and loaded, from this kit." % noun)
+        rep.note(key, OUT_OK)
+        return None
+    if not rows_with(doc, "WOULD-CHANGE"):
+        why = watch_why(doc, code, "check")
+        io.say("%s waits for you: %s" % (noun, why))
+        rep.note(key, OUT_WAITING, why)
+        return None
+    io.say("%s is not up to date: the rows above name what would change. Its installer writes one "
+           "LaunchAgent in your own home. It switches the job on itself only when the job's first "
+           "pass would raise no more alerts than its ceiling; above that the job stays off, and the "
+           "end says why." % noun)
+    if not io.ask("Install the hourly health check now?"):
+        rep.note(key, OUT_WAITING, "behind; you did not install it")
+        return None
+    code, out = io.run_rows(base + ["apply", "--conf", conf], stdin_text=json.dumps(WATCH_ANSWERS))
+    if io.interrupted:
+        rep.note(key, OUT_UNMEASURED, "interrupted during its installer")
+        return stop(io, INTERRUPTED % "The health check's installer", code or EX_BLOCKED)
+    doc = rows_doc(out, WATCH_ROWS_SCHEMA)
+    io.say("")
+    if doc is not None:
+        rep.seen[seen] = (code, cards_of(doc))
+    if doc is not None and code == 0:
+        io.say("%s is installed and loaded." % noun)
+        rep.note(key, OUT_UPDATED)
+        return None
+    if doc is not None and code in (EX_BLOCKED, EX_UNMEASURED):
+        why = watch_why(doc, code, "apply")
+        io.say("%s %s: %s. Carrying on; it is on the list at the end."
+               % (noun, "waits for you" if code == EX_BLOCKED else "could not be measured", why))
+        rep.note(key, OUT_WAITING if code == EX_BLOCKED else OUT_UNMEASURED, why)
+        return None
+    rep.note(key, OUT_UNMEASURED, watch_why(doc, code, "apply"))
+    return stop(io, "the health check's installer stopped with exit %s. The lines above say why."
+                % code, code if code not in (None, 0, EX_BLOCKED) else EX_UNMEASURED)
 
 
 def step_stage_a(io, conf, stage_e_conf, rep):
@@ -2281,11 +2375,14 @@ class FakeIo(Io):
         return " ".join([script] + [a for a in argv[2:3] if not a.startswith("/")])
 
     seen_out = {}                          # program key -> the lines run_seen returns for it
-    # Program key -> what a `check` or `apply` printed. By default the notifier's check prints a
-    # clean document, so the cases written before KIT-850 keep their meaning in Automatic.
+    # Program key -> what a `check` or `apply` printed. By default the notifier's check and the
+    # health check's print a clean document, so the cases written before KIT-850 and KIT-869 keep
+    # their meaning in Automatic.
     rows_out = {"pipeline_notifier_setup.py check": json.dumps(
         {"schema": [s for s in JOB_STEPS if s["key"] == "notifier"][0]["rows_schema"],
-         "command": "check", "exit": 0, "rows": []})}
+         "command": "check", "exit": 0, "rows": []}),
+                "pipeline_watch.py check": json.dumps(
+        {"schema": WATCH_ROWS_SCHEMA, "command": "check", "exit": 0, "rows": []})}
     piped = ()                             # (program key, the text piped into it), in order
 
     def run_seen(self, argv):
@@ -2832,7 +2929,8 @@ def selftest():
                "pipeline_bridge_setup.py verify": 0,
                "pipeline_notifier_setup.py run --dry-run": 0,      # asked only where notifier.conf is present
                "pipeline_notifier_setup.py check": 0,              # …in Automatic (KIT-850)
-               "pipeline_queue_setup.py run --dry-run": 0}        # asked only where queue.conf is present
+               "pipeline_queue_setup.py run --dry-run": 0,        # asked only where queue.conf is present
+               "pipeline_watch.py check": 0}                      # in Automatic, where update.conf is (KIT-869)
 
     def go(codes=None, answers=(), argv=None, **kw):
         io = FakeIo(codes=dict(healthy, **(codes or {})), answers=answers, **kw)
@@ -3445,6 +3543,88 @@ def selftest():
     code, io = watch(("missing", "x"), {watch_run: 0}, answers=[True], interrupt={watch_run})
     check("watch-ctrl-c-in-its-installer-stops-the-run",
           (code, "pipeline_stage_a_setup.py run" in io.ran), (EX_BLOCKED, False))
+    check("watch-manual-runs-the-persons-own-install-never-check-or-apply",
+          ([k for k in io.ran if "pipeline_watch" in k], list(io.piped)), ([watch_run], []))
+
+    # KIT-869: in Automatic, the health check's own `check`, then its `apply` with the consent piped
+    # in. Its documents are built by the installer's own function, so a change of shape there turns
+    # these red.
+    import pipeline_watch as watch_setup
+    wchk, wapp = "pipeline_watch.py check", "pipeline_watch.py apply"
+    W, B, D, A, U, F = (watch_setup.WOULD_CHANGE, watch_setup.BLOCKED, watch_setup.DONE,
+                        watch_setup.ALREADY_DONE, watch_setup.NOT_MEASURED, watch_setup.FAILED)
+
+    class Knew(object):
+        """What a pass of the installer knew, for its own rows_document."""
+        def __init__(self, first=None, left=None):
+            self.row_cards, self.ceiling, self.first_pass, self.left_off = {}, 3, first, left
+
+    def wdoc(command, code_, rows_, **kw):
+        return json.dumps(watch_setup.rows_document(command, code_, rows_, Knew(**kw)))
+
+    w_left = "left off: its first pass would raise 4 alerts, above its ceiling of 3"
+    w_paused = "it is not loaded, and it has run here before (its log is there): it was stopped on purpose"
+    w_work = wdoc("check", 10, [("job", W, "would write it"), ("enable", W, "would switch it on")])
+    w_on = wdoc("apply", 0, [("job", D, "wrote it"), ("enable", D, "switched it on")], first=(2, 10))
+    w_off = wdoc("apply", 10, [("job", D, "wrote it"), ("enable", B, w_left + ". It is installed")],
+                 first=(4, 10), left=w_left)
+
+    class SudoSeen(FakeIo):
+        def sudo_once(self, why):
+            self.events.append("sudo: " + why)
+            return self.sudo_ok
+
+    def wauto(codes=None, rows_out=None, interrupt=()):
+        io = SudoSeen(codes=dict(healthy, **(codes or {})), typed=["1", "yes"])
+        io.rows_out = dict(rows_out or {})
+        io.interrupt_on = set(interrupt)
+        return main(base + ["--update-conf", update_conf], io=io), io
+
+    check("watch-auto-answers-and-rows-are-the-installers-own-schemas",
+          (WATCH_ANSWERS["schema"], WATCH_ROWS_SCHEMA, sorted(WATCH_ANSWERS)),
+          (watch_setup.ANSWERS_SCHEMA, watch_setup.ROWS_SCHEMA, ["consent", "schema"]))
+    code, io = wauto({wchk: 10, wapp: 0}, {wchk: w_work, wapp: w_on})
+    check("watch-auto-work-runs-apply-with-only-the-consent-piped-in-and-never-install",
+          ([k for k in io.ran if "pipeline_watch" in k], [p for p in io.piped if "watch" in p[0]],
+           wout(io), io.level_asked, "pipeline_stage_a_setup.py run" in io.ran),
+          ([wchk, wapp], [(wchk, None), (wapp, json.dumps(WATCH_ANSWERS))], [(OUT_UPDATED, "")], 0,
+           True))
+    check("watch-auto-asks-for-no-mac-password",
+          [e for e in io.events if str(e).startswith("sudo") and "health" in str(e).lower()], [])
+    code, io = wauto({wchk: 10, wapp: 10}, {wchk: w_work, wapp: w_off})
+    check("watch-auto-above-the-ceiling-is-left-off-and-its-one-line-is-the-end-line",
+          (wout(io), code, "pipeline_stage_a_setup.py run" in io.ran,
+           any(w_left in ln for ln in io.lines if "An hourly check" in ln)),
+          ([(OUT_WAITING, w_left)], EX_BLOCKED, True, True))
+    code, io = wauto({wchk: 0}, {wchk: wdoc("check", 0, [("job", A, "ok"), ("enable", A, "held")])})
+    check("watch-auto-clean-check-is-up-to-date-and-applies-nothing",
+          (wout(io), io.ran.count(wapp)), ([(OUT_OK, "")], 0))
+    code, io = wauto({wchk: 10}, {wchk: wdoc("check", 10, [("job", A, "ok"), ("enable", B, w_paused)])})
+    check("watch-auto-a-job-you-stopped-is-yours-and-applies-nothing",
+          (wout(io), io.ran.count(wapp), "pipeline_stage_a_setup.py run" in io.ran),
+          ([(OUT_WAITING, w_paused)], 0, True))
+    for name, codes, rows_out in (
+            ("a-check-with-no-rows-at-exit-0", {wchk: 0}, {wchk: "all fine, trust me"}),
+            ("a-check-of-another-schema", {wchk: 0}, {wchk: json.dumps({"schema": "x/1", "rows": []})}),
+            ("a-check-that-could-not-measure", {wchk: 4},
+             {wchk: wdoc("check", 4, [("enable", U, "launchd could not be asked")])}),
+            ("an-apply-that-could-not-measure", {wchk: 10, wapp: 4},
+             {wchk: w_work, wapp: wdoc("apply", 4, [("job", D, "wrote it"), ("enable", U, "not held")])})):
+        code, io = wauto(codes, rows_out)
+        check("watch-auto-%s-is-never-up-to-date-and-carries-on" % name,
+              (code, [o for o, _d in wout(io)], "pipeline_stage_a_setup.py run" in io.ran),
+              (EX_UNMEASURED, [OUT_UNMEASURED], True))
+    for name, codes, rows_out, want in (
+            ("an-apply-with-no-rows-at-exit-0", {wchk: 10, wapp: 0}, {wchk: w_work, wapp: ""}, EX_UNMEASURED),
+            ("an-apply-that-failed", {wchk: 10, wapp: 1},
+             {wchk: w_work, wapp: wdoc("apply", 1, [("job", D, "wrote it"), ("enable", F, "refused")])}, 1)):
+        code, io = wauto(codes, rows_out)
+        check("watch-auto-%s-stops-and-is-never-up-to-date" % name,
+              (code, [o for o, _d in wout(io)], "pipeline_stage_a_setup.py run" in io.ran),
+              (want, [OUT_UNMEASURED], False))
+    code, io = wauto({wchk: 10, wapp: 0}, {wchk: w_work, wapp: w_on}, interrupt={wchk})
+    check("watch-auto-ctrl-c-in-its-check-stops-before-any-apply",
+          (code, io.ran.count(wapp), "pipeline_stage_a_setup.py run" in io.ran), (EX_BLOCKED, 0, False))
 
     # watch_level itself, against a made-up home and a made-up launchctl: it reads and changes nothing.
     import plistlib
@@ -3888,7 +4068,7 @@ def selftest():
           (by_id(io)["review"], code), (OUT_UNMEASURED, EX_UNMEASURED))
     io = FakeIo(codes=dict(healthy))
     io.present = {waker_conf, kit_file("update.conf")}
-    io.measure_codes = {"pipeline_conflict_waker_setup.py run": 10, "pipeline_watch.py --conf": 1}
+    io.measure_codes = {"pipeline_conflict_waker_setup.py run": 10, "pipeline_watch.py check": 1}
     io.levels = ("unmeasured", "its job could not be looked at")
     code = main(base, io=io)
     check("lines-unmeasured-outranks-waiting", code, EX_UNMEASURED)
@@ -4171,16 +4351,15 @@ def selftest():
           (got["settings"]["jobs"][status_job],
            got["settings"]["jobs"]["review/" + review["jobs"][0]["label"]]),
           ({"key": "STATUS_INTERVAL_SECONDS", "value": "900"}, {"key": None, "value": None}))
-    # KIT-850: the notifier's part is the first to declare one; the record keeps the list's number.
-    # KIT-859: the runner's part declares one too.
-    paging_ceiling = [p for p in real_parts if p["id"] == "paging"][0]["ceiling"]
-    runner_ceiling = [p for p in real_parts if p["id"] == "runner"][0]["ceiling"]
+    # KIT-850, KIT-869 and KIT-859: the notifier's part, the health check's and the runner's declare
+    # one; the record keeps each number the list has, and none for every other part.
+    listed_ceilings = dict((p["id"], p["ceiling"]) for p in real_parts)
+    recorded = got["settings"]["ceilings"]
     check("kit717-record-has-each-ceiling-from-the-parts-list",
-          (got["settings"]["ceilings"]["paging"], got["settings"]["ceilings"]["runner"],
-           isinstance(paging_ceiling, int), isinstance(runner_ceiling, int),
-           set(v for k, v in got["settings"]["ceilings"].items() if k not in ("paging", "runner")),
-           "review" in got["settings"]["ceilings"]),
-          (paging_ceiling, runner_ceiling, True, True, {None}, True))
+          (recorded == dict((k, listed_ceilings[k]) for k in recorded),
+           [(i, isinstance(recorded.get(i), int)) for i in ("paging", "health-check", "runner")],
+           "review" in recorded),
+          (True, [("paging", True), ("health-check", True), ("runner", True)], True))
     check("kit717-a-switch-that-looks-like-a-secret-is-never-recorded-by-value",
           (switch_value("LINEAR_API_KEY", {"LINEAR_API_KEY": "abc"}),
            switch_value("LINEAR_API_KEY", {}), switch_value("STATUS_FILE", {"STATUS_FILE": "x"})),

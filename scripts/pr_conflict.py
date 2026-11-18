@@ -204,6 +204,16 @@ THE WAKER'S HEARTBEAT (contract §13)
   `finished_at`, `result` (ok | idle | problems | error) and what it did. A stale
   file is NOT RUNNING; a fresh one saying `idle` is ran-and-had-nothing-to-do.
   A dry run and a refusal write none, so neither can impersonate a pass.
+
+THE WAKER'S SPEND LEDGER (KIT-687, contract §30)
+
+  Each fix session that started, its timeout included, adds one row to
+  `<state dir>/conflict-waker-spend.jsonl`. The session prints text, not JSON, so
+  the row's cost is unknown, never zero, and so is how it was paid for: it ran on
+  the person's own sign-in. The model is `--model`, or null. A session that never
+  started adds none. A row that cannot be written is said, and never changes the
+  pass. The usage job runs as the role account, which cannot read this home, so it
+  leaves this ledger off unless its config names it.
 """
 import argparse
 import datetime as dt
@@ -284,6 +294,7 @@ DISPATCHER_ENV_FILE = "~/.stage-e/env"
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pipeline_dispatch_local import AGENT_ENV_MARKERS  # noqa: E402  (one tuple, owned there)
+import pipeline_spend_ledger as spend_ledger  # noqa: E402  (KIT-687: a fix session's spend row, §30)
 
 
 class CouldNotTell(Exception):
@@ -1411,13 +1422,32 @@ def new_tally():
             "busy": [], "deferred": [], "outcomes": {}, "problems": []}
 
 
+def record_fix_spend(path, model, number):
+    """KIT-687: one row in the waker's spend ledger (contract §30) for a fix session that started, its
+    timeout included. The session prints text, not JSON, so its cost is unknown, never zero, and it
+    ran under the person's own sign-in, so how it was paid for is unknown too. The model is --model,
+    or null. No path is no ledger. A row that cannot be written is said, and never changes the pass:
+    the ledger's mark says the call was not counted."""
+    if not path:
+        return
+    try:
+        spend_ledger.append(path, spend_ledger.row_from_result("conflict_waker", None, "unknown",
+                                                               model or None))
+    except (OSError, ValueError) as e:
+        print(f"#{number}: NOTE: could not record the fix session's spend in {path}: {type(e).__name__}",
+              file=sys.stderr)
+
+
 def wake(gh, repo_dir, now, *, runner=run, env=None, sleep=time.sleep, dry_run=False,
          claude_bin="claude", resume_mode="from-pr", checks=(), model=None, budget_usd=DEFAULT_BUDGET_USD,
          timeout_min=DEFAULT_TIMEOUT_MIN, lock_dir=None, sessions_left=DEFAULT_MAX_SESSIONS,
-         claude_dir=None, uid=None, dispatcher_env=DISPATCHER_ENV_FILE, home_of=account_home):
+         claude_dir=None, uid=None, dispatcher_env=DISPATCHER_ENV_FILE, home_of=account_home,
+         spend_path=None):
     """One repository's share of a pass. Returns its tally; raises CouldNotTell when the
     repository cannot be read at all, and Refusal before anything is read. A check no rule could
-    name is a ValueError, raised before anything is read too: `main` refuses it as usage first."""
+    name is a ValueError, raised before anything is read too: `main` refuses it as usage first.
+    `spend_path` is the waker's spend ledger, where each fix session that started leaves a row
+    (record_fix_spend); wake_pass names it, and None keeps none."""
     env = os.environ if env is None else env
     uid = os.getuid() if uid is None else uid
     refuse_waker(env, dry_run, uid, os.path.expanduser(dispatcher_env) if dispatcher_env else None)
@@ -1527,7 +1557,7 @@ def wake(gh, repo_dir, now, *, runner=run, env=None, sleep=time.sleep, dry_run=F
             cmd = fix_argv(claude_bin, prompt, n, budget_usd, resume_mode, model,
                            fix_rules(home, n, branch, base, checks),
                            fix_settings(home, n, uid, os.path.realpath(repo_dir), account))
-            timed_out, rc, output = False, None, ""
+            timed_out, rc, output, started = False, None, "", True
             try:
                 r = runner(cmd, cwd=home, timeout=timeout_min * 60)
                 rc, output = r.returncode, (r.stdout or "") + (r.stderr or "")
@@ -1535,7 +1565,9 @@ def wake(gh, repo_dir, now, *, runner=run, env=None, sleep=time.sleep, dry_run=F
                 timed_out = True
                 output = e.stdout.decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
             except OSError as e:
-                rc, output = 127, f"could not start {claude_bin}: {e}"
+                rc, output, started = 127, f"could not start {claude_bin}: {e}", False
+            if started:
+                record_fix_spend(spend_path, model, n)
             tally["woken"].append(n)
             ran = "timed out" if timed_out else f"exited {rc}"
             try:
@@ -1614,6 +1646,9 @@ def wake_pass(repo_dirs, gh_for, now, *, state_dir, dry_run=False, max_sessions=
     held_home(wake_kw.get("home_of", account_home), uid, dry_run)
     state_dir = os.path.expanduser(state_dir)
     wake_kw.setdefault("lock_dir", os.path.join(state_dir, "locks"))
+    # KIT-687: each fix session's row, beside the heartbeat (contract §30). The waker runs as a person, so
+    # the role account's usage job cannot read it, and leaves it off unless its config names it.
+    wake_kw.setdefault("spend_path", spend_ledger.path_in(state_dir, "conflict_waker"))
     if dry_run:   # what a fix session may do, said before any PR is: the installer's card signs it
         for line in describe_fix_session(wake_kw.get("checks", ()), wake_kw.get("model")):
             print(line)
@@ -2528,6 +2563,52 @@ def selftest():
         expect(rc == 1 and beat["result"] == "problems" and "failed" in beat["outcomes"].values(),
                f"a failed fix must exit 1 and say problems: rc={rc} {beat}")
 
+        # 26c. THE SPEND LEDGER (KIT-687): each fix session that started leaves one row beside the
+        #      heartbeat, read by the usage job's own reader: its cost and billing unknown, never
+        #      zero, the model --model or null. A timeout leaves one too; a session that never
+        #      started leaves none; a ledger that will not take the row is said, and the pass is
+        #      as it was.
+        def one_seven():
+            return FakeGh([_pr(7, labels=[LABEL])], {7: [_bot(marker("request", 1), 2)]})
+
+        def claude_raises(exc):
+            def runner_(cmd, cwd=None, input=None, timeout=None):
+                if cmd[0] == "claude":
+                    raise exc
+                return run(cmd, cwd=cwd, input=input, timeout=timeout)
+            return runner_
+
+        def spend_pass(name, gh_of, block=False, **kw):
+            sdir = os.path.join(tmp, "waker-spend-" + name)
+            led = spend_ledger.path_in(sdir, "conflict_waker")
+            if block:
+                os.makedirs(led)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc_ = wake_pass([repo], gh_of, NOW, state_dir=sdir, env={}, **dict(pass_kw, **kw))
+            note_, rows_ = spend_ledger.read(led, "conflict_waker", 0)
+            return rc_, note_["state"], [(r["usd"], r["billing"], r["model"], r["run_id"])
+                                         for r in rows_ or []], err.getvalue(), led
+        rc, state, rows, said, _led = spend_pass("two", lambda d: two(), max_sessions=2,
+                                                model="sonnet")
+        expect((rc, state, rows) == (0, "read", [(None, "unknown", "sonnet", None)] * 2)
+               and "NOTE" not in said,
+               f"each fix session must leave one row, its cost and billing unknown: {rc} {state} {rows} {said}")
+        rc, state, rows, _said, _led = spend_pass("no-model", lambda d: one_seven())
+        expect(rows == [(None, "unknown", None, None)], f"no --model is a null model, never a guess: {rows}")
+        rc, state, rows, _said, _led = spend_pass(
+            "timeout", lambda d: one_seven(),
+            runner=claude_raises(subprocess.TimeoutExpired(["claude"], 2400)))
+        expect(rows == [(None, "unknown", None, None)], f"a session that timed out ran, so it leaves a row: {rows}")
+        rc, state, rows, _said, _led = spend_pass(
+            "absent", lambda d: one_seven(),
+            runner=claude_raises(FileNotFoundError(2, "No such file or directory", "claude")))
+        expect((state, rows) == ("read", []), f"a session that never started leaves no row: {state} {rows}")
+        rc, state, rows, said, led = spend_pass("blocked", lambda d: one_seven(), block=True)
+        expect(rc == 0 and state == "could-not-read" and said == (
+            f"#7: NOTE: could not record the fix session's spend in {led}: IsADirectoryError\n"),
+               f"a row the ledger will not take is said, and the pass is as it was: {rc} {state} {said!r}")
+
         # 27. the fix session is handed the PR's OWN base, never `main` by assumption: a `develop`
         #     base gets a command that runs; a base the prompt must not carry is declined, said.
         calls.clear()
@@ -2910,7 +2991,8 @@ def selftest():
     if not os.environ.get("PR_CONFLICT_SELFTEST_NESTED"):
         here = os.path.dirname(os.path.abspath(__file__))
         needed = ("pr_conflict.py", "pipeline_dispatch_local.py", "jsonschema_mini.py",
-                  "pipeline_labels.py", "pipeline_agent_env.py", "scratch_run.py")
+                  "pipeline_labels.py", "pipeline_agent_env.py", "scratch_run.py",
+                  "pipeline_spend_ledger.py")
         env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
         env["PR_CONFLICT_SELFTEST_NESTED"] = "1"
 
