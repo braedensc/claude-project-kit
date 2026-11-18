@@ -119,7 +119,10 @@ settings and environment. A second program would be a second adapter, reading th
 | plan | Read, Grep, Glob | our own sandbox | none | 180 min, 4 GB |
 | acceptance | Bash, Read: it builds the app it checks | the built-in sandbox | the project's list | 180 min, 8 GB |
 
-Every kind's disk ceiling is 20 GB. What no kind's data can say, because the loader refuses it:
+Every kind's disk ceiling is 20 GB. With `session_tools` set, code, fix and conflict also get their
+own five ticket tools ("The session's own tracker tools", below), and the rules they are given name
+each one: no skill loads from the workspace to tell them. What no kind's data can say, because the
+loader refuses it:
 
 - **A mode that skips the checks.** The only value is `deny-unlisted`: what no rule allows is refused.
 - **A file tool allowed by name.** Each is allowed by the workspace's path only.
@@ -153,6 +156,9 @@ The files sit behind the `hooks-change` label: a change to one changes what a se
 - **The kit's guard on every tool call,** from the engine's own folder (below).
 - **A short environment,** exactly its kind's names: the path (the program's own folder first),
   a home, a temp folder, the language, the sign-in token, and two switches.
+- **No tracker sign-in.** No tracker key is in its environment, its `mcp.json` lists no tracker
+  server, and every tracker key file is walled from its file tools and from Bash. With
+  `session_tools` set, a code, fix or conflict session gets five tracker tools of its own instead.
 
 Good: a review session's Grep reaches only its workspace, and the system itself stops it writing.
 Not: a review session is given Bash, or a file tool allowed by its bare name.
@@ -228,6 +234,44 @@ A row the session never tried is NOT MEASURED, never PASS. A refusal counts as t
 when its own words are seen. Exit 0 means every wall held; 1 a wall failed; 2 some wall was not
 measured; 3 it could not run.
 
+## The session's own tracker tools
+
+A code, fix or conflict run gets one tool server of its own when `session_tools` is set:
+`scripts/pipeline_session_tools.py`, started for that run alone. The runner writes the server's run
+file in the run's folder, outside the workspace. The run's `mcp.json` lists that server and no other.
+A review, a plan and an acceptance check get none: each returns one checked block.
+
+| Tool | What it does |
+| --- | --- |
+| `read_ticket` | Reads the run's own ticket: its fields, labels, description and comments, fenced as data. |
+| `comment` | Posts one comment on it: a plan, progress, a plan note. |
+| `ask_question` | Asks the run's one question, under the escalation mark the notifier pages on. |
+| `file_finding` | Requests a follow-up ticket: the finding block the finding filer files into the backlog. Three a run. |
+| `report_done` | Ends the run, once: the summary and the run's telemetry block. After it, nothing more is written. |
+
+- **No tool takes a ticket id.** The server knows only its own run's ticket. So no tool can write
+  to another ticket, make a ticket, or set a state, a label or an approval.
+- **It writes what a session writes today.** Each comment holds the same mark or block as before,
+  so the notifier, the finding filer, the bridge and the telemetry collector read it unchanged.
+- **It writes as the session writer:** the tracker user those readers already trust as a session's
+  author. That is never the owner. Before its first call, it checks the key belongs to
+  `writer_user_id`. If it does not, the server refuses everything.
+- **Every argument is hostile.** Text is judged as the tracker will store it. A mark, another
+  tool's block, a receipt line or a credential's shape is refused. Routing tags, fence tags and
+  @mentions are made inert.
+- **Its caps are contract section 8's:** 20 comments a run, the last kept for `report_done`; three
+  findings; one question; bodies of 16 000 characters. Each write is counted before it is sent.
+  Reads stop at 100 a run, which only a runaway meets.
+
+Good: a session calls `file_finding` with a title and a body. The finding filer files it in the
+backlog and replies on the ticket.
+Not: a session puts a finding block in a `comment`. The comment is refused, because a finding goes
+through `file_finding`, where the cap of three holds.
+
+**The writer's key.** Put a Linear API key for the user named in `writer_user_id` in a file of the
+role account's, mode 0600, outside the work and home folders. The readers must trust that user. The
+finding filer's `agent_user_id` and the bridge's agent user must both name it.
+
 ## Settings
 
 One JSON file. The example is `runner.example.json`. `~/` means the account's own home.
@@ -249,6 +293,7 @@ One JSON file. The example is `runner.example.json`. `~/` means the account's ow
 | `max_starts_per_ticket` | A runaway's limit on starts of one ticket and kind. | `20` |
 | `hold` | The watcher's hold file (contract section 20). Set, nothing starts. | none |
 | `limits` | `wall_minutes`, `memory_mb`, `disk_mb`, `check_seconds` (how often trees and folders are measured) and `room` (the floor). See "Its limits". | above |
+| `session_tools` | `key_file`, the session writer's tracker key, and `writer_user_id`, the user it must belong to, never an owner. See "The session's own tracker tools". Absent, no session gets tracker tools. | none |
 | `projects` | Each project: `repo` (the runner's own clone), `base`, `approval_states` per kind, `allowed_hosts`. | required |
 
 The four folders must not sit inside one another.
@@ -275,6 +320,14 @@ review's profile with the system's own `sandbox-exec`, and `test:runner` runs a 
 inside it. The CI job on the Mac's Python runs both on every pull request. On any other system they
 print that they skipped it, and only the profile's text is checked. The probe runs the real program
 inside it, on the owner's Mac.
+
+```bash
+npm run test:session-tools
+```
+
+The session tools' selftest checks every refusal and every cap. It checks that only the fixed
+requests reach the tracker, and that no answer, log line or file holds the key. It holds each
+comment against the job that reads it, then runs the real server over stdio.
 
 ## When it refuses
 
@@ -311,3 +364,9 @@ The runner refuses to start from inside a Claude session, or as root.
 - That the acceptance kind's look tool can start its own sandbox in an acceptance session. It is
   a tool server, started outside Bash's sandbox, so nothing should nest. It joins that kind with
   the acceptance lane (KIT-708), and the probe gains a row for it then.
+- That a real session calls its own tracker tools, and that Linear takes their comments. Their
+  selftest runs the real server over stdio against a stand-in tracker. The first coding lane on
+  the runner (KIT-645) is the first live run.
+- How the owner's answer to a session's question reaches the work again on this lane. The
+  notifier pages the question as today. Taking the answer back to the session by resume is
+  KIT-707's.

@@ -15,6 +15,6 @@
   "env": ["PATH", "HOME", "TMPDIR", "LANG", "CLAUDE_CODE_OAUTH_TOKEN", "DISABLE_AUTOUPDATER",
           "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "GIT_CONFIG_GLOBAL"],
   "guards": ["pre-tool-use"],
-  "tool_servers": [],
+  "tool_servers": ["ticket"],
   "limits": {"wall_minutes": 360, "memory_mb": 8192, "disk_mb": 20480}
 }

@@ -127,7 +127,8 @@ deliberately **not** a block — a human's ad-hoc session in a configured repo m
 bricked — so an unpinned session is treated as exactly that. In
 `.claude/hooks/pre-tool-use.py` the grader-path half of `scope-fence` is scoped to pinned
 sessions (`:1423`), `ticket-branch` needs a pinned ID (`:1433`), and `pin-binding` blocks
-only on a *malformed, mismatched or expired* pin, never a missing one (`:981`). A session
+only on a *malformed, mismatched or expired* pin, or one the pins ledger says was written
+and is now gone (KIT-674), never on one that was never written (`:981`). A session
 this daemon starts therefore gets **fewer** guards than a dispatched one, not more.
 
 What still holds, under every dispatcher, because §2 makes it universal and it lives in
@@ -373,8 +374,10 @@ so `/work` fails closed as though nothing had been dispatched
 ([`LESSONS.md`](LESSONS.md)).
 
 `--show` reports what is bound to this worktree using the hook's own vocabulary
-(`ok` / `absent` / `expired` / `mismatch` / `malformed`), which is the fastest way to
-tell a stale pin from an unbound session. `--dry-run` prints the pin without writing it.
+(`ok` / `absent` / `missing` / `unreadable` / `expired` / `mismatch` / `malformed`), which
+is the fastest way to tell a stale pin from an unbound session. `missing` is a pin deleted
+by hand while the ledger still expects it; the hook refuses every write there until
+`--release` records the release (KIT-674). `--dry-run` prints the pin without writing it.
 `--ticket-file <json>` dispatches offline from a saved issue object instead of calling
 Linear; otherwise the key is read from `$LINEAR_API_KEY` (the **name** of the variable is
 what `--api-key-env` takes — never the key itself).

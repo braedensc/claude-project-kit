@@ -33,7 +33,8 @@ Each file says what a session of that kind is given and what walls it runs behin
     env           the names of the only environment variables the program is given
     guards        the kit's guards the session's tool calls go through, run from the engine's
                   own folder (scripts/pipeline_runner_guard.py)
-    tool_servers  tool servers the session gets. None is offered yet
+    tool_servers  tool servers the session may get: `ticket`, its own five ticket tools, for
+                  code, fix and conflict, only while the runner's `session_tools` is set
     limits        the kind's own time, memory and disk ceilings; the runner holds each run to
                   the smaller of these and its settings' limits
 
@@ -70,7 +71,9 @@ ALLOW_HOW = ("workspace", "name")
 DENY_PLACES = ("store", "pins", "keys", "home")
 WALLS = ("built-in-sandbox", "own-sandbox")
 GUARDS = ("pre-tool-use",)
-TOOL_SERVERS = ()                          # none is offered yet; the session's own tools come later
+# The tool servers a kind may name. `ticket` is the session's own ticket tools (KIT-706,
+# scripts/pipeline_session_tools.py), given only while the runner's `session_tools` is set.
+TOOL_SERVERS = ("ticket",)
 LIMIT_KEYS = ("wall_minutes", "memory_mb", "disk_mb")
 WORD_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,29}\Z")
 ENV_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}\Z")
@@ -168,8 +171,9 @@ def problems(doc, name):
             and len(set(guards)) == len(guards)):
         say("guards: must hold pre-tool-use, and only the kit's own guards (%s)" % ", ".join(GUARDS))
     servers = doc["tool_servers"]
-    if not (isinstance(servers, list) and all(s in TOOL_SERVERS for s in servers)):
-        say("tool_servers: none is offered yet, so the list is empty")
+    if not (isinstance(servers, list) and all(s in TOOL_SERVERS for s in servers)
+            and len(set(servers)) == len(servers)):
+        say("tool_servers: only the session's own ticket tools (%s) are offered" % ", ".join(TOOL_SERVERS))
     lim = doc["limits"]
     if not (isinstance(lim, dict) and sorted(lim) == sorted(LIMIT_KEYS)
             and all(_int_in(lim[k], limits.FLOORS[k], limits.CEILINGS[k]) for k in LIMIT_KEYS)):
@@ -273,6 +277,12 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
            [t for t in kinds["review"]["tools"] if t not in reviewer], [])
     expect("…and none is in the reviewer's fence",
            [t for t in kinds["review"]["tools"] if t in _read_tuple(stage_e, "DISALLOWED_BUILTINS")], [])
+    import ast
+    with open(os.path.join(HERE, "pipeline_session_tools.py"), encoding="utf-8") as fh:
+        stages = next(ast.literal_eval(n.value) for n in ast.parse(fh.read()).body
+                      if isinstance(n, ast.Assign) and any(getattr(t, "id", None) == "STAGES" for t in n.targets))
+    expect("the kinds that name the ticket tools are the ones the tools' own server serves",
+           sorted(k for k, d in kinds.items() if "ticket" in d["tool_servers"]), sorted(stages))
     expect("the plan kind's tools are inside the planner's set",
            [t for t in kinds["plan"]["tools"] if t not in planner], [])
     expect("…and none is in the planner's fence",
@@ -296,7 +306,7 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
             ("a wall left out", {"deny": ["store", "pins", "home"]},
              "code: deny: must list every one of store, pins, keys, home, once"),
             ("a tool server nobody offers", {"tool_servers": ["tracker"]},
-             "code: tool_servers: none is offered yet, so the list is empty"),
+             "code: tool_servers: only the session's own ticket tools (ticket) are offered"),
             ("no guard", {"guards": []},
              "code: guards: must hold pre-tool-use, and only the kit's own guards (pre-tool-use)"),
             ("a field it does not know", {"sandbox": False}, "code: 'sandbox' is not a field"),

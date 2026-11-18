@@ -11,7 +11,8 @@ WHAT IT BUILDS, for one run of one kind (scripts/pipeline_session_kinds.py), and
     settings()     that settings file: the deny rules, the kit's guard run from the engine's own
                    folder, and for a kind with Bash the built-in sandbox with its host list and
                    deny-read list (rows r3, r3b)
-    mcp()          the tool-server file: empty, as no tool server is offered yet
+    mcp()          the tool-server file with no server: the runner writes the session's own
+                   ticket tools' server itself (scripts/pipeline_session_tools.py, KIT-706)
     profile()      for a kind without Bash, our own macOS sandbox around the whole program
                    (row r5a): no write but the program's own home and the run's temp folder, and no
                    read of the store, the pins or a key
@@ -120,8 +121,10 @@ def check(spec):
         if tool in (spec.get("tools") or []) and allow.get("Read") != "workspace":
             bad.append("%s: allow: %s is held by Read's rule, so Read must be allowed by the "
                        "workspace's path" % (name, tool))
-    if spec.get("tool_servers"):
-        bad.append("%s: tool_servers: the %s adapter offers none yet" % (name, NAME))
+    others = [s for s in spec.get("tool_servers") or [] if s != "ticket"]
+    if others:
+        bad.append("%s: tool_servers: the %s adapter has no tool server but the session's own ticket "
+                   "tools, which the runner writes with its session_tools setting" % (name, NAME))
     return bad
 
 
@@ -234,7 +237,8 @@ def settings(spec, run):
 
 
 def mcp(spec, run):
-    """The run's --mcp-config file: no tool server is offered yet."""
+    """The run's --mcp-config file with no server. The session's own ticket tools are the runner's
+    to add (scripts/pipeline_session_tools.py), with its session_tools setting."""
     return {"mcpServers": {}}
 
 
@@ -495,7 +499,7 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                 "Edit(/%s/**)" % P["home"], "Write(/%s/**)" % P["home"]])
     expect("a path with a space is quoted for the hook's shell",
            shlex.split(guard_command(dict(run, workspace="/w s/ENG-1"), "pre-tool-use"))[7], "/w s/ENG-1")
-    expect("no tool server is offered yet", mcp(kinds["code"], run), {"mcpServers": {}})
+    expect("the adapter adds no tool server of its own", mcp(kinds["code"], run), {"mcpServers": {}})
 
     # ---- the environment -------------------------------------------------- #
     for name in sorted(kinds):

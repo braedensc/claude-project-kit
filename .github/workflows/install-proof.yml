@@ -270,8 +270,9 @@ jobs:
           # is the other form of the same short list: one "<name> is waiting on you; its own lines
           # above say what for." line for each part that waits (here the skills and the kit
           # checkout). So this step requires that form, requires it to name every waiting part, and
-          # fails on "Nothing is waiting on you.". The `host` part has no check and no card, so it is
-          # not in the list at all; showing it there is a change to the command, a separate ticket.
+          # fails on "Nothing is waiting on you.". The `host` part has no installer, but the command looks
+          # for one on its own (KIT-756): here there is none, so it reads "waiting on you" and the
+          # closing list opens with "Build this first.", its steps and the guide.
           {
           # The checks are a file, so a later step can run them on broken copies of the output.
           cat > "$PROOF_DIR/assert_look.py" <<'PY'
@@ -371,7 +372,7 @@ jobs:
           for p in parts:
               n = len(row_of.get(p["id"], []))
               named = bare.count(p["name"])
-              if p.get("check") or is_checkout(p):
+              if p.get("check") or is_checkout(p) or p["id"] == "host":
                   # a part with a check has one line; so has the part for this command's own checkout
                   if n != 1 or named:
                       bad("%s: wanted one outcome line and no mention on the closing line, found %d line(s) and %d mention(s)" % (p["id"], n, named))
@@ -390,6 +391,14 @@ jobs:
                       bad("%s could not be measured: %s" % (pid, rest[:140]))
                   elif word == "up to date" and not (is_checkout(by_id[pid]) and rest.endswith("(at origin's tip)")):
                       bad("%s reads 'up to date', but nothing of it is set up on a Mac that has never seen the kit" % pid)
+          host_got = [w for w, _ in row_of.get("host", [])]
+          if host_got != ["waiting on you"]:
+              bad("host: a Mac that has never seen the kit has no host, so it must read 'waiting on you', not %r" % host_got)
+          first = [ln for ln in tail if ln.strip()]
+          if not first or not first[0].startswith("Build this first"):
+              bad("the short list does not open with 'Build this first.' for the host")
+          elif not any("docs/HOST.md" in ln for ln in tail):
+              bad("the host item does not name docs/HOST.md")
           for p in parts:
               f = (p.get("settings") or {}).get("file") or ""
               if p.get("check") and f.endswith((".conf", ".json")) and not os.path.exists(f):
@@ -574,6 +583,7 @@ jobs:
           mutate gone "wanted one outcome line" '/^  off on this Mac/ && !d {d=1; next} {print}'
           mutate uptodate "reads 'up to date'" '/^  off on this Mac/ && !d {d=1; sub(/^  off on this Mac/, "  up to date")} {print}'
           mutate exit0 "exit 0" '{print}' 0
+          mutate nohost "short list does not open with 'Build this first.'" '!/^Build this first/'
           mutate nolist "short list is missing" '!/is waiting on you; its own lines above say what for\.$/'
 
           printf '\n== 0. Where this is running\n\nStopped: this needs a person at a terminal: x\nand one line more\n' > "$PROOF_DIR/broken-refusal.out"

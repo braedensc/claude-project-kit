@@ -283,7 +283,12 @@ Code that is fine on a newer Python can break there, so one job runs on it.
 The Python 3.9 job (`.github/workflows/ci-mac-python.yml`) puts a `python3` link to
 `/usr/bin/python3` first on the PATH, then fails unless `python3 -V` says 3.9 and matches
 `/usr/bin/python3 -V`. It byte-compiles every tracked `.py`, then runs `npm run check:temp-leaks`
-(the hook battery and every other battery, one at a time). A failure turns the PR red.
+(the hook battery and every other battery, one at a time). It also runs the **direct checks**:
+the scripts Kit checks runs bare over the real tree (runner pin, agent trigger, standard-library,
+workflow calls, placeholders, session brief, schemas, delivery config, alert pages, the parts list) and the
+JSON/YAML parse, through `python3 scripts/check_direct_checks.py --run`. That script holds the list.
+Kit checks keeps its own named steps and runs `--verify`, which fails when its direct steps and
+the list differ (`npm run test:direct-checks`). A failure turns the PR red.
 
 It is **not a required context**, so a failure turns the PR red without blocking the merge. The
 owner can add it with the same command as Temp-leak sweeps above, using the context name
@@ -344,14 +349,16 @@ them would hold that PR forever. It holds and uses no secret.
   scripts, the checkout action's log) are not in it.
 - Each check is shown to fail. The job plants a file in the empty home, in the real `~/.claude`
   and in the checkout, and a token of every shape the scan knows; and the checks that read text
-  must refuse four broken copies of the look's output and a refusal with one line too many, for
+  must refuse five broken copies of the look's output and a refusal with one line too many, for
   the right reason. A green run is never a check that compared nothing.
 
 **The "Only you can do these" list.** A clean Mac never prints it: every part with a check is off,
 so no waiting part's own output names a card, and the command prints that list only for a card.
 The job accepts what is printed instead, one "`<name>` is waiting on you" line for each part that
-waits, and requires it to name every one of them; the `host` part has no check or card, so it does
-not appear there at all (a separate ticket).
+waits, and requires it to name every one of them. The `host` part has no installer, but the
+command looks for a host itself (the pipeline's account and its lane marker). A clean Mac has none,
+so the host must read "waiting on you" and the list must open with "Build this first." and name
+`docs/HOST.md`; a fifth broken copy that drops that line must be refused (KIT-756).
 
 First measured 13 Nov 2026: macOS 15.8.2 (image `macos-15-arm64` 20261104.0514.1), `/usr/bin/python3`
 3.9.6, the developer tools of Xcode 16.4, passwordless `sudo`. The job ran in 14 seconds, after
@@ -384,6 +391,19 @@ exceptions are the `ALLOWED` list in the script, each with a reason; an entry ma
 fails too. Its standard-library list is one constant, so Python 3.9 and 3.12 agree; the selftest
 fails when the running Python knows a module the constant lacks (add it). `npm run
 test:stdlib-only` runs the selftest, `npm run lint:stdlib-only` the real check.
+
+## Installers refuse to run as root (KIT-693)
+
+An installer run as root writes files owned by root in the owner's or the role account's folders,
+and later passes cannot read or replace them. Every installer refuses at its entry, before it reads
+its conf, with the one message in `scripts/pipeline_root_guard.py` and exit 3 (the installer that
+already used another exit code for this keeps it). A step that needs root asks for it itself,
+once, with a reason; none starts as root. `npm run test:root-guard` runs each installer as root
+(the uid stubbed) from an empty folder and checks it refuses and leaves the folder empty. A new
+installer calls `refusal()` and is added to the list there.
+
+Good: you run the installer in your own terminal and it asks for your password when a step needs it.
+Not: you run it with `sudo` and find root-owned files in your home later.
 
 ## Every test script has a CI step (KIT-620)
 
