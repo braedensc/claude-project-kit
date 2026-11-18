@@ -3634,6 +3634,15 @@ def _dispatch(data) -> None:
             # merely ends in "sk" (desk-, task-) from reading as a key.
             (r"\bsk-(?:proj|svcacct|admin)-[A-Za-z0-9_-]{20,}", "OpenAI API key (sk-proj-…)"),
             (r"\bsk-[A-Za-z0-9]{32,}", "OpenAI legacy API key (sk-…)"),
+            # The pipeline's own credentials (KIT-683): the tracker's API key, Slack's bot,
+            # user and app-level tokens, and GitHub's fine-grained token, which the
+            # gh[pousr]_ shape above does not match. Each mirrors the secret scan's rule for
+            # it. scripts/secret_shapes.py is the one list: the hook battery checks this
+            # guard against it, and the scanner's selftest checks the real rules.
+            (r"\blin_api_[A-Za-z0-9_]{32,}", "Linear API key (lin_api_…)"),
+            (r"\b(?:xoxb|xoxp|xapp|xoxa|xoxo|xoxr)-(?:\d-)?(?:[A-Za-z0-9]{1,40}-)+"
+             r"[A-Za-z0-9]{1,40}\b", "Slack token (xoxb-, xoxp-, xapp-…)"),
+            (r"\bgithub_pat_[A-Za-z0-9_]{82}", "GitHub fine-grained token (github_pat_…)"),
             # Extension point: add patterns for providers YOUR project uses, and a battery
             # case in test_hooks.py for every pattern you add.
         ]
