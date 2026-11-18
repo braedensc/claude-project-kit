@@ -244,6 +244,39 @@ def run_session(spec, run, prompt, token, timeout):
     return seen
 
 
+def program_problems(claude, env, specs):
+    """(version, problems): the program's own --version, and why it cannot run the kinds' command
+    lines: an option its own --help does not list. Checked before any session, because a program
+    that stops at an unknown option exits 1 with no output, and every row would read NOT MEASURED."""
+    try:
+        ver = subprocess.run([claude, "--version"], env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, universal_newlines=True, timeout=60, cwd="/")
+        hlp = subprocess.run([claude, "--help"], env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, universal_newlines=True, timeout=60, cwd="/")
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, ["the program could not be run (%s)" % type(exc).__name__]
+    lines = (ver.stdout or "").strip().splitlines()
+    version = lines[0][:80] if lines else None
+    if ver.returncode != 0 or hlp.returncode != 0:
+        return version, ["the program's --version or --help failed (exit %s, %s)" % (ver.returncode, hlp.returncode)]
+    missing = [f for f in harness.flags_used(specs) if f not in harness.UNLISTED
+               and not re.search(r"(?<![A-Za-z0-9-])%s(?![A-Za-z0-9-])" % re.escape(f), hlp.stdout or "")]
+    if missing:
+        return version, ["it does not know %s, which the runner's command line uses: it needs claude %s or "
+                         "later" % (", ".join(missing), harness.OLDEST)]
+    return version, []
+
+
+def _failed(seen):
+    """Why a session gave no usable result, with the program's own last words."""
+    if seen["result"] is None:
+        why = "the session gave no result (exit %s%s)" % (seen["exit"], ", timed out" if seen["timed_out"] else "")
+    else:
+        why = "the session ended in an error: %s" % (seen["result"] or "")[:160]
+    tail = " ".join((seen.get("stderr_tail") or "").split())[-240:]
+    return why + (": " + tail if tail else "")
+
+
 # --------------------------------------------------------------------------- #
 # The prompts: plain steps, one tool call each
 # --------------------------------------------------------------------------- #
@@ -340,9 +373,7 @@ def judge_files(w, spec, ws, seen):
     kind, words = spec["kind"], w["words"]
     rows = []
     if seen["result"] is None or seen["is_error"]:
-        why = ("the session gave no result (exit %s%s)" % (seen["exit"], ", timed out" if seen["timed_out"] else "")
-               if seen["result"] is None else "the session ended in an error: %s" % (seen["result"] or "")[:160])
-        return [_row(kind, "files", "wall", "the file walls", NOT, why)]
+        return [_row(kind, "files", "wall", "the file walls", NOT, _failed(seen))]
     if spec["wall"] == "own-sandbox":
         rows.append(_row(kind, "own-sandbox", "work", "it runs inside our own sandbox", WORKS,
                          "a result came back (%s turns)" % seen["turns"]))
@@ -439,8 +470,7 @@ def _result_file(ws, name):
 def judge_bash(w, spec, ws, seen, env_names):
     kind, words = spec["kind"], w["words"]
     if seen["result"] is None or seen["is_error"]:
-        return [_row(kind, "bash", "wall", "the Bash walls", NOT, "the session gave no result" if seen["result"] is None
-                     else "the session ended in an error: %s" % (seen["result"] or "")[:160])]
+        return [_row(kind, "bash", "wall", "the Bash walls", NOT, _failed(seen))]
     rows = []
     inside = (_read(os.path.join(ws, "probe-bash.txt")) or "").strip() == "probe"
     rows.append(_row(kind, "bash-write-inside", "work", "Bash writes the workspace", WORKS if inside else BLOCKED,
@@ -508,7 +538,7 @@ def dotenv_fact(w, spec, ws, seen):
     other = os.path.join(w["root"], "dotenv-config")
     if seen["result"] is None and not os.path.isdir(other):
         return _row("program", "reads-dotenv", "fact", "the program reads a .env in its working folder",
-                    "NOT MEASURED", "the session gave no result")
+                    "NOT MEASURED", _failed(seen))
     used = os.path.isdir(other) and bool(os.listdir(other))
     return _row("program", "reads-dotenv", "fact", "the program reads a .env in its working folder",
                 "YES" if used else "NO", "its state went to the folder the .env named" if used
@@ -533,6 +563,14 @@ def probe(claude, out_dir, wanted, model, work, token, timeout=RUN_TIMEOUT, say=
     root = os.path.realpath(tempfile.mkdtemp(prefix="runner-probe-", dir=work))
     rows, meta = [], {}
     try:
+        home = os.path.join(root, "program-check-home")
+        os.makedirs(home, mode=0o700)
+        env = harness.environment(kinds["code"], {"claude_bin": claude, "home": home, "tmp": home}, token)
+        version, bad = program_problems(claude, env, [kinds[k] for k in wanted])
+        meta["version"] = version
+        if bad:
+            say("COULD NOT MEASURE: %s (%s): %s" % (claude, version or "no version", bad[0]))
+            return EXIT_COULD_NOT
         w = build_world(root)
         for kind in wanted:
             spec = kinds[kind]
@@ -630,10 +668,20 @@ def main(argv=None):
 STANDIN = r'''#!%(python)s -I
 """A stand-in for the claude program, for the probe's own test. It answers a prompt of numbered
 steps with the stream the program writes, and acts by its mode file: tight (every wall holds),
-leaky (every wall leaks), refuses (it makes no call) or error (it ends in an error)."""
+leaky (every wall leaks), refuses (it makes no call), error (it ends in an error) or old (its
+help lacks an option the command line uses, as a program older than it needs)."""
 import json, os, re, subprocess, sys
 argv = sys.argv[1:]
 mode = open(%(mode)r).read().strip()
+if argv == ["--version"]:
+    print("0.0.0 (stand-in)")
+    sys.exit(0)
+if argv == ["--help"]:
+    print("\n".join("  %%s <value>" %% f for f in %(flags)r if not (mode == "old" and f == "--permission-prompts")))
+    sys.exit(0)
+if mode == "dies":                  # stops before any output, as a program does at a bad option
+    sys.stderr.write("error: unknown option '--a-later-option'\n")
+    sys.exit(1)
 prompt = sys.stdin.read()
 ws = os.path.realpath(os.getcwd())
 tools = argv[argv.index("--tools") + 1].split(",")
@@ -738,7 +786,8 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
     os.makedirs(bindir)
     claude, mode_file = os.path.join(bindir, "claude"), os.path.join(tmp, "mode")
     with open(claude, "w") as fh:
-        fh.write(STANDIN % {"python": sys.executable, "mode": mode_file})
+        fh.write(STANDIN % {"python": sys.executable, "mode": mode_file,
+                            "flags": harness.flags_used(kinds_data.load()[0].values())})
     os.chmod(claude, 0o755)
     passthrough = os.path.join(bindir, "sandbox-exec")
     with open(passthrough, "w") as fh:               # drops "-f <profile>": these runs test the judges, and
@@ -799,6 +848,21 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
         code, rows, said = run_mode("error", ["acceptance"])
         expect("a session that ends in an error measures nothing",
                (code, rows), (EXIT_GAPS, {"acceptance:files": NOT, "acceptance:bash": NOT}))
+        code, rows, said = run_mode("dies", ["review"])
+        with open(os.path.join(tmp, "out-dies", "results.json")) as fh:
+            notes = [r["note"] for r in json.load(fh)["rows"]]
+        expect("a session that dies before any output is NOT MEASURED, and the results keep its own words",
+               (code, rows, notes), (EXIT_GAPS, {"review:files": NOT},
+                                     ["the session gave no result (exit 1): error: unknown option '--a-later-option'"]))
+        with open(mode_file, "w") as fh:
+            fh.write("old")
+        said = []
+        expect("a program too old for the command line is said before any session, with what it lacks",
+               (probe(claude, os.path.join(tmp, "out-old"), ["code"], "haiku", tmp, "t", say=said.append),
+                said[-1:]),
+               (EXIT_COULD_NOT, ["COULD NOT MEASURE: %s (0.0.0 (stand-in)): it does not know --permission-prompts, "
+                                 "which the runner's command line uses: it needs claude %s or later"
+                                 % (claude, harness.OLDEST)]))
         said = []
         expect("a kind that does not exist could not be measured",
                probe(claude, os.path.join(tmp, "out-x"), ["deploy"], "haiku", tmp, "t", say=said.append),

@@ -288,6 +288,30 @@ def command(spec, run, output="json"):
     return argv
 
 
+# The oldest program that knows every option command() uses: `--permission-prompts` arrived in
+# 2.1.259 (the program's own changelog). An older one stops at its first unknown option, with exit
+# 1 and no output, before any session starts.
+OLDEST = "2.1.259"
+# Options the program takes but its --help does not list (2.1.287's help, read 18 Nov 2026). KIT-630's
+# live runs passed both to 2.1.247 and to 2.1.287, so a check of the help must not count them missing.
+UNLISTED = ("--append-system-prompt-file", "--max-turns")
+
+
+def flags_used(specs):
+    """Every option the command lines for these kinds can hold, started or resumed, in either
+    output: what a program's own --help must list before a session of it can start."""
+    p = "/x"
+    run = {"claude_bin": p, "model": "m", "workspace": p, "run_dir": p, "tmp": p, "store": p, "pins": p,
+           "pin": "", "home": p, "keys": [p], "engine": p, "hosts": [], "session_id": "s",
+           "budget": {"maxTurns": 1, "maxUsd": 1.0}, "extra_allowed": []}
+    found = set()
+    for spec in specs:
+        for resume in (False, True):
+            for output in OUTPUTS:
+                found.update(a for a in command(spec, dict(run, resume=resume), output) if a.startswith("--"))
+    return sorted(found)
+
+
 def search_path(claude_bin):
     """The program's own folder first (a node-run program needs its node there), then the fixed
     path, each folder once."""
@@ -438,6 +462,11 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
     expect("the probe's stream output changes the output flags and nothing else",
            (streamed[7:10], streamed[:7] + streamed[10:] == want_argv["review"][:7] + want_argv["review"][9:]),
            (["--output-format", "stream-json", "--verbose"], True))
+    expect("the options a program's help must list: every one the kinds' lines can hold",
+           flags_used(kinds.values()),
+           ["--allowedTools", "--append-system-prompt-file", "--max-budget-usd", "--max-turns", "--mcp-config",
+            "--model", "--output-format", "--permission-mode", "--permission-prompts", "--resume",
+            "--session-id", "--setting-sources", "--settings", "--strict-mcp-config", "--tools", "--verbose"])
     extra = command(kinds["code"], dict(run, extra_allowed=["mcp__session__read_my_ticket"]))
     expect("added exact tool names go last in the allow list, and nothing else moves",
            extra, want_argv["code"][:-len(tail)] + ["mcp__session__read_my_ticket"] + tail)

@@ -218,6 +218,12 @@ python3 scripts/pipeline_runner_probe.py run --claude <the role's claude> --out 
 | Work: the instructions arrive; reads, searches and writes inside work; Bash writes its workspace and temp folder; `git status` and a commit; a listed host is reached | WORKS, or the lane cannot move |
 | Facts: whether the code host's command-line tool gets through TLS in the sandbox, and whether the program reads a `.env` in its working folder | recorded |
 
+Before any session, the probe asks the program for its version and its help. If the help lacks an
+option the command line uses, the probe stops and names it: a program that meets an unknown option
+exits 1 before it writes anything. On 18 Nov 2026 the role account's own copy, 2.1.247, failed every
+session this way, because `--permission-prompts` arrived in 2.1.259. Every session that fails
+leaves the program's own last words in the results.
+
 A row the session never tried is NOT MEASURED, never PASS. A refusal counts as the guard's only
 when its own words are seen. Exit 0 means every wall held; 1 a wall failed; 2 some wall was not
 measured; 3 it could not run.
@@ -232,7 +238,7 @@ One JSON file. The example is `runner.example.json`. `~/` means the account's ow
 | `store_dir` | The runner's store. Outside every git working tree, mode 0700. | required |
 | `work_dir` | Where workspaces go. | required |
 | `session_home` | The sessions' own home folder. Holds nothing of the account's setup. | required |
-| `claude_bin` | The program's full path. | required |
+| `claude_bin` | The program's full path: 2.1.259 or later, because the command line uses `--permission-prompts`. A copy the sessions' account cannot change, never that account's own. | required |
 | `model` | The model for every session. | `sonnet` |
 | `token_env` | The NAME of the variable that holds the sign-in token. | `CLAUDE_WRITER_OAUTH_TOKEN` |
 | `linear_key_file` | The tracker key, in a file of this account's, mode 0600. | required |
