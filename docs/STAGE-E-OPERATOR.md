@@ -268,7 +268,7 @@ whenever `status` looks better than the machine feels.
 (`CK-1` — applying a protected label and merging are a human's signal by design, so the
 installer checks and prints, and has no code path to either); read the dry-run count before
 anything is switched on (`CK-5` — the first real pass opens a ticket per eligible PR, and
-only you know whether that number is the one you meant); read your conflict waker's dry-run
+only you know whether that number is the one you meant; change REVIEW_REPOS, MANAGED_TEAM_KEYS or RUNNER_LANE_REPOS after signing and it asks again); read your conflict waker's dry-run
 count (`CK-8` — Step 6; it does not appear with `CONFLICT_WAKER_CONF=off`); name the ticket
 the heartbeat monitor comments on (`CK-9` — it does not appear once `HEARTBEAT_MONITOR_TICKET`
 names one or says `off`); read the catch-up poller's first count before it is installed
