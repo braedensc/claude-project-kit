@@ -22,13 +22,19 @@ ONE PASS, in order. Each step says what it did, or which nothing.
        - its facts (pipeline_validator_facts.for_piece), the hard limits, and its evidence: the
          queue's own verdict that its plan is approved and only its change since waits for him;
        - a hold no later pass can settle (the safety-system floor, a human-only class the owner has
-         not allowed, an idea he did not file) is a `held` row, once: an unchanged hold is not
-         written again;
+         not allowed, an idea he did not file) is a `held` row, once: the same hold on a piece that
+         has not changed since its row is not written again;
+       - a piece the agent already judged, unchanged since, waits for the owner: no second run;
        - any other wait writes nothing, and is said;
        - both passing: the ticket brief (the piece as written, against its plan's criteria:
          pipeline_validator_brief.build_ticket_brief), ONE agent run, the route's decision, and its
          row. A send-back has no dev session yet, so it is an escalation. At most one agent run per
-         pass.
+         pass. The piece is read again after the agent answers: one whose text or plan's criteria
+         changed meanwhile gets no row, and a later pass judges it as it stands.
+
+ITS LAST CHANGE.  The queue's own pass read each piece's creation and whole history; the pool's own
+reader (read_history) gives the newest time of them. A row newer than that is about the piece as it
+stands. The pool admits on an approval by the same rule.
 
 ITS QUEUE FACT.  A held piece is not in the queue's order until it is admitted, so its queue fact is
 the order's runaway stops for this pass, and no load of its own: the order judges its load when it
@@ -60,6 +66,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 try:
+    import pipeline_queue_pool as pool
     import pipeline_queue_start as queue_start
     import pipeline_status_local as status_job
     import pipeline_validator_brief as brief
@@ -142,6 +149,23 @@ class Host(object):
         return vrun.run_agent(self.cfg["agent"], built, environ=self.environ, runner=self.runner)
 
 
+def last_change(inputs, verdict):
+    """The piece's last change, in seconds, as the queue's own pass read it: its creation, and every
+    entry of its history, by the pool's own reader. None when it cannot be told."""
+    if not isinstance(inputs, dict) or not isinstance(verdict, dict):
+        return None
+    ident = verdict.get("id")
+    hist = pool.read_history((inputs.get("histories") or {}).get(ident))
+    created = None
+    for t in list(inputs.get("tickets") or []) + [k for e in inputs.get("epics") or []
+                                                  for k in pool.children_of(e)]:
+        if isinstance(t, dict) and t.get("id") == ident:
+            created = pool.epoch(t.get("createdAt"))
+    if hist is None or created is None:
+        return None
+    return max([created] + [when for when, _e in hist])
+
+
 def _latest(rows, ticket):
     found = None
     for row in rows:
@@ -188,6 +212,7 @@ def run_pass(cfg, host, now=None, dry=False, say=print):
         say("Nothing to judge: the queue's pass is %s (%s)." % (res.get("state"), res.get("why")))
         return EXIT_OK if res.get("state") in ("closed", "no-room") else EXIT_PARTIAL
     decision = res.get("decision") or {}
+    inputs = res.get("inputs") or {}
     waiting = sorted((v for v in res.get("verdicts") or () if isinstance(v, dict)
                       and v.get("source") == "plan" and not v.get("admitted")
                       and v.get("reason") in WAITING and isinstance(v.get("ticket"), str)),
@@ -205,11 +230,14 @@ def run_pass(cfg, host, now=None, dry=False, say=print):
         l1 = limits.limits(doc["item"], settings, doc["limits"])
         l2 = {"verdict": "yes", "reasons": []}       # the queue's own verdict: it waits only for you
         decision_ = route.decide("piece", l1, l2, None, None)
-        latest = _latest(rows, ticket)
+        latest, last = _latest(rows, ticket), last_change(inputs, v)
+        # A row about the piece as it stands: newer than its last change.
+        fresh = (latest is not None and last is not None
+                 and (pool.epoch(latest["at"]) or 0) > last)
         if decision_["record"]:
-            if latest is not None and (latest["kind"], latest["reasons"]) == (
-                    decision_["kind"], decision_["reasons"]):
-                say("  %s: still held for you (already recorded)." % ticket)
+            if fresh and (latest["kind"], latest["reasons"]) == (decision_["kind"],
+                                                                 decision_["reasons"]):
+                say("  %s: still held for you (already recorded, unchanged since)." % ticket)
                 continue
             say("  %s: held for you: %s." % (ticket, "; ".join(
                 route.reason_words(decision_["reasons"]))))
@@ -217,6 +245,10 @@ def run_pass(cfg, host, now=None, dry=False, say=print):
             continue
         if decision_["wait"] != ["agent-not-run"]:
             say("  %s: waits: %s." % (ticket, "; ".join(decision_["wait"])))
+            continue
+        if fresh and latest["kind"] != "approved" and latest["layers"]["agent"] != "not-run":
+            say("  %s: still waits for you: the validator's agent judged it (%s), and it has not "
+                "changed since." % (ticket, latest["kind"]))
             continue
         try:
             built = brief.build_ticket_brief(doc["brief"].get("criteria"), doc["brief"].get("ticket"))
@@ -226,7 +258,14 @@ def run_pass(cfg, host, now=None, dry=False, say=print):
         if dry:
             say("  [dry-run] %s passes the hard limits: would run the agent on it." % ticket)
             return EXIT_OK
-        answer = route.answer_of(host.run_agent(built), built)
+        ran = host.run_agent(built)
+        again = host.facts(ticket, now, named)
+        if (again.get("brief") != doc.get("brief")
+                or (again.get("limits") or {}).get("paths") != doc["limits"].get("paths")):
+            say("  %s: it changed while the agent judged it, so nothing is recorded: a later pass "
+                "judges it as it stands. The pass ends: one agent run per pass." % ticket)
+            return EXIT_OK
+        answer = route.answer_of(ran, built)
         decision_ = route.decide("piece", l1, l2, answer, None)
         if not decision_["record"]:
             say("  %s: waits: %s. The pass ends: one agent run per pass."
@@ -297,15 +336,25 @@ class _FakeHost(object):
         self.agent_cfg, self.environ = agent_cfg, environ
         self.stub, self.log, self.state = vrun.Stub(), [], "decided"
         self.waiting = {}            # ticket -> (reason, paths)
+        self.changed, self.text, self.during = {}, {}, None    # ticket -> last change; its text
+
+    def _hist(self, ticket):
+        at = self.changed.get(ticket, pool.epoch("2026-11-01T00:00:00Z"))
+        entry = dict((k, None) for k in pool.HISTORY_KEYS)
+        entry.update(createdAt=pool.iso(at), actorId="someone")
+        return [entry]
 
     def queue(self, now, say):
-        verdicts = [{"ticket": t, "source": "plan", "admitted": False, "reason": r, "reply": "start " + t}
-                    for t, (r, _p) in self.waiting.items()]
+        verdicts = [{"ticket": t, "id": "id-" + t, "source": "plan", "admitted": False, "reason": r,
+                     "reply": "start " + t} for t, (r, _p) in self.waiting.items()]
         verdicts.append({"ticket": "TOD-99", "source": "todo", "admitted": False, "reason": "changed"})
         # A piece of a paused plan has no start to give: never judged, though it sorts first.
         verdicts.append({"ticket": "TOD-5", "source": "plan", "admitted": False,
                          "reason": "plan-paused", "reply": None})
-        return {"state": self.state, "why": "test", "verdicts": verdicts,
+        inputs = {"tickets": [{"id": "id-" + t, "createdAt": "2026-10-30T00:00:00Z"}
+                              for t in self.waiting], "epics": [],
+                  "histories": dict(("id-" + t, self._hist(t)) for t in self.waiting)}
+        return {"state": self.state, "why": "test", "verdicts": verdicts, "inputs": inputs,
                 "decision": {"start": [], "held": [], "stops": [], "needs_ok": []}}
 
     def facts(self, ticket, now, queue_result):
@@ -317,12 +366,16 @@ class _FakeHost(object):
                            "hold": "none"},
                 "evidence": {"last_piece": None, "acceptance": None},
                 "brief": {"criteria": "## Acceptance criteria\n\n- [ ] The pieces work together.\n",
-                          "diff": None, "ticket": "## Acceptance criteria\n\n- [ ] It works.\n"},
+                          "diff": None,
+                          "ticket": self.text.get(ticket, "## Acceptance criteria\n\n- [ ] It works.\n")},
                 "unread": {}}
 
     def run_agent(self, built):
         self.log.append("agent")
-        return vrun.run_agent(self.agent_cfg, built, environ=self.environ, runner=self.stub)
+        got = vrun.run_agent(self.agent_cfg, built, environ=self.environ, runner=self.stub)
+        if self.during:
+            self.during()           # someone edits the piece while the agent runs
+        return got
 
 
 def selftest():
@@ -422,8 +475,32 @@ def selftest():
               ([("TOD-20", "held", ["risk-path"])], [], True))
         code, said = go(host)
         check("...and an unchanged hold is said, not written again",
-              (kinds(), "TOD-20: still held for you (already recorded)" in said),
+              (kinds(), "TOD-20: still held for you (already recorded, unchanged since)" in said),
               ([("TOD-20", "held", ["risk-path"])], True))
+
+        host.changed["TOD-20"] = time.time() + 3600         # the piece changes after its row
+        code, said = go(host)
+        check("...but the same hold on a piece changed since its row is written again",
+              kinds(), [("TOD-20", "held", ["risk-path"]), ("TOD-20", "held", ["risk-path"])])
+
+        # 3b. A piece the agent escalated, unchanged since, waits for you: no second run, and the
+        #     next piece gets the pass's one run (Stage E on #618).
+        host = fresh(**{"TOD-12": ("changed", SAFE), "TOD-13": ("changed", SAFE)})
+        host.stub.text = "ESCALATE\nThe piece reaches past its plan."
+        go(host)
+        host.stub.text = "PASS\nIt asks for what its plan asks."
+        code, said = go(host)
+        check("an escalated piece, unchanged since, is not judged again, and the next one is",
+              (kinds(), host.log, "TOD-12: still waits for you" in said),
+              ([("TOD-12", "escalated", []), ("TOD-13", "approved", [])], ["agent", "agent"], True))
+
+        # 3c. An edit while the agent runs: nothing recorded, so no approval of text it never saw.
+        host = fresh(**{"TOD-14": ("changed", SAFE)})
+        host.during = lambda: host.text.update({"TOD-14": "## Acceptance criteria\n\n- [ ] More.\n"})
+        code, said = go(host)
+        check("a piece edited while the agent judged it gets no row, and is said",
+              (kinds(), host.log, "TOD-14: it changed while the agent judged it" in said),
+              ([], ["agent"], True))
 
         # 4. The agent's no: a send-back has no dev session, so it is an escalation; a hold is a hold.
         host = fresh(**{"TOD-30": ("changed", SAFE)})

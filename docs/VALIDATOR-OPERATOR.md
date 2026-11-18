@@ -607,8 +607,11 @@ install is a later piece.
 | A hold no pass can settle: the safety system, a human-only class, an idea you did not file | A `held` row, once. It waits for you. An unchanged hold is not written again. |
 | A fact not read, or the window closed | Nothing written. It waits, and says why. |
 | The limits pass | One agent run and its row. A send-back becomes an escalation: a piece has no dev session yet. |
+| A piece the agent already judged, unchanged since | It waits for you. No second run, so the pieces after it get their turn. |
+| A piece edited while the agent judged it | Nothing written. A later pass judges it as it stands. |
 
-At most one agent run per pass. It never starts a piece itself. The queue's starter does, from the
+At most one agent run per pass. "Unchanged" is judged by the piece's own history, as the queue
+read it: a row newer than the piece's last change is about the piece as it stands. It never starts a piece itself. The queue's starter does, from the
 ledger (`docs/QUEUE-OPERATOR.md`, "When the validator approves a piece's start").
 
 **The agent's second brief.** A piece has no diff yet, so the agent judges the ticket as written. Its
