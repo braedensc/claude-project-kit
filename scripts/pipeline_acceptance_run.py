@@ -102,6 +102,8 @@ if HERE not in sys.path:
 import jsonschema_mini as jsm  # noqa: E402
 import pipeline_acceptance_poller as poller  # noqa: E402
 import pipeline_routing_tags as routing  # noqa: E402
+# KIT-708: the runner's store, where a check on the runner's lane is asked for and read back.
+import pipeline_runner_store as runner_store  # noqa: E402
 
 EXIT_OK, EXIT_ERROR, EXIT_USAGE, EXIT_DECLINED, EXIT_TIMEOUT = 0, 1, 2, 3, 4
 LINEAR_API = "https://api.linear.app/graphql"
@@ -172,7 +174,11 @@ CONFIG_KEYS = {
     "request_author_ids": "tracker user ids whose check request on an epic counts (contract section 26). Default: the "
                           "user of this pass's own key, which the bridge shares on a one-key install",
     "run_timeout_seconds": "wall clock for one pass (default 300)",
+    "runner_lane": "{\"store_dir\": the runner's store, \"repos\": {\"owner/repo\": its project key in the runner's "
+                   "settings}} (KIT-708): where our own runner is. It switches nothing: a repository's checks go to the "
+                   "runner only while the runner says its acceptance lane is on for that project. Absent: none does",
 }
+RUNNER_RESUMES_MAX = 20              # a check's run, and the runner's own resumes of it, read back at most this far
 
 
 class RunError(Exception):
@@ -315,6 +321,24 @@ def load_config(path):
                 errors.append("config 'required_checks' %r must be a non-empty list of check run names" % (repo,))
             else:
                 cfg["required_checks"][repo.lower()] = [n.strip() for n in names]
+    # KIT-708: where our own runner is, and which of its projects each repository is: the fix driver's own shape.
+    lane = raw.get("runner_lane", {})
+    cfg["runner_lane"] = {}
+    repos = lane.get("repos") if isinstance(lane, dict) else None
+    if not isinstance(lane, dict) or set(lane) - {"store_dir", "repos"} or (lane and not isinstance(repos, dict)):
+        errors.append("config 'runner_lane' must be {\"store_dir\": the runner's store, \"repos\": {\"owner/repo\": "
+                      "its project key}}")
+    elif repos:
+        store_dir = lane.get("store_dir")
+        if not all(REPO_RE.match(str(k)) and isinstance(v, str) and runner_store.PROJECT_RE.match(v)
+                   for k, v in repos.items()):
+            errors.append("config 'runner_lane' must map each owner/repo to its project key in the runner's settings")
+        elif not (isinstance(store_dir, str) and "\0" not in store_dir
+                  and (os.path.isabs(store_dir) or store_dir.startswith("~/"))):
+            errors.append("config 'runner_lane' store_dir must be the runner's store: an absolute path, or one under ~/")
+        else:
+            cfg["runner_lane"] = {"store_dir": os.path.realpath(os.path.expanduser(store_dir)),
+                                  "repos": dict((k.lower(), v) for k, v in repos.items())}
     if errors:
         raise RunError("config problems:\n  - " + "\n  - ".join(errors), EXIT_USAGE)
     return cfg
@@ -586,11 +610,13 @@ def latest_activity(session, after=None):
     return None, None, None
 
 
-def second_look_prompt(plan, head, problems):
+def second_look_prompt(plan, head, problems, thread=True):
     """The re-prompt for the second look (contract section 27): fixed words, then for each problem its id, severity,
-    where it was seen, the screenshot's name and what the session said, all neutralized, and the block to copy."""
-    lines = ["**The acceptance check asks for a second look**, before anything is filed or holds the plan. Nobody is "
-             "watching this thread live: answer here, never to a person.",
+    where it was seen, the screenshot's name and what the session said, all neutralized, and the block to copy. On the
+    runner's lane (KIT-708, `thread` false) it is a resume's text, with no thread to answer in."""
+    lines = ["**The acceptance check asks for a second look**, before anything is filed or holds the plan. %s"
+             % ("Nobody is watching this thread live: answer here, never to a person." if thread else
+                "Nobody is watching this session live: answer in your final message."),
              "",
              "Try to show each problem below is not real. Look again at its screenshot and the page. Then answer each "
              "one with its block below, copied into a ```json fence, with three fields filled in:",
@@ -861,7 +887,7 @@ def gather_facts(cfg, linear, github, problems, out, authors=()):
         if acceptance_of[repo] is None:
             continue
         plan = {"plan": ticket, "repo": repo, "acceptance": acceptance_of[repo], "pieces": pieces}
-        info[ticket] = {"epic_id": epic_id, "repo": repo, "epic": epic,
+        info[ticket] = {"epic_id": epic_id, "repo": repo, "epic": epic, "pieces": pieces,
                         "requested_at": newest_request(epic, ticket, authors), "merged_prs": merged_prs}
         if plan["acceptance"] and len(open_kids) == 1:
             kid, prs = open_kids[0]
@@ -979,13 +1005,15 @@ def look_config_path(cfg, ticket):
     return os.path.join(cfg["look_config_dir"], ticket + ".json")
 
 
-def write_look_config(cfg, base, ticket, plan, workspace_dir):
+def write_look_config(cfg, base, ticket, plan, workspace_dir, worktree=None, name=None):
     """The check's own look config, written atomically into look_config_dir and read back by the look tool's own loader.
-    Its worktree is the dispatcher's folder for the ticket, its record folder its own, under look_record_dir."""
+    Its worktree is the dispatcher's folder for the ticket, its record folder its own, under look_record_dir. On the
+    runner's lane (KIT-708) `ticket` is the check's start request, `worktree` the runner's workspace for the piece, and the
+    file is named for the piece (`name`): one workspace, one config, which a later check of the piece replaces."""
     import pipeline_look
-    doc = dict(base, worktree=os.path.join(workspace_dir, ticket), plan=plan,
+    doc = dict(base, worktree=worktree or os.path.join(workspace_dir, ticket), plan=plan,
                record_dir=os.path.join(cfg["look_record_dir"], ticket))
-    path = look_config_path(cfg, ticket)
+    path = look_config_path(cfg, name or ticket)
     _atomic_write_json(path, doc, mode=0o644)
     try:
         pipeline_look.load_config(path)
@@ -1000,6 +1028,84 @@ def _remove(path):
         os.unlink(path)
     except FileNotFoundError:
         pass
+
+
+def check_piece(info, source):
+    """KIT-708: the ticket a check on the runner's lane is asked for, whose approval the runner checks: the plan's last
+    piece. Before the merge, the piece whose pull request is checked; after it, the plan's last done piece."""
+    if source.get("piece"):
+        return source["piece"]
+    done = [p["id"] for p in info.get("pieces") or [] if p.get("state") == "done"]
+    return done[-1] if done else None
+
+
+def runner_facts(repo, plan, head, source, blocks, left_out):
+    """KIT-708: a check's facts, as its start request's text: checked fields and validated blocks, and no step. The runner
+    hands them to the session fenced as data; the steps are the acceptance kind's own rules. Blocks that do not fit one
+    request are left out, last first, and counted with the others left out."""
+    if "pr" in source:
+        where = ["- Pull request: #%d, the plan's last piece, %s" % (source["pr"], source["piece"]),
+                 "- Fetch it with: git fetch origin pull/%d/head" % source["pr"]]
+    else:
+        where = ["- Branch: %s, after the plan's pieces merged" % source["branch"],
+                 "- Fetch it with: git fetch origin %s" % source["branch"]]
+
+    def text(kept):
+        out = left_out + len(blocks) - len(kept)
+        lines = (["The acceptance check's facts, from the acceptance job.", "", "- Plan: %s" % plan,
+                  "- Repository: %s" % repo] + where + ["- Head to build: %s" % head, "", "## The plan's check blocks", ""])
+        if not blocks:
+            lines.append("None: the plan names no browser check.")
+        for block in kept:
+            lines += ["```json", block, "```", ""]
+        if out:
+            lines.append("%d check block(s) in the plan's tickets were left out: out of shape, carrying text a "
+                         "dispatcher would read as a routing tag, or past what one request holds." % out)
+        return "\n".join(lines).rstrip() + "\n"
+    kept = list(blocks)
+    while kept and len(text(kept)) > runner_store.TEXT_MAX:
+        kept.pop()
+    body = text(kept)
+    if len(body) > runner_store.TEXT_MAX:
+        raise RunError("the check's facts do not fit one request")
+    return body
+
+
+def runner_result(store_dir, request_id):
+    """KIT-708: where one of a check's requests stands in the runner, from the runner's own records alone, never from
+    anything a session wrote: {"state", "run", "output", "why"}. `state` is waiting (not taken yet), gone (withdrawn
+    before it was taken), refused, running (its run, or the runner's own resume of it, still goes), ended (`output` is
+    the final message the runner kept, or None when the run left none) or unreadable."""
+    got = {"state": "unreadable", "run": None, "output": None, "why": ""}
+    try:
+        ans = runner_store.answer(store_dir, request_id)
+        if ans is None:
+            waiting = os.path.lexists(os.path.join(store_dir, "requests", request_id + ".json"))
+            got.update(state="waiting" if waiting else "gone",
+                       why="the runner has not taken it yet" if waiting else "it was withdrawn before the runner took it")
+            return got
+        if not ans.get("ok"):
+            got.update(state="refused", run=ans.get("run"), why=str(ans.get("why") or "no reason given"))
+            return got
+        run_id = ans.get("run")
+        for _ in range(RUNNER_RESUMES_MAX):
+            rec = runner_store.read_run(store_dir, run_id) if isinstance(run_id, str) \
+                and runner_store.RUN_RE.match(run_id) else None
+            if rec is None:
+                got["why"] = "the record of its run could not be read"
+                return got
+            got["run"] = run_id
+            if rec["state"] in runner_store.LIVE or rec["auto_resume"] == "pending":
+                got.update(state="running", why="its session is still going")
+                return got
+            if not rec["resumed_by"]:
+                got.update(state="ended", output=runner_store.run_output(store_dir, run_id), why=rec["why"] or "")
+                return got
+            run_id = rec["resumed_by"]
+        got["why"] = "its run was resumed more than %d times" % RUNNER_RESUMES_MAX
+    except (runner_store.StoreError, ValueError, OSError) as exc:
+        got["why"] = str(exc)
+    return got
 
 
 def team_state(team, kind):
@@ -1044,6 +1150,45 @@ class Pass:
         self.state = load_run_state(cfg)
         self._team = None
         self._base = None
+        self._lanes = None
+
+    # ---- KIT-708: which road a check takes
+    def road(self, repo):
+        """("ticket", None), ("runner", lane) or ("unknown", why) for a check of `repo`. The runner's road only for a
+        repository `runner_lane` names, whose project the runner says takes acceptance checks (its lanes, read once a
+        pass from its store): so the runner's own `lanes.acceptance` switches a project, and switches it back. Lanes it
+        has not said are off; lanes that cannot be read are unknown, never off."""
+        lane = self.cfg.get("runner_lane") or {}
+        project = (lane.get("repos") or {}).get(str(repo).lower())
+        if not project:
+            return "ticket", None
+        if self._lanes is None:
+            try:
+                self._lanes = ("read", runner_store.read_lanes(lane["store_dir"]))
+            except runner_store.StoreError as exc:
+                self._lanes = ("unread", str(exc))
+        how, lanes = self._lanes
+        if how == "unread":
+            return "unknown", "the runner's lanes could not be read (%s)" % lanes
+        if not runner_store.lane_on(lanes, project, "acceptance"):
+            return "ticket", None
+        if lanes["look_config_dir"] != self.cfg["look_config_dir"]:
+            return "unknown", ("the runner starts the look tool on %s, not on this job's look_config_dir, so the "
+                               "session's look tool would find no config" % lanes["look_config_dir"])
+        return "runner", {"store_dir": lane["store_dir"], "project": project, "work_dir": lanes["work_dir"]}
+
+    def must_wait(self, repo, piece):
+        """Why a check of `repo` for `piece` cannot start this pass, or "": its road cannot be told, or the runner still
+        holds an earlier check of the same piece. One acceptance run per ticket runs at a time, and a fresh one needs the
+        earlier one ended, so a new head waits for it rather than being refused."""
+        road, why = self.road(repo)
+        if road == "unknown":
+            return why
+        if road == "runner" and piece and any(
+                r.get("via") == "runner" and r.get("piece") == piece and r.get("delegated") and r.get("closed") is None
+                for r in self.state["checks"].values()):
+            return "an earlier check of %s on the runner is not over yet" % piece
+        return ""
 
     def team(self):
         if self._team is None:
@@ -1064,6 +1209,11 @@ class Pass:
         undelegated, records it, writes the look config, then delegates. Raises to say the start failed; what it made
         is undone where it can be. `source` is ticket_body's."""
         repo, number = info["repo"], source.get("pr")
+        road, lane = self.road(repo)
+        if road == "unknown":
+            raise RunError(lane)
+        if road == "runner":
+            return self.start_on_runner(plan, head, info, source, lane)
         entry = self.cfg["entries"].get(repo.lower())
         if entry is None:
             raise RunError("%s has acceptance on, but this pass has no acceptance entry for it" % repo)
@@ -1102,6 +1252,43 @@ class Pass:
         self.say("%-10s started: %s, delegated, for %s %s at %s" % (
             plan, ticket, repo, "#%d" % number if number else source.get("branch"), head[:12]))
 
+    def start_on_runner(self, plan, head, info, source, lane):
+        """KIT-708: the same start on the runner's lane, with no ticket filed and no tracker write. The check is named by
+        its start request, chosen first: the look config names the record folder by it, and is on disk before the request,
+        so the session's look tool finds it when the session starts. Then one `acceptance` start request for the plan's
+        last piece, whose text is the check's facts. Recorded before anything else, like a ticket."""
+        piece = check_piece(info, source)
+        if not piece:
+            raise RunError("the plan has no piece to ask the runner's acceptance check for")
+        blocks, left_out = check_blocks(info["epic"])
+        text = runner_facts(info["repo"], plan, head, source, blocks, left_out)
+        base, rid = self.base(), runner_store.new_request_id()
+        rec = {"plan": plan, "head": head, "repo": info["repo"], "pr": source.get("pr"), "branch": source.get("branch"),
+               "epic_id": info["epic_id"], "via": "runner", "ticket": rid, "request": rid, "piece": piece,
+               "project": lane["project"], "store_dir": lane["store_dir"], "created_at": _iso(self.now),
+               "delegated": False, "requests": [], "closed": None}
+        self.state["checks"]["%s@%s" % (plan, head)] = rec
+        save_run_state(self.cfg, self.state)            # on disk before the session can start
+        try:
+            rec["look_config"] = write_look_config(self.cfg, base, rid, plan, None, name=piece,
+                                                   worktree=os.path.join(lane["work_dir"], "acceptance", piece))
+            runner_store.ask(lane["store_dir"], "acceptance", "start", "acceptance", lane["project"], piece,
+                             text=text, request_id=rid)
+        except Exception as exc:                         # noqa: BLE001 - the start failed: undone, recorded, said
+            _remove(look_config_path(self.cfg, piece))
+            rec["closed"] = "not started"
+            save_run_state(self.cfg, self.state)
+            if isinstance(exc, RunError):
+                raise
+            raise RunError("the runner could not be asked (%s)" % (exc if isinstance(exc, ValueError)
+                                                                   else type(exc).__name__))
+        rec["delegated"] = True
+        save_run_state(self.cfg, self.state)
+        self.started += 1
+        self.say("%-10s started: asked the runner for %s's acceptance check (%s), for %s %s at %s" % (
+            plan, piece, rid, info["repo"], "#%d" % source["pr"] if source.get("pr") else source.get("branch"),
+            head[:12]))
+
     def start_default(self, plan, info, why, again=False, head=None, source=None):
         """A check outside the poller's own rule: of the default branch's head after the plan's pieces merged, or of
         `head` from `source` ({"pr", "piece"}), asked for before the merge. Its ledger row goes first, under the
@@ -1121,6 +1308,13 @@ class Pass:
                 return False
             source = {"branch": branch}
         where = "%s's head" % source["branch"] if "branch" in source else "#%d's head" % source["pr"]
+        wait = self.must_wait(info["repo"], check_piece(info, source))
+        if wait:
+            if self.road(info["repo"])[0] == "unknown":
+                self.problems.append("%s: its check (%s) waits: %s" % (plan, why, wait))
+            else:
+                self.say("%-10s waits: %s" % (plan, wait))
+            return False
         if self.dry:
             self.say("%-10s would start a check of %s %s: %s" % (plan, where, head[:12], why))
             return False
@@ -1310,6 +1504,8 @@ class Pass:
             return
         if rec.get("second_look"):
             return self.collect_second_look(rec)
+        if rec.get("via") == "runner":
+            return self.collect_on_runner(rec)
         ticket, age = rec["ticket"], self.now - (_epoch(rec.get("created_at")) or self.now)
         timed_out = age > self.cfg["time_limit_minutes"] * 60
         try:
@@ -1351,13 +1547,72 @@ class Pass:
             return self.ask_second_look(rec, judged, problems, sessions[0]["id"], at)
         self.conclude(rec, judged)
 
+    def collect_on_runner(self, rec):
+        """KIT-708: a check on the runner's lane, read from the runner's own records: its start request's answer, its run
+        and the runner's own resumes of it, and the final message the runner kept. Never from anything a session wrote.
+        A request the runner refused is could-not-check, in the runner's words. Past the time limit it is stopped."""
+        plan, head = rec["plan"], rec["head"]
+        age = self.now - (_epoch(rec.get("created_at")) or self.now)
+        got = runner_result(rec["store_dir"], rec["request"])
+        if got["state"] == "refused":
+            return self.conclude(rec, poller._verdict(
+                "could-not-check", "the runner did not start the check: %s" % got["why"], cause="no-result"))
+        if got["state"] == "gone":
+            return self.conclude(rec, poller._verdict(
+                "could-not-check", "the check's request to the runner is gone", cause="no-result"))
+        if got["state"] != "ended":
+            if age > self.cfg["time_limit_minutes"] * 60:
+                return self.stop(rec, age)
+            if got["state"] == "unreadable":
+                self.errors.append("%s: the check's run in the runner could not be read (%s); tried again next pass"
+                                   % (plan, got["why"]))
+            else:
+                self.say("%-10s waiting: %s on the runner: %s (%d of %d minutes)"
+                         % (plan, rec["ticket"], got["why"], age // 60, self.cfg["time_limit_minutes"]))
+            return
+        rec["run"], out = got["run"], got["output"]
+        if out is None:
+            return self.conclude(rec, poller._verdict(
+                "could-not-check", "the acceptance session ended without a result", cause="no-result"))
+        if out["is_error"]:
+            return self.conclude(rec, poller._verdict(
+                "could-not-check", "the acceptance session reported an error", cause="no-result"))
+        judged = poller.judge(result_block(out["text"]), plan, head, os.path.join(self.cfg["look_record_dir"],
+                                                                                   rec["ticket"]))
+        problems = poller._clean_problems(judged.get("problems"))[0]
+        if judged.get("outcome") == "found-problems" and problems:
+            return self.ask_second_look(rec, judged, problems, got["run"], None)
+        self.conclude(rec, judged)
+
     def ask_second_look(self, rec, judged, problems, session_id, after):
         """Re-prompt the same session in its own thread for a second look at each problem (contract section 27).
         Recorded `posting` before the post, so one a stopped pass left is never posted again: it waits as if asked.
-        A post that fails ends the second look at once, every problem not judged: filed, and a high one holds."""
+        A post that fails ends the second look at once, every problem not judged: filed, and a high one holds. On the
+        runner's lane (KIT-708) it is a resume request for the check's run, named first, so a pass that stopped between
+        the record and the request reads that request back."""
         if self.dry:
             self.say("%-10s would ask %s for a second look at %d problem(s)" % (rec["plan"], rec["ticket"],
                                                                                    len(problems)))
+            return
+        if rec.get("via") == "runner":
+            look = rec["second_look"] = {"status": "posting", "at": _iso(self.now), "run": session_id,
+                                         "request": runner_store.new_request_id(), "problems": len(problems),
+                                         "ids": [pb["id"] for pb in problems], "prompts": 1, "judged": judged}
+            save_run_state(self.cfg, self.state)
+            try:
+                runner_store.ask(rec["store_dir"], "acceptance", "resume", "acceptance", rec["project"], rec["piece"],
+                                 run=session_id, request_id=look["request"],
+                                 text=second_look_prompt(rec["plan"], rec["head"], problems, thread=False))
+            except (ValueError, OSError, runner_store.StoreError) as exc:
+                look["status"], look["prompts"] = "failed", 0
+                self.problems.append("%s: the second look could not be asked of the runner (%s), so no problem is "
+                                     "judged by it" % (rec["plan"], exc if isinstance(exc, ValueError)
+                                                       else type(exc).__name__))
+                return self.end_second_look(rec, "not asked", {})
+            look["status"] = "asked"
+            save_run_state(self.cfg, self.state)
+            self.say("%-10s asked the runner for a second look at %d problem(s), resuming %s"
+                     % (rec["plan"], len(problems), session_id))
             return
         look = rec["second_look"] = {"status": "posting", "at": _iso(self.now), "session": session_id,
                                      "after": after, "problems": len(problems), "ids": [pb["id"] for pb in problems],
@@ -1384,6 +1639,28 @@ class Pass:
         if look.get("outcome") is not None or look.get("status") == "failed":
             return self.end_second_look(rec, look.get("outcome") or "not asked", look.get("answers") or {})
         late = self.now - (_epoch(look.get("at")) or self.now) > self.cfg["time_limit_minutes"] * 60
+        if rec.get("via") == "runner":
+            got = runner_result(rec["store_dir"], look.get("request") or "")
+            if got["state"] in ("refused", "gone"):
+                return self.end_second_look(rec, "not asked", {})
+            if got["state"] == "ended":
+                out = got["output"]
+                if out is None or out["text"] is None:
+                    return self.end_second_look(rec, "the session ended without an answer", {})
+                if out["is_error"]:
+                    return self.end_second_look(rec, "the session reported an error", {})
+                return self.end_second_look(rec, "answered", second_look_answers(out["text"], rec["plan"], rec["head"],
+                                                                                 look.get("ids") or []))
+            if late:
+                return self.end_second_look(rec, "no answer in time", {})
+            if got["state"] == "unreadable":
+                self.errors.append("%s: the second look on the runner could not be read (%s); tried again next pass"
+                                   % (rec["plan"], got["why"]))
+                return
+            self.say("%-10s waiting: the second look on the runner has not answered (%d of %d minutes)"
+                     % (rec["plan"], (self.now - (_epoch(look.get("at")) or self.now)) // 60,
+                        self.cfg["time_limit_minutes"]))
+            return
         try:
             kind, body, _at = latest_activity(self.linear.session(look["session"]), after=look.get("after"))
         except NotFound:
@@ -1417,12 +1694,13 @@ class Pass:
         self.conclude(rec, look["judged"], answered_by(look.get("answers", answers)))
 
     def stop(self, rec, age):
-        """Past the time limit: no more look runs (its config goes), its ticket canceled, and could-not-check."""
+        """Past the time limit: no more look runs (its config goes), its ticket canceled (on the runner's lane, its run
+        asked to stop, or its request withdrawn), and could-not-check."""
         if self.dry:
             self.say("%-10s would stop %s: %d minutes, past the limit of %d" % (rec["plan"], rec["ticket"], age // 60,
                                                                                 self.cfg["time_limit_minutes"]))
             return
-        _remove(look_config_path(self.cfg, rec["ticket"]))
+        _remove(rec.get("look_config") or look_config_path(self.cfg, rec["ticket"]))
         self.close_ticket(rec, "canceled", "stopped")
         self.conclude(rec, poller._verdict("could-not-check", "the check ran past its limit of %d minutes, so it was "
                                            "stopped" % self.cfg["time_limit_minutes"], cause="timed-out"))
@@ -1448,15 +1726,18 @@ class Pass:
             self.problems.append("%s at %s: the verdict was not written (%s)" % (plan, head[:8], outcome))
         if outcome not in ("written", "write-failed"):
             return                                       # the check is not over: nothing is closed
-        _remove(look_config_path(self.cfg, ticket))
+        _remove(rec.get("look_config") or look_config_path(self.cfg, ticket))
         self.close_ticket(rec, "completed", "closed")
         save_run_state(self.cfg, self.state)
 
     def close_ticket(self, rec, kind, said):
         """Move the acceptance ticket to the team's first state of `kind`, once. A read or a move that fails is said and
-        left for the next pass, which tries again (run_once): never an error that stops the pass."""
+        left for the next pass, which tries again (run_once): never an error that stops the pass. On the runner's lane
+        there is no ticket: the check is closed once nothing of it is left in the runner (close_on_runner)."""
         if rec.get("closed") is not None:
             return
+        if rec.get("via") == "runner":
+            return self.close_on_runner(rec)
         try:
             state_id = team_state(self.team(), kind)
             if not state_id:
@@ -1467,6 +1748,41 @@ class Pass:
                                  % (rec["plan"], rec["ticket"], said, exc))
             return
         rec["closed"] = "done" if kind == "completed" else "canceled"
+        save_run_state(self.cfg, self.state)
+
+    def close_on_runner(self, rec):
+        """KIT-708: end what is left of a check on the runner's lane. Each of its requests still waiting is withdrawn, and
+        looked at again a pass later (the runner may have been taking it then); each of its runs still going is asked to
+        stop, once. Closed once nothing of it runs and nothing of it waits. A store that cannot be read is said, and
+        tried again next pass, as a ticket that cannot be moved is."""
+        busy, stops, withdrawn = False, rec.setdefault("stops", []), rec.setdefault("withdrawn", {})
+        for rid in (rec.get("request"), (rec.get("second_look") or {}).get("request")):
+            if not rid:
+                continue
+            got = runner_result(rec["store_dir"], rid)
+            try:
+                if got["state"] == "unreadable":
+                    raise runner_store.StoreError(got["why"])
+                if got["state"] == "waiting":
+                    runner_store.withdraw(rec["store_dir"], rid)
+                    withdrawn[rid] = self.now
+                    busy = True
+                elif got["state"] == "gone" and withdrawn.get(rid, 0) >= self.now:
+                    busy = True                          # withdrawn this pass: looked at again next pass
+                elif got["state"] == "running":
+                    if got["run"] not in stops:
+                        runner_store.ask(rec["store_dir"], "acceptance", "stop", "acceptance", rec["project"],
+                                         rec["piece"], run=got["run"])
+                        stops.append(got["run"])
+                    busy = True
+            except (ValueError, OSError, runner_store.StoreError) as exc:
+                self.problems.append("%s: what is left of its check in the runner could not be ended (%s); tried "
+                                     "again next pass" % (rec["plan"], exc if not isinstance(exc, OSError)
+                                                          else type(exc).__name__))
+                save_run_state(self.cfg, self.state)
+                return
+        if not busy:
+            rec["closed"] = "done"
         save_run_state(self.cfg, self.state)
 
     def post_requests(self, rec, requests):
@@ -1521,6 +1837,14 @@ def run_once(cfg, linear, github, now, out, dry_run=False):
     for plan in plans:
         verdict, _detail, head = poller.decide_plan(plan)
         if verdict == poller.START and (plan["plan"], head) not in rows:
+            # KIT-708: a start whose road cannot be told, or whose piece the runner still holds, waits unrecorded.
+            wait = p.must_wait(plan["repo"], (info.get(plan["plan"]) or {}).get("piece"))
+            if wait:
+                if p.road(plan["repo"])[0] == "unknown":
+                    p.problems.append("%s: its check waits: %s" % (plan["plan"], wait))
+                else:
+                    out.write("%-10s waits: %s\n" % (plan["plan"], wait))
+                continue
             if room <= 0:
                 out.write("%-10s waits: %d check(s) start per pass\n" % (plan["plan"], cfg["max_starts_per_pass"]))
                 continue
@@ -2608,6 +2932,222 @@ def selftest():
     expect(acted is False and not lin.calls and "still running" in said.getvalue()
            and poller.load_ledger(cfg["ledger"])[("TOD-100", D)]["at"] == _iso(NOW - 60),
            "a re-run waits while its head's check runs, and leaves that row alone: %s" % said.getvalue())
+
+    # 15. KIT-708: the runner's lane. The runner's own `lanes.acceptance` switches a project, and back; a check there is
+    #     asked of the runner and read back from its own records, and no ticket is filed or moved.
+    for bad_lane, words in (({"store_dir": "rel", "repos": {"acme/app": "app"}}, "store_dir must be the runner's store"),
+                            ({"store_dir": "/s", "repos": {"acme/app": "App"}}, "must map each owner/repo"),
+                            ({"store_dir": "/s", "repos": {"acme/app": "app"}, "project": "app"}, "must be {"),
+                            ([], "must be {")):
+        try:
+            config(runner_lane=bad_lane)
+            expect(False, "runner_lane %r must be refused" % (bad_lane,))
+        except RunError as exc:
+            expect(exc.code == EXIT_USAGE and words in str(exc), "runner_lane %r is refused: %s" % (bad_lane, exc))
+    expect(config()["runner_lane"] == {}, "no runner_lane is the ticket road for every repository")
+    rwork, made = os.path.join(root, "rwork"), [0]
+    run1, run2 = "run-" + "1" * 32, "run-" + "2" * 32
+
+    def on_runner(on=True):
+        """A fresh plan, a fresh runner store whose lanes say the acceptance lane is on (or off) for project app, and the
+        config that names it."""
+        clean()
+        made[0] += 1
+        store = os.path.join(root, "runner-store-%d" % made[0])
+        runner_store.prepare(store)
+        runner_store.write_lanes(store, {"schema": runner_store.LANES_SCHEMA, "enabled": True, "work_dir": rwork,
+                                         "look_config_dir": configs, "projects": {"app": ["acceptance"] if on else []}})
+        lin, gh = world()
+        return lin, gh, config(runner_lane={"store_dir": store, "repos": {"acme/app": "app"}}), store
+
+    def lane_record(run, state="ended", resumes=None, request=None):
+        rec = dict((k, None) for k in runner_store.RUN_KEYS)
+        rec.update(schema=runner_store.RUN_SCHEMA, run=run, request=request, caller="acceptance", kind="acceptance",
+                   project="app", ticket="TOD-102", resumes=resumes, started_for="request", approved_by="owner-1",
+                   approved_at="2026-11-10T12:00:00Z", how="resumed-run" if resumes else "move",
+                   session_id="0b0e5e2c-1111-4222-8333-944445555666",
+                   workspace=os.path.join(rwork, "acceptance", "TOD-102"), branch="chore/tod-102-acceptance",
+                   state=state, started_at="2026-11-10T12:00:00Z")
+        if state not in runner_store.LIVE:
+            rec.update(ended_at="2026-11-10T12:30:00Z", reason="ended", why="the program ended with exit 0", exit=0)
+        return rec
+
+    def runner_takes(store, rid, run, text=None, state="ended", ok=True, why="", resumes=None):
+        """The runner's part, as its own records hold it: the request answered, its run, and the final message kept."""
+        doc = runner_store.read_json(os.path.join(store, "requests", rid + ".json"))
+        runner_store.settle(store, rid, doc, ok, run if ok else None, why, NOW)
+        if ok:
+            runner_store.write_run(store, lane_record(run, state, resumes, rid))
+            if text is not None and state == "ended":
+                runner_store.write_output(store, run, False, "success", text, NOW)
+
+    def recorded(rid, status="passed"):
+        folder = os.path.join(looks, rid, "TOD-100")
+        os.makedirs(folder, exist_ok=True)
+        with open(os.path.join(folder, "001-20261110T120000Z.json"), "w") as fh:
+            json.dump({"schema": "pipeline-look-record/1", "plan": "TOD-100", "run_id": "001-20261110T120000Z",
+                       "checks": ["c1"], "result": status, "outcome_trust": "runner-only",
+                       "runs": [{"check": "c1", "viewport": "desktop", "mode": "default", "status": status,
+                                 "steps": [], "shots": []}]}, fh)
+
+    def asked(store, action=None):
+        return [(i, d) for i, d, _p in runner_store.pending(store) if action is None or d["action"] == action]
+
+    passing = {"schema": RESULT_SCHEMA, "plan": "TOD-100", "head": H1, "outcome": "found-nothing",
+               "ran": [{"check": "c1", "viewport": "desktop", "mode": "default", "result": "passed"}], "problems": []}
+    lin, gh, rcfg, store = on_runner(on=False)
+    code, out = go(lin, gh, c=rcfg)
+    expect(lin.kinds() == ["create", "delegate"] and asked(store) == [],
+           "with the runner's acceptance lane off for the project, the check files its ticket as before: %s" % out)
+    lin, gh, rcfg, store = on_runner()
+    real_ask, before = runner_store.ask, []
+
+    def ask_spy(*a, **k):
+        before.append(os.path.exists(os.path.join(configs, "TOD-102.json")))
+        return real_ask(*a, **k)
+    runner_store.ask = ask_spy
+    try:
+        code, out = go(lin, gh, c=rcfg)
+    finally:
+        runner_store.ask = real_ask
+    req = (asked(store) or [(None, {})])[0]
+    rec = load_run_state(rcfg)["checks"].get("TOD-100@" + H1) or {}
+    expect(code == EXIT_OK and lin.calls == [] and before == [True] and rec.get("via") == "runner"
+           and rec.get("request") == req[0] and rec.get("delegated") is True
+           and [req[1].get(k) for k in ("caller", "action", "kind", "project", "ticket")]
+           == ["acceptance", "start", "acceptance", "app", "TOD-102"],
+           "on the lane: one start request to the runner for the plan's last piece, the look config on disk before it, "
+           "and no ticket filed: %s %r %r" % (out, lin.calls, before))
+    rid, text = req[0] or "rq-?", req[1].get("text") or ""
+    expect(H1 in text and "git fetch origin pull/7/head" in text and '"schema": "pipeline-browser-check/1"' in text
+           and "acme/app" in text and "TOD-100" in text and "look_run" not in text and "[repo=" not in text,
+           "the request's text is the check's facts alone: the plan, the repository, the head, how to fetch it and the "
+           "check blocks; the steps are the acceptance kind's own rules: %r" % text)
+    lc = pipeline_look.load_config(os.path.join(configs, "TOD-102.json"))
+    expect((lc["worktree"], lc["record_dir"], lc["plan"]) == (os.path.join(rwork, "acceptance", "TOD-102"),
+                                                              os.path.join(looks, rid), "TOD-100")
+           and pipeline_look.config_for_worktree(configs, os.path.join(rwork, "acceptance", "TOD-102"))["plan"]
+           == "TOD-100",
+           "the look config names the runner's workspace for the piece and the check's own record folder, named by "
+           "its request, and the look tool started there finds it: %s" % lc)
+    code, out = go(lin, gh, c=rcfg, now=NOW + 60)
+    expect(code == EXIT_OK and lin.calls == [] and len(asked(store)) == 1 and "the runner has not taken it yet" in out,
+           "until the runner takes it, the check waits and asks nothing more: %s" % out)
+    recorded(rid)
+    runner_takes(store, rid, run1, text="Done.\n```json\n%s\n```" % json.dumps(passing))
+    code, out = go(lin, gh, c=rcfg, now=NOW + 120)
+    row = poller.load_ledger(rcfg["ledger"]).get(("TOD-100", H1)) or {}
+    rec = load_run_state(rcfg)["checks"].get("TOD-100@" + H1) or {}
+    expect(code == EXIT_OK and lin.kinds() == ["comment"] and (row.get("verdict") or {}).get("word") == "passed"
+           and (row.get("verdict") or {}).get("page", {}).get("folder") == rid
+           and not os.path.exists(os.path.join(configs, "TOD-102.json")) and rec.get("closed") == "done"
+           and rec.get("run") == run1,
+           "the result is read from the final message the runner kept, with the look tool's record: the verdict on the "
+           "epic, its page's folder the check's own, the look config gone, and nothing left to close: %s %r %r"
+           % (out, lin.calls, rec))
+    lanes_off = runner_store.read_lanes(store)
+    runner_store.write_lanes(store, dict(lanes_off, projects={"app": []}))
+    gh.prs[("acme/app", 7)] = {"state": "open", "head": {"sha": H2}}
+    gh.runs[H2] = GREEN
+    outcome("acme/app", 7, H2)
+    code, out = go(lin, gh, c=rcfg, now=NOW + 180)
+    expect(lin.kinds() == ["comment", "create", "delegate"] and len(asked(store)) == 0,
+           "…and switched back by the same one setting, the next head's check files its ticket: %s" % out)
+
+    # 15b. a problem's second look is a resume of the check's own run, and its follow-up names the check's request
+    lin, gh, rcfg, store = on_runner()
+    go(lin, gh, c=rcfg)
+    rid = (asked(store) or [("rq-?", {})])[0][0]
+    recorded(rid)
+    runner_takes(store, rid, run1, text="```json\n%s\n```" % json.dumps(result))
+    code, out = go(lin, gh, c=rcfg, now=NOW + 120)
+    resume = (asked(store, "resume") or [(None, {})])[0]
+    rtext = resume[1].get("text") or ""
+    expect(code == EXIT_OK and lin.calls == [] and resume[1].get("run") == run1
+           and [resume[1].get(k) for k in ("caller", "kind", "project", "ticket")]
+           == ["acceptance", "acceptance", "app", "TOD-102"]
+           and "white card" in rtext and look in rtext and "this thread" not in rtext and "<!--" not in rtext,
+           "a result with a problem asks the runner to resume the check's own run for a second look, with no thread "
+           "reply: %s %r" % (out, resume))
+    runner_takes(store, resume[0] or "rq-?", run2, text="Looked again.\n" + second_look(), resumes=run1)
+    code, out = go(lin, gh, c=rcfg, now=NOW + 180)
+    comments = [c[2] for c in lin.calls if c[0] == "comment"]
+    row = poller.load_ledger(rcfg["ledger"]).get(("TOD-100", H1)) or {}
+    expect(code == EXIT_OK and lin.kinds() == ["comment", "comment"] and (row.get("verdict") or {}).get("word") == "held"
+           and comments[:1] and comments[0].split("\n")[0]
+           == "<!-- pipeline-acceptance:finding plan=TOD-100 head=%s run=%s -->" % (H1, rid)
+           and (load_run_state(rcfg)["checks"]["TOD-100@" + H1].get("second_look") or {}).get("outcome") == "answered",
+           "the resume's answer is read from its own final message: the follow-up's mark names the check by its start "
+           "request, then the verdict, and nothing is moved: %s %r" % (out, comments[:1]))
+    try:
+        import pipeline_finding_poller as finder
+        read = finder.read_acceptance_mark(comments[0].split("\n")[0]) if comments else None
+    except Exception as exc:                              # noqa: BLE001 - said below
+        read = "could not read: %r" % exc
+    expect(read == ("TOD-100", H1, rid), "the finding path reads that mark: %r" % (read,))
+
+    # 15c. a request the runner refuses is could-not-check, in the runner's own words
+    lin, gh, rcfg, store = on_runner()
+    go(lin, gh, c=rcfg)
+    rid = (asked(store) or [("rq-?", {})])[0][0]
+    runner_takes(store, rid, None, ok=False, why="the acceptance lane is off for project app")
+    code, out = go(lin, gh, c=rcfg, now=NOW + 60)
+    row = poller.load_ledger(rcfg["ledger"]).get(("TOD-100", H1)) or {}
+    expect((row.get("verdict") or {}).get("word") == "could-not-check" and lin.kinds() == ["comment"]
+           and "the acceptance lane is off for project app" in (lin.calls[-1][2] if lin.calls else "")
+           and not os.path.exists(os.path.join(configs, "TOD-102.json")),
+           "a refused request is could-not-check, never a pass, and says the runner's reason: %s" % out)
+
+    # 15d. past the time limit: a request not taken yet is withdrawn; a run still going is asked to stop, once
+    lin, gh, rcfg, store = on_runner()
+    go(lin, gh, c=rcfg)
+    rid = (asked(store) or [("rq-?", {})])[0][0]
+    code, out = go(lin, gh, c=rcfg, now=NOW + 61 * 60)
+    row = poller.load_ledger(rcfg["ledger"]).get(("TOD-100", H1)) or {}
+    rec = load_run_state(rcfg)["checks"].get("TOD-100@" + H1) or {}
+    expect((row.get("verdict") or {}).get("word") == "could-not-check" and asked(store) == []
+           and runner_store.answer(store, rid) is None and rec.get("closed") is None
+           and not os.path.exists(os.path.join(configs, "TOD-102.json")),
+           "a check the runner never took is withdrawn at the limit, could-not-check, its look config gone: %s" % out)
+    go(lin, gh, c=rcfg, now=NOW + 62 * 60)
+    expect((load_run_state(rcfg)["checks"].get("TOD-100@" + H1) or {}).get("closed") == "done",
+           "…and closed a pass later, once it is still not taken")
+    lin, gh, rcfg, store = on_runner()
+    go(lin, gh, c=rcfg)
+    rid = (asked(store) or [("rq-?", {})])[0][0]
+    runner_takes(store, rid, run1, state="running")
+    go(lin, gh, c=rcfg, now=NOW + 61 * 60)
+    go(lin, gh, c=rcfg, now=NOW + 62 * 60)
+    stops = asked(store, "stop")
+    expect([d.get("run") for _i, d in stops] == [run1]
+           and (poller.load_ledger(rcfg["ledger"]).get(("TOD-100", H1), {}).get("verdict") or {}).get("word")
+           == "could-not-check",
+           "a run still going at the limit is asked to stop once, and the check is could-not-check: %r" % stops)
+
+    # 15e. lanes that cannot be read hold the start, said; an earlier check of the same piece makes a new head wait
+    lin, gh, rcfg, store = on_runner()
+    with open(os.path.join(store, runner_store.LANES_FILE), "w") as fh:
+        fh.write("{not json")
+    code, out = go(lin, gh, c=rcfg)
+    expect(code == EXIT_DECLINED and lin.calls == [] and asked(store) == [] and not poller.load_ledger(rcfg["ledger"])
+           and "the runner's lanes could not be read" in out,
+           "lanes that cannot be read are never 'off': the start waits, unrecorded, and is said: %s" % out)
+    lin, gh, rcfg, store = on_runner()
+    go(lin, gh, c=rcfg)
+    gh.prs[("acme/app", 7)] = {"state": "open", "head": {"sha": H2}}
+    gh.runs[H2] = GREEN
+    outcome("acme/app", 7, H2)
+    code, out = go(lin, gh, c=rcfg, now=NOW + 60)
+    expect(len(asked(store)) == 1 and ("TOD-100", H2) not in poller.load_ledger(rcfg["ledger"])
+           and "an earlier check of TOD-102 on the runner is not over yet" in out,
+           "a new head waits while the runner still holds the piece's earlier check: %s" % out)
+    big = [json.dumps({"schema": CHECK_SCHEMA, "pad": "x" * 1500}) for _ in range(20)]
+    facts = runner_facts("acme/app", "TOD-100", H1, {"pr": 7, "piece": "TOD-102"}, big, 1)
+    kept_blocks = facts.count("```json")
+    expect(len(facts) <= runner_store.TEXT_MAX and 0 < kept_blocks < 20
+           and "%d check block(s)" % (20 - kept_blocks + 1) in facts,
+           "blocks past what one request holds are left out, last first, and counted: %d kept" % kept_blocks)
+    cfg = config()
 
     # 12. the lock, the heartbeat, a missing credential
     clean()
