@@ -1895,6 +1895,8 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
 
         # ---- off: nothing is taken ----------------------------------------- #
         off = Runner(dict(cfg, enabled=False), tracker, environ=environ, git_env=genv, say=said.append, room=roomy)
+        expect("KIT-866: off holds whatever the lanes say: the off runner's project has every lane on",
+               set(off.cfg["projects"]["app"]["lanes"].values()), {True})
         expect("off with no store: nothing is made", (off.pass_once()["state"], os.path.isdir(sdir)),
                ("off", False))
         expect("the store is made on the first pass", store.prepare(sdir), [])
