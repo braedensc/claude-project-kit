@@ -76,7 +76,6 @@ CONF_DEFAULTS = {
     # runner's own `lanes.acceptance` does. Empty: no repository's check goes to the runner.
     "ACCEPTANCE_RUNNER_LANE_REPOS": "", "ACCEPTANCE_RUNNER_STORE_DIR": "",
 }
-RUNNER_PROJECT_RE = arun.runner_store.PROJECT_RE    # the runner's own project-key rule, imported, never copied
 CONF_KEYS = set(CONF_REQUIRED) | set(CONF_DEFAULTS)
 # Left invalid on purpose, so an unedited copy of the example cannot run.
 CONF_UNEDITED = {"DISPATCHER_CONFIG": "/opt/example-dispatcher/config.json",
@@ -218,12 +217,12 @@ def validate_conf(values, invoking_user=None):
 
 def runner_lane_entries(c):
     """{OWNER/NAME: project} from ACCEPTANCE_RUNNER_LANE_REPOS (KIT-708), {} while it is empty, or None when an entry is
-    not OWNER/NAME:PROJECT for a repository of ACCEPTANCE_REPOS."""
+    not OWNER/NAME:PROJECT for a repository of ACCEPTANCE_REPOS. A project is judged by the runner store's own rule."""
     repos, out = set(r.lower() for r in split_list(c.get("ACCEPTANCE_REPOS"))), {}
     for entry in split_list(c.get("ACCEPTANCE_RUNNER_LANE_REPOS") or ""):
         repo, sep, project = entry.rpartition(":")
-        if not (sep and arun.REPO_RE.match(repo) and repo.lower() in repos and RUNNER_PROJECT_RE.match(project)
-                and repo.lower() not in out):
+        if not (sep and arun.REPO_RE.match(repo) and repo.lower() in repos
+                and arun.runner_store.PROJECT_RE.match(project) and repo.lower() not in out):
             return None
         out[repo.lower()] = project
     return out
@@ -1216,8 +1215,6 @@ def _cases(check, tmp):
           (json.loads(compose(lane_conf, fake.home)["run"]).get("runner_lane"), "runner_lane" in run_doc,
            validate_conf(lane_conf, person)[1]),
           ({"store_dir": fake.home + "/.pipeline-runner/store", "repos": {"acme/app": "app"}}, False, []))
-    check("conf (KIT-708): a project key is judged by the runner store's own rule, imported, never a copy",
-          RUNNER_PROJECT_RE is arun.runner_store.PROJECT_RE, True)
     check("conf (KIT-708): a runner lane for a repository the check does not cover, or with no store, is refused", [
         refused("ACCEPTANCE_RUNNER_LANE_REPOS must", ACCEPTANCE_RUNNER_LANE_REPOS="other/repo:app"),
         refused("ACCEPTANCE_RUNNER_LANE_REPOS must", ACCEPTANCE_RUNNER_LANE_REPOS="acme/app:App"),
