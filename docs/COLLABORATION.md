@@ -395,7 +395,9 @@ Stop hook between them:
 1. **Claude Code PreToolUse hook** — runs before every tool call; the model **cannot**
    skip the hook. Block reasons print to **stderr** (the only stream Claude Code relays
    for a blocking exit 2), and an internal hook error **fails closed** (blocks)
-   instead of crashing to a non-blocking exit.
+   instead of crashing to a non-blocking exit. So does a call the hook could not judge
+   within its own 7-second deadline, which sits under the settings timeout: past that
+   timeout Claude Code would run the tool unjudged (KIT-684).
 
    > **Read this list as "catches mistakes", not "cannot be evaded".** The *invocation*
    > is unbypassable; the **Bash** guards below are regular expressions over raw command

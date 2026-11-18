@@ -19,6 +19,17 @@ tool would run — so the guards run inside a boundary that converts any uncaugh
 exception to exit 2. (Malformed harness *stdin* still fails open by design — a broken
 payload must not brick every tool call.)
 
+**Running out of time fails closed too (KIT-684).** Claude Code treats a hook that runs
+past its `timeout` (10 seconds in `.claude/settings.json`) as a non-blocking error and runs
+the tool unjudged, so one stuck `git` (a locked repository, a slow mount) would switch every
+guard off for that call. Each `git` and `gh` call has its own timeout, but they add up, so
+the hook keeps a 7-second deadline of its own, armed as it starts: a call it could not judge
+in time is refused, and the message names the deadline. The interrupted subprocess is killed
+on the way out. A 1-second backstop writes the reason and exits 2 if that unwinding ever
+stalls. The battery stages a `git` that hangs and checks the refusal arrives inside the
+settings timeout, that every subprocess call has a timeout, and that the deadline and
+backstop end at least a second before the settings timeout.
+
 **Session root:** the anchor is `CLAUDE_PROJECT_DIR` (falling back to the hook file's
 location), **widened to the worktree the session's transcript folder names** — the
 payload's `transcript_path` lives under `~/.claude/projects/<launch dir, non-alphanumerics
