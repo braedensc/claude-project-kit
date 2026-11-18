@@ -2209,6 +2209,7 @@
       ],
       "scripts": [
         "scripts/pipeline_validator_evidence.py",
+        "scripts/pipeline_validator_facts.py",
         "scripts/pipeline_validator_settings.py",
         "scripts/pipeline_validator_ledger.py",
         "scripts/pipeline_validator_brief.py",
