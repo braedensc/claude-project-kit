@@ -67,7 +67,7 @@ RULES_NAME, MANIFEST_NAME, COPIER_RULES_NAME = "etc/watcher.json", "manifest.jso
 # The files the watcher runs from: its import closure, derived by the selftest with `ast`, and its schema.
 WATCHER_FILES = ("scripts/pipeline_watcher_local.py", "scripts/pipeline_watcher_tracker.py",
                  "scripts/pipeline_hold.py", "scripts/pipeline_validator_ledger.py",
-                 "scripts/check_schemas.py", "scripts/jsonschema_mini.py",
+                 "scripts/check_grader_paths.py", "scripts/check_schemas.py", "scripts/jsonschema_mini.py",
                  "schemas/pipeline-watcher.schema.json")
 COPIER_FILES = ("scripts/pipeline_watcher_copy.py",)       # the root copier: stdlib only, run with -I
 INSTALLED_FILES = WATCHER_FILES + COPIER_FILES
@@ -84,6 +84,8 @@ CONF_DEFAULTS = {
     "PYTHON": "/usr/bin/python3", "GITHUB_TOKEN_ENV": "WATCHER_GITHUB_TOKEN", "INTERVAL_SECONDS": "900",
     "LINEAR_KEY_ENV": "", "TRACKER_TEAMS": "", "TRACKER_TRUSTED_USERS": "", "USAGE_FILE": "",
     "LIMIT_DAY_USD": "", "LIMIT_PIECE_USD": "", "LIMIT_DAY_RUNS": "", "LIMIT_PIECE_RUNS": "",
+    # KIT-518: the most of the validator's decisions in a row that may all be approvals before the owner is paged.
+    "LIMIT_APPROVALS_IN_A_ROW": "",
     # KIT-546: the validator's ledger, the owner's own GitHub logins, and the day's approvals limit.
     "VALIDATOR_LEDGER": "", "OWNER_LOGINS": "", "LIMIT_DAY_APPROVALS": "",
 }
@@ -194,8 +196,9 @@ def validate_conf(values, user=None):
          "VALIDATOR_LEDGER must be the validator ledger's absolute path, or empty")
     need(all(LOGIN_RE.match(x) for x in split_list(c.get("OWNER_LOGINS"))),
          "OWNER_LOGINS must list GitHub logins, or be empty")
-    v = c.get("LIMIT_DAY_APPROVALS", "")
-    need(v == "" or (v.isdigit() and int(v) > 0), "LIMIT_DAY_APPROVALS must be a whole number above 0, or empty")
+    for k in ("LIMIT_DAY_APPROVALS", "LIMIT_APPROVALS_IN_A_ROW"):
+        v = c.get(k, "")
+        need(v == "" or (v.isdigit() and int(v) > 0), "%s must be a whole number above 0, or empty" % k)
     return c, e
 
 
@@ -250,6 +253,8 @@ def compose_rules(c, watcher):
             limits[name] = int(c[key]) if name.endswith("runs") else float(c[key])
     if c["LIMIT_DAY_APPROVALS"]:
         limits["day_approvals"] = int(c["LIMIT_DAY_APPROVALS"])
+    if c["LIMIT_APPROVALS_IN_A_ROW"]:
+        limits["approvals_in_a_row"] = int(c["LIMIT_APPROVALS_IN_A_ROW"])
     if limits:
         doc["limits"] = limits
     if c["VALIDATOR_LEDGER"]:
@@ -879,9 +884,11 @@ LIMIT_PIECE_RUNS=
 # repository is checked against the validator's approvals.  This account must be able to read the file.
 # OWNER_LOGINS: your own GitHub logins, comma-separated: your own merges need no approval.  Leave yours out,
 # and each of your merges holds new starts.  LIMIT_DAY_APPROVALS: the most approvals in 24 hours, a runaway's.
+# LIMIT_APPROVALS_IN_A_ROW: the most decisions in a row that may all be approvals before you are paged, a runaway's.
 VALIDATOR_LEDGER=
 OWNER_LOGINS=
 LIMIT_DAY_APPROVALS=
+LIMIT_APPROVALS_IN_A_ROW=
 """
 
 
@@ -1149,20 +1156,24 @@ def selftest():
                  "VALIDATOR_LEDGER"),
                 ("an owner login that is not one", {"OWNER_LOGINS": "not a login"}, "OWNER_LOGINS"),
                 ("a day's approvals that is not whole", {"LIMIT_DAY_APPROVALS": "2.5"},
-                 "LIMIT_DAY_APPROVALS")):
+                 "LIMIT_DAY_APPROVALS"),
+                ("approvals in a row of zero", {"LIMIT_APPROVALS_IN_A_ROW": "0"},
+                 "LIMIT_APPROVALS_IN_A_ROW")):
             _c, e = validate_conf(dict(values, KIT_CHECKOUT=REPO, **over), "alice")
             check("conf: %s is refused, by key" % label, any(needle in x for x in e), True)
         import pipeline_watcher_local as _watcher_mod
         system = {"KIT_CHECKOUT": REPO, "INSTALL_DIR": "/opt/watch/inst", "STATE_DIR": "/opt/watch/state"}
         c_v, e_v = validate_conf(dict(values, VALIDATOR_LEDGER="/Users/Shared/v/ledger.json",
-                                      OWNER_LOGINS="the-owner", LIMIT_DAY_APPROVALS="20", **system), "alice")
+                                      OWNER_LOGINS="the-owner", LIMIT_DAY_APPROVALS="20",
+                                      LIMIT_APPROVALS_IN_A_ROW="30", **system), "alice")
         rules_v = json.loads(compose_rules(c_v, _watcher_mod).decode("utf-8")) if not e_v else {}
-        check("KIT-546: the validator's ledger, the owner's logins and the day's approvals reach the rules, "
-              "and the watcher's own loader takes them",
+        check("KIT-546, KIT-518: the validator's ledger, the owner's logins, the day's approvals and the approvals "
+              "in a row reach the rules, and the watcher's own loader takes them",
               (e_v, rules_v.get("validator_ledger"), rules_v.get("owner_logins"),
                (rules_v.get("limits") or {}).get("day_approvals"),
+               (rules_v.get("limits") or {}).get("approvals_in_a_row"),
                _watcher_mod.which_on(_watcher_mod.validate_config(rules_v))["approval-rate"] if rules_v else "x"),
-              ([], "/Users/Shared/v/ledger.json", ["the-owner"], 20, None))
+              ([], "/Users/Shared/v/ledger.json", ["the-owner"], 20, 30, None))
         c_n, _e = validate_conf(dict(values, **system), "alice")
         check("...and with none of them, approval-rate stays off", "validator_ledger" in json.loads(
             compose_rules(c_n, _watcher_mod).decode("utf-8")), False)
