@@ -385,6 +385,17 @@ fails too. Its standard-library list is one constant, so Python 3.9 and 3.12 agr
 fails when the running Python knows a module the constant lacks (add it). `npm run
 test:stdlib-only` runs the selftest, `npm run lint:stdlib-only` the real check.
 
+## Every test script has a CI step (KIT-620)
+
+`python3 scripts/check_ci_covers_tests.py` lists each `test:*` script in `package.json` and fails,
+naming it, when no step in a Kit checks job (any job but the leak sweeps) runs its command, arguments included. The sweeps run
+every battery, so they would hide a missing step. A script left out on purpose goes in `ALLOWED` in
+the script with a one-line reason; an entry that is covered anyway, or names no script, fails too.
+`npm run test:ci-covers` runs the selftest, `npm run lint:ci-covers` the real check.
+
+Good: you add `test:foo` and a `python3 scripts/foo.py --selftest` step in the same PR.
+Not: you add `test:foo` and rely on the leak sweeps to run it.
+
 ## What CI never does
 
 - Never runs the DB-backed suite.

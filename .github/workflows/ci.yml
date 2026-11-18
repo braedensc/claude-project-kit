@@ -642,7 +642,7 @@ jobs:
         run: |
           python3 scripts/pipeline_bridge_tracker.py --selftest
           python3 scripts/pipeline_bridge_config.py --selftest
-          npm run --silent test:bridge-requests
+          python3 scripts/pipeline_bridge_requests.py --selftest
           python3 scripts/pipeline_bridge_answers.py --selftest
           python3 scripts/pipeline_bridge_replan.py --selftest
           python3 scripts/pipeline_bridge_plans.py --selftest
@@ -797,6 +797,18 @@ jobs:
           python3 scripts/pipeline_machine_tickets.py --selftest
           python3 scripts/pipeline_routing_tags.py --selftest
           python3 .claude/skills/sync-kit/compare.py --selftest
+          python3 scripts/pipeline_acceptance_run.py --selftest
+          python3 scripts/pipeline_acceptance_setup.py --selftest
+          python3 scripts/pipeline_runner_store.py --selftest
+          python3 scripts/pipeline_runner.py --selftest
+          python3 scripts/pipeline_runner_limits.py --selftest
+
+      # KIT-620. Every package.json test:* script needs a step above, or an entry with a reason
+      # in the check's allow list. The leak sweeps do not count.
+      - name: CI covers every test script (a battery cannot silently stop blocking merges)
+        run: |
+          python3 scripts/check_ci_covers_tests.py --selftest
+          python3 scripts/check_ci_covers_tests.py
 
       - name: Dashboard selftest (self-contained page, one summary object)
         run: python3 scripts/telemetry_dashboard.py --selftest
