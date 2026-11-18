@@ -320,7 +320,8 @@ twice on doc-tail merges before these rules existed:
    dry-run count and sign it off. It takes only a worktree **your own Claude Code
    worked in**. A dispatcher's PR never qualifies; the bounce driver re-prompts that
    session in its own thread. Each session is capped (`MAX_BUDGET_USD`, `TIMEOUT_MIN`),
-   and so is each pass (`MAX_SESSIONS_PER_PASS`). Three automated attempts per PR.
+   and so is each pass (`MAX_SESSIONS_PER_PASS`). Three automated attempts per PR, and
+   deleting the bot's comments does not give them back.
    After that, or when nothing claims a request within 15 minutes, the monitor pages
    a person. Logged out, asleep, or never installed, you get the old page, never
    silence. On a Stage E machine, its installer's `conflict-waker` step does this for

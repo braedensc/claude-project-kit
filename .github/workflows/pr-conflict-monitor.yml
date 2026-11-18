@@ -17,7 +17,9 @@ name: PR conflict monitor
 #
 # So a conflict now STARTS A FIX. The logic lives in scripts/pr_conflict.py
 # (monitor half here; one marker grammar, one selftest in CI). Per new episode:
-#   • budget left (3 automated attempts per PR, lifetime; `--max-fix-requests N`
+#   • budget left (3 automated attempts per PR, lifetime, counted from the
+#     label's own events as well, so deleting the bot's comments does not
+#     reset it (KIT-671); `--max-fix-requests N`
 #     changes it, and 0 means NOTHING HERE ANSWERS — page at the first conflict
 #     instead of asking, which is the right setting for a repository with no
 #     waker and no dispatcher) → label + a `request`
@@ -73,7 +75,7 @@ on:
 
 permissions:
   contents: read
-  issues: write # labels + comments on a PR go through the issues API
+  issues: write # labels, comments and the label's events on a PR go through the issues API
   pull-requests: write
 
 # Three triggers can collide (a merge to main during a scheduled tick). Serialize
