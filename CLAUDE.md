@@ -403,7 +403,8 @@ npm run test:queue-start     # the queue's starter (KIT-452): what may start now
 npm run test:session-kinds   # each kind of session as data (KIT-704): every kind loads; a mode that skips
                              #   checks, a file tool by name, Bash in our own sandbox each refused
 npm run test:harness-claude  # the one adapter (KIT-704): every kind's full command line, settings and
-                             #   environment pinned; our own sandbox's profile run for real on a Mac
+                             #   environment pinned; our own sandbox's profile run for real on a Mac;
+                             #   the one builder the turn and the writer use too (KIT-708)
 npm run test:runner-guard    # the guards' launcher (KIT-704): no folder named or two named is a refusal;
                              #   a crash is a refusal; the engine's folder this account could change
 npm run test:runner-probe    # the live probe of each kind's walls (KIT-704), against a stand-in: walls
@@ -413,7 +414,8 @@ npm run test:runner-store    # the runner's store (KIT-642): requests and run re
 npm run test:runner          # the runner (KIT-642): start, resume, stop and a restart against a
                              #   stand-in; the owner's approval from the history; the pin; the one
                              #   command line; a run that died resumed once; a lane that is off for
-                             #   its project refused in words (KIT-866); leaves nothing behind
+                             #   its project refused in words (KIT-866); the lanes it takes said in
+                             #   its store, the acceptance kind's look tool (KIT-708); leaves nothing behind
 npm run test:runner-limits   # the runner's limits (KIT-643): stand-ins that grow without bound
                              #   in memory (a child that left the group too) and on disk stopped
                              #   with their whole tree; the floor; each incident told once

@@ -277,6 +277,9 @@ CATCHUP_WEBHOOK_ID=
 # reply in the tracker thread.  The ledger, the fix budget and the page when a
 # fix is never pushed stay the same.  That repository's team leaves the
 # catch-up poller, which is not installed at all once no team is left.
+# The runner's own lanes switch each kind (KIT-708): a fix goes this way only
+# while the runner's `fix` lane is on for the project, and a conflict only
+# while its `conflict` lane is on.  Off, each goes by the thread as before.
 # Name a repository only once its coding sessions run through the runner too:
 # until then a fix finds no session there, and the driver says so on the PR.
 # The catch-up poller works by team, so a team leaves it as a whole: name

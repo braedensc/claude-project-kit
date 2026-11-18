@@ -14,8 +14,10 @@ The formats it reads and writes: `docs/PIPELINE-CONTRACT.md` section 28, and sec
 - **Nothing installs it yet.** Its installer comes with the first lane that moves.
 - **No real session goes through it yet.** Its selftest runs it against a stand-in program.
 
-A lane runs through the runner only when both switches are on: the caller's own (the job that asks)
-and the runner's lane for that project. Either one off is the way back.
+**Each project's `lanes` is the one switch** (KIT-708). The runner writes the lanes it takes into its
+store, and the jobs that ask it read them. A job sends a kind to the runner only while the runner
+says that lane is on for the project. Off, the job takes its old road. A job's own `runner_lane`
+only says where the runner's store is and which project a repository is.
 
 Each kind of session is data now, behind walls the probe proved live for every kind, as the role
 account, on 18 Nov 2026: 95 of 95 (KIT-704). One thing still comes before any lane moves: a
@@ -135,12 +137,27 @@ settings and environment. A second program would be a second adapter, reading th
 | fix, conflict | the same: each is a resume of a code run | the built-in sandbox | the project's list | 360 min, 8 GB |
 | review | Read, Grep, Glob | our own sandbox | none | 180 min, 4 GB |
 | plan | Read, Grep, Glob | our own sandbox | none | 180 min, 4 GB |
-| acceptance | Bash, Read: it builds the app it checks | the built-in sandbox | the project's list | 180 min, 8 GB |
+| acceptance | Bash, Read, and the look tool: it builds the app it checks | the built-in sandbox | the project's list | 180 min, 8 GB |
 
 Every kind's disk ceiling is 20 GB. With `session_tools` set, code, fix and conflict also get their
 own five ticket tools ("The session's own tracker tools", below), and the rules they are given name
-each one: no skill loads from the workspace to tell them. What no kind's data can say, because the
-loader refuses it:
+each one: no skill loads from the workspace to tell them.
+
+**A kind may carry its own steps** (`rules`, KIT-708). They go into the run's rules file, after its
+brief. The acceptance check's steps are there: fetch the head, build, one look run per check block,
+judge, one result block, and the second look. So a request's text carries only facts, fenced as data.
+
+**The look tool** (KIT-708) is the acceptance kind's alone. The run's `mcp.json` starts it from the
+engine's own folder, isolated, with `--config-dir` set to `look_config_dir`. The acceptance job writes
+the one config naming the run's workspace there before it asks. The program starts the tool outside
+Bash's sandbox, so the tool starts its own no-network sandbox (`docs/LOOK-TOOL.md`). Its one tool,
+`mcp__look__look_run`, is allowed by its exact name.
+
+**One command-line builder** (KIT-708). `line()` in the adapter spells every option the program is
+given, in one order. The runner's command line, the tech lead's turn and the one-shot writer all use
+it. Each names its own options and values. The builder has no option for a mode that skips the checks.
+
+What no kind's data can say, because the loader refuses it:
 
 - **A mode that skips the checks.** The only value is `deny-unlisted`: what no rule allows is refused.
 - **A file tool allowed by name.** Each is allowed by the workspace's path only.
@@ -179,6 +196,7 @@ The files sit behind the `hooks-change` label: a change to one changes what a se
 - **No tracker sign-in.** No tracker key is in its environment, its `mcp.json` lists no tracker
   server, and every tracker key file is walled from its file tools and from Bash. With
   `session_tools` set, a code, fix or conflict session gets five tracker tools of its own instead.
+- **An acceptance check gets the look tool,** and no other tool server (KIT-708, above).
 
 Good: a review session's Grep reaches only its workspace, and the system itself stops it writing.
 Not: a review session is given Bash, or a file tool allowed by its bare name.
@@ -334,6 +352,7 @@ One JSON file. The example is `runner.example.json`. `~/` means the account's ow
 | `hold` | The watcher's hold file (contract section 20). Set, nothing starts. | none |
 | `limits` | `wall_minutes`, `memory_mb`, `disk_mb`, `check_seconds` (how often trees and folders are measured) and `room` (the floor). See "Its limits". | above |
 | `session_tools` | `key_file`, the session writer's tracker key, and `writer_user_id`, the user it must belong to, never an owner. See "The session's own tracker tools". Absent, no session gets tracker tools. | none |
+| `look_config_dir` | The folder the acceptance job writes each check's look config into: its own `look_config_dir`. The acceptance kind's look tool is started on it. Needed while any project's acceptance lane is on. Never inside the other three folders, nor in a git working tree. | none |
 | `projects` | Each project: `repo` (the runner's own clone), `base`, `lanes`, `approval_states` per kind, `allowed_hosts`. | required |
 
 The four folders must not sit inside one another.
@@ -349,6 +368,16 @@ is on needs its approved states in `approval_states`: `fix` and `conflict` use t
 Good: `"lanes": {"review": true}` for the drill repository. Only reviews of it go through the runner.
 Not: a review request for a project whose `review` lane is off. It is refused: "the review lane is
 off for project app".
+
+**It says which lanes it takes** (KIT-708). Each pass writes `<store_dir>/lanes.json` from its own
+checked settings, when they change: whether it is on, each project's lanes that are on, its work
+folder and `look_config_dir`. The acceptance job and the fix driver read it. A lane it does not take,
+or a runner that has written nothing yet, is the job's old road. A file that cannot be read is "could
+not tell": the job sends nothing and says so, and never reads it as off.
+
+Good: the owner sets `"acceptance": true` for project app. The next acceptance check of app's
+repository is asked of the runner. He sets it back to false, and the next check files its ticket.
+Not: a job that keeps asking the runner for a lane the runner no longer takes.
 
 ## Checking it
 
@@ -415,8 +444,9 @@ The runner refuses to start from inside a Claude session, or as root.
 - That our own sandbox lets the real program run for a review or plan session. The selftest runs
   the profile on a Mac with a stand-in. The probe runs the real program in it.
 - That the acceptance kind's look tool can start its own sandbox in an acceptance session. It is
-  a tool server, started outside Bash's sandbox, so nothing should nest. It joins that kind with
-  the acceptance lane (KIT-708), and the probe gains a row for it then.
+  a tool server, started outside Bash's sandbox, so nothing should nest. It joined that kind with
+  KIT-708. The probe does not start it yet, so one live check of an acceptance run is owed before
+  the acceptance lane moves.
 - That a real session calls its own tracker tools, and that Linear takes their comments. Their
   selftest runs the real server over stdio against a stand-in tracker. The first coding lane on
   the runner (KIT-645) is the first live run.

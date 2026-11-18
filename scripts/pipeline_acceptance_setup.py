@@ -72,7 +72,11 @@ CONF_DEFAULTS = {
     "ACCEPTANCE_INTERVAL_SECONDS": "300", "ACCEPTANCE_TIME_LIMIT_MINUTES": "90", "ACCEPTANCE_MAX_STARTS": "2",
     "LOOK_MAX_RUNS": "6", "LOOK_TIMEOUT_SECONDS": "300", "BASE_REF": "origin/main", "BASE_GIT_DIR": "",
     "CONFIG_BACKUPS_KEPT": "5",
+    # KIT-708: where our own runner is, and which of its projects each repository is. It switches nothing: the
+    # runner's own `lanes.acceptance` does. Empty: no repository's check goes to the runner.
+    "ACCEPTANCE_RUNNER_LANE_REPOS": "", "ACCEPTANCE_RUNNER_STORE_DIR": "",
 }
+RUNNER_PROJECT_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}\Z")      # the runner's own project key
 CONF_KEYS = set(CONF_REQUIRED) | set(CONF_DEFAULTS)
 # Left invalid on purpose, so an unedited copy of the example cannot run.
 CONF_UNEDITED = {"DISPATCHER_CONFIG": "/opt/example-dispatcher/config.json",
@@ -193,6 +197,12 @@ def validate_conf(values, invoking_user=None):
          "ACCEPTANCE_MCP_CONFIG is inside the Playwright or browser folder: it must be a file of its own")
     need(c.get("ACCEPTANCE_LOOK_CONFIG_DIR") != c.get("ACCEPTANCE_LOOK_RECORD_DIR"),
          "ACCEPTANCE_LOOK_CONFIG_DIR and ACCEPTANCE_LOOK_RECORD_DIR are one folder")
+    lane = runner_lane_entries(c)
+    need(lane is not None, "ACCEPTANCE_RUNNER_LANE_REPOS must list OWNER/NAME:PROJECT entries, each repository one of "
+                           "ACCEPTANCE_REPOS and each project a key of the runner's settings")
+    store = c.get("ACCEPTANCE_RUNNER_STORE_DIR") or ""
+    need(not lane or path_ok(store), "ACCEPTANCE_RUNNER_STORE_DIR must be the runner's store, `~/…` or an absolute path "
+                                     "with no `..`, while a repository is named in ACCEPTANCE_RUNNER_LANE_REPOS")
     need("ROLE_KIT_CLONE" in bad or c["ROLE_KIT_CLONE"].rstrip("/") == se.ROLE_KIT_CLONE_PATH,
          "ROLE_KIT_CLONE is not Stage E's clone, %s" % se.ROLE_KIT_CLONE_PATH)
     clone = ns.resolve_path(c["ROLE_KIT_CLONE"], ns.ROLE_HOME_SENTINEL) if "ROLE_KIT_CLONE" not in bad else None
@@ -201,6 +211,19 @@ def validate_conf(values, invoking_user=None):
         need(k in bad or clone is None or not ns._under(ns.resolve_path(c[k], ns.ROLE_HOME_SENTINEL), clone),
              "%s is inside ROLE_KIT_CLONE, a git working tree" % k)
     return c, e
+
+
+def runner_lane_entries(c):
+    """{OWNER/NAME: project} from ACCEPTANCE_RUNNER_LANE_REPOS (KIT-708), {} while it is empty, or None when an entry is
+    not OWNER/NAME:PROJECT for a repository of ACCEPTANCE_REPOS."""
+    repos, out = set(r.lower() for r in split_list(c.get("ACCEPTANCE_REPOS"))), {}
+    for entry in split_list(c.get("ACCEPTANCE_RUNNER_LANE_REPOS") or ""):
+        repo, sep, project = entry.rpartition(":")
+        if not (sep and arun.REPO_RE.match(repo) and repo.lower() in repos and RUNNER_PROJECT_RE.match(project)
+                and repo.lower() not in out):
+            return None
+        out[repo.lower()] = project
+    return out
 
 
 def load_conf(path, user=None):
@@ -240,6 +263,9 @@ def compose(c, home):
            "look_base_config": role(c, "ACCEPTANCE_LOOK_BASE", home), "look_config_dir": role(c, "ACCEPTANCE_LOOK_CONFIG_DIR", home),
            "look_record_dir": role(c, "ACCEPTANCE_LOOK_RECORD_DIR", home),
            "time_limit_minutes": whole(c["ACCEPTANCE_TIME_LIMIT_MINUTES"]), "max_starts_per_pass": whole(c["ACCEPTANCE_MAX_STARTS"])}
+    lane = runner_lane_entries(c)
+    if lane:                                             # KIT-708: the runner's store, and each repository's project
+        run["runner_lane"] = {"store_dir": role(c, "ACCEPTANCE_RUNNER_STORE_DIR", home), "repos": lane}
     base_text = json.dumps(base, indent=2, sort_keys=True) + "\n"
     run_text = json.dumps(run, indent=2, sort_keys=True) + "\n"
     with tempfile.TemporaryDirectory(prefix="acceptance-setup-judge-") as tmp:
@@ -1181,6 +1207,16 @@ def _cases(check, tmp):
           ([MCP_SERVER], ["--config-dir", run_doc["look_config_dir"]], True))
     check("compose: a composition the live pass's loader refuses is refused in its words",
           str(quiet(lambda: compose(dict(conf, TEAM_KEY="x"), fake.home))[0])[:44], "REFUSED by the live pass's own loader: confi")
+    lane_conf = dict(conf, ACCEPTANCE_RUNNER_LANE_REPOS="acme/app:app", ACCEPTANCE_RUNNER_STORE_DIR="~/.pipeline-runner/store")
+    check("compose (KIT-708): the runner's lane names the runner's store and the repository's project, and the live pass's "
+          "own loader takes it; with none named the config has no runner lane",
+          (json.loads(compose(lane_conf, fake.home)["run"]).get("runner_lane"), "runner_lane" in run_doc,
+           validate_conf(lane_conf, person)[1]),
+          ({"store_dir": fake.home + "/.pipeline-runner/store", "repos": {"acme/app": "app"}}, False, []))
+    check("conf (KIT-708): a runner lane for a repository the check does not cover, or with no store, is refused", [
+        refused("ACCEPTANCE_RUNNER_LANE_REPOS must", ACCEPTANCE_RUNNER_LANE_REPOS="other/repo:app"),
+        refused("ACCEPTANCE_RUNNER_LANE_REPOS must", ACCEPTANCE_RUNNER_LANE_REPOS="acme/app:App"),
+        refused("ACCEPTANCE_RUNNER_STORE_DIR must", ACCEPTANCE_RUNNER_LANE_REPOS="acme/app:app")], [True] * 3)
 
     # under a model
     fake, conf = world()

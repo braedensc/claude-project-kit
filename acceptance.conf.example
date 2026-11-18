@@ -44,3 +44,10 @@ LOOK_TIMEOUT_SECONDS=300
 BASE_REF=origin/main
 BASE_GIT_DIR=
 CONFIG_BACKUPS_KEPT=5
+
+# --- optional: our own runner (KIT-708, docs/ACCEPTANCE-POLLER-OPERATOR.md "On the runner's lane") -----------------
+# Repositories whose checks may go to our own runner, as OWNER/NAME:PROJECT (PROJECT is its key in the runner's
+# settings), and the runner's store. This switches nothing: a check goes to the runner only while the runner's own
+# lanes.acceptance is on for that project. EMPTY: every check files its ticket, as before.
+ACCEPTANCE_RUNNER_LANE_REPOS=
+ACCEPTANCE_RUNNER_STORE_DIR=

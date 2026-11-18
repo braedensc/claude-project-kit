@@ -68,6 +68,10 @@ The acceptance poller's live pass writes one config per check into that folder b
 tool takes **the one config whose `worktree` is the folder it was started in**. The dispatcher starts the session there,
 and the session cannot change it. No config naming it, or more than one, is a refusal, said in words.
 
+On the runner's lane (KIT-708) our own runner starts the tool the same way, from its own copy of the kit, with
+`--config-dir` set to its `look_config_dir`. The live pass names the runner's workspace for the plan's last piece in the
+config, and names the file for that piece, so a later check of the piece replaces it (`docs/RUNNER.md`).
+
 The tool looks for its config file again at every run. When the live pass stops a check past its time limit, it removes
 the file, and every run after that is refused.
 

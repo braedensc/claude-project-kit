@@ -117,7 +117,9 @@ The acceptance check posts its follow-up requests on the plan's epic, with your 
 under the mark in contract §25. The poller files one only when all three hold:
 
 - line 1 is the mark, whole:
-  `<!-- pipeline-acceptance:finding plan=<epic> head=<sha> run=<ticket> -->`;
+  `<!-- pipeline-acceptance:finding plan=<epic> head=<sha> run=<check> -->`. The check is its
+  acceptance ticket, or on the runner's lane its start request's id, `rq-` and 32 hex
+  characters (KIT-708);
 - the plan it names is the ticket the comment is on;
 - its author is the poller's own tracker user. The poller asks the tracker once a pass, and
   only when a request needs it.
