@@ -54,6 +54,14 @@ WHAT IT DOES, IN ORDER
   3b. The sweep (`scripts/pipeline_sweep_setup.py run`), when this Mac has a `sweep.conf`:
      it installs the job that removes what finished dispatcher runs left, and never loads
      it. Its card (CK-S1) is yours and does not hold the idea gate back.
+  3c. The notifier (`scripts/pipeline_notifier_setup.py`), when this Mac has a `notifier.conf`
+     (`--notifier-conf` names another). It runs the installer's own `run --dry-run`, shown as
+     it runs. Exit 0 is "up to date". A step table with a WOULD-CHANGE row is work: it asks,
+     then runs `run` on a yes ("updated"). Only a card left (a job to load, a ping to watch)
+     is "waiting on you": nothing is asked, because `run` cannot clear it. A dry run that
+     printed no table, or ended with any other code, is never "up to date". A `run` that ends
+     on a card stops the command in Manual and is carried past in Automatic. With no
+     `notifier.conf` the part is "off on this Mac" and nothing runs.
   4. The idea gate (`scripts/pipeline_stage_a_setup.py run`). On a first run it writes
      its own settings from what the review installer's settings already say. Then it
      works through its steps, asking before each one that changes something a person
@@ -125,7 +133,7 @@ TO ONLY LOOK: --check (KIT-736)
 
 Usage:
     pipeline_install.py [--conf stage-a.conf] [--stage-e-conf stage-e.conf]
-                        [--no-pull] [--skip-stage-e]
+                        [--no-pull] [--skip-stage-e] [--notifier-conf notifier.conf]
     pipeline_install.py --check [--conf stage-a.conf] [--stage-e-conf stage-e.conf]
                         [--sweep-conf sweep.conf] [--skip-stage-e]
     pipeline_install.py --selftest
@@ -174,6 +182,7 @@ SKILLS = os.path.join(HERE, "sync_user_skills.py")
 STAGE_E = os.path.join(HERE, "pipeline_stage_e_setup.py")
 STAGE_A = os.path.join(HERE, "pipeline_stage_a_setup.py")
 SWEEP_SETUP = os.path.join(HERE, "pipeline_sweep_setup.py")
+NOTIFIER_SETUP = os.path.join(HERE, "pipeline_notifier_setup.py")
 
 # What each installer's exit code means, in a sentence a person can act on. The codes are
 # the installers' own (their docstrings); an unknown one is passed through as it is.
@@ -252,6 +261,35 @@ class Io(object):
                 child = subprocess.Popen(argv, cwd=KIT, preexec_fn=lambda: signal.signal(
                     signal.SIGINT, signal.SIG_DFL))
                 return child.wait(), ""
+            finally:
+                signal.signal(signal.SIGINT, previous)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return 127, str(exc)
+
+    def run_seen(self, argv):
+        """(exit code, output): the installer's lines go to the person as they come, and are
+        also kept, so this command can read what the installer found. Standard input stays
+        the person's terminal, so a password prompt still works. Ctrl-C belongs to the
+        installer, as in `run`."""
+        import signal
+        kept = []
+        try:
+            previous = signal.signal(signal.SIGINT,
+                                     lambda _s, _f: setattr(self, "interrupted", True))
+            try:
+                # The child writes into a pipe, which a Python child buffers by blocks. Unbuffered, so
+                # an installer's words (why it needs the Mac password) arrive before sudo asks.
+                child = subprocess.Popen(argv, cwd=KIT, stdout=subprocess.PIPE,
+                                         stderr=subprocess.STDOUT,
+                                         env=dict(os.environ, PYTHONUNBUFFERED="1"),
+                                         preexec_fn=lambda: signal.signal(signal.SIGINT,
+                                                                          signal.SIG_DFL))
+                for raw in iter(child.stdout.readline, b""):
+                    text = raw.decode("utf-8", "replace")
+                    kept.append(text)
+                    sys.stdout.write(text)
+                    sys.stdout.flush()
+                return child.wait(), "".join(kept)
             finally:
                 signal.signal(signal.SIGINT, previous)
         except (OSError, subprocess.SubprocessError) as exc:
@@ -762,6 +800,86 @@ def step_sweep(io, conf, rep):
     return stop(io, "the sweep's installer stopped with exit %d. The lines above say why." % code, code)
 
 
+# What an installer that prints the Stage E step table says: a row whose outcome is WOULD-CHANGE
+# is work its `run` would do; a row that is only a card is work for a person, which running it
+# again cannot clear. The notifier installer prints this table; this file's selftest pins the
+# word against the installer's own constant.
+STEP_TABLE = "-- steps --"
+WOULD_CHANGE_ROW = re.compile(r"^\s+\S+\s+WOULD-CHANGE(\s|$)", re.M)
+
+
+def would_change(text):
+    """True when the dry run's step table has work its `run` would do. A dry run that printed
+    no table says nothing about what it found, so that counts as work too: it is asked about,
+    and never read as up to date."""
+    return STEP_TABLE not in (text or "") or bool(WOULD_CHANGE_ROW.search(text or ""))
+
+
+# The steps that run an optional job's installer when its settings file is on this Mac: look
+# first with the installer's own read-only pass, ask only when there is work, run it on a yes.
+# `note` is said before the question, for what a run of it may do.
+JOB_STEPS = (
+    {"key": "notifier", "number": "3c", "title": "The notifier, what pages you",
+     "noun": "The notifier", "conf": "notifier.conf", "script": NOTIFIER_SETUP,
+     "look": ["run", "--dry-run"], "apply": ["run"],
+     "note": "It writes the notifier's settings and its job file as the role account; it "
+             "never loads the job."},
+)
+
+
+def step_job(io, spec, files, rep):
+    """None to carry on, or an exit code. See JOB_STEPS."""
+    key, noun = spec["key"], spec["noun"]
+    heading(io, "%s. %s" % (spec["number"], spec["title"]))
+    conf = files[spec["conf"]]
+    if not io.exists(conf):
+        rep.note(key, OUT_OFF, missing(conf))
+        io.say("No %s, so %s is not set up on this Mac. Copy %s.example to switch it on."
+               % (os.path.relpath(conf, KIT), noun.lower(), spec["conf"]))
+        return None
+    base = [sys.executable, spec["script"]]
+    code, out = io.run_seen(base + spec["look"] + ["--conf", conf])
+    if io.interrupted:
+        rep.note(key, OUT_UNMEASURED, "interrupted during its check")
+        return stop(io, INTERRUPTED % (noun + "'s check"), code or EX_BLOCKED)
+    if code == 0:
+        io.say("")
+        io.say("%s is up to date. Nothing to do." % noun)
+        rep.note(key, OUT_OK)
+        return None
+    if code != EX_BLOCKED:
+        rep.note_code(key, code, "its check")
+        return stop(io, "%s's check stopped with exit %d. The lines above say why."
+                    % (noun, code), code)
+    if not would_change(out):
+        io.say("")
+        io.say("%s has nothing to change; what is left is for you, named above." % noun)
+        rep.note(key, OUT_WAITING, "a card is still yours", card_only=True)
+        return None
+    io.say("")
+    io.say("%s is not up to date: the check above names what would change." % noun)
+    io.say(spec["note"])
+    if not io.ask("Update %s now?" % noun.lower()):
+        rep.note(key, OUT_WAITING, "behind; you did not update it")
+        return None
+    code, _out = io.run(base + spec["apply"] + ["--conf", conf])
+    if io.interrupted:
+        rep.note(key, OUT_UNMEASURED, "interrupted during its installer")
+        return stop(io, INTERRUPTED % (noun + "'s installer"), code or EX_BLOCKED)
+    io.say("")
+    if code == 0:
+        io.say("%s is up to date." % noun)
+        rep.note(key, OUT_UPDATED)
+        rep.asked.add(key)
+        return None
+    rep.note_code(key, code, "its installer")
+    if code == EX_BLOCKED and io.auto:
+        io.say("%s waits for you at the card above. Carrying on; come back to it." % noun)
+        return None
+    return stop(io, "%s's installer stopped with exit %d. The lines above say why; do what "
+                    "they say, then run this command again." % (noun, code), code)
+
+
 def step_stage_a(io, conf, stage_e_conf, rep):
     heading(io, "4. The idea gate")
     before = look_first(io, rep, "stage_a")
@@ -1167,7 +1285,8 @@ def step_write_settings(io, writes):
 # The step of this command that acts on a part is found from the part's own installer or
 # check script, never from a list of part ids, so a new part is picked up from the list.
 STEP_OF_SCRIPT = {"sync_user_skills.py": "skills", "pipeline_stage_e_setup.py": "stage_e",
-                  "pipeline_sweep_setup.py": "sweep", "pipeline_stage_a_setup.py": "stage_a"}
+                  "pipeline_sweep_setup.py": "sweep", "pipeline_stage_a_setup.py": "stage_a",
+                  "pipeline_notifier_setup.py": "notifier"}
 
 
 def step_of(part):
@@ -1499,7 +1618,8 @@ def look_only(io, args):
     io.say(ONLY_LOOKED)
     files = {"stage-a.conf": os.path.abspath(args.conf),
              "stage-e.conf": os.path.abspath(args.stage_e_conf),
-             "sweep.conf": os.path.abspath(args.sweep_conf)}
+             "sweep.conf": os.path.abspath(args.sweep_conf),
+             "notifier.conf": os.path.abspath(args.notifier_conf)}
     rep, parts, unreadable = Report(), [], None
     try:
         parts = io.parts()
@@ -1550,6 +1670,9 @@ def main(argv=None, io=None):
                         help="use this checkout as it is, without pulling")
     parser.add_argument("--sweep-conf", default=os.path.join(KIT, "sweep.conf"),
                         help="the sweep's settings (default: sweep.conf in the kit; absent skips it)")
+    parser.add_argument("--notifier-conf", default=os.path.join(KIT, "notifier.conf"),
+                        help="the notifier's settings (default: notifier.conf in the kit; "
+                             "absent skips it)")
     parser.add_argument("--skip-stage-e", action="store_true",
                         help="do not check or update the review jobs")
     parser.add_argument("--check", action="store_true", help="only look: change nothing, ask nothing, no terminal needed")
@@ -1597,7 +1720,8 @@ def main(argv=None, io=None):
     # the end says so, in words.
     files = {"stage-a.conf": os.path.abspath(args.conf),
              "stage-e.conf": os.path.abspath(args.stage_e_conf),
-             "sweep.conf": os.path.abspath(args.sweep_conf)}
+             "sweep.conf": os.path.abspath(args.sweep_conf),
+             "notifier.conf": os.path.abspath(args.notifier_conf)}
     rep = Report()
     parts, unreadable = [], None
     try:
@@ -1647,8 +1771,9 @@ def main(argv=None, io=None):
              lambda: step_checkout(io, argv, args.no_pull, rep, args.pulled_from, mode),
              lambda: step_skills(io, rep),
              lambda: step_stage_e(io, files["stage-e.conf"], args.skip_stage_e, rep),
-             lambda: step_sweep(io, files["sweep.conf"], rep),
-             lambda: step_stage_a(io, files["stage-a.conf"], files["stage-e.conf"], rep))
+             lambda: step_sweep(io, files["sweep.conf"], rep)) \
+        + tuple((lambda spec=spec: step_job(io, spec, files, rep)) for spec in JOB_STEPS) \
+        + (lambda: step_stage_a(io, files["stage-a.conf"], files["stage-e.conf"], rep),)
     code, reached, stopped = None, True, False
     try:
         for n, step in enumerate(steps):
@@ -1740,8 +1865,21 @@ class FakeIo(Io):
         script = os.path.basename(argv[1])
         return " ".join([script] + [a for a in argv[2:3] if not a.startswith("/")])
 
+    seen_out = {}                          # program key -> the lines run_seen returns for it
+
+    def run_seen(self, argv):
+        """Scripted like `run`; the lines it returns are `seen_out[key]`."""
+        code, _out = self.run(argv)
+        return code, self.seen_out.get(self.ran[-1], "")
+
     def run(self, argv, capture=False):
         k = self.key(argv)
+        if argv[0] != "git":
+            # A flag after the subcommand tells a look from the real thing: `run --dry-run`
+            # from `run`, `install` from `install --apply`.
+            for flag in ("--dry-run", "--apply"):
+                if flag in argv[3:] and not k.endswith(flag):
+                    k += " " + flag
         self.ran.append(k)
         self.argvs.append(list(argv))
         if argv[0] == "git":
@@ -2242,9 +2380,11 @@ def selftest():
         fh.write("ROLE_ACCOUNT=_x\n")
     a_conf = os.path.join(tmp, "stage-a.conf")
     sweep_conf = os.path.join(tmp, "sweep.conf")                  # absent: the sweep is skipped
+    notifier_conf = os.path.join(tmp, "notifier.conf")           # absent: the notifier is off
     base = ["--conf", a_conf, "--stage-e-conf", se_conf, "--sweep-conf", sweep_conf]
     healthy = {"sync_user_skills.py": 0, "pipeline_stage_e_setup.py verify": 0,
-               "pipeline_stage_a_setup.py run": 0}
+               "pipeline_stage_a_setup.py run": 0,
+               "pipeline_notifier_setup.py run --dry-run": 0}      # asked only where notifier.conf is present
 
     def go(codes=None, answers=(), argv=None, **kw):
         io = FakeIo(codes=dict(healthy, **(codes or {})), answers=answers, **kw)
@@ -2482,6 +2622,104 @@ def selftest():
               (code, "pipeline_stage_a_setup.py run" in io.ran), (rc, False))
     os.unlink(sweep_conf)
 
+    # 6c. THE NOTIFIER (KIT-583): its own dry run first, a question only when there is work, its `run` on a yes,
+    #     and an outcome by name. An unmeasured step is never up to date.
+    import contextlib
+    import io as stdio
+    import pipeline_notifier_setup as notifier_setup
+    look, apply_ = "pipeline_notifier_setup.py run --dry-run", "pipeline_notifier_setup.py run"
+
+    def table(*rows):
+        """A dry run's step table, printed by the notifier installer's own function."""
+        buf = stdio.StringIO()
+        with contextlib.redirect_stdout(buf):
+            notifier_setup._print_rows(list(rows))
+        return buf.getvalue()
+
+    work = table(("job", notifier_setup.WOULD_CHANGE, "the plist is not installed"),
+                 ("enable", notifier_setup.BLOCKED, "CK-N3: you load it"))
+    cards = table(("job", notifier_setup.ALREADY_DONE, "installed"),
+                  ("enable", notifier_setup.BLOCKED, "CK-N3: you load it"))
+    check("notifier-pin-would-change-word", (notifier_setup.WOULD_CHANGE, would_change(work),
+                                             would_change(cards), would_change("")),
+          ("WOULD-CHANGE", True, False, True))
+
+    def notifier(codes=None, seen=None, answers=(), interrupt=(), **kw):
+        io = FakeIo(codes=dict(healthy, **(codes or {})), answers=answers, **kw)
+        io.seen_out = dict(seen or {})
+        io.interrupt_on = set(interrupt or ())
+        return main(base + ["--notifier-conf", notifier_conf], io=io), io
+
+    def outcome(io, part="paging"):
+        return [(r["outcome"], r["detail"]) for r in io.records if r["id"] == part]
+
+    code, io = notifier()
+    check("notifier-no-conf-is-off-and-not-run",
+          (code, [k for k in io.ran if "notifier" in k], outcome(io)),
+          (EX_OK, [], [(OUT_OFF, "no notifier.conf in %s" % tmp)]))
+    with open(notifier_conf, "w") as fh:
+        fh.write("DM_USER_IDS=U1\n")
+    code, io = notifier({look: 0})
+    check("notifier-current-is-up-to-date-and-asks-nothing",
+          (code, io.ran.count(apply_), io.asked, outcome(io)), (EX_OK, 0, [], [(OUT_OK, "")]))
+    code, io = notifier({look: 10, apply_: 0}, {look: work}, answers=[True])
+    check("notifier-work-asked-then-run-then-updated",
+          (code, [k for k in io.ran if "notifier" in k or "stage_a" in k], len(io.asked), outcome(io)),
+          (EX_OK, [look, apply_, "pipeline_stage_a_setup.py run"], 1, [(OUT_UPDATED, "")]))
+    code, io = notifier({look: 10}, {look: work}, answers=[False])
+    check("notifier-declined-is-waiting-and-changes-nothing",
+          (code, io.ran.count(apply_), "pipeline_stage_a_setup.py run" in io.ran, outcome(io)),
+          (EX_BLOCKED, 0, True, [(OUT_WAITING, "behind; you did not update it")]))
+    code, io = notifier({look: 10}, {look: cards})
+    check("notifier-cards-only-asks-nothing-runs-nothing-is-waiting",
+          (code, io.asked, io.ran.count(apply_), "pipeline_stage_a_setup.py run" in io.ran, outcome(io)),
+          (EX_BLOCKED, [], 0, True, [(OUT_WAITING, "a card is still yours")]))
+    code, io = notifier({look: 10, apply_: 0}, {look: "no table here"}, answers=[True])
+    check("notifier-a-dry-run-with-no-table-is-asked-about-never-current",
+          (code, len(io.asked), outcome(io)), (EX_OK, 1, [(OUT_UPDATED, "")]))
+    code, io = notifier({look: 10, apply_: 10}, {look: work}, answers=[True])
+    check("notifier-a-run-ending-on-a-card-stops-in-manual",
+          (code, "pipeline_stage_a_setup.py run" in io.ran, [o for o, _d in outcome(io)]),
+          (EX_BLOCKED, False, [OUT_WAITING]))
+    code, io = notifier({look: 10, apply_: 10}, {look: work}, typed=["1", "yes"])
+    check("notifier-a-run-ending-on-a-card-is-carried-past-in-automatic",
+          (code, "pipeline_stage_a_setup.py run" in io.ran, [o for o, _d in outcome(io)]),
+          (EX_BLOCKED, True, [OUT_WAITING]))
+    for rc in (1, 2, 3, 4, 5, 77):
+        code, io = notifier({look: rc})
+        check("notifier-check-exit-%d-stops-never-current" % rc,
+              (code, "pipeline_stage_a_setup.py run" in io.ran, outcome(io)[0][0] != OUT_OK),
+              (rc, False, True))
+    for rc in (1, 4):
+        code, io = notifier({look: 10, apply_: rc}, {look: work}, answers=[True])
+        check("notifier-installer-exit-%d-stops-unmeasured" % rc,
+              (code, "pipeline_stage_a_setup.py run" in io.ran, [o for o, _d in outcome(io)]),
+              (rc, False, [OUT_UNMEASURED]))
+    code, io = notifier({look: 0}, interrupt={look})
+    check("notifier-ctrl-c-in-its-check-stops-the-run",
+          (code, "pipeline_stage_a_setup.py run" in io.ran), (EX_BLOCKED, False))
+
+    # A line an installer prints arrives while it is still running, not when it ends (a buffered child would
+    # show sudo's bare prompt first). The child waits for the line to reach this program's own output.
+    marker = os.path.join(tmp, "line-arrived")
+    child_code = ("import os, time\nprint('early')\nfor _ in range(100):\n"
+                  "    if os.path.exists(%r):\n        break\n    time.sleep(0.1)\n"
+                  "print('late' if os.path.exists(%r) else 'never')\n" % (marker, marker))
+
+    class Watching(object):
+        def write(self, text):
+            if "early" in text:
+                open(marker, "w").close()
+        def flush(self):
+            pass
+    real_out, sys.stdout = sys.stdout, Watching()
+    try:
+        got = Io().run_seen([sys.executable, "-c", child_code])
+    finally:
+        sys.stdout = real_out
+    check("run-seen-passes-a-line-on-while-the-child-is-still-running", got, (0, "early\nlate\n"))
+    os.unlink(notifier_conf)
+
     # 7. CTRL-C REACHES THE INSTALLER AND ITS CLEAN-UP RUNS TO THE END. Real processes:
     #    a terminal's Ctrl-C goes to the whole process group, and a wrapper that did not
     #    step aside would kill the installer a quarter of a second in.
@@ -2622,7 +2860,11 @@ def selftest():
     check("lines-waiting-says-nothing-is-waiting-never",
           "Nothing is waiting on you." in io.lines, False)
     paging_conf = kit_file("notifier.conf")
-    io = FakeIo(codes=dict(healthy))
+    waker_conf = kit_file("conflict-waker.conf")    # a part with a check and no step of its own
+    # The notifier is a step now: its dry run ends on a card alone, and its own check is read once
+    # more for the card ids.
+    io = FakeIo(codes=dict(healthy, **{"pipeline_notifier_setup.py run --dry-run": 10}))
+    io.seen_out = {"pipeline_notifier_setup.py run --dry-run": "-- steps --\n  enable   BLOCKED-ON-HUMAN  CK-N3\n"}
     io.present = {paging_conf}
     io.measure_codes = {"pipeline_notifier_setup.py run": 10}
     io.measure_out = {"pipeline_notifier_setup.py run": "CK-N1 is yours\nthen CK-N3 and CK-N10"}
@@ -2671,19 +2913,19 @@ def selftest():
     for name, measured in (("exit-1", 1), ("exit-4", 4), ("exit-5-no-password", 5),
                            ("did-not-finish", None)):
         io = FakeIo(codes=dict(healthy))
-        io.present = {paging_conf}
-        io.measure_codes = {"pipeline_notifier_setup.py run": measured}
+        io.present = {waker_conf}
+        io.measure_codes = {"pipeline_conflict_waker_setup.py run": measured}
         code = main(base, io=io)
         check("lines-check-%s-is-unmeasured-and-exits-4" % name,
-              (by_id(io)["paging"], code), (OUT_UNMEASURED, EX_UNMEASURED))
+              (by_id(io)["conflict-fixer"], code), (OUT_UNMEASURED, EX_UNMEASURED))
     for name, rc, words in (("exit-5", 5, ""), ("its-own-words", 1, "Mac password needed to continue")):
         io = FakeIo(codes=dict(healthy))
-        io.present = {paging_conf}
-        io.measure_codes = {"pipeline_notifier_setup.py run": rc}
-        io.measure_out = {"pipeline_notifier_setup.py run": words}
+        io.present = {waker_conf}
+        io.measure_codes = {"pipeline_conflict_waker_setup.py run": rc}
+        io.measure_out = {"pipeline_conflict_waker_setup.py run": words}
         main(base, io=io)
         check("lines-password-%s-detail" % name,
-              [r["detail"] for r in io.records if r["id"] == "paging"],
+              [r["detail"] for r in io.records if r["id"] == "conflict-fixer"],
               ["it needs your Mac password, which a check run without a terminal cannot ask for"])
     code, io = go(argv=["--no-pull"])
     check("lines-own-no-pull-is-unmeasured",
@@ -2712,15 +2954,15 @@ def selftest():
     check("lines-skipped-stage-e-is-unmeasured-not-up-to-date",
           (by_id(io)["review"], code), (OUT_UNMEASURED, EX_UNMEASURED))
     io = FakeIo(codes=dict(healthy))
-    io.present = {paging_conf, kit_file("update.conf")}
-    io.measure_codes = {"pipeline_notifier_setup.py run": 10, "pipeline_watch.py --conf": 1}
+    io.present = {waker_conf, kit_file("update.conf")}
+    io.measure_codes = {"pipeline_conflict_waker_setup.py run": 10, "pipeline_watch.py --conf": 1}
     code = main(base, io=io)
     check("lines-unmeasured-outranks-waiting", code, EX_UNMEASURED)
     code, io = go(codes={"pipeline_stage_a_setup.py run": 10})
     check("lines-the-idea-gate-at-10-still-exits-10", code, EX_BLOCKED)
     io = FakeIo(codes=dict(healthy, **{"pipeline_stage_a_setup.py run": 10}))
-    io.present = {paging_conf}
-    io.measure_codes = {"pipeline_notifier_setup.py run": 1}
+    io.present = {waker_conf}
+    io.measure_codes = {"pipeline_conflict_waker_setup.py run": 1}
     check("lines-the-idea-gate-at-10-with-an-unmeasured-part-exits-4",
           main(base, io=io), EX_UNMEASURED)
     check("lines-another-code-of-the-idea-gate-is-passed-through",
@@ -2745,19 +2987,19 @@ def selftest():
           (code, by_id(io)["review"], by_id(io)["idea-gate"]),
           (EX_BLOCKED, OUT_WAITING, OUT_NOT_REACHED))
     io = FakeIo(codes=dict(healthy))
-    io.present = {paging_conf}
+    io.present = {waker_conf}
     io.interrupt_on.add("sync_user_skills.py")
     code = main(base, io=io)
     got = by_id(io)
     check("lines-ctrl-c-prints-the-lines-and-runs-no-more-checks",
-          (code != EX_OK, got["skills"], got["idea-gate"], got["paging"], io.measured),
+          (code != EX_OK, got["skills"], got["idea-gate"], got["conflict-fixer"], io.measured),
           (True, OUT_UNMEASURED, OUT_NOT_REACHED, OUT_NOT_REACHED, []))
     io = FakeIo(codes=dict(healthy))
-    io.present = {paging_conf}
+    io.present = {waker_conf}
     io.interrupt_on.add("pipeline_stage_a_setup.py run")
     code = main(base, io=io)
     check("lines-ctrl-c-in-the-last-step-runs-no-more-checks",
-          (code != EX_OK, by_id(io)["idea-gate"], by_id(io)["paging"], "pipeline_notifier_setup.py run" in io.measured),
+          (code != EX_OK, by_id(io)["idea-gate"], by_id(io)["conflict-fixer"], "pipeline_conflict_waker_setup.py run" in io.measured),
           (True, OUT_UNMEASURED, OUT_NOT_REACHED, False))
     code, io = go(git_state={"rev-parse HEAD": [(0, "aaa"), (0, "bbb")]})
     check("lines-a-restart-that-returns-is-not-a-pass", code, EX_UNMEASURED)
@@ -2783,7 +3025,7 @@ def selftest():
     check("lines-steps-are-found-from-the-list",
           (keys["one-command"], keys["skills"], keys["cleanup"], keys["idea-gate"],
            set(k for k in keys.values() if k) == set(["checkout", "skills", "stage_e",
-                                                      "sweep", "stage_a"]),
+                                                      "sweep", "stage_a", "notifier"]),
            all(keys[pt["id"]] == "stage_e" for pt in real
                if pt["check"] and pt["check"]["script"].endswith("pipeline_stage_e_setup.py"))),
           ("checkout", "skills", "sweep", "stage_a", True, True))
