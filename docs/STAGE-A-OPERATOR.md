@@ -360,6 +360,8 @@ What it does, in order:
      record keeps them:
      - a name in the session's own list that the log does not give it, even `Bash`: the
        log, not that list, judges the session;
+     - a tool the log gives the session that its own list leaves out. A helper's list may
+       name fewer tools, and that is not reported;
      - a server or rule named only in a sentence, like `mcp__linear__*`;
      - a line that may name a tool and is not one name, such as `Read (and Bash)` or
        `I also hold Bash and Write`. A sentence may say a tool is held or that it is not.

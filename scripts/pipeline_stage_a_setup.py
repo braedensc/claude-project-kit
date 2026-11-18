@@ -4189,10 +4189,11 @@ X_NOT_IN_LOG = "names %s, which the session's log does not hold"
 X_RULE = "names %s only in a sentence"
 X_LOOSE = 'has a line that may name a tool: "%s"'
 X_NO_NAMES = "names no tool the probe could read"
+X_LEFT_OUT = "leaves out %s, which the log gives the session"
 CROSS_CHECK_SHOWN = 3
 
 
-def cross_check_list(text, measured):
+def cross_check_list(text, measured, whole=False):
     """[(finding, detail)] for ONE list of the session's own answer, read against the log's
     list `measured`; [] when the list agrees with it.
 
@@ -4200,7 +4201,12 @@ def cross_check_list(text, measured):
     keep-set (for the session's list, the log has already judged it; for the helper's, it has
     already stopped the probe). So is every server or rule named only in a sentence, and every
     line that may name a tool and was not read as one (KIT-734). With no log, `measured` is
-    None and nothing is said about what the log holds."""
+    None and nothing is said about what the log holds.
+
+    `whole` is for the session's own list, which should name what the log gives the session:
+    the tools it leaves out are one finding more, so "agrees with the log" is said only when the
+    two match (Stage E on #613). A helper may hold fewer tools than its session, so its list is
+    never `whole`."""
     text = (text or "").strip()
     if not text:
         return [(X_NOTHING, "")]
@@ -4215,12 +4221,17 @@ def cross_check_list(text, measured):
     out.extend((X_LOOSE, line[:100]) for line in loose)
     if not names:
         out.append((X_NO_NAMES, ""))
+    elif whole and measured:
+        left = [name for name in measured if name not in names]
+        if left:
+            out.append((X_LEFT_OUT, ", ".join(left)))
     return out
 
 
 def cross_check(sections, measured):
     """{list: [(finding, detail)]} for both lists of the session's own answer (KIT-796)."""
-    return dict((which, cross_check_list(sections.get(which), measured))
+    return dict((which, cross_check_list(sections.get(which), measured,
+                                         whole=which == "session tools"))
                 for which in TOOL_LISTS)
 
 
@@ -4248,11 +4259,13 @@ def say_cross_check(ctx, found, measured):
 
 
 def cross_check_note(found):
-    """The record's words for the cross-check: one clause per list."""
+    """The record's words for the cross-check: one clause per list. A long detail is cut at
+    60 characters and marked `[cut]`, never cut silently."""
     parts = []
     for which in TOOL_LISTS:
         rows = found.get(which) or []
-        said = [_finding(f, d[:60]) for f, d in rows[:CROSS_CHECK_SHOWN]]
+        said = [_finding(f, d if len(d) <= 60 else d[:60] + " [cut]")
+                for f, d in rows[:CROSS_CHECK_SHOWN]]
         if len(rows) > CROSS_CHECK_SHOWN:
             said.append("%d more" % (len(rows) - CROSS_CHECK_SHOWN))
         parts.append("%s list %s" % (_LIST_NAME[which], ", ".join(said) if said
@@ -6801,13 +6814,24 @@ def _selftest_one_command(check, tmp):
           ('fence judged by code, nothing asked: the dispatcher\'s log gave PROD-100\'s session '
            '"Read, Grep, Glob, Task, Agent" (5 tools, all in the keep-set)' in note_of(c),
            "the helper's own list: 3 tools, all in the keep-set" in note_of(c),
-           "session list agrees with the log; helper list agrees with the log" in note_of(c),
            said(c, "fence: judged by code, nothing asked. The dispatcher's log gives the "
                    "session 5 tools, all in the keep-set")),
-          (True, True, True, True))
+          (True, True, True))
     # KIT-215: the log says whether the read was attempted; only then does an answer count.
     check("probe-log-read-attempted-not-returned",
           list(c.state.data["notes"].get("probe_canary", {}).values()), ["NOT-RETURNED"])
+    # The session's own list here names four of the log's five tools. Leaving one out is said,
+    # and "agrees with the log" is written only when the two match (Stage E on #613). A helper
+    # may hold fewer tools than its session, so its list is never held to the whole log.
+    check("probe-session-list-that-leaves-a-tool-out-is-reported",
+          (said(c, "session list: leaves out Agent, which the log gives the session."),
+           "session list leaves out Agent, which the log gives the session; helper list "
+           "agrees with the log" in note_of(c)), (True, True))
+    got, c = with_log("probe-log-matches-the-answer", ["Read", "Grep", "Glob", "Task"])
+    check("probe-session-list-that-matches-the-log-agrees",
+          (got, with_log.asked, "session list agrees with the log; helper list agrees with "
+           "the log" in note_of(c), said(c, "session list: agrees with the log.")),
+          ("signed", SIGNED_ASKS, True, True))
     got, c = with_log("probe-log-no-read", ["Read", "Grep", "Glob", "Task"], read=False)
     check("probe-log-no-read-attempt-is-no-answer",
           (got, list(c.state.data["notes"].get("probe_canary", {}).values())),
@@ -7517,6 +7541,23 @@ def _wizard_and_key_cases(check, tmp):
           (cross_check(parse_tool_report("hello"), ["Read"]),
            helper_state(parse_tool_report("hello"), None)),
           ({"session tools": [(X_NOTHING, "")], "helper tools": [(X_NOTHING, "")]}, HELPER_NONE))
+    # Only the session's own list is held to the whole log (Stage E on #613). What it leaves
+    # out is one finding naming every tool; a helper's shorter list is no finding at all; a
+    # list that names no tool says that, and is not also said to leave everything out.
+    check("tool-report-a-session-list-that-leaves-tools-out",
+          (cross_check_list("Read\nGrep", ["Read", "Grep", "Glob", "Task"], whole=True),
+           cross_check_list("Read\nGrep", ["Read", "Grep", "Glob", "Task"]),
+           cross_check_list("Read\nGrep", ["Read", "Grep"], whole=True),
+           cross_check_list("Read\nGrep", None, whole=True),
+           cross_check_list("I could not list them.", ["Read"], whole=True)),
+          ([(X_LEFT_OUT, "Glob, Task")], [], [], [],
+           [(X_LOOSE, "I could not list them."), (X_NO_NAMES, "")]))
+    check("tool-report-a-long-detail-in-the-record-is-cut-and-says-so",
+          cross_check_note({"session tools": [(X_LEFT_OUT, ", ".join(
+              "Tool%02d" % i for i in range(12)))], "helper tools": []}),
+          "cross-check of the session's answer, reported and never asked: session list "
+          "leaves out Tool00, Tool01, Tool02, Tool03, Tool04, Tool05, Tool06, Tool [cut], "
+          "which the log gives the session; helper list agrees with the log")
     # A note after a name is still a tool line. `(deferred)` dropped five of the eleven helper
     # tools from the 12 Oct record, and would have dropped a `Bash (deferred)` unjudged.
     check("tool-report-a-noted-line-is-a-tool",
