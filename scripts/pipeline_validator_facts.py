@@ -105,6 +105,12 @@ ISSUE_QUERY = ("query($id: String!) { issue(id: $id) { id identifier description
                "pageInfo { hasNextPage } } } } }" % MAX_CHILDREN)
 
 
+# Everything Stage E's tracker reader can raise for a read that did not come back whole: its own
+# error, a socket timeout during the read (an OSError, not a URLError), and an answer of the wrong
+# shape. Each is an unread fact, never a crash of the whole read.
+TRACKER_FAULTS = (stage_e.BounceError, OSError, AttributeError, TypeError, ValueError, KeyError)
+
+
 class Unread(Exception):
     """A fact that could not be read. Its words are fixed: they never quote what a source said."""
 
@@ -170,7 +176,7 @@ def _issue(cfg, ident):
         raise Unread("no linear_key_env is configured, so the tracker is not read")
     try:
         data = stage_e.linear_graphql(ISSUE_QUERY, {"id": ident}, _tracker_cfg(cfg))
-    except stage_e.BounceError:
+    except TRACKER_FAULTS:
         raise Unread("the tracker did not answer for %s" % ident)
     node = data.get("issue") if isinstance(data, dict) else None
     if not isinstance(node, dict) or node.get("identifier") != ident:
@@ -281,7 +287,8 @@ def _last_piece(node, ident):
 # --------------------------------------------------------------------------- #
 # The facts every item shares, and each kind's own
 # --------------------------------------------------------------------------- #
-def _shared(cfg, doc, now):
+def _shared(cfg, doc, now, piece_queue=None):
+    """The facts every item shares. `piece_queue`, for a piece, replaces the merge's queue fact."""
     lim = doc["limits"]
 
     def queue_fact():
@@ -332,7 +339,7 @@ def _shared(cfg, doc, now):
         return got
 
     lim["window"] = _read(doc, "window", window_fact)
-    lim["queue"] = _read(doc, "queue", queue_fact)
+    lim["queue"] = _read(doc, "queue", piece_queue or queue_fact)
     lim["watcher"] = _read(doc, "watcher", watcher_fact)
     lim["hold"] = _read(doc, "hold", hold_fact)
 
@@ -350,7 +357,10 @@ def _delivery(run, owner_repo, branch):
         doc = json.loads(raw)
     except (ValueError, AttributeError, TypeError, UnicodeDecodeError):
         raise Unread("delivery.json on %s is not readable JSON" % branch)
-    risk = ((doc.get("autonomy") or {}) if isinstance(doc, dict) else {}).get("riskPaths", [])
+    autonomy = doc.get("autonomy", {}) if isinstance(doc, dict) else None
+    if not isinstance(autonomy, dict):
+        raise Unread("delivery.json on %s gives an autonomy section that is not an object" % branch)
+    risk = autonomy.get("riskPaths", [])
     if not isinstance(risk, list) or not all(isinstance(g, str) for g in risk):
         raise Unread("delivery.json on %s gives riskPaths that are not a list of paths" % branch)
     budget, _threshold, _label, _state, state = stage_e.parse_delivery(raw)
@@ -435,7 +445,7 @@ def for_merge(cfg, owner_repo, number, now, run=None):
             raise Unread("no linear_key_env is configured, so the tracker is not read")
         try:
             got = stage_e.linear_ticket_for_pr_url(url, _tracker_cfg(cfg))
-        except stage_e.BounceError:
+        except TRACKER_FAULTS:
             raise Unread("the tracker did not answer for the pull request")
         if not got or not TICKET_RE.fullmatch(got):
             raise Unread("the tracker records no one ticket for the pull request")
@@ -508,10 +518,12 @@ def criteria_text(acceptance, out_of_scope):
     return "\n".join(lines) + "\n"
 
 
-def for_piece(cfg, ident, now, run=None):
+def for_piece(cfg, ident, now, run=None, queue_result=None):
     """The facts for piece `ident` before it starts: who filed its idea, the paths its ticket names,
     its repository's riskPaths, its plan, and the facts every item shares. It has no pull request, no
-    diff and no send-backs yet, and says so."""
+    diff and no send-backs yet, and says so. Its queue fact is the queue's own: `queue_result` is the
+    order() result of the pass that is about to start it, which judged this piece against the day's
+    load. Without one, or one that does not name the piece, whether it fits the day is unread."""
     run = run or _gh
     doc = _empty("piece", ident)
     for fact in ("pr", "bounces", "diff", "acceptance", "last_piece"):
@@ -548,7 +560,20 @@ def for_piece(cfg, ident, now, run=None):
     else:
         for fact in ("paths", "risk_paths", "criteria"):
             doc["unread"].setdefault(fact, "its ticket was not read")
-    _shared(cfg, doc, now)
+
+    def piece_queue():
+        if not isinstance(queue_result, dict):
+            raise Unread("the queue's own order for this pass was not given, so whether the piece "
+                         "fits the day's load is not known")
+        named = [e.get("ticket") for e in list(queue_result.get("start") or [])
+                 + list(queue_result.get("held") or []) if isinstance(e, dict)]
+        if ident not in named:
+            raise Unread("the queue's own order does not name this piece")
+        got = limits.queue_fact(queue_result, ident)
+        if got is None:
+            raise Unread("the queue's own order gave no stops to read")
+        return got
+    _shared(cfg, doc, now, piece_queue)
     return doc
 
 
@@ -763,6 +788,12 @@ def selftest():
                         return d[part][fact]
                 return d.get(fact)
             bad_hold = put("watcher/bad-hold.json", "{ not a hold")
+            # Each limits fact's own reason when it is unread: the limits name what they could not tell.
+            UNKNOWN = {"origin": "provenance-unknown", "paths": "paths-unknown",
+                       "risk_paths": "risk-paths-unknown", "pr": "size-unknown",
+                       "bounces": "bounces-unknown", "window": "window-unknown",
+                       "queue": "queue-unknown", "watcher": "watcher-unknown",
+                       "hold": "hold-unknown"}
             for label, kw, fact in (
                     ("the pull request", {"answers": {"repos/acme/app/pulls/12": Exception("HTTP 502")}},
                      "pr"),
@@ -777,15 +808,22 @@ def selftest():
                     ("delivery.json, unanswered", {"answers": {
                         "repos/acme/app/contents/delivery.json?ref=main": Exception("HTTP 502")}},
                      "risk_paths"),
+                    ("delivery.json, an autonomy that is not an object", {"answers": {
+                        "repos/acme/app/contents/delivery.json?ref=main": encoded(
+                            {"version": 1, "budgets": {"maxBounces": 3}, "autonomy": ["x"]})}},
+                     "risk_paths"),
                     ("Stage E's ledger, not configured", {"cfg_over": {"stage_e_ledger": ""}}, "bounces"),
                     ("Stage E's ledger, corrupt", {"cfg_over": {"stage_e_ledger": put(
                         "stage-e/corrupt.jsonl", "not json\n")}}, "bounces"),
                     ("the tracker's attachment", {"attach": stage_e.BounceError("down")}, "ticket"),
+                    ("the tracker timing out mid-read", {"attach": TimeoutError("timed out")}, "ticket"),
                     ("a pull request two tickets claim", {"attach": ["TOD-13", "TOD-14"]}, "ticket"),
                     ("an idea the owner did not file", {"tickets_over": {"TOD-4": issue(
                         "TOD-4", creator=DISPATCHER)}}, "origin"),
                     ("a planning run the tracker would not give", {"tickets_over": {
                         "TOD-5": stage_e.BounceError("down")}}, "origin"),
+                    ("a planning run read with a timeout", {"tickets_over": {
+                        "TOD-5": TimeoutError("timed out")}}, "origin"),
                     ("a ticket under a plan the idea gate did not file", {"tickets_over": {
                         "TOD-13": issue("TOD-13", labels=(), parent=dict(PLAN, labels={"nodes": []}))}},
                      "origin"),
@@ -811,8 +849,9 @@ def selftest():
                 check("unread: %s is None, never clear, empty or zero" % label, value(got, fact), None)
                 check("unread: %s is said, by name" % label, bool(got["unread"].get(fact)), True)
                 if fact in got["limits"]:
-                    check("unread: %s holds the limits, with a reason" % label,
-                          limits.limits(got["item"], SETTINGS, got["limits"])["verdict"], "fail")
+                    check("unread: %s holds the limits with its own reason" % label,
+                          UNKNOWN[fact] in limits.limits(got["item"], SETTINGS, got["limits"])["reasons"],
+                          True)
             got = facts_with(answers={"repos/acme/app/contents/delivery.json?ref=main": Exception("HTTP 404")})
             check("no delivery.json: no risk paths named, and no send-back budget, so the bounces are unread",
                   (got["limits"]["risk_paths"], got["limits"]["bounces"], bool(got["unread"].get("bounces"))),
@@ -850,12 +889,35 @@ def selftest():
             piece_ticket = {"TOD-13": issue("TOD-13", labels=(), parent=PLAN, description=(
                 "## Acceptance criteria\n\n- [ ] It works.\n\nTouch `src/a.py`."))}
             piece = facts_with(tickets_over=piece_ticket, piece=True)
+            check("a piece with no order() result given has its queue fact unread, and the limits hold",
+                  (piece["limits"]["queue"], bool(piece["unread"].get("queue")),
+                   "queue-unknown" in limits.limits(piece["item"], SETTINGS, piece["limits"])["reasons"]),
+                  (None, True, True))
+            tickets.clear()
+            tickets.update(base_tickets)
+            tickets.update(piece_ticket)
+            over = {"start": [], "held": [{"ticket": "TOD-13", "reason": "over-load", "waits_on": []}],
+                    "stops": [], "needs_ok": []}
+            got = for_piece(CFG, "TOD-13", NOW, run=host(), queue_result=over)
+            check("a piece the queue's own order held over the day's load is read as over-load, "
+                  "and the limits say so",
+                  (got["limits"]["queue"], "over-load" in limits.limits(
+                      got["item"], SETTINGS, got["limits"])["reasons"]),
+                  ({"stops": [], "held": "over-load"}, True))
+            fits = {"start": [{"ticket": "TOD-13"}], "held": [], "stops": [], "needs_ok": []}
+            check("a piece the queue's order would start is read as fitting the day",
+                  for_piece(CFG, "TOD-13", NOW, run=host(), queue_result=fits)["limits"]["queue"],
+                  {"stops": [], "held": None})
+            got = for_piece(CFG, "TOD-13", NOW, run=host(), queue_result=dict(fits, start=[]))
+            check("an order() result that does not name the piece leaves its queue fact unread",
+                  (got["limits"]["queue"], bool(got["unread"].get("queue"))), (None, True))
+            piece = facts_with(tickets_over=piece_ticket, piece=True)
             check("a piece: its origin, the paths its ticket names, its repository's riskPaths, its criteria",
                   (piece["limits"]["origin"], piece["limits"]["paths"], piece["limits"]["risk_paths"],
                    bool(piece["brief"]["criteria"]), piece["item"]),
                   ("owner", ["src/a.py"], ["infra/**"], True, {"kind": "piece", "ref": "TOD-13", "head": None}))
             check("...and what a piece has not got yet is said, never zero",
-                  sorted(piece["unread"]), ["acceptance", "bounces", "diff", "last_piece", "pr"])
+                  sorted(piece["unread"]), ["acceptance", "bounces", "diff", "last_piece", "pr", "queue"])
             got = facts_with(tickets_over=piece_ticket, piece=True, cfg_over={
                 "queue_config": put("queue/no-repo.json", {
                     "pool": {"owner_user_ids": [OWNER], "dispatcher_user_ids": [DISPATCHER],
