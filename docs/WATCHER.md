@@ -251,6 +251,14 @@ own file. The usage job is still the workers' account's own reader of its own lo
 editing what the watcher reads. A worker who owns the source's folder can still replace the file with another file
 that account owns; the check is that the file is the workers' own, not that it is honest.
 
+**The three job heartbeats (KIT-782).** The same copier also copies the queue's, the morning job's and the sweep's
+heartbeat files, each named in `watcher.conf` (`QUEUE_HEARTBEAT`, `MORNING_HEARTBEAT`, `SWEEP_HEARTBEAT`; empty means that
+job is off here). Each is refused for the same reasons as the usage file (a link, a file of another account, more than 64 KB)
+and its old copy removed, so the health watch sees it missing and says the job has not checked in, never that it is well.
+The copies are `queue-heartbeat.json`, `morning-heartbeat.json` and `sweep-heartbeat.json` in `INSTALL_DIR/copy/`. The health
+watch reads them; the one command sets the matching lines in `update.conf` (docs/UPDATE-OPERATOR.md). With only heartbeats and no
+`USAGE_FILE`, the copier still runs and the watcher's rules name no usage file.
+
 Two more limits: the copier has a plain-file check but does not read the content (the watcher judges that), and clearing
 `USAGE_FILE` later does not remove the copier's job. Remove it by hand.
 
