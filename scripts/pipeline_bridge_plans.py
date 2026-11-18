@@ -3127,7 +3127,8 @@ class PlansMixin(object):
         if not entry["covered"]:
             return ("acceptance-coverage-uncovered:" + entry["merged_head"][:8], "%s is finished, but no acceptance "
                     "check has run on the code that merged (%s). The check starts one on its own; I'll mark it %s "
-                    "once that passes." % (ticket, entry["merged_head"][:8], done))
+                    "once that passes. If it can't check it, send `check %s`."
+                    % (ticket, entry["merged_head"][:8], done, ticket))
         # An entry counts only for the merges the plan has now: one written before a later pull request merged names
         # fewer, so it is a record of an earlier merge and holds the plan until the live pass looks again.
         merged_now = sorted({m["number"] for piece in read for m in piece_merge(piece["prs"])[1]})
