@@ -194,7 +194,9 @@ CATCHES UP AFTER SLEEP
 
   The FIRST pass (no state file) records everything already in the window as seen and
   answers none of it. A state file that cannot be read is refused, never treated as a first
-  pass: the record of open questions is what binds a "yes" to a ticket.
+  pass: the record of open questions is what binds a "yes" to a ticket. So is a state file
+  that is GONE once this job has written one (KIT-677): the pass says "state missing" and
+  stops, and `run --init-state` starts a clean one on purpose.
 
 SAYS WHICH NOTHING IT DID (contract §13)
 
@@ -308,7 +310,8 @@ from pipeline_bridge_transport import BridgeError, SlackClient, _http_json  # no
 # object: its selftest and its installer read them here. The modules only that code
 # reads (hashlib, datetime, telemetry_scrape) are imported where it is now.
 from pipeline_bridge_config import (CHANNEL_RE, CONFIG_KEYS,  # noqa: E402,F401
-                                    CONFIG_SCHEMA, CONFIRMED, DECLINED, DEFAULT_DONE_STATE,
+                                    CONFIG_SCHEMA, CONFIRMED, DECLINED,
+                                    DEFAULT_ACCEPTANCE_LEDGER, DEFAULT_DONE_STATE,
                                     DEFAULT_HANDOFF_STATES, DEFAULT_MAX_ACTIONS_PER_HOUR,
                                     DEFAULT_MAX_QUESTIONS_PER_HOUR,
                                     DEFAULT_QUESTION_REMINDER_HOURS,
@@ -325,7 +328,7 @@ from pipeline_bridge_config import (CHANNEL_RE, CONFIG_KEYS,  # noqa: E402,F401
                                     epoch, heartbeat_path,
                                     iso, key_of, label_names, live_secrets, load_config,
                                     load_dm_posts, load_pings, load_state, lock_path,
-                                    new_state, run_idea, save_state, state_path,
+                                    new_state, run_idea, save_state, seen_path, state_path,
                                     ticket_number, ts_float, validate_config,
                                     write_heartbeat)
 from pipeline_bridge_requests import (DM_HELP, EDITED_WHY, NO_RE,  # noqa: E402,F401
@@ -1256,6 +1259,13 @@ class FakeTracker(object):
                 "comments": {"nodes": list(self.notes_on.get(ident, [])),
                              "pageInfo": {"hasNextPage": ident in self.more_comments}}}
 
+    def epic_comments(self, issue_id):
+        """KIT-325: a plan's newest comments, the verdicts among them, from `notes_on`."""
+        if self.fail or getattr(self, "epic_comments_fail", False):
+            raise BridgeError("the tracker could not be read (simulated)")
+        i = next((x for x in self.issues.values() if x["id"] == issue_id), None)
+        return list(self.notes_on.get(i["identifier"], [])) if i else []
+
     def file_followup(self, team_id, title, description):
         self.filed.append({"teamId": team_id, "title": title, "description": description})
         if self.file_raises is not None:
@@ -1547,7 +1557,8 @@ THEN_SLOTS = {"DIRECT_BIND": (2, ("DIRECT_PLAN_THEN_BIND", "DIRECT_PLAN_EACH_THE
               "APPROVE_BIND": (4, ("APPROVE_THEN_BIND", "APPROVE_OFF_THEN_BIND")),
               "ANSWER_BIND": (4, ("ANSWER_THEN_BIND", "ANSWER_OFF_THEN_BIND")),
               "PLAN_MOVE_BIND": (4, ("PAUSE_THEN_BIND", "RESUME_THEN_BIND", "CANCEL_THEN_BIND",
-                                     "STOP_PLANNING_THEN_BIND", "APPROVE_OFF_THEN_BIND"))}
+                                     "STOP_PLANNING_THEN_BIND", "APPROVE_OFF_THEN_BIND",
+                                     "CHECK_THEN_BIND"))}
 POST_TEXT_ARGS = {"post": 2, "post_refusal": 2, "refuse_request": 3, "note": 2, "drop": 2,
                   "finish": 1, "refuse": 0}
 STATE_NAMES = ("Plan it", "Todo", "Done", "Backlog", "Needs Approval")
@@ -1747,7 +1758,7 @@ class Kit(object):
 
         dm_help = ("I can do `plan <ticket id>`, `replan <ticket id>`, `approve <ticket id>`, "
                    "`pause <ticket id>`, `resume <ticket id>`, `cancel <ticket id>`, "
-                   "`retry <ticket id>`, `start <ticket id>` and yes or "
+                   "`retry <ticket id>`, `start <ticket id>`, `check <ticket id>` and yes or "
                    "no here. I read an ask in your own words too, such as `please replan "
                    "<ticket id>`, with up to 10 tickets to plan or replan at once. To add an "
                    "answer to a plan's open questions, send `answer <plan id>: <your answer>`. "
@@ -1778,18 +1789,25 @@ class Kit(object):
         t_sid = "11111111-1111-4111-8111-111111111111"
 
         class FakeTurn(object):
-            """Stands in for run_turn: records each call, answers from the list it was given."""
+            """Stands in for run_turn: records each call, answers from the list it was given.
+            With `seeds` (KIT-751) it asks the turn's seed as run_turn does, once, when the
+            answer it gives starts a new conversation (not resumed), and records the lines."""
 
-            def __init__(self, *answers):
+            def __init__(self, *answers, **opts):
                 self.answers, self.calls = list(answers), []
+                self.seeds = opts.get("seeds", False)
 
             def __call__(self, cfg, text, session, now, **kw):
+                a = self.answers.pop(0) if self.answers else {}
+                seed = kw.get("seed")
+                lines = seed() if self.seeds and seed and not a.get("resumed") else None
                 self.calls.append({"text": text, "session": session,
                                    "seconds": cfg["turn_timeout_seconds"],
-                                   "note": kw.get("note", ""), "earlier": kw.get("earlier", "")})
-                a = self.answers.pop(0) if self.answers else {}
+                                   "note": kw.get("note", ""), "earlier": kw.get("earlier", ""),
+                                   "seed": lines})
                 return dict({"text": None, "why": "", "session_id": None, "resumed": False,
-                             "cost": None, "turns": None}, **a)
+                             "cost": None, "turns": None,
+                             "seeded": None if lines is None else len(lines)}, **a)
 
         def with_turn(fake, fn, outbox=None):
             """`fn`, with `fake` standing in for the turn and, when given, `outbox` for what the
@@ -2126,7 +2144,7 @@ def _selftest(identity=(True,) * 5, reached=()):
         "CREDIT_BIND": "(Asked for by %s.)",
         "DM_HELP": ("I can do `plan <ticket id>`, `replan <ticket id>`, `approve <ticket id>`, "
                     "`pause <ticket id>`, `resume <ticket id>`, `cancel <ticket id>`, "
-                    "`retry <ticket id>`, `start <ticket id>` and yes "
+                    "`retry <ticket id>`, `start <ticket id>`, `check <ticket id>` and yes "
                     "or no here. I read an ask in your own words too, such as `please replan "
                     "<ticket id>`, with up to 10 tickets to plan or replan at once. To add an "
                     "answer to a plan's open questions, send `answer <plan id>: <your answer>`. "
@@ -2182,6 +2200,8 @@ def _selftest(identity=(True,) * 5, reached=()):
                                     "new planning run starts and the planner drops any re-run "
                                     "it owes it. A planning run already going keeps going, and "
                                     "still files its plan"),
+        "CHECK_THEN_BIND": ("I'll ask the acceptance check to run again: it picks the request "
+                            "up on its next pass"),
         "PAUSE_THEN_BIND": ("I'll move the plan back to the backlog and start none of its "
                             "pieces until you resume it. A piece already at work keeps going"),
         "RESUME_HINT_BIND": "To go on with it, type `resume %s`.",
@@ -2329,6 +2349,53 @@ def _selftest(identity=(True,) * 5, reached=()):
         code, out = run(cfg, slack, tracker)
         check("first-pass-asks-nothing", (code, slack.posts, "first pass" in out),
               (EXIT_OK, [], True))
+        # KIT-677: a state file that was written and is then gone is LOST, not a first pass.
+        cfg7, slack7, tracker7 = world("lost-state")
+        run(cfg7, slack7, tracker7)
+        check("a-first-pass-leaves-a-state-and-the-mark-that-one-was-written",
+              (os.path.exists(state_path(cfg7)), os.path.exists(seen_path(cfg7))), (True, True))
+        os.remove(state_path(cfg7))
+        lost_out = io.StringIO()
+        lost_code = run_command(cfg7, False, 30, slack=slack7, tracker=tracker7, out=lost_out)
+        lost_beat = json.load(open(heartbeat_path(cfg7)))
+        check("a-lost-state-file-ends-the-job-non-zero-and-its-heartbeat-says-state-missing",
+              (lost_code != EXIT_OK, lost_beat["exit"] != EXIT_OK, "state missing" in lost_beat["summary"]),
+              (True, True, True))
+        code7, out7 = run(cfg7, slack7, tracker7)
+        check("a-lost-state-file-stops-the-pass-and-says-so",
+              (code7 != EXIT_OK, "state missing" in out7, os.path.exists(state_path(cfg7))),
+              (True, True, False))
+        init_cfg = os.path.join(os.path.dirname(state_path(cfg7)), "init.json")
+        with open(init_cfg, "w", encoding="utf-8") as fh:
+            json.dump(dict(EXAMPLE_CONFIG, state_dir=cfg7["state_dir"]), fh)
+        seen_flag = []
+        real_run_command = globals()["run_command"]
+        globals()["run_command"] = lambda c, d, t, **k: seen_flag.append(c.get("init_state")) or 0
+        try:
+            main(["run", "--config", init_cfg, "--init-state"])
+            main(["run", "--config", init_cfg])
+        finally:
+            globals()["run_command"] = real_run_command
+        check("the---init-state-flag-reaches-the-pass-through-main-and-only-then",
+              seen_flag, [True, None])
+        code7, out7 = run(dict(cfg7, init_state=True), slack7, tracker7)
+        check("init-state-starts-a-clean-state-on-purpose",
+              (code7, os.path.exists(state_path(cfg7)), "first pass" in out7),
+              (EXIT_OK, True, True))
+        code7, out7 = run(cfg7, slack7, tracker7)
+        check("…and the pass after it needs no flag", code7, EXIT_OK)
+        # A mark that cannot be written is said, never swallowed: a broken link stands where it goes.
+        cfg8 = world("lost-state-unmarked")[0]
+        os.makedirs(cfg8["state_dir"], exist_ok=True)
+        os.symlink(os.path.join(cfg8["state_dir"], "no-such-folder", "mark"), seen_path(cfg8))
+        stderr_was, sys.stderr = sys.stderr, io.StringIO()
+        try:
+            save_state(cfg8, new_state())
+            noted = sys.stderr.getvalue()
+        finally:
+            sys.stderr = stderr_was
+        check("a-mark-that-cannot-be-written-is-said-and-the-state-still-lands",
+              ("lost-state mark" in noted, os.path.exists(state_path(cfg8))), (True, True))
         # KIT-291: the first pass checks each HANDOFF_STATES name on each team, in the log
         # alone. A name a team lacks is said once, and the pass still does its work.
         check("first-pass-finds-every-handoff-lane-and-says-nothing-of-it",
@@ -3887,18 +3954,19 @@ def _selftest(identity=(True,) * 5, reached=()):
           (len(re.findall(r"\.move\(", body)), len(re.findall(r"\.file_followup\(", body)),
            len(re.findall(r"_query\(M_FOLLOWUP", body))), (7, 1, 1))
     # The other tracker writes, made through the tracker client from the modules that make
-    # them: eleven comments, one hand-over, one thread reply and one plan description (an
+    # them: twelve comments, one hand-over, one thread reply and one plan description (an
     # answer, KIT-334). A new call site, in the bridge or in any module, turns this red, so
     # each one is chosen (review of KIT-407); the ninth comment names who paused, resumed
     # or cancelled a plan (KIT-351), the tenth the one comment on the idea a finished plan
-    # came from (KIT-305), and the eleventh a change made to an approved plan without the
-    # owner, from the ledger's fields (KIT-320). Every hand-over, the bridge's own, the queue's
+    # came from (KIT-305), the eleventh a change made to an approved plan without the
+    # owner, from the ledger's fields (KIT-320), and the twelfth a plan's request for a new
+    # acceptance check, on a yes (KIT-325). Every hand-over, the bridge's own, the queue's
     # (KIT-454) and a `retry` or `start` on a yes (KIT-352), goes through the one
     # `delegate_to`, and its comment through the one `attribute`.
     check("the-comment-hand-over-and-thread-reply-callers-are-counted",
           [len(re.findall(r"\.%s\(" % verb, body))
            for verb in ("comment", "delegate", "reply_in_thread", "describe")],
-          [11, 1, 1, 1])
+          [12, 1, 1, 1])
     check("no-other-write-verb", [v for v in ("issueDelete", "issueArchive",
                                               "issueAddLabel", "issueRelationCreate",
                                               "issueBatchCreate", "agentSessionCreate",
@@ -3930,6 +3998,8 @@ def main(argv=None):
                         choices=("run", "lanes", "name"), default="run")
     parser.add_argument("--config")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--init-state", action="store_true",
+                        help="start a clean state on purpose, when the old one is gone (KIT-677)")
     parser.add_argument("--timeout", type=int, default=None)
     parser.add_argument("--example-config", action="store_true")
     parser.add_argument("--selftest", action="store_true")
@@ -3959,6 +4029,8 @@ def main(argv=None):
     if args.command == "name":
         return name_command(cfg)
     timeout = args.timeout if args.timeout is not None else cfg["run_timeout_seconds"]
+    if args.init_state:
+        cfg = dict(cfg, init_state=True)
     return run_command(cfg, args.dry_run, timeout)
 
 
