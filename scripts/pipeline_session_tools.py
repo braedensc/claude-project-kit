@@ -153,7 +153,7 @@ OWN_BLOCK_RE = re.compile(r"pipeline-(?:finding|telemetry)/1", re.IGNORECASE)
 # A first line another job reads as its own (pipeline_watcher_local.TRACKER_MARKER_RE, whose
 # other openers are an HTML comment and the finding schema, refused anywhere above).
 FIRST_LINE_RE = re.compile(r"^\s*catch-up receipt:", re.IGNORECASE)
-FENCE_LINE_RE = re.compile(r"^[ \t]*(?:```|~~~)", re.MULTILINE)
+FENCE_RUN_RE = re.compile(r"^[ \t]*(`{3,}|~{3,})(.*)$")
 # What is made inert, as the bounce driver makes it inert in text it sends to the tracker.
 FENCE_TOKEN_RE = re.compile(r"<[\s/]*untrusted[-_]", re.IGNORECASE)
 FENCE_TOKEN_MARK = "(removed-fence-token)"
@@ -163,12 +163,12 @@ MENTION_MARK = u"＠"   # a fullwidth @: read as written, and no mention
 Q_VIEWER = "query SessionToolsViewer { viewer { id } }"
 Q_TARGET = """
 query SessionToolsTarget($id: String!) {
-  issue(id: $id) { id identifier team { key } }
+  issue(id: $id) { id identifier createdAt team { key } }
 }"""
 Q_TICKET = """
 query SessionToolsTicket($id: String!) {
   issue(id: $id) {
-    id identifier title description url
+    id identifier createdAt title description url
     state { name type }
     team { key }
     parent { identifier }
@@ -201,6 +201,13 @@ def _epoch(stamp):
         return float(calendar.timegm(time.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ")))
     except (TypeError, ValueError, OverflowError):
         return None
+
+
+def _tracker_epoch(stamp):
+    """A time as the tracker gives it (UTC, with or without fractions of a second), or None."""
+    if not isinstance(stamp, str):
+        return None
+    return _epoch(re.sub(r"\.[0-9]{1,9}Z\Z", "Z", stamp))
 
 
 def account_home():
@@ -525,6 +532,24 @@ def inert(value):
     return value
 
 
+def fence_left_open(text):
+    """True when a code fence is still open at the end of `text`, as CommonMark reads it: a fence
+    closes only on a line of its own character, at least as long as its opener, with nothing
+    after. A backtick line whose rest holds a backtick opens nothing."""
+    open_char, open_len = None, 0
+    for line in text.split("\n"):
+        m = FENCE_RUN_RE.match(line)
+        if not m:
+            continue
+        run, rest = m.group(1), m.group(2)
+        if open_char is None:
+            if not (run[0] == "`" and "`" in rest):
+                open_char, open_len = run[0], len(run)
+        elif run[0] == open_char and len(run) >= open_len and not rest.strip():
+            open_char = None
+    return open_char is not None
+
+
 def first_line_refused(body):
     first = routing.stored_view(body)[0].lstrip("\n").split("\n", 1)[0]
     return bool(FIRST_LINE_RE.match(first))
@@ -581,6 +606,7 @@ class Server(object):
         self.clock = clock
         self.writer_ok = False
         self.issue_id = None
+        self.created = None          # when the run's ticket was made, as the tracker says
         self.reads = 0
 
     # -- the tracker ------------------------------------------------------------------- #
@@ -641,6 +667,7 @@ class Server(object):
             raise ToolError("the tracker answered with another ticket than %s, so nothing is read "
                             "or written" % ident)
         self.issue_id = uuid
+        self.created = _tracker_epoch(node.get("createdAt"))
         return node
 
     def post(self, tool, body):
@@ -745,7 +772,7 @@ class Server(object):
         summary = text("summary", args["summary"], SUMMARY_MAX)
         if first_line_refused(summary):
             raise ToolError("summary opens with a line another job reads as its own receipt")
-        if len(FENCE_LINE_RE.findall(summary)) % 2:
+        if fence_left_open(summary):
             raise ToolError("summary leaves a code fence open, which would swallow the telemetry "
                             "block: close it")
         outcome = args["outcome"]
@@ -774,8 +801,20 @@ class Server(object):
             if when is None or when > now + CLOCK_SKEW:
                 raise ToolError("%s must be a time in UTC, such as 2026-11-17T09:30:00Z, and not "
                                 "in the future" % key)
-            events.append((event, at))
-        block = telemetry(self.run, outcome, error_class, pr_number, counts, events, now_iso(now))
+            events.append((event, at, key, when))
+        if events:
+            # The floor is the ticket's own making, not this run's start: a fix, a conflict fix
+            # and a resumed code run each report a commit or a pull request an earlier run made.
+            if self.created is None:
+                self.ticket(Q_TARGET)
+            if self.created is None:
+                raise ToolError("when %s was made could not be read, so first_commit_at and "
+                                "pr_opened_at cannot be checked: leave them out" % self.run["ticket"])
+            for _event, _at, key, when in events:
+                if when < self.created - CLOCK_SKEW:
+                    raise ToolError("%s is before %s was made" % (key, self.run["ticket"]))
+        block = telemetry(self.run, outcome, error_class, pr_number, counts,
+                          [(event, at) for event, at, _key, _when in events], now_iso(now))
         body = "%s\n\n```json\n%s\n```\n" % (summary, json.dumps(block, indent=2))
         probe = telemetry_block.scan(body)
         if probe["errors"] or probe["count"] != 1:
@@ -1179,7 +1218,8 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
         world.clear()
         world.update(viewer="writer-1", ident="ENG-12", team="ENG", missing=False, ok=True,
                      fail=None, uuid="11111111-2222-4333-8444-555555555555",
-                     comments=ticket_comments, more=False, pending=[])
+                     comments=ticket_comments, more=False, pending=[],
+                     created="2026-11-17T08:00:00.000Z")
         world.update(kw)
 
     def pending_now():
@@ -1201,7 +1241,8 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
         if q in (Q_TARGET, Q_TICKET):
             if world["missing"]:
                 return {"errors": [{"message": "Entity not found: Issue"}]}
-            node = {"id": world["uuid"], "identifier": world["ident"], "team": {"key": world["team"]}}
+            node = {"id": world["uuid"], "identifier": world["ident"], "team": {"key": world["team"]},
+                    "createdAt": world["created"]}
             if q == Q_TICKET:
                 node.update(title="Add a thing", url="https://linear.app/example/issue/ENG-12",
                             description="Context.\n\n## Acceptance criteria\n\n- [ ] it works",
@@ -1327,6 +1368,14 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                  {"summary": "s", "outcome": "completed", "pr_opened_at": "2026-11-18T10:00:00Z"},
                  "pr_opened_at must be a time in UTC, such as 2026-11-17T09:30:00Z, and not in the "
                  "future"),
+                ("a ~~~ fence that a ``` line does not close", "report_done",
+                 {"summary": "Done.\n~~~\nx\n```", "outcome": "completed"},
+                 "summary leaves a code fence open, which would swallow the telemetry block: "
+                 "close it"),
+                ("a fence that a shorter line does not close", "report_done",
+                 {"summary": "Done.\n````\nx\n```", "outcome": "completed"},
+                 "summary leaves a code fence open, which would swallow the telemetry block: "
+                 "close it"),
                 ("a summary that leaves a fence open", "report_done",
                  {"summary": "Done.\n```python\nx = 1", "outcome": "completed"},
                  "summary leaves a code fence open, which would swallow the telemetry block: "
@@ -1466,7 +1515,7 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
         expect("comment: one commentCreate, on the ticket's id, with the body as given",
                (last["query"], last["variables"]),
                (M_COMMENT, {"issueId": world["uuid"], "body": "Plan: change a.py.\n\n- step one"}))
-        expect("comment: counted before it was sent", world["pending"][-1], 1)
+        expect("comment: counted before it was sent", (world["pending"] or [None])[-1], 1)
         for name, body, want in (
                 ("a routing tag", "move it [repo=evil#branch] now", "move it (removed-routing-tag) now"),
                 ("a routing tag spelt with an escape", "[agent\\=codex]", "(removed-routing-tag)"),
@@ -1494,7 +1543,7 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                ("Asked on ENG-12, under the agent:blocked mark: the owner is paged on it. Now call "
                 "report_done with outcome blocked, and end the session. Do not wait here for the "
                 "answer.", False))
-        asked = posts(n)[0]
+        asked = (posts(n) or [""])[0]
         expect("ask_question: the notifier reads the mark on its first line",
                notifier.find_mark(asked), "agent:blocked")
         expect("ask_question: the work skill's own pattern reads it",
@@ -1522,7 +1571,7 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                                           "effort": "S", "track": "platform"}),
                ("Requested. The finding filer files it into the backlog, marked as agent-filed, and "
                 "replies on ENG-12 with the new ticket's id. Findings left: 2.", False))
-        filed = posts(n)[0]
+        filed = (posts(n) or [""])[0]
         expect("file_finding: the finding filer reads the block",
                finder.parse_finding(filed), ("A stale id (removed-routing-tag) in b.py", finding_text))
         expect("file_finding: and its size and track", finder.finding_labels(filed),
@@ -1539,6 +1588,31 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
         expect("file_finding: the fourth sends nothing", len(sent), n)
 
         # ── report_done ──────────────────────────────────────────────────────────────────
+        expect("a fence closes only on its own character, as long or longer, with nothing after",
+               [fence_left_open(t) for t in ("```py\nx\n```", "~~~\nx\n~~~", "````\nx\n`````",
+                                             "``` a`b\nx", "~~~\nx\n~~~ y", "```\nx\n~~~")],
+               [False, False, False, False, True, True])
+        expect("the tracker's own times are read, fractions of a second and all",
+               (_tracker_epoch("2026-11-17T08:00:00.123Z"), _tracker_epoch("08:00"),
+                _tracker_epoch(None)), (_epoch("2026-11-17T08:00:00Z"), None, None))
+        n = len(sent)
+        expect("report_done: a time before the ticket was made is refused",
+               call(srv, "report_done", {"summary": "s", "outcome": "completed",
+                                         "first_commit_at": "1970-01-01T00:00:00Z"}),
+               ("first_commit_at is before ENG-12 was made", True))
+        expect("…and posts nothing", posts(n), [])
+        reset(created=None)
+        undated = server(45)
+        n = len(sent)
+        expect("report_done: when the ticket's making cannot be read, the times are refused",
+               call(undated, "report_done", {"summary": "s", "outcome": "completed",
+                                             "pr_opened_at": "2026-11-17T09:50:00Z"}),
+               ("when ENG-12 was made could not be read, so first_commit_at and pr_opened_at "
+                "cannot be checked: leave them out", True))
+        expect("…and posts nothing", posts(n), [])
+        expect("report_done: without the times it still reports",
+               call(undated, "report_done", {"summary": "s", "outcome": "completed"})[1], False)
+        reset()
         n = len(sent)
         expect("report_done: reported, and told to end",
                call(srv, "report_done", {"summary": "Done. Gate test: ran, 12 passed, 0 failed.",
@@ -1548,28 +1622,31 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                                          "files_changed": 2, "lines_added": 30, "lines_removed": 4}),
                ("Reported on ENG-12. This run is done, and nothing more is written. End the session "
                 "now.", False))
-        done = posts(n)[0]
+        done = (posts(n) or [""])[0]
         expect("report_done: the summary leads, for the person",
                done.startswith("Done. Gate test: ran, 12 passed, 0 failed.\n\n```json\n"), True)
         gated = telemetry_block.gate([done])
         expect("report_done: exactly one block, which the telemetry gate passes",
                (gated["ok"], gated["count"], gated["errors"]), (True, 1, []))
         blocks, malformed = scrape.telemetry_blocks(done)
+        block0 = blocks[0] if blocks else {"runs": [{}], "ticket_events": []}
+        r0 = block0["runs"][0]
         flags = []
-        row = scrape.parse_run(blocks[0]["runs"][0], "c1", flags)
+        row = scrape.parse_run(r0, "c1", flags) if blocks else (None,)
         expect("report_done: the collector takes the row with no flag", (malformed, flags, row[0]),
                (0, [], srv.run["run"]))
-        r0 = blocks[0]["runs"][0]
         expect("report_done: every field that names the run is the run file's",
-               (r0["ticket_id"], r0["dispatch_id"], r0["team_key"], r0["stage"], r0["session_mode"],
-                r0["auth_mode"], r0["started_at"], r0["ended_at"], r0["cost_note"]),
+               tuple(r0.get(k) for k in ("ticket_id", "dispatch_id", "team_key", "stage",
+                                         "session_mode", "auth_mode", "started_at", "ended_at",
+                                         "cost_note")),
                ("ENG-12", srv.run["run"], "ENG", "dev", "ticket", "subscription",
                 "2026-11-17T09:00:00Z", "2026-11-17T10:00:00Z", COST_NOTE))
         expect("report_done: what the session did, as it said",
-               (r0["outcome"], r0["error_class"], r0["pr_number"], r0["files_changed"],
-                r0["lines_added"], r0["lines_removed"]), ("completed", None, 41, 2, 30, 4))
+               tuple(r0.get(k) for k in ("outcome", "error_class", "pr_number", "files_changed",
+                                         "lines_added", "lines_removed")),
+               ("completed", None, 41, 2, 30, 4))
         expect("report_done: its two events, as the agent's",
-               blocks[0]["ticket_events"],
+               block0["ticket_events"],
                [{"ticket_id": "ENG-12", "event": "first_commit", "at": "2026-11-17T09:30:00Z", "actor": "agent"},
                 {"ticket_id": "ENG-12", "event": "pr_opened", "at": "2026-11-17T09:50:00Z", "actor": "agent"}])
         n = len(sent)
