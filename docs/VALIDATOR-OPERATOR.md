@@ -125,9 +125,10 @@ are built, nothing is approved for you.
 ## 2. The ledger
 
 Every decision the validator makes is one row in its ledger: what it decided, about what, and
-why. Only the validator writes it. The stand-up and the weekly recap will read it. The watcher
-checks every merge against it (`docs/WATCHER.md`, the `approval-rate` monitor). Nothing writes rows yet: the pieces that
-decide come next. The format is contract §24; the code is `scripts/pipeline_validator_ledger.py`.
+why. Only the validator writes it. The stand-up and the sprint recap read it (section 7, "In
+the stand-up"). The watcher checks every merge against it (`docs/WATCHER.md`, the
+`approval-rate` monitor). Nothing writes rows yet: the pieces that decide come next. The format
+is contract §24; the code is `scripts/pipeline_validator_ledger.py`.
 
 | A row says | For example |
 |---|---|
@@ -526,8 +527,28 @@ session.
 
 **What you see.** Each escalation and each hold that waits for you is a blocker, with its reason in
 plain words and the reply that clears it: `approve <plan>` for a plan, `start <piece>` for a
-piece. A pull request is yours to merge or close on GitHub. A later piece puts these in the
-stand-up. The agent's own words are shown apart, as its words, never as the report's.
+piece. A pull request is yours to merge or close on GitHub. The agent's own words are shown apart,
+as its words, never as the report's.
+
+### In the stand-up
+
+The daily stand-up and the sprint recap say the validator's decisions, built by code from the
+ledger (KIT-545, `docs/STANDUP.md`). Each approval since the last stand-up is one line. Each
+escalation and each hold that still waits for you is a blocker, an urgent one first and marked
+urgent. The recap lists the week's approvals, send-backs, escalations and holds.
+
+To turn it on:
+
+1. Set `STANDUP_VALIDATOR_LEDGER` in `bridge.conf` to the ledger's absolute path.
+2. Run the bridge installer's `standup` command (`docs/BRIDGE-OPERATOR.md`). It shows the file it
+   writes, asks one yes, and reads it back.
+
+The bridge runs as the role account, so that account must be able to read the ledger. A ledger
+it cannot read is said in the stand-up: *The validator's record could not be read, so no
+approval is claimed.* It is never shown as none.
+
+Good: one line per approval, and the agent's reason quoted under it as its words. Not that: a
+quiet stand-up while the record cannot be read.
 
 **An urgent one pages you through the watcher,** which reads the ledger on its own account. The
 validator sends nothing itself, so it never assumes a page. It says `paged` only once the watcher's
