@@ -61,9 +61,7 @@ It works through the list below and stops at the first thing that needs you. **A
 | A question about updating the review jobs | `y`, when nothing is In Progress. It moves the review jobs onto the code you merged. |
 | The change to the repository's `delivery.json`: open it now? | `y`. It opens the pull request as you. See section 3. |
 | The change to the session runner's settings: type yes | `yes`, the whole word. It backs the file up, writes the planning setup and restarts the session runner. |
-| Run the probe now? | `y`. It files test tickets on the work team and closes them afterwards. |
-| Does the session or helper list hold any tool other than these: …? | Only asked when a tool list came back but could not be read. Read that list in the output above. `y` if any name in it is not one it names. That stops the probe. |
-| Sign the probe with the helper's tools unmeasured? | Only asked when no helper list came back. `y` signs, and the record says the helper was not measured. `n` signs nothing. |
+| Run the probe now? | `y`. It files test tickets on the work team and closes them afterwards. It asks nothing about the tool lists: code judges them from the session runner's own log (KIT-796). Read its cross-check lines if you like. They decide nothing. |
 | Is the team's agent guidance empty, or silent about how to plan or build? | Look first. See section 4. |
 | Your initials | Two to four letters. They sign the probe. |
 | Start the planner job now? | `y`. From then on it checks Plan it every five minutes. |
@@ -226,13 +224,13 @@ While planning is stopped, `~<role account>/.stage-a/state/stop.json` exists and
 | `the dispatcher was restarted, and it has not answered` | It did not answer within a minute of its restart | Run the `sudo launchctl print` command it prints. If that shows it running, wait a minute and run the one command again |
 | `the dispatcher is not answering … so no probe ticket was filed` | The session runner is still starting, or stopped | Follow its lines. When it says launchd holds it, wait a minute and run it again. Do not `bootstrap` a running one: that only prints `Bootstrap failed: 5` |
 | `own delivery schema would reject the change` | The repository's copy of the schema is older than the kit's | See section 3. Nothing was opened |
-| `the session's tools were not measured` | The session log could not be read, and the session named no tools | Nothing was signed. Read the reason in brackets, fix it, then run it again |
+| `UNKNOWN` and `the planning session's tools … were not measured` | The session runner's own log could not be read, or names no tools. The session's answer never stands in for it | Nothing was signed. Read the reason in brackets. Make the log readable as the session runner's account, then run it again |
 | `the planning entry … has changed since the probe` | A kit change altered the brief, the label or the fence | Run the one command. It probes again |
 | `the drill could not test anything` | The job filed no planning ticket during the drill | See section 5. Planning was not stopped |
 | `the review installer printed a card` | The review jobs wait on you | Do what the card says. If only a card is left and the jobs run the current code, the idea gate carries on |
 | `Stopped: interrupted.` | You pressed Ctrl-C. The step you stopped finished its own clean-up first | Run the one command again when you are ready |
 | `the probe failed` | A test ticket did not reach the planning setup | The lines under it say where it went. Fix that, then run it again |
-| `holds a tool the fence should have removed` | A planning session could use something it must not | Do not start the job. Keep the output and ask for a kit change |
+| `holds a tool the fence should have removed` | Code found a tool outside the keep-set, in the session runner's log or named as a tool in the helper's list. The line names it | Do not start the job. Keep the output and ask for a kit change |
 | An idea sits in Plan it, no note | The job is not running, cannot reach the tracker, or planning is blocked | Read the heartbeat, then the log |
 | `Planning was not started` | Someone other than you moved it | Move it out of Plan it and back in yourself |
 | `this looks like live work` | The ticket is handed over, has a session, a parent, children or a pull request | Copy the idea into a new ticket and move that one |
@@ -247,7 +245,7 @@ While planning is stopped, `~<role account>/.stage-a/state/stop.json` exists and
 ## What is not proven
 
 - **A real idea carried through every stop with a person watching is not recorded.** The drill and the probe have run; a full plan end to end, watched, has not been written down (KIT-164).
-- **A helper session's tools are measured only when the log shows a helper started.** Otherwise the record says so (KIT-261).
+- **A helper session's tools are the session's own words.** No log records them. Code judges each tool its list names, and only reports a sentence. The list counts only when the log shows a helper started; otherwise the record says so (KIT-261, KIT-796).
 - **The wait for the session runner after a restart is one minute.** A slower start stops the step and says how to look (no ticket yet).
 - **A planning session may be able to read files in the role account's home.** The probe checks with a harmless test file and prints what it found (KIT-162).
 - **The planner's key and the review jobs' key are the same key by default.** Revoking it stops both (no ticket yet).

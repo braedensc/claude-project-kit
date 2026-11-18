@@ -935,6 +935,36 @@ no read" as if it had measured them. The reader now counts the call records it c
 in the same session file as the tool list: an older session's calls never speak for a
 newer one. With none, both are not measured, and the screen and the record say why.
 
+### Update 2026-11-18 — the fence is judged by code, and nothing about it is asked (KIT-796)
+
+This supersedes, where they differ, every passage above that puts a tool list to a person.
+
+**What broke.** On 18 Nov 2026 the owner ran the probe three times to clear a review pause.
+Each time it asked him whether a helper list held any tool outside the keep-set. That is a
+comparison against a fixed set. He answered y on a clean list, the probe failed, and reviews
+stayed paused. A manual step is a missing stage.
+
+**Decision (18 Nov, the ticket).** Code judges the fence, and no tool list is a question.
+- The session's tools come from the dispatcher's own session log, which no session can
+  write. A tool outside the keep-set there fails the probe and is named.
+- The helper's tools come from the items in its own list, because no log records them. An
+  item naming a fenced or unknown tool fails the probe and is named, as KIT-261 decided.
+  That protection was kept on review of the plan. One name in markdown, such as `**Bash**`,
+  is an item.
+- A log that cannot be read, or whose start-up list names no tools, is UNKNOWN. The
+  session's answer is never used in its place.
+- The session's own list, every sentence, and every line that may name a tool are a
+  cross-check. They are printed and kept in the record, and decide nothing.
+
+**What it gives up.** A sentence that says a helper holds `Bash` is reported, not refused,
+and so is a note such as `Read (and Bash)`. Under KIT-734 the owner was asked about them.
+A parser cannot tell "holds" from "does not hold", and a question is what failed. A bold
+label with no colon, such as `**Deferred**`, now reads as an item and fails the probe.
+
+**The questions that stay.** "Run the probe now?" files tickets as the owner, a change he
+should see. The team's agent guidance cannot be read through the tracker's API. His initials
+sign that answer.
+
 ## Update 2026-09-23 — planning built into each work team (KIT-184)
 
 **The decision.** The owner decided on 2026-09-21, and approved the design on 2026-09-23,
