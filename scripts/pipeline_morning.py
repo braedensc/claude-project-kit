@@ -620,6 +620,29 @@ def run(cfg, dry_run=False, clock=None, runner=None, say=print):
     return exit_code(doc["planned_by"], partial or proposed is False)
 
 
+HEARTBEAT_SCHEMA = "pipeline-morning-heartbeat/1"
+HEARTBEAT_NAME = "morning-heartbeat.json"
+
+
+def write_heartbeat(cfg, code, now, dry_run=False):
+    """KIT-689: one small file after each real pass, nothing-to-do passes included, beside the day
+    plan, so the health watch can tell a morning job that stopped from one with nothing to do. A
+    dry run writes none. A failed write is said, and never changes the pass's own exit."""
+    if dry_run:
+        return
+    path = os.path.join(os.path.dirname(cfg["day_plan_file"]), HEARTBEAT_NAME)
+    doc = {"schema": HEARTBEAT_SCHEMA, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+           "exit": code}
+    tmp = path + ".tmp"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh)
+        os.replace(tmp, path)
+    except OSError as exc:
+        print("COULD NOT write the heartbeat %s: %s" % (path, type(exc).__name__))
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="pipeline_morning.py", description=__doc__.split("\n")[0])
     p.add_argument("--selftest", action="store_true")
@@ -641,12 +664,14 @@ def main(argv=None):
             print("CONFIG: %s" % text)
         return EXIT_USAGE
     try:
-        return run(cfg, dry_run=args.dry_run)
+        code = run(cfg, dry_run=args.dry_run)
     except Exception as exc:  # noqa: BLE001 — a bug must still say so, and is exit 1
         frames = traceback.extract_tb(exc.__traceback__)
         print("the pass stopped on an unexpected error: %s in %s (line %d)" % (
             type(exc).__name__, frames[-1][2] if frames else "?", frames[-1][1] if frames else 0))
-        return EXIT_ERROR
+        code = EXIT_ERROR
+    write_heartbeat(cfg, code, time.time(), args.dry_run)
+    return code
 
 
 # --------------------------------------------------------------------------- #
@@ -1289,6 +1314,15 @@ def _cases(verify, hits, tmp):
                "CONFIG: --config must hold one JSON object",
                "unexpected error: ZeroDivisionError in <lambda> (line ")], "division" in text),
            ([2, 0, 2, 2, 1], [True], [True] * 4, False))
+    beat_path = os.path.join(os.path.dirname(good["day_plan_file"]), HEARTBEAT_NAME)
+    with open(beat_path, encoding="utf-8") as fh:
+        beat = json.load(fh)
+    dry_dir = os.path.join(cfg_dir, "dry-plans")
+    write_heartbeat({"day_plan_file": os.path.join(dry_dir, "day-plan.json")}, 0, 1794000000, True)
+    verify("KIT-689: a real pass leaves a heartbeat beside the day plan, even a crashed one (exit "
+           "1); a dry run leaves none",
+           (beat["schema"], beat["exit"], isinstance(beat["at"], str), os.path.exists(dry_dir)),
+           ("pipeline-morning-heartbeat/1", 1, True, False))
     source = inspect.getsource(me).split("\ndef selftest():")[0]
     verify("no shell, no socket, one environment variable read (the token's)",
            ([w for w in ("shell=True", "os.system", "import socket", "urllib") if w in source],
