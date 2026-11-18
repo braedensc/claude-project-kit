@@ -78,6 +78,7 @@
     "test:validator-app": "python3 scripts/pipeline_validator_app.py --selftest",
     "test:morning": "python3 scripts/pipeline_morning.py --selftest",
     "test:validator-brief": "python3 scripts/pipeline_validator_brief.py --selftest",
+    "test:validator-run": "python3 scripts/pipeline_validator_run.py --selftest",
     "test:validator-limits": "python3 scripts/pipeline_validator_limits.py --selftest",
     "test:tech-lead-turn": "python3 scripts/pipeline_tech_lead_turn.py --selftest",
     "test:standup": "python3 scripts/pipeline_standup.py --selftest",
