@@ -710,6 +710,7 @@ verdict:
 | No coverage file next to it, or one it can't read | Holds it, and says the check hasn't said whether the merged code was checked. |
 | The coverage file has no entry for the plan yet | Holds it. The check looks on its next pass. |
 | The entry says the merged head is not covered | Holds it, names that head, and waits for the check the live pass starts on it. |
+| The entry names other merged pull requests than the plan has now | Holds it: it is from before a later merge. The check looks again on its next pass. |
 | None yet | Holds it. The check runs on its own after the merge, so one comes. |
 | Still running | Holds it, and says so once in its thread. |
 | Couldn't start | Holds it, and names `check <plan>`. |
@@ -734,7 +735,7 @@ Not: `check PROD-51` on a piece. The bridge says it runs no plan for it.
 The acceptance check can. Each pass it compares the head the plan's last pull request merged at with
 its records, and writes one entry per plan to `<ACCEPTANCE_LEDGER>.coverage.json`: covered, or not
 covered with that head (`docs/ACCEPTANCE-POLLER-OPERATOR.md`). The bridge closes a finished plan only
-when its entry says covered. A fix pushed after the check passed and merged before a new check of it
+when its entry says covered, and lists the same merged pull requests the plan has now. A fix pushed after the check passed and merged before a new check of it
 started is therefore not closed on the earlier pass: the entry says not covered, the check starts one
 on the default branch, and the plan closes on that check's verdict. A plan whose last piece merged at
 the checked head closes as before, with no second check. Either job may run first after the merge.

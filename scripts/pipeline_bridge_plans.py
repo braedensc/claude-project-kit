@@ -3070,6 +3070,8 @@ class PlansMixin(object):
         by = entry.get("by") if isinstance(entry, dict) else None
         if (not isinstance(entry, dict) or not isinstance(entry.get("covered"), bool)
                 or not ACCEPTANCE_HEAD_RE.match(str(entry.get("merged_head") or ""))
+                or not isinstance(entry.get("merged_prs"), list)
+                or any(not isinstance(n, int) or isinstance(n, bool) for n in entry["merged_prs"])
                 or (entry["covered"] and not ACCEPTANCE_HEAD_RE.match(str(by or "")))):
             return "unreadable", None
         return "read", entry
@@ -3111,6 +3113,13 @@ class PlansMixin(object):
             return ("acceptance-coverage-uncovered:" + entry["merged_head"][:8], "%s is finished, but no acceptance "
                     "check has run on the code that merged (%s). The check starts one on its own; I'll mark it %s "
                     "once that passes." % (ticket, entry["merged_head"][:8], done))
+        # An entry counts only for the merges the plan has now: one written before a later pull request merged names
+        # fewer, so it is a record of an earlier merge and holds the plan until the live pass looks again.
+        merged_now = sorted({m["number"] for piece in read for m in piece_merge(piece["prs"])[1]})
+        if sorted(entry["merged_prs"]) != merged_now:
+            return ("acceptance-coverage-stale:" + ",".join(str(n) for n in merged_now),
+                    "%s is finished, but what the acceptance check says about the code that merged is from before "
+                    "its latest merge, so I haven't marked it %s. I'll look again." % (ticket, done))
         if row is None:
             return ("acceptance-waiting", "%s is finished, but its acceptance check hasn't run yet, "
                     "so I haven't marked it %s. The check runs on its own; I'll mark it %s once "
@@ -6332,8 +6341,8 @@ def cases_finish(kit):
         def entry_of(merged=H, covered=True, by=H):
             """The live pass's entry for the plan (KIT-610): the head its last piece merged at, and whether a check
             covers it."""
-            return {"merged_head": merged, "merged_pr": 7, "merged_at": "2026-11-10T09:40:00Z",
-                    "covered": covered, "by": by if covered else None, "looked_at": "2026-11-10T09:55:00Z"}
+            return {"merged_head": merged, "merged_pr": 7, "merged_prs": [437, 438],
+                    "merged_at": "2026-11-10T09:40:00Z", "covered": covered, "by": by if covered else None, "looked_at": "2026-11-10T09:55:00Z"}
 
         def coverage_of(entry=None, raw=None, plans=None, schema="pipeline-acceptance-coverage/1"):
             """The coverage file next to the ledger: by default the plan covered at H."""
@@ -6474,7 +6483,15 @@ def cases_finish(kit):
                 ("merged head not a head", "can't read what the acceptance check says",
                  lambda: coverage_of(dict(entry_of(), merged_head="abc"))),
                 ("covered not a boolean", "can't read what the acceptance check says",
-                 lambda: coverage_of(dict(entry_of(), covered="yes")))):
+                 lambda: coverage_of(dict(entry_of(), covered="yes"))),
+                ("no list of merged pull requests", "can't read what the acceptance check says",
+                 lambda: coverage_of({k: v for k, v in entry_of().items() if k != "merged_prs"})),
+                ("merged pull requests not numbers", "can't read what the acceptance check says",
+                 lambda: coverage_of(dict(entry_of(), merged_prs=["437", 438]))),
+                ("covered, from before the latest merge", "is from before its latest merge",
+                 lambda: coverage_of(dict(entry_of(), merged_prs=[437]))),
+                ("covered, for merges the plan no longer has", "is from before its latest merge",
+                 lambda: coverage_of(dict(entry_of(), merged_prs=[437, 438, 439])))):
             def case_uncovered(word=word, make=make):
                 def setup(t):
                     passed_at()(t)          # a passed verdict, on a check that ran before the merge
