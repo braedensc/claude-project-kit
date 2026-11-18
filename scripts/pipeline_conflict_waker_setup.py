@@ -19,7 +19,7 @@ would otherwise do for you is listed in docs/COLLABORATION.md, parallel-session 
 WHAT IT BUILDS.  For the PERSON running it, never for anyone else:
 
     ~/.pr-conflict-waker/code         a clone, level with origin, that the job execs
-    ~/.pr-conflict-waker/state        the waker's heartbeat and per-PR locks
+    ~/.pr-conflict-waker/state        the waker's heartbeat, per-PR locks and spend ledger
     ~/.pr-conflict-waker/setup        this installer's ledger and sign-offs
     ~/Library/LaunchAgents/<LABEL>.plist
                                       one LaunchAgent: `pr_conflict.py wake` every
@@ -147,7 +147,9 @@ DEFAULT_STATE_HOME = HOME_DIR + "/setup"
 # that touches none of them leaves the job's code current. The selftest derives the closure
 # from the sources and fails when this tuple drifts from it.
 REQUIRED_SCRIPTS = ("pr_conflict.py", "pipeline_dispatch_local.py", "pipeline_labels.py", "jsonschema_mini.py",
-                    "pipeline_agent_env.py")
+                    "pipeline_agent_env.py",
+                    # The spend ledgers' one writer: each fix session leaves a row (KIT-687).
+                    "pipeline_spend_ledger.py")
 DAEMON_PATH = se.DAEMON_PATH
 HEARTBEAT_WAIT_SECONDS = 90
 # How far ahead of this machine's clock a heartbeat's stamp may be and still count: ordinary

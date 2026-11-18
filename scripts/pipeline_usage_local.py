@@ -94,10 +94,12 @@ SPEND_LEDGER_PATHS = {
     "standup": "~/.stage-e/state/" + spend_ledger.FILE_NAMES["standup"],
     "tech_lead": "~/.stage-e/state/" + spend_ledger.FILE_NAMES["tech_lead"],
 }
-# No caller writes its ledger yet, so every one is off by default: a ledger nothing writes would read
-# as no calls, a zero nobody measured (Stage E on #622). KIT-687 adds the writers, and with them
-# makes SPEND_LEDGER_PATHS the defaults.
-DEFAULT_SPEND_LEDGERS = dict((caller, "") for caller in spend_ledger.CALLERS)
+# Each caller writes its ledger since KIT-687, so the three this account can read are on by default,
+# each where its writer puts it with its own defaults: the selftest pins every one to its writer's
+# own default, so none is a guess. A ledger nothing writes would read as no calls, a zero nobody
+# measured (Stage E on #622), so the waker's stays off: it is in a person's home.
+DEFAULT_SPEND_LEDGERS = dict((caller, SPEND_LEDGER_PATHS.get(caller, ""))
+                             for caller in spend_ledger.CALLERS)
 DEFAULT_LOOKBACK_DAYS = 8
 MAX_LOOKBACK_DAYS = 31
 
@@ -154,8 +156,9 @@ CONFIG_KEYS = {
     "judge_file": "the watcher judge's judge-calls.json, whose calls the judge's cost is read "
                   "from (default: empty, which turns this source off)",
     "spend_ledgers": "for each caller (%s), its spend ledger's path, absolute or ~/ (contract "
-                     "section 30), where its job writes it: %s. \"\" or a caller left out turns "
-                     "its ledger off, and every one is off by default until its caller writes it"
+                     "section 30). A caller left out takes its default, where its job writes it: "
+                     "%s. The conflict waker's is off by default: it is in a person's home, which "
+                     "this account cannot read. \"\" turns a ledger off"
                      % (", ".join(spend_ledger.CALLERS),
                         ", ".join("%s %s" % kv for kv in sorted(SPEND_LEDGER_PATHS.items()))),
     "reviews_team_key": "optional: the KEY of an old Reviews team, e.g. \"REV\": a run in a folder "
@@ -792,6 +795,7 @@ def selftest():
     time.tzset()
     try:
         _cases(check)
+        _selftest_writers(check)
     finally:
         if saved_zone is None:
             os.environ.pop("TZ", None)
@@ -1643,24 +1647,57 @@ def _cases(check):
                                           stage_a_state_dir="", judge_file="")))[k]
                for k in ("stage_e_state_dir", "stage_a_state_dir", "judge_file")]
               + ["absolute" in refused(dict(example, dispatcher_home=""))], ["", "", "", True])
-        # KIT-844: each caller's spend ledger, its default unless named, off when empty.
+        # KIT-844, KIT-687: each caller's spend ledger, its default unless named, off when empty.
         home_db = os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir)
         led = os.path.join(tmp, "ledgers")
-        check("spend_ledgers: a caller named is read from its path, \"\" or a caller left out "
-              "is off",
+        under_home = dict((c, os.path.join(os.path.realpath(os.path.join(
+            home_db, os.path.dirname(p[2:]))), os.path.basename(p)))
+            for c, p in SPEND_LEDGER_PATHS.items())
+        check("spend_ledgers: a caller named is read from its path, \"\" is off, and a caller "
+              "left out takes its default",
               load_config(conf_file(dict(example, spend_ledgers={
                   "morning": os.path.join(led, "m.jsonl"), "standup": ""})))["spend_ledgers"],
-              {"morning": os.path.join(led, "m.jsonl"), "standup": "", "tech_lead": "",
-               "conflict_waker": ""})
-        check("…every ledger is off by default until its caller writes it, never read as no calls "
-              "(Stage E on #622); a ~/ path is under this account's home",
+              {"morning": os.path.join(led, "m.jsonl"), "standup": "",
+               "tech_lead": under_home["tech_lead"], "conflict_waker": ""})
+        check("…the three ledgers this account can read are on by default, now that each caller "
+              "writes its own (KIT-687), under this account's home; the waker's, in a person's "
+              "home, is off, never read as no calls (Stage E on #622)",
               (load_config(conf_file(dict((k, v) for k, v in example.items()
                                           if k != "spend_ledgers")))["spend_ledgers"],
-               EXAMPLE_CONFIG["spend_ledgers"] == DEFAULT_SPEND_LEDGERS,
-               load_config(conf_file(dict(example, spend_ledgers={
-                   "morning": SPEND_LEDGER_PATHS["morning"]})))["spend_ledgers"]["morning"]),
-              (dict((c, "") for c in spend_ledger.CALLERS), True,
-               os.path.join(home_db, ".stage-e", "queue", "morning-spend.jsonl")))
+               EXAMPLE_CONFIG["spend_ledgers"] == DEFAULT_SPEND_LEDGERS),
+              (dict(under_home, conflict_waker=""), True))
+        # KIT-687: one call of each caller, its row added by the ledgers' one writer where that
+        # caller writes it by default, is in the file with its model and billing; an unread cost
+        # is unpriced. The account's home is stood in for, as the jobs' own `~` is theirs.
+        role_home = os.path.join(tmp, "kit-687-role-home")
+        made = {"morning": (0.04, "claude-sonnet-5-5"), "standup": (None, None),
+                "tech_lead": (0.2, "claude-opus-5-5")}
+        for caller, (usd, model) in sorted(made.items()):
+            path = os.path.join(role_home, SPEND_LEDGER_PATHS[caller][2:])
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            out_doc = None if usd is None else {"is_error": False, "subtype": "success",
+                                                "total_cost_usd": usd,
+                                                "modelUsage": {model: {"costUSD": usd}}}
+            spend_ledger.append(path, spend_ledger.row_from_result(caller, out_doc, "plan",
+                                                                   "sonnet"), now=T - 3600)
+        held_home = globals()["account_home"]
+        globals()["account_home"] = lambda: role_home
+        try:
+            defaults = load_spend_ledgers({})
+        finally:
+            globals()["account_home"] = held_home
+        cfg_d, _ = std_world(os.path.join(tmp, "kit-687-defaults"), spend_ledgers=defaults)
+        code_d, _said_d = go(cfg_d)
+        doc_d = written(cfg_d)
+        check("KIT-687 after one call of each caller, the file has a row for each read from its "
+              "default ledger, with its model and billing; the waker's is off, never zero",
+              (code_d, [(c, dig(doc_d, "spend", c, "state"), dig(doc_d, "spend", c, "calls"),
+                         dig(doc_d, "spend", c, "unpriced"), dig(doc_d, "spend", c, "models"),
+                         dig(doc_d, "spend", c, "billing")) for c in spend_ledger.CALLERS]),
+              (EXIT_OK, [("morning", READ, 1, 0, {"claude-sonnet-5-5": 1}, {"plan": 1}),
+                         ("standup", READ, 1, 1, {"sonnet": 1}, {"plan": 1}),
+                         ("tech_lead", READ, 1, 0, {"claude-opus-5-5": 1}, {"plan": 1}),
+                         ("conflict_waker", OFF, None, None, None, None)]))
         os.symlink(led, os.path.join(tmp, "ledgers-link"))
         check("…a ledger's folder is resolved and its file name kept, so a ledger that is a link "
               "is left for the reader to refuse",
@@ -1764,6 +1801,29 @@ def _cases(check):
                sorted(usage_runs.STATUS_WORDS + (WORD_OTHER,))
                == sorted(defs["window_event"]["properties"]["status"]["enum"])),
               (True, True, True, True))
+
+
+def _selftest_writers(check):
+    """KIT-687: a ledger this job reads by default is where its writer puts it with the writer's
+    own defaults, so no default is a guess: the morning job's beside its default day plan, the
+    stand-up's and the tech lead's in the bridge's default state folder. The waker's ledger, in
+    its own default state folder in a person's home, stays off. The writers are imported here
+    only, in the selftest: the job itself never loads them."""
+    import pipeline_bridge_config as bridge_config
+    import pipeline_morning as morning
+    import pr_conflict
+    writers = {
+        "morning": os.path.join(os.path.dirname(morning.DEFAULTS["day_plan_file"]),
+                                spend_ledger.FILE_NAMES["morning"]),
+        "standup": spend_ledger.path_in(bridge_config.DEFAULT_STATE_DIR, "standup"),
+        "tech_lead": spend_ledger.path_in(bridge_config.DEFAULT_STATE_DIR, "tech_lead"),
+    }
+    check("KIT-687 each ledger read by default is where its writer puts it by default; the "
+          "waker's, in its own state folder in a person's home, is off",
+          (DEFAULT_SPEND_LEDGERS, SPEND_LEDGER_PATHS,
+           spend_ledger.path_in(pr_conflict.DEFAULT_STATE_DIR, "conflict_waker")),
+          (dict(writers, conflict_waker=""), writers,
+           "~/.pr-conflict-waker/state/conflict-waker-spend.jsonl"))
 
 
 if __name__ == "__main__":

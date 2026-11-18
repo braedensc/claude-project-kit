@@ -265,15 +265,54 @@ python3 scripts/pipeline_watch.py status           # the last pass, per kind
 ```
 
 **The one command checks it too** (`python3 scripts/pipeline_install.py`, step 3f) when this Mac has an `update.conf`.
-It looks, and changes nothing, at whether the job file is there, names this kit, this settings file and this interval,
-and is held by launchd. If not, it asks, then runs the `install` above, which still shows its dry pass and asks for its
-own `yes`. It looks again after, and a job it did not see loaded reads "could not be measured", never "updated".
 Its line says whether the job is installed and current, not what a pass finds: run `pipeline_watch.py run --dry-run`
 or `status` for that.
 
-`install` refuses in an agent environment. It records the `brew`, `gh`, `npm` and `git`
-directories your shell has now in the job's `PATH`. Re-run it after moving any of them. A
-"no" changes nothing: a job already loaded keeps running.
+- **In Manual,** it looks, and changes nothing, at whether the job file is there, names this kit, this settings file
+  and this interval, and is held by launchd. If not, it asks, then runs the `install` above, which still shows its dry
+  pass and asks for its own `yes`. It looks again after, and a job it did not see loaded reads "could not be
+  measured", never "updated".
+- **In Automatic (KIT-869),** it runs `check`, then `apply` with your consent piped in, when a row is work. Neither
+  asks anything, and neither needs your Mac password: the job is yours, in your own login.
+
+| Command | What it is |
+|---|---|
+| `check` | for a program: two rows, `job` (the file names this kit, this settings file and this interval) and `enable` (launchd holds the job, running that command). Changes nothing, records nothing, asks nothing. Prints one JSON document on stdout; its words go to stderr |
+| `apply` | for a program, after your consent: its answers come through a pipe, and it asks nothing. It writes the job file, and loads the job itself, under its ceiling. A person types `install` instead |
+
+**`apply` reads its answers from a pipe on stdin:**
+
+```json
+{"schema": "watch-answers/1", "consent": "yes"}
+```
+
+- **A pipe only.** A terminal, a file or an argument is refused. A session could write a file, and every process can
+  read an argument.
+- **Anything but `"consent": "yes"`** changes nothing and exits 10.
+- **It refuses** as root, and in an agent environment before it reads its stdin.
+
+**The first-pass ceiling.** `pipeline-parts.json` gives this part a ceiling: the most alerts its first pass may raise
+with nobody reading the number first. It is 3. An alert is one GitHub issue the pass would open or close, and one
+Slack page when its status file would read `problem`. `apply` counts them with a pass that sends and writes nothing.
+
+- **At or below the ceiling,** it enables and loads the job, then asks launchd whether it holds this command.
+- **Above it,** the job stays installed, disabled and off. The end line says, for example,
+  `left off: its first pass would raise 4 alerts, above its ceiling of 3`. Read the pass it printed, clear what you
+  can, then run `install` yourself, or let the next Automatic run count again.
+- **A ceiling it cannot read** also leaves the job off, and reads "could not be measured".
+
+**A job file written while the job is off is disabled** in the same step, so your next login cannot start it.
+launchd loads every file in `~/Library/LaunchAgents` at login unless its label is disabled. `install` enables the label
+before it loads, so it switches on a job that `apply` left off.
+
+**A job you stopped stays stopped.** A job that has run here before (its log, `~/.pipeline-update/watch.log`, is
+there) and is not loaded now was stopped on purpose. `apply` never switches it back on, and the end line says so.
+Run `install` to switch it on yourself.
+
+`install` and `apply` refuse in an agent environment. A job file either one writes records the `brew`, `gh`,
+`npm` and `git` directories your shell has now in the job's `PATH`. `apply` rewrites the file only when it names
+another kit, settings file or interval, so re-run `install` after moving any of them. A "no" changes nothing: a job
+already loaded keeps running.
 
 ## What is not proven
 
@@ -283,5 +322,12 @@ directories your shell has now in the job's `PATH`. Re-run it after moving any o
   just-released version can read as current for a while (no ticket yet).
 - The health watch end to end on a real machine: a GitHub issue opened and closed by a live
   run, and the Slack page through the heartbeat monitor reading the status file (KIT-218).
+- That `apply`'s launchctl calls work in a real login's domain. The battery drives a launchd
+  that keeps state: disable, enable, load, reload, and a load it refuses. No live `apply` has
+  run yet (KIT-869).
+- That 3 is the right ceiling. It is a first choice, with no measurement behind it. A Mac with
+  more problems at once leaves the health check off until you look (KIT-869).
+- That a log means the job ran. launchd writes it when the job runs; a log you delete makes a
+  job you stopped look like one never on, and `apply` may then switch it on (KIT-869).
 - That a `front-door` probe from this machine sees what the tracker's webhooks see. Both go
   through the same public name, but the tracker connects from elsewhere (no ticket yet).
