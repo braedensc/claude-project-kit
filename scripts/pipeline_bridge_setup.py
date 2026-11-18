@@ -221,6 +221,15 @@ CONF_KEYS = {
                                  "member ID). A reply under one of its pings that it did "
                                  "not record is then refused aloud, and `verify` needs the "
                                  "pings file"),
+    "ACCEPTANCE_REPOS": ("", "optional: owner/repo names, comma-separated, whose plans close "
+                             "only after the acceptance check's verdict holds nothing, and whose "
+                             "plans `check <plan>` may run again (KIT-325). Empty: every plan "
+                             "closes as before"),
+    "ACCEPTANCE_LEDGER": (bridge.DEFAULT_ACCEPTANCE_LEDGER,
+                          "with ACCEPTANCE_REPOS: the acceptance check's ledger, where its own "
+                          "config writes it (its `ledger`, by default "
+                          "<its state_dir>/acceptance-ledger.json). The tech lead reads which check "
+                          "of a plan is the newest there; not there, the plan is held, and said"),
     "DM_USER_IDS": ("", "optional: the Slack user ids whose DM with the tech lead's app it also "
                         "reads and answers in, comma-separated (KIT-295). Each message there "
                         "is one of its own, so it notifies. Empty: no DM"),
@@ -374,7 +383,7 @@ def validate_conf(values):
     if conf["ROLE_ACCOUNT"] and not ACCOUNT_RE.match(conf["ROLE_ACCOUNT"]):
         errors.append("ROLE_ACCOUNT %r is not an account name" % conf["ROLE_ACCOUNT"])
     for key in ("ROLE_KIT_CLONE", "ENV_FILE", "BRIDGE_CONFIG", "STATE_DIR",
-                "DISPATCHER_ENV_FILE", "NOTIFIER_STATE_DIR"):
+                "DISPATCHER_ENV_FILE", "NOTIFIER_STATE_DIR", "ACCEPTANCE_LEDGER"):
         if conf[key] and not PATH_RE.match(conf[key]):
             errors.append("%s must be an absolute or ~/ path of plain characters, got %r"
                           % (key, conf[key]))
@@ -425,6 +434,11 @@ def validate_conf(values):
     elif label and label == conf["JOB_LABEL"]:
         errors.append("NOTIFIER_JOB_LABEL is the tech lead's own JOB_LABEL. Set it to the "
                       "JOB_LABEL in notifier.conf, or leave it empty")
+    # KIT-325: the repositories whose plans wait for the acceptance check.
+    bad_repos = [r for r in split_list(conf["ACCEPTANCE_REPOS"])
+                 if not re.match(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$", r)]
+    if bad_repos:
+        errors.append("ACCEPTANCE_REPOS must list owner/repo names, got %s" % ", ".join(bad_repos))
     # KIT-295: each a member's own user id, named once. The job checks the same.
     dms = split_list(conf["DM_USER_IDS"])
     bad = [u for u in dms if not bridge.SLACK_USER_RE.match(u)]
@@ -530,23 +544,16 @@ def ask_name(conf_path, values, reader=None, tty=None, err=None):
         err.write("No name was written to %s. Run this again to name your tech lead.\n"
                   % conf_path)
         return EX_USAGE, values
-    # A temp file beside the conf, swapped in whole: a failed write never leaves it partial.
-    tmp = "%s.name.%d" % (conf_path, os.getpid())
     try:
-        with open(conf_path, encoding="utf-8") as fh:
-            text = fh.read()
-        mode = os.stat(conf_path).st_mode & 0o777
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(set_conf_line(text, "APP_NAME", name))
-        os.replace(tmp, conf_path)
-    except OSError as exc:
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
-        err.write("Could not write the name into %s: %s. Nothing was written.\n"
-                  % (conf_path, exc))
+        write_conf_name(conf_path, name)
+    except NameWriteError as exc:
+        if exc.kind in ("readback", "mismatch"):    # the file was swapped in: it was written
+            err.write("The name was written to %s but %s. Check it by hand.\n"
+                      % (conf_path, "reads back differently" if exc.kind == "mismatch"
+                         else "could not be read back (%s)" % exc.detail))
+        else:
+            err.write("Could not write the name into %s: %s. Nothing was written.\n"
+                      % (conf_path, exc.detail or exc.kind))
         return EX_FAILED, values
     err.write("Saved: your tech lead is called %r (APP_NAME in %s). To rename it later, change "
               "that line and paste the manifest again.\n" % (name, conf_path))
@@ -709,6 +716,7 @@ COMPOSED_AS = {"CHANNEL_IDS": "channel_ids", "OWNER_USER_ID": "owner_user_id",
                "BOT_USER_ID": "bot_user_id", "TEAM_KEYS": "team_keys", "EPIC_WIP": "epic_wip",
                "ACT": "act", "NOTIFIER_STATE_DIR": ("pings_file", "notifier_posts_file"),
                "INTERVAL_SECONDS": "run_interval_seconds", "DM_USER_IDS": "dm_user_ids",
+               "ACCEPTANCE_REPOS": "acceptance_repos", "ACCEPTANCE_LEDGER": "acceptance_ledger",
                "QUESTION_REMINDER_HOURS": "question_reminder_hours",
                "QUEUE_CONFIG": "queue_config", "QUEUE_EVERY_SECONDS": "queue_every_seconds"}
 # KIT-298: the tech lead's keys, each checked above by its conf name.
@@ -739,6 +747,7 @@ JOB_KEY_FROM = {
     "pings_file": "NOTIFIER_STATE_DIR", "handoff_states": "HANDOFF_STATES",
     "done_state": "DONE_STATE", "notifier_bot_user_id": "NOTIFIER_BOT_USER_ID",
     "dm_user_ids": "DM_USER_IDS", "notifier_posts_file": "NOTIFIER_STATE_DIR",
+    "acceptance_repos": "ACCEPTANCE_REPOS", "acceptance_ledger": "ACCEPTANCE_LEDGER",
     "notifier_plist": "NOTIFIER_JOB_LABEL", "run_interval_seconds": "INTERVAL_SECONDS",
     "tech_lead_turn": "TECH_LEAD_TURN", "turn_bin": "TURN_BIN", "turn_model": "TURN_MODEL",
     "turn_token_env": "TURN_TOKEN_ENV", "turn_tools_config": "TURN_TOOLS_CONFIG",
@@ -980,6 +989,11 @@ def compose_config(conf):
     if split_list(conf["DM_USER_IDS"]):
         doc["dm_user_ids"] = split_list(conf["DM_USER_IDS"])
         doc["notifier_posts_file"] = dm_posts_file(conf)
+    # KIT-325: composed only when set, so a config from before the key stays the same. The
+    # check's ledger goes with it: the gate reads it where the check writes it.
+    if split_list(conf["ACCEPTANCE_REPOS"]):
+        doc["acceptance_repos"] = split_list(conf["ACCEPTANCE_REPOS"])
+        doc["acceptance_ledger"] = conf["ACCEPTANCE_LEDGER"]
     # Composed only when set, so a config written before the key existed stays the same.
     if conf["NOTIFIER_JOB_LABEL"]:
         doc["notifier_plist"] = notifier_plist_path(conf)
@@ -2173,14 +2187,89 @@ def drill_command(conf):
 
 
 def set_conf_line(text, key, value):
-    """The conf's text with KEY=value set: its own line changed in place, or one added."""
-    lines, done = text.splitlines(), False
-    for n, line in enumerate(lines):
-        if line.strip().split("=", 1)[0].strip() == key and not line.strip().startswith("#"):
-            lines[n], done = "%s=%s" % (key, value), True
+    """The conf's text with KEY=value set, and no other byte changed (KIT-747).
+
+    The active line is the one whose key (the part before the first `=`), stripped, is KEY and
+    that is not a comment. It is replaced and keeps its own ending (none, on a last line with
+    none). A commented `#KEY=` example stays as it is. With no active line, one is added after
+    the last line, ended like the file's lines: CRLF when the last line that has an ending ends
+    in CRLF, else LF. A last line with no ending is ended in that style first. An empty file
+    gets the line alone, ended with LF."""
+    out, done, style, last_end = [], False, "\n", None
+    for piece in text.splitlines(keepends=True):
+        body = piece.splitlines()[0]
+        end = piece[len(body):]
+        last_end = end
+        if end:
+            style = "\r\n" if end == "\r\n" else "\n"
+        stripped = body.strip()
+        if stripped.split("=", 1)[0].strip() == key and not stripped.startswith("#"):
+            out.append("%s=%s%s" % (key, value, end))
+            done = True
+        else:
+            out.append(piece)
     if not done:
-        lines.append("%s=%s" % (key, value))
-    return "\n".join(lines) + "\n"
+        if last_end == "":
+            out.append(style)            # the last line had no ending: end it first, in the file's style
+        out.append("%s=%s%s" % (key, value, style))
+    return "".join(out)
+
+
+class NameWriteError(Exception):
+    """write_conf_name's failure. `kind` is read, changed, write, readback or mismatch; `detail`
+    is the exception's class name, or empty."""
+
+    def __init__(self, kind, detail=""):
+        Exception.__init__(self, kind, detail)
+        self.kind, self.detail = kind, detail
+
+
+def write_conf_name(path, name, guard=None):
+    """KIT-747: the one writer of the tech lead's name. Sets the active APP_NAME line of the
+    settings file at `path` (or adds one), keeps every other byte, swaps the whole file in
+    from a temp file made new beside it (never through a link, with the old mode), and reads it
+    back. `guard(text)`, if given, returns a reason to stop (the file changed since it was
+    read): then nothing is written. Raises NameWriteError; returns the text written."""
+    try:
+        with open(path, "rb") as fh:
+            old = fh.read().decode("utf-8")
+        mode = os.stat(path).st_mode & 0o777
+    except (OSError, ValueError) as exc:
+        raise NameWriteError("read", type(exc).__name__)
+    if guard is not None and guard(old):
+        raise NameWriteError("changed")
+    new = set_conf_line(old, "APP_NAME", name).encode("utf-8")
+    tmp = "%s.name.%d" % (path, os.getpid())
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+    except OSError as exc:
+        raise NameWriteError("write", type(exc).__name__)
+    swapped = False
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            os.fchmod(fh.fileno(), mode)
+            fh.write(new)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        swapped = True
+    except OSError as exc:
+        raise NameWriteError("write", type(exc).__name__)
+    finally:
+        if not swapped:                  # a failure or Ctrl-C: the temp file this call made goes
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    try:
+        with open(path, "rb") as fh:
+            back = fh.read()
+        back_values, back_errors = parse_conf(back.decode("utf-8"))
+    except (OSError, ValueError) as exc:
+        raise NameWriteError("readback", type(exc).__name__)
+    if back != new or back_errors or back_values.get("APP_NAME") != name:
+        raise NameWriteError("mismatch")
+    return new.decode("utf-8")
 
 
 def cmd_direct_asks(conf, conf_path, runner, sudo, apply_it, reader=None):
@@ -3396,6 +3485,35 @@ def selftest():
                                           % os.getpid()))["channel_ids"],
               ["C0000000AA", "C0000000BB"])
         check("config-acts-on-nothing-by-default", compose_config(conf)["act"], False)
+        # KIT-325: the acceptance gate, composed only when a repository is named.
+        gated, gerrs = validate_conf(dict(values, ACCEPTANCE_REPOS="acme/app, acme/web"))
+        check("config-carries-the-acceptance-repos-only-when-named",
+              (gerrs, compose_config(gated).get("acceptance_repos"),
+               "acceptance_repos" in compose_config(conf),
+               bridge.validate_config(dict(compose_config(gated), state_dir="/tmp/x-%d"
+                                           % os.getpid()))["acceptance_repos"]),
+              ([], ["acme/app", "acme/web"], False, ["acme/app", "acme/web"]))
+        _g, bad_errs = validate_conf(dict(values, ACCEPTANCE_REPOS="app"))
+        check("refuse: an ACCEPTANCE_REPOS entry that is not owner/repo",
+              any("ACCEPTANCE_REPOS must list owner/repo" in e for e in bad_errs), True)
+        # KIT-325 review: the gate reads the check's ledger where the check writes it, so the
+        # path goes into the config with the repositories, never left to the job's guess.
+        moved, merrs = validate_conf(dict(values, ACCEPTANCE_REPOS="acme/app",
+                                          ACCEPTANCE_LEDGER="~/.stage-e/x/acceptance-ledger.json"))
+        check("config-carries-the-acceptance-ledger-with-the-repos",
+              (compose_config(gated).get("acceptance_ledger"),
+               (merrs, compose_config(moved).get("acceptance_ledger")),
+               "acceptance_ledger" in compose_config(conf),
+               bridge.validate_config(dict(compose_config(moved), state_dir="/tmp/x-%d"
+                                           % os.getpid()))["acceptance_ledger"]),
+              ("~/.stage-e/state/acceptance-ledger.json",
+               ([], "~/.stage-e/x/acceptance-ledger.json"), False,
+               os.path.realpath(os.path.expanduser("~/.stage-e/x/acceptance-ledger.json"))))
+        _g, bad_errs = validate_conf(dict(values, ACCEPTANCE_REPOS="acme/app",
+                                          ACCEPTANCE_LEDGER="ledger.json"))
+        check("refuse: an ACCEPTANCE_LEDGER that is not a full or ~/ path",
+              any(e.startswith("ACCEPTANCE_LEDGER must be an absolute or ~/ path")
+                  for e in bad_errs), True)
         on, _e = validate_conf(dict(values, ACT="yes"))
         check("config-acts-with-ACT-yes", (compose_config(on)["act"],
                                            compose_config(on)["plan_it_state"]),
@@ -3769,6 +3887,65 @@ def selftest():
         check("name-written-whole-through-a-swap-keeping-the-mode-and-a-failed-write-keeps-the-conf",
               (w_rc, w_left, f_rc, f_kept, f_left, "Nothing was written" in f_err.getvalue()),
               (EX_OK, (["bridge.conf"], "0o600"), EX_FAILED, True, ["bridge.conf"], True))
+        # KIT-747: the one writer keeps every other byte: CRLF endings, a missing final newline,
+        # a commented example, an active line. Each is written to a file, read back and compared.
+        keep_cases = (
+            ("crlf-no-line", "# c\r\nACT=no\r\n", "# c\r\nACT=no\r\nAPP_NAME=Rex\r\n"),
+            ("crlf-active-line", "# c\r\nAPP_NAME=Old\r\nACT=no\r\n",
+             "# c\r\nAPP_NAME=Rex\r\nACT=no\r\n"),
+            ("no-final-newline-no-line", "# c\nACT=no", "# c\nACT=no\nAPP_NAME=Rex\n"),
+            ("no-final-newline-active-last", "ACT=no\nAPP_NAME=Old", "ACT=no\nAPP_NAME=Rex"),
+            ("commented-example-only", "#APP_NAME=Tech lead\nACT=no\n",
+             "#APP_NAME=Tech lead\nACT=no\nAPP_NAME=Rex\n"),
+            ("active-line-and-a-commented-one", "#APP_NAME=Tech lead\nAPP_NAME=Old\nACT=no\n",
+             "#APP_NAME=Tech lead\nAPP_NAME=Rex\nACT=no\n"),
+            ("trailing-spaces-and-tabs-kept", "ACT=no  \r\nINTERVAL_SECONDS=60\t\n",
+             "ACT=no  \r\nINTERVAL_SECONDS=60\t\nAPP_NAME=Rex\n"),
+            ("empty-file", "", "APP_NAME=Rex\n"),
+        )
+        with tempfile.TemporaryDirectory() as ktmp:
+            for klabel, before, expected in keep_cases:
+                kpath = os.path.join(ktmp, "k.conf")
+                with open(kpath, "wb") as fh:
+                    fh.write(before.encode("utf-8"))
+                try:
+                    write_conf_name(kpath, "Rex")
+                except NameWriteError as exc:
+                    got = "failed: %s" % exc.kind
+                else:
+                    with open(kpath, "rb") as fh:
+                        got = fh.read().decode("utf-8")
+                check("kit747-name-writer-keeps-every-other-byte-" + klabel, got, expected)
+                check("kit747-set-conf-line-keeps-every-other-byte-" + klabel,
+                      set_conf_line(before, "APP_NAME", "Rex"), expected)
+        # The file was swapped in before a read-back or a mismatch is found, so those two say
+        # "written", not "nothing was written"; a failed swap says nothing was written.
+        with tempfile.TemporaryDirectory() as mtmp:
+            mpath = os.path.join(mtmp, "bridge.conf")
+            with open(mpath, "w", encoding="utf-8") as fh:
+                fh.write(bare)
+            said = {}
+            real_write = globals()["write_conf_name"]
+            try:
+                for kind in ("mismatch", "readback", "write"):
+                    def boom(path, name, guard=None, _k=kind):
+                        raise NameWriteError(_k, "OSError" if _k != "mismatch" else "")
+                    globals()["write_conf_name"] = boom
+                    m_err = io.StringIO()
+                    m_rc = ask_name(mpath, {}, reader=lambda _q: "Rex", tty=True, err=m_err)[0]
+                    said[kind] = (m_rc, m_err.getvalue())
+            finally:
+                globals()["write_conf_name"] = real_write
+        check("kit747-a-name-found-wrong-after-the-swap-says-it-was-written",
+              (said["mismatch"][0], "was written to" in said["mismatch"][1],
+               "reads back differently" in said["mismatch"][1],
+               "Nothing was written" in said["mismatch"][1]), (EX_FAILED, True, True, False))
+        check("kit747-a-name-that-cannot-be-read-back-says-it-was-written",
+              ("was written to" in said["readback"][1], "Nothing was written" in said["readback"][1]),
+              (True, False))
+        check("kit747-a-swap-that-fails-says-nothing-was-written",
+              ("Nothing was written" in said["write"][1], "was written to" in said["write"][1]),
+              (True, False))
         check("name-saved-line-says-the-name-and-how-to-rename",
               (r_asked[4].startswith("Saved: your tech lead is called 'babyclaw' (APP_NAME in "),
                "change that line and paste the manifest again" in r_asked[4]), (True, True))

@@ -201,11 +201,12 @@ heartbeat left from before the load came from the old code. It says nothing abou
 just loaded. The installer records the second it loads each daemon, and holds each heartbeat
 to its own daemon's load. That covers the load in `enable`, the one the `code` step makes as
 soon as the clone has moved, and the one a stopped run makes on its way out. A daemon is
-proven when its heartbeat was written in a later second than its load. One written in the
-load's own second cannot be told from one the old job left just before it exited, so it waits
-for the next pass.
+proven when its heartbeat was written at or after its load. The installer starts each load at
+the top of a second, so nothing the old job wrote can share that second.
 
-If a daemon is not proven within 90 seconds, the step ends `UNKNOWN`, never done. It names
+A heartbeat comes when a pass ends, and a pass can run for minutes. The step waits one whole
+pass for each daemon: 15 minutes for the review poller and the bounce driver, 5 for the finding
+poller, plus 30 seconds. If a daemon is not proven by then, the step ends `UNKNOWN`, never done. It names
 each daemon with `no heartbeat` or `its heartbeat is from before the load`. `verify` reads the
 same record and says the same sentence. Read the logs it points to under the role account's
 `~/.stage-e/`, then run the same command again.
@@ -1768,6 +1769,15 @@ refused by name. The example below is the work-team shape the installer writes:
   resets to the default. It is a **different question** from `in_flight_hours` — one is
   "how soon may I re-prompt", the other is "when has waiting become silence" — so the two
   are separate keys and neither implies the other.
+- `validator_ledger_file` is optional, and off when empty (KIT-542). Set it to the
+  validator's ledger, as an absolute path this account can read, and a `sent-back` row for a
+  pull request at its current head re-prompts that pull request's session: one more trigger on
+  the same budget, with the validator's agent's reason as one marked line inside the fence. A
+  path that is not absolute is refused when the config loads. A ledger the driver cannot read
+  is *CANNOT EVALUATE* on each pull request where nothing else triggers, never a quiet
+  nothing. The validator's own `Validator` check is always set aside, like a check in
+  `human_pending_checks`, whatever that list says: its verdict is never bounced as red CI.
+  See `docs/VALIDATOR-OPERATOR.md`, section 7.
 - `needs_human_label_id` is optional; without it the driver reads the label ids from
   `delivery.json`. Unset in **both** ⇒ exhaustion and the no-push signal still post their
   comments and still hand the pull request to a person, say once that the id is missing,
@@ -2512,10 +2522,11 @@ request from the repository's own bot account could raise it, to 20 at most.
 | The pull request was opened by | Answered by | Where the fix runs |
 |---|---|---|
 | A dispatcher's session | the **bounce driver** (already installed, above) | that session, resumed in its own thread, worktree and sandbox |
-| One of your own local sessions | your **conflict waker** | a new capped session in that worktree, as you, under the repo's hooks |
+| One of your own local sessions | your **conflict waker** | a new capped session in that worktree, as you, held to it (KIT-676) |
 
-Why the split matters: a waker starts its session **outside** any sandbox. Pointed at a
-branch a sandboxed session wrote, it would run that session's work with your reach. So:
+Why the split matters: a waker's session is held to its worktree, but it pushes with **your**
+GitHub login. Pointed at a branch a sandboxed session wrote, it would carry that session's work
+with your reach. So:
 
 - The waker takes a request only for a worktree **your own Claude Code has worked in**.
   A dispatcher's sessions keep their transcripts under the role account's home, which
@@ -2600,12 +2611,14 @@ out, your local sessions are not running either, and the monitor pages you.
 the monitor's two-hour result deadline. Every session in a pass is acknowledged before the
 first starts. A request over the cap is left unclaimed and named; the monitor pages it.
 
-**Give the fix session its tools.** A headless session gets only what your settings and
-`CLAUDE_ARGS` allow. Its prompt uses git, gh, and your local checks. Allow all three.
+**Name the fix session's checks.** A fix session is held to its worktree (KIT-676). It loads
+none of your settings. It may run only the git and gh steps of its prompt and your
+`CHECK_COMMANDS`, each by its exact words, and its commands run in Claude Code's sandbox.
 
-- Good, for this kit: `--permission-mode acceptEdits --allowedTools Bash(git:*) Bash(gh:*) Bash(npm:*) Bash(python3:*)`.
-- Not: git and gh only. The session merges, cannot run a check, and pushes untested or
-  ends `failed`.
+- Good, for this kit: `CHECK_COMMANDS=npm run test:hooks, python3 scripts/check_placeholders.py`.
+- Not: an empty `CHECK_COMMANDS` on a project that has a local gate. The session merges, runs
+  no check, and pushes with only CI to test it.
+- Not: `CLAUDE_ARGS`. It is gone, and a conf that still sets it is refused by name.
 
 **Is it running?** Read the heartbeat, not the log:
 

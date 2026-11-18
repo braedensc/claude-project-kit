@@ -28,16 +28,16 @@ WHAT IT BUILDS.  For the PERSON running it, never for anyone else:
 WHY A LAUNCHAGENT FOR YOU, AND NOT A DAEMON FOR THE ROLE ACCOUNT.  The three Stage E jobs
 run as the dispatcher's role account under system LaunchDaemons, because what they serve
 — the dispatcher — runs at boot with nobody logged in. The waker serves the opposite
-thing. It wakes LOCALLY SPAWNED sessions: yours, in your worktrees, under your hooks, with
-your `claude` and `gh` logins, which on macOS live in your login keychain — and a system
+thing. It wakes LOCALLY SPAWNED sessions: yours, in your worktrees, each held to its
+worktree, with your `claude` and `gh` logins, which on macOS live in your login keychain — and a system
 daemon cannot open that keychain. So it is a user LaunchAgent, and it runs only while you
 are logged in. That is the honest scope: when you are logged out, your local sessions are
 not running either, and the conflict monitor's ack deadline turns an unclaimed request
 into a page on the PR — never silence.
 
 A waker as the ROLE ACCOUNT is refused, here and in the waker itself. Every PR that
-account's sessions opened is a SANDBOXED session's, and a waker starts its fix outside
-any sandbox. Those conflicts go back through the session's own tracker thread instead —
+account's sessions opened is a SANDBOXED session's, and a waker's fix, though held to its
+worktree, pushes with your GitHub login. Those conflicts go back through the session's own tracker thread instead —
 the Stage E bounce driver's `conflict` action. Both cases exist on a real machine; each
 has exactly one lane, and neither lane can take the other's PR (see scripts/pr_conflict.py,
 WHOSE PULL REQUEST THE WAKER MAY TAKE).
@@ -67,9 +67,9 @@ every setting but LABEL, and the transcripts folder. `attest` binds the sign-off
 A later run that measures anything else asks again at CK-W1 and names what changed. A sign-off
 made before the binding names nothing, so it asks once more. The count is not part of the
 record, because it moves with the pull requests; the note carries it. The record also keeps
-every dry-run line that starts `fix session:`, saying what a session may do. Today's waker
-prints none, so that part is empty; the tool list is bound through CLAUDE_ARGS meanwhile. Once
-the waker prints those lines (KIT-676), a change in them asks again too.
+every dry-run line that starts `fix session:`, the list CK-W1 shows of what a session may do
+(KIT-676). So a change to the checks, the model, or the waker's own command list asks again
+too, even one that a merge brought in.
 
 THE OTHER INSTALLERS' SIGN-OFFS.  Each is bound to what it measured, or holds nothing that can
 drift:
@@ -94,6 +94,14 @@ session cap whose product with the timeout must fit the monitor's result deadlin
 conf is refused otherwise); per PR the monitor's three requests, lifetime; and no loop —
 launchd starts each pass. The daily worst case is therefore three sessions per
 conflicted local PR, each capped, never an unbounded retry.
+
+WHAT HOLDS EACH FIX SESSION (KIT-676).  It loads none of your settings and none of the
+worktree's. It may run only the commands its prompt names, and CHECK_COMMANDS by their
+exact words. Its file tools reach only its worktree, and its commands run in Claude
+Code's sandbox (scripts/pr_conflict.py, THE FIX SESSION'S WALLS). The dry run prints that
+list, and CK-W1 signs it with the count. Preflight puts each check's program folder on the
+job's PATH, because nothing from your settings reaches the session. It also refuses an
+SSH origin: git cannot use SSH inside the sandbox on macOS.
 """
 import argparse
 import hashlib
@@ -148,9 +156,14 @@ CONF_DEFAULTS = {
     "TIMEOUT_MIN": str(prc.DEFAULT_TIMEOUT_MIN),
     "MAX_SESSIONS_PER_PASS": str(prc.DEFAULT_MAX_SESSIONS),
     "RESUME_MODE": "from-pr",
-    "CLAUDE_ARGS": "",
+    "CHECK_COMMANDS": "",
+    "MODEL": "",
 }
 CONF_KEYS = set(CONF_REQUIRED) | set(CONF_DEFAULTS)
+# Gone, with the one sentence that says what replaced it: an old conf is refused by name.
+CONF_GONE = {"CLAUDE_ARGS": "CLAUDE_ARGS is gone (KIT-676): the waker builds a fix session's whole "
+                            "command line now. Name your local checks in CHECK_COMMANDS, each by its "
+                            "exact words, and a model in MODEL (conflict-waker.conf.example)"}
 CONF_UNEDITED = {"REPO_DIRS": "/Users/you/src/your-project"}
 RESUME_MODES = ("from-pr", "continue", "fresh")
 
@@ -226,6 +239,9 @@ def parse_conf(text, source="conflict-waker.conf"):
         if key in seen:
             errors.append("%s:%d: duplicate key %s, first set at line %d" % (source, n, key, seen[key]))
             continue
+        if key in CONF_GONE:
+            errors.append("%s:%d: %s" % (source, n, CONF_GONE[key]))
+            continue
         if key not in CONF_KEYS:
             errors.append("%s:%d: unknown key %s (see conflict-waker.conf.example)" % (source, n, key))
             continue
@@ -274,10 +290,15 @@ def validate_conf(values):
             errors.append("INTERVAL_SECONDS below 60 would hammer the code host for nothing")
     if conf.get("RESUME_MODE") not in RESUME_MODES:
         errors.append("RESUME_MODE must be one of %s (got %r)" % ("|".join(RESUME_MODES), conf.get("RESUME_MODE")))
-    try:
-        shlex.split(conf.get("CLAUDE_ARGS", ""))
-    except ValueError as exc:
-        errors.append("CLAUDE_ARGS does not split into words: %s" % exc)
+    checks = split_list(conf.get("CHECK_COMMANDS"))
+    for check in checks:
+        problem = prc.check_command_problem(check)
+        if problem:
+            errors.append("CHECK_COMMANDS: %s" % problem)
+    if len(set(checks)) != len(checks):
+        errors.append("CHECK_COMMANDS names the same check twice")
+    if conf.get("MODEL") and not prc.MODEL_RE.match(conf["MODEL"]):
+        errors.append("MODEL %r is not a model name (empty means Claude Code's default)" % conf["MODEL"])
     return conf, errors
 
 
@@ -307,16 +328,16 @@ CARDS = {
         "why": ("Once loaded, the waker's first pass starts a PAID Claude Code session for every "
                 "unclaimed conflict fix request on a PR whose worktree one of your local sessions "
                 "worked in — up to MAX_SESSIONS_PER_PASS per pass, each capped at MAX_BUDGET_USD. "
-                "Nothing can decide for you whether that number is what you meant, or whether the "
-                "fix session will be allowed the tools it needs: a headless session gets only the "
-                "tools your settings and CLAUDE_ARGS allow. One that cannot run git ends `failed` "
-                "and pages you; one that cannot run your local checks pushes a merge nobody tested, "
-                "or ends `failed`."),
-        "do": ["Read the dry run the installer just printed: `would wake [...]` is the count.",
-               "Check CLAUDE_ARGS gives a fix session what its prompt asks for: git and gh, AND",
-               "every runner your local gate uses (CLAUDE.md names it; conflict-waker.conf.example",
-               "has a worked line). Change it and re-run if not. Then sign the count off and",
-               "re-run — the installer loads the job:",
+                "Each session is held to its worktree and may run only the commands the dry run "
+                "lists (KIT-676): the git and gh steps of its prompt, and your CHECK_COMMANDS, each "
+                "by its exact words. Nothing can decide for you whether that count is what you meant, "
+                "or whether that list holds your whole local gate. A check missing from it is never "
+                "run, so the fix is pushed with only CI to test it."),
+        "do": ["Read the dry run the installer just printed: `would wake [...]` is the count, and",
+               "the `fix session:` lines are everything a fix session may do.",
+               "Check CHECK_COMMANDS names each command of your local gate, exactly as CLAUDE.md",
+               "names it (conflict-waker.conf.example has the kit's line). Change it and re-run if",
+               "not. Then sign the count off and re-run — the installer loads the job:",
                "    python3 scripts/pipeline_conflict_waker_setup.py attest A-WAKE-DRY-RUN "
                "--initials " + se.INITIALS_PLACEHOLDER + " --note \"count read: N\"",
                "(YOUR initials, 2-4 letters, and N the count. Both the placeholder and an empty",
@@ -337,17 +358,14 @@ FACTS_NOTE = "dry-run-facts"
 # Every setting but LABEL, launchd's name for the job: each of the rest changes what a fix session
 # may do, how many start, how often, from which code, or for which checkouts.
 SIGNED_SETTINGS = tuple(sorted(k for k in CONF_KEYS if k != "LABEL"))
-# How a waker's dry run says what a session may do. Today's waker prints none, so this part of the
-# record is empty and the tool list is bound through CLAUDE_ARGS. Once the waker prints them
-# (KIT-676), a change in them asks again.
+# How a waker's dry run says what a fix session may do (KIT-676): the list CK-W1 shows, signed with it.
 SESSION_LINE = "fix session:"
 
 
 def signed_facts(ctx, said=""):
     """What A-WAKE-DRY-RUN signs, besides the count its note names. The settings; the folder whose
     transcripts mark a worktree as yours; and every line of the dry run that says what a fix
-    session may do, which stays empty until the waker prints such lines. The count is not one:
-    it moves with the pull requests."""
+    session may do. The count is not one: it moves with the pull requests."""
     return {"settings": dict((k, ctx.conf.get(k, "")) for k in SIGNED_SETTINGS),
             "transcripts": ctx.claude_dir,
             "session": [ln.strip() for ln in (said or "").splitlines() if ln.strip().startswith(SESSION_LINE)]}
@@ -436,6 +454,7 @@ class Ctx(object):
         self.claude_bin = None
         self.gh_bin = None
         self.python_bin = None
+        self.check_dirs = []     # the folder each named check's program was found in (KIT-676)
         self.code_state = None
         self.origin_url = None
         self.plist_changed = False
@@ -478,6 +497,10 @@ class Ctx(object):
         return split_list(self.conf["REPO_DIRS"])
 
     @property
+    def checks(self):
+        return split_list(self.conf.get("CHECK_COMMANDS"))
+
+    @property
     def code_url(self):
         return self.conf.get("CODE_REPO_URL") or self.origin_url or ""
 
@@ -485,6 +508,24 @@ class Ctx(object):
 def _first_line(res):
     lines = (res.out or "").strip().splitlines()
     return lines[0].strip() if res.ok and lines else ""
+
+
+def ssh_url(url):
+    """True for a remote git reaches over SSH: `ssh://…`, or the scp form `[user@]host:path`,
+    whose first `:` comes before any `/` (a host alias from ~/.ssh/config included)."""
+    text = (url or "").strip()
+    if text.startswith("ssh://"):
+        return True
+    if "://" in text:
+        return False
+    colon, slash = text.find(":"), text.find("/")
+    return colon > 0 and (slash == -1 or colon < slash)
+
+
+def gh_helper(value):
+    """True for a git credential helper that runs gh, as `gh auth setup-git` writes it."""
+    words = (value or "").strip().lstrip("!").split()
+    return bool(words) and os.path.basename(words[0]) == "gh"
 
 
 # --------------------------------------------------------------------------- #
@@ -547,6 +588,23 @@ def step_preflight(ctx, apply_it):
         ctx.gh_bin = gh
         if not r.read([gh, "auth", "status"]).ok:
             problems.append("`gh auth status` failed — log in with `gh auth login`")
+    # Nothing from your settings reaches a fix session (KIT-676), so the job's own PATH must find
+    # each check's program: the folder this shell finds it in goes there. A path runs as written.
+    ctx.check_dirs = []
+    for check in ctx.checks:
+        program = shlex.split(check)[0]
+        if program.startswith("/"):
+            if not r.read(["test", "-x", program]).ok:
+                problems.append("CHECK_COMMANDS names `%s`, and %s is not a program that runs" % (check, program))
+            continue
+        if "/" in program:
+            continue                  # relative to the worktree, where the session runs it
+        found = _first_line(r.read(["/bin/sh", "-c", "command -v " + shlex.quote(program)]))
+        if not found.startswith("/"):
+            problems.append("CHECK_COMMANDS names `%s`, and `%s` is not on your PATH, so a fix session "
+                            "could not run it" % (check, program))
+        elif os.path.dirname(found) not in ctx.check_dirs:
+            ctx.check_dirs.append(os.path.dirname(found))
     for d in ctx.repo_dirs:
         top = _first_line(r.read(["git", "-C", d, "rev-parse", "--show-toplevel"]))
         if not top:
@@ -557,9 +615,30 @@ def step_preflight(ctx, apply_it):
                             "whose `git worktree list` holds your sessions' worktrees" % (d, top))
             continue
         origin = _first_line(r.read(["git", "-C", d, "remote", "get-url", "origin"]))
-        if not se._repo_slug(origin):
+        slug = se._repo_slug(origin)
+        if not slug:
             problems.append("REPO_DIRS entry %s has no GitHub-shaped origin remote" % d)
-        elif ctx.origin_url is None:
+            continue
+        if ssh_url(origin):
+            problems.append("REPO_DIRS entry %s fetches and pushes over SSH (%s). A fix session's git runs "
+                            "in Claude Code's sandbox, where SSH cannot connect on macOS (KIT-676), so every "
+                            "fix there would fail. Give it an HTTPS origin:  git -C %s remote set-url origin "
+                            "https://github.com/%s.git" % (d, origin, d, slug))
+        # The push needs git's own credential helper: inside the sandbox gh cannot hand git the
+        # login, so a gh-backed helper fails every push ("could not read Username", measured).
+        helpers = []
+        for key in ("credential.helper", "credential.https://github.com.helper"):
+            got = r.read(["git", "-C", d, "config", "--get-all", key])
+            helpers += [ln.strip() for ln in (got.out or "").splitlines() if got.ok and ln.strip()]
+        ghs = [h for h in helpers if gh_helper(h)]
+        if ghs:
+            problems.append("REPO_DIRS entry %s gives git its GitHub login through gh (%s). A fix session's "
+                            "git runs in Claude Code's sandbox, where gh cannot hand git that login, so every "
+                            "push would fail (KIT-676). Give git its own helper for github.com instead, such as "
+                            "macOS's keychain (`osxkeychain`). `git -C %s config --show-origin --get-all "
+                            "credential.https://github.com.helper` shows where the gh one is set"
+                            % (d, ghs[0], d))
+        if ctx.origin_url is None:
             ctx.origin_url = origin
     if not ctx.code_url:
         problems.append("no CODE_REPO_URL, and no REPO_DIRS origin to default it to")
@@ -663,9 +742,12 @@ def render_plist(ctx):
             "--claude-bin", ctx.claude_bin or "claude"]
     for d in ctx.repo_dirs:
         argv += ["--repo-dir", d]
-    argv += ["--claude-arg=" + a for a in shlex.split(conf.get("CLAUDE_ARGS", ""))]
+    argv += ["--check-command=" + c for c in ctx.checks]     # each by its exact words (KIT-676)
+    if conf.get("MODEL"):
+        argv += ["--model", conf["MODEL"]]
     path = []
-    for p in [os.path.dirname(ctx.claude_bin or ""), os.path.dirname(ctx.gh_bin or "")] + DAEMON_PATH.split(":"):
+    for p in ([os.path.dirname(ctx.claude_bin or ""), os.path.dirname(ctx.gh_bin or "")]
+              + list(ctx.check_dirs) + DAEMON_PATH.split(":")):
         if p and p not in path:
             path.append(p)
     env = {"HOME": ctx.home, "PATH": ":".join(path)}
@@ -723,9 +805,12 @@ def step_dry_run(ctx, apply_it):
         raise SetupError("the waker's code is not in place (%s), so its dry run cannot run" % ctx.code_state)
     res = ctx.runner.read(dry_run_argv(ctx), timeout=600)
     text = (res.out or "") + (res.err or "")
+    lines = text.strip().splitlines()
+    walls = [ln for ln in lines if ln.startswith("fix session:")]
     say("")
     say("  -- the conflict waker's dry run --")
-    for line in text.strip().splitlines()[-14:]:
+    # What a fix session may do, every line of it: CK-W1 signs this list with the count (KIT-676).
+    for line in walls + [ln for ln in lines if not ln.startswith("fix session:")][-14:]:
         say("    " + line)
     say("")
     if res.rc == 1:
@@ -733,6 +818,10 @@ def step_dry_run(ctx, apply_it):
                       "could not be read", "read its output above; `gh auth status` and each REPO_DIRS origin")
     if res.rc != 0:
         raise SetupError("the waker's dry run failed (exit %d): %s" % (res.rc, text.strip()[-400:]))
+    if not walls:
+        raise SetupError("the waker's dry run printed no `fix session:` list, so the code it runs predates "
+                         "KIT-676 and a fix session would start with none of its walls. The clone is level "
+                         "with origin, so origin's default branch lacks that change: merge it, then re-run")
     m = _WOULD_RE.search(text)
     if not m:
         raise Unknown("the waker's dry run never printed its `would wake` count, so no count was proved",
@@ -1074,8 +1163,8 @@ def _fake_ctx(conf_text=GOOD_CONF, answers=(), dry_run=False, attested=True, uid
     ctx = Ctx(conf, runner, state, home=HOME, uid=uid, env={})
     ctx.platform = "darwin"
     ctx.sleep = lambda s: None
-    if attested:   # bound to what this context's dry run runs with, as `attest` binds it (KIT-688)
-        facts = signed_facts(ctx)
+    if attested:   # bound to what this context's dry run runs with, walls included, as `attest` binds it
+        facts = signed_facts(ctx, dry_run_text("", ctx))
         state.attest("A-WAKE-DRY-RUN", "ab", "count read: 1", facts_sha256=facts_sha256(facts), facts=facts)
     return ctx, runner
 
@@ -1110,10 +1199,17 @@ def _settled_answers(ctx, heartbeat_age=30, loaded=True, beat_extra=None):
         ("code rev-parse FETCH_HEAD", 0, HEAD + "\n"),
         ("code cat-file -e FETCH_HEAD:scripts/", 0, ""),
         ("cat /Users/you/Library/LaunchAgents/local.pr-conflict-waker.plist", 0, render_plist(ctx)),
-        ("pr_conflict.py wake", 0, "asked: …; pending 1 · would wake [7] · declined none\n"),
+        ("pr_conflict.py wake", 0, dry_run_text("asked: …; pending 1 · would wake [7] · declined none")),
         ("heartbeat.json", 0, json.dumps(beat)),
     ]
     return answers
+
+
+def dry_run_text(tail, ctx=None):
+    """What the waker's dry run prints: the fix session's walls, then `tail` (KIT-676)."""
+    checks = ctx.checks if ctx else ()
+    model = ctx.conf.get("MODEL") if ctx else None
+    return "\n".join(prc.describe_fix_session(checks, model) + [tail]) + "\n"
 
 
 def selftest():
@@ -1156,8 +1252,22 @@ def _selftest_body():
     long_path = "REPO_DIRS=/Users/you/" + "a-long-dotless-checkout-directory-name" * 2 + "\n"
     expect("conf-long-path-is-not-a-secret", not parse_conf(long_path)[1],
            "a long dotless checkout path was refused as a credential: %s" % parse_conf(long_path)[1])
-    expect("conf-blob-still-refused", parse_conf("CLAUDE_ARGS=--x " + "Q" * 44 + "\n")[1],
+    expect("conf-blob-still-refused", parse_conf("CHECK_COMMANDS=npm test --x " + "Q" * 44 + "\n")[1],
            "a bare high-entropy token must still be refused")
+    # KIT-676: the old pass-through is refused by name, with what replaced it; a check no exact rule
+    # could name, a check named twice and a model that is not a name are refused with the rest.
+    gone = parse_conf("REPO_DIRS=/Users/you/src/app\nCLAUDE_ARGS=--permission-mode acceptEdits\n")[1]
+    expect("conf-claude-args-gone", len(gone) == 1 and "CLAUDE_ARGS is gone" in gone[0]
+           and "CHECK_COMMANDS" in gone[0] and "KIT-676" in gone[0], str(gone))
+    bad_checks = validate_conf(parse_conf(
+        "REPO_DIRS=/Users/you/src/app\nCHECK_COMMANDS=npm *, npm test && rm x, make test, make test\n"
+        "MODEL=two words\n")[0])[1]
+    text = "\n".join(bad_checks)
+    for needle in ("'npm *' carries", "'npm test && rm x' carries", "same check twice", "MODEL 'two words'"):
+        expect("conf-checks-refused", needle in text, "missing %r in:\n%s" % (needle, text))
+    expect("conf-checks-good", not validate_conf(parse_conf(
+        "REPO_DIRS=/Users/you/src/app\nCHECK_COMMANDS=npm run test:hooks, python3 scripts/check_placeholders.py\n"
+        "MODEL=sonnet\n")[0])[1], "a conf naming plain checks and a model must validate")
     example = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                            "conflict-waker.conf.example")
     try:
@@ -1208,9 +1318,21 @@ def _selftest_body():
     expect("plist-escaped", plistlib.loads(render_plist(_fake_ctx(
         "REPO_DIRS=/Users/you/a&b<c>\n")[0]).encode())["ProgramArguments"][-1] == "/Users/you/a&b<c>",
         "a path with markup characters must survive the plist")
-    ctx_args, _f = _fake_ctx(GOOD_CONF + "CLAUDE_ARGS=--permission-mode acceptEdits\n")
-    expect("plist-claude-args", "--claude-arg=--permission-mode" in plistlib.loads(
-        render_plist(ctx_args).encode())["ProgramArguments"], "CLAUDE_ARGS must reach the waker verbatim")
+    ctx_args, _f = _fake_ctx(GOOD_CONF + "CHECK_COMMANDS=npm run test:hooks, python3 scripts/check_placeholders.py\n"
+                                         "MODEL=sonnet\n")
+    ctx_args.check_dirs = ["/Users/you/.nvm/versions/node/v22.23.0/bin", "/Users/you/.pyenv/shims"]
+    doc_args = plistlib.loads(render_plist(ctx_args).encode())
+    argv_args = doc_args["ProgramArguments"]
+    expect("plist-check-commands", [a for a in argv_args if a.startswith("--check-command=")]
+           == ["--check-command=npm run test:hooks", "--check-command=python3 scripts/check_placeholders.py"]
+           and argv_args[argv_args.index("--model") + 1] == "sonnet"
+           and not any(a.startswith("--claude-arg") for a in argv_args),
+           "each check must reach the waker by its exact words, and the model by name: %s" % argv_args)
+    path_args = doc_args["EnvironmentVariables"]["PATH"]
+    expect("plist-check-path", path_args == ":".join(ctx_args.check_dirs + [DAEMON_PATH]),
+           "the job's PATH must find each check's program before the daemon PATH: %s" % path_args)
+    expect("plist-no-checks", "--model" not in argv and not any(a.startswith("--check-command") for a in argv),
+           "an unset CHECK_COMMANDS and MODEL add nothing: %s" % argv)
     parsed = prc.main.__code__ is not None and dry_run_argv(ctx)[-1] == "--dry-run"
     expect("dry-run-argv", parsed and dry_run_argv(ctx)[:-1] == argv, "the dry run must pass the job's own argv")
 
@@ -1218,10 +1340,27 @@ def _selftest_body():
     for rc, attested, want in ((0, False, BLOCKED), (1, True, UNKNOWN), (2, True, FAILED), (0, True, ALREADY_DONE)):
         c, f = _fake_ctx(attested=attested)
         f.answers = [a for a in _settled_answers(c) if a[0] != "pr_conflict.py wake"] + [
-            ("pr_conflict.py wake", rc, "pending 1 · would wake [7]\n")]
+            ("pr_conflict.py wake", rc, dry_run_text("pending 1 · would wake [7]"))]
         rows, _ = quiet(lambda: measure(c, apply_it=False, keep_going=True))
         got = dict((s, o) for s, o, _d, _e in rows)
         expect("dry-run-%s-%s" % (rc, attested), got.get("dry-run") == want, "%s" % rows)
+    # KIT-676: the card's reader sees every line of what a fix session may do, however long the
+    # dry run's tail; and a dry run that prints none is code from before the walls, never signed.
+    c, f = _fake_ctx(GOOD_CONF + "CHECK_COMMANDS=npm run test:hooks\n", attested=False)
+    f.answers = [("command -v npm", 0, "/Users/you/.nvm/versions/node/v22.23.0/bin/npm\n")] + [
+        a for a in _settled_answers(c) if a[0] != "pr_conflict.py wake"] + [
+        ("pr_conflict.py wake", 0, dry_run_text("\n".join(["#%d: would wake a session" % n for n in range(40)]
+                                                           + ["pending 40 · would wake [1]"]), c))]
+    rows, out = quiet(lambda: measure(c, apply_it=False, keep_going=True))
+    shown = [ln.strip() for ln in out.splitlines() if ln.strip().startswith("fix session:")]
+    expect("dry-run-shows-the-walls", shown == prc.describe_fix_session(("npm run test:hooks",), "")
+           and dict((s, o) for s, o, _d, _e in rows).get("dry-run") == BLOCKED, "%s\n%s" % (rows, out))
+    c, f = _fake_ctx()
+    f.answers = [a for a in _settled_answers(c) if a[0] != "pr_conflict.py wake"] + [
+        ("pr_conflict.py wake", 0, "pending 1 · would wake [7]\n")]
+    rows, _ = quiet(lambda: measure(c, apply_it=False, keep_going=True))
+    got = [(o, "predates KIT-676" in d) for s, o, d, _e in rows if s == "dry-run"]
+    expect("dry-run-without-walls-fails", got == [(FAILED, True)], str(rows))
 
     # 6. enable: stale heartbeat on a loaded job is UNKNOWN (NOT RUNNING); not loaded is
     #    WOULD-CHANGE under verify; an apply bootstraps into the GUI domain and waits for a beat.
@@ -1442,7 +1581,7 @@ def _selftest_body():
         if env is not None:
             c.env = env
         f.answers = [a for a in _settled_answers(c) if a[0] != "pr_conflict.py wake"] + [
-            ("pr_conflict.py wake", 0, said + "\n")]
+            ("pr_conflict.py wake", 0, dry_run_text(said, c))]     # the walls for this conf, then `said`
         rows, _out = quiet(lambda: measure(c, apply_it=False, keep_going=True))
         return [(o, d) for s, o, d, _e in rows if s == "dry-run"][0], c
 
@@ -1465,15 +1604,15 @@ def _selftest_body():
             ("label-is-not-signed", {"conf_text": GOOD_CONF + "LABEL=local.other-waker\n"}, ALREADY_DONE, "holds"),
             ("a-bound-changed-asks", {"conf_text": GOOD_CONF + "MAX_SESSIONS_PER_PASS=1\n"}, BLOCKED,
              "changed since the sign-off (%s by ab): MAX_SESSIONS_PER_PASS." % se.now_iso()[:10]),
-            ("the-tool-list-changed-asks", {"conf_text": GOOD_CONF + "CLAUDE_ARGS=--allowedTools Bash(rm:*)\n"},
-             BLOCKED, ": CLAUDE_ARGS."),
+            ("the-tool-list-changed-asks", {"conf_text": GOOD_CONF + "CHECK_COMMANDS=make test\n"},
+             BLOCKED, ": CHECK_COMMANDS, what a fix session may do."),
             ("a-checkout-added-asks", {"conf_text": "REPO_DIRS=/Users/you/src/app,/Users/you/src/kit,/Users/you/src/new\n"},
              BLOCKED, ": REPO_DIRS."),
             ("the-transcripts-moved-asks", {"env": {"CLAUDE_CONFIG_DIR": "/Users/you/other-claude"}}, BLOCKED,
              "the transcripts folder"),
-            # The mechanism, ahead of the lines: today's waker prints none (KIT-676 adds them).
+            # The waker's own list changed, as a merge could change it, with every setting the same.
             ("a-session-line-changed-asks", {"said": "fix session: commands  git push --force\npending 1 · would wake [7]"},
-             BLOCKED, "what a fix session may do")):
+             BLOCKED, ": what a fix session may do.")):
         (o, d), _c = dry_run_row(state=st, **kw)
         expect("signoff-%s" % name, o == want and needle in d, "%s: %s" % (o, d))
     st.data["attestations"]["A-WAKE-DRY-RUN"] = {"initials": "ab", "note": "count read: 1", "at": se.now_iso()}
@@ -1481,9 +1620,9 @@ def _selftest_body():
     expect("signoff-made-before-the-binding-asks", o == BLOCKED and "names no settings" in d and "KIT-688" in d,
            "%s: %s" % (o, d))
 
-    # 10c. KIT-688's regression, in the words main already had: signed off, then the tool list changed.
+    # 10c. KIT-688's regression: signed off, then the tool list changed (CLAUDE_ARGS then, CHECK_COMMANDS now).
     c, f = _fake_ctx()
-    c.conf = validate_conf(parse_conf(GOOD_CONF + "CLAUDE_ARGS=--allowedTools Bash(rm:*)\n")[0])[0]
+    c.conf = validate_conf(parse_conf(GOOD_CONF + "CHECK_COMMANDS=make test\n")[0])[0]
     f.answers = _settled_answers(c)
     rows, _ = quiet(lambda: measure(c, apply_it=False, keep_going=True))
     expect("kit-688-a-tool-list-changed-after-sign-off-asks-again",
@@ -1516,6 +1655,46 @@ def _selftest_body():
     env_w = plistlib.loads(render_plist(c).encode())["EnvironmentVariables"]
     expect("claude-dir-captured", rows[0][1] == ALREADY_DONE and "transcripts from /Users/you/alt-claude" in rows[0][2]
            and env_w.get("CLAUDE_CONFIG_DIR") == "/Users/you/alt-claude", "%s %s" % (rows[0], env_w))
+
+    # 13b. KIT-676: nothing from your settings reaches a fix session, so preflight finds each check's
+    #      program where this shell does and the job's PATH carries its folder. One it cannot find is
+    #      refused; a path runs as written. An SSH origin is refused: git cannot use SSH in the sandbox.
+    nvm_npm = "/Users/you/.nvm/versions/node/v22.23.0/bin/npm"
+    c, f = _fake_ctx(GOOD_CONF + "CHECK_COMMANDS=npm run test:hooks, ./scripts/check.sh, nosuchtool --x\n")
+    f.answers = [("command -v npm", 0, nvm_npm + "\n"),
+                 ("src/kit remote get-url origin", 0, "git@example.invalid:example-org/kit.git\n")] + _settled_answers(c)
+    rows, _ = quiet(lambda: measure(c, apply_it=False))
+    detail = rows[0][2] if rows else ""
+    expect("preflight-checks-and-ssh", rows and rows[0][1] == FAILED
+           and "`nosuchtool` is not on your PATH" in detail and "check.sh" not in detail
+           and "over SSH" in detail and "remote set-url origin https://github.com/example-org/kit.git" in detail
+           and c.check_dirs == [os.path.dirname(nvm_npm)], "%s %s" % (detail, c.check_dirs))
+    c, f = _fake_ctx(GOOD_CONF + "CHECK_COMMANDS=npm run test:hooks\n")
+    f.answers = [("command -v npm", 0, nvm_npm + "\n")] + _settled_answers(c)
+    rows, _ = quiet(lambda: measure(c, apply_it=False))
+    expect("preflight-check-found", rows and rows[0][1] == ALREADY_DONE and c.check_dirs == [os.path.dirname(nvm_npm)]
+           and os.path.dirname(nvm_npm) in plistlib.loads(render_plist(c).encode())["EnvironmentVariables"]["PATH"],
+           "%s %s" % (rows[:1], c.check_dirs))
+    # Every host here is example.invalid: the provenance scan reads a real host after a user as an email.
+    for url, want in (("git@example.invalid:o/n.git", True), ("ssh://git@example.invalid/o/n", True),
+                      ("example.invalid:o/n.git", True), ("myalias:o/n", True),
+                      ("https://example.invalid/o/n.git", False), ("https://user@example.invalid/o/n", False),
+                      ("/srv/clones/kit", False), ("./dir:x", False), ("", False)):
+        expect("ssh-url-%s" % url, ssh_url(url) is want, url)
+    # A gh-backed credential helper is refused, by name, with where it was set: inside the sandbox gh
+    # cannot hand git the login, so every push would fail (measured). Git's own helper passes.
+    c, f = _fake_ctx()
+    f.answers = [("src/kit config --get-all credential.https://github.com.helper", 0,
+                  "\n!/opt/homebrew/bin/gh auth git-credential\n"),
+                 ("config --get-all credential.helper", 0, "osxkeychain\n")] + _settled_answers(c)
+    rows, _ = quiet(lambda: measure(c, apply_it=False))
+    detail = rows[0][2] if rows else ""
+    expect("preflight-gh-credential-helper", rows and rows[0][1] == FAILED and "through gh" in detail
+           and "/Users/you/src/kit" in detail and "osxkeychain" in detail and "/Users/you/src/app gives" not in detail,
+           detail)
+    for value, want in (("!/opt/homebrew/bin/gh auth git-credential", True), ("!gh auth git-credential", True),
+                        ("osxkeychain", False), ("store", False), ("", False), ("!/usr/bin/ghost x", False)):
+        expect("gh-helper-%s" % value, gh_helper(value) is want, value)
 
     # 14. the clone is `behind` only when a script the job runs changed: a merge elsewhere leaves
     #     it level (said), a changed pr_conflict.py is named, and a missing import is FAILED.
@@ -1576,9 +1755,12 @@ def _selftest_body():
         "dirty or foreign clone is never discarded; placeholder sign-offs refused; no merge, "
         "approve, label or sudo path; a non-macOS machine is told so before anything runs; "
         "CLAUDE_CONFIG_DIR is proved where the job will look; the clone is behind only when a "
-        "script the job execs changed, and that set is the import closure; the sign-off is bound to "
-        "what its dry run ran with, so a changed setting, tool list or session line asks again and "
-        "says which, an older unbound sign-off asks once, and the count and LABEL ask nothing")
+        "script the job execs changed, and that set is the import closure; a fix session's walls "
+        "are printed in full for CK-W1 and a dry run without them fails; CLAUDE_ARGS is refused by "
+        "name; each check is named by its exact words and its program found on the job's PATH; an "
+        "SSH origin is refused; the sign-off is bound to what its dry run ran with, so a changed "
+        "setting or fix-session line asks again and says which, an older unbound sign-off asks "
+        "once, and the count and LABEL ask nothing")
     return 0
 
 

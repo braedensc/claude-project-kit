@@ -22,11 +22,19 @@ from a root-owned copy, and a live probe of the walls as the role account (KIT-7
 Each pass, every few seconds:
 
 1. **Finds each live run again.** A run whose process is gone gets its record finished and its pin
-   removed. Anything left of its process group is killed first. A run that left no result and no
-   exit is *interrupted*, and is resumed once. A lock only the wrapper holds says a run is alive;
-   the session never gets it, so it cannot fake its own end.
+   removed. Anything left of it is killed first, and again until nothing is: one kill can miss a
+   process that is being forked at that instant. A run that left no result and no exit is
+   *interrupted*, and is resumed once. A lock only the wrapper holds says a run is alive; the
+   session never gets it, so it cannot fake its own end.
 2. **Answers each waiting request, oldest first.** It starts, resumes or stops a session, or refuses
    with a reason. A request it cannot judge now waits for a later pass.
+
+**A resume whose session is gone starts afresh, once.** The program may no longer have the
+conversation a resume names. Then the runner starts one new session in the same workspace, given
+the ticket and the text of the request whose work it carries on. Its record says `started_for:
+session-gone` and names the lost session in `gone_session`. It happens once per request: a fresh
+start that is itself lost later is not started again, and its record says why. A resume that fails
+any other way keeps its own reason.
 
 Before it starts anything, it checks the request against the tracker:
 
@@ -49,6 +57,7 @@ keep sessions from writing a request at all.
 | A branch | `<type>/<ticket, lower case>-<title or kind>` | One fixed pattern. Every git command is a list of arguments. No repository hook runs. |
 | A pin | the project's pins root | Written before the program runs, removed when the run ends. Budget, mode, criteria and out of scope. |
 | The run's folder | `<store_dir>/runs/<run>/` | The command's inputs, the program's output, its exit, and the run's record. |
+| Its remembered processes | `<store_dir>/trees/<run>.json` | The runner's alone. Never in the run's folder, which the run's own processes write. |
 | A temp folder | `<work_dir>/.tmp/<run>` | The session's TMPDIR, outside every wall. Removed when the run ends. |
 
 A start refused after its workspace was made removes the workspace and its branch, so the next start
@@ -72,15 +81,21 @@ limit hit in normal use is a defect.
 - **Past a limit,** the run's whole tree gets SIGTERM, then SIGKILL after the grace. Its record says
   `stopped`, with the limit as its reason (`limit:time`, `limit:memory` or `limit:disk`).
 - **Its whole tree, even what leaves it.** Each process the runner sees in a run's tree is kept,
-  with its start time, in the run's folder. When the run ends, any of them still alive is killed.
-  The start time tells it from a later process that reused its number.
+  with its start time, in the runner's own store. A session cannot name a process for it to kill.
+  When the run ends, any of them still alive is killed. The start time tells it from a later
+  process that reused its number.
+- **Start times, as fine as the system gives them.** To the microsecond on macOS, from the kernel's
+  own record. In clock ticks on Linux, from `/proc`. To the second, from `ps`, only where neither is
+  there. The record names its resolution.
 - **A tree of more than 512 processes** counts as past its memory limit, however little each holds.
+  So do more than 4096 of its processes alive at once. Each look forgets the ones that are gone, so a
+  long run never fills the record. Past 4096 the newest are kept, and the run is stopped.
 - **Below the floor,** no new session starts and requests wait. Running sessions finish.
 - **It measures only its own:** its runs' trees, by process group and parent, its runs' folders, and
   three numbers about the whole machine. It reads nothing about any other app.
 - **Each incident is told once,** in plain words, in `<store_dir>/incidents.json`: a run stopped at a
-  limit, a run it could not measure, or the floor holding starts. A floor incident ends when there is
-  room again.
+  limit, a run it could not measure, a run whose processes it could not remember or check, or the
+  floor holding starts. A floor incident ends when there is room again.
 
 Good: a session's tree passes 8 GB. It is stopped, its record says `limit:memory`, and one line is told.
 Not: the same session is told about again on every pass.
@@ -157,5 +172,8 @@ The runner refuses to start from inside a Claude session, or as root.
 
 - That a session outlives a restart of the runner under launchd. The selftest proves it for a runner
   killed with its whole process group. One live check is owed.
+- That the program says a lost session in the words the runner looks for: "No conversation found",
+  as an error result or as the last line of its errors. The tech lead's turn relies on the same
+  words. The selftest's stand-in prints them. One live check is owed.
 - That one sign-in serves the runner and the tech lead together (KIT-629).
 - That sandboxed Bash may write the session's temp folder. Each kind's walls are measured in KIT-704.
