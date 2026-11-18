@@ -17,6 +17,11 @@ The formats it reads and writes: `docs/PIPELINE-CONTRACT.md` section 28, and sec
 A lane runs through the runner only when both switches are on: the caller's own (the job that asks)
 and the runner's lane for that project. Either one off is the way back.
 
+**Its runs count against the day and the week** once `RUNNER_STORE` in `queue.conf` names its
+`store_dir` (KIT-860). The usage job reads every run record through the store's one reader, beside
+the old dispatcher's logs (docs/QUEUE-OPERATOR.md, "The runner's runs"). Set it before the first
+lane moves.
+
 One piece comes before any lane moves: each kind of session as measured data, the kit's guard
 from a root-owned copy, and a live probe of the walls as the role account (KIT-704).
 

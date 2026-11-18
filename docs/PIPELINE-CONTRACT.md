@@ -30,7 +30,7 @@ exists to prevent.
 | [Acceptance follow-up request](#25-acceptance-follow-up-request) | a comment on the plan's epic | the acceptance poller's live pass | the finding poller |
 | [Acceptance check request](#26-acceptance-check-request) | a comment on the plan's epic | the Slack bridge, on the owner's yes | the acceptance poller's live pass |
 | [Acceptance second look](#27-acceptance-second-look) | the acceptance session's answer, in its own thread | the acceptance session, asked by the live pass | the acceptance poller's live pass |
-| [Run record](#28-run-record) | the runner's own store, outside every worktree | requests: five pipeline jobs; records: the runner | the runner; the usage job, when a lane moves |
+| [Run record](#28-run-record) | the runner's own store, outside every worktree | requests: five pipeline jobs; records: the runner | the runner; the usage job, when its config names the store |
 | [Spend ledgers](#30-spend-ledgers) | each caller's own state folder, outside every worktree | the four callers whose model calls no dispatcher log records, by one writer function | the usage job, by one reader function |
 
 > **§8 onwards are appended rather than slotted in beside their topical neighbours.**
@@ -2217,7 +2217,8 @@ One file says what the pipeline spent: the dollars each local day, the dollars s
 weekly reset by kind of work and by piece, how long its sessions ran, Anthropic's newest word on
 each usage window, how each session signed in, the runs that never reached the model, and
 the runs the plan's limit cut off (KIT-422, KIT-470). It also counts the model calls no dispatcher
-log records, from their callers' spend ledgers (§30, KIT-844). The usage job, `scripts/pipeline_usage_local.py`, writes it each pass. It runs with
+log records, from their callers' spend ledgers (§30, KIT-844), and the runs our own runner started,
+from its run records (§28, KIT-860). The usage job, `scripts/pipeline_usage_local.py`, writes it each pass. It runs with
 no AI, no network and no credential, as the role account, like the status job. It reads files
 and writes one file. It starts nothing and stops nothing. Machine-readable:
 `schemas/pipeline-usage.schema.json`. The job checks its document against that schema before it
@@ -2246,6 +2247,7 @@ dispatcher and the role account and sit outside every worktree, so a session can
 | `logs` | Every run: `<dispatcher_home>/logs/<workspace>/session-<session id>-<UTC start>.jsonl`, for each file modified within `lookback_days` plus one day. From its `sdk-message` lines: the last `result` line's running totals, the first and last timestamped line, the `init` line's sign-in source, the kind of the first prompt, and the `rate_limit_event` lines. From its first `session-metadata` line: when it started. A `session-pending-<UTC start>.jsonl` file is a run's placeholder. | The file system, as the role account |
 | `ledger` | Stage E's `<stage_e_state_dir>/bounce-ledger.jsonl`, the rows whose outcome is `delivered` or `conflict-delivered`, and `<stage_e_state_dir>/outcomes/*.json`, which say each pull request's ticket. | The file system, as the role account |
 | `planner` | The idea gate's `<stage_a_state_dir>/seen.json`. Each trigger's `run_ticket` is a planning run. | The file system, as the role account |
+| `runner` | The runner's run records, `<runner_store>/runs/<run>/run.json` (§28), each one run: its kind, ticket, session, times, length and cost. Read only when the config names the store (KIT-860). | The store's one reader, `read_runs()`, as the role account |
 
 A line that is not JSON, or is longer than 8 MiB, is passed over. A workspace is a folder under
 `logs/`: a ticket's id, or `slack-` and a thread's id for a chat. A *run* is one log file in it:
@@ -2267,6 +2269,11 @@ A run is the first of these that fits:
 | `judge` | not a dispatcher run at all: a model call the watcher's judge made (KIT-569) | the judge's calls file, `judge-calls.json` (`judge_file`) |
 | `morning` | not a dispatcher run: the morning job's planner call (KIT-844) | its spend ledger (§30) |
 | `standup` | not a dispatcher run: the stand-up's turn (KIT-844) | its spend ledger (§30) |
+
+A run of the runner's is the kind its record names, through the store's `USAGE_KINDS` (§28):
+`code` is `coding`, `fix` is `bounce_fix`, `conflict` is `conflict_fix`, `review` is `review`,
+`plan` is `planner` and `acceptance` is `other_later`. Its record is the runner's own, so nothing
+above is needed to tell it.
 
 **The judge's calls (KIT-569).** The dispatcher's logs hold no judge call, so the judge keeps its own record: each call's time and
 cost, fields only. When the usage job's config names it (`judge_file`), every call counts as one run of kind `judge`, in the local
@@ -2299,6 +2306,29 @@ ledger makes it `partial` too: some of its lines were not rows, and only the row
 counted. A ledger not written yet, in a folder that exists, is `read` with no calls, unless its
 mark says a call lost its row (§30). A missing folder's reason names the config key to check. No
 caller writes its ledger yet (KIT-687 adds them), so the config's defaults leave every ledger off.
+
+**The runner's runs (KIT-860).** Our own runner (§28) keeps one record for each run it starts, and
+no dispatcher log holds those runs. When the config names its store (`runner_store`), the job reads
+every record through the store's one reader, so a lane moved to the runner still counts against the
+day and the week. Each record is one run, as a log's run is: in the local day it ended (a run still
+going, in the day it started), in the week from the plan's reset, under its kind, and under its
+ticket's piece. A ticket the runner reviewed or planned is a review's or a planning run's piece.
+
+- **What it cost.** A record's `cost_usd` is the program's own total for that one run, which the
+  runner started as a process of its own, so it is the run's spend. A record that gives no cost is
+  unpriced, and so is a zero from a run that did not end with exit 0, as a crash's zeroed total is:
+  counted in `runs` and `unpriced`, never as zero.
+- **How long it ran.** Its `seconds`; a run still going counts the time since it started.
+- **No run at all.** A run whose program could not start (`could-not-start`) spent nothing, and is
+  not counted.
+- **Counted once.** A runner run whose session the logs hold too, in a run that started within 60
+  seconds of it, is that one run. It is counted once, from its log, which says more of it (its
+  models, tokens, sign-in and usage events), and the log's run takes the kind the record gives.
+- **What a record does not say.** It names no model, no sign-in and no usage event. So a runner run
+  adds nothing to `by_model`, `sign_in`, `status` or `limit_stops`. The runner starts no session
+  without a `claude setup-token` token (§28).
+- **A store it cannot read.** `sources.runner` says why, no run of it is counted, never as zero,
+  and `result` is `partial`. A record it cannot read is named there, and the others are counted.
 
 The fixed lines are `Stage E bounce`, `Stage E conflict fix` and `Catch-up`, as the bounce driver
 and the catch-up job write them; the selftest reads their source to keep this true. The kind of
@@ -2347,6 +2377,13 @@ An unknown week is never zero and never a guess.
 `pieces` lists each ticket that spent anything since the week began. A chat run counts in
 `tech_lead` and in the totals, and is never listed one by one.
 
+Each day and the week say where their runs were counted from, in `by_source` (KIT-860): `logs`
+(the old dispatcher's session logs), `runner` (the runner's run records), `spend` (the spend
+ledgers) and `judge` (the judge's record). Each has its runs, unpriced runs and dollars. Every
+counted run is under exactly one, so the four add up to the day's or the week's `runs`,
+`unpriced` and `usd`. A source that is off or could not be read shows zeros there, and `sources`,
+`spend` or `judge` says which.
+
 ### Runs the plan's limit cut off
 
 When the plan's five-hour or weekly window is at its limit, a running session is cut off. The
@@ -2357,7 +2394,8 @@ run that went on. A warning (`allowed_warning`) is not a rejection. An event wit
 is not counted, as no event without one is.
 
 `limit_stops` lists each limit-stopped run in the lookback, newest first, by its last line:
-`ticket` (its id; null for a chat thread), `kind`, `ended_at`, `window` (the rejected window's
+`ticket` (its id; null for a chat thread), `kind`, `source` (where it was counted from: `logs` or
+`runner`, KIT-860), `ended_at`, `window` (the rejected window's
 word, `other` for one the list lacks) and `resets_at` (null when the rejection named no reset,
 or one that is not a time). The queue's pass reads it (KIT-472) to hand a stopped coding piece over once
 more after `resets_at`, once for each stop. It is a runaway cap, not a limit: at most 200 are listed, and
@@ -2377,7 +2415,8 @@ Words from the closed lists and numbers only: nothing a run said is kept.
   "sources": {
     "logs": {"state": "read", "asked": 212, "answered": 212, "reason": null, "read_at": "2026-11-03T18:04:58Z"},
     "ledger": {"state": "partly-read", "asked": 7, "answered": 6, "reason": "a review record could not be read", "read_at": "2026-11-03T18:04:59Z"},
-    "planner": {"state": "read", "asked": 1, "answered": 1, "reason": null, "read_at": "2026-11-03T18:04:59Z"}
+    "planner": {"state": "read", "asked": 1, "answered": 1, "reason": null, "read_at": "2026-11-03T18:04:59Z"},
+    "runner": {"state": "read", "asked": 1, "answered": 1, "reason": null, "read_at": "2026-11-03T18:04:59Z"}
   },
   "judge": {"state": "read", "reason": null},
   "spend": {
@@ -2406,7 +2445,11 @@ Words from the closed lists and numbers only: nothing a run said is kept.
       "judge": {"runs": 0, "usd": 0}, "morning": {"runs": 4, "usd": 0.6},
       "standup": {"runs": 8, "usd": 0.4}
     },
-    "by_model": {"claude-opus-5-5": 30.2, "claude-sonnet-5-5": 12.137}
+    "by_source": {
+      "logs": {"runs": 100, "unpriced": 2, "usd": 33.037}, "runner": {"runs": 10, "unpriced": 0, "usd": 5.2},
+      "spend": {"runs": 32, "unpriced": 1, "usd": 4.1}, "judge": {"runs": 0, "unpriced": 0, "usd": 0}
+    },
+    "by_model": {"claude-opus-5-5": 25.0, "claude-sonnet-5-5": 12.137}
   },
   "days": [
     {"date": "2026-11-02", "usd": 9.75, "runs": 34, "unpriced": 1, "seconds": 11800, "by_kind": {
@@ -2415,14 +2458,18 @@ Words from the closed lists and numbers only: nothing a run said is kept.
       "bounce_fix": {"runs": 4, "usd": 1.2}, "conflict_fix": {"runs": 1, "usd": 0.3},
       "catch_up": {"runs": 0, "usd": 0}, "other_later": {"runs": 6, "usd": 0.6},
       "judge": {"runs": 0, "usd": 0}, "morning": {"runs": 1, "usd": 0.15},
-      "standup": {"runs": 2, "usd": 0.1}}},
+      "standup": {"runs": 2, "usd": 0.1}}, "by_source": {
+      "logs": {"runs": 23, "unpriced": 0, "usd": 6.7}, "runner": {"runs": 4, "unpriced": 0, "usd": 2.0},
+      "spend": {"runs": 7, "unpriced": 1, "usd": 1.05}, "judge": {"runs": 0, "unpriced": 0, "usd": 0}}},
     {"date": "2026-11-03", "usd": 7.45, "runs": 26, "unpriced": 2, "seconds": 9100, "by_kind": {
       "tech_lead": {"runs": 6, "usd": 0.9}, "review": {"runs": 4, "usd": 1.4},
       "planner": {"runs": 0, "usd": 0}, "coding": {"runs": 9, "usd": 3.55},
       "bounce_fix": {"runs": 2, "usd": 0.5}, "conflict_fix": {"runs": 0, "usd": 0},
       "catch_up": {"runs": 1, "usd": 0.15}, "other_later": {"runs": 2, "usd": 0.75},
       "judge": {"runs": 0, "usd": 0}, "morning": {"runs": 1, "usd": 0.15},
-      "standup": {"runs": 1, "usd": 0.05}}}
+      "standup": {"runs": 1, "usd": 0.05}}, "by_source": {
+      "logs": {"runs": 15, "unpriced": 2, "usd": 5.15}, "runner": {"runs": 3, "unpriced": 0, "usd": 1.2},
+      "spend": {"runs": 8, "unpriced": 0, "usd": 1.1}, "judge": {"runs": 0, "unpriced": 0, "usd": 0}}}
   ],
   "pieces": [
     {"id": "ENG-301", "kind": "coding", "usd": 7.25, "runs": 6, "last_at": "2026-11-03T16:40:12Z"},
@@ -2437,11 +2484,11 @@ Words from the closed lists and numbers only: nothing a run said is kept.
   },
   "sign_in": {
     "counts": {"none": 150, "ANTHROPIC_API_KEY": 2},
-    "api_key_runs": [{"id": "ENG-307", "at": "2026-11-03T09:12:00Z"}]
+    "api_key_runs": [{"id": "ENG-307", "at": "2026-11-03T09:12:00Z", "source": "logs"}]
   },
   "never_reached_model": 1,
   "limit_stops": [
-    {"ticket": "ENG-312", "kind": "coding", "ended_at": "2026-11-03T17:41:09Z", "window": "five_hour", "resets_at": "2026-11-03T19:00:00Z"}
+    {"ticket": "ENG-312", "kind": "coding", "source": "logs", "ended_at": "2026-11-03T17:41:09Z", "window": "five_hour", "resets_at": "2026-11-03T19:00:00Z"}
   ],
   "limit_stops_over_cap": 0
 }
@@ -2453,6 +2500,9 @@ signed in with a key, and one of them was a chat, so one is listed. Three spend 
 read, and every call in them falls inside the week, so each ledger's figures are its kind's for the
 week: the tech lead's 20 runs are all its turns. One stand-up call, on 2 November, could not be
 priced and named no model: it is one of the week's three unpriced runs. The waker's ledger is off.
+The runner's store was read: ten of the week's runs came from its records. They name no model, so
+`by_model` falls short of `usd` by their $5.20. Each `by_source` adds up to its day's or the week's
+`runs`, `unpriced` and `usd`, and the stopped run and the key run were counted from the logs.
 
 ### The file
 
@@ -2463,7 +2513,7 @@ priced and named no model: it is one of the week's three unpriced runs. The wake
 | `started_at` | time | When this pass began reading. |
 | `result` | `ok` \| `partial` \| `failed` | `ok`: every source that is on was read whole. `partial`: at least one was not (exit 3), and `sources`, `judge` or `spend` says which and why. `failed`: the logs could not be read, no source could be, or the pass stopped on an error (exit 1). |
 | `error` | string \| null | Null, unless the pass stopped on an unexpected error: then one line with the error's class and where it came from, and every source that is on is `could-not-read`, as is every spend ledger the config names. |
-| `sources` | object | `logs`, `ledger` and `planner`, each a source below. |
+| `sources` | object | `logs`, `ledger`, `planner` and `runner`, each a source below. |
 | `spend` | object | `morning`, `standup`, `tech_lead` and `conflict_waker`, each a spend ledger below (KIT-844). |
 | `week` | object | Since the plan's weekly reset, below. |
 | `days` | day[] | One for each local date in the lookback, oldest first. Empty when the logs could not be read. |
@@ -2478,8 +2528,8 @@ Times are UTC to the second (`2026-11-03T18:05:00Z`), or null where the source g
 
 | Field | Type | Notes |
 |---|---|---|
-| `state` | `read` \| `partly-read` \| `could-not-read` \| `off` | `read`: every question was answered. `partly-read`: some were not. `could-not-read`: none was, or none could be asked. `off`: the config turns it off (`ledger` and `planner` only). |
-| `asked` | integer | Questions put to it this pass: run files, placeholders and older logs read, and folders that could not be listed; the ledger, the review records' folder and each record; the idea gate's record. |
+| `state` | `read` \| `partly-read` \| `could-not-read` \| `off` | `read`: every question was answered. `partly-read`: some were not. `could-not-read`: none was, or none could be asked. `off`: the config turns it off (`ledger`, `planner` and `runner` only). |
+| `asked` | integer | Questions put to it this pass: run files, placeholders and older logs read, and folders that could not be listed; the ledger, the review records' folder and each record; the idea gate's record; the runner's store, read whole by its one reader. |
 | `answered` | integer | How many it answered. A ledger or record that does not exist yet is an answer: nothing yet. |
 | `reason` | string \| null | Why it was not read whole, in the job's own words. Null when it was, or when it is off. |
 | `read_at` | time \| null | When this pass last had an answer from it. |
@@ -2516,7 +2566,8 @@ When `state` is `could-not-read` or `off`, every figure is null: the calls are u
 | `unpriced` | integer \| null | Runs with no usable total, counted in `runs` and never in `usd`. |
 | `seconds` | integer \| null | How long the week's sessions ran, summed over runs. |
 | `by_kind` | object \| null | Runs and spend for each kind in the table above. Every kind is present, with zeros for one that did not run. |
-| `by_model` | object \| null | Spend by the model that ran it, from `modelUsage`, and from the spend ledgers' rows. It can fall short of `usd` when a result or a call named no model. At most 64 models: past that the cheapest are folded into `other`, and the spend still adds up. |
+| `by_source` | object \| null | Runs, unpriced runs and spend by where they were counted from, below (KIT-860). They add up to `runs`, `unpriced` and `usd`. |
+| `by_model` | object \| null | Spend by the model that ran it, from `modelUsage`, and from the spend ledgers' rows. It can fall short of `usd` when a result or a call named no model, as a runner run never does. At most 64 models: past that the cheapest are folded into `other`, and the spend still adds up. |
 
 ### A day
 
@@ -2525,6 +2576,21 @@ When `state` is `could-not-read` or `off`, every figure is null: the calls are u
 | `date` | string | A local date, `YYYY-MM-DD`. |
 | `usd`, `runs`, `unpriced`, `seconds` | | As the week's. |
 | `by_kind` | object | As the week's. |
+| `by_source` | object | As the week's, and it adds up to the day's `runs`, `unpriced` and `usd`. |
+
+### By source
+
+Where a day's or the week's runs were counted from (KIT-860). Each of the four is always present,
+with zeros for one that counted nothing, and every counted run is under exactly one.
+
+| Source | Its runs |
+|---|---|
+| `logs` | The old dispatcher's runs, from its session logs, a runner run its logs hold too among them. |
+| `runner` | The runner's runs that no log holds, from its run records (§28). |
+| `spend` | The model calls in the spend ledgers (§30). |
+| `judge` | The watcher judge's calls, from its record. |
+
+Each holds `runs`, `unpriced` (counted in `runs`, never in `usd`) and `usd`.
 
 ### A piece
 
@@ -2570,7 +2636,7 @@ The windows are named as the SDK names them:
 | Field | Type | Notes |
 |---|---|---|
 | `counts` | object | Runs in the lookback by the SDK's own word for how they signed in: `ANTHROPIC_API_KEY`, `apiKeyHelper`, `/login managed key`, `none`, `user`, `project`, `org`, `temporary` or `oauth`. `other`: a word that list does not have. `not seen`: a run with no `init` line, or one that names no source. |
-| `api_key_runs` | object[] | Each run on a ticket that signed in any way but the plan's own (`none` or `oauth`): a key, a key helper, another source the SDK names, or `other`. The newest first, at most 500: its ticket `id` and the time it started, `at`. A chat run is counted in `counts` and never listed. A run whose source was `not seen` is counted, never listed. |
+| `api_key_runs` | object[] | Each run on a ticket that signed in any way but the plan's own (`none` or `oauth`): a key, a key helper, another source the SDK names, or `other`. The newest first, at most 500: its ticket `id`, the time it started, `at`, and where it was counted from, `source` (`logs` or `runner`, KIT-860). A chat run is counted in `counts` and never listed. A run whose source was `not seen` is counted, never listed. A runner run names no sign-in, so it is in neither: the runner starts no session without a setup token (§28). |
 
 A plan sign-in draws on the plan's windows. A key is billed by the token, and a worktree `.env`
 can put one in a session without anyone choosing it (`docs/AUTONOMY.md`). `api_key_runs` is how
@@ -2584,6 +2650,7 @@ that shows.
 | `stage_e_state_dir` | `~/.stage-e/state` | Stage E's state folder. An empty string turns the `ledger` source off. |
 | `stage_a_state_dir` | `~/.stage-a/state` | The idea gate's state folder. An empty string turns the `planner` source off. |
 | `judge_file` | empty: off | The watcher judge's `judge-calls.json` (KIT-569): each call's time and dollars, no words. Empty turns the judge's cost off, and the file's `judge` says `off`. |
+| `runner_store` | empty: off | The runner's `store_dir` (§28, KIT-860), whose run records the job counts beside the logs. Empty turns the `runner` source off. The queue's installer names it from `RUNNER_STORE` in `queue.conf`; set it when a lane moves to the runner. A store that is not there, or fails the store's walls, is `could-not-read`, never no runs. |
 | `spend_ledgers` | every one off | For each caller, its spend ledger's path (§30, KIT-844), where its job writes it: `morning` `~/.stage-e/queue/morning-spend.jsonl`, `standup` `~/.stage-e/state/standup-spend.jsonl`, `tech_lead` `~/.stage-e/state/tech-lead-spend.jsonl`. An empty path, or a caller left out, turns its ledger off. No caller writes its ledger yet: KIT-687 adds the writers and names the three role-account ledgers by default. Until then each is off, since a ledger nothing writes would read as no calls. The waker's ledger is in the owner's home, which the role account cannot read, so it is named only where this account can read it. A path inside a git working tree is a config error. |
 | `reviews_team_key` | empty | Optional (KIT-596): the key of an old separate Reviews team, such as `REV`. A review on a work team is told by the review poller's record, and a record that cannot be read is said in the Stage E source. |
 | `out` | `~/.stage-e/usage/usage.json` | Where the file is written, outside every git working tree. |
@@ -2601,7 +2668,7 @@ where, and a file that stops being written is stale.
 | Exit | Meaning |
 |---|---|
 | 0 | Every source that is on was read whole, and the file was written. |
-| 3 | The file was written, and at least one source, the judge's record or a spend ledger was not read whole. It names which. |
+| 3 | The file was written, and at least one source (the runner's store among them), the judge's record or a spend ledger was not read whole. It names which. |
 | 1 | The logs could not be read, no source that is on could be, the pass crashed, or the file could not be written or did not conform. A file that did not conform is not written at all. |
 | 2 | Usage or config: nothing was read or written. |
 
@@ -2614,6 +2681,8 @@ write, and writes nothing. `--print` also prints the document.
 - A run still going has no `result` yet, so it is unpriced until a later pass.
 - `coding` is told by the log file names. A folder whose oldest logs were deleted shows the
   oldest one left as its first run.
+- A runner run's cost is its own program's total. A runner run still going is unpriced, as a log's
+  is, until a later pass.
 - A piece is a folder named as a ticket id. A folder with any other name counts in the totals and
   is never listed.
 
@@ -3397,8 +3466,8 @@ keeps the newest, counts the rest in `dropped`, and stops the run at `limit:memo
 
 **How to read it.** `read_runs()` gives every record, oldest first, and says `read`, `partly-read`
 (a record it could not read is named) or `could-not-read`. Then the runs are `None`, never an empty
-list (§13). The usage job reads the runs through it once a lane moves to the runner;
-`USAGE_KINDS` gives the usage file's kind for each (§17).
+list (§13). The usage job reads the runs through it when its config names the store
+(`runner_store`, KIT-860), and `USAGE_KINDS` gives the usage file's kind for each (§17).
 
 **Fields only.** No ticket text is in a request or a record. A resume's `text` reaches the session
 fenced as data. Each run's own folder also holds its command's inputs, the program's output and its

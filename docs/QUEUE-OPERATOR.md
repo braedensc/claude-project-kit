@@ -187,6 +187,20 @@ No caller writes its ledger yet. KIT-687 adds the writers, and with them turns o
 account's home. Until then each line says `off`, never `read` with no calls. The waker runs as you, so its ledger is in
 your own home, where the role account cannot read. It stays `off`, and the waker's calls are not counted.
 
+## The runner's runs
+
+Our own runner (docs/RUNNER.md) keeps one record for each run it starts, and no dispatcher log holds those runs. The
+usage job counts them beside the logs once `RUNNER_STORE` in `queue.conf` names the runner's `store_dir` (KIT-860). Set
+it before the first lane moves to the runner, then run the installer again, or that lane's runs do not count against
+the day and the week.
+
+Each day and the week say where their runs came from, in `by_source`: the logs, the runner, the spend ledgers and the
+judge. The four add up to the totals. A run both the logs and the runner hold is counted once, from its log.
+
+Good: `runner   read            asked 1, answered 1`. Not that: `runner   could-not-read  asked 1, answered 0: the
+runner's store could not be read (the store does not exist)`. Then check `RUNNER_STORE`. None of the runner's runs is
+counted, never as zero, and the pass is `partial`. Empty, the line says `off`.
+
 ## Pausing it
 
 Unload a job: `sudo launchctl bootout system/<label>`. `disable` it too to survive a restart. The installer never reloads

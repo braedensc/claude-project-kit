@@ -382,7 +382,8 @@ npm run test:window          # the working window (KIT-437): open or closed at a
 npm run test:queue-order     # the queue's order and limits (KIT-434): what starts next, in lanes,
                              #   within the day's load; each runaway stop holds every start
 npm run test:usage-runs      # the usage runs (KIT-422): the dispatcher's logs read into priced,
-                             #   classified, timed runs; a crash unpriced never zero, reads only
+                             #   classified, timed runs; a crash unpriced never zero, reads only;
+                             #   the runner's records too, a run both hold counted once (KIT-860)
 npm run test:usage           # the usage job (KIT-422): the runs counted into one file of spend;
                              #   the week unknown not guessed, a source it could not read said,
                              #   a file that does not conform never written
