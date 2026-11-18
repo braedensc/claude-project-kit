@@ -4228,15 +4228,18 @@ def _finding(finding, detail):
     return finding % detail if "%s" in finding else finding
 
 
-def say_cross_check(ctx, found):
+def say_cross_check(ctx, found, measured):
     """Print the cross-check under the answer: each finding on a line of its own, and one line
-    for a list that agrees with the log. It asks nothing."""
-    ctx.say("  Cross-check of that answer against the log, for you to read. It decides")
-    ctx.say("  nothing, and nothing here waits on you:")
+    for a list with none. It asks nothing. With no log list to read against, a list with no
+    finding is said to have none, never to agree with a log nobody read (contract §13)."""
+    ctx.say("  Cross-check of that answer%s, for you to read. It decides nothing, and"
+            % (" against the log" if measured else ""))
+    ctx.say("  nothing here waits on you:")
     for which in TOOL_LISTS:
         rows = found.get(which) or []
         if not rows:
-            ctx.say("    %s list: agrees with the log." % _LIST_NAME[which])
+            ctx.say("    %s list: %s." % (_LIST_NAME[which], "agrees with the log" if measured
+                                          else "nothing to report, and no log to read it against"))
         for finding, detail in rows[:CROSS_CHECK_SHOWN]:
             ctx.say("    %s list: %s." % (_LIST_NAME[which], _finding(finding, detail)))
         if len(rows) > CROSS_CHECK_SHOWN:
@@ -4650,7 +4653,7 @@ def run_probe(ctx, rows):
             for line in (body.strip().splitlines() or ["(no answer)"])[:60]:
                 ctx.say("    | " + line)
             found = cross_check(sections, measured)
-            say_cross_check(ctx, found)
+            say_cross_check(ctx, found, measured)
             if verdict == "open":
                 raise SetupError("the planning session on %s holds a tool the fence should "
                                  "have removed: %s. It was judged by code. Nothing was signed "
@@ -6837,8 +6840,10 @@ def _selftest_one_command(check, tmp):
            "never a pass" in got, c.state.attested("CA-PROBE"), with_log.asked,
            len(c.tracker.moves), PROBE_CANARY in c.host.files,
            said(c, "session log could not be read"),
-           said(c, "which is a cross-check and never a question")),
-          (True, True, False, [RUN_Q], 2, False, True, True))
+           said(c, "which is a cross-check and never a question"),
+           # A list with no finding never "agrees with the log" when no log was read (§13).
+           said(c, "agrees with the log"), said(c, "no log to read it against")),
+          (True, True, False, [RUN_Q], 2, False, True, True, False, True))
     got, c = with_log("probe-log-names-no-tools", [])
     check("probe-empty-start-up-list-is-unknown",
           (got.startswith("unknown: "), "(it named no tools)" in got, NO_CALL_RECORDS in got,
