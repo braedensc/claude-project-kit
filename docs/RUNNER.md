@@ -44,7 +44,8 @@ a lost session gets them again. A stop carries no text.
 
 **The session's final message is kept for its caller** (KIT-858). When a run ends, the runner keeps
 the final message the program reported in `<store_dir>/outputs/<run>.json`. That is its last 150,000
-characters, marked `cut` when the message was longer. The caller reads it with `run_output()` once
+characters, marked `cut` when the message was longer. The runner reads the program's result line
+whole up to 8 MiB; a longer one counts as no result. The caller reads it with `run_output()` once
 the run's record says it ended. `None` means the run left no result at all. A result that carried
 no message is kept as one with none, never as an empty message. The message is the session's own
 words: data for its caller, never part of the run's record.

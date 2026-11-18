@@ -3345,7 +3345,8 @@ list (§13). The usage job reads the runs through it once a lane moves to the ru
 the final message the program reported in `<store>/outputs/<run>.json`: `{"schema":
 "pipeline-runner-output/1", "run", "at", "is_error", "subtype", "text", "cut"}`. `text` is the
 message's last 150,000 characters, or null when the program's result carried none, and `cut` says it
-was longer. A run that left no result at all has no file. The runner alone writes it, outside the
+was longer. The runner reads the program's result line whole up to 8 MiB; a longer one counts as no
+result. A run that left no result at all has no file. The runner alone writes it, outside the
 run's folder. The caller that asked for the run reads it with `run_output()`: the document, `None`
 when there is none, or an error when one is there and cannot be read (§13). The text is the
 session's own words: data for its caller, checked by the caller's own rules, never part of the record.

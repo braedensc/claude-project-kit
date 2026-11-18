@@ -197,7 +197,9 @@ _PATTERN_CHARS = re.compile(r"[*?\[\]{}!\\]")       # a permission rule would ma
 GIT_TIMEOUT = 300
 CLEAR_TRIES, CLEAR_PAUSE = 20, 0.05                 # an ending run is killed again until clear
 INSTRUCTIONS_MAX = 200 << 10                        # the project's CLAUDE.md, read from its base
-RESULT_SCAN = 1 << 20
+# The end of the program's output read for its result. Its result line is read whole up to this
+# size, far past the final message the store keeps (KIT-858); a longer line reads as no result.
+RESULT_SCAN = 8 << 20
 PIN_EXTRA_MINUTES = 30                              # as the hand-run pin writer does
 PIN_MAX_MINUTES = 24 * 60
 
@@ -2183,6 +2185,18 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                "says it was cut",
                (len(out.get("text") or ""), (out.get("text") or "").endswith("the block at the end"),
                 out.get("cut")), (store.OUTPUT_MAX, True, True))
+        big = os.path.join(tmp, "big-result")             # Stage E on the first push: a result line
+        os.makedirs(big)                                   # past the first 1 MiB scan was lost whole
+        for name, size, whole in (("of 2 MiB is read whole", 2 << 20, True),
+                                  ("past the scan is said to be none", RESULT_SCAN + 1, False)):
+            with open(os.path.join(big, "out.jsonl"), "w") as fh:
+                fh.write(json.dumps({"type": "result", "subtype": "success", "is_error": False,
+                                     "result": "x" * size + "the block at the end", "num_turns": 2,
+                                     "total_cost_usd": 0.01}) + "\n")
+            got = read_result(big)
+            expect("a result line %s" % name,
+                   (len(got["text"]), got["text"].endswith("the block at the end"), got["turns"])
+                   if got else None, (size + 20, True, 2) if whole else None)
         for state, waits, how in ((store.RUNNING, None, "still going"), ("interrupted", "pending", "to be resumed")):
             why = runner.clear_ended(cfg["projects"]["app"], "app", "plan", "ENG-40", ws40,
                                      "chore/eng-40-plan", [dict(rec40b, state=state, auto_resume=waits)])
