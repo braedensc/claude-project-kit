@@ -1247,7 +1247,10 @@ class Pass:
         if not covered and not running:
             self.start_default(plan, info, "its pieces merged before a check ran" if not mine else
                                "its last piece merged at %s, a head no check covered" % head[:12])
+        # `merged_prs` is every merged pull request this pass read for the plan: the bridge holds the plan unless
+        # that is the list it sees, so an entry written before a later merge never closes it.
         self.write_coverage(plan, {"merged_head": head, "merged_pr": number, "merged_at": _iso(merged_at),
+                                   "merged_prs": sorted({m["number"] for m in info["merged_prs"]}),
                                    "covered": covered, "by": by, "looked_at": _iso(self.now)})
         self.say("%-10s merged head %s: %s" % (plan, head[:12], "covered by a check at %s" % by[:12] if covered
                                              else "not covered by any check"))
@@ -2421,8 +2424,8 @@ def selftest():
     seed([row(H1, NOW - 3000)])
     go(lin, gh)
     rec = coverage() or {}
-    expect(sorted(rec) == ["by", "covered", "looked_at", "merged_at", "merged_head", "merged_pr"]
-           and rec["merged_at"] == _iso(NOW - 1000) and rec["merged_pr"] == 7,
+    expect(sorted(rec) == ["by", "covered", "looked_at", "merged_at", "merged_head", "merged_pr", "merged_prs"]
+           and rec["merged_at"] == _iso(NOW - 1000) and rec["merged_pr"] == 7 and rec["merged_prs"] == [5, 7],
            "the record names the merged head, pull request and time, and what covers it: %r" % rec)
 
     clean()

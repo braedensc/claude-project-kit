@@ -188,8 +188,9 @@ merge. A check whose start failed covers nothing. When it is not covered and not
 starts one check of the default branch, once per head.
 
 The pass writes its answer, one entry per plan, to a file next to the ledger: `<ledger>.coverage.json`
-(`pipeline-acceptance-coverage/1`). An entry holds `merged_head`, `merged_pr`, `merged_at`, `covered` (true or false),
-`by` (the head of the check that covers it, or null) and `looked_at`. The entry is written after the decision, so on
+(`pipeline-acceptance-coverage/1`). An entry holds `merged_head`, `merged_pr`, `merged_at`, `merged_prs` (every merged
+pull request it read for the plan), `covered` (true or false), `by` (the head of the check that covers it, or null)
+and `looked_at`. The entry is written after the decision, so on
 the pass that starts the check it says not covered, and on the next it says covered, by that check.
 **Good:** `TOD-100    merged head aaaaaaaaaaaa: covered by a check at aaaaaaaaaaaa`.
 **Not:** `NOT DONE: TOD-100: its last merged pull request could not be read`. The pass could not tell, so it leaves no
