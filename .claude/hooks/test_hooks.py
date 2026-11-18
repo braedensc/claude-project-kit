@@ -338,6 +338,14 @@ def hung_scanner_verdict(rc, said, took, listing, why_not, hang_mark):
     return "FAIL", True, f" — rc={rc} took={took:.0f}s left_running={left} said={said.strip()[-200:]!r}"
 
 
+def record_verdict(word, failed, name, not_checked):
+    """A case's verdict into the battery's count: the failures it adds, and, for NOT CHECKED,
+    its name in `not_checked`, so the last line leaves it out of the passed count (KIT-785)."""
+    if word == "NOT CHECKED":
+        not_checked.append(name)
+    return 1 if failed else 0
+
+
 def summary_line(total, failures, not_checked):
     """The battery's last line. A case this machine could not check is neither passed nor failed:
     it is named, and left out of the passed count (KIT-785)."""
@@ -4438,8 +4446,10 @@ def main():
     seq_ran += 1
     name2 = "a descendant that left the process group cannot hold the battery: run_tree still gives up in time"
     _starting(name2)
-    escaper = ("import subprocess, time; subprocess.Popen(['sleep', '%s'], start_new_session=True); "
-               "time.sleep(600)" % str(int(HANG_SECONDS) + 1))
+    # The escaper writes its child's pid, so the cleanup can stop it by pid where `ps` is refused (KIT-785).
+    escaped_pid_file = os.path.join(tempfile.mkdtemp(prefix="kit424-escaper-"), "child.pid")
+    escaper = ("import subprocess, time; p = subprocess.Popen(['sleep', '%s'], start_new_session=True); "
+               "open(%r, 'w').write(str(p.pid)); time.sleep(600)" % (str(int(HANG_SECONDS) + 1), escaped_pid_file))
     t1 = time.time()
     try:
         run_tree([sys.executable, "-c", escaper], 3)
@@ -4451,23 +4461,26 @@ def main():
     print(f"[{'PASS' if ok2 else 'FAIL'}] pre-commit (KIT-424): {name2}"
           + ("" if ok2 else f" — gave_up={gave_up} took={took2:.0f}s"))
     failures += 0 if ok2 else 1
+    # The one that left its group is stopped by the pid it wrote, so this needs no process list.
+    try:
+        with open(escaped_pid_file) as fh:
+            os.kill(int(fh.read().strip()), 9)
+    except (OSError, ValueError):
+        pass   # it never started, wrote nothing, or is gone already
     # Where the process list cannot be read (a sandbox refuses `ps`, KIT-785), the case says NOT
-    # CHECKED for the one thing it needs the list for, and nothing is killed: there is no pid to name.
+    # CHECKED for the one thing it needs the list for, and its stand-in is not looked for by pid.
     listing, why_not = process_listing()
     word, failed, detail = hung_scanner_verdict(rc, said, took, listing, why_not, HANG_MARK)
     if listing is not None:
         left = [ln.split()[0] for ln in listing if ln.rstrip().endswith(HANG_MARK)]
-        listing2, _why = process_listing()
-        escaped = [ln.split()[0] for ln in (listing2 or [])
+        escaped = [ln.split()[0] for ln in listing   # a second look, in case its pid was never written
                    if ln.rstrip().endswith("sleep " + str(int(HANG_SECONDS) + 1))]
         if escaped:
             subprocess.run(["kill", "-9", *escaped], capture_output=True)   # the one that left its group
         if left:
             subprocess.run(["kill", "-9", *left], capture_output=True)   # this run's own stand-in
     print(f"[{word}] pre-commit (KIT-424): {name}{detail}")
-    failures += 1 if failed else 0
-    if word == "NOT CHECKED":
-        not_checked.append("pre-commit (KIT-424): " + name)
+    failures += record_verdict(word, failed, "pre-commit (KIT-424): " + name, not_checked)
     # KIT-785, pinned: a refused process list is NOT CHECKED, never a pass, and a case that failed
     # what it could check still fails. A refusal is no list at all, never an empty one.
     seq_ran += 1
@@ -4479,7 +4492,17 @@ def main():
                 hung_scanner_verdict(0, "", 50, None, "ps refused", HANG_MARK),
                 hung_scanner_verdict(124, "TIMED OUT after 8 s", 9, ["123 " + HANG_MARK], None, HANG_MARK),
                 hung_scanner_verdict(124, "TIMED OUT after 8 s", 9, ["1 /sbin/launchd"], None, HANG_MARK)]
+    # Each verdict as the battery records it: a NOT CHECKED case is named and adds no failure.
+    named = []
+    counted = [record_verdict(w, f, "case-%d" % i, named) for i, (w, f, _d) in enumerate(verdicts)]
+    try:
+        with open(escaped_pid_file) as fh:
+            wrote_pid = fh.read().strip().isdigit()
+    except OSError:
+        wrote_pid = False
     ok3 = (bad_ps[0] is None and "could not be read" in (bad_ps[1] or "")
+           and counted == [0, 1, 1, 0] and named == ["case-0"]
+           and wrote_pid
            and false_ps[0] is None and "exited" in (false_ps[1] or "")
            and [v[:2] for v in verdicts] == [("NOT CHECKED", False), ("FAIL", True), ("FAIL", True),
                                              ("PASS", False)]
@@ -4487,7 +4510,8 @@ def main():
            and summary_line(10, 1, ["x"]) == "\n8/10 cases passed; NOT CHECKED here: x"
            and summary_line(10, 0, []) == "\n10/10 cases passed")
     print(f"[{'PASS' if ok3 else 'FAIL'}] pre-commit (KIT-424, KIT-785): {name3}"
-          + ("" if ok3 else f" — listings {bad_ps!r} {false_ps!r}, verdicts {verdicts!r}"))
+          + ("" if ok3 else f" — listings {bad_ps!r} {false_ps!r}, verdicts {verdicts!r}, "
+                            f"recorded {counted!r} {named!r}, escaper wrote its pid: {wrote_pid}"))
     failures += 0 if ok3 else 1
     for r in _PRECOMMIT_TMP:
         shutil.rmtree(r, ignore_errors=True)
