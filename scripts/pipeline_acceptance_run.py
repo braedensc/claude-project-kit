@@ -48,6 +48,15 @@ ONE PASS, IN ORDER
      covered, in which case one check of the default branch starts when nothing of the plan runs. A lookup it cannot
      read leaves no record and is said.
 
+ON THE RUNNER'S LANE (KIT-708). A repository `runner_lane` names, whose project our own runner says takes acceptance
+checks (the lanes it writes in its store), gets steps 2 to 4 from the runner instead, with no ticket filed or moved: the
+look config first, naming the runner's workspace for the plan's last piece, then one `acceptance` start request for that
+piece, whose text is the check's facts. The check is named by that request, chosen first. The result is the final
+message the runner kept; the second look is a resume of the check's run; past the time limit its run is asked to stop,
+or its request is withdrawn while the runner has not taken it. So the runner's one `lanes.acceptance` setting moves a
+project's checks, and moves them back. Lanes that cannot be read hold a start, said; so does an earlier check of the
+same piece the runner still holds.
+
 THE SECOND PASS (contract section 27, KIT-608). A result that lists a problem is not concluded at once: the pass replies
 in the session's own thread, the bounce driver's route, naming each problem and its screenshot, and asks for one
 block per problem. A later pass reads the newest answer after the result; slice 3's `disprove` answers from it. A
@@ -63,8 +72,8 @@ would read as a routing directive is left out and said. The ticket's description
 file's own, or nothing is filed. The session's own words reach a comment only through the poller's neutralizer.
 
 WHAT IT NEVER DOES. It never merges, approves or labels anything, never moves a plan or a piece, never writes to GitHub,
-and never starts a session except by delegating the one acceptance ticket it filed. It prompts no session but that
-one, once, for its second look. Its tracker writes are exactly: issueCreate (the acceptance ticket), issueUpdate (that
+and never starts a session except by delegating the one acceptance ticket it filed, or on the runner's lane by one
+start request to our own runner. It prompts no session but that one, once, for its second look. Its tracker writes are exactly: issueCreate (the acceptance ticket), issueUpdate (that
 ticket's delegate, and its state when it is closed or stopped), and commentCreate (the follow-up requests and the
 verdict, on the plan's epic, and the second look's one reply in the session's thread). The selftest holds the source
 to that.
