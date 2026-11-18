@@ -376,6 +376,11 @@ jobs:
       # merge state; anything it cannot read is no.
       - name: Validator evidence selftest (no when it cannot tell; never PR text in its answer)
         run: python3 scripts/pipeline_validator_evidence.py --selftest
+      # The validator's facts for one item (KIT-791): what the limits, the evidence and the brief
+      # read, each through its owner's reader. Offline, with a stubbed tracker and code host: every
+      # fact read, and each one unread said by name and held by the limits, never clear or zero.
+      - name: Validator facts selftest (each fact from its owner; an unread one is never clear)
+        run: python3 scripts/pipeline_validator_facts.py --selftest
       # The validator's ledger (KIT-535, contract section 24): one row per decision, written by one
       # function. Offline: append-only and atomic, one verdict per head, an approval only when all three
       # layers pass, and a ledger that cannot be trusted gives no rows, never an empty list.
