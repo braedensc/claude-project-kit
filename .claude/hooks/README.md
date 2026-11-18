@@ -481,6 +481,11 @@ python3 .claude/hooks/test_hooks.py
 case — and keep docs/COLLABORATION.md's "What's automatic (enforcement)" section in
 sync.**
 
+Inside a sandbox that refuses `ps`, such as Claude Code's, the battery still finishes
+(KIT-785). The KIT-424 hung-scanner case needs the process list for one check: whether
+it left a process running. There it says NOT CHECKED, with the reason, and the last line
+names it. It never counts as passed, and the case still fails if its timeout broke.
+
 ---
 
 ## The bypass battery — `test_guard_bypass.py`

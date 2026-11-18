@@ -320,7 +320,8 @@ twice on doc-tail merges before these rules existed:
    dry-run count and sign it off. It takes only a worktree **your own Claude Code
    worked in**. A dispatcher's PR never qualifies; the bounce driver re-prompts that
    session in its own thread. Each session is capped (`MAX_BUDGET_USD`, `TIMEOUT_MIN`),
-   and so is each pass (`MAX_SESSIONS_PER_PASS`). Three automated attempts per PR.
+   and so is each pass (`MAX_SESSIONS_PER_PASS`). Three automated attempts per PR, and
+   deleting the bot's comments does not give them back.
    After that, or when nothing claims a request within 15 minutes, the monitor pages
    a person. Logged out, asleep, or never installed, you get the old page, never
    silence. On a Stage E machine, its installer's `conflict-waker` step does this for
@@ -328,10 +329,18 @@ twice on doc-tail merges before these rules existed:
 
    - **`REPO_DIRS` names every project.** A checkout left out is never claimed. Parallel
      sessions in two projects means both roots, comma-separated.
-   - **`CLAUDE_ARGS` covers the whole prompt.** A headless session gets only the tools it
-     is given. The prompt uses git, gh, and the local checks your `CLAUDE.md` names, so
-     allow each runner. Missing git or gh ends `failed` and pages you; missing the gate's
-     runners pushes an untested merge. `conflict-waker.conf.example` has the kit's line.
+   - **A fix session is held to its worktree (KIT-676).** It loads none of your settings
+     and none of the worktree's. Its file tools reach only its worktree. Its commands run
+     in Claude Code's sandbox, which refuses writes outside the worktree. It may run only
+     the git and gh steps its prompt names, plus your `CHECK_COMMANDS`.
+   - **`CHECK_COMMANDS` names your whole local gate**, each check by its exact words
+     (`conflict-waker.conf.example` has the kit's line). A check left out is never run, and
+     the fix is pushed with only CI to test it. The dry run prints the whole list for you to
+     sign. `CLAUDE_ARGS` is gone, and a conf that still sets it is refused by name.
+   - **Each `REPO_DIRS` checkout needs an HTTPS origin, and git's own credential helper.**
+     git cannot use SSH inside the sandbox on macOS, and gh cannot hand git its login there.
+     So preflight refuses an SSH origin, and a helper that runs gh (`gh auth setup-git` writes
+     one), naming the fix. macOS's `osxkeychain` helper works.
    - **`CLAUDE_CONFIG_DIR` is read at install.** The job keeps the value your shell had
      then (else `~/.claude`). Change it later and re-run `run`, or the waker finds no
      transcripts and every conflict pages you. Preflight refuses a directory with none.
@@ -655,7 +664,10 @@ Stop hook between them:
    them; a PR authored in another clone or the web UI never meets one. The job runs
    the gate script from the default branch's tip for the same reason it reads config
    there — a head that can rewrite the gate grades its own homework, and a base the
-   PR names could be a branch its author pushed (KIT-410).
+   PR names could be a branch its author pushed (KIT-410). The workflow itself runs
+   on `pull_request_target`, so GitHub takes it from the default branch too, and a PR
+   that edits it cannot change how it is judged (KIT-668; what that needs from the
+   owner before 2 Dec 2026 is in `docs/SECURITY.md`).
 
 Plus two **standing watchers**, because every layer above samples a moment and a PR
 can break after that moment, when nobody is in a session:

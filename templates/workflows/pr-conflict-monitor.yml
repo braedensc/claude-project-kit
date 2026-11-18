@@ -14,7 +14,9 @@ name: PR conflict monitor
 #
 # The logic is scripts/pr_conflict.py — the same file the kit runs on itself,
 # one marker grammar, one selftest in CI. Per new conflict episode:
-#   • budget left (3 automated attempts per PR, lifetime; `--max-fix-requests N`
+#   • budget left (3 automated attempts per PR, lifetime, counted from the
+#     label's own events as well, so deleting the bot's comments does not
+#     reset it (KIT-671); `--max-fix-requests N`
 #     changes it, and 0 means NOTHING HERE ANSWERS — page at the first conflict
 #     instead of asking, which is the right setting for a repository with no
 #     waker and no dispatcher) → label + a `request`
@@ -63,7 +65,7 @@ on:
 
 permissions:
   contents: read
-  issues: write # labels + comments on a PR go through the issues API
+  issues: write # labels, comments and the label's events on a PR go through the issues API
   pull-requests: write
 
 # Serialize rather than cancel: a cancelled run could die between "post comment" and

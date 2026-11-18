@@ -836,7 +836,7 @@ def check_push_connection(env, conf, state):
     pass, so a DM is still answered, only not at once."""
     path = conf.get("PUSH_HEARTBEAT_FILE")
     if not path:
-        return finding("push-connection", OK, "PUSH_HEARTBEAT_FILE is not set: the bridge's "
+        return finding("push-connection", OK, "PUSH_HEARTBEAT_FILE is not set: the tech lead's "
                                                "push-connection job is not watched here")
     problem = _push_problem(path, _now(env))
     if problem is None:
@@ -844,7 +844,7 @@ def check_push_connection(env, conf, state):
         return finding("push-connection", OK, "connected, and Slack was heard from lately")
     if _debounced(state, "push-connection", True):
         return finding("push-connection", FIRING, (
-            "%s, for %d passes running. DMs are still answered once a minute by the bridge's own "
+            "%s, for %d passes running. DMs are still answered once a minute by the tech lead's own "
             "pass, only not at once. Check: `python3 scripts/pipeline_bridge_setup.py verify "
             "--conf <its conf>`." % (problem[0].upper() + problem[1:], DEBOUNCE)))
     return finding("push-connection", UNKNOWN, "%s this pass; one more and it fires" % problem)
