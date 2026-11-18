@@ -820,6 +820,7 @@ jobs:
           python3 scripts/pipeline_acceptance_poller.py --selftest
           python3 scripts/pin_hooks_path.py --selftest
           python3 scripts/pipeline_machine_tickets.py --selftest
+          python3 scripts/check_repo_setup.py --selftest
           python3 scripts/pipeline_root_guard.py --selftest
           python3 scripts/pipeline_routing_tags.py --selftest
           python3 .claude/skills/sync-kit/compare.py --selftest

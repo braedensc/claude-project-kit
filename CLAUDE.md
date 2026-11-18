@@ -426,6 +426,8 @@ npm run test:ci-covers      # every package.json test:* script has a CI step out
 npm run lint:ci-covers      # …and the same check over this repo
 npm run test:stdlib-only    # the kit's Python imports only the standard library, bar a named list (KIT-652)
 npm run lint:stdlib-only    # …and the same check over this repo's tracked .py files
+npm run test:repo-setup     # the repo-setup check: missing label, missing variable, all present, unreadable (KIT-692)
+npm run check:repo-setup    # …and the real one: reads GitHub only, names each missing label and variable (owner runs it)
 npm run test:pr-base         # PR-base gate: a PR's base must be a base branch; an unknown
                              #   event or missing value FAILS, main() itself is exercised
 npm run test:label-gate      # the label gate runs the default branch's workflow and code on
