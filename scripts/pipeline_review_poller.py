@@ -5762,6 +5762,8 @@ class _FakeLinear:
     is checked as that lane's."""
 
     def __init__(self, lane=None):
+        """A fresh stand-in, or a reset of one: a reset keeps its lane and its store, and empties
+        the store's folders, so each case starts from the same fixture on either lane."""
         self.lane = lane or getattr(self, "lane", None) or "old"
         self.store_dir = getattr(self, "store_dir", None)     # the runner lane's store, kept
         self.stops = []           # the runner lane's stop requests: (run, ticket)
@@ -10405,7 +10407,13 @@ def selftest():
                       ([a["request"] for a in fake.created], runner_review_asked(fake.store_dir, rid644)),
                       ([rid644, rid644], True))
             with tempfile.TemporaryDirectory() as tmp:          # settings unread; a lane switched
+                runner_store.ask(fake.store_dir, runner_store.REVIEW, "start", runner_store.REVIEW,
+                                 "app", "KIT-5", text="x", tier="standard")   # for the reset to clear
                 fake.__init__()
+                check("KIT-644 a reset of the stand-in keeps its lane and empties its runner's store",
+                      (fake.lane, fake.created, [os.listdir(os.path.join(fake.store_dir, f))
+                                                 for f in ("requests", "taken", "runs")]),
+                      ("runner", [], [[], [], []]))
                 posted.clear()
                 save_seen(seen_path(tmp), dict(seen0))
                 lanes644 = globals()["runner_review_lanes"]
@@ -10422,10 +10430,14 @@ def selftest():
                 globals()["runner_review_lanes"] = lanes644       # …and on again
                 filed = [i.get("teamId") for i in fake.created]
                 fake.respond("rev-uuid-1", "```json\n%s\n```" % json.dumps(clean_doc), via="old")
-                check("KIT-644 a review filed on the old lane finishes there when the lane is switched on",
-                      (filed, scan(c, False), collect(c, False), len(posted), fake.updated,
-                       load_seen(seen_path(tmp))[pr_key("o/r", 5)]["status"]),
-                      (["team-1"], EXIT_OK, EXIT_OK, 1, [("rev-uuid-1", {"stateId": "done-1"})], "collected"))
+                switched = scan(c, False)
+                check("KIT-644 a review filed on the old lane finishes there when the lane is switched "
+                      "on, and the runner is asked nothing for it",
+                      (filed, switched, [i.get("request") for i in fake.created],
+                       os.listdir(os.path.join(fake.store_dir, "requests")), collect(c, False),
+                       len(posted), fake.updated, load_seen(seen_path(tmp))[pr_key("o/r", 5)]["status"]),
+                      (["team-1"], EXIT_OK, [None], [], EXIT_OK, 1, [("rev-uuid-1", {"stateId": "done-1"})],
+                       "collected"))
             alone(None)
 
         # 8. Telemetry absence is said, never silent — with the real emit_telemetry and no module.
