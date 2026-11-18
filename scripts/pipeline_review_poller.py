@@ -3745,7 +3745,12 @@ def settle_routings(cfg, seen, api_key, dry_run, result):
     has a verdict, or until the only ones left are past the plain wait (the dispatcher is
     busy with earlier review tickets: later passes check them again, so a pass sleeps no
     longer than it did before KIT-795), or until the pass's own deadline is near. A check
-    left waiting is finished first on the next pass. Work teams only."""
+    left waiting is finished first on the next pass. Work teams only.
+
+    A ticket past its plain wait ("queued") is read ONCE per call, not every few seconds
+    while the call waits on another ticket's note. Its own wait runs in minutes and each
+    pass reads it twice, so it may trip up to one pass after its wait ends. Read every few
+    seconds through a burst, it would cost the tracker's rate limit, once per queued ticket."""
     if cfg.get("mode") != MODE_WORK_TEAMS:
         return
     clock = cfg.get("_clock") or _Clock
@@ -3756,7 +3761,7 @@ def settle_routings(cfg, seen, api_key, dry_run, result):
                if (r.get("routing") or {}).get("verdict") == "pending" and r.get("review_ticket_id")]
     # The heartbeat's count is the review tickets still waiting when the pass ends, so each
     # call sets it afresh rather than adding to the earlier call's.
-    result.routing_waiting, unread = len(pending), 0
+    result.routing_waiting, unread, queued = len(pending), 0, 0
     while pending:
         try:
             sessions = sessions_by_issue([r["review_ticket_id"] for _k, r in pending], api_key)
@@ -3765,7 +3770,7 @@ def settle_routings(cfg, seen, api_key, dry_run, result):
                 "next pass, and nothing is collected meanwhile" % (len(pending), exc))
             result.errors += 1
             return
-        still, fresh = [], False
+        still = []
         for key, record in pending:
             try:
                 verdict, evidence = check_review_routing(
@@ -3784,20 +3789,19 @@ def settle_routings(cfg, seen, api_key, dry_run, result):
                                                         evidence.get("expected")))
             elif verdict == "wrong":
                 trip_misroute(cfg, seen, key, record, evidence, api_key, dry_run, result)
+            elif verdict == "queued":
+                queued += 1             # read again by the next call, not in this one
             else:
                 still.append((key, record))
-                fresh = fresh or verdict == "pending"
         pending = still
-        result.routing_waiting = len(pending) + unread
-        if not pending:
-            break
-        if not fresh or clock.monotonic() + ROUTING_POLL_SECONDS > deadline:
-            log("NOTE: %d review ticket(s) still wait for their routing note%s; the next pass "
-                "checks again, and nothing is collected meanwhile"
-                % (len(pending), "" if fresh else ", each behind earlier review tickets and "
-                   "inside its own longer wait"))
+        result.routing_waiting = len(pending) + queued + unread
+        if not pending or clock.monotonic() + ROUTING_POLL_SECONDS > deadline:
             break
         clock.sleep(ROUTING_POLL_SECONDS)
+    if pending or queued:
+        log("NOTE: %d review ticket(s) still wait for their routing note (%d behind earlier "
+            "review tickets, inside their own longer wait); the next pass checks again, and "
+            "nothing is collected meanwhile" % (len(pending) + queued, queued))
 
 
 PAGE_MISROUTED = ("%s\n### This review was cancelled: it may not have reached the review "
@@ -5964,6 +5968,7 @@ def _selftest_work_teams(check, basis, diff):
                     WFake.__init__(self)
                     self.clock, self.plan = clock, list(plan)
                     self.dispatch = self.route
+                    self.reads = {}           # session id -> how many times it was read
 
                 def route(self, _issue):
                     delay, body = self.plan.pop(0)
@@ -5974,6 +5979,7 @@ def _selftest_work_teams(check, basis, diff):
 
                 def __call__(self, query, variables, api_key):
                     if re.search(r"\bReviewRouting\b", query):
+                        self.reads[variables["id"]] = self.reads.get(variables["id"], 0) + 1
                         shown = [a for a in self.routing.get(variables["id"]) or []
                                  if _parse_iso(a["createdAt"]).timestamp() <= self.clock.t]
                         return {"agentSession": {"id": variables["id"], "activities": {
@@ -6071,6 +6077,30 @@ def _selftest_work_teams(check, basis, diff):
                   (EXIT_OK, (EXIT_OK, ["pending"], {}, []), EXIT_ERROR, MISROUTED_STATUS,
                    "no routing note from the dispatcher within %d seconds, the longer wait for a "
                    "ticket filed while 2 other review ticket(s) were in flight" % wait83, ["o/r"]))
+
+            # A queued ticket is read ONCE per check, not every few seconds while the pass
+            # waits on another ticket's note: through a burst that would cost the tracker's
+            # rate limit once per queued ticket. So it may trip up to one pass after its wait.
+            c9, clock9 = busy_cfg("reads"), Clock()
+            busy9 = Busy(clock9, [(10, ok_note), (0, None), (100, ok_note)])
+            open_prs[:] = [pr(91), pr(92)]
+            code9a = busy_pass(c9, busy9, clock9)        # 92 is queued at its plain wait
+            open_prs[:] = [pr(91), pr(92), pr(93)]
+            rec92 = load_seen(seen_path(c9["state_dir"])).get(pr_key("o/r", 92)) or {}
+            busy9.reads.clear()
+            code9b = busy_pass(c9, busy9, clock9)        # 93's note takes 100 s of this pass
+            check("burst: a queued ticket is read once per check while the pass waits on another",
+                  (code9a, code9b, busy_state(c9, (91, 92, 93)),
+                   busy9.reads.get("s-" + str(rec92.get("review_ticket_id"))),
+                   (rec92.get("routing") or {}).get("in_flight")),
+                  (EXIT_OK, EXIT_OK, ["ok", "pending", "ok"], 2, 1))
+            code9c = busy_pass(c9, busy9, clock9)        # past its 180 s: trips on this pass
+            rec92 = load_seen(seen_path(c9["state_dir"])).get(pr_key("o/r", 92)) or {}
+            check("burst: …and it still trips on the pass after its own wait ends",
+                  (code9c, rec92.get("status"), (rec92.get("routing") or {}).get("reason")),
+                  (EXIT_ERROR, MISROUTED_STATUS,
+                   "no routing note from the dispatcher within 180 seconds, the longer wait for "
+                   "a ticket filed while 1 other review ticket(s) were in flight"))
 
             # The wait's own rules: 60 s more per review ticket in flight, up to the longest
             # wait; a ticket filed before KIT-795 (no count) or with a count that is not a

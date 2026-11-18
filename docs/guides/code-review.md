@@ -49,7 +49,7 @@ How long it waits for the note:
 - Fifteen minutes at most.
 - At least five and a half minutes while a repository setup hook runs.
 
-One pass waits two minutes at most. A longer wait goes on in later passes.
+One pass waits no longer than the plain wait: two minutes by default, five and a half while a setup hook runs. A longer wait goes on in later passes, which check the note once each. So a missing note can pause reviews up to one pass after its wait ends.
 
 - The note names the review setup: the review is collected.
 - The note names anything else: the job cancels the ticket at once, writes the evidence and pages you.

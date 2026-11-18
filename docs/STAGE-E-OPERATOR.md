@@ -680,9 +680,11 @@ wrote. On a separate Reviews team the same failure landed in a read-only reviewe
   wait is at least 330 seconds. The record keeps the count as `routing.in_flight`.
 - Why it grows (KIT-795): on 17 Nov a burst of review tickets met ten running reviews. One
   note came late, the plain wait read it as a misroute, and every review paused for six hours.
-- A pass sleeps on a note only through the plain wait. A ticket past it, inside its own
-  wait, is "not routed yet": later passes check it again, and the heartbeat counts it in
-  `routing_waiting`. A check the pass had no time for is finished first on the next pass.
+- A pass sleeps on a note only through the plain wait: `routing_wait_seconds`, or 330
+  seconds while a setup hook runs. A ticket past it, inside its own wait, is "not routed
+  yet": each later check reads it once, never every few seconds, and the heartbeat counts it
+  in `routing_waiting`. So a note that never comes trips up to one pass after the ticket's
+  wait ends. A check the pass had no time for is finished first on the next pass.
 - Only a confirmed review is collected. Until then the ticket's answer is never published.
 
 **When the note is wrong, or never comes:**
