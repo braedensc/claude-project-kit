@@ -1188,7 +1188,8 @@ def room_block(status, record, now):
             "record could not be read."), None
 
 
-CLONE_FILE_RE = re.compile(r"^(?:scripts|schemas)/[A-Za-z0-9._-]{1,100}\Z")
+# The status job's own shape for a job file: scripts, schemas, or a session kind the runner reads (KIT-880).
+CLONE_FILE_RE = re.compile(r"^(?:scripts|schemas|session-kinds)/[A-Za-z0-9._-]{1,100}\Z")
 CLONE_NAMES_SAID = 3
 
 
@@ -3469,6 +3470,10 @@ def _selftest():
     check("kit-copy-names-outside-the-job-files-and-a-non-number-are-never-said",
           "scripts/ok.py" in odd and "etc/passwd" not in odd and "docs/a.md" not in odd
           and "by many" not in odd, odd[-500:])
+    kinds_k = clone_text(dict(behind_k, merges_behind=1, files=["session-kinds/code.json"], files_total=1))
+    check("kit-copy-behind-on-a-session-kind-names-it-kit-880",
+          "behind main by 1 merge, in files the jobs run: session-kinds/code.json. A merged fix" in kinds_k,
+          kinds_k[-500:])
     # --- KIT-483 with KIT-487's list: pull requests outside a plan wait on the merge too ---
     # The status file's `other_pull_requests` arrives with KIT-487 (PR #350). This reader goes
     # first, so these fixtures are written as the status job writes them, past `put`'s check

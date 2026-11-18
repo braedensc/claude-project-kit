@@ -67,6 +67,10 @@ Its environment is exactly the kind's names: PATH, HOME, TMPDIR, LANG, the sign-
 one name the program reads, and two switches. A workspace whose dotenv files name a variable the
 program reads (an API key, a base address, a proxy) is refused before the program runs. Nothing
 starts while the engine's folder, the kinds' data or the guard could be changed by this account.
+The kinds are read once, when the runner starts, and a hash of the bytes it read is kept. Before
+each start and resume the kit's folder is hashed again, with no network call: while the two
+differ, no session starts from kinds the kit no longer has (KIT-880). The request waits, and says
+why; a restart of the runner loads them.
 
 NO TRACKER SIGN-IN (KIT-706, scripts/pipeline_session_tools.py).  No session holds a tracker key:
 none is in its environment, its mcp.json lists no tracker server, and every tracker key file is
@@ -154,14 +158,15 @@ ENGINE = os.path.dirname(HERE)             # the kit copy the runner runs from: 
 def _load_kinds():
     """Each kind of session, as data (session-kinds/<kind>.json, KIT-704): its tools, rules, wall,
     hosts, environment names, limits and brief, each checked by the data's own rules and by the
-    adapter's. A runner whose kinds do not all load starts nothing."""
-    found, bad = kinds_data.load()
+    adapter's. A runner whose kinds do not all load starts nothing. The third answer is the hash of
+    the very bytes it loaded (KIT-880), or None when nothing loaded."""
+    found, bad, digest = kinds_data.load_with_digest()
     for spec in found.values():
         bad = bad + harness.check(spec)
-    return (found if not bad else {}), bad
+    return (found if not bad else {}), bad, (digest if not bad else None)
 
 
-KINDS, KIND_PROBLEMS = _load_kinds()
+KINDS, KIND_PROBLEMS, KINDS_DIGEST = _load_kinds()
 INTERRUPTED_TEXT = ("This session was interrupted before it ended. Carry on from where it "
                     "stopped.")
 # KIT-764. What a fresh start after a lost session is told first, before the ticket and the request.
@@ -896,11 +901,13 @@ def session_main(rdir, fd):
 # --------------------------------------------------------------------------- #
 class Runner(object):
     def __init__(self, cfg, tracker, environ=None, git_env=None, clock=time.time, say=None,
-                 room=None, engine=None):
+                 room=None, engine=None, kinds=None):
         self.cfg, self.tracker = cfg, tracker
         self.room, self.measured, self._floor = room, {}, None    # room: the floor's reader
         # engine: what of the engine's folder this account could change (KIT-704); [] is none
         self.engine = engine or (lambda: guard_launcher.engine_problems(ENGINE))
+        # kinds: the kit's session kinds as they are now, as (hash, why) (KIT-880)
+        self.kinds = kinds or (lambda: kinds_data.digest())
         self.environ = os.environ if environ is None else environ
         self.git_env = git_env_default() if git_env is None else git_env
         self.clock, self.say = clock, say or (lambda line: print(line, flush=True))
@@ -1337,6 +1344,22 @@ class Runner(object):
             return "the branch an earlier %s run left for %s could not be removed" % (kind, ticket)
         return ""
 
+    def stale_kinds(self):
+        """Why the session kinds this runner holds are not the kit's now, or '' (KIT-880). It reads
+        them once, when it starts. A kit that moved after that (its clone moved on, a file changed)
+        would have each later session start behind walls the kit no longer has. No network call:
+        the kit's folder is read again and hashed as the runner's start read it. A folder that
+        cannot be read is never taken as unchanged."""
+        now, why = self.kinds()
+        if now is None:
+            return ("the kit's session kinds could not be read to compare with the ones this runner "
+                    "loaded (%s), so no session starts until they can be" % why)
+        if now != KINDS_DIGEST:
+            return ("the kit's session kinds changed after this runner loaded them (it holds %s, the "
+                    "kit's folder now %s), so a session would start behind walls the kit no longer "
+                    "has: restart the runner, and it loads them" % ((KINDS_DIGEST or "none")[:12], now[:12]))
+        return ""
+
     def stop(self, doc):
         """(ok, run, why). The group gets SIGTERM now, and SIGKILL past the grace."""
         rec = store.read_run(self.store_dir(), doc["run"])
@@ -1370,6 +1393,9 @@ class Runner(object):
             return "held", None, "the machine is below its floor: %s" % short[0]
         if KIND_PROBLEMS:
             return "held", None, "the session kinds could not be loaded: %s" % KIND_PROBLEMS[0]
+        stale = self.stale_kinds()
+        if stale:
+            return "held", None, stale
         unsafe = self.engine()
         if unsafe:
             return "held", None, ("the engine's folder could be changed by this account, and with it "
@@ -2685,6 +2711,45 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                "and says why", (rq in out["waiting"], store.answer(sdir, rq),
                                 any("the engine's folder could be changed by this account" in s for s in said)),
                (True, None, True))
+        if os.path.exists(os.path.join(sdir, "requests", rq + ".json")):
+            os.unlink(os.path.join(sdir, "requests", rq + ".json"))
+
+        # ---- the kinds it holds are the kit's (KIT-880) ------------------------- #
+        kit_now = os.path.join(tmp, "kit-kinds-now")
+        shutil.copytree(kinds_data.FOLDER, kit_now)
+        watched = Runner(cfg, tracker, environ=environ, git_env=genv, say=said.append, room=roomy,
+                         engine=safe, kinds=lambda: kinds_data.digest(kit_now))
+        expect("the runner keeps the hash of the kinds it loaded, and the kit's folder read again matches it",
+               (KINDS_DIGEST, runner.stale_kinds(), watched.stale_kinds()), (kinds_data.digest()[0], "", ""))
+        code_kind = os.path.join(kit_now, "code.json")
+        with open(code_kind, "rb") as fh:
+            kept = fh.read()
+        with open(code_kind, "wb") as fh:
+            fh.write(kept.replace(b'"wall_minutes": 360', b'"wall_minutes": 361'))
+        moved = kinds_data.digest(kit_now)[0]
+        rq = store.ask(sdir, "queue", "start", "code", "app", "ENG-42")
+        out = watched.pass_once()
+        expect("a kind's data changed in the kit after the runner loaded it: nothing starts, the request "
+               "waits, and the runner says why in words",
+               (rq in out["waiting"], store.answer(sdir, rq),
+                "runner: request %s waits: the kit's session kinds changed after this runner loaded them (it "
+                "holds %s, the kit's folder now %s), so a session would start behind walls the kit no longer "
+                "has: restart the runner, and it loads them" % (rq, KINDS_DIGEST[:12], moved[:12]) in said),
+               (True, None, True))
+        held = watched.start("app", "fix", "ENG-42", "queue", None, text="on",
+                             resumes={"ticket": "ENG-99", "project": "app"})
+        expect("…and a resume is held the same way, before anything of the run is looked at",
+               (held[0], held[1], held[2].startswith("the kit's session kinds changed after this runner loaded")),
+               ("held", None, True))
+        with open(code_kind, "wb") as fh:
+            fh.write(kept)
+        expect("the kit's kinds put back as they were: nothing is held for them", watched.stale_kinds(), "")
+        os.unlink(os.path.join(kit_now, "plan.json"))
+        os.symlink(os.path.join(kinds_data.FOLDER, "plan.json"), os.path.join(kit_now, "plan.json"))
+        expect("a kind's file that cannot be read is never taken as unchanged: nothing starts, and it says why",
+               watched.stale_kinds(),
+               "the kit's session kinds could not be read to compare with the ones this runner loaded "
+               "(plan.json: could not be read (OSError)), so no session starts until they can be")
         if os.path.exists(os.path.join(sdir, "requests", rq + ".json")):
             os.unlink(os.path.join(sdir, "requests", rq + ".json"))
 

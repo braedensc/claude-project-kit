@@ -572,7 +572,14 @@ CLONE_JOB_SCRIPTS = REQUIRED_SCRIPTS + tuple(sorted(
 # judged against schemas/review-findings.schema.json and a telemetry row against
 # schemas/telemetry-block.schema.json, so a schema change changes what the daemons do
 # without touching a single script.
-RUNTIME_DATA_DIRS = ("schemas",)
+#
+# session-kinds/ (KIT-880): the runner reads each kind of session's data (its tools, rules, wall
+# and limits) from the clone when it starts. Left out, a merge that changed only a kind's data read
+# as level, and the runner went on starting sessions behind the old walls. It counts on every
+# machine, not only where the runner is installed: those files change rarely (one merge in the 60
+# days to 18 Nov 2026, alongside a script that counted already), so no machine is told "behind"
+# for nothing. The selftest checks that the folder pipeline_session_kinds.py reads is listed here.
+RUNTIME_DATA_DIRS = ("schemas", "session-kinds")
 
 # The colour of a label this installer creates.
 STATE_COLOR = "#95a2b3"
@@ -13574,6 +13581,18 @@ def _selftest_body():
            and "schemas/review-findings.schema.json" in dB,
            "a moved schema the jobs read at run time read %s: %r" % (oB, dB[:160]))
 
+    # KIT-880: a kind of session's data alone, which the runner reads from the clone at its start.
+    cases += 1
+    (oB, dB), _f = _code_row_when_behind(
+        (_fetch, 0, "FETCH_HEAD beef00000000\nsession-kinds/code.json\n"))
+    expect("KIT-880 behind-session-kind-moved-is-named", oB == WOULD_CHANGE
+           and "session-kinds/code.json" in dB,
+           "a moved session kind the runner reads at its start read %s: %r" % (oB, dB[:160]))
+    fetched = [_fmt(a) for a in _f.reads if _fetch in _fmt(a)]
+    expect("KIT-880 behind-compares-the-session-kinds", fetched and all(
+        re.search(r"(^|\s)session-kinds(\s|$)", f) for f in fetched),
+        "the comparison did not name session-kinds among the paths it diffs: %r" % [f[-200:] for f in fetched][:2])
+
     cases += 1
     (oB, dB), _f = _code_row_when_behind((_fetch, 7, ""))
     expect("KIT-149 behind-could-not-fetch-is-unknown", oB == UNKNOWN,
@@ -13652,9 +13671,10 @@ def _selftest_body():
             origin_dir, kit_dir = os.path.join(tmpG, "origin"), os.path.join(tmpG, "kit")
             os.makedirs(os.path.join(origin_dir, "scripts"))
             os.makedirs(os.path.join(origin_dir, "schemas"))
+            os.makedirs(os.path.join(origin_dir, "session-kinds"))
             _git("init", "-q", origin_dir)
             for rel in ("README.md", "scripts/pipeline_bounce_local.py",
-                        "schemas/review-findings.schema.json"):
+                        "schemas/review-findings.schema.json", "session-kinds/code.json"):
                 with open(os.path.join(origin_dir, rel), "w") as fh:
                     fh.write("v1\n")
             _git("add", "-A", cwd=origin_dir)
@@ -13681,6 +13701,12 @@ def _selftest_body():
             expect("KIT-149 behind-shell-runs", rcG == 0
                    and "schemas/review-findings.schema.json" in linesG[1:],
                    "a schema commit: rc %s, %r" % (rcG, linesG))
+            # KIT-880: the clone moved level with origin first, so this diff is the kind alone.
+            _git("merge", "--ff-only", "-q", "FETCH_HEAD", cwd=kit_dir)
+            rcG, linesG = _moved_after("session-kinds/code.json")
+            expect("KIT-880 behind-shell-names-a-session-kind", rcG == 0
+                   and linesG[1:] == ["session-kinds/code.json"],
+                   "a commit to a session kind's data alone: rc %s, %r" % (rcG, linesG))
             gone = Runner().read(["/bin/sh", "-c", fragment(os.path.join(tmpG, "nope"))])
             expect("KIT-149 behind-shell-runs", gone.rc == 7,
                    "a clone that cannot fetch must exit 7, got %s" % gone.rc)
@@ -16940,6 +16966,15 @@ def _selftest_body():
                                          sorted(set(compared) - every)))
 
     _kit280_closure()
+
+    # KIT-880: the data the runner reads at its start counts too. Its kinds' folder is named by the
+    # module that reads it, never by a second copy of the name, so a moved folder fails here.
+    cases += 1
+    import pipeline_session_kinds as _kinds_data
+    kinds_rel = os.path.relpath(_kinds_data.FOLDER, os.path.dirname(here))
+    expect("KIT-880 the-runners-kinds-are-compared", kinds_rel in RUNTIME_DATA_DIRS,
+           "the runner reads its kinds from %s/, and RUNTIME_DATA_DIRS lists %s"
+           % (kinds_rel, list(RUNTIME_DATA_DIRS)))
 
     # -- THE HEARTBEAT MONITOR STEP (KIT-127): the job that reads the three heartbeats --
     # Named ticket, `off` by name, or a card — never a silent absence. Proved to exist and
