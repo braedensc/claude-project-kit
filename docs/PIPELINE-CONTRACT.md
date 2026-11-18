@@ -2314,10 +2314,14 @@ day and the week. Each record is one run, as a log's run is: in the local day it
 going, in the day it started), in the week from the plan's reset, under its kind, and under its
 ticket's piece. A ticket the runner reviewed or planned is a review's or a planning run's piece.
 
-- **What it cost.** A record's `cost_usd` is the program's own total for that one run, which the
-  runner started as a process of its own, so it is the run's spend. A record that gives no cost is
-  unpriced, and so is a zero from a run that did not end with exit 0, as a crash's zeroed total is:
-  counted in `runs` and `unpriced`, never as zero.
+- **What it cost.** A record's `cost_usd` is the program's result total. For a run that resumed a
+  session it is the session's running total, as a log's `result` line is (*What a run cost*), so a
+  run's spend is its share, priced the same way: its total less the total of the session's previous
+  run that gave one, from every record of that session the store holds, older ones included. A
+  smaller total means the session started again, so the whole total is the share. A record that
+  gives no cost is unpriced, and so is a zero from a run that did not end with exit 0, as a
+  crash's zeroed total is: counted in `runs` and `unpriced`, never as zero, and never the next
+  run's base (Stage E on #636).
 - **How long it ran.** Its `seconds`; a run still going counts the time since it started.
 - **No run at all.** A run whose program could not start (`could-not-start`) spent nothing, and is
   not counted.
@@ -2681,8 +2685,8 @@ write, and writes nothing. `--print` also prints the document.
 - A run still going has no `result` yet, so it is unpriced until a later pass.
 - `coding` is told by the log file names. A folder whose oldest logs were deleted shows the
   oldest one left as its first run.
-- A runner run's cost is its own program's total. A runner run still going is unpriced, as a log's
-  is, until a later pass.
+- A runner run's spend is its share of its session's running total, as a log's run's is. A runner
+  run still going is unpriced, as a log's is, until a later pass.
 - A piece is a folder named as a ticket id. A folder with any other name counts in the totals and
   is never listed.
 

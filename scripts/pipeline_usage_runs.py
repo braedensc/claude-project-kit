@@ -26,10 +26,10 @@ WHAT IT READS.
      caller's kind, priced by the CLI's own total or unpriced, with no length and no ticket.
   4. The runner's run records, when the config names its store (`runner_store`), through the
      store's one reader, scripts/pipeline_runner_store.py (KIT-860, contract §28). Each record is
-     one run: its kind is the record's own, and its spend is the program's own total for that one
-     run, or unpriced. A run whose program never started is no run. A runner run that the logs
-     hold too (the same session, started within a minute) is counted once, from its log, with the
-     kind its record gives.
+     one run: its kind is the record's own, and its spend is its share of its session's running
+     total, as a log's run's is, or unpriced. A run whose program never started is no run. A
+     runner run that the logs hold too (the same session, started within a minute) is counted
+     once, from its log, with the kind its record gives.
 
 WHAT IT GIVES.  Each log file is one run: its kind (tech lead, review, planner, coding, bounce
 fix, conflict fix, catch-up or other later), its own spend and tokens, its length in seconds,
@@ -759,34 +759,58 @@ def read_spend(cfg, now):
 
 def runner_run(rec, now_at):
     """One of the runner's records as a run (KIT-860, contract §17), or None for a run whose
-    program never started, which spent nothing. Its kind is the record's own. Its spend is the
-    record's `cost_usd`: the program's own total for that one run, which the runner started as a
-    process of its own. A cost the record does not give is unpriced, and so is a zero from a run
-    that did not end with exit 0, as a crash's zeroed total is: never zero. A run still going
-    counts on the day it started, unpriced, and its length so far is its seconds. Fields only:
-    the ticket, the session id, the times, the kind and the figures."""
+    program never started, which spent nothing. Its kind is the record's own. Its `total` is the
+    record's `cost_usd`, the program's result total: for a resumed session, the session's running
+    total, as a log's result line is (Stage E on #636). price_runner() turns it into the run's
+    own share. A cost the record does not give is unpriced, and so is a zero from a run that did
+    not end with exit 0, as a crash's zeroed total is: never zero. A run still going counts on the
+    day it started, unpriced, and its length so far is its seconds. Fields only: the ticket, the
+    run and session ids, the times, the kind and the figures."""
     if rec["reason"] == "could-not-start":
         return None
     started = epoch(rec["started_at"])
     ended = epoch(rec["ended_at"]) if rec["ended_at"] else None
     if started is None:
         return None
-    cost = money(rec["cost_usd"])
-    if cost == 0 and not (rec["state"] == "ended" and rec["exit"] == 0):
-        cost = None
+    total = money(rec["cost_usd"])
+    if total == 0 and not (rec["state"] == "ended" and rec["exit"] == 0):
+        total = None
     if rec["seconds"] is not None:
         seconds = finite(rec["seconds"], 0.0, 1e9) or 0.0
     elif rec["state"] in runner_store.LIVE:
         seconds = max(0.0, now_at - started)
     else:
         seconds = 0.0
-    return {"source": RUNNER, "workspace": rec["ticket"], "session": rec["session_id"],
-            "kind": RUNNER_KINDS[rec["kind"]], "how": "runner record", "cost": cost,
+    return {"source": RUNNER, "run": rec["run"], "workspace": rec["ticket"],
+            "session": rec["session_id"], "kind": RUNNER_KINDS[rec["kind"]],
+            "how": "runner record", "total": total, "cost": None,
             "start": started, "last": ended if ended is not None else started,
             "seconds": int(seconds), "models": {},
             "tokens": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0},
             "key_source": None, "events": {}, "weekly": None, "event_times": [],
             "limit_stop": None, "started": None}
+
+
+def price_runner(runs):
+    """Each runner run's own share of its session's running total (Stage E on #636), as price()
+    gives a log's run: its total less the total of the session's previous run that gave one, in
+    the order the runs started. The chain is every record of the session the store holds, older
+    ones past the logs' reach included, so a resume's base is never lost. A smaller total means
+    the session started again, so the whole total is the share. A run with no usable total is
+    unpriced and is never the next run's base: its spend lands in the next priced run."""
+    chains = {}
+    for r in runs:
+        chains.setdefault(r["session"], []).append(r)
+    for chain in chains.values():
+        chain.sort(key=lambda r: (r["start"], r["run"]))
+        prev = None
+        for r in chain:
+            r["cost"] = None
+            if r["total"] is None:
+                continue
+            restart = prev is not None and r["total"] < prev
+            r["cost"] = round(r["total"] if prev is None or restart else r["total"] - prev, 6)
+            prev = r["total"]
 
 
 def read_runner(cfg, now):
@@ -808,9 +832,9 @@ def read_runner(cfg, now):
         src.fail("the runner's store was read in part: %s" % got["why"])
     now_at = now()
     reach = now_at - (cfg["lookback_days"] + 1) * 86400
-    runs = [r for r in (runner_run(rec, now_at) for rec in got["runs"])
-            if r is not None and r["last"] >= reach]
-    return runs, src
+    every = [r for r in (runner_run(rec, now_at) for rec in got["runs"]) if r is not None]
+    price_runner(every)                 # the whole chain of each session, older runs included
+    return [r for r in every if r["last"] >= reach], src
 
 
 def twins(runs, runner_runs):
@@ -1181,16 +1205,19 @@ def selftest_kit():
                    exit=None if live else code, reason=None if live else reason, cost_usd=cost)
         return rec
 
-    # The runner's world (KIT-860), each record labelled. R7 never started its program, R8 is past
-    # the logs' reach, and R9 is a run the logs hold too: E14's session, ten seconds after it.
-    # R11 shares B0's and B1's session, two hours after B1: a run of its own.
+    # The runner's world (KIT-860), each record labelled. R1, R2 and R3 are one session: R3 left no
+    # total, so it is no base, and R2 resumed R1, whose $1.25 its $1.65 running total holds (Stage
+    # E on #636). R7 never started its program, R8 is past the logs' reach, and R9 is a run the
+    # logs hold too: E14's session, ten seconds after it. R11 shares B0's and B1's session, two
+    # hours after B1: a run of its own.
     RUNNER_RECS = [
         ("R1", runner_rec(1, "code", "ENG-30", "2026-11-03T08:00:00Z", "2026-11-03T08:30:00Z",
                           cost=1.25, seconds=1800.0)),
         ("R2", runner_rec(2, "fix", "ENG-30", "2026-11-03T09:00:00Z", "2026-11-03T09:10:00Z",
-                          cost=0.4, seconds=600.0)),
+                          cost=1.65, seconds=600.0, session=sid(101))),
         ("R3", runner_rec(3, "conflict", "ENG-30", "2026-11-02T20:00:00Z", "2026-11-02T20:05:00Z",
-                          state="interrupted", reason="interrupted", code=None, seconds=300.0)),
+                          state="interrupted", reason="interrupted", code=None, seconds=300.0,
+                          session=sid(101))),
         ("R4", runner_rec(4, "review", "ENG-31", "2026-11-03T07:00:00Z", "2026-11-03T07:05:00Z",
                           code=1, cost=0, seconds=300.0)),
         ("R5", runner_rec(5, "plan", "ENG-32", "2026-11-02T10:00:00Z", "2026-11-02T10:01:00Z",
@@ -1455,6 +1482,42 @@ def _cases(check):
                 (rec["state"], rec["asked"], rec["answered"], rec["reason"]))
     RUNNER_FACTS = (RUNNER_EXPECT, [("bounce_fix", "runner record", 0.5)], ["logs", "runner"],
                     (READ, 1, 1, None))
+
+    # A runner run's spend is its share of its session's running total (Stage E on #636). P1 is a
+    # base past the logs' reach; P4's smaller total is a session that started again; P6 left no
+    # total between P5 and P7, so it is no base.
+    rr = kit.runner_rec
+    PRICED_RECS = [
+        ("P1", rr(41, "code", "ENG-40", "2026-10-02T10:00:00Z", "2026-10-02T10:30:00Z",
+                  cost=2.0, seconds=1800.0, session=sid(140))),
+        ("P2", rr(42, "fix", "ENG-40", "2026-11-03T10:00:00Z", "2026-11-03T10:05:00Z",
+                  cost=2.3, seconds=300.0, session=sid(140))),
+        ("P3", rr(43, "code", "ENG-41", "2026-11-03T02:00:00Z", "2026-11-03T02:30:00Z",
+                  cost=0.9, seconds=1800.0, session=sid(141))),
+        ("P4", rr(44, "conflict", "ENG-41", "2026-11-03T03:00:00Z", "2026-11-03T03:10:00Z",
+                  cost=0.3, seconds=600.0, session=sid(141))),
+        ("P5", rr(45, "code", "ENG-42", "2026-11-03T04:00:00Z", "2026-11-03T04:30:00Z",
+                  cost=1.0, seconds=1800.0, session=sid(142))),
+        ("P6", rr(46, "fix", "ENG-42", "2026-11-03T05:00:00Z", "2026-11-03T05:10:00Z",
+                  state="interrupted", reason="interrupted", code=None, seconds=600.0,
+                  session=sid(142))),
+        ("P7", rr(47, "conflict", "ENG-42", "2026-11-03T06:00:00Z", "2026-11-03T06:10:00Z",
+                  cost=1.5, seconds=600.0, session=sid(142))),
+    ]
+    PRICED_LABELS = dict(RUNNER_LABELS)
+    PRICED_LABELS.update(((rec["ticket"], U(rec["started_at"])), label)
+                         for label, rec in PRICED_RECS)
+    PRICED_EXPECT = {"R1": 1.25, "R2": 0.4, "R3": None, "P2": 0.3, "P3": 0.9, "P4": 0.3,
+                     "P5": 1.0, "P6": None, "P7": 0.5}
+
+    def priced_facts(root):
+        """Each runner run's spend in the priced world, by its label, for the chains above."""
+        cfg_p, _ = std_world(root, runner_store=kit.runner_world(
+            root, recs=kit.RUNNER_RECS + PRICED_RECS))
+        got = scan(cfg_p, lambda: T)
+        return dict((PRICED_LABELS[(r["workspace"], r["start"])], r["cost"])
+                    for r in got["runner"] or []
+                    if PRICED_LABELS[(r["workspace"], r["start"])] in PRICED_EXPECT)
 
     def missing_facts(root):
         """The runner's runs and its source, for a config that names a store that is not there."""
@@ -1916,6 +1979,10 @@ def _cases(check):
               "total or unpriced (no cost, or a zero from a run that ended badly; a clean zero is "
               "zero); a run still going counts its time so far; a run whose program never started, "
               "and one past the logs' reach, are no run", rf[0], RUNNER_EXPECT)
+        check("…a resumed run's spend is its share of its session's running total, as a log's "
+              "run's is: less the previous total, a base past the logs' reach included; a smaller "
+              "total is a session begun again; a run with no total is never the base (Stage E "
+              "on #636)", priced_facts(os.path.join(tmp, "runner-priced")), PRICED_EXPECT)
         check("…a run the logs hold too (its session, started within a minute) is counted once, "
               "from its log, with its record's kind; a run of a session the logs hold that started "
               "two hours apart is a run of its own", (rf[1], "R9" in rf[0], "R11" in rf[0]),
@@ -1961,7 +2028,7 @@ def _cases(check):
     with tempfile.TemporaryDirectory() as tmp:
         tmp = os.path.realpath(tmp)
         original = dict((n, globals()[n]) for n in ("parse_run", "price", "PROMPT_MARKS",
-                                                    "runner_run", "read_runner"))
+                                                    "runner_run", "read_runner", "price_runner"))
         status_word_original = status_word
 
         def reply_usage_parse(path):
@@ -2059,8 +2126,8 @@ def _cases(check):
         def zero_counted_run(rec, now_at):
             """runner_run, with a zero from a run that ended badly counted as zero."""
             run = original["runner_run"](rec, now_at)
-            if run is not None and run["cost"] is None and money(rec["cost_usd"]) == 0:
-                run["cost"] = 0.0
+            if run is not None and run["total"] is None and money(rec["cost_usd"]) == 0:
+                run["total"] = 0.0
             return run
 
         def never_started_run(rec, now_at):
@@ -2099,9 +2166,49 @@ def _cases(check):
             globals()["read_runner"] = saved_read
         check("mutant: a store that could not be read read as no runs is caught",
               unread != missing_facts(os.path.join(tmp, "m14-clean")), True)
+        # Stage E on #636: a runner run's spend is its share of its session's running total.
+        def raw_total_price(runs_p):
+            """price_runner, with each run priced at its whole running total."""
+            for r in runs_p:
+                r["cost"] = r["total"]
+
+        def no_total_as_base_price(runs_p):
+            """price_runner, with a run that left no total taken as the next run's base."""
+            chains = {}
+            for r in runs_p:
+                chains.setdefault(r["session"], []).append(r)
+            for chain in chains.values():
+                prev = None
+                for r in sorted(chain, key=lambda x: (x["start"], x["run"])):
+                    r["cost"] = None if r["total"] is None else round(
+                        r["total"] if prev is None or r["total"] < prev else r["total"] - prev, 6)
+                    prev = r["total"]
+
+        def reach_only_read(cfg_u, now_u):
+            """read_runner, with each session priced from the runs in the logs' reach alone."""
+            runs_u, src_u = original["read_runner"](cfg_u, now_u)
+            if runs_u:
+                original["price_runner"](runs_u)
+            return runs_u, src_u
+
+        def priced_caught(name, **patched):
+            saved = dict((k, globals()[k]) for k in patched)
+            globals().update(patched)
+            try:
+                return priced_facts(os.path.join(tmp, name)) != PRICED_EXPECT
+            finally:
+                globals().update(saved)
+        check("mutant: a resumed runner run priced at its whole running total is caught",
+              priced_caught("m15", price_runner=raw_total_price), True)
+        check("mutant: a runner run that left no total taken as the next run's base is caught",
+              priced_caught("m16", price_runner=no_total_as_base_price), True)
+        check("mutant: a resume's base past the logs' reach lost is caught",
+              priced_caught("m17", read_runner=reach_only_read), True)
         check("…and with every mutant undone the job is as it was",
               (facts(os.path.join(tmp, "clean")) == EXPECT,
-               runner_facts(os.path.join(tmp, "clean-runner")) == RUNNER_FACTS), (True, True))
+               runner_facts(os.path.join(tmp, "clean-runner")) == RUNNER_FACTS,
+               priced_facts(os.path.join(tmp, "clean-priced")) == PRICED_EXPECT),
+              (True, True, True))
 
 
 if __name__ == "__main__":

@@ -21,8 +21,9 @@ like the status job. It reads files, and it writes one.
      run was. The same module reads each spend ledger the config names (contract §30): the
      model calls no dispatcher log records, made by the morning job, the stand-up, the tech
      lead's turns and the conflict waker (KIT-844). And when the config names the runner's
-     store, its run records: each one run, of the record's own kind, at the program's own
-     total or unpriced, and a run the logs hold too counted once (KIT-860, contract §28).
+     store, its run records: each one run, of the record's own kind, priced as its share of
+     its session's running total or unpriced, and a run the logs hold too counted once
+     (KIT-860, contract §28).
   2. This job counts the runs: spend per local day, and since the plan's weekly reset by kind
      of work and by piece; how long sessions ran; Anthropic's newest word on each usage window;
      how each session signed in; the runs that never reached the model; and the runs the plan's
