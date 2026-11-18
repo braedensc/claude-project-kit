@@ -12418,7 +12418,10 @@ def _selftest_body():
     ctxLC, fakeLC = _settled_ctx(conf_lane)
     fakeLC.answers = [("launchctl print system/" + clabel, 1, ""), ("test -f " + cplist, 1, "")] \
         + fakeLC.answers
-    (okLC, detLC, _n), _p = _quiet(lambda: step_catchup(ctxLC, apply_it=True))
+    try:
+        (okLC, detLC, _n), _p = _quiet(lambda: step_catchup(ctxLC, apply_it=True))
+    except Exception as exc:        # taken for on, the step would install it, or stop on its card
+        okLC, detLC = False, "the step raised %s: %s" % (type(exc).__name__, exc)
     expect("runner-lane-catchup-off", okLC is True and "RUNNER_LANE_REPOS" in detLC
            and "stays lost" not in detLC and not fakeLC.writes
            and "the catch-up poller" not in _privilege_reason("run", False, "x", conf_lane),
