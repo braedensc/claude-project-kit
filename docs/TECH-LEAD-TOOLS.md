@@ -33,15 +33,29 @@ says how many; it is never cut in the middle of the mark. One too large to fit i
 
 ## What the pipeline can't land
 
-A dev session's push credential cannot change CI workflows, by design: a session that could
-rewrite CI could disable the checks that supervise it. So no session can land a ticket that
-names `.github/workflows`, branch protection or an installer.
+Some work no dev session can land. The tech lead's rules name each kind on its own line, with
+its reason (KIT-485):
+
+- **CI workflows**, a change under `.github/workflows`. A session's push credential lacks
+  GitHub's Workflows permission, by design: a session that could rewrite CI could disable the
+  checks that supervise it.
+- **Branch protection and the repository's other settings.** They live in the repository's
+  settings, where no session reaches.
+- **An installer.** You run it by hand.
+
+For such work the tech lead never offers a plan. It says the work is yours to do by hand, and
+what it would take, from what it has read. It files no tickets: if you ask it to file such work
+as an idea, it says you can file it, and that the description should say why no dev session can
+land it, so the planner sees that too. Its selftest pins those lines word for word, and checks
+them against this kit's own rule, in the words of `docs/SESSION-BRIEF.md` and the fix-CI skill.
 
 `reach` says so for a ticket. The tools that start work (`plan`, `replan`, `approve`, `retry`
 and `start`) refuse such a ticket, and say why, however the tech lead's rules are worded. The
 check is in the tool, not in the rules. It reads the ticket's title and description, matches
 them, and never repeats them. `pause`, `resume` and `cancel` do not refuse it: they hold or
-stop work, so you may ask about any ticket of the project.
+stop work, so you may ask about any ticket of the project. The check matches CI workflows,
+branch protection and installers. The repository's other settings are in the rules only, as
+the tech lead's advice.
 
 Good: *PROD-12 is out of the pipeline's reach: it names CI workflows, which no dev session
 can land. It is theirs to do by hand.*

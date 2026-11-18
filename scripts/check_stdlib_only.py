@@ -7,8 +7,9 @@
 WHY. The kit's jobs and hooks run on a Python with nothing added to it, and a standalone app
 will carry such a Python too. A new outside import would pass review and fail on a user's
 machine. This reads every tracked .py file with `ast` and lists each import that is neither the
-standard library nor one of the kit's own modules (the basename of a tracked .py file: the
-scripts import each other as top-level modules). Imports inside functions and `try` blocks
+standard library nor one of the kit's own modules the importing file can really reach: a tracked .py file in its
+own folder, or in a folder the file's folder adds to its import path (IMPORT_PATH below, as
+data). A same-named file elsewhere does not exempt an outside package (KIT-658). Imports inside functions and `try` blocks
 count like any other; relative imports are the kit's own and are skipped.
 
 THE ALLOW LIST below is data: each exception names its file, the module and the reason. An
@@ -36,10 +37,18 @@ ALLOWED = (
     ("scripts/check_runner_pin.py", "yaml", "parses workflows as YAML, not by pattern; says COULD NOT CHECK without it"),
     ("scripts/check_workflow_calls.py", "yaml", "parses workflows as YAML; CI installs PyYAML"),
     ("scripts/check_agent_trigger_author.py", "yaml", "parses workflows as YAML; CI installs PyYAML"),
+    ("scripts/check_label_gate.py", "yaml", "parses the label gate's workflow as YAML; says COULD NOT CHECK without it"),
     ("scripts/pipeline_safe_outputs_probe.py", "yaml", "reads a workflow as YAML in the probe; an ImportError is handled"),
     ("scripts/telemetry_scrape.py", "psycopg", "Postgres driver for the optional scrape; psycopg 3 preferred, tried inside try"),
     ("scripts/telemetry_scrape.py", "psycopg2", "Postgres driver fallback to psycopg 3; tried inside try"),
 )
+
+# Folders whose files put another folder on sys.path, as data: folder -> folders it adds. The
+# hook batteries and the sync-kit compare script insert the kit's scripts folder.
+IMPORT_PATH = {
+    ".claude/hooks": ("scripts",),
+    ".claude/skills/sync-kit": ("scripts",),
+}
 
 # Union of sys.stdlib_module_names for CPython 3.10 to 3.13, plus the modules 3.12 removed
 # (asynchat, asyncore, distutils, imp, smtpd).
@@ -81,9 +90,40 @@ STDLIB = frozenset("""
 """.split())
 
 
-def own_modules(files):
-    """The kit's own top-level module names: the basename of each tracked .py file."""
-    return {os.path.splitext(os.path.basename(f))[0] for f in files}
+def own_modules(files, rel):
+    """The kit's own module names that the file `rel` can really import: a tracked .py file in
+    its own folder (a script's folder is on its import path), or in a folder IMPORT_PATH names
+    for that folder. A same-named file anywhere else does not count (KIT-658)."""
+    here = os.path.dirname(rel)
+    folders = {here, *IMPORT_PATH.get(here, ())}
+    return {os.path.splitext(os.path.basename(f))[0] for f in files if os.path.dirname(f) in folders}
+
+
+def unused_import_paths(sources, import_path=None):
+    """[message] for each IMPORT_PATH (folder, added folder) pair that no import of a file in
+    `folder` needs: a module of the added folder that the file's own folder lacks. Like an ALLOWED
+    entry that matches nothing, a stale pair would keep exempting names for no reason."""
+    import_path = IMPORT_PATH if import_path is None else import_path
+    used = set()
+    for rel in sources:
+        here = os.path.dirname(rel)
+        extras = import_path.get(here, ())
+        if not extras:
+            continue
+        try:
+            found = imports(sources[rel])
+        except SyntaxError:
+            continue
+        mine = {os.path.splitext(os.path.basename(f))[0] for f in sources if os.path.dirname(f) == here}
+        for _line, mod in found:
+            if mod in STDLIB or mod in mine:
+                continue
+            for extra in extras:
+                if any(os.path.dirname(f) == extra and os.path.splitext(os.path.basename(f))[0] == mod
+                       for f in sources):
+                    used.add((here, extra))
+    return [f"IMPORT_PATH entry ({folder}, {extra}) is used by no import: remove it"
+            for folder, extras in sorted(import_path.items()) for extra in extras if (folder, extra) not in used]
 
 
 def imports(source):
@@ -103,7 +143,6 @@ def judge(sources, allowed=None):
     pairs that are neither stdlib nor the kit's own; each not on the allow list is a problem,
     and so is each allow-list entry that matched nothing."""
     allowed = ALLOWED if allowed is None else allowed
-    own = own_modules(sources)
     problems, matched, outside = [], set(), set()
     for rel in sorted(sources):
         try:
@@ -111,6 +150,7 @@ def judge(sources, allowed=None):
         except SyntaxError as exc:
             problems.append(f"{rel}:{exc.lineno}: cannot parse ({exc.msg}); this is not a pass")
             continue
+        own = own_modules(sources, rel)
         for line, mod in found:
             if mod in STDLIB or mod in own:
                 continue
@@ -135,7 +175,7 @@ def tracked_python(root):
     return [p for p in out.stdout.splitlines() if p]
 
 
-def verdict(root):
+def verdict(root, import_path=None):
     """(exit code, lines). No files, or no git, is its own answer, never a pass."""
     try:
         files = tracked_python(root)
@@ -153,6 +193,7 @@ def verdict(root):
         except (OSError, UnicodeDecodeError) as exc:
             return 2, [f"COULD NOT CHECK: {rel} unreadable ({exc}); this is not a pass"]
     problems, outside = judge(sources)
+    problems += unused_import_paths(sources, import_path)
     if problems:
         return 1, ["FAIL: " + p for p in problems]
     return 0, [f"OK: {len(files)} Python file(s), {len(outside)} allowed outside import(s), "
@@ -173,6 +214,19 @@ def selftest():
 
     expect(not bad("import os, sys\nfrom json import loads\nimport os.path\n"), "stdlib flagged")
     expect(not bad("import b\n", extra={"scripts/b.py": ""}), "a kit module flagged")
+    # a module is the kit's own only where the importing file can import it (KIT-658)
+    expect(bad("import yaml\n", extra={"docs/yaml.py": ""}), "a same-named file in another folder exempted yaml")
+    expect(bad("import yaml\n", extra={".claude/hooks/yaml.py": ""}), "a hooks file exempted yaml for a script")
+    expect(not judge({".claude/hooks/t.py": "import b\n", "scripts/b.py": ""}, ())[0], "hooks' import path flagged")
+    expect(judge({"docs/t.py": "import b\n", "scripts/b.py": ""}, ())[0], "an unrelated folder reached scripts")
+    # an IMPORT_PATH pair that nothing uses is stale, like an ALLOWED entry that matches nothing
+    pair = {".claude/hooks": ("scripts",)}
+    fake = {".claude/hooks/t.py": "import b\n", "scripts/b.py": ""}
+    expect(unused_import_paths(fake, pair) == [], "a used IMPORT_PATH pair flagged")
+    expect(len(unused_import_paths({".claude/hooks/t.py": "import os\n", "scripts/b.py": ""}, pair)) == 1,
+           "an unused IMPORT_PATH pair must fail")
+    expect(len(unused_import_paths({".claude/hooks/t.py": "import t2\n", ".claude/hooks/t2.py": "", "scripts/t2.py": ""}, pair)) == 1,
+           "a module found in the file's own folder does not use the pair")
     expect(not bad("from . import x\nfrom .y import z\n"), "a relative import flagged")
     for src in ("import yaml\n", "import yaml.nodes\n", "from yaml import safe_load\n",
                 "def f():\n    import yaml\n", "try:\n    import yaml\nexcept ImportError:\n    pass\n",
@@ -209,6 +263,13 @@ def selftest():
         git("add", "a.py")
         code, lines = verdict(tmp)
         expect(code == 1 and "a.py:2" in lines[0] and "yaml" in lines[0], f"git tree with outside import: {code} {lines}")
+        with open(os.path.join(tmp, "a.py"), "w", encoding="utf-8") as fh:
+            fh.write("import os\n")
+        git("add", "a.py")
+        code, lines = verdict(tmp, {})
+        expect("IMPORT_PATH entry" not in "\n".join(lines), f"no IMPORT_PATH pair, none reported: {code} {lines}")
+        code, lines = verdict(tmp, {"scripts": ("docs",)})
+        expect(code == 1 and "IMPORT_PATH entry" in "\n".join(lines), f"a stale pair in a real run fails: {code} {lines}")
     if failures:
         print("check_stdlib_only selftest: FAIL")
         for f in failures:
