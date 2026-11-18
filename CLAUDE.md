@@ -312,7 +312,8 @@ npm run test:conflict-waker-setup  # the waker's installer: a user LaunchAgent, 
 npm run test:update          # review-and-update (KIT-238): UNKNOWN is never "current";
                              #   an update refuses under an agent and stops before any change
 npm run test:watch           # the health watch (KIT-236): alerts on change only, debounced,
-                             #   no page without internet, delivery checked
+                             #   no page without internet, delivery checked; its installer's
+                             #   `check` rows, `apply` answers through a pipe, the first-pass ceiling (KIT-869)
 npm run test:catchup         # the catch-up poller (KIT-47): a lost delegation re-prompted
                              #   once, past Linear's retries, never twice, gated on a live route
 npm run test:sweep           # the sweep (KIT-464): a finished run's worktree, ticket folder,

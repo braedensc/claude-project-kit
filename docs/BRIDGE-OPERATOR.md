@@ -1349,6 +1349,13 @@ bridge's log says what it cost and how much of its input came from the cache. A 
 starts only when the saved one cannot be resumed, and the log says why. A `turn_session_hours`
 left in an old config is ignored, and the log says that too.
 
+**Every turn's spend is counted (KIT-687).** Each run of the CLI a turn starts adds one row to a
+spend ledger in `STATE_DIR`. A DM's turn and a plan note's go to `tech-lead-spend.jsonl`. The
+stand-up's goes to `standup-spend.jsonl`. The usage job counts them into the day and the week
+(docs/QUEUE-OPERATOR.md). If a row cannot be written, the log says so and the answer still goes out.
+A resumed conversation's cost from the CLI is its running total, so the bridge keeps the newest
+total with the conversation, and each row holds only that turn's share.
+
 **A new conversation never starts blank (KIT-751).** The first conversation in a DM, and one that
 had to begin again, is given the DM's recent messages: yours, the tech lead's own and the
 pipeline's, oldest first. The tech lead reads them as a record of what was said, not as requests.

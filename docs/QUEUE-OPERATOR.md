@@ -209,9 +209,15 @@ Good: `spend    morning         read, 1 call, $0.04`. Not that: `spend    tech_l
 reason names what to check. That ledger's calls are not counted, never as zero, and the pass is `partial`. A call
 whose row could not be written is marked beside its ledger, and the line says it was not counted.
 
-No caller writes its ledger yet. KIT-687 adds the writers, and with them turns on the three ledgers in the role
-account's home. Until then each line says `off`, never `read` with no calls. The waker runs as you, so its ledger is in
-your own home, where the role account cannot read. It stays `off`, and the waker's calls are not counted.
+Each caller writes its own ledger. The morning job's is beside the day plan. The stand-up's and the tech lead's are
+in the bridge's state folder. The installer names those three in the usage job's config, from its own paths. The
+stand-up's and the tech lead's sit beside `BRIDGE_STATE_FILE`, so leaving it empty turns them `off`. The waker runs
+as you, so its ledger is in your own home, where the role account cannot read. It stays `off`, and the waker's calls
+are not counted.
+
+If a caller cannot write a row, its own log says so, and the call itself still runs. It leaves a mark beside the
+ledger, so the usage job says the call was not counted. Only a disk that takes no write at all loses the mark too.
+For example, `morning.log` says `NOTE: could not record the planner call's spend in ...`.
 
 ## Pausing it
 
