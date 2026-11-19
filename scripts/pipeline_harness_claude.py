@@ -57,6 +57,12 @@ try:
     import pipeline_voice as voice
 except ImportError as exc:  # a packaging accident, never a state to run in
     sys.exit("FAIL: %s. The adapter uses those files' own code and keeps no copy." % exc)
+try:
+    # KIT-886: the push token's names, by name from the kinds' own data, and so re-exported here: this
+    # file needs them whatever else it imports from that module.
+    from pipeline_session_kinds import PUSH_ENV, PUSH_TOKEN_ENV
+except ImportError as exc:  # a packaging accident, never a state to run in
+    sys.exit("FAIL: %s. The adapter uses those files' own code and keeps no copy." % exc)
 
 NAME = "claude"
 SANDBOX_EXEC = "/usr/bin/sandbox-exec"
@@ -75,14 +81,14 @@ ENV_SOURCES = {"PATH": "path", "HOME": "home", "TMPDIR": "tmp", "LANG": "lang",
                # for it as git's own config by environment: first every stored helper cleared (the
                # system's keychain helper among them), then one that hands git the token for
                # github.com alone. So no command line ever holds the token.
-               kinds_data.PUSH_TOKEN_ENV: "push", "GIT_CONFIG_COUNT": "git-count",
+               PUSH_TOKEN_ENV: "push", "GIT_CONFIG_COUNT": "git-count",
                "GIT_CONFIG_KEY_0": "git-key-0", "GIT_CONFIG_VALUE_0": "git-value-0",
                "GIT_CONFIG_KEY_1": "git-key-1", "GIT_CONFIG_VALUE_1": "git-value-1"}
 # git's helper: it reads what git writes to it, then answers a `get` with the token from its own
 # environment. It answers nothing else, and git asks it about github.com alone.
 GIT_PUSH_HOST = "https://github.com"
 GIT_PUSH_HELPER = ('!f() { cat >/dev/null; if test "$1" = get; then echo username=x-access-token; '
-                   'echo "password=$%s"; fi; }; f' % kinds_data.PUSH_TOKEN_ENV)
+                   'echo "password=$%s"; fi; }; f' % PUSH_TOKEN_ENV)
 GIT_PUSH_CONFIG = (("credential.helper", ""), ("credential.%s.helper" % GIT_PUSH_HOST, GIT_PUSH_HELPER))
 # The program applies a Read rule to these, so they are allowed by Read's own rule.
 COVERED_BY_READ = ("Grep", "Glob")
@@ -372,7 +378,7 @@ def environment(spec, run, token, push=None):
     It reaches the program only under a name the kind's data lists, so a kind that lists none never
     gets it, whatever is offered. A kind that lists it and is offered none is a ValueError: it would
     start a session that cannot push."""
-    if kinds_data.PUSH_TOKEN_ENV in spec["env"] and not push:
+    if PUSH_TOKEN_ENV in spec["env"] and not push:
         raise ValueError("a %s session needs the push token, and none was given" % spec.get("kind", "?"))
     src = {"path": search_path(run["claude_bin"]), "home": run["home"], "tmp": run["tmp"],
            "lang": voice.DEFAULT_LANG, "token": token, "1": "1", "devnull": os.devnull,
@@ -572,13 +578,16 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                   == os.devnull),
            sorted(k for k in kinds if "Bash" in kinds[k]["tools"]))
     # KIT-886: the push token, offered to every kind, reaches code, fix and conflict alone.
+    import pipeline_session_kinds as push_names
+    expect("the adapter re-exports the push token's names from the kinds' own data, by name",
+           [n for n in ("PUSH_TOKEN_ENV", "PUSH_ENV") if globals().get(n) != getattr(push_names, n)], [])
     held = dict((k, environment(kinds[k], run, "t", push=push)) for k in sorted(kinds))
     expect("offered to every kind, the push token reaches code, fix and conflict, under its one name",
-           sorted((k, e[kinds_data.PUSH_TOKEN_ENV]) for k, e in held.items() if kinds_data.PUSH_TOKEN_ENV in e),
+           sorted((k, e[PUSH_TOKEN_ENV]) for k, e in held.items() if PUSH_TOKEN_ENV in e),
            [("code", push), ("conflict", push), ("fix", push)])
     expect("…and review, plan and acceptance get none of its names, nor git's helper",
            [(k, n) for k, e in sorted(held.items()) if k in ("review", "plan", "acceptance")
-            for n in kinds_data.PUSH_ENV if n in e], [])
+            for n in PUSH_ENV if n in e], [])
     expect("…nor any value that holds it",
            [k for k, e in sorted(held.items()) if k in ("review", "plan", "acceptance")
             and any(push in v for v in e.values())], [])
@@ -593,7 +602,7 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
     expect("a kind that holds it runs Bash inside the built-in sandbox, held to its host list (KIT-886)",
            sorted((k, (sandboxes[k].get("network") or {}).get("allowedDomains"),
                    sandboxes[k].get("allowUnsandboxedCommands")) for k in held
-                  if kinds_data.PUSH_TOKEN_ENV in held[k]),
+                  if PUSH_TOKEN_ENV in held[k]),
            [(k, run["hosts"], False) for k in ("code", "conflict", "fix")])
     expect("the token is in nothing the adapter writes to a file: settings, tool servers, profile, command line",
            [k for k in sorted(kinds) if push in json.dumps([settings(kinds[k], run), mcp(kinds[k], run),

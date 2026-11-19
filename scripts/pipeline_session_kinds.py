@@ -11,7 +11,10 @@ Each file says what a session of that kind is given and what walls it runs behin
     branch        {type, word}: the workspace's branch (word "title" is the ticket title's slug);
                   null for a kind that is only ever a resume, which keeps its run's branch
     approval      {newest_move, states}: the owner's newest move must be the approval, or any
-                  of his moves; and which of the project's approval_states lists counts
+                  of his moves; and which of the project's approval_states lists counts. Or
+                  {from_run: code}, for a kind that follows the coding it judges: it is let start
+                  by the approval the runner recorded when it started that ticket's code run
+                  (KIT-644, the review kind), and by nothing else
     brief         the fixed words the session is told first
     permissions   "deny-unlisted": anything no allow rule covers is refused, never asked.
                   It is the only value there is: no kind can say "skip every check"
@@ -44,8 +47,15 @@ Each file says what a session of that kind is given and what walls it runs behin
 One small adapter turns a kind into the program's command line (scripts/pipeline_harness_claude.py).
 This file knows nothing of any one program: a second harness would read the same data.
 
+ONE HASH OF THE FOLDER (KIT-880).  `digest()` hashes every entry of the folder by its name, and
+each kind's file by its bytes, read as `load()` reads them. `load_with_digest()` gives the same
+hash of the very bytes it loaded. The runner keeps that hash when it starts, and compares it with
+the folder's before each session: a kit that moved under it never starts a session from walls it
+no longer has. A folder or a file that cannot be read gives no hash, never an old one.
+
 Standard library only. It reads files and nothing else.
 """
+import hashlib
 import json
 import os
 import re
@@ -133,9 +143,13 @@ def problems(doc, name):
     elif kind not in store.STARTS:
         say("branch: a kind that is only ever a resume keeps its run's branch, so it has none")
     ap = doc["approval"]
-    if not (isinstance(ap, dict) and sorted(ap) == ["newest_move", "states"]
-            and isinstance(ap["newest_move"], bool) and ap["states"] in store.STARTS):
-        say("approval: {newest_move: true or false, states: one of %s}" % ", ".join(store.STARTS))
+    by_states = (isinstance(ap, dict) and sorted(ap) == ["newest_move", "states"]
+                 and isinstance(ap["newest_move"], bool) and ap["states"] in store.STARTS)
+    by_run = (isinstance(ap, dict) and sorted(ap) == ["from_run"] and ap["from_run"] == "code"
+              and kind in store.STARTS and kind != "code")
+    if not (by_states or by_run):
+        say("approval: {newest_move: true or false, states: one of %s}, or {from_run: code} for a "
+            "starting kind that follows a code run" % ", ".join(store.STARTS))
     if doc["permissions"] not in PERMISSIONS:
         say("permissions: must be deny-unlisted; no kind may skip the checks")
     tools = doc["tools"]
@@ -204,31 +218,87 @@ def problems(doc, name):
     return bad
 
 
-def load(folder=None):
-    """(kinds, problems): every kind's data, by name, and everything wrong with the folder. Every
-    kind the store knows needs its file, and the folder holds nothing else. Kinds come back only
-    when there are no problems at all: a runner never starts a kind from part of its data."""
+def _is_kind_file(entry):
+    stem, ext = os.path.splitext(entry)
+    return ext == ".json" and stem in store.KINDS
+
+
+def _raw(path):
+    """(bytes, '') or (None, why): one kind's file, read as every reader here reads it: never
+    through a link, never past FILE_MAX."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd, "rb") as fh:
+            raw = fh.read(FILE_MAX + 1)
+    except OSError as exc:
+        return None, "could not be read (%s)" % type(exc).__name__
+    if len(raw) > FILE_MAX:
+        return None, "larger than %d bytes" % FILE_MAX
+    return raw, ""
+
+
+def _hash(read):
+    """One hash over [(entry, bytes or None)], in the folder's sorted order: each entry's name, then
+    its bytes' own hash, or a mark for an entry that is not a kind's file and so was not read."""
+    h = hashlib.sha256(SCHEMA.encode("ascii") + b"\0")
+    for entry, raw in read:
+        h.update(os.fsencode(entry) + b"\0")
+        h.update(b"F" + hashlib.sha256(raw).digest() if raw is not None else b"N")
+    return h.hexdigest()
+
+
+def digest(folder=None):
+    """(hash, '') or (None, why): the kinds' folder as it is now, as one hash (KIT-880). Every entry
+    counts by its name, and each kind's file by its bytes, read as load() reads them. So a file
+    added, removed or changed changes it, and one rewritten with the same bytes does not. A folder
+    or a file that cannot be read gives no hash: it is never taken as unchanged."""
     folder = folder or FOLDER
     try:
         names = sorted(os.listdir(folder))
     except OSError as exc:
-        return {}, ["the session kinds' folder could not be read (%s)" % type(exc).__name__]
-    found, bad = {}, []
+        return None, "the session kinds' folder could not be read (%s)" % type(exc).__name__
+    read = []
     for entry in names:
-        stem, ext = os.path.splitext(entry)
-        if ext != ".json" or stem not in store.KINDS:
+        if not _is_kind_file(entry):
+            read.append((entry, None))
+            continue
+        raw, why = _raw(os.path.join(folder, entry))
+        if raw is None:
+            return None, "%s: %s" % (entry, why)
+        read.append((entry, raw))
+    return _hash(read), ""
+
+
+def load(folder=None):
+    """(kinds, problems): every kind's data, by name, and everything wrong with the folder. Every
+    kind the store knows needs its file, and the folder holds nothing else. Kinds come back only
+    when there are no problems at all: a runner never starts a kind from part of its data."""
+    found, bad, _hash_of_them = load_with_digest(folder)
+    return found, bad
+
+
+def load_with_digest(folder=None):
+    """(kinds, problems, hash): load()'s answer, and digest()'s hash of the very bytes it loaded,
+    so no change between two reads can slip in. The hash is None whenever nothing loaded."""
+    folder = folder or FOLDER
+    try:
+        names = sorted(os.listdir(folder))
+    except OSError as exc:
+        return {}, ["the session kinds' folder could not be read (%s)" % type(exc).__name__], None
+    found, bad, read = {}, [], []
+    for entry in names:
+        stem = os.path.splitext(entry)[0]
+        if not _is_kind_file(entry):
             bad.append("%s: not a kind's file (each is <kind>.json, for %s)" % (entry[:60], ", ".join(store.KINDS)))
             continue
-        path = os.path.join(folder, entry)
+        raw, why = _raw(os.path.join(folder, entry))
+        if raw is None:
+            bad.append("%s: %s" % (entry, why))
+            continue
+        read.append((entry, raw))
         try:
-            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-            with os.fdopen(fd, "rb") as fh:
-                raw = fh.read(FILE_MAX + 1)
-            if len(raw) > FILE_MAX:
-                bad.append("%s: larger than %d bytes" % (entry, FILE_MAX))
-                continue
             doc = json.loads(raw.decode("utf-8"))
-        except (OSError, ValueError, UnicodeDecodeError, RecursionError) as exc:
+        except (ValueError, UnicodeDecodeError, RecursionError) as exc:
             bad.append("%s: could not be read (%s)" % (entry, type(exc).__name__))
             continue
         more = problems(doc, stem)
@@ -239,7 +309,9 @@ def load(folder=None):
         if kind not in found and not any(b.startswith(kind + ".json:") or b.startswith(kind + ":")
                                          for b in bad):
             bad.append("%s: no file for this kind" % kind)
-    return (found if not bad else {}), bad
+    if bad:
+        return {}, bad, None
+    return found, bad, _hash(read)
 
 
 # --------------------------------------------------------------------------- #
@@ -323,6 +395,27 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
     expect("…and none is in the planner's fence",
            [t for t in kinds["plan"]["tools"] if t in _read_tuple(stage_a, "DISALLOWED_BUILTINS")], [])
 
+    # KIT-644: a review is let start by the approval its ticket's code run recorded, and the
+    # review kind's brief speaks of the facts it is given, not of a ticket it is not given.
+    expect("the review kind is approved by its ticket's code run, by nothing of its own",
+           kinds["review"]["approval"], {"from_run": "code"})
+    expect("...and every other kind by the owner's moves",
+           sorted(k for k, d in kinds.items() if "states" in d["approval"]),
+           sorted(k for k in kinds if k != "review"))
+    expect("the review kind's brief names its facts, not a ticket", ("facts" in kinds["review"]["brief"],
+           "ticket describes" in kinds["review"]["brief"]), (True, False))
+    approved = dict(kinds["review"])
+    for what, value in (("the code kind itself", ("code", {"from_run": "code"})),
+                        ("a run of another kind", ("review", {"from_run": "plan"})),
+                        ("both shapes at once", ("review", {"from_run": "code", "states": "code"})),
+                        ("a kind that is only a resume", ("fix", {"from_run": "code"}))):
+        name, ap = value
+        doc = dict(kinds[name], approval=ap)
+        expect("refused: an approval from a run for %s" % what, problems(doc, name)[:1],
+               ["%s: approval: {newest_move: true or false, states: one of %s}, or {from_run: code} "
+                "for a starting kind that follows a code run" % (name, ", ".join(store.STARTS))])
+    expect("the review kind as shipped loads", problems(approved, "review"), [])
+
     # Each refusal, one change at a time from a good kind.
     good = kinds["code"]
     for what, change, want in (
@@ -351,7 +444,8 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
             ("an environment name in lower case", {"env": good["env"] + ["path"]},
              "code: env: a list of distinct variable names"),
             ("an approval no list counts", {"approval": {"newest_move": True, "states": "fix"}},
-             "code: approval: {newest_move: true or false, states: one of code, review, plan, acceptance}"),
+             "code: approval: {newest_move: true or false, states: one of code, review, plan, "
+             "acceptance}, or {from_run: code} for a starting kind that follows a code run"),
             ("a starting kind with no branch", {"branch": None}, "code: branch: a kind that starts needs one"),
             ("the push token without git's helper for it",
              {"env": [e for e in good["env"] if e not in PUSH_ENV[1:]]},
@@ -409,6 +503,44 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
            ({}, ["notes.txt: not a kind's file (each is <kind>.json, for %s)" % ", ".join(store.KINDS)]))
     expect("a folder that cannot be read", load(os.path.join(tmp, "nowhere")),
            ({}, ["the session kinds' folder could not be read (FileNotFoundError)"]))
+
+    # One hash of the folder (KIT-880): what the runner keeps when it starts, and compares later.
+    kit_hash, why = digest()
+    expect("the kit's folder has a hash, and a load of it gives the same one, of the bytes it loaded",
+           (bool(kit_hash), why, load_with_digest()[2]), (True, "", kit_hash))
+    same = tempfile.mkdtemp(prefix="kinds-hash-")
+    for name in sorted(kinds):
+        with open(os.path.join(FOLDER, name + ".json"), "rb") as src, \
+                open(os.path.join(same, name + ".json"), "wb") as dst:
+            dst.write(src.read())
+    expect("the same files in another folder give the same hash: it is of the data, not the place",
+           digest(same), (kit_hash, ""))
+    code_path = os.path.join(same, "code.json")
+    with open(code_path, "rb") as fh:
+        code_bytes = fh.read()
+    with open(code_path, "wb") as fh:
+        fh.write(code_bytes)
+    expect("a file written again with the same bytes leaves the hash as it was", digest(same)[0], kit_hash)
+    with open(code_path, "wb") as fh:
+        fh.write(code_bytes.replace(b'"wall_minutes": 360', b'"wall_minutes": 361'))
+    changed = digest(same)[0]
+    expect("one changed value in one kind's file changes the hash, and the data still loads",
+           (bool(changed) and changed != kit_hash, load(same)[1]), (True, []))
+    expect("…and a load of it gives the new hash", load_with_digest(same)[2], changed)
+    with open(code_path, "wb") as fh:
+        fh.write(code_bytes)
+    with open(os.path.join(same, "notes.txt"), "w") as fh:
+        fh.write("x")
+    expect("an entry added beside the kinds changes the hash, and a load of that folder gives none",
+           (digest(same)[0] not in (None, kit_hash), load_with_digest(same)[2]), (True, None))
+    os.unlink(os.path.join(same, "notes.txt"))
+    os.unlink(os.path.join(same, "plan.json"))
+    expect("a kind's file taken away changes the hash", digest(same)[0] not in (None, kit_hash), True)
+    os.symlink(os.path.join(FOLDER, "plan.json"), os.path.join(same, "plan.json"))
+    expect("a kind's file that is a link gives no hash, and says which", digest(same),
+           (None, "plan.json: could not be read (OSError)"))
+    expect("a folder that cannot be read gives no hash", digest(os.path.join(same, "nowhere")),
+           (None, "the session kinds' folder could not be read (FileNotFoundError)"))
 
     if failures:
         print("FAIL: pipeline_session_kinds selftest")
