@@ -90,8 +90,11 @@ it anyway. If a guard is in your way, say so and stop — never respell the comm
   (the commit would be stranded). Branch fresh off updated `main`.
 - **Never-merge guard** — **`gh pr merge` (including `--auto`) is blocked. Merging is
   the human's action only.** Open the PR (`gh pr create`) and stop. Never enable
-  auto-merge. (Even *mentioning* `gh pr merge` in a shell command — e.g. a grep
-  pattern — trips it; that's expected.)
+  auto-merge. The same merge sent straight to the API is blocked too (KIT-897): a write
+  to `/pulls/<n>/merge` by `gh api`, `curl` or `wget`, and the GraphQL
+  `mergePullRequest`, `enablePullRequestAutoMerge` and `enqueuePullRequest` mutations.
+  Reading a PR, its checks and its merge state stays allowed. (Even *mentioning*
+  `gh pr merge` in a shell command — e.g. a grep pattern — trips it; that's expected.)
 - **Self-approval guard** — **you cannot approve a PR** (`gh pr review --approve`/`-a`,
   the bare `gh pr review`, or an `event: APPROVE` write via `gh api`/GraphQL/`curl`).
   An approval claims that someone *else* read the code; supplying your own makes that
@@ -375,6 +378,8 @@ npm run test:validator-setup  # the validator's install (KIT-547): one LaunchAge
                              #   `apply` answers through a pipe, a first-pass ceiling of 0; no key in any output
 npm run test:validator-pieces  # the validator approves a piece starting (KIT-543): the ticket as written,
                              #   against its plan's criteria; it records, and the queue's pool starts it
+npm run test:validator-plans  # the validator approves a plan in your place (KIT-544): the plan as written,
+                             #   against its idea; it records, and the bridge approves it as the validator's
 npm run test:day-planner     # the day planner (KIT-439): ticket text fenced as data in its brief, one
                              #   answer block read, every pick checked, a failing one dropped with a reason
 npm run test:morning         # the morning job (KIT-446): once a day inside the window, one tool-less call,
@@ -412,7 +417,8 @@ npm run test:queue-start     # the queue's starter (KIT-452): what may start now
 npm run test:session-kinds   # each kind of session as data (KIT-704): every kind loads; a mode that skips
                              #   checks, a file tool by name, Bash in our own sandbox each refused
 npm run test:harness-claude  # the one adapter (KIT-704): every kind's full command line, settings and
-                             #   environment pinned; our own sandbox's profile run for real on a Mac
+                             #   environment pinned; our own sandbox's profile run for real on a Mac;
+                             #   the one builder the turn and the writer use too (KIT-708)
 npm run test:runner-guard    # the guards' launcher (KIT-704): no folder named or two named is a refusal;
                              #   a crash is a refusal; the engine's folder this account could change
 npm run test:runner-probe    # the live probe of each kind's walls (KIT-704), against a stand-in: walls
@@ -423,7 +429,8 @@ npm run test:runner-store    # the runner's store (KIT-642): requests and run re
 npm run test:runner          # the runner (KIT-642): start, resume, stop and a restart against a
                              #   stand-in; the owner's approval from the history; the pin; the one
                              #   command line; a run that died resumed once; a lane that is off for
-                             #   its project refused in words (KIT-866); leaves nothing behind
+                             #   its project refused in words (KIT-866); the lanes it takes said in
+                             #   its store, the acceptance kind's look tool (KIT-708); leaves nothing behind
 npm run test:runner-limits   # the runner's limits (KIT-643): stand-ins that grow without bound
                              #   in memory (a child that left the group too) and on disk stopped
                              #   with their whole tree; the floor; each incident told once

@@ -57,7 +57,7 @@ it comes from. `merge_repos` lists repositories, `[]` for none.
 Keep it in your own home, outside every repository. Good: `~/.validator/settings.json`, mode 600.
 Not that: a file inside a checkout. A session can write there, so the file is not obeyed.
 
-The install (section 11) writes this file for you, once, with every switch off. It never writes it
+The install (section 12) writes this file for you, once, with every switch off. It never writes it
 again, so no update can turn a switch on.
 
 ### When every switch reads off
@@ -154,8 +154,8 @@ capitals. GitHub's names ignore case, so `acme/app` covers a pull request in `Ac
 
 ### What is built
 
-The merge path (section 9) and the piece pass (section 10) decide, and the install runs both
-(section 11). Approving a plan is its own piece: until it is built, its switch decides nothing.
+The merge path (section 9), the piece pass (section 10) and the plan pass (section 11) decide, and
+the install runs all three (section 12).
 
 ## 2. The ledger
 
@@ -190,7 +190,7 @@ with nothing hidden in it. It is the only text in the ledger.
 that only you can write. Anything else gives no rows, and says why. Good: no ledger yet, which
 means nothing has been decided. Not that: `the ledger is inside a git working tree, where a
 session can write, so no approval stands`. The install sets where it lives: `LEDGER_FILE` in
-`validator.conf` (section 11).
+`validator.conf` (section 12).
 
 ### The check on the pull request
 
@@ -436,7 +436,7 @@ runs the other way: `ESCALATE_URGENT` always reaches you.
 
 The hard limits are the first layer: plain code with no model. They are worked out again at each
 decision, from things no session can write. The code is `scripts/pipeline_validator_limits.py`.
-The merge path (section 9) and the piece pass (section 10) call it. Plan approvals are their own piece.
+The merge path (section 9), the piece pass (section 10) and the plan pass (section 11) call it.
 
 It answers `pass`, or `fail` with every reason, in short fixed words. It never quotes a ticket or a
 pull request.
@@ -485,7 +485,8 @@ one that touches `.github/workflows/ci.yml` passing. It fails with `risk-path`, 
 
 The agent is one run of the `claude` CLI. It reads the brief from section 4 and answers in two
 lines. It can do nothing else. The code is `scripts/pipeline_validator_run.py`. The merge path
-(section 9) and the piece pass (section 10) call it, from the validator's own job (section 11).
+(section 9), the piece pass (section 10) and the plan pass (section 11) call it, from the
+validator's own job (section 12).
 
 **What it can do.** Read the brief, and answer. It has no tools, so it cannot read a file, run a
 command, or reach the tracker or GitHub. It loads none of your settings, hooks, plugins or skills.
@@ -528,8 +529,8 @@ agent to see what it would say.
 ## 7. What a no does
 
 When the validator does not approve, code decides what happens next, from the agent's answer and
-the layers. The code is `scripts/pipeline_validator_route.py`. The merge path (section 9) and the
-piece pass (section 10) call it. Plan approvals are their own piece.
+the layers. The code is `scripts/pipeline_validator_route.py`. The merge path (section 9), the
+piece pass (section 10) and the plan pass (section 11) call it.
 
 | What happened | What it records | What happens next |
 |---|---|---|
@@ -602,8 +603,8 @@ verdict is the validator's: a send-back has its own path, and an escalation or a
 
 Before it judges anything, the validator reads the facts about it once: who filed the idea, which
 files change, how big the change is, whether the window is open, and so on. The code is
-`scripts/pipeline_validator_facts.py`. It only reads. The merge path (section 9) and the piece pass
-(section 10) call it. Plan approvals are their own piece.
+`scripts/pipeline_validator_facts.py`. It only reads. The merge path (section 9), the piece pass
+(section 10) and the plan pass (section 11) call it.
 
 Each fact comes from the part of the kit that owns it, through that part's own reader:
 
@@ -629,7 +630,7 @@ Not that: a pull request approved because its ticket could not be read.
 **Its sources are yours to point it at.** Its config names the tracker key's variable (a read-only
 key), the work teams, the queue's config, Stage E's ledger and snapshot folder, the acceptance
 ledger, and the watcher's status and hold files. One left empty is a source it does not read, and
-every fact from it is said as unread. The install sets them, from `validator.conf` (section 11).
+every fact from it is said as unread. The install sets them, from `validator.conf` (section 12).
 
 **Read one pull request's facts yourself.** It prints the facts as fields, with the criteria and the
 diff as sizes only, and changes nothing:
@@ -650,7 +651,7 @@ verdict, and is not read here: such work's provenance is said as unread, so it w
 The validator's own job turns on GitHub's own auto-merge for one pull request at a time, each on
 the latest main. It never merges, approves a review or labels: GitHub merges, once its own rules
 pass. The code is `scripts/pipeline_validator_merge.py`. The validator's own job runs one pass every
-few minutes, once installed (section 11).
+few minutes, once installed (section 12).
 
 **What one pass does.**
 
@@ -700,7 +701,7 @@ updated a second time waits, and each pass says why. It is never approved on a s
 
 **Its config** is `~/.validator/config.json`: `settings_file`, `ledger_file`, the `merge` section
 (`review_bar`, `merge_method`, `max_pages`), and the `facts`, `agent` and `check` sections. The
-install writes it from `validator.conf` (section 11). Change the conf, then run the install
+install writes it from `validator.conf` (section 12). Change the conf, then run the install
 again: an edit to the config by hand is put back on the next install. To see the shape:
 
 ```bash
@@ -728,7 +729,7 @@ config needs fixing, or this is an agent's environment. 3: something could not b
 A piece of a plan you approved waits for your `start` when it was added to the plan, or changed,
 after your approval. With the pieces switch on, the validator may give that start in your place
 (KIT-543). The code is `scripts/pipeline_validator_pieces.py`. The validator's own job runs
-one pass every few minutes, once installed (section 11).
+one pass every few minutes, once installed (section 12).
 
 **What one pass does.**
 
@@ -775,7 +776,85 @@ Exit 0: the pass ran and said what it did, or that it was off or held. 1: a ledg
 be written. 2: the config needs fixing, or this is an agent's environment. 3: something could not
 be read.
 
-## 11. Install it
+## 11. A plan
+
+With the plans switch on, the validator may approve a plan in place of your `approve <plan>`
+(KIT-544). It judges and records. The bridge approves the plan, on its next pass. The code is
+`scripts/pipeline_validator_plans.py` and `scripts/pipeline_bridge_plans.py`. The validator's own
+job runs one pass every few minutes, after the piece pass, once installed (section 12).
+
+**Which plans it judges.** Only a plan whose `approve` question is open: one the bridge asked you
+about, that you have not answered. It reads those questions from the bridge's state, the file the
+queue's reader names (`reader.bridge_state_file`). A plan you approved, declined or were never
+asked about is not judged. Nor is one that has left the backlog.
+
+**What one pass does.**
+
+1. It reads the switches. The plans switch off: it stops and says `OFF`.
+2. It reads the watcher's hold. A hold, or a hold file it cannot read: it stops and says `HELD`.
+3. It reads the bridge's open questions. A state it cannot read: it stops, and says so.
+4. Each plan, oldest ticket first: its facts, the hard limits, then the agent.
+
+| What it finds | What it does |
+|---|---|
+| An idea you did not file | Never approved, whatever the switches. It waits for you, and says why. |
+| Pieces that touch the safety system, or a human-only class you have not allowed | A `held` row, once. It waits for you. An unchanged hold is not written again. |
+| A fact not read, or the window closed | Nothing written. It waits, and says why. |
+| The limits pass | One agent run and its row. A send-back becomes an escalation: a plan has no dev session yet. |
+| A plan it already decided, unchanged since, under the same switches | No second run. The plans after it get their turn. |
+| A plan whose last change can't be read | Nothing written, and no run. It waits, and says so. |
+| A plan edited while the agent judged it | Nothing written. A later pass judges it as it stands. |
+
+At most one agent run per pass. A row carries the moment before the plan's last read: after the
+agent's run, it is read once more. A change to the plan, its pieces or its idea after that moment
+needs a new decision, and so does a question asked after it.
+
+**The agent's brief.** Your idea's own text, and the plan with every piece as written. Each sits in
+its own fence, marked as data. The question is whether the plan asks for what your idea asks, and
+nothing else that needs you. The code is `build_ticket_brief` in `scripts/pipeline_validator_brief.py`.
+
+**How the bridge approves it.** On each pass, after your own messages, the bridge reads the
+validator's newest decision about each plan with an open question. An `approved` one counts only
+when all of these hold:
+
+- the plans switch is still on, in the settings the queue's reader names
+  (`reader.validator_settings_file`), and the ledger it names can be trusted;
+- the switches on now are the ones it decided under. Turn one on or off, and it decides again;
+- the plan, its pieces and its idea have not changed since the validator read them, and it
+  decided after you were asked;
+- its idea is yours: filed with your key, marked `provenance:human`, with no parent;
+- every check your own `yes` gets passes.
+
+Then the bridge approves the plan as the validator's, never yours. Its record says
+`approved_by: validator`. The plan's comment, the reply where it asked you and each piece's start
+comment name the validator, and no person.
+
+**Your choice always stands.** Your own answer is read first. A plan you declined stays declined.
+When the bridge can't act on the validator's approval, it says why where it asked you, once, and
+your question stays open. You can still approve a plan yourself at any time. You can pause or cancel a plan the validator
+approved, as any other: `pause <plan>` or `cancel <plan>`.
+
+**A hold** is a blocker in the stand-up, with the reply that clears it: `approve <plan>`.
+
+**Its config** is the validator's one config, `~/.validator/config.json`, as the piece pass reads
+it. Both of the queue's validator files empty, or the plans switch off: your `approve` decides, as
+before.
+
+**Try one pass that writes nothing.** It reads and judges, runs no agent, and changes nothing. Run
+it in a terminal, as yourself: it is refused in an agent's environment.
+
+```bash
+python3 scripts/pipeline_validator_plans.py run --config ~/.validator/config.json --dry-run
+```
+
+Good: `TOD-10: the validator approved it.`, then in your DM: *The validator approved TOD-10 in your
+place.* Not that: a plan approved from an idea an agent filed.
+
+Exit 0: the pass ran and said what it did, or that it was off or held. 1: a ledger row could not
+be written. 2: the config needs fixing, or this is an agent's environment. 3: something could not
+be read: the hold, the ledger, or the bridge's questions.
+
+## 12. Install it
 
 The validator's job runs under your own login: one LaunchAgent, as you, every few minutes. It makes
 no account and runs no `sudo`. After a fresh install every switch is off, and the job says so on
@@ -823,7 +902,7 @@ What it builds, all yours:
 |---|---|
 | `~/.validator/settings.json` | The switches. Written once, when absent, with every switch off. Never written again. |
 | `~/.validator/config.json` | The job's config, from `validator.conf`: the settings, the ledger, the hold and the facts' sources. |
-| `~/Library/LaunchAgents/<JOB_LABEL>.plist` | The job: each pass reads your env file, then runs the merge path and the piece pass. |
+| `~/Library/LaunchAgents/<JOB_LABEL>.plist` | The job: each pass reads your env file, then runs the merge path, the piece pass and the plan pass. |
 | `~/.validator/validator.log` | What each pass said. While every switch is off: `OFF: the merges switch is off ...`. |
 | `~/.validator/last-pass.json` | When the last pass ended, and its exit code. |
 | `~/.validator/setup.json` | One fact: the job has been on. A job that was on and is not loaded now, you paused. |

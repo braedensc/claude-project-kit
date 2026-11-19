@@ -297,10 +297,10 @@ PROBES = [
       "M=merge; gh pr $M 7 --squash", BYPASS, "merges the PR",
       argv=("gh", "pr", "merge", "7", "--squash")),
     P("merge-05", "never-merge", "api-route",
-      "gh api -X PUT /repos/o/r/pulls/7/merge", BYPASS, "merges the PR",
-      argv=("gh", "api", "-X", "PUT", "/repos/o/r/pulls/7/merge"),
-      note="The matcher only knows the `gh pr merge` subcommand. The REST "
-           "endpoint that does the same thing is not covered in any spelling."),
+      "gh api -X PUT /repos/o/r/pulls/7/merge", BLOCKED, "merges the PR",
+      note="Got through until 2026-11-18, when the matcher knew only the `gh pr "
+           "merge` subcommand. The API half (KIT-897) refuses a write to the "
+           "endpoint from any client."),
     P("merge-06", "never-merge", "prose-strip",
       'gh pr create --title "$(gh pr merge 7 --squash)"', BYPASS,
       "merges the PR",
@@ -309,6 +309,66 @@ PROBES = [
       "gh pr merge --disable-auto 7", BY_DESIGN,
       "turns auto-merge OFF; never causes a merge",
       argv=("gh", "pr", "merge", "--disable-auto", "7")),
+    # The API half (KIT-897), recorded 2026-11-18.
+    P("merge-08", "never-merge", "api-route",
+      "gh api graphql -f query='mutation { mergePullRequest(input: "
+      "{pullRequestId: \"x\"}) { clientMutationId } }'", BLOCKED,
+      "merges the PR through GraphQL"),
+    P("merge-09", "never-merge", "api-route",
+      "curl -X PUT https://api.github.com/repos/o/r/pulls/7/merge", BLOCKED,
+      "merges the PR with a hand-rolled request"),
+    P("merge-10", "never-merge", "var-expand",
+      "M=PUT; gh api -X $M /repos/o/r/pulls/7/merge", BLOCKED, "merges the PR",
+      note="A method the hook cannot read on the merge endpoint fails closed, "
+           "so holding PUT in a variable does not pay."),
+    P("merge-11", "never-merge", "field-split",
+      "gh${IFS}api${IFS}-X${IFS}PUT${IFS}/repos/o/r/pulls/7/merge", BLOCKED,
+      "merges the PR",
+      note="Same reason as merge-10: `-X` is still visible, and what follows "
+           "it is no method the hook can read, so it fails closed."),
+    P("merge-12", "never-merge", "line-continuation",
+      "gh api -X PUT \\\n  /repos/o/r/pulls/7/merge", BLOCKED, "merges the PR",
+      note="The API half reads the whole command, not a slice that stops at "
+           "the newline."),
+    P("merge-13", "never-merge", "quote-collapse",
+      'gh api -X PUT /repos/o/r/pulls/7/mer""ge', BYPASS, "merges the PR",
+      argv=("gh", "api", "-X", "PUT", "/repos/o/r/pulls/7/merge"),
+      note="The endpoint is matched as text, so a respelt path is not seen."),
+    P("merge-14", "never-merge", "quote-collapse",
+      'gh api -""X PUT /repos/o/r/pulls/7/merge', BYPASS, "merges the PR",
+      argv=("gh", "api", "-X", "PUT", "/repos/o/r/pulls/7/merge"),
+      note="Unlike approve-04, mangling the FLAG pays here: with no method "
+           "flag left the request reads as a GET, and a GET of the merge "
+           "endpoint is the read that must stay allowed."),
+    P("merge-15", "never-merge", "var-expand",
+      "P=pulls/7/merge; gh api -X PUT /repos/o/r/$P", BYPASS, "merges the PR",
+      argv=("gh", "api", "-X", "PUT", "/repos/o/r/pulls/7/merge")),
+    P("merge-16", "never-merge", "quote-collapse",
+      "gh api graphql -f query='mutation { merge''PullRequest(input: "
+      "{pullRequestId: \"x\"}) { clientMutationId } }'", BYPASS,
+      "merges the PR through GraphQL",
+      argv=("gh", "api", "graphql", "-f",
+            "query=mutation { mergePullRequest(input: {pullRequestId: \"x\"}) "
+            "{ clientMutationId } }")),
+    P("merge-17", "never-merge", "opaque-body",
+      "gh api graphql -F query=@merge.graphql", BYPASS,
+      "merges the PR with the mutation held in a file",
+      argv=("gh", "api", "graphql", "-F", "query=@merge.graphql"),
+      note="Failing closed here would also refuse every GraphQL read kept in "
+           "a file, so the record keeps it as a known gap."),
+    P("merge-18", "never-merge", "verb-coverage",
+      "python3 -c \"import urllib.request as u; u.urlopen(u.Request("
+      "'https://api.github.com/repos/o/r/pulls/7/merge', method='PUT'))\"",
+      BYPASS, "merges the PR from inside python",
+      note="Excluded from layer 2: the request is made inside the interpreter, "
+           "not by the shell, so an argv check would prove nothing."),
+    P("merge-19", "never-merge", "documented-exemption",
+      "gh api graphql -f query='mutation { disablePullRequestAutoMerge(input: "
+      "{pullRequestId: \"x\"}) { clientMutationId } }'", BY_DESIGN,
+      "turns auto-merge OFF; never causes a merge",
+      argv=("gh", "api", "graphql", "-f",
+            "query=mutation { disablePullRequestAutoMerge(input: "
+            "{pullRequestId: \"x\"}) { clientMutationId } }")),
 
     # -- self-approval matcher ------------------------------------------------
     P("approve-01", "self-approval", "baseline",
@@ -570,10 +630,16 @@ CLASSIFICATION = {
         "durable layer is a network policy at the sandbox boundary, which does "
         "not care how the command was spelled (KIT-24)."),
     "never-merge": (ADVISORY,
-        "Four spellings get through locally, and the REST endpoint is not "
-        "covered at all. This one has always been documented as a first line: "
-        "the real gate is branch protection plus the platform merge rules, "
-        "which live in repository settings outside the repo tree."),
+        "Two halves, both over command text. The `gh pr merge` matcher still "
+        "falls to four shell spellings. The API half (KIT-897) refuses a write "
+        "to `/pulls/<n>/merge` from any client and the GraphQL merge, "
+        "auto-merge and merge-queue mutations, and fails closed on a method it "
+        "cannot read, so `$IFS` or a variable method does not pay. A respelt "
+        "path or mutation name, a mangled method flag (it reads as a GET), a "
+        "mutation held in a file or an interpreter still gets through. No "
+        "durable layer covers WHO merges yet: branch protection's required "
+        "checks decide WHAT may merge, and a rule on who may update the "
+        "default branch is the owner's decision (docs/SECURITY.md)."),
     "self-approval": (ADVISORY,
         "The best-behaved of the first six, and the reason is structural rather than "
         "lexical: because a `gh pr review` with no readable event fails "

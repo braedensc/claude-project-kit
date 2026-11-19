@@ -19,7 +19,9 @@ state alone, and never the dispatcher's user. Four sources:
                is `provenance:human`, has no parent, and is not in the finding record.
   plan         a piece of a plan the owner approved, as it stood at the approval: in Slack (the
                bridge's record holds each piece's fingerprint and who approved) or by moving the
-               plan's epic into the ready state. A piece added or changed since is held.
+               plan's epic into the ready state. A piece added or changed since is held. A plan the
+               bridge's record shows the validator approved in his place (KIT-544, `approved_by`
+               "validator", which no Slack id is) counts the same, `via` "validator".
   agent_filed  a finding a session requested (contract §8): admitted by itself only when it is
                small (effort S), names no guarded path in its Pointers, came from a source the
                finding record does not itself list as agent-filed, and the day's count of such
@@ -106,6 +108,10 @@ except ImportError as exc:  # a packaging accident, never a state to run in
 EXIT_USAGE = 2
 SOURCES = ("todo", "backlog", "plan", "agent_filed", "none")
 VIAS = ("move", "creation", "slack", "limits", "validator")
+# The validator's name wherever an approval of its own is recorded: a piece's start it approved
+# (KIT-543), and a plan it approved in the owner's place, in the bridge's record (KIT-544). Lower
+# case, so no Slack member's id is ever spelled so.
+VALIDATOR = "validator"
 REASONS = (
     "admitted",
     # never, whatever anyone approved or the owner taps
@@ -528,11 +534,14 @@ def slack_owner(cfg, by):
 def plan_approval(cfg, ctx, epic, rec, approved):
     """How the owner approved a plan: (by, seconds, via), or (reason, None, tap) when not, where
     `tap` says whether the owner's `approve` would settle it. A Slack approval by anyone else is
-    already on the bridge's record, which would only answer that it is approved."""
+    already on the bridge's record, which would only answer that it is approved. One the bridge
+    recorded as the validator's, made in the owner's place (KIT-544), is the validator's."""
     if rec is not None:                      # the bridge's record of an approval in Slack
         at, by = epoch(rec.get("approved_at")), rec.get("approved_by")
         if at is None or approved is None:
             return "record-unreadable", None, False
+        if by == VALIDATOR:
+            return by, at, "validator"
         return (by, at, "slack") if slack_owner(cfg, by) else ("not-owner", None, False)
     ehist = read_history(ctx.histories.get(epic.get("id")))
     if ehist is None:
@@ -579,7 +588,7 @@ def lane_plan(cfg, t, ctx, epic, hist, created, v):
     if at is None:
         return v(by, tap=APPROVE % epic.get("identifier") if via else None)
     held = None
-    if via == "slack":
+    if via in ("slack", "validator"):        # the bridge's record: each piece's fingerprint
         if t.get("id") not in approved:
             held = "added-after-approval"
         elif fingerprint(t) != approved[t["id"]]:
@@ -598,7 +607,7 @@ def lane_plan(cfg, t, ctx, epic, hist, created, v):
             return v(held, tap=True)
         if plan_wait_open(rec, t, epic):
             return v("plan-waits")
-        return v("admitted", by="validator", at=iso(vat), via="validator")
+        return v("admitted", by=VALIDATOR, at=iso(vat), via="validator")
     if plan_wait_open(rec, t, epic):
         return v("plan-waits")
     return v("admitted", by=by, at=iso(at), via=via)
@@ -1017,6 +1026,17 @@ def _cases(check):
       [PA, PA, ("plan", "added-after-approval", "start ENG-13")],
       pieces=[piece(11), piece(12), piece(13)], approved_from=[piece(11), piece(12)])
     P("a plan the owner paused", tap("plan-paused", None), epic_state="Backlog")
+    # KIT-544: a plan the bridge recorded as approved by the validator, in the owner's place, is
+    # approved as his Slack approval is, and the start is the validator's, never his.
+    P("approved in the owner's place by the validator, as the bridge recorded it", [PA, PA],
+      approver=VALIDATOR)
+    P("…and a piece changed since the validator's approval waits for a start",
+      [("plan", "changed", "start ENG-11"), PA], approver=VALIDATOR,
+      pieces=[piece(11, description=GOOD + "\nMore."), piece(12)], approved_from=[piece(11), piece(12)])
+    P("…paused by the owner afterwards, it holds every piece", tap("plan-paused", None),
+      approver=VALIDATOR, epic_state="Backlog")
+    P("…but a record naming the validator in any other spelling is not one",
+      tap("not-owner", None), approver="Validator")
 
     # KIT-543: the validator may give a held piece's start, only after the piece's last change, only
     # while its pieces switch is on (a record at all), and never past a rule that holds for good.
@@ -1027,6 +1047,9 @@ def _cases(check):
     def first(vs):
         v = vs[0]
         return (v["admitted"], v["reason"], v["via"], v["by"], v["reply"])
+    check("validator: the pieces of a plan it approved in your place are its starts, never yours "
+          "(KIT-544)", [(v["by"], v["via"]) for v in planworld(approver=VALIDATOR)],
+          [(VALIDATOR, "validator")] * 2)
     later, sooner = epoch(T3), epoch(T0) - 60
     check("validator: an approval after a changed piece's last change starts it, as the validator's",
           first(vworld({"ENG-11": {"kind": "approved", "at": later}})),

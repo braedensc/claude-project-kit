@@ -123,6 +123,8 @@ MAX_BYTES = 2 * 1024 * 1024
 MAX_PLANS = 200
 TIME_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\Z")
 TICKET_RE = re.compile(r"^[A-Z][A-Z0-9]{1,9}-[0-9]{1,6}\Z")
+# A check's own record folder: its acceptance ticket, or on the runner's lane its start request (KIT-708).
+CHECK_FOLDER_RE = re.compile(r"^(?:[A-Z][A-Z0-9]{1,9}-[0-9]{1,6}|rq-[0-9a-f]{32})\Z")
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}\Z")
 SHA_RE = re.compile(r"^[0-9a-f]{40}\Z")
 PIECE_STATES = ("backlog", "ready", "working", "review", "done")
@@ -815,14 +817,14 @@ def page_facts(word, judged, triaged):
 def page_problem(page, word):
     """What is wrong with the page facts for a verdict `word`, or "". Every field in its shape, and `cause` present for a
     could-not-check and only then. `folder` is optional: the check's own record folder under the look tool's record
-    root, named by its acceptance ticket (the live pass sets it), which holds `<plan>/<run id>/<name>`. Absent, the
-    screenshots sit straight under `<plan>/`."""
+    root, named by its acceptance ticket, or on the runner's lane by its start request (KIT-708; the live pass sets
+    it), which holds `<plan>/<run id>/<name>`. Absent, the screenshots sit straight under `<plan>/`."""
     if not isinstance(page, dict):
         return "they are not an object"
     if set(page) - {"folder"} != set(PAGE_KEYS) | ({"cause"} if word == "could-not-check" else set()):
         return "they do not hold exactly the page's fields"
-    if "folder" in page and not (isinstance(page["folder"], str) and TICKET_RE.match(page["folder"])):
-        return "folder is not a ticket id"
+    if "folder" in page and not (isinstance(page["folder"], str) and CHECK_FOLDER_RE.match(page["folder"])):
+        return "folder is not a check's: a ticket id or a runner request id"
     for key in ("holds", "failed_runs", "followups"):
         if type(page[key]) is not int or not 0 <= page[key] <= 999:
             return "%s is not a whole number from 0 to 999" % key
@@ -1728,7 +1730,11 @@ def _selftest_page(expect, H1, H2, pb, sk, plan, pr):
                      ("five screenshots", dict(held["page"], shots=["%s/s%d.png" % (R1, i) for i in range(5)])),
                      ("the same screenshot twice", dict(held["page"], shots=[R1 + "/a.png", R1 + "/a.png"])),
                      ("a record folder that is a path", dict(held["page"], folder="../up")),
-                     ("a record folder that is not text", dict(held["page"], folder=7)))
+                     ("a record folder that is not text", dict(held["page"], folder=7)),
+                     ("a record folder that is a request id cut short (KIT-708)",
+                      dict(held["page"], folder="rq-" + "a" * 31)))
+        expect(page_problem(dict(held["page"], folder="rq-" + "a" * 32), "held") == "",
+               "a check on the runner's lane names its record folder by its start request (KIT-708)")
         for name, page in bad_pages:
             r = write_verdict(ledger_path, "TOD-100", H1, held["comment"], post, 20, page=page)
             expect(r[0] == "refused" and "verdict" not in load_ledger(ledger_path)[("TOD-100", H1)] and not seen,

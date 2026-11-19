@@ -2246,6 +2246,7 @@
         "scripts/pipeline_validator_run.py",
         "scripts/pipeline_validator_merge.py",
         "scripts/pipeline_validator_pieces.py",
+        "scripts/pipeline_validator_plans.py",
         "scripts/pipeline_validator_setup.py"
       ],
       "installer": "scripts/pipeline_validator_setup.py",
@@ -2306,7 +2307,7 @@
             "program": "/bin/sh",
             "args": [
               "-c",
-              "set -a; . <ENV_FILE>; set +a; rc=0; <PYTHON> <kit>/scripts/pipeline_validator_merge.py run --config <owner home>/.validator/config.json; r=$?; [ \"$r\" -gt \"$rc\" ] && rc=$r; <PYTHON> <kit>/scripts/pipeline_validator_pieces.py run --config <owner home>/.validator/config.json; r=$?; [ \"$r\" -gt \"$rc\" ] && rc=$r; printf '{\"schema\": \"validator-pass/1\", \"at\": \"%s\", \"exit\": %d}\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" \"$rc\" > <owner home>/.validator/last-pass.json.tmp && mv -f <owner home>/.validator/last-pass.json.tmp <owner home>/.validator/last-pass.json; exit $rc"
+              "set -a; . <ENV_FILE>; set +a; rc=0; <PYTHON> <kit>/scripts/pipeline_validator_merge.py run --config <owner home>/.validator/config.json; r=$?; [ \"$r\" -gt \"$rc\" ] && rc=$r; <PYTHON> <kit>/scripts/pipeline_validator_pieces.py run --config <owner home>/.validator/config.json; r=$?; [ \"$r\" -gt \"$rc\" ] && rc=$r; <PYTHON> <kit>/scripts/pipeline_validator_plans.py run --config <owner home>/.validator/config.json; r=$?; [ \"$r\" -gt \"$rc\" ] && rc=$r; printf '{\"schema\": \"validator-pass/1\", \"at\": \"%s\", \"exit\": %d}\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" \"$rc\" > <owner home>/.validator/last-pass.json.tmp && mv -f <owner home>/.validator/last-pass.json.tmp <owner home>/.validator/last-pass.json; exit $rc"
             ]
           },
           "schedule": "interval",

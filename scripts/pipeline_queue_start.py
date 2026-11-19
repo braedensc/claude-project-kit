@@ -103,8 +103,9 @@ WHY = {"todo": "you moved it into the ready state{at}",
        "backlog": "you filed it in the backlog, and the backlog may start",
        "plan": "it is a piece of {plan}, which you approved{at}",
        "agent_filed": "it is an agent-filed finding small enough to start by itself"}
-# KIT-543: a piece of an approved plan whose start the validator approved, in the owner's place.
-WHY_VALIDATOR = "it is a piece of {plan}, which you approved, and the validator approved its start{at}"
+# KIT-543: a piece of an approved plan whose start the validator approved, in the owner's place. It
+# names no one as the plan's approver: the validator may have approved the plan too (KIT-544).
+WHY_VALIDATOR = "it is a piece of {plan}, and the validator approved its start{at}"
 # The room (KIT-457): the settings' defaults, the pressure words, and the fixed commands.
 ROOM_DEFAULTS = {"min_free_disk_gb": 25, "max_pressure": "critical", "max_swap_gb": 4}
 PRESSURE_LEVEL = {"warn": 2, "critical": 4}         # kern.memorystatus_vm_pressure_level
@@ -995,8 +996,8 @@ def _cases(check, tmp, home):
               "approved at 2026-11-03 10:00 UTC."]),
             ("attribution: a piece whose start the validator approved says so, never that you did",
              say(source="plan", plan="ENG-10", by="validator"),
-             "Started by the queue, in lane acme/app:1: it is a piece of ENG-10, which you approved, "
-             "and the validator approved its start at 2026-11-03 10:00 UTC."),
+             "Started by the queue, in lane acme/app:1: it is a piece of ENG-10, and the validator "
+             "approved its start at 2026-11-03 10:00 UTC."),
             ("attribution: not one of the order's starts is refused",
              [say(source="none"), say(lane="acme"), say(ticket="ENG-1 " + LEAK)],
              ["refused"] * 3),

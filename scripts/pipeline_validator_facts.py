@@ -2,16 +2,17 @@
 """The validator's facts for one item: what the hard limits, the evidence and the agent's brief read,
 gathered once from the parts of the kit that own them (KIT-791). Read-only.
 
-    from pipeline_validator_facts import config, for_merge, for_piece, origin_of
+    from pipeline_validator_facts import config, for_merge, for_piece, for_plan, origin_of
     for_merge(cfg, owner_repo, number, now)   one pull request
     for_piece(cfg, ticket, now)               one piece, before it starts
+    for_plan(cfg, ticket, now)                one plan, before it is approved (KIT-544)
     origin_of(cfg, ticket)                    who filed the idea behind a ticket, a plan's too
 
     python3 scripts/pipeline_validator_facts.py show --config PATH --repo OWNER/NAME --pr N
     python3 scripts/pipeline_validator_facts.py --selftest
 
 THE SHAPE.  One document for every item. Each consumer reads its own part, and looks nothing up again:
-  item      {"kind": "merge"|"piece", "ref": "owner/name#N"|"TEAM-12", "head": <40 hex>|None}:
+  item      {"kind": "merge"|"piece"|"plan", "ref": "owner/name#N"|"TEAM-12", "head": <40 hex>|None}:
             what pipeline_validator_limits.limits() is asked about
   limits    {"origin", "paths", "risk_paths", "pr", "window", "queue", "bounces", "watcher", "hold"}:
             exactly the facts limits() reads, each None when it could not be read
@@ -19,8 +20,14 @@ THE SHAPE.  One document for every item. Each consumer reads its own part, and l
             besides the platform, which it reads itself
   brief     {"criteria", "diff", "ticket"}: what the brief builder takes. A merge's: the criteria
             as delegated, and the diff, for build_brief() with the evidence record. A piece's: its
-            plan's criteria, and the piece's own text, for build_ticket_brief() (KIT-543)
+            plan's criteria, and the piece's own text, for build_ticket_brief() (KIT-543). A plan's:
+            its idea's text, and the plan with every piece as written, for the same (KIT-544)
   ticket, plan, idea   the tracker ids it followed, or None
+  state     a plan's own state type, as the tracker gives it (`backlog` until it is approved);
+            None for the other kinds, or when it was not read
+  last_change   a plan's newest change, as the tracker dates it: the newest `updatedAt` of the plan,
+            of every piece and of its idea, in seconds; None for the other kinds, or when one of
+            them was not read
   unread    {fact: why}: every fact it could not read, by name, in fixed words
 
 UNREAD IS NEVER CLEAR (contract section 13).  A fact it could not read is None in its place and named in
@@ -36,9 +43,10 @@ WHERE EACH FACT COMES FROM, each through the reader of the part that owns it:
                rule for a ticket the owner filed: the bridge config's plan_run() and receipt_idea()
                (run_idea() for a planning ticket; on our own runner's lane the plan's receipt names
                the idea itself, KIT-705), and the limits' idea_origin(). A ticket with no plan is
-               judged by the same rule itself.
+               judged by the same rule itself. A plan starts at its own receipt.
                Agent-filed work's generation is the pool's to certify, and is not read here.
-  pr, paths    the pull request and every file it changes, a rename's old name too, from GitHub
+  pr, paths    the pull request and every file it changes, a rename's old name too, from GitHub. A
+               plan's paths: the ones its own text and every piece's name (the limits' named_paths)
   risk_paths   `autonomy.riskPaths` in delivery.json on the default branch; none named is []
   bounces      Stage E's ledger by the limits' bounce_fact(), against `budgets.maxBounces`, read
                by Stage E's own parse_delivery()
@@ -101,11 +109,20 @@ DEFAULTS = {
 }
 PATH_KEYS = ("queue_config", "stage_e_ledger", "snapshot_dir", "acceptance_ledger", "watcher_status",
              "hold_file")
-ISSUE_QUERY = ("query($id: String!) { issue(id: $id) { id identifier description creator { id } "
-               "team { key } labels(first: 20) { nodes { name } } parent { id identifier description "
+ISSUE_QUERY = ("query($id: String!) { issue(id: $id) { id identifier title description updatedAt "
+               "creator { id } team { key } labels(first: 20) { nodes { name } } "
+               "parent { id identifier description "
                "creator { id } labels(first: 20) { nodes { name } } "
                "children(first: %d) { nodes { identifier state { type } } "
                "pageInfo { hasNextPage } } } } }" % MAX_CHILDREN)
+# A plan, with every piece's own text and when each last changed (KIT-544): what the agent judges, and
+# what says whether a decision is about the plan as it stands.
+PLAN_QUERY = ("query($id: String!) { issue(id: $id) { id identifier title description updatedAt "
+              "creator { id } team { key } labels(first: 20) { nodes { name } } parent { id } "
+              "state { type } children(first: %d) { nodes { id identifier title description "
+              "updatedAt } pageInfo { hasNextPage } } } }" % MAX_CHILDREN)
+# The plan states that wait for an approval: a plan someone approved, started or closed has left them.
+PLAN_WAITING = ("backlog", "triage")
 
 
 # Everything Stage E's tracker reader can raise for a read that did not come back whole: its own
@@ -173,12 +190,13 @@ def _tracker_cfg(cfg):
     return {"linear_api_key_env": cfg["linear_key_env"], "team_keys": list(cfg["team_keys"])}
 
 
-def _issue(cfg, ident):
-    """One ticket, with its parent plan and that plan's pieces, through Stage E's tracker reader."""
+def _issue(cfg, ident, query=ISSUE_QUERY):
+    """One ticket, with its parent plan and that plan's pieces, through Stage E's tracker reader. With
+    PLAN_QUERY, one plan with every piece's text."""
     if not cfg["linear_key_env"]:
         raise Unread("no linear_key_env is configured, so the tracker is not read")
     try:
-        data = stage_e.linear_graphql(ISSUE_QUERY, {"id": ident}, _tracker_cfg(cfg))
+        data = stage_e.linear_graphql(query, {"id": ident}, _tracker_cfg(cfg))
     except TRACKER_FAULTS:
         raise Unread("the tracker did not answer for %s" % ident)
     node = data.get("issue") if isinstance(data, dict) else None
@@ -193,7 +211,8 @@ def _empty(kind, ref):
                                                "queue", "bounces", "watcher", "hold")),
             "evidence": {"last_piece": None, "acceptance": None},
             "brief": {"criteria": None, "diff": None, "ticket": None},
-            "ticket": None, "plan": None, "idea": None, "unread": {}}
+            "ticket": None, "plan": None, "idea": None, "state": None, "last_change": None,
+            "unread": {}}
 
 
 def _read(doc, name, fn):
@@ -240,11 +259,26 @@ def _is_plan(node):
     return isinstance(node, dict) and pool.GATE_EPIC_LABEL in pool.label_names(node)
 
 
-def origin_of(cfg, ident, node=None):
-    """(origin, plan id, idea id): `owner` when the owner filed the idea behind ticket `ident`, by the
-    queue pool's own rule. Raises Unread for anything it cannot certify, in fixed words: a source that
-    could not be read, or an idea that is not certified as the owner's."""
-    node = node or _issue(cfg, ident)
+def _idea_of_plan(cfg, pcfg, plan_node):
+    """The idea a plan was filed from, as the tracker's ticket: the plan's receipt names its planning
+    run, and the run names its idea, each on a ticket the owner's key filed. Raises Unread otherwise."""
+    plan = plan_node.get("identifier")
+    runs = [r for r in (bridge_config.plan_run(plan_node, owner) for owner in pcfg["owner_user_ids"])
+            if r]
+    if len(runs) != 1:
+        raise Unread("plan %s names no planning run filed with the owner's key" % plan)
+    run_node = _issue(cfg, runs[0])
+    # KIT-705: on our own runner's lane the receipt names the idea itself (receipt_idea).
+    ideas = sorted(set(i for i in (bridge_config.receipt_idea(run_node, owner)
+                                   for owner in pcfg["owner_user_ids"]) if i))
+    if len(ideas) != 1:
+        raise Unread("the planning run of %s names no idea" % plan)
+    return _issue(cfg, ideas[0])
+
+
+def _origin(cfg, ident, node, is_plan=False):
+    """(origin, plan id, the idea's ticket) for ticket `ident`, read as `node`. A plan starts at its
+    own receipt; any other ticket at its parent plan's, or is its own idea when it has none."""
     raw = _queue_raw(cfg)
     pcfg, bad = pool.config(raw.get("pool") or {})
     if bad or not pcfg:
@@ -252,24 +286,25 @@ def origin_of(cfg, ident, node=None):
     findings = _findings(raw)
     parent = node.get("parent") if isinstance(node.get("parent"), dict) else None
     plan, idea_node = None, node
-    if parent is not None:
+    if is_plan:
+        if not _is_plan(node) or parent is not None:
+            raise Unread("%s is not a plan the idea gate filed" % ident)
+        plan, idea_node = ident, _idea_of_plan(cfg, pcfg, node)
+    elif parent is not None:
         if not _is_plan(parent):
             raise Unread("%s sits under a ticket that is not a plan the idea gate filed" % ident)
-        plan = parent.get("identifier")
-        runs = [r for r in (bridge_config.plan_run(parent, owner) for owner in pcfg["owner_user_ids"])
-                if r]
-        if len(runs) != 1:
-            raise Unread("plan %s names no planning run filed with the owner's key" % plan)
-        run_node = _issue(cfg, runs[0])
-        # KIT-705: on our own runner's lane the receipt names the idea itself (receipt_idea).
-        ideas = sorted(set(i for i in (bridge_config.receipt_idea(run_node, owner)
-                                       for owner in pcfg["owner_user_ids"]) if i))
-        if len(ideas) != 1:
-            raise Unread("the planning run of %s names no idea" % plan)
-        idea_node = _issue(cfg, ideas[0])
+        plan, idea_node = parent.get("identifier"), _idea_of_plan(cfg, pcfg, parent)
     got = limits.idea_origin(raw.get("pool") or {}, idea_node, findings)
     if got not in limits.ORIGINS:
         raise Unread("the idea behind %s is not certified as one the owner filed" % ident)
+    return got, plan, idea_node
+
+
+def origin_of(cfg, ident, node=None):
+    """(origin, plan id, idea id): `owner` when the owner filed the idea behind ticket `ident`, by the
+    queue pool's own rule. Raises Unread for anything it cannot certify, in fixed words: a source that
+    could not be read, or an idea that is not certified as the owner's."""
+    got, plan, idea_node = _origin(cfg, ident, node or _issue(cfg, ident))
     return got, plan, idea_node.get("identifier")
 
 
@@ -514,6 +549,20 @@ def _raise(why):
     raise Unread(why)
 
 
+def _risk_of(cfg, run, node, what):
+    """The riskPaths of the repository the queue's reader names for this ticket, from delivery.json on
+    its default branch. `what` names the ticket in the words an unread fact says."""
+    rcfg, bad = queue_read.reader_config(_queue_raw(cfg).get("reader") or {})
+    repo = None if bad else queue_read.repo_of(rcfg, node)
+    if not isinstance(repo, str) or not REPO_RE.fullmatch(repo):
+        raise Unread("the %s's repository is not known from the queue's reader" % what)
+    info = _api(run, "repos/%s" % repo, "the %s's repository" % what)
+    branch = info.get("default_branch") if isinstance(info, dict) else None
+    if not isinstance(branch, str) or not branch:
+        raise Unread("the %s's repository named no default branch" % what)
+    return _delivery(run, repo, branch)[0]
+
+
 def criteria_text(acceptance, out_of_scope):
     """The snapshot's criteria as the brief's text: the acceptance criteria, then what is out of scope."""
     lines = ["## Acceptance criteria", ""] + ["- [ ] %s" % c for c in acceptance]
@@ -544,18 +593,8 @@ def for_piece(cfg, ident, now, run=None, queue_result=None):
         doc["limits"]["paths"] = _read(doc, "paths", lambda: limits.named_paths(
             [node.get("description") if isinstance(node.get("description"), str) else None])
             if isinstance(node.get("description"), str) else _raise("the piece's ticket has no text"))
-
-        def risk_fact():
-            rcfg, bad = queue_read.reader_config(_queue_raw(cfg).get("reader") or {})
-            repo = None if bad else queue_read.repo_of(rcfg, node)
-            if not isinstance(repo, str) or not REPO_RE.fullmatch(repo):
-                raise Unread("the piece's repository is not known from the queue's reader")
-            info = _api(run, "repos/%s" % repo, "the piece's repository")
-            branch = info.get("default_branch") if isinstance(info, dict) else None
-            if not isinstance(branch, str) or not branch:
-                raise Unread("the piece's repository named no default branch")
-            return _delivery(run, repo, branch)[0]
-        doc["limits"]["risk_paths"] = _read(doc, "risk_paths", risk_fact)
+        doc["limits"]["risk_paths"] = _read(doc, "risk_paths",
+                                            lambda: _risk_of(cfg, run, node, "piece"))
         # The agent judges the piece as written against its plan's criteria (KIT-543): no code yet.
         parent = node.get("parent") if isinstance(node.get("parent"), dict) else {}
         plan_text = parent.get("description")
@@ -585,6 +624,84 @@ def for_piece(cfg, ident, now, run=None, queue_result=None):
             raise Unread("the queue's own order gave no stops to read")
         return got
     _shared(cfg, doc, now, piece_queue)
+    return doc
+
+
+def _text(value):
+    """A ticket's text as the tracker gives it: none is empty, and anything else is not text."""
+    return "" if value is None else value if isinstance(value, str) else None
+
+
+def plan_text(node, kids):
+    """The plan as written, for the agent's ticket brief: its own title and text, then each piece's,
+    in the tracker's order. Raises Unread when a text is not text."""
+    parts = []
+    for n, (label, ticket) in enumerate([("Plan", node)] + [("Piece", k) for k in kids]):
+        title, text = _text(ticket.get("title")), _text(ticket.get("description"))
+        if title is None or text is None:
+            raise Unread("the text of %s could not be read" % (ticket.get("identifier") or "a piece"))
+        head = "%s %s: %s" % (label, ticket.get("identifier"), " ".join(title.split()))
+        if label == "Piece":
+            head = "%s (%d of %d)" % (head, n, len(kids))
+        parts.append("%s\n\n%s" % (head, text.strip()) if text.strip() else head)
+    return "\n\n".join(parts) + "\n"
+
+
+def for_plan(cfg, ident, now, run=None):
+    """The facts for plan `ident` before it is approved (KIT-544): who filed its idea, the paths it and
+    its pieces name, its repository's riskPaths, the facts every item shares, its state and its newest
+    change, and for the agent's brief its idea's text and the plan as written. It has no pull request,
+    no diff, no send-backs and no acceptance check yet, and says so."""
+    run = run or _gh
+    doc = _empty("plan", ident)
+    for fact in ("pr", "bounces", "diff", "acceptance", "last_piece"):
+        doc["unread"][fact] = "a plan that is not approved has no %s" % fact.replace("_", " ")
+    if not isinstance(ident, str) or not TICKET_RE.fullmatch(ident):
+        doc["unread"] = dict((f, "the plan is not a ticket id") for f in FACTS)
+        return doc
+    doc["ticket"] = doc["plan"] = ident
+    node = _read(doc, "origin", lambda: _issue(cfg, ident, PLAN_QUERY))
+    kids = None
+    if node is not None:
+        found = node.get("children") if isinstance(node.get("children"), dict) else {}
+        nodes = found.get("nodes")
+        if (isinstance(nodes, list) and all(isinstance(k, dict) for k in nodes)
+                and (found.get("pageInfo") or {}).get("hasNextPage") is False):
+            kids = nodes
+        state = (node.get("state") or {}).get("type") if isinstance(node.get("state"), dict) else None
+        doc["state"] = state if isinstance(state, str) else None
+        got = _read(doc, "origin", lambda: _origin(cfg, ident, node, is_plan=True))
+        idea = None
+        if got:
+            doc["limits"]["origin"], _plan, idea = got
+            doc["idea"] = idea.get("identifier")
+            title, text = _text(idea.get("title")), _text(idea.get("description"))
+            if title is None or text is None or not (title.strip() or text.strip()):
+                doc["unread"]["criteria"] = "the plan's idea has no text to judge it against"
+            else:
+                head = "Idea %s: %s" % (doc["idea"], " ".join(title.split()))
+                doc["brief"]["criteria"] = ("%s\n\n%s\n" % (head, text.strip()) if text.strip()
+                                            else head + "\n")
+        else:
+            doc["unread"].setdefault("criteria", "the plan's idea was not read")
+        if kids is None:
+            for fact in ("paths", "ticket"):
+                doc["unread"][fact] = "the pieces of plan %s could not all be read" % ident
+        else:
+            texts = [_text(t.get("description")) for t in [node] + kids]
+            doc["limits"]["paths"] = _read(doc, "paths", lambda: limits.named_paths(texts)
+                                           if None not in texts else
+                                           _raise("the text of plan %s or a piece could not be read"
+                                                  % ident))
+            doc["brief"]["ticket"] = _read(doc, "ticket", lambda: plan_text(node, kids))
+            # The idea too: the agent judges the plan against it (Stage E on #638).
+            times = [pool.epoch(t.get("updatedAt")) for t in [node] + kids + [idea or {}]]
+            doc["last_change"] = None if None in times else max(times)
+        doc["limits"]["risk_paths"] = _read(doc, "risk_paths", lambda: _risk_of(cfg, run, node, "plan"))
+    else:
+        for fact in ("paths", "risk_paths", "criteria", "ticket"):
+            doc["unread"].setdefault(fact, "the plan was not read")
+    _shared(cfg, doc, now)
     return doc
 
 
@@ -961,6 +1078,88 @@ def selftest():
                     "reader": {"findings_file": findings}})})
             check("...a piece whose repository the queue cannot name has its riskPaths unread",
                   (got["limits"]["risk_paths"], bool(got["unread"].get("risk_paths"))), (None, True))
+
+            # A plan, before it is approved (KIT-544): its idea through its own receipt, every piece's
+            # text and the paths each names, its state, and its newest change.
+            def plan_doc(kids, state="backlog", labels=(pool.GATE_EPIC_LABEL,), more=False, **over):
+                node = {"id": "id-TOD-10", "identifier": "TOD-10", "title": "The  parser",
+                        "description": "Plan id: TOD-5/abcdef\n\nBuild the parser in `src/parse.py`.",
+                        "updatedAt": "2026-11-18T10:00:00.000Z", "creator": {"id": OWNER},
+                        "team": {"key": "TOD"}, "labels": {"nodes": [{"name": n} for n in labels]},
+                        "parent": None, "state": {"type": state},
+                        "children": {"nodes": [{"id": "id-" + i, "identifier": i, "title": "Do " + i,
+                                                "description": d, "updatedAt": at}
+                                               for i, d, at in kids],
+                                     "pageInfo": {"hasNextPage": more}}}
+                node.update(over)
+                return node
+            KIDS = (("TOD-11", "Write `src/parse.py`.", "2026-11-18T11:00:00.000Z"),
+                    ("TOD-12", None, "2026-11-18T09:00:00.000Z"))
+            IDEA = dict(issue("TOD-4", description="Parse the logs, and nothing more."),
+                        title="Log  parser", updatedAt="2026-11-18T08:00:00.000Z")
+
+            def plan_with(node=None, idea=None, cfg_over=None):
+                tickets.clear()
+                tickets.update(base_tickets)
+                tickets.update({"TOD-10": plan_doc(KIDS) if node is None else node,
+                                "TOD-4": IDEA if idea is None else idea})
+                return for_plan(dict(CFG, **(cfg_over or {})), "TOD-10", NOW, run=host())
+            plan = plan_with()
+            check("a plan: every fact it can have is read, and what it has not got yet is said",
+                  sorted(plan["unread"]), ["acceptance", "bounces", "diff", "last_piece", "pr"])
+            check("a plan: its idea through its own receipt, the paths it and its pieces name, its "
+                  "repository's riskPaths, its state and its newest change",
+                  (plan["item"], plan["limits"]["origin"], (plan["ticket"], plan["plan"], plan["idea"]),
+                   plan["limits"]["paths"], plan["limits"]["risk_paths"], plan["state"],
+                   plan["last_change"]),
+                  ({"kind": "plan", "ref": "TOD-10", "head": None}, "owner", ("TOD-10", "TOD-10", "TOD-4"),
+                   ["src/parse.py"], ["infra/**"], "backlog", pool.epoch("2026-11-18T11:00:00Z")))
+            check("...its brief: its idea's own text, and the plan with each piece as written",
+                  (plan["brief"]["criteria"], plan["brief"]["ticket"], plan["brief"]["diff"]),
+                  ("Idea TOD-4: Log parser\n\nParse the logs, and nothing more.\n",
+                   "Plan TOD-10: The parser\n\nPlan id: TOD-5/abcdef\n\nBuild the parser in "
+                   "`src/parse.py`.\n\nPiece TOD-11: Do TOD-11 (1 of 2)\n\nWrite `src/parse.py`.\n\n"
+                   "Piece TOD-12: Do TOD-12 (2 of 2)\n", None))
+            check("...and limits() reads every fact of it as known",
+                  [r for r in limits.limits(plan["item"], SETTINGS, plan["limits"])["reasons"]
+                   if r.endswith("-unknown")], [])
+            for label, kw, facts_ in (
+                    ("an idea the owner did not file", {"idea": dict(IDEA, creator={"id": DISPATCHER})},
+                     ("origin", "criteria")),
+                    ("a plan the idea gate did not file", {"node": plan_doc(KIDS, labels=())},
+                     ("origin", "criteria")),
+                    ("a plan whose receipt names no planning run", {"node": plan_doc(
+                        KIDS, description="No receipt.")}, ("origin", "criteria")),
+                    ("pieces that run past one page", {"node": plan_doc(KIDS, more=True)},
+                     ("paths", "ticket")),
+                    ("a piece's text that is not text", {"node": plan_doc(
+                        (("TOD-11", ["x"], "2026-11-18T11:00:00.000Z"),))}, ("paths", "ticket")),
+                    ("an idea with no text", {"idea": dict(IDEA, title="", description=None)},
+                     ("criteria",)),
+                    ("the plan, not given by the tracker", {"node": stage_e.BounceError("down")},
+                     ("origin", "paths", "risk_paths", "criteria", "ticket"))):
+                got = plan_with(**kw)
+                reasons = limits.limits(got["item"], SETTINGS, got["limits"])["reasons"]
+                check("a plan, unread: %s is said by name, None in its place, and a limit's own "
+                      "reason holds it" % label,
+                      [f for f in facts_ if not got["unread"].get(f) or value(got, f) is not None
+                       or (f in UNKNOWN and UNKNOWN[f] not in reasons)], [])
+            got = plan_with(node=plan_doc((("TOD-11", "x", None),)))
+            check("a plan with a piece whose last change is not dated has no newest change",
+                  (got["last_change"], got["brief"]["ticket"] is not None), (None, True))
+            check("a plan's newest change counts its idea: the agent judges the plan against it "
+                  "(Stage E on #638), and an idea not dated leaves it unknown",
+                  [plan_with(idea=dict(IDEA, updatedAt=at))["last_change"]
+                   for at in ("2026-11-18T12:30:00.000Z", None)],
+                  [pool.epoch("2026-11-18T12:30:00Z"), None])
+            check("a plan someone approved, started or closed says its own state",
+                  [plan_with(node=plan_doc(KIDS, state=s))["state"] for s in ("unstarted", "canceled")],
+                  ["unstarted", "canceled"])
+            check("the other kinds carry no plan state and no newest change",
+                  [(d["state"], d["last_change"]) for d in (facts_with(), facts_with(
+                      tickets_over=piece_ticket, piece=True))], [(None, None), (None, None)])
+            check("a plan id that is not one reads nothing",
+                  sorted(for_plan(CFG, "not a ticket", NOW)["unread"]), sorted(FACTS))
             check("an id that is not one reads nothing", sorted(for_piece(CFG, "not a ticket", NOW)["unread"]),
                   sorted(FACTS))
             check("a pull request that is not one reads nothing",

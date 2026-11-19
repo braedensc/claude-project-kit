@@ -583,6 +583,10 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
             # After every message is read, so a plan already asked about in a message this
             # pass is not asked about twice (KIT-274).
             self.ask_ready_plans()
+        # KIT-544: after every message is read, so your own answer to a plan comes first; before
+        # the stand-up and the starts, so a plan the validator approved is not said to wait, and
+        # its pieces start this pass.
+        self.validator_approvals()
         self.rundown()
         self.drop_old_words()
         self.watch_answers()
@@ -1438,6 +1442,7 @@ class FakeTracker(object):
 
         def node(i):
             return {"id": i["id"], "identifier": i["identifier"], "title": i["title"],
+                    "updatedAt": i.get("updatedAt"),           # KIT-544: as Q_EPIC dates each
                     "description": i.get("description"), "project": i.get("project"),
                     "state": dict(i["state"]), "team": dict(i["team"]),
                     "delegate": i.get("delegate"), "creator": i.get("creator"),
@@ -2205,6 +2210,9 @@ def _selftest(identity=(True,) * 5, reached=()):
         "PAUSE_THEN_BIND": ("I'll move the plan back to the backlog and start none of its "
                             "pieces until you resume it. A piece already at work keeps going"),
         "RESUME_HINT_BIND": "To go on with it, type `resume %s`.",
+        # KIT-544: a plan the validator approved in your place stays yours to stop.
+        "VALIDATOR_DONE_BIND": ("It's still yours: `pause %s` stops new starts, and `cancel %s` "
+                                "ends it."),
         "RESUME_THEN_BIND": ("I'll mark the plan ready again and go on handing its pieces to "
                              "the agent, at most %d at a time, each once the pieces it waits "
                              "on are done. Merging stays yours"),
@@ -3147,6 +3155,7 @@ def _selftest(identity=(True,) * 5, reached=()):
         pipeline_bridge_plans.cases_answer(kit)
         pipeline_bridge_plans.cases_plan_moves(kit)
         pipeline_bridge_plans.cases_plan_changes(kit)
+        pipeline_bridge_plans.cases_validator(kit)
         pipeline_bridge_pings.cases_pings(kit)
         ping_text = kit.ping_text
         pipeline_bridge_config.cases_config(kit)

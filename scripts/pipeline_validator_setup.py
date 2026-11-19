@@ -21,7 +21,7 @@ WHAT IT BUILDS, for the person running it and nobody else. It makes no account a
         config.json                 the job's config, composed from validator.conf: the settings,
                                     the ledger, the watcher's hold and status, the facts' sources,
                                     the agent and the app's id. Each pass's own loader accepts it
-                                    first: the merge path's and the piece pass's
+                                    first: the merge path's, the piece pass's and the plan pass's
         validator.log               what each pass said: `OFF: ...` while every switch is off
         last-pass.json              the time and exit code of the job's last pass, written by the
                                     job's own shell line after each pass
@@ -126,7 +126,8 @@ try:
     import pipeline_validator_ledger as vledger
     import pipeline_validator_limits as limits
     import pipeline_validator_merge as vmerge             # each pass's own config loader:
-    import pipeline_validator_pieces as vpieces           # the merge path's, and the piece pass's
+    import pipeline_validator_pieces as vpieces           # the merge path's, the piece pass's,
+    import pipeline_validator_plans as vplans             # and the plan pass's (KIT-544)
     import pipeline_validator_settings as vsettings
 except ImportError as exc:  # a packaging accident, never a state to run in
     sys.exit("FAIL: %s. The installer uses those files' own code and keeps no copy." % exc)
@@ -144,10 +145,12 @@ BEAT_NAME, STATE_NAME = "last-pass.json", "setup.json"
 # The NAME the job's config gives the app key file's path (pipeline_validator_check.credential).
 # The plist sets it to APP_KEY_FILE: a path, never the key.
 KEY_ENV = "VALIDATOR_APP_KEY_FILE"
-# The passes the job runs, in order, each `run --config <config>`: the merge path, then the piece
-# pass (KIT-543). Each reads the one config through its own loader, says `OFF:` while its switch is
-# off, and prints `[dry-run]` for each thing a rehearsal says it would decide.
-PASSES = ("pipeline_validator_merge.py", "pipeline_validator_pieces.py")
+# The passes the job runs, in order, each `run --config <config>`: the merge path, the piece pass
+# (KIT-543), then the plan pass (KIT-544): without it no plan is ever approved in the owner's place.
+# Each reads the one config through its own loader, says `OFF:` while its switch is off, and prints
+# `[dry-run]` for each thing a rehearsal says it would decide.
+PASSES = ("pipeline_validator_merge.py", "pipeline_validator_pieces.py",
+          "pipeline_validator_plans.py")
 ROWS_SCHEMA = "validator-setup-rows/1"
 ANSWERS_SCHEMA = "validator-answers/1"
 ANSWERS_KEYS = frozenset(("schema", "consent"))
@@ -998,9 +1001,10 @@ def read_json(path):
 
 
 def loaders_refuse(load):
-    """Every problem each pass's own loader finds, named by its pass; [] when both accept it."""
+    """Every problem each pass's own loader finds, named by its pass; [] when each accepts it."""
     out = []
-    for name, module in (("the merge path", vmerge), ("the piece pass", vpieces)):
+    for name, module in (("the merge path", vmerge), ("the piece pass", vpieces),
+                         ("the plan pass", vplans)):
         _cfg, bad = load(module)
         out += ["%s: %s" % (name, b) for b in bad]
     return out
@@ -1777,13 +1781,15 @@ def selftest():
         if stub is None:
             os.symlink(HERE, os.path.join(kit, "scripts"))
         else:
-            # The first pass says it would decide `n` things and exits `rc`; the others decide
-            # nothing and exit 0, as a pass whose switch is off does.
-            n, rc = stub
-            for i_, pass_ in enumerate(PASSES):
+            # One pass says it would decide `n` things and exits `rc`: the first, or the pass named
+            # third. The others decide nothing and exit 0, as a pass whose switch is off does.
+            n, rc = stub[:2]
+            which = stub[2] if len(stub) > 2 else PASSES[0]
+            for pass_ in PASSES:
+                mine = pass_ == which
                 write(os.path.join(kit, "scripts", pass_), "import sys\n%ssys.exit(%d)\n" % (
                     "".join("print('  [dry-run] would record approved for acme/app#%d at 0123456789ab')\n"
-                            % (i + 1) for i in range(n if i_ == 0 else 0)), rc if i_ == 0 else 0), 0o644)
+                            % (i + 1) for i in range(n if mine else 0)), rc if mine else 0), 0o644)
         conf = os.path.join(base, "validator.conf")
         write(conf, "HOLD_FILE=%s\nWATCHER_STATUS=%s\nAGENT_BIN=%s\nGH_BIN=%s\nPYTHON=%s\n"
               "ENV_FILE=%s\nAPP_KEY_FILE=%s\n%s" % (
@@ -1897,11 +1903,18 @@ def selftest():
        and s[vsettings.REPOS_KEY] == [] and not any(s["limits"].values()), s)
     cfg, bad_cfg = vmerge.load_config(os.path.join(p["home"], FOLDER, CONFIG_NAME))
     pcfg, bad_pcfg = vpieces.load_config(os.path.join(p["home"], FOLDER, CONFIG_NAME))
-    ok("apply: the config holds the hold file and the ledger, and both passes' own loaders accept it",
-       not bad_cfg and not bad_pcfg and cfg["facts"]["hold_file"] == p["hold"]
+    lcfg, bad_lcfg = vplans.load_config(os.path.join(p["home"], FOLDER, CONFIG_NAME))
+    ok("apply: the config holds the hold file and the ledger, and each pass's own loader accepts it",
+       not bad_cfg and not bad_pcfg and not bad_lcfg and cfg["facts"]["hold_file"] == p["hold"]
        and pcfg["facts"]["hold_file"] == p["hold"] and pcfg["ledger_file"] == cfg["ledger_file"]
+       and lcfg["facts"]["hold_file"] == p["hold"] and lcfg["ledger_file"] == cfg["ledger_file"]
        and cfg["ledger_file"] == os.path.join(p["home"], FOLDER, "ledger.json")
-       and cfg["check"] == {"app_id": 4242, "key_file_env": KEY_ENV}, bad_cfg or bad_pcfg or cfg)
+       and cfg["check"] == {"app_id": 4242, "key_file_env": KEY_ENV},
+       bad_cfg or bad_pcfg or bad_lcfg or cfg)
+    asked = [b.split(": ")[0] for b in loaders_refuse(lambda module: (None, ["refused"]))]
+    ok("config: every pass the job runs has its own loader asked, the plan pass's too (KIT-544)",
+       asked == ["the merge path", "the piece pass", "the plan pass"] and len(asked) == len(PASSES),
+       asked)
     plist_path = os.path.join(p["home"], "Library", "LaunchAgents", "local.validator.plist")
     with open(plist_path, "rb") as fh:
         pl = plistlib.load(fh)
@@ -1917,11 +1930,14 @@ def selftest():
     with open(os.path.join(p["home"], FOLDER, LOG_NAME), encoding="utf-8") as fh:
         log = fh.read()
     beat, _why = read_beat(c)
-    ok("apply: the job's first pass ran both real passes, the merge path and then the piece pass, "
-       "and each said its switch is off",
-       PASSES == ("pipeline_validator_merge.py", "pipeline_validator_pieces.py")
+    ok("apply: the job's first pass ran every real pass, the merge path, the piece pass and then the "
+       "plan pass (KIT-544), and each said its switch is off",
+       PASSES == ("pipeline_validator_merge.py", "pipeline_validator_pieces.py",
+                  "pipeline_validator_plans.py")
        and "OFF: the merges switch is off" in log and "OFF: the pieces switch is off" in log
+       and "OFF: the plans switch is off" in log
        and log.index("OFF: the merges switch") < log.index("OFF: the pieces switch")
+       < log.index("OFF: the plans switch")
        and beat and beat["exit"] == 0 and "exited 0" in detail(rows, "enable")
        and c.first_pass == (0, 0), log + str(beat))
     ok("apply: the job file runs each pass with this config, in order",
@@ -2114,6 +2130,15 @@ def selftest():
        and doc["left_off"] == "left off: its first pass would decide 2 things, above its ceiling of 0"
        and doc["first_pass"] == 2 and en["detail"].startswith(doc["left_off"])
        and "[dry-run] would record" in out, "%s\n%s" % (json.dumps(doc)[:900], out[-600:]))
+    vp = place("plan-above", stub=(1, 0, "pipeline_validator_plans.py"))
+    c, fake = ctx_for(vp)
+    (code, rows), out, err = quiet(lambda: cmd_apply(c))
+    doc = rows_document("apply", code, rows, c)
+    ok("ceiling: the plan pass is rehearsed with the others: a plan it would approve, above 0, leaves "
+       "the job off and disabled (KIT-544)",
+       code == EX_BLOCKED and fake.held is None and fake.disabled.get("local.validator") is True
+       and doc["first_pass"] == 1 and "bootstrap" not in fake.verbs(),
+       "%s\n%s" % (json.dumps(doc)[:600], out[-400:]))
     w = place("declined", stub=(0, 3))
     c, fake = ctx_for(w)
     (code, rows), out, err = quiet(lambda: cmd_apply(c))

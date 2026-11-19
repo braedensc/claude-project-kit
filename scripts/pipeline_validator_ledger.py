@@ -70,6 +70,20 @@ HIDDEN_CATEGORIES = ("Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp")
 SAYS_MAX = 300
 
 
+def switches_on(settings):
+    """The ledger's words for the validator's switches that are on, from the settings' load():
+    what a row's `settings_on` holds. A plan's decision counts only under the switches it was made
+    under, so the bridge and the plan pass match a row against these (KIT-544)."""
+    if not isinstance(settings, dict) or settings.get("state") != "read":
+        return []
+    on = ["approve-%s" % k for k in ("plans", "pieces", "merges")
+          if (settings.get("approve") or {}).get(k) is True]
+    on += ["allow-%s" % k.replace("_", "-") for k in ("credentials", "billing_and_accounts",
+                                                       "production_deploy", "deleting_data")
+           if (settings.get("allow") or {}).get(k) is True]
+    return on
+
+
 def plain_line(text):
     """True for one line a person can read in full: 1 to 300 characters, not blank, and none of
     them hidden."""
@@ -784,6 +798,16 @@ def selftest():
            'open(path, "rb")' in rest), ([], 1, True))
     check("append() checks the path before it opens anything",
           0 <= writer_src.find("inside_git_worktree") < writer_src.find("os.open("), True)
+
+    # KIT-544: the words for the switches on are the ledger's own, in its order, and none for
+    # settings that were not read.
+    every = {"state": "read", "approve": {"plans": True, "pieces": True, "merges": True},
+             "allow": dict((k, True) for k in ("credentials", "billing_and_accounts",
+                                               "production_deploy", "deleting_data"))}
+    check("switches_on: every switch on is every ledger word, in order; settings not read, none",
+          (switches_on(every), switches_on(dict(every, state="absent")), switches_on(None),
+           switches_on(dict(every, approve={"plans": True}, allow={}))),
+          (list(SWITCHES), [], [], ["approve-plans"]))
 
     if failures:
         for line in failures:

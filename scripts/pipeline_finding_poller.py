@@ -52,7 +52,8 @@ WHAT THIS DOES, PER FINDING
 THE ACCEPTANCE CHECK'S FOLLOW-UP REQUESTS  (contract section 25, KIT-607)
 
   The acceptance check posts each follow-up on the plan's epic with THIS job's key: line 1
-  is `<!-- pipeline-acceptance:finding plan=<epic> head=<sha> run=<ticket> -->`. It is filed
+  is `<!-- pipeline-acceptance:finding plan=<epic> head=<sha> run=<check> -->`, the check
+  its acceptance ticket, or on the runner's lane its start request (`rq-...`, KIT-708). It is filed
   as above only when that line is the mark, whole, the plan is the ticket it is on, and its
   author is this key's own user. A comment that opens with the mark, or carries it and is not
   the agent's, and breaks a rule is named in the log and never filed, by this path or the
@@ -428,13 +429,14 @@ OVER_TICKET_CAP = "over the per-ticket cap"
 
 # The acceptance check's follow-up request (contract section 25, KIT-607): a comment on a
 # plan's epic, written with THIS job's own key, whose first line is the mark. Its own cap is
-# per check RUN (the check's own acceptance ticket), so a new head, or the same head checked
-# again, can file its own. And one problem is filed once per plan and head.
+# per check RUN (the check's own acceptance ticket, or on the runner's lane its start request,
+# KIT-708), so a new head, or the same head checked again, can file its own. And one problem is
+# filed once per plan and head.
 ACCEPTANCE_MARK_WORD = "pipeline-acceptance:finding"
 ACCEPTANCE_MARK_OPENS = "<!-- " + ACCEPTANCE_MARK_WORD
 ACCEPTANCE_MARK_RE = re.compile(
     r"<!-- pipeline-acceptance:finding plan=([A-Z][A-Z0-9]{1,9}-[0-9]{1,6}) "
-    r"head=([0-9a-f]{40}) run=([A-Z][A-Z0-9]{1,9}-[0-9]{1,6}) -->")
+    r"head=([0-9a-f]{40}) run=([A-Z][A-Z0-9]{1,9}-[0-9]{1,6}|rq-[0-9a-f]{32}) -->")
 MAX_PER_CHECK_RUN = 3
 OVER_RUN_CAP = "over the cap of one acceptance check run"
 ALREADY_FOR_HEAD = "already filed for this plan and head"
@@ -2506,6 +2508,17 @@ def selftest():
         ok3("acceptance: a check run again at the same head, and a new head, can each file "
            "three more; the epic's own per-ticket cap does not count them",
            rc_c2 == EXIT_OK and len(fake_c2.created) == 6, fake_c2.created)
+        # KIT-708: a check on the runner's lane is named by its start request, and is a run of its own.
+        H_C = "c" * 40
+        runner = [_acc("c%d" % n, "on the runner %d" % n, head=H_C, run="rq-" + "e" * 32) for n in range(11, 15)]
+        short = _acc("c15", "a request id cut short", head=H_C, run="rq-" + "e" * 31)
+        fake_c3, log_c3 = _FakeLinear(four + again + newer + runner + [short]), []
+        rc_c3 = _pass(fake_c3, cfg_path, capture=log_c3)
+        ok3("acceptance: a check on the runner's lane, named by its start request, files three, and "
+           "a mark whose run is no request id is not filed, and is named (KIT-708)",
+           rc_c3 == EXIT_OK and [c["title"] for c in fake_c3.created]
+           == ["on the runner %d" % n for n in range(11, 14)]
+           and "comment c14 " in log_c3[0] and "comment c15 " in log_c3[0], (fake_c3.created, log_c3))
         ok3("acceptance: no per-ticket cap note is posted on the epic for a check's requests",
            not any("most one ticket may ask for" in r["body"]
                    for r in fake_c.receipts + fake_c2.receipts))
