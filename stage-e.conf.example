@@ -291,6 +291,18 @@ CATCHUP_WEBHOOK_ID=
 RUNNER_LANE_REPOS=
 RUNNER_STORE_DIR=
 
+# Where our own runner's settings file is, as the role account sees it
+# (docs/RUNNER.md).  The review poller reads each project's review lane there.
+# EMPTY: the file the runner's installed job reads, found each time this runs
+# (the --config in its LaunchDaemon).  With no runner job installed, nothing is
+# written, and the review poller keeps its own default.  Set it only for a
+# runner this installer cannot see; one that disagrees with the installed job
+# is refused, with both files named.  A repository named in RUNNER_LANE_REPOS
+# whose runner settings are missing or unreadable stops the review poller's
+# pass and pages you: it is never read as "lane off".
+# RULE: an absolute path, or one under ~/, or EMPTY.
+RUNNER_SETTINGS=
+
 # The watcher's hold file (docs/WATCHER.md).  While this file exists, the bounce
 # driver sends no re-prompt and the catch-up job re-prompts nothing; each says so
 # on every pass.  Only you clear it, with scripts/pipeline_hold.py.

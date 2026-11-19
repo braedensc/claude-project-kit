@@ -223,7 +223,9 @@ Read its log first.
 script the five jobs load, their imports included, and `schemas/`, which a review and a
 telemetry row are judged against. `session-kinds/` counts too: the runner reads each kind of
 session's walls from it when it starts (KIT-880). They include the notifier's and the Slack bridge's files
-on a machine that runs that job. A merge that touched none of them — a doc, an ADR,
+on a machine that runs that job. A job's own data counts the same way, only where that job is
+installed (KIT-889): `.claude/hooks/` where the runner runs, since its guard runs the kit's guards
+from the clone on every tool call, and `templates/sandbox/look.sb` where the acceptance job runs. A merge that touched none of them — a doc, an ADR,
 another project's script, a bridge file on a machine with no bridge — leaves `verify` at
 `ALREADY-DONE`, naming both commits. If the list of jobs cannot be read, every job's files
 count. `run`
@@ -739,9 +741,16 @@ ticket again. A review already asked finishes on the lane it started on.
 
 - **Which repository.** A project's repository is the one its committed `delivery.json` names
   (`github.owner` and `github.repo`), read from the runner's own clone.
-- **Where the settings are.** `runner_settings` in `poller.json`, by default
+- **Where the settings are.** `runner_settings` in `poller.json`. The installer writes it from
+  `RUNNER_SETTINGS` in `stage-e.conf`, or, with that empty, from the runner's installed job: the
+  `--config` its LaunchDaemon runs with (KIT-892). Move the runner's folder, and the next run of
+  the installer follows it. A key that names another file than the installed job reads is
+  refused, with both named. With no runner job and no key, nothing is written, and the job reads
   `~/.pipeline-runner/runner.json`, where the runner's installer puts them. No file there means
   the runner is not installed, and every review goes by review ticket.
+- **A runner project's settings must be there.** A repository `RUNNER_LANE_REPOS` names is a runner
+  project (`runner_projects` in `poller.json`). Its settings missing, or unreadable, stop the pass:
+  the log names each one, and the heartbeat monitor pages you. It is never read as "lane off".
 - **A file it cannot read stops the pass.** Nothing is filed or asked, on either lane, until it
   can be read again. A lane never changes because a file could not be read.
 
@@ -1749,8 +1758,9 @@ refused by name. The example below is the work-team shape the installer writes:
   directory for the basis resolver). `reviews_team_key` and `reviews_team_id` belong to the
   older Reviews-team shape only: beside the sign-off they are refused by name.
 - Optional too: `runner_settings`, where our own runner's settings are (default
-  `~/.pipeline-runner/runner.json`). It is a place, not a switch: see *Reviews through our own
-  runner* above.
+  `~/.pipeline-runner/runner.json`), and `runner_projects`, the repositories Stage E's settings
+  name as runner projects (KIT-892). Each is a place or a name, not a switch: see *Reviews
+  through our own runner* above.
 
 `~/.stage-e/config.json` — the bounce driver's default path, so its commands need no
 `--config` at all:

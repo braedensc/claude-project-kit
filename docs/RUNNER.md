@@ -196,7 +196,9 @@ files once, when it starts, and keeps a hash of the bytes it read. Before each s
 it reads the folder again and compares, with no network call. When they differ, nothing starts:
 the request waits, and the runner says why. A restart loads the new files. A folder it cannot read
 is never taken as unchanged. Stage E's `verify` counts `session-kinds/` too, so a merge that
-changed only these files moves the clone.
+changed only these files moves the clone. Where the runner's job is installed, it counts the
+kit's guards in `.claude/hooks/` as well (KIT-889): the guard launcher runs them from the clone on
+every tool call.
 
 Good: a merge changes `code.json` alone. `verify` says the clone is behind, and a runner still
 holding the old file holds every start until it restarts.
