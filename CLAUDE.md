@@ -375,6 +375,8 @@ npm run test:validator-setup  # the validator's install (KIT-547): one LaunchAge
                              #   `apply` answers through a pipe, a first-pass ceiling of 0; no key in any output
 npm run test:validator-pieces  # the validator approves a piece starting (KIT-543): the ticket as written,
                              #   against its plan's criteria; it records, and the queue's pool starts it
+npm run test:validator-plans  # the validator approves a plan in your place (KIT-544): the plan as written,
+                             #   against its idea; it records, and the bridge approves it as the validator's
 npm run test:day-planner     # the day planner (KIT-439): ticket text fenced as data in its brief, one
                              #   answer block read, every pick checked, a failing one dropped with a reason
 npm run test:morning         # the morning job (KIT-446): once a day inside the window, one tool-less call,

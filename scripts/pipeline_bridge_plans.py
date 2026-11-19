@@ -32,6 +32,9 @@ WHAT IS HERE
                  offered again only once Linear has stopped retrying it (KIT-289).
   Finish (KIT-299)  once every piece is merged: the epic to its done state, one comment,
                  one wrap-up, and its review notes filed as one ticket after one more yes.
+  The validator (KIT-544)  with its plans switch on, its approval answers an open approve
+                 question in the owner's place, on every check his yes gets, and is recorded
+                 under the validator's name, never his (validator_approvals).
 """
 import hashlib
 import json
@@ -56,6 +59,10 @@ import pipeline_queue_start as starter  # noqa: E402
 import pipeline_pass_lock as pass_lock  # noqa: E402  (one pass at a time: the queue's ledger lock, KIT-681)
 import pipeline_routing_tags as routing  # noqa: E402  (KIT-405: the follow-up's directive pin)
 import pipeline_runner_store as runner_store  # noqa: E402  (KIT-645: requests to our own runner)
+# KIT-544: the validator's ledger and settings, read by their own readers: a plan it approved
+# in the owner's place, while its plans switch is on.
+import pipeline_validator_ledger as vledger  # noqa: E402
+import pipeline_validator_settings as vsettings  # noqa: E402
 import pipeline_voice as voice  # noqa: E402
 # The telemetry reader's own parse of a comment's `pipeline-telemetry/1` blocks: a review's
 # notes are read the way the dashboard reads them (KIT-299).
@@ -63,8 +70,8 @@ import telemetry_scrape as scrape  # noqa: E402
 from pipeline_bridge_transport import BridgeError  # noqa: E402
 from pipeline_bridge_config import (ASK_AGAIN_BIND, DONE, EXIT_USAGE, EXPIRED,  # noqa: E402
                                     OPEN, REFUSED, SLACK_USER_RE, _TICKET_WORD_RE,
-                                    credit_terms, epoch, iso, key_of, label_names, plan_run,
-                                    receipt_idea, run_idea, state_path, ticket_number,
+                                    credit_terms, epoch, iso, key_of, label_names, open_approvals,
+                                    plan_run, receipt_idea, run_idea, state_path, ticket_number,
                                     ts_float)
 
 # KIT-305: how many passes a plan's close keeps trying to close its idea when the tracker would
@@ -103,6 +110,18 @@ APPROVE_ONE_QUESTION = ("It came with one open question from the planner, in its
                         "ticket's notes.")
 APPROVE_QUESTIONS = ("It came with %d open questions from the planner, in its planning "
                      "ticket's notes.")
+# KIT-544: the validator approves a plan in the owner's place while its plans switch is on. Its
+# approval is recorded under its own name, the pool's VALIDATOR, which no Slack id is, and never
+# under his. What the bridge says when it acts on one, and how the plan stays his.
+VALIDATOR = starter.pool.VALIDATOR
+VALIDATOR_NAME = "the validator"
+VALIDATOR_DONE = ("The validator approved %s in your place. I'll hand its pieces to the agent in "
+                  "order, at most %d at a time, each once what it waits on is done, and say here as "
+                  "each one starts.%s")
+VALIDATOR_DONE_BIND = "It's still yours: `pause %s` stops new starts, and `cancel %s` ends it."
+VALIDATOR_REFUSED = "The validator approved %s in your place, but "
+# The ledger's own word for a plan's row, and the idea gate's mark of an idea the owner filed.
+PLAN_SUBJECT, HUMAN_LABEL = "plan", starter.pool.HUMAN_LABEL
 # How long a page the bridge asked about, or passed over, is remembered: past the four weeks
 # the notifier keeps any record of it, so no page is ever asked about twice.
 READY_PLANS_KEEP_SECONDS = 35 * 24 * 3600
@@ -555,6 +574,17 @@ def changes_since(shown, epic):
     if removed:
         parts.append("%d removed" % removed)
     return "; ".join(parts)
+
+
+def plan_last_change(epic):
+    """KIT-544: the plan's newest change, as the tracker dates it: the newest `updatedAt` of the
+    epic and of every piece, in seconds. None when one is not dated, or its pieces run past one
+    read. The validator's facts read the same (pipeline_validator_facts.for_plan): a row of its
+    is about the plan as it stands only when it is newer than this."""
+    if ((epic.get("children") or {}).get("pageInfo") or {}).get("hasNextPage") is not False:
+        return None
+    times = [starter.pool.epoch(n.get("updatedAt")) for n in [epic] + children_of(epic)]
+    return None if None in times else max(times)
 
 
 def epic_problems(epic, kids=None, owner=None):
@@ -1097,11 +1127,17 @@ def wrap_up_parts(epic, pieces, notes, done_name, checked=None):
 
 def closing_comment(rec, pieces, done_name, now):
     """The comment on a plan the bridge closes: who approved it, when it finished, and each
-    piece with its pull requests. Names and titles are relayed text."""
-    lines = ["Marked %s by the tech lead at %s: every piece of this plan is finished. "
-             "**%s** (Slack user %s) approved it in Slack at %s."
-             % (done_name, iso(now), _relayed(rec.get("approved_name"), 120) or "?",
-                rec.get("approved_by") or "?", rec.get("approved_at") or "?"), ""]
+    piece with its pull requests. Names and titles are relayed text. A plan the validator
+    approved says so, and names no person (KIT-544)."""
+    if rec.get("approved_by") == VALIDATOR:
+        who = ("The validator approved it at %s, in the owner's place."
+               % (rec.get("approved_at") or "?"))
+    else:
+        who = ("**%s** (Slack user %s) approved it in Slack at %s."
+               % (_relayed(rec.get("approved_name"), 120) or "?", rec.get("approved_by") or "?",
+                  rec.get("approved_at") or "?"))
+    lines = ["Marked %s by the tech lead at %s: every piece of this plan is finished. %s"
+             % (done_name, iso(now), who), ""]
     for p in pieces:
         _why, merged, unknown = piece_merge(p["prs"])
         if merged:
@@ -1543,16 +1579,34 @@ class PlansMixin(object):
         open_ = [s for s in statuses if s not in poller.SESSION_FINISHED]
         return bool(open_) and all(s in SESSION_UNPICKED for s in open_)
 
-    def act_approve(self, channel, thread, q, msg):
+    def act_approve(self, channel, thread, q, msg, validator=None):
         """Move the epic to its team's ready state, as the owner, and record it as approved,
-        so every pass from now on starts its children in order. Re-read first."""
+        so every pass from now on starts its children in order. Re-read first. With
+        `validator`, the time of the validator's `approved` row (KIT-544), there is no message:
+        the validator approves in the owner's place, on every check his yes gets, and the
+        record, the comment and the reply name the validator, never him. Its approval counts
+        only for the plan as it stands, and only for a plan from an idea he filed: otherwise
+        nothing is done, and the question stays his. A refusal is said where he was asked, and
+        his question stays open too (Stage E on #638). Either way that decision is not tried
+        again (`validator_tried`). Its caller has checked the action limit."""
+        by_validator = validator is not None
+
         def finish(status, text, what, kind="approve-refused", bind=""):
             # Posted first: the status changes only after the reply saying so lands.
+            if by_validator and kind != "approve-done":
+                text = VALIDATOR_REFUSED % q["ticket"] + text
             self.post(channel, thread, text, kind=kind, bind=bind, join=" ",
                       facts={"ticket": q["ticket"]})
+            if by_validator:
+                if kind == "approve-done":
+                    q.update(status=status, answered_by=VALIDATOR, answered_ts=None)
+                else:
+                    q["validator_tried"] = validator          # his question stays open
+                self.say("  validator: %s: %s" % (q["ticket"], what))
+                return
             q.update(status=status, answered_by=msg["user"], answered_ts=msg.get("ts"))
             self.mark(channel, msg, what)
-        if self.refused_over_limit(channel, thread, msg):
+        if not by_validator and self.refused_over_limit(channel, thread, msg):
             return
         epic = self.tracker.epic(q["ticket"])
         if not epic or not epic.get("id"):
@@ -1568,6 +1622,12 @@ class PlansMixin(object):
             finish(DONE, "%s is already approved." % q["ticket"], "done: already",
                    kind="approve-already")
             return
+        if by_validator:
+            waits = self.validator_waits(epic, validator, q.get("asked_at"))
+            if waits:
+                q["validator_tried"] = validator              # its next decision is tried
+                self.say("  validator: %s: %s, so its approval does nothing" % (q["ticket"], waits))
+                return
         changed = changes_since(q.get("children") or {}, epic)
         if changed:
             finish(REFUSED, "%s's pieces changed since I asked (%s), so nothing was "
@@ -1586,10 +1646,13 @@ class PlansMixin(object):
                    "refused: %s" % problems[0][:80])
             return
         if self.dry:
-            self.say("  [dry-run] would approve %s" % q["ticket"])
+            self.say("  [dry-run] would approve %s%s" % (q["ticket"], " as the validator"
+                                                         if by_validator else ""))
             return
-        name = self.name_of(msg["user"])
-        when = iso(ts_float(msg.get("ts")))
+        if by_validator:
+            by, name, when = VALIDATOR, VALIDATOR_NAME, iso(self.now)
+        else:
+            by, name, when = msg["user"], self.name_of(msg["user"]), iso(ts_float(msg.get("ts")))
         state = epic.get("state") or {}
         if state.get("id") != ready_id and state.get("type") in ("backlog", "triage",
                                                                  "unstarted"):
@@ -1597,14 +1660,19 @@ class PlansMixin(object):
             self.state["acted_at"].append(self.now)
         self.state["epics"][epic["id"]] = {
             "ticket": epic["identifier"], "team": team, "channel": channel,
-            "thread": thread, "approved_by": msg["user"], "approved_name": name,
+            "thread": thread, "approved_by": by, "approved_name": name,
             "approved_at": when, "started": [], "noted": [],
             "approved": dict(q.get("children") or {}), "started_at": {}, "failures": 0}
         self.save()
-        body = ("Approved in Slack by **%s** (Slack user %s) at %s, through the tech lead."
-                "\n\nIts children are handed to the agent in dependency order, at most %d at "
-                "once, each once the tickets it waits on are Done. Merging stays the owner's."
-                % (name, msg["user"], when, self.cfg["epic_wip"]))
+        how = ("Its children are handed to the agent in dependency order, at most %d at once, "
+               "each once the tickets it waits on are Done. Merging stays the owner's."
+               % self.cfg["epic_wip"])
+        if by_validator:
+            body = ("Approved by the validator at %s, in the owner's place: its plans switch is "
+                    "on, and its record approves this plan as it stands.\n\n%s" % (when, how))
+        else:
+            body = ("Approved in Slack by **%s** (Slack user %s) at %s, through the tech lead."
+                    "\n\n%s" % (name, msg["user"], when, how))
         owed = ""
         try:
             self.tracker.comment(epic["id"], body)
@@ -1615,12 +1683,149 @@ class PlansMixin(object):
             self.owe(epic["id"], q["ticket"], body)
             owed = (" The approval was done, but the comment naming who approved it could not "
                     "be written; I will try again.")
-        finish(DONE, "Approved %s for <@%s>. I'll hand its pieces to the agent in order, "
-               "at most %d at a time, each once what it waits on is done, and say here as "
-               "each one starts.%s" % (q["ticket"], msg["user"], self.cfg["epic_wip"], owed),
-               "done: approved %s" % q["ticket"], kind="approve-done")
+        if by_validator:
+            finish(DONE, VALIDATOR_DONE % (q["ticket"], self.cfg["epic_wip"], owed),
+                   "done: approved %s as the validator" % q["ticket"], kind="approve-done",
+                   bind=VALIDATOR_DONE_BIND % (q["ticket"], q["ticket"]))
+        else:
+            finish(DONE, "Approved %s for <@%s>. I'll hand its pieces to the agent in order, "
+                   "at most %d at a time, each once what it waits on is done, and say here as "
+                   "each one starts.%s" % (q["ticket"], msg["user"], self.cfg["epic_wip"], owed),
+                   "done: approved %s" % q["ticket"], kind="approve-done")
         self.counts["acted"] += 1
-        self.say("  acted: approved %s for %s" % (q["ticket"], msg["user"]))
+        self.say("  acted: approved %s for %s" % (q["ticket"], VALIDATOR_NAME if by_validator
+                                                  else msg["user"]))
+
+    # -- The validator approves a plan in the owner's place (KIT-544) ------------------------
+    def validator_record(self):
+        """(rows, switches, why): the validator's ledger rows, while its plans switch is on, from
+        the two files the queue's reader names (`reader.validator_settings_file` and
+        `reader.validator_ledger_file`, KIT-543): one place names them for the whole pipeline.
+        Each is read by its own reader. `switches` are the ledger's words for the switches on now:
+        a decision counts only under the switches it was made under. Rows None, with why in
+        words, when its approval cannot count: no queue config or no file named, settings not
+        read, the plans switch off, or a ledger its reader does not trust. Then the owner's
+        `approve` decides, as before."""
+        if not self.cfg["queue_config"]:
+            return None, (), "no queue config names the validator's files"
+        try:
+            with open(self.cfg["queue_config"], encoding="utf-8") as fh:
+                qcfg, bad = starter.load(json.load(fh))
+        except (OSError, ValueError, RecursionError) as exc:
+            return None, (), "the queue's settings could not be read (%s)" % type(exc).__name__
+        if bad:
+            return None, (), "the queue's settings are not usable"
+        spath = qcfg["reader"]["validator_settings_file"]
+        lpath = qcfg["reader"]["validator_ledger_file"]
+        if not spath or not lpath:
+            return None, (), "the queue's reader names no validator settings and ledger"
+        settings = vsettings.load(spath)
+        if settings["state"] != vsettings.READ:
+            return None, (), "the validator's settings were not read (%s)" % settings["why"]
+        if settings["approve"].get("plans") is not True:
+            return None, (), "the validator's plans switch is off"
+        got = vledger.read(lpath)
+        if got["rows"] is None:
+            return None, (), got["why"]
+        return got["rows"], tuple(sorted(vledger.switches_on(settings))), ""
+
+    def owners_idea(self, idea):
+        """Nothing ("") when the plan's idea is one the owner filed himself, by the parts of the
+        queue pool's rule the bridge can read: his key filed it, it carries `provenance:human`, and
+        it has no parent. Else why not, in words. A plan from an idea an agent filed never counts as
+        the validator's to approve (KIT-544): the validator's own limits hold it, and this holds
+        it again."""
+        ident = idea.get("identifier") or "?"
+        if (idea.get("creator") or {}).get("id") != self.cfg["owner_user_id"]:
+            return "its idea %s was not filed with your key" % ident
+        if HUMAN_LABEL not in label_names(idea):
+            return "its idea %s does not carry `%s`" % (ident, HUMAN_LABEL)
+        if (idea.get("parent") or {}).get("id"):
+            return "its idea %s has a parent ticket" % ident
+        return ""
+
+    def validator_waits(self, epic, at, asked_at):
+        """Why the validator's approval, recorded at `at` (seconds), does not answer the question
+        asked at `asked_at` for this plan now, or "". Its idea, found as a re-plan finds it
+        (plan_idea), must be one the owner filed: otherwise it never counts. And it must be about
+        the plan as it stands and as he was asked about it: newer than the plan's, every piece's
+        and its idea's last change, and than the question. Any of those later waits for a new
+        decision (Stage E on #638: a piece taken out of the plan, which may date no ticket left
+        in it, shows against the question's own pieces, as for his yes)."""
+        idea, why = self.plan_idea({"ticket": epic["identifier"]})
+        why = why if idea is None else self.owners_idea(idea)
+        if why:
+            return "%s, which only you can approve" % why
+        last = plan_last_change(epic)
+        idea_at = starter.pool.epoch(idea.get("updatedAt"))
+        if last is None or idea_at is None:
+            return "the plan's last change is not dated, so its approval cannot be matched to it"
+        if at <= max(last, idea_at):
+            return ("the plan or its idea changed after the validator read them, so it waits for "
+                    "a new decision")
+        if not isinstance(asked_at, (int, float)) or at <= asked_at:
+            return "the validator decided before I asked you, so it waits for a new decision"
+        return ""
+
+    def validator_approvals(self):
+        """KIT-544: with the validator's plans switch on, its `approved` row answers an open approve
+        question in the owner's place: act_approve, with every check his yes gets, and recorded
+        under the validator's name, never his. Only the newest row about the plan counts. The
+        owner's own answer comes first: this runs after every message is read, so a question he
+        answered, approved or declined is no longer open, and a plan already approved is left
+        alone. The switch off or unreadable, a decision made under other switches than are on now
+        (Stage E on #638), a question past its time, settings changed since it was asked, acting
+        off, or the hour's action limit reached: nothing is done, and the pass log says which. A
+        decision that waited or was refused is not tried again: the validator's next one is. A
+        tracker that fails is said, and the next pass tries again."""
+        asked = open_approvals(self.state)
+        if not asked:
+            return
+        rows, switches, why = self.validator_record()
+        if rows is None:
+            self.say("  validator: %s, so no plan is approved in your place" % why)
+            return
+        latest = {}
+        for row in rows:
+            if row["subject"] == PLAN_SUBJECT:
+                latest[row["ref"]] = row
+        approved = set(rec.get("ticket") for rec in self.state["epics"].values())
+        def oldest_first(kq):
+            at = kq[1].get("asked_at") if isinstance(kq[1], dict) else None
+            return (at if isinstance(at, (int, float)) and not isinstance(at, bool) else 0, kq[0])
+        for _key, q in sorted(self.state["questions"].items(), key=oldest_first):
+            if not isinstance(q, dict):
+                continue
+            row = latest.get(q.get("ticket"))
+            if (q.get("kind") != "approve" or q.get("status") != OPEN
+                    or q.get("ticket") not in asked or q["ticket"] in approved
+                    or not row or row["kind"] != "approved" or epoch(row["at"]) is None
+                    or q.get("validator_tried") == epoch(row["at"])):
+                continue
+            if self.now - (q.get("asked_at") or 0) > self.cfg["question_ttl_hours"] * 3600:
+                continue                          # its time is up: the expiry closes it this pass
+            if tuple(sorted(row["settings_on"])) != switches:
+                self.say("  validator: %s: it decided under switches that have changed since, so "
+                         "it waits for a new decision" % q["ticket"])
+                continue
+            if q.get("promised") != self.promised("approve"):
+                self.say("  validator: %s: my settings changed since I asked, so its approval "
+                         "does nothing" % q["ticket"])
+                continue
+            if not self.cfg["act"]:
+                self.say("  validator: %s: acting is switched off here, so it was not approved"
+                         % q["ticket"])
+                continue
+            if self.actions_left() <= 0:
+                self.say("  validator: %s waits for the next hour: the action limit" % q["ticket"])
+                return
+            try:
+                self.act_approve(q["channel"], q.get("thread"), q, None, validator=epoch(row["at"]))
+            except BridgeError as exc:
+                self.say("  validator: %s could not be approved this pass: %s"
+                         % (q["ticket"], self.clean(str(exc))[:160]))
+            approved = set(rec.get("ticket") for rec in self.state["epics"].values())
+            self.save()
 
     # -- A plan paused, resumed or cancelled from Slack (KIT-351) ---------------------------
     def request_plan_move(self, channel, msg, thread, requester, ident, kind, by_bot=False,
@@ -2670,9 +2875,14 @@ class PlansMixin(object):
             self.say("  [dry-run] would hand %s to the agent" % ident)
             return
         after = [b.get("identifier") or "?" for b, _st in blockers_of(child)]
-        body = ("Started by the tech lead for **%s** (Slack user %s), who approved %s in "
-                "Slack at %s." % (rec["approved_name"], rec["approved_by"], rec["ticket"],
-                                  rec["approved_at"]))
+        if rec.get("approved_by") == VALIDATOR:
+            # KIT-544: approved in the owner's place, so no person is named as its approver.
+            body = ("Started by the tech lead. The validator approved %s at %s, in the owner's "
+                    "place." % (rec["ticket"], rec["approved_at"]))
+        else:
+            body = ("Started by the tech lead for **%s** (Slack user %s), who approved %s in "
+                    "Slack at %s." % (rec["approved_name"], rec["approved_by"], rec["ticket"],
+                                      rec["approved_at"]))
         if after:
             body += "\n\nIt waited on %s, now Done." % ", ".join(after)
 
@@ -8280,12 +8490,282 @@ def cases_plan_changes(kit):
               [True, True, True, False, False, False, False, False, False, False, False])
 
 
+def cases_validator(kit):
+    """The validator approves a plan in the owner's place (KIT-544): one case per state of its
+    plans switch, the provenance rule and the actor recorded, with a mutant that records the
+    owner as the approver. Its settings and its ledger are real files, read by their own
+    readers; the queue's decision is stood in for, as the queue's own cases do."""
+    global VALIDATOR                       # the mutant below records another name, then puts it back
+    from pipeline_bridge import ALICE, BOB, EXIT_OK, OWNER, run_text
+    from pipeline_bridge_config import DECLINED
+    with kit as tmp:
+        check, now, posted = kit.take("check", "now", "posted")
+        run, world, status_of = kit.take("run", "world", "status_of")
+        ROW = {"subject": PLAN_SUBJECT, "ref": "PROD-50", "head": None, "kind": "approved",
+               "layers": {"hard_limits": "pass", "evidence": "pass", "agent": "pass"},
+               "settings_on": ["approve-plans"],
+               "size_limits": {"max_changed_lines": 400, "max_files": 20},
+               "reasons": [], "agent_says": "It asks for what its idea asks, and nothing more."}
+        HELD = dict(ROW, kind="held", reasons=["risk-path"], agent_says=None,
+                    layers={"hard_limits": "fail", "evidence": "pass", "agent": "not-run"})
+        PERSON = (OWNER, ALICE, BOB)
+
+        def settings_doc(plans=True, everything=False):
+            return {"schema": vsettings.SETTINGS_SCHEMA,
+                    "approve": {"plans": plans, "pieces": everything, "merges": everything},
+                    "limits": {"max_changed_lines": 400, "max_files": 20},
+                    "allow": dict((k, everything) for k in vsettings.ALLOW),
+                    "stage_e_login": None, "merge_repos": []}
+
+        def vworld(name, settings=None, named=True, idea=None, act=True):
+            """A plan the idea gate filed from the owner's own idea, asked about with `approve`,
+            with the validator's two files named in the queue's config. `settings` is the text of
+            its settings file ("absent" for none; None for the plans switch on), and `idea` what
+            differs of the idea, PROD-6."""
+            folder = os.path.join(tmp, "validator-" + name)
+            os.makedirs(folder, mode=0o755)
+            spath, lpath = os.path.join(folder, "settings.json"), os.path.join(folder, "ledger.json")
+            if settings != "absent":
+                with open(spath, "w", encoding="utf-8") as fh:
+                    fh.write(json.dumps(settings_doc()) if settings is None else settings)
+                os.chmod(spath, 0o600)
+            with open(os.path.join(folder, "usage.json"), "w", encoding="utf-8") as fh:
+                json.dump({"schema": "pipeline-usage/1", "written_at": iso(now + 1500),
+                           "result": "ok", "limit_stops": [], "limit_stops_over_cap": 0}, fh)
+            reader = {"ledger_file": os.path.join(folder, "starts.json"),
+                      "inputs_file": os.path.join(folder, "in.json")}
+            if named:
+                reader.update(validator_settings_file=spath, validator_ledger_file=lpath)
+            conf = os.path.join(folder, "queue.json")
+            with open(conf, "w", encoding="utf-8") as fh:
+                json.dump({"pool": {"owner_user_ids": ["owner-1"], "team_keys": ["PROD"],
+                                    "dispatcher_user_ids": ["agent-1"]}, "reader": reader,
+                           "morning": {"usage_file": os.path.join(folder, "usage.json")},
+                           "hold": {"file": os.path.join(folder, "hold.json")}}, fh)
+            c, s, t = world(name, act=act, agent_user_name="Agent", epic_wip=1, queue_config=conf)
+            t.add_epic("PROD-50", (("PROD-51", ()), ("PROD-52", ("PROD-51",))))
+            # Its receipt, its planning run and its idea, as the idea gate files them.
+            t.issues["PROD-60"] = {
+                "id": "uuid-60", "identifier": "PROD-60", "title": "Planning run",
+                "team": {"key": "PROD"},
+                "state": {"id": "st-done", "name": "Done", "type": "completed"},
+                "creator": {"id": OWNER, "displayName": "Planner"},
+                "description": run_text("PROD-6", "T1")}
+            t.issues["PROD-50"]["description"] += "\n\nPlan id: PROD-60/abc"
+            t.issues["PROD-6"].update(creator={"id": OWNER}, labels=["provenance:human"],
+                                      parent=None, updatedAt="2025-10-09T08:00:00.000Z")
+            t.issues["PROD-6"].update(idea or {})
+            for ident in ("PROD-50", "PROD-51", "PROD-52"):
+                t.issues[ident]["updatedAt"] = "2025-10-09T08:00:00.000Z"   # filed before it
+            run(c, s, t)
+            root = s.add(ALICE, "approve PROD-50")
+            run(c, s, t)
+            return c, s, t, root, lpath
+
+        def decide(lpath, *rows):
+            for n, row in enumerate(rows):
+                vledger.append(lpath, row, lambda n=n: now + 100 + n)
+
+        def record(c):
+            with open(state_path(c), encoding="utf-8") as fh:
+                return json.load(fh)["epics"].get("uuid-50")
+
+        def actor_ok(c, t):
+            """The approval is the validator's, and no person is named anywhere it is kept."""
+            rec = record(c) or {}
+            kept = [json.dumps(rec)] + [b for i, b in t.comments if i == "uuid-50"]
+            return (rec.get("approved_by") == starter.pool.VALIDATOR
+                    and not [p for p in PERSON for x in kept if p in x])
+
+        answer = {"v": {"state": "closed", "why": "before-start", "window": {}, "inputs": None,
+                        "decision": None}}
+        real = starter.decide
+        starter.decide = lambda raw, gql, now_, clock=None, say=None: answer["v"]
+        try:
+            # 1. ON: its approval answers the open question in your place, recorded as its own.
+            c, s, t, root, lpath = vworld("val-on")
+            decide(lpath, ROW)
+            said = len(posted(s))
+            code, _out = run(c, s, t, at=now + 1000)
+            q = [v for v in json.load(open(state_path(c)))["questions"].values()][0]
+            check("validator-on-its-approval-answers-your-question-and-the-plan-moves-to-ready",
+                  (code, t.moves, q["status"], q.get("answered_by")),
+                  (EXIT_OK, [("uuid-50", "st-todo")], DONE, starter.pool.VALIDATOR))
+            check("validator-the-approval-is-recorded-as-the-validators-never-a-persons",
+                  ((record(c) or {}).get("approved_name"), actor_ok(c, t)), (VALIDATOR_NAME, True))
+            check("validator-the-plan-says-the-validator-approved-it-in-your-place",
+                  [b.splitlines()[0] for i, b in t.comments if i == "uuid-50"],
+                  ["Approved by the validator at %s, in the owner's place: its plans switch is on, "
+                   "and its record approves this plan as it stands." % iso(now + 1000)])
+            check("validator-it-is-said-where-you-were-asked-with-how-to-stop-it",
+                  posted(s)[said:], [VALIDATOR_DONE % ("PROD-50", 1, "") + " "
+                                     + VALIDATOR_DONE_BIND % ("PROD-50", "PROD-50")])
+            # Its pieces start as a plan you approved does, and each start names the validator.
+            answer["v"] = {"state": "decided", "why": None, "window": {}, "inputs": None,
+                           "decision": {"start": [{
+                               "ticket": "PROD-51", "id": "uuid-51", "repo": "acme/app",
+                               "lane": "acme/app:1", "slot": 1, "estimate": 2.0, "priority": 0,
+                               "source": "plan", "plan": "PROD-50", "by": starter.pool.VALIDATOR,
+                               "at": iso(now + 1000)}], "held": [], "stops": []}}
+            run(c, s, t, at=now + 2000)
+            answer["v"] = dict(answer["v"], state="closed", decision=None)
+            check("validator-a-piece-of-it-starts-with-a-comment-naming-the-validator-not-you",
+                  ([i for i, _a in t.delegations],
+                   [b.splitlines()[0] for i, b in t.comments if i == "uuid-51"]),
+                  (["uuid-51"], ["Started by the tech lead. The validator approved PROD-50 at %s, "
+                                 "in the owner's place." % iso(now + 1000)]))
+            # You can still cancel it, at any time.
+            req = s.add(ALICE, "cancel PROD-50")
+            run(c, s, t, at=now + 2100)
+            s.add(BOB, "yes", thread=req)
+            run(c, s, t, at=now + 2200)
+            check("validator-you-can-still-cancel-a-plan-it-approved",
+                  (t.moves[-1], record(c)), (("uuid-50", "st-canceled"), None))
+
+            # 2. OFF, UNREADABLE, ABSENT OR NOT NAMED: its approval does nothing, and your own yes
+            #    approves as it always has.
+            for name, kw in (("val-off", {"settings": json.dumps(settings_doc(plans=False))}),
+                             ("val-garbled", {"settings": "{ not settings"}),
+                             ("val-absent", {"settings": "absent"}),
+                             ("val-unnamed", {"named": False})):
+                c, s, t, root, lpath = vworld(name, **kw)
+                decide(lpath, ROW)
+                code, out = run(c, s, t, at=now + 1000)
+                first = (code, list(t.moves), record(c), status_of(c),
+                         "so no plan is approved in your place" in out)
+                s.add(BOB, "yes", thread=root)
+                run(c, s, t, at=now + 1100)
+                check("validator-%s-its-approval-does-nothing-and-your-yes-approves-as-before" % name,
+                      (first, t.moves, (record(c) or {}).get("approved_by")),
+                      ((EXIT_OK, [], None, [OPEN], True), [("uuid-50", "st-todo")], BOB))
+
+            # 3. THE PROVENANCE RULE: a plan from an idea you did not file is never its to
+            #    approve, whatever the switches. The question stays yours.
+            for name, idea, why in (
+                    ("val-idea-by-agent", {"creator": {"id": "agent-1"}}, "was not filed with your key"),
+                    ("val-idea-unmarked", {"labels": ["provenance:agent"]},
+                     "does not carry `provenance:human`"),
+                    ("val-idea-a-finding", {"parent": {"id": "uuid-5"}}, "has a parent ticket")):
+                c, s, t, root, lpath = vworld(
+                    name, idea=idea, settings=json.dumps(settings_doc(everything=True)))
+                decide(lpath, dict(ROW, settings_on=list(vledger.SWITCHES)))
+                said = len(posted(s))
+                code, out = run(c, s, t, at=now + 1000)
+                _code, again = run(c, s, t, at=now + 1100)
+                check("validator-provenance-%s-is-never-approved-by-it-whatever-the-switches-"
+                      "said-once" % name,
+                      (t.moves, record(c), status_of(c), why in out, why in again, posted(s)[said:]),
+                      ([], None, [OPEN], True, False, []))
+
+            # 4. ONLY THE PLAN AS IT STANDS: an approval older than its last change waits for a
+            #    new one; only its newest decision counts; a plan changed since you were asked
+            #    is not approved, and that is said.
+            c, s, t, root, lpath = vworld("val-stale")
+            decide(lpath, ROW)
+            t.issues["PROD-52"]["updatedAt"] = iso(now + 500)       # after the validator read it
+            code, out = run(c, s, t, at=now + 1000)
+            first = (list(t.moves), record(c), status_of(c),
+                     "changed after the validator read them" in out)
+            vledger.append(lpath, ROW, lambda: now + 1200)         # it judged the plan again
+            run(c, s, t, at=now + 1500)
+            check("validator-an-approval-older-than-the-plans-last-change-waits-for-a-new-one",
+                  (first, t.moves, (record(c) or {}).get("approved_by")),
+                  (([], None, [OPEN], True), [("uuid-50", "st-todo")], starter.pool.VALIDATOR))
+            # Stage E on #638: its idea is part of what it judged, and a decision made before you
+            # were asked is not its answer to the question.
+            for name, setup, when, why in (
+                    ("val-idea-changed",
+                     lambda t_: t_.issues["PROD-6"].update(updatedAt=iso(now + 500)), now + 100,
+                     "the plan or its idea changed after the validator read them"),
+                    ("val-before-asked", None, now - 100, "the validator decided before I asked you")):
+                c, s, t, root, lpath = vworld(name)
+                if setup:
+                    setup(t)
+                vledger.append(lpath, ROW, lambda when=when: when)
+                code, out = run(c, s, t, at=now + 1000)
+                first = (list(t.moves), record(c), status_of(c), why in out)
+                vledger.append(lpath, ROW, lambda: now + 1200)     # it judged the plan again
+                run(c, s, t, at=now + 1500)
+                check("validator-%s-waits-for-a-new-decision-then-approves" % name,
+                      (first, t.moves, (record(c) or {}).get("approved_by")),
+                      (([], None, [OPEN], True), [("uuid-50", "st-todo")], starter.pool.VALIDATOR))
+            c, s, t, root, lpath = vworld("val-newest")
+            decide(lpath, ROW, HELD)
+            run(c, s, t, at=now + 1000)
+            check("validator-only-its-newest-decision-counts-a-hold-after-an-approval-approves-nothing",
+                  (t.moves, record(c), status_of(c)), ([], None, [OPEN]))
+            c, s, t, root, lpath = vworld("val-changed")
+            t.issues["PROD-52"].update(description="Something else.", updatedAt=iso(now + 50))
+            decide(lpath, ROW)
+            said = len(posted(s))
+            run(c, s, t, at=now + 1000)
+            run(c, s, t, at=now + 1100)
+            # Stage E on #638: the refusal is said once, where you were asked, and your question
+            # stays open: the validator's refusal is never your answer.
+            check("validator-a-plan-changed-since-you-were-asked-is-not-approved-said-once-and-"
+                  "your-question-stays-open",
+                  (t.moves, record(c), status_of(c),
+                   [p.split(" (")[0] for p in posted(s)[said:]]),
+                  ([], None, [OPEN], ["The validator approved PROD-50 in your place, but "
+                                      "PROD-50's pieces changed since I asked"]))
+            # A decision made under other switches than are on now waits for a new one: here the
+            # pieces switch was turned on after it.
+            c, s, t, root, lpath = vworld("val-switches", settings=json.dumps(dict(
+                settings_doc(), approve={"plans": True, "pieces": True, "merges": False})))
+            decide(lpath, ROW)
+            code, out = run(c, s, t, at=now + 1000)
+            first = (list(t.moves), record(c), "decided under switches that have changed" in out)
+            vledger.append(lpath, dict(ROW, settings_on=["approve-plans", "approve-pieces"]),
+                           lambda: now + 1200)
+            run(c, s, t, at=now + 1500)
+            check("validator-a-decision-under-other-switches-than-now-waits-for-a-new-one",
+                  (first, t.moves, (record(c) or {}).get("approved_by")),
+                  (([], None, True), [("uuid-50", "st-todo")], starter.pool.VALIDATOR))
+
+            # 5. YOUR CHOICE STANDS: a plan you declined stays declined, your own yes in the
+            #    same pass is yours, and with acting off nothing moves.
+            c, s, t, root, lpath = vworld("val-declined")
+            s.add(BOB, "no", thread=root)
+            run(c, s, t, at=now + 500)
+            decide(lpath, ROW)
+            run(c, s, t, at=now + 1000)
+            check("validator-a-plan-you-declined-stays-declined",
+                  (t.moves, record(c), status_of(c)), ([], None, [DECLINED]))
+            c, s, t, root, lpath = vworld("val-yours-first")
+            decide(lpath, ROW)
+            s.add(BOB, "yes", thread=root)
+            run(c, s, t, at=now + 1000)
+            check("validator-your-own-yes-in-the-same-pass-comes-first-and-is-yours",
+                  ((record(c) or {}).get("approved_by"), t.moves), (BOB, [("uuid-50", "st-todo")]))
+            c, s, t, root, lpath = vworld("val-act-off", act=False)
+            decide(lpath, ROW)
+            code, out = run(c, s, t, at=now + 1000)
+            check("validator-with-acting-off-nothing-moves-and-it-is-said",
+                  (t.moves, record(c), status_of(c), "acting is switched off here" in out),
+                  ([], None, [OPEN], True))
+
+            # 6. MUTANT: an approval recorded as the owner's is caught by the actor's case.
+            kept = VALIDATOR
+            VALIDATOR = OWNER
+            try:
+                c, s, t, root, lpath = vworld("val-mutant")
+                decide(lpath, ROW)
+                run(c, s, t, at=now + 1000)
+                caught = (bool(record(c)), actor_ok(c, t))
+            finally:
+                VALIDATOR = kept
+            check("validator-mutant-an-approval-recorded-as-the-owners-is-caught", caught, (True, False))
+        finally:
+            starter.decide = real
+
+
 def selftest():
     import pipeline_bridge
     return pipeline_bridge.split_module_selftest(os.path.abspath(__file__),
                                                  [cases_approve, cases_plan_moves,
                                                   cases_finish, cases_ready_plans,
-                                                  cases_answer, cases_plan_changes])
+                                                  cases_answer, cases_plan_changes,
+                                                  cases_validator])
 
 
 if __name__ == "__main__":

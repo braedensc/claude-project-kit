@@ -437,6 +437,11 @@ jobs:
       # as written; one agent run a pass; off and held said; it never starts a piece itself.
       - name: Validator piece pass selftest (judges, records, starts nothing)
         run: python3 scripts/pipeline_validator_pieces.py --selftest
+      # The validator approves a plan in the owner's place (KIT-544). Offline: only a plan with an open
+      # approve question is judged; an idea he did not file never passes; the floor is held once; the
+      # agent judges the plan as written against its idea; one agent run a pass; it approves nothing itself.
+      - name: Validator plan pass selftest (judges, records, approves nothing itself)
+        run: python3 scripts/pipeline_validator_plans.py --selftest
       # The validator's hard limits (KIT-538): layer 1, plain code with no model. Offline, in a
       # temp folder: one case per rule and every reason reached; each fact read by the part of
       # the kit that owns it; the safety-system floor is never a switch; closed words only.
