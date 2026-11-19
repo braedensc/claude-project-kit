@@ -68,6 +68,19 @@ DEDUP: THE LEDGER IS THE RECORD, AND THE THREAD IS THE BACKSTOP
   acknowledgements past Linear's 5-second budget. Over the cap is LEFT for the next pass and
   named, never dropped (§13).
 
+A TEAM WHOSE FIXES THE RUNNER TAKES IS LEFT OUT, PASS BY PASS (KIT-707)
+
+  `runner_lane` names, for each team, the projects its repositories are in our own runner's
+  settings (Stage E's RUNNER_LANE_REPOS, which switches nothing by itself). Each pass reads the
+  lanes the runner says it takes, from its own store, the way the bounce driver does (KIT-708). A
+  team whose every named project has the runner's `fix` lane on is left out: its fixes go by
+  resume through the runner, and nothing of it travels this job's road. So one setting, the
+  runner's `fix` lane for the project, moves a project's fixes and this job's cover together, and
+  moves them back. A pass that leaves every team out reads nothing and re-prompts nothing, not
+  even the route or the webhook, and says so. Lanes it cannot read leave no team out, and fire:
+  "could not tell" is never "off", and never a team quietly dropped. A team that leaves takes its
+  watched sessions with it: a stuck one of its is no longer reported here.
+
 WHAT IT NEVER DOES (asserted in --selftest against this file's own source)
 
   Its only Linear write is `commentCreate`, as a reply under an agent session's root comment.
@@ -101,6 +114,8 @@ from datetime import datetime, timezone
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pipeline_machine_tickets as machine  # noqa: E402  (what a planning ticket is — KIT-184)
 import pipeline_hold as watcher_hold  # noqa: E402  (the watcher's hold, which stops a start — KIT-527)
+# The runner's store: the lanes it says it takes, read and never written (KIT-707).
+import pipeline_runner_store as runner_store  # noqa: E402
 
 HEARTBEAT_SCHEMA = "pipeline-catchup-heartbeat/1"
 LEDGER_SCHEMA = "pipeline-catchup-ledger/1"
@@ -155,6 +170,10 @@ CONFIG_KEYS = {
     "run_timeout_seconds": "wall clock for one pass (default %d)" % DEFAULT_RUN_TIMEOUT_SECONDS,
     "hold": "the watcher's hold file, as {\"file\": \"/path/to/hold.json\"}; while it exists "
             "(or cannot be read) nothing is re-prompted. Empty: the watcher cannot stop this job",
+    "runner_lane": "our own runner's store and each team's projects there, as {\"store_dir\": "
+                   "\"/path/to/store\", \"teams\": {\"KIT\": [\"kit\"]}} (KIT-707). A team is left "
+                   "out of a pass while the runner takes the fix lane of every one of its projects. "
+                   "Empty: every team is caught up",
 }
 
 EXAMPLE_CONFIG = {
@@ -271,7 +290,11 @@ def load_config(path):
     hold_file, hold_bad = watcher_hold.setting(raw.get("hold"))
     if hold_bad:
         raise ConfigError("config 'hold' is not usable: " + "; ".join(hold_bad))
+    lane, lane_bad = runner_lane_setting(raw.get("runner_lane"), teams)
+    if lane_bad:
+        raise ConfigError("config 'runner_lane' is not usable: " + "; ".join(lane_bad))
     return {
+        "runner_lane": lane,
         "agent_user_id": agent.strip(),
         "teams": list(teams),
         "linear_key_env": key_env,
@@ -288,6 +311,57 @@ def load_config(path):
         "run_timeout_seconds": clock,
         "hold_file": hold_file,
     }
+
+
+def runner_lane_setting(raw, teams):
+    """({} or {"store_dir", "teams"}, problems): the config's `runner_lane` (KIT-707). Absent or
+    empty is every team caught up, as before. The store is the runner's own, an absolute path or
+    one under ~/; each team, one this job covers, maps to its projects' keys in the runner's
+    settings."""
+    if raw is None or raw == {}:
+        return {}, []
+    if not isinstance(raw, dict):
+        return {}, ['it must be an object: {"store_dir": ..., "teams": {"TEAM": ["project"]}}']
+    bad = ["%s is not one of its keys (store_dir, teams)" % repr(k)[:40]
+           for k in sorted(raw, key=repr) if k not in ("store_dir", "teams")]
+    named = raw.get("teams")
+    if not (isinstance(named, dict) and named and all(
+            isinstance(t, str) and t in (teams or []) and isinstance(ps, list) and ps
+            and all(isinstance(p, str) and runner_store.PROJECT_RE.match(p) for p in ps)
+            for t, ps in named.items())):
+        bad.append("teams must map each team this job covers to its projects' keys in the "
+                   "runner's settings")
+    store_dir = raw.get("store_dir")
+    if not (isinstance(store_dir, str) and "\0" not in store_dir
+            and (os.path.isabs(store_dir) or store_dir.startswith("~/"))):
+        bad.append("store_dir must be the runner's store: an absolute path, or one under ~/")
+    if bad:
+        return {}, bad
+    return {"store_dir": os.path.realpath(os.path.expanduser(store_dir)),
+            "teams": dict((t, list(ps)) for t, ps in named.items())}, []
+
+
+def runner_lane_split(cfg):
+    """(the teams this pass catches up, the teams it leaves out, a finding or None): KIT-707.
+
+    A team whose every named project has the runner's `fix` lane on is left out: its fixes go by
+    resume through the runner. The lanes are the runner's own word, from its store, read as the
+    bounce driver reads them (KIT-708): no file is a runner that has said nothing, so every lane
+    is off. Lanes that cannot be read leave no team out and fire, so a person looks: "could not
+    tell" is never "off", and a team is never dropped on a read that failed (§13)."""
+    lane, teams = cfg.get("runner_lane") or {}, list(cfg["teams"])
+    if not lane:
+        return teams, [], None
+    try:
+        lanes = runner_store.read_lanes(lane["store_dir"])
+    except runner_store.StoreError as exc:
+        return teams, [], {"kind": "runner-lanes", "state": FIRING, "summary": (
+            "the runner's lanes could not be read (%s), so no team was left out: a lost delegation "
+            "of any team is still re-sent. The bounce driver cannot tell either, and says so on "
+            "each pull request it holds" % exc)}
+    left = [t for t in teams if (lane["teams"].get(t) or []) and all(
+        runner_store.lane_on(lanes, p, "fix") for p in lane["teams"][t])]
+    return [t for t in teams if t not in left], left, None
 
 
 def state_dir_hint(path):
@@ -748,6 +822,34 @@ def run_pass(cfg, api_key, dry_run=False, gql=None, get=None, sleep=None, now=No
     path = ledger_path(sd)
     ledger = load_ledger(path)
 
+    # KIT-707: A TEAM WHOSE FIXES THE RUNNER TAKES IS LEFT OUT OF THIS PASS. With none left there
+    # is nothing to catch up: nothing is read or asked, not the route, the webhook or the tracker,
+    # and the pass says which nothing it did.
+    covered, left, lane_finding = runner_lane_split(cfg)
+    counts["left_out"] = len(left)
+    if left:
+        log("LEFT OUT %s: the runner takes %s fixes by resume (its fix lane is on for %s), so no "
+            "hand-off of %s travels this job's road" % (
+                ", ".join(left), "their" if len(left) > 1 else "its",
+                ", ".join(p for t in left for p in cfg["runner_lane"]["teams"][t]),
+                "theirs" if len(left) > 1 else "its"))
+    if not covered:
+        # The route was not asked, so a streak of held passes ends here, unjudged: its awake time
+        # must not run on into a later pass and page for an outage nobody measured.
+        if not dry_run and load_gate(sd)["held_passes"]:
+            try:
+                _atomic_write_json(gate_path(sd), {"held_passes": 0, "held_awake": 0.0,
+                                                   "last_awake": None, "at": _iso(now)})
+            except OSError as exc:
+                log("NOTE: could not record the held count (%s)" % exc)
+        return EXIT_OK, "ok", [{"kind": "runner-lane", "state": OK, "summary": (
+            "nothing to catch up: the runner takes every team's fixes by resume (%s), so nothing "
+            "was read or re-prompted" % ", ".join(left))}], counts
+    if lane_finding:
+        log("NOTE: " + lane_finding["summary"])
+        findings.append(lane_finding)
+    cfg = dict(cfg, teams=covered)
+
     # THE GATE GATES POSTING, NOT LOOKING. A held pass still reads the webhook and the
     # sessions, so a disabled webhook or a stuck session stays reported while the dispatcher
     # is down — a pass that stopped looking would read as a recovery. The held time is AWAKE
@@ -1167,8 +1269,11 @@ def cmd_check(args):
     except ConfigError as exc:
         log("USAGE: %s" % exc)
         return EXIT_USAGE
-    log("config OK: teams %s, floor %d s, at most %d re-prompt(s) per pass, state %s"
-        % (",".join(cfg["teams"]), cfg["age_floor_seconds"], cfg["max_per_pass"], cfg["state_dir"]))
+    log("config OK: teams %s, floor %d s, at most %d re-prompt(s) per pass, state %s%s"
+        % (",".join(cfg["teams"]), cfg["age_floor_seconds"], cfg["max_per_pass"], cfg["state_dir"],
+           "; left out of a pass while the runner takes their fixes: %s" % ", ".join(
+               "%s (%s)" % (t, ", ".join(ps)) for t, ps in sorted(cfg["runner_lane"]["teams"].items()))
+           if cfg["runner_lane"] else ""))
     return EXIT_OK
 
 
@@ -1965,6 +2070,84 @@ def selftest():
                 os.environ.pop("CATCHUP_SELFTEST_KEY", None)
             else:
                 os.environ["CATCHUP_SELFTEST_KEY"] = saved_key
+
+        # -- KIT-707: a team whose fixes the runner takes is left out, pass by pass ---------------
+        store = os.path.join(tmp, "runner-store")
+        check("KIT-707 the runner's store is made for the cases", runner_store.prepare(store), [])
+
+        def lanes(enabled=True, **projects):
+            """The runner's own word in its store: each project, the kinds it takes."""
+            runner_store.write_lanes(store, {"schema": runner_store.LANES_SCHEMA, "enabled": enabled,
+                                             "work_dir": "/w", "look_config_dir": None, "projects": projects})
+
+        def lane_cfg(teams=("KIT", "TOD"), named=None, **over):
+            return cfg(teams=list(teams), runner_lane={"store_dir": store, "teams": named or {"KIT": ["kit"]}},
+                       **over)
+        c707 = lane_cfg(_dir="l1")
+        check("KIT-707 a runner that has said nothing leaves no team out",
+              runner_lane_split(c707), (["KIT", "TOD"], [], None))
+        lanes(kit=["code", "fix"], web=["fix"])
+        check("KIT-707 the runner's fix lane on for a team's project leaves that team out, and only it",
+              runner_lane_split(c707), (["TOD"], ["KIT"], None))
+        lanes(kit=["code", "review"])
+        check("KIT-707 …and its fix lane off catches the team up again: the one setting moves it back",
+              runner_lane_split(c707), (["KIT", "TOD"], [], None))
+        lanes(enabled=False, kit=["fix"])
+        check("KIT-707 a runner switched off takes no lane", runner_lane_split(c707)[:2], (["KIT", "TOD"], []))
+        lanes(kit=["fix"])
+        check("KIT-707 a team stays caught up while any one of its projects keeps the old road",
+              runner_lane_split(lane_cfg(_dir="l1b", named={"KIT": ["kit", "docs"]}))[:2], (["KIT", "TOD"], []))
+        check("KIT-707 with no runner_lane every team is caught up, and the runner's store is not read",
+              runner_lane_split(cfg(_dir="l1c", teams=["KIT", "TOD"])), (["KIT", "TOD"], [], None))
+
+        def gets():
+            asked = []
+            return asked, lambda url: (asked.append(url), up(url))[1]
+        # A pass: the runner's team is left alone, the other re-prompted; then the lane goes off,
+        # and the next pass re-prompts the first team's lost delegation too.
+        lanes(kit=["fix"])
+        both = [session("s-kit", 9, ident="KIT-7", team="KIT"), session("s-tod", 9, ident="TOD-3", team="TOD")]
+        fake = FakeLinear(both)
+        code, result, _f, counts = run_pass(lane_cfg(_dir="l2"), "k", gql=fake, get=up, now=NOW)
+        check("KIT-707 a pass re-prompts the team it catches up, and leaves out the one whose fixes the runner takes",
+              (code, result, [r["issueId"] for r in fake.replies], counts["left_out"]),
+              (EXIT_OK, "ok", ["i-s-tod"], 1))
+        lanes(kit=[])
+        fake = FakeLinear(both)
+        code, result, _f, counts = run_pass(lane_cfg(_dir="l2"), "k", gql=fake, get=up, now=NOW)
+        check("KIT-707 …and with the runner's fix lane off for it, the next pass catches it up again",
+              (code, [r["issueId"] for r in fake.replies], counts["left_out"]), (EXIT_OK, ["i-s-kit"], 0))
+        lanes(kit=["fix"])
+        fake = FakeLinear(both)
+        asked, door = gets()
+        code, result, found, counts = run_pass(lane_cfg(teams=("KIT",), _dir="l3"), "k", gql=fake, get=door, now=NOW)
+        check("KIT-707 every team's fixes on the runner: nothing is read or re-prompted, and the pass says so",
+              (code, result, fake.queries, asked, counts["left_out"], [(f["kind"], f["state"]) for f in found],
+               "nothing to catch up" in found[0]["summary"]),
+              (EXIT_OK, "ok", [], [], 1, [("runner-lane", OK)], True))
+        with open(os.path.join(store, runner_store.LANES_FILE), "w") as fh:
+            fh.write("{not json")
+        fake = FakeLinear(both)
+        code, result, found, counts = run_pass(lane_cfg(_dir="l4"), "k", gql=fake, get=up, now=NOW)
+        check("KIT-707 lanes that cannot be read leave no team out, and fire: never 'off'",
+              (code, result, sorted(r["issueId"] for r in fake.replies), counts["left_out"],
+               [f["state"] for f in found if f["kind"] == "runner-lanes"]),
+              (EXIT_DECLINED, "problems", ["i-s-kit", "i-s-tod"], 0, [FIRING]))
+        os.unlink(os.path.join(store, runner_store.LANES_FILE))
+        for bad, why in ((["x"], "it must be an object"), ({"store_dir": store}, "teams must map"),
+                         ({"store_dir": store, "teams": {}}, "teams must map"),
+                         ({"store_dir": store, "teams": {"OPS": ["ops"]}}, "teams must map"),
+                         ({"store_dir": store, "teams": {"KIT": ["Kit"]}}, "teams must map"),
+                         ({"store_dir": store, "teams": {"KIT": []}}, "teams must map"),
+                         ({"store_dir": "store", "teams": {"KIT": ["kit"]}}, "store_dir must be"),
+                         ({"store_dir": store, "teams": {"KIT": ["kit"]}, "at": 1}, "not one of its keys")):
+            try:
+                cfg(_dir="cfg707", runner_lane=bad)
+                said = ""
+            except ConfigError as exc:
+                said = str(exc)
+            check("KIT-707 config refuses runner_lane %r" % (bad,), why in said, True)
+        check("KIT-707 an empty runner_lane is off", cfg(_dir="cfg707", runner_lane={})["runner_lane"], {})
 
         # -- config ----------------------------------------------------------------------
         for bad, why in (({"teams": ["kit"]}, "team KEYS"), ({"agent_user_id": ""}, "agent_user_id"),
