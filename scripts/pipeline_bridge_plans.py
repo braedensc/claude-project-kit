@@ -22,6 +22,12 @@ WHAT IS HERE
   The queue (KIT-454)  with `queue_config` set, the queue says what starts, a plan's pieces
                  included, inside the working window (scripts/pipeline_queue_start.py): the
                  day's ledger row first, then the same one hand-over.
+  Our own runner (KIT-645)  on a repository `runner_lane` wires to a runner project whose own
+                 `lanes.code` is on, the one hand-over is a code request to the runner, and
+                 nothing is delegated. Its answer is read each pass: a start gets the comment
+                 naming who approved it; a refusal, or no answer for RUNNER_ANSWER_WAIT, ends
+                 the pass loud, once. `retry`, `start` and the plan limit's resume are refused
+                 there in words: the runner starts a ticket only on its approver's move.
   A stalled start  a hand-over not started two hours on, as its sessions show it (KIT-284),
                  offered again only once Linear has stopped retrying it (KIT-289).
   Finish (KIT-299)  once every piece is merged: the epic to its done state, one comment,
@@ -49,6 +55,7 @@ import pipeline_plan_executor as executor  # noqa: E402
 import pipeline_queue_start as starter  # noqa: E402
 import pipeline_pass_lock as pass_lock  # noqa: E402  (one pass at a time: the queue's ledger lock, KIT-681)
 import pipeline_routing_tags as routing  # noqa: E402  (KIT-405: the follow-up's directive pin)
+import pipeline_runner_store as runner_store  # noqa: E402  (KIT-645: requests to our own runner)
 import pipeline_voice as voice  # noqa: E402
 # The telemetry reader's own parse of a comment's `pipeline-telemetry/1` blocks: a review's
 # notes are read the way the dashboard reads them (KIT-299).
@@ -189,6 +196,16 @@ NEEDS_HUMAN_LABEL = "agent:needs-human"
 # the question records as a stated term; and how many lines the wrap-up lists before it
 # says how many more.
 FINISH_RECHECK_SECONDS = 900
+# KIT-645, our own runner. It answers a request within seconds; one it has not answered in this
+# long ends a pass loud, once. A ticket it refused is remembered this long, so the same approval
+# is never asked again; a newer one is.
+RUNNER_ANSWER_WAIT = 30 * 60
+RUNNER_REFUSED_KEEP = 14 * 86400
+
+
+class RunnerHeld(Exception):
+    """A start on a switched project that cannot be asked now: the pass ends loud, and nothing
+    more starts in it (KIT-645)."""
 # How often a held epic's history is read again (review of #281): a move the owner made
 # between two passes still counts, and a held epic pays one history read in that time.
 HELD_RECHECK_SECONDS = 900
@@ -1925,6 +1942,7 @@ class PlansMixin(object):
         if not self.cfg["act"]:
             self.say("  acting is off: %d approved epic(s) wait" % len(self.state["epics"]))
             return
+        self.runner_answers()                       # KIT-645: what our own runner did with each ask
         agent_id = why = None
         if self.state["epics"]:
             agent_id, why = self.tracker.agent_user(self.cfg["agent_user_name"])
@@ -2610,11 +2628,15 @@ class PlansMixin(object):
                       facts={"ticket": ident, "waits_on": waits})
         return True
 
-    def hand_over(self, issue_id, ident, agent_id, body, record=None):
+    def hand_over(self, issue_id, ident, agent_id, body, record=None, runner=None, approved_at=None):
         """The one hand-over, the bridge's own and the queue's (KIT-454): the ticket to the
         agent, then the comment saying why. `record` notes the start before the save. The
         hand-over stands if the comment fails, since it cannot be taken back: the comment is
-        owed, and the words returned say so."""
+        owed, and the words returned say so. With `runner` (store, project), on a switched
+        project, it is a code request to our own runner instead, and nothing is delegated
+        (KIT-645): its comment waits for the runner's answer."""
+        if runner:
+            return self.ask_runner(issue_id, ident, body, record, runner, approved_at)
         self.delegate_to(issue_id, agent_id)
         self.state.setdefault("order_own", {})[ident] = self.now      # KIT-239: never paged
         if record:
@@ -2642,7 +2664,7 @@ class PlansMixin(object):
                     "not be written; I will try again.")
         return ""
 
-    def start_child(self, rec, child, kids, agent_id):
+    def start_child(self, rec, child, kids, agent_id, runner=None):
         ident = child["identifier"]
         if self.dry:
             self.say("  [dry-run] would hand %s to the agent" % ident)
@@ -2657,20 +2679,127 @@ class PlansMixin(object):
         def record():
             rec["started"].append(ident)
             rec.setdefault("started_at", {})[ident] = self.now
-        owed = self.hand_over(child["id"], ident, agent_id, body, record)
+        owed = self.hand_over(child["id"], ident, agent_id, body, record, runner=runner,
+                              approved_at=rec.get("approved_at"))
         position = [k["id"] for k in kids].index(child["id"]) + 1
         title = notify.safe_title(child.get("title") or "")
         # While the daily stand-up is on, each start is in the afternoon wrap instead of a
         # message of its own (decision 7, KIT-349). The hand-over itself is unchanged.
         if not self.standup_on:
-            self.post(rec["channel"], rec["thread"], "Started %s “%s” (%d of %d)%s.%s" % (
-                ident, title, position, len(kids),
+            self.post(rec["channel"], rec["thread"], "%s %s “%s” (%d of %d)%s.%s" % (
+                "Asked our runner to start" if runner else "Started", ident, title, position, len(kids),
                 ", now that %s %s Done" % (", ".join(after), "is" if len(after) == 1 else "are")
                 if after else "", owed), kind="started-child",
                 facts={"ticket": ident, "title": title, "epic": rec["ticket"],
                        "position": position, "of": len(kids), "waited_on": after})
         self.counts["acted"] += 1
-        self.say("  acted: handed %s to the agent (%s)" % (ident, rec["ticket"]))
+        self.say("  acted: %s %s (%s)" % ("asked our runner to start" if runner else
+                                          "handed to the agent", ident, rec["ticket"]))
+
+    # -- our own runner (KIT-645) ---------------------------------------------------
+    def runner_route(self, repo):
+        """("runner", (store, project)) when a start on this repository goes to our own runner,
+        ("old", None) when it is a hand-over as before, or ("held", why) when the bridge cannot
+        tell: then nothing starts either way. The switch is the runner's: its project's
+        `lanes.code`, read through the runner store's own reading of its settings."""
+        lane = self.cfg.get("runner_lane") or {}
+        project = (lane.get("repos") or {}).get(repo) if isinstance(repo, str) else None
+        if not project:
+            return "old", None
+        state, where, why = runner_store.caller_lane(lane["settings_file"], project, "code")
+        if state == "on":
+            return "runner", (where, project)
+        return ("old", None) if state == "off" else ("held", why)
+
+    def runner_route_of(self, issue):
+        """runner_route for a ticket the bridge read itself: its repository as the queue's own
+        reader routes one (its routing labels, else its team), from the queue's settings."""
+        if not (self.cfg.get("runner_lane") or {}).get("repos"):
+            return "old", None
+        try:
+            with open(self.cfg["queue_config"], encoding="utf-8") as fh:
+                qcfg, bad = starter.load(json.load(fh))
+        except (OSError, ValueError, RecursionError) as exc:
+            return "held", "the queue's settings could not be read (%s)" % type(exc).__name__
+        if bad:
+            return "held", "the queue's settings are not usable"
+        return self.runner_route(starter.reader.repo_of(qcfg["reader"], issue))
+
+    def runner_wait(self, entry):
+        """Why a queued start does not go to the runner this pass, in words, or "". A ticket whose
+        request waits is never asked twice, and while any request from an earlier pass waits no
+        new one is asked: a runner that is down never gets a pile. A ticket the runner refused is
+        asked again only on a newer approval, so a refusal is told once."""
+        asks = self.state.get("runner_asks") or {}
+        if entry["ticket"] in asks:
+            return "waits for our runner's answer to its start"
+        if any(a.get("at", self.now) < self.now for a in asks.values()):
+            return "waits: our runner has not answered an earlier start yet"
+        refused = (self.state.get("runner_refused") or {}).get(entry["ticket"])
+        if refused and refused.get("approved_at") == entry.get("at"):
+            return "was refused by our runner for this approval, and waits for a new one"
+        return ""
+
+    def ask_runner(self, issue_id, ident, body, record, runner, approved_at):
+        """The hand-over on a switched project (KIT-645): one code request to our own runner, and
+        nothing delegated. The runner judges it with the queue's own judge, moves the ticket and
+        starts the session. The comment naming who approved it is written once it started."""
+        where, project = runner
+        try:
+            rid = runner_store.ask(where, "queue", "start", "code", project, ident, now=self.now)
+        except (ValueError, OSError) as exc:
+            raise RunnerHeld("our runner's store would not take %s's start (%s)" % (
+                ident, self.clean(str(exc)) if isinstance(exc, ValueError) else type(exc).__name__))
+        self.state.setdefault("runner_asks", {})[ident] = {
+            "request": rid, "store": where, "project": project, "issue_id": issue_id,
+            "body": body, "approved_at": approved_at, "at": self.now}
+        (self.state.get("runner_refused") or {}).pop(ident, None)
+        self.state["acted_at"].append(self.now)
+        if record:
+            record()
+        self.save()
+        return ""
+
+    def runner_answers(self):
+        """Each request left with our own runner, read back once a pass (KIT-645). A start it took
+        gets the comment naming who approved it, owed when it fails, as a hand-over's is. A
+        refusal ends the pass loud once, in the runner's own words. A request with no answer for
+        RUNNER_ANSWER_WAIT ends it loud once: the runner may be off, down or holding starts. An
+        answer that cannot be read is said each pass. Could not read is never taken as done."""
+        asks = self.state.get("runner_asks") or {}
+        refused = self.state.setdefault("runner_refused", {})
+        for ident in sorted(asks):
+            ask = asks[ident]
+            try:
+                got = runner_store.answer(ask["store"], ask["request"])
+            except (ValueError, runner_store.StoreError) as exc:
+                self.release_errors.append("our runner's answer to %s's start could not be read (%s)"
+                                           % (ident, self.clean(str(exc))[:160]))
+                continue
+            if got is None:
+                waited = self.now - ask.get("at", self.now)
+                if waited >= RUNNER_ANSWER_WAIT and not ask.get("late"):
+                    ask["late"] = True
+                    self.release_errors.append(
+                        "our runner has not answered %s's start in %d minutes: it may be off, down, "
+                        "or holding starts (the machine's floor, the watcher's hold)"
+                        % (ident, waited // 60))
+                continue
+            del asks[ident]
+            if got.get("ok"):
+                owed = self.attribute(ask["issue_id"], ident, ask["body"], done="started by our runner")
+                self.counts["acted"] += 1
+                self.say("  acted: our runner started %s (run %s)%s" % (ident, got.get("run"), owed))
+            else:
+                words = self.clean(str(got.get("why") or "it gave no reason"))[:300]
+                refused[ident] = {"approved_at": ask.get("approved_at"), "at": self.now}
+                self.release_errors.append("the queue: our runner refused to start %s: %s"
+                                           % (ident, words))
+                self.say("  RUNNER: refused %s: %s" % (ident, words))
+        for ident in [k for k, v in refused.items() if self.now - v.get("at", 0) > RUNNER_REFUSED_KEEP]:
+            del refused[ident]
+        self.state["runner_asks"] = asks
+        self.save()
 
     # -- the queue (MVP 2, KIT-454) --------------------------------------------------
     def record_room(self, lines=None):
@@ -2830,15 +2959,28 @@ class PlansMixin(object):
                      "counts them in the day's load" % resumed)
             return
         for entry in result["decision"]["start"]:
-            if agent_id is None and why is None:
-                agent_id, why = self.tracker.agent_user(self.cfg["agent_user_name"])
-            if not agent_id:
-                return self.queue_failed("there is no agent to hand work to (%s)" % why)
+            # KIT-645: our own runner or the agent, by the runner's own switch for the project.
+            route, where = self.runner_route(entry.get("repo"))
+            if route == "held":
+                return self.queue_failed("%s cannot start: %s" % (entry["ticket"], self.clean(where)))
+            if route == "runner":
+                wait = self.runner_wait(entry)
+                if wait:
+                    self.say("  queue: %s %s" % (entry["ticket"], wait))
+                    continue
+            else:
+                if agent_id is None and why is None:
+                    agent_id, why = self.tracker.agent_user(self.cfg["agent_user_name"])
+                if not agent_id:
+                    return self.queue_failed("there is no agent to hand work to (%s)" % why)
             if self.actions_left() <= 0:
                 self.say("  action limit: %s waits for the next hour" % entry["ticket"])
                 return
             try:
-                self.start_queued(entry, agent_id, ledger)
+                self.start_queued(dict(entry, runner=where) if route == "runner" else entry,
+                                  agent_id, ledger)
+            except RunnerHeld as exc:
+                return self.queue_failed(str(exc))
             except starter.QueueBusy as exc:       # KIT-681: another pass is writing the ledger: not a failure
                 return self.say("  QUEUE: %s; nothing starts from the queue this pass" % exc)
             except (OSError, ValueError) as exc:
@@ -2938,7 +3080,7 @@ class PlansMixin(object):
                 return
         refusal = self.handover_refusal("retry", issue, node, sessions, agent_id)
         if refusal:
-            if refusal[2] in ("team", "closed", "not the agent's"):
+            if refusal[2] in ("team", "closed", "not the agent's", "runner lane"):
                 self.say("  queue: resume: %s is let go (%s)" % (ident, refusal[2]))
                 done[ident] = dict(done.get(ident) or {}, ended_at=stop["ended_at"],
                                    result=refusal[2])
@@ -2991,19 +3133,23 @@ class PlansMixin(object):
         return None
 
     def start_queued(self, entry, agent_id, ledger):
-        """One start the queue made: its ledger row, then the hand-over."""
-        ident = entry["ticket"]
+        """One start the queue made: its ledger row, then the hand-over. An entry routed to our
+        own runner (KIT-645) carries it as `runner`, and its hand-over is the runner's request."""
+        ident, runner = entry["ticket"], entry.get("runner")
         piece = self.queued_piece(entry) if entry["source"] == "plan" else None
         if self.dry:
-            self.say("  [dry-run] the queue would hand %s to the agent" % ident)
+            self.say("  [dry-run] the queue would %s %s" % (
+                "ask our runner to start" if runner else "hand to the agent", ident))
             return
         starter.record_start(ledger, self.now, ident, entry["source"])
         if piece:
-            self.start_child(piece[0], piece[1], piece[2], agent_id)
+            self.start_child(piece[0], piece[1], piece[2], agent_id, runner=runner)
             return
-        self.hand_over(entry["id"], ident, agent_id, starter.attribution(entry))
+        self.hand_over(entry["id"], ident, agent_id, starter.attribution(entry), runner=runner,
+                       approved_at=entry.get("at"))
         self.counts["acted"] += 1
-        self.say("  acted: the queue handed %s to the agent (%s)" % (ident, entry["source"]))
+        self.say("  acted: the queue %s %s (%s)" % (
+            "asked our runner to start" if runner else "handed to the agent", ident, entry["source"]))
 
     # -- a finished plan (KIT-299) -------------------------------------------------
     def finish_epic(self, epic_id, rec, epic, kids):
@@ -4795,7 +4941,8 @@ def cases_approve(kit):
                 json.dump({"pool": {"owner_user_ids": ["owner-1"], "team_keys": ["PROD"],
                                     "dispatcher_user_ids": ["agent-1"]},
                            "reader": {"ledger_file": ledger,
-                                      "inputs_file": os.path.join(folder, "in.json")},
+                                      "inputs_file": os.path.join(folder, "in.json"),
+                                      "repo_by_team": {"PROD": "acme/app"}},
                            "morning": {"usage_file": os.path.join(folder, "usage.json")},
                            "hold": {"file": hold_file}}, fh)
             return conf, ledger
@@ -4865,6 +5012,84 @@ def cases_approve(kit):
             run(c, s, t, at=now + 1100)
             check("the-queue-is-asked-at-most-every-queue-every-seconds",
                   (len(asks), delegated(t)), (0, ["uuid-51", "uuid-7"]))
+
+            # -- KIT-645: our own runner. On a switched project the queue's start is a code
+            #    request to the runner, and nothing is delegated; each later pass reads its answer.
+            def runner_at(name, code=True, enabled=True, text=None):
+                folder = os.path.join(tmp, "runner-" + name)
+                os.makedirs(folder)
+                rstore = os.path.join(folder, "store")
+                runner_store.prepare(rstore)
+                path = os.path.join(folder, "runner.json")
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(text if text is not None else json.dumps({
+                        "enabled": enabled, "store_dir": rstore,
+                        "projects": {"app": {"lanes": {"code": code}}}}))
+                return {"settings_file": path, "repos": {"acme/app": "app"}}, rstore
+
+            def waiting(rstore):
+                return [(d["caller"], d["action"], d["kind"], d["project"], d["ticket"])
+                        for _i, d, _p in runner_store.pending(rstore)]
+
+            def answer_all(rstore, ok, why=""):
+                for rid, d, _p in runner_store.pending(rstore):
+                    runner_store.settle(rstore, rid, d, ok, "run-" + "a" * 32 if ok else None, why, now)
+            todo7 = start("PROD-7", "todo", "acme/app:2")
+            words7 = ("Started by the queue, in lane acme/app:2: you moved it into the ready state at "
+                      "2025-10-09 06:00 UTC.")
+            lane, rstore = runner_at("on")
+            c, s, t, out, ledger = queued("q-runner", decided(todo7), runner_lane=lane)
+            check("runner-a-switched-projects-start-is-a-code-request-and-nothing-is-delegated",
+                  (waiting(rstore), delegated(t), rows(ledger), dict(t.comments).get("uuid-7"), out[0]),
+                  ([("queue", "start", "code", "app", "PROD-7")], [], [("PROD-7", "todo")], None, EXIT_OK))
+            answer_all(rstore, True)
+            answer["v"] = decided()
+            out = run(c, s, t, at=now + 2000)
+            check("runner-the-start-it-took-gets-the-comment-naming-who-approved-it",
+                  (dict(t.comments).get("uuid-7"), delegated(t), out[0]), (words7, [], EXIT_OK))
+            lane, rstore = runner_at("refused")
+            c, s, t, out, ledger = queued("q-runner-refused", decided(todo7), runner_lane=lane)
+            answer_all(rstore, False, "the queue's judge does not admit PROD-7 (not-owner)")
+            out1, out2 = run(c, s, t, at=now + 2000), run(c, s, t, at=now + 3000)
+            check("runner-a-refusal-ends-one-pass-loud-in-its-words-and-the-same-approval-is-not-asked-again",
+                  (out1[0] != EXIT_OK, "the queue: our runner refused to start PROD-7: the queue's judge does "
+                   "not admit PROD-7 (not-owner)" in out1[1], out2[0], waiting(rstore), delegated(t),
+                   dict(t.comments).get("uuid-7")),
+                  (True, True, EXIT_OK, [], [], None))
+            answer["v"] = decided(dict(todo7, at="2025-10-10T06:00:00Z"))
+            run(c, s, t, at=now + 4000)
+            check("runner-a-newer-approval-of-a-refused-ticket-is-asked-again",
+                  (waiting(rstore), rows(ledger)),
+                  ([("queue", "start", "code", "app", "PROD-7")], [("PROD-7", "todo"), ("PROD-7", "todo")]))
+            lane, rstore = runner_at("late")
+            c, s, t, out, ledger = queued("q-runner-late", decided(todo7), runner_lane=lane)
+            answer["v"] = decided(todo7, start("PROD-8", "todo", "acme/app:3"))
+            slow = [run(c, s, t, at=now + 1000 + d) for d in (1000, RUNNER_ANSWER_WAIT + 60,
+                                                              RUNNER_ANSWER_WAIT + 1000)]
+            check("runner-no-answer-in-its-wait-ends-one-pass-loud-and-nothing-more-is-asked-meanwhile",
+                  ([o[0] != EXIT_OK for o in slow],
+                   "our runner has not answered PROD-7's start in 31 minutes" in slow[1][1],
+                   waiting(rstore), delegated(t)),
+                  ([False, True, False], True, [("queue", "start", "code", "app", "PROD-7")], []))
+            lane, rstore = runner_at("off", code=False)
+            c, s, t, out, ledger = queued("q-runner-off", decided(todo7), runner_lane=lane)
+            check("runner-a-project-whose-code-lane-is-off-is-handed-over-as-before",
+                  (delegated(t), waiting(rstore), dict(t.comments).get("uuid-7")), (["uuid-7"], [], words7))
+            for name, kw, said in (
+                    ("unread", {"text": "{not json"}, "the runner's settings could not be read"),
+                    ("stopped", {"enabled": False}, "project app's code lane is on, but the runner is "
+                                                    "switched off")):
+                lane, rstore = runner_at(name, **kw)
+                c, s, t, out, ledger = queued("q-runner-" + name, decided(todo7), runner_lane=lane)
+                check("runner-%s-settings-start-nothing-either-way-and-the-pass-ends-loud" % name,
+                      (delegated(t), waiting(rstore), rows(ledger), out[0] != EXIT_OK,
+                       ("the queue: PROD-7 cannot start: " + said) in out[1]), ([], [], None, True, True))
+            lane, rstore = runner_at("piece")
+            c, s, t, out, ledger = queued("q-runner-piece", decided(start("PROD-51")), runner_lane=lane)
+            check("runner-a-plans-piece-goes-to-the-runner-too-and-its-thread-says-so",
+                  (waiting(rstore), delegated(t), sum("Asked our runner to start PROD-51" in p for p in posted(s)),
+                   sum("Started PROD-51" in p for p in posted(s))),
+                  ([("queue", "start", "code", "app", "PROD-51")], [], 1, 0))
             c, s, t, out, ledger = queued("q-unread", {
                 "state": "unread", "why": "the tracker did not answer", "decision": None})
             check("a-failed-read-starts-nothing-and-the-pass-ends-loud",

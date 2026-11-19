@@ -205,6 +205,12 @@ CONF_KEYS = {
                          "window, and starts it; empty: the tech lead's own hand-over of plans"),
     "QUEUE_EVERY_SECONDS": (str(bridge_config.DEFAULT_QUEUE_EVERY_SECONDS),
                             "how often the queue is asked, 60 to 86400 seconds"),
+    "RUNNER_SETTINGS": ("", "our own runner's settings file, as the role account sees it "
+                            "(KIT-645): with RUNNER_REPOS, a queued start on a listed repository "
+                            "goes to the runner while its project's lanes.code there is on"),
+    "RUNNER_REPOS": ("", "each OWNER/REPO=project whose queued starts may go to our own runner, "
+                         "comma-separated, project being its key in the runner's settings; "
+                         "empty: every start is a hand-over, as before (KIT-645)"),
     "QUESTION_REMINDER_HOURS": (str(bridge.DEFAULT_QUESTION_REMINDER_HOURS),
                                 "after how many hours a question still open in a DM gets its "
                                 "one reminder, 0 to %d; 0: none (KIT-340)" % REMINDER_HOURS_MAX),
@@ -379,6 +385,10 @@ def split_list(value):
     return [v.strip() for v in (value or "").split(",") if v.strip()]
 
 
+# KIT-645: one RUNNER_REPOS item, OWNER/REPO=project (the project's key in the runner's settings).
+RUNNER_PAIR_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}=[a-z0-9][a-z0-9-]{0,39}\Z")
+
+
 def validate_conf(values):
     conf = dict((k, values.get(k, d) or d) for k, (d, _doc) in CONF_KEYS.items())
     # KIT-492: the old chain's lines this conf still has, by name. Read as nothing.
@@ -423,6 +433,16 @@ def validate_conf(values):
     every = conf["QUEUE_EVERY_SECONDS"]
     if not WHOLE_RE.match(every) or not 60 <= int(every) <= 86400:
         errors.append("QUEUE_EVERY_SECONDS must be a whole number from 60 to 86400")
+    # KIT-645: the wiring to our own runner. Its switch is the runner's own lanes.code.
+    rsettings, rpairs = conf["RUNNER_SETTINGS"], split_list(conf["RUNNER_REPOS"])
+    if rsettings and not (rsettings.startswith("/") or rsettings.startswith("~/")):
+        errors.append("RUNNER_SETTINGS must be a full path, or start with ~/, or be empty")
+    bad_pairs = [x for x in rpairs if not RUNNER_PAIR_RE.match(x)]
+    if bad_pairs:
+        errors.append("RUNNER_REPOS must list OWNER/REPO=project pairs, got %s" % ", ".join(bad_pairs))
+    elif rpairs and not rsettings:
+        errors.append("RUNNER_REPOS needs RUNNER_SETTINGS: the runner's settings hold each "
+                      "project's switch")
     if not WHOLE_RE.match(conf["EPIC_WIP"]) or not 1 <= int(conf["EPIC_WIP"]) <= 10:
         errors.append("EPIC_WIP must be a whole number from 1 to 10")
     hours = conf["QUESTION_REMINDER_HOURS"]
@@ -724,7 +744,8 @@ COMPOSED_AS = {"CHANNEL_IDS": "channel_ids", "OWNER_USER_ID": "owner_user_id",
                "INTERVAL_SECONDS": "run_interval_seconds", "DM_USER_IDS": "dm_user_ids",
                "ACCEPTANCE_REPOS": "acceptance_repos", "ACCEPTANCE_LEDGER": "acceptance_ledger",
                "QUESTION_REMINDER_HOURS": "question_reminder_hours",
-               "QUEUE_CONFIG": "queue_config", "QUEUE_EVERY_SECONDS": "queue_every_seconds"}
+               "QUEUE_CONFIG": "queue_config", "QUEUE_EVERY_SECONDS": "queue_every_seconds",
+               "RUNNER_SETTINGS": "runner_lane", "RUNNER_REPOS": "runner_lane"}
 # KIT-298: the tech lead's keys, each checked above by its conf name.
 COMPOSED_AS.update({"TECH_LEAD_TURN": "tech_lead_turn", "TURN_BIN": "turn_bin",
                     "TURN_MODEL": "turn_model", "TURN_TOKEN_ENV": "turn_token_env",
@@ -763,6 +784,7 @@ JOB_KEY_FROM = {
     "direct_max_age_minutes": "DIRECT_MAX_AGE_MINUTES",
     "question_reminder_hours": "QUESTION_REMINDER_HOURS",
     "queue_config": "QUEUE_CONFIG", "queue_every_seconds": "QUEUE_EVERY_SECONDS",
+    "runner_lane": "RUNNER_REPOS",
     "push_mode": "PUSH_MODE", "push_token_env": "PUSH_TOKEN_ENV",
 }
 _QUOTED_KEY_RE = re.compile(r"'([a-z][a-z0-9_]*)'")
@@ -977,6 +999,10 @@ def compose_config(conf):
     # KIT-454: the queue, composed only when set, so a config written before it is unchanged.
     if conf["QUEUE_CONFIG"]:
         doc["queue_config"] = conf["QUEUE_CONFIG"]
+    # KIT-645: the wiring to our own runner, the same.
+    if split_list(conf["RUNNER_REPOS"]):
+        doc["runner_lane"] = {"settings_file": conf["RUNNER_SETTINGS"], "repos": dict(
+            x.split("=", 1) for x in split_list(conf["RUNNER_REPOS"]))}
     if conf["QUEUE_EVERY_SECONDS"] != str(bridge_config.DEFAULT_QUEUE_EVERY_SECONDS):
         every = conf["QUEUE_EVERY_SECONDS"]
         doc["queue_every_seconds"] = int(every) if WHOLE_RE.match(every) else every
@@ -3541,6 +3567,27 @@ def selftest():
                 for name, bad in (("QUEUE_CONFIG", "queue.json"),
                                   ("QUEUE_EVERY_SECONDS", "30"))]),
               (["~/.stage-e/queue/queue.json", 600], [], [True, True]))
+        # KIT-645: the wiring to our own runner, composed only when set; each pair, and the
+        # runner's settings it needs, refused by name; the job's own check names the queue.
+        wired, _e = validate_conf(dict(values, QUEUE_CONFIG="~/q.json", RUNNER_SETTINGS="~/runner.json",
+                                       RUNNER_REPOS="acme/app=app, acme/web=web"))
+        check("config-carries-the-runner-wiring-only-when-set",
+              (compose_config(wired).get("runner_lane"), _e,
+               "runner_lane" in compose_config(validate_conf(dict(values))[0])),
+              ({"settings_file": "~/runner.json", "repos": {"acme/app": "app", "acme/web": "web"}},
+               [], False))
+        check("conf-RUNNER-keys-refused-by-name",
+              [any(want in e for e in validate_conf(dict(values, **over))[1]) for over, want in (
+                  ({"RUNNER_SETTINGS": "runner.json", "RUNNER_REPOS": "acme/app=app",
+                    "QUEUE_CONFIG": "~/q.json"}, "RUNNER_SETTINGS must be a full path"),
+                  ({"RUNNER_SETTINGS": "~/r.json", "RUNNER_REPOS": "app=app",
+                    "QUEUE_CONFIG": "~/q.json"}, "RUNNER_REPOS must list OWNER/REPO=project"),
+                  ({"RUNNER_SETTINGS": "~/r.json", "RUNNER_REPOS": "acme/app=App",
+                    "QUEUE_CONFIG": "~/q.json"}, "RUNNER_REPOS must list OWNER/REPO=project"),
+                  ({"RUNNER_REPOS": "acme/app=app", "QUEUE_CONFIG": "~/q.json"},
+                   "RUNNER_REPOS needs RUNNER_SETTINGS"),
+                  ({"RUNNER_SETTINGS": "~/r.json", "RUNNER_REPOS": "acme/app=app"},
+                   "RUNNER_REPOS needs QUEUE_CONFIG"))], [True] * 5)
         # KIT-224 review: the pings file is the NOTIFIER's, in its STATE_DIR, never left to
         # the bridge's own state dir; the notifier's bot user is composed only when set.
         pinged_conf, _e = validate_conf(dict(values, STATE_DIR="~/.bridge-state",
@@ -3656,6 +3703,7 @@ def selftest():
             TECH_LEAD_LINK_HOSTS="github.com", HANDOFF_STATES="Ready to merge",
             DONE_STATE="Shipped", NOTIFIER_BOT_USER_ID="U0NOTIFY01", ACT="yes",
             AGENT_USER_NAME="Agent", DIRECT_ASKS="yes", QUEUE_CONFIG="~/q.json",
+            RUNNER_SETTINGS="~/runner.json", RUNNER_REPOS="acme/app=app",
             QUESTION_REMINDER_HOURS="5"))
         composed_keys = sorted(compose_config(everything))
         sources = [JOB_KEY_FROM.get(k, "missing") for k in composed_keys]

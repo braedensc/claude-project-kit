@@ -27,6 +27,7 @@
     "key_file": "~/.pipeline-runner/session-writer-key",
     "writer_user_id": "<the session writer's tracker user id, never the owner's>"
   },
+  "queue_config": "~/.stage-e/queue/queue.json",
   "projects": {
     "app": {
       "repo": "/Users/<role-account>/repos/app",

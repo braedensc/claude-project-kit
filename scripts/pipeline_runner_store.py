@@ -34,6 +34,11 @@ The runner checks every request against the tracker's history before it starts a
 (scripts/pipeline_runner.py). What keeps a session from writing a request at all is the walls below,
 and its sandbox. What this file checks is the shape, and that the named caller may ask for that kind.
 
+EACH PROJECT'S LANES (KIT-866, KIT-645).  lane_flags() is the one reading of a project's `lanes`:
+absent is every lane off. The runner reads its settings through it, and so does a caller asking
+caller_lane() whether to ask the runner or keep to its old way. A caller that cannot read the
+runner's settings is held, never sent the old way: could not read is not off.
+
 A REVIEW'S START (KIT-644).  The review job's start carries the review's facts as its text, up to
 REVIEW_TEXT_MAX characters since they hold the diff, and says its tier: `standard`, or `guarded` for
 a change to a guarded path, which gets the stronger model. The job chooses the request's id
@@ -68,6 +73,7 @@ import contextlib
 import fcntl
 import json
 import os
+import pwd
 import re
 import stat
 import sys
@@ -119,10 +125,12 @@ LIMIT_REASONS = ("limit:time", "limit:memory", "limit:disk")
 STARTED_FOR = ("request", "interrupted", "session-gone")
 RUNNERS_OWN = ("interrupted", "session-gone")
 AUTO_RESUME = ("pending", "started", "refused")
-# How a run was let start: the owner's move or creation, a resume of a run of the same session,
-# a fresh session in the workspace of a run whose session was gone, or the approval its ticket's
-# code run recorded (KIT-644: a review follows the coding it judges).
-HOW = ("move", "creation", "resumed-run", "fresh-session", "code-run")
+# How a run was let start: the owner's move or creation, a plan he approved in Slack or the
+# validator in his place (each as the queue's own judge names it, KIT-645), a resume of a run of
+# the same session, a fresh session in the workspace of a run whose session was gone, or the
+# approval its ticket's code run recorded (KIT-644: a review follows the coding it judges).
+APPROVALS = ("move", "creation", "slack", "validator")
+HOW = APPROVALS + ("resumed-run", "fresh-session", "code-run")
 FOLLOWS = ("resumed-run", "fresh-session")              # a run that carries on another run
 
 TICKET_RE = re.compile(r"^[A-Z][A-Z0-9]{0,15}-[0-9]{1,9}\Z")
@@ -173,6 +181,50 @@ def may(caller, action, kind):
             or kind not in CALLERS[caller]:
         return False
     return action != "start" or kind in STARTS
+
+
+def lane_flags(raw):
+    """{kind: on} from a project's `lanes`, or None when it is not one: the one rule the runner and
+    each caller read (KIT-866). Absent is every lane off, and a kind left out is off."""
+    lanes = {} if raw is None else raw
+    if not (isinstance(lanes, dict) and all(k in KINDS and isinstance(v, bool)
+                                            for k, v in lanes.items())):
+        return None
+    return dict((k, lanes.get(k) is True) for k in KINDS)
+
+
+def caller_lane(settings_path, project, kind):
+    """("on" | "off" | "held", store_dir, why) for a caller choosing between the runner and its old
+    way (KIT-645), read from the runner's own settings file. "on": the runner is switched on and the
+    project's lane is on, so the caller asks it, in `store_dir`. "off": the lane is off, so the
+    caller's old way stands. "held": the caller cannot tell, or the lane is on while the runner is
+    off. Nothing starts either way then, and `why` says so in words, never with a value from the
+    file. Could not read is never "off" (contract section 13)."""
+    if not (isinstance(settings_path, str) and os.path.isabs(settings_path)):
+        return "held", None, "the runner's settings file is not named by an absolute path"
+    try:
+        doc = read_json(settings_path)
+    except StoreError as exc:
+        return "held", None, "the runner's settings could not be read: %s" % exc
+    projects = doc.get("projects") if isinstance(doc, dict) else None
+    if not (isinstance(projects, dict) and isinstance(doc.get("enabled"), bool)):
+        return "held", None, "the runner's settings are not the runner's: no projects or no switch"
+    if not isinstance(projects.get(project), dict):
+        return "held", None, "the runner's settings have no project %s" % project
+    flags = lane_flags(projects[project].get("lanes"))
+    if flags is None:
+        return "held", None, "project %s's lanes in the runner's settings are not usable" % project
+    if not flags.get(kind):
+        return "off", None, "the %s lane is off for project %s" % (kind, project)
+    if not doc["enabled"]:
+        return "held", None, ("project %s's %s lane is on, but the runner is switched off"
+                              % (project, kind))
+    where = doc.get("store_dir")
+    if isinstance(where, str) and (where == "~" or where.startswith("~/")):
+        where = os.path.join(pwd.getpwuid(os.getuid()).pw_dir, where[2:])
+    if not (isinstance(where, str) and os.path.isabs(where) and "\0" not in where):
+        return "held", None, "the runner's settings name no store to ask in"
+    return "on", where, ""
 
 
 def _plain(text, limit):
@@ -1002,6 +1054,58 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
     expect("a runs folder that fails its walls gives None, never an empty list",
            (got["state"], got["runs"]), ("could-not-read", None))
     os.chmod(os.path.join(store, "runs"), 0o700)
+
+    # ---- KIT-645: how a start was approved, as the queue's judge names it ----- #
+    for how in ("slack", "validator"):
+        expect("a start the queue's judge let through by %s is a record" % how,
+               run_problems(dict(rec, how=how)), [])
+    expect("…and a start that names no approval is not one",
+           run_problems(dict(rec, how="limits")), ["the record's how is not valid"])
+
+    # ---- the lanes, read one way by the runner and by each caller (KIT-866, KIT-645) ---- #
+    expect("lanes: absent is every lane off", lane_flags(None), dict.fromkeys(KINDS, False))
+    expect("lanes: a kind left out is off",
+           (lane_flags({"code": True})["code"], lane_flags({"code": True})["fix"]), (True, False))
+    expect("lanes: a kind that is none, or a word for true, is not lanes at all",
+           (lane_flags({"deploy": True}), lane_flags({"code": "yes"}), lane_flags([])), (None, None, None))
+    settings = os.path.join(root, "runner.json")
+
+    def lane_of(doc, project="app", kind="code"):
+        if doc is not None:
+            with open(settings, "w", encoding="utf-8") as fh:
+                fh.write(doc if isinstance(doc, str) else json.dumps(doc))
+        return caller_lane(settings, project, kind)
+    on = {"enabled": True, "store_dir": store, "projects": {"app": {"lanes": {"code": True}}}}
+    expect("caller: the runner on and the project's lane on is on, with the store to ask in",
+           lane_of(on), ("on", store, ""))
+    expect("caller: another kind of the same project is off, and its old way stands",
+           lane_of(None, kind="review"), ("off", None, "the review lane is off for project app"))
+    expect("caller: a project with no lanes is off", lane_of(dict(on, projects={"app": {}})),
+           ("off", None, "the code lane is off for project app"))
+    expect("caller: the lane on while the runner is off is held, never the old way",
+           lane_of(dict(on, enabled=False)),
+           ("held", None, "project app's code lane is on, but the runner is switched off"))
+    expect("caller: a project the runner does not have is held",
+           lane_of(on, project="web"), ("held", None, "the runner's settings have no project web"))
+    expect("caller: settings that are not JSON are held, never off",
+           lane_of("{not json")[:2], ("held", None))
+    expect("caller: settings that are gone are held, never off",
+           (os.unlink(settings), caller_lane(settings, "app", "code")[:2])[1], ("held", None))
+    expect("caller: lanes that are not lanes are held",
+           lane_of(dict(on, projects={"app": {"lanes": {"code": "on"}}})),
+           ("held", None, "project app's lanes in the runner's settings are not usable"))
+    expect("caller: settings with no switch are not the runner's",
+           lane_of({"projects": on["projects"]})[:2], ("held", None))
+    expect("caller: a store under ~/ is this account's home, from the account database",
+           lane_of(dict(on, store_dir="~/runner/store"))[1],
+           os.path.join(pwd.getpwuid(os.getuid()).pw_dir, "runner", "store"))
+    expect("caller: a relative store is held", lane_of(dict(on, store_dir="store"))[:2], ("held", None))
+    expect("caller: a settings path that is not absolute is held",
+           caller_lane("runner.json", "app", "code")[0], "held")
+    link = os.path.join(root, "runner-link.json")
+    lane_of(on)
+    os.symlink(settings, link)
+    expect("caller: settings read through a link are held", caller_lane(link, "app", "code")[0], "held")
 
     # The session's final message, kept by the runner when a run ends (KIT-858).
     one, two = "run-" + "5" * 32, "run-" + "6" * 32

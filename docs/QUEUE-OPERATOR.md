@@ -131,6 +131,18 @@ session list not read whole. Only coding pieces resume. An ordinary error is `re
 Good: `acted: the queue handed ENG-5 over again`. Not that: `queue: resume: the usage file cannot be trusted ...`. Check
 the usage job. Not that: `I took the agent off ENG-5 ... nobody holds it now`. Hand it to the agent in Linear.
 
+On a project that codes on our own runner (KIT-645, `docs/RUNNER.md`), such a piece is let go, and the log says so: the
+runner's own resume of it is not built yet.
+
+## On a project that codes on our own runner
+
+With the runner's `lanes.code` on for a project, and the bridge wired to it (`docs/BRIDGE-OPERATOR.md`), the queue
+decides as before and the bridge's start is a code request to the runner (KIT-645). The runner judges each start with
+this queue's own reader and judge, and starts only a ticket a named approver let through. So a small agent-filed finding
+the limits admit (`agent_filed: limits`) is refused there, and the bridge's pass ends loud once. Move such a finding into
+Todo yourself to start it, or keep `agent_filed` off while a project codes on the runner. The runner reads this queue's
+config file (`queue_config` in its own settings), so both must name the same file.
+
 ## Pacing each day to the plan's weekly reset
 
 The plan's usage limit resets once a week, and a busy Monday can spend what Friday needed. Set `PACE_TO_RESET=yes` and

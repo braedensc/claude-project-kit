@@ -34,6 +34,7 @@ if HERE not in sys.path:
 
 import pipeline_notify_local as notify  # noqa: E402
 import pipeline_plan_poller as poller  # noqa: E402
+import pipeline_runner_store as runner_store  # noqa: E402  (KIT-645: a project key's shape)
 import pipeline_tech_lead_turn as turn  # noqa: E402  (KIT-489: the turn's own keys and rules)
 from pipeline_bridge_transport import BridgeError  # noqa: E402
 
@@ -149,6 +150,12 @@ CONFIG_KEYS = {
                     "own hand-over of approved plans, as before",
     "queue_every_seconds": "how often the queue is asked, in seconds (default %d, at least 60)"
                            % DEFAULT_QUEUE_EVERY_SECONDS,
+    "runner_lane": "KIT-645: {\"settings_file\": our own runner's settings, \"repos\": "
+                   "{\"OWNER/REPO\": its project key there}}. A queued start on a listed "
+                   "repository goes to the runner as a code request, and nothing is delegated, "
+                   "while the runner's own `lanes.code` for that project is on: that switch is "
+                   "the runner's. Needs queue_config. Empty, the default: every start is a "
+                   "hand-over, as before",
     "pings_file": "the notifier's record of agent:blocked pings (default "
                   "<state_dir>/notifier-bridge-pings.json, where the notifier writes it)",
     "relay_max_chars": "a longer answer is refused, never cut (default the relay's, 1000)",
@@ -285,6 +292,39 @@ def load_config(path):
     return validate_config(raw)
 
 
+RUNNER_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}\Z")
+
+
+def runner_lane_setting(raw, queue_config):
+    """({} or {"settings_file", "repos"}, errors): the bridge's wiring to our own runner (KIT-645).
+    Absent, or naming no repository, is none: every start is a hand-over, as before. Each listed
+    repository maps to its project key in the runner's settings, whose own `lanes.code` is the
+    switch. The queue's starts are what go there, so it needs `queue_config`."""
+    if raw is None or raw == {}:
+        return {}, []
+    shape = ("config 'runner_lane' must be {\"settings_file\": <the runner's settings file>, "
+             "\"repos\": {\"OWNER/REPO\": <its project key there>}}, or empty for none")
+    if not isinstance(raw, dict) or set(raw) - {"settings_file", "repos"}:
+        return {}, [shape]
+    errors, repos, path = [], raw.get("repos") or {}, raw.get("settings_file")
+    if not (isinstance(repos, dict) and all(
+            isinstance(k, str) and RUNNER_REPO_RE.match(k) and isinstance(v, str)
+            and runner_store.PROJECT_RE.match(v) for k, v in repos.items())):
+        errors.append("config 'runner_lane.repos' must map each OWNER/REPO to its project key in "
+                      "the runner's settings")
+    if not (isinstance(path, str) and path.strip() and "\0" not in path
+            and os.path.isabs(os.path.expanduser(path.strip()))):
+        errors.append("config 'runner_lane.settings_file' must be the full path of our own "
+                      "runner's settings file, or start with ~/")
+    if not errors and repos and not queue_config:
+        errors.append("config 'runner_lane' needs 'queue_config': the queue's starts are what "
+                      "go to the runner")
+    if errors or not repos:
+        return {}, errors
+    return {"settings_file": os.path.realpath(os.path.expanduser(path.strip())),
+            "repos": dict(repos)}, []
+
+
 def validate_config(raw):
     errors = []
     unknown = sorted(set(raw) - set(CONFIG_KEYS) - set(RETIRED_KEYS))
@@ -324,6 +364,7 @@ def validate_config(raw):
         "handoff_states": raw.get("handoff_states", list(DEFAULT_HANDOFF_STATES)),
         "queue_config": raw.get("queue_config") or "",
         "queue_every_seconds": raw.get("queue_every_seconds", DEFAULT_QUEUE_EVERY_SECONDS),
+        "runner_lane": raw.get("runner_lane") or {},
         "pings_file": raw.get("pings_file") or "",
         "relay_max_chars": raw.get("relay_max_chars", notify.DEFAULT_RELAY_MAX_CHARS),
         "relay_max_per_hour": raw.get("relay_max_per_hour", DEFAULT_RELAY_MAX_PER_HOUR),
@@ -475,6 +516,8 @@ def validate_config(raw):
                       "empty for none, got %r" % (cfg["queue_config"],))
     elif cfg["queue_config"]:
         cfg["queue_config"] = os.path.realpath(os.path.expanduser(cfg["queue_config"]))
+    cfg["runner_lane"], lane_bad = runner_lane_setting(cfg["runner_lane"], cfg["queue_config"])
+    errors += lane_bad
     handoff = cfg["handoff_states"]
     if not isinstance(handoff, list) or not handoff or not all(
             isinstance(s, str) and s and s == s.strip() for s in handoff):
@@ -1034,6 +1077,32 @@ def cases_config(kit):
                "'queue_config' must be a path" in _config_error(dict(
                    EXAMPLE_CONFIG, queue_config=5, state_dir=os.path.join(tmp, "q2")))),
               ("", True, True))
+        # KIT-645: the wiring to our own runner. Absent is none; each repository names its project
+        # key there; it needs the queue, whose starts are what go to the runner.
+        wired = {"settings_file": os.path.join(tmp, "runner.json"), "repos": {"acme/app": "app"}}
+        queue_file = os.path.join(tmp, "queue.json")
+        check("config-runner-lane-off-by-default-wired-with-the-queue",
+              (validate_config(dict(EXAMPLE_CONFIG, state_dir=os.path.join(tmp, "r0")))["runner_lane"],
+               validate_config(dict(EXAMPLE_CONFIG, state_dir=os.path.join(tmp, "r1"), queue_config=queue_file,
+                                    runner_lane=wired))["runner_lane"],
+               validate_config(dict(EXAMPLE_CONFIG, state_dir=os.path.join(tmp, "r2"),
+                                    runner_lane={"settings_file": "/x", "repos": {}}))["runner_lane"]),
+              ({}, dict(wired, settings_file=os.path.realpath(wired["settings_file"])), {}))
+        for name, lane, queue, want in (
+                ("without the queue", wired, "", "'runner_lane' needs 'queue_config'"),
+                ("a repository that is no OWNER/REPO", dict(wired, repos={"app": "app"}), queue_file,
+                 "'runner_lane.repos' must map each OWNER/REPO"),
+                ("a project key that is not one", dict(wired, repos={"acme/app": "App"}), queue_file,
+                 "'runner_lane.repos' must map each OWNER/REPO"),
+                ("no settings file", dict(wired, settings_file=""), queue_file,
+                 "'runner_lane.settings_file' must be the full path"),
+                ("a relative settings file", dict(wired, settings_file="runner.json"), queue_file,
+                 "'runner_lane.settings_file' must be the full path"),
+                ("a key it does not know", dict(wired, store_dir="/x"), queue_file,
+                 "config 'runner_lane' must be {")):
+            check("config-runner-lane-refuses-%s" % name.replace(" ", "-"),
+                  want in _config_error(dict(EXAMPLE_CONFIG, runner_lane=lane, queue_config=queue,
+                                             state_dir=os.path.join(tmp, "r-" + name[:6].strip()))), True)
         # KIT-284: the hand-off lanes are a list of names, the lane setup-board makes by
         # default, and never a state a child sits in before its work starts.
         check("config-handoff-states-default-to-the-lane-setup-board-makes",
