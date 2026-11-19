@@ -44,7 +44,7 @@ One pass every few minutes, as the role account:
 | `planning-needs-input` | the plan executor | the planner stopped to ask you something, and filed no plan; with `REPLAN_IN_DM=yes`, a page in direct messages ends with where the answer goes and the `replan <ticket>` to send (KIT-321) | `agent:blocked` |
 | `planning-no-output` | the plan executor, on a run the planner job does not own | a planning run ended without a plan, so nothing was filed; with `REPLAN_IN_DM=yes`, a page in direct messages ends with the `replan <ticket>` to send (KIT-321) | `agent:blocked` |
 | `planning-rejected` | the plan executor, on a run the planner job does not own | a plan couldn't be filed; the ticket says why; with `REPLAN_IN_DM=yes`, a page in direct messages ends with the `replan <ticket>` to send (KIT-321) | none |
-| `planning-failed` | the planner job, on every way it stops without filing a plan | how planning ended, whether anything may have been filed, and what to do next; with `REPLAN_IN_DM=yes`, a page in direct messages ends with the `replan <idea>` to send, where a replan can work | none: the run is over and its ticket closed |
+| `planning-failed` | the planner job, on every way it stops without filing a plan | how planning ended, whether anything may have been filed, and what to do next; with `REPLAN_IN_DM=yes`, a page in direct messages ends with the `replan <idea>` to send, where a replan can work | none: the run is over, so the page is the cue |
 | `agent:blocked` | a stopped session | a dev stopped to ask you something | `agent:blocked` |
 | `needs-human-session` | a stopped session, which the session brief now tells to write (KIT-419) | a dev stopped work for good, so a person takes it from here | `agent:needs-human` |
 | `needs-human-routing` | the planner job, on a planning ticket it could not route | the planning run was cancelled, and planning is stopped until you sign the probe again | `agent:needs-human` |
@@ -117,7 +117,8 @@ planner job did not start. Say yes only once the bridge
 acts (`ACT=yes` in bridge.conf). Otherwise the page says the ticket shows how to plan it
 again. The planner job holds back the executor's own refused or empty-run page, so one run
 never pages twice. That page carried `agent:blocked`; the planner's own page adds no label,
-since the run's ticket is already closed.
+since the run is over: its planning ticket is closed, or, on our own runner's lane, none was made
+and the page sits on the idea (KIT-705).
 
 **The plan-ready page reads one line from the executor's summary** (KIT-274): its second
 line, in exactly this shape, or the page keeps its general words.

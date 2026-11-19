@@ -71,22 +71,25 @@ So the question a project actually has to answer is not *"what does `delivery.js
 say"*. It is **"what started this session, and does that thing read `delivery.json` at
 all?"**
 
-| Limit | Tier 0 — local (`pipeline_dispatch_local.py`) | Tier 1 — CI dispatch (`pipeline-dispatch.yml`) | An external agent daemon |
-|---|---|---|---|
-| `perEffort[e].maxTurns` (clamped by `maxTurns`) | pinned, **advisory** | **enforced** — `--max-turns` on the agent step | not pinned, **not enforced** |
-| `perEffort[e].maxMinutes` | pinned, **advisory** | **enforced** — `timeout-minutes` on the agent step, inside a 120-minute job wall | **none** |
-| `perEffort[e].maxUsd` | pinned, **advisory** | **enforced on the api-key lane** (`--max-budget-usd`); on the subscription lane it is a *reservation* against `dailyUsd`, not a cap on the run | **none** |
-| `wipLimit` | **none** — tier 0 keeps no state record | enforced twice: `max-parallel` within a run, the `working` count across runs | **none** |
-| `totalAttempts` | **none** — a local dispatch consumes no slot | enforced; `claim` increments *before* the session starts | **none** |
-| `dailyUsd` | **none** — reserves nothing | enforced; each ticket's `maxUsd` reserved at dispatch over a rolling 24h | **none** |
-| `maxBounces` | n/a | enforced out of session, keyed on CI run IDs | **enforced** — counted from the bounce driver's own append-only ledger, which the fix session cannot write. The one limit in this table that *does* hold on this lane. Its *value* is read from `delivery.json` on the **committed default branch**, so a project without that file has bouncing off rather than unlimited, and the driver says which |
-| `fixIterations` | prompt material only | prompt material only | prompt material only |
+| Limit | Tier 0 — local (`pipeline_dispatch_local.py`) | Tier 1 — CI dispatch (`pipeline-dispatch.yml`) | An external agent daemon | Our own runner's coding lane (`pipeline_runner.py`, KIT-645) |
+|---|---|---|---|---|
+| `perEffort[e].maxTurns` (clamped by `maxTurns`) | pinned, **advisory** | **enforced** — `--max-turns` on the agent step | not pinned, **not enforced** | pinned, **enforced** — `--max-turns` from the pin |
+| `perEffort[e].maxMinutes` | pinned, **advisory** | **enforced** — `timeout-minutes` on the agent step, inside a 120-minute job wall | **none** | pinned, **enforced** — the run's time limit, held to the pin's minutes |
+| `perEffort[e].maxUsd` | pinned, **advisory** | **enforced on the api-key lane** (`--max-budget-usd`); on the subscription lane it is a *reservation* against `dailyUsd`, not a cap on the run | **none** | pinned, passed as `--max-budget-usd` |
+| `wipLimit` | **none** — tier 0 keeps no state record | enforced twice: `max-parallel` within a run, the `working` count across runs | **none** | the queue's lanes decide what starts; the runner does not count it |
+| `totalAttempts` | **none** — a local dispatch consumes no slot | enforced; `claim` increments *before* the session starts | **none** | **enforced** — counted from the runner's own run records |
+| `dailyUsd` | **none** — reserves nothing | enforced; each ticket's `maxUsd` reserved at dispatch over a rolling 24h | **none** | **none** in the runner; the queue paces against the plan's usage windows |
+| `maxBounces` | n/a | enforced out of session, keyed on CI run IDs | **enforced** — counted from the bounce driver's own append-only ledger, which the fix session cannot write. The one limit in this table that *does* hold on this lane. Its *value* is read from `delivery.json` on the **committed default branch**, so a project without that file has bouncing off rather than unlimited, and the driver says which | **enforced**, as on that lane: the bounce driver's own ledger |
+| `fixIterations` | prompt material only | prompt material only | prompt material only | prompt material only |
 
 Tier 0's column is deliberate, and [spelled out below](#tier-0--local-and-why-it-exists) —
 nothing meters a human's own session, which is why `--attempt N` exists so a re-run can
-say which attempt it is honestly. It is the last column that surprises people.
+say which attempt it is honestly. It is the external daemon's column that surprises people. Our own runner's coding lane writes a
+pin, so it holds the per-run budget again: its session holds no tracker sign-in, only five tools
+tied to its own ticket, and the guard reads its pin beside the lane marker (contract §3,
+[RUNNER.md](RUNNER.md)).
 
-> **That last column is a deployed shape, not a thought experiment.** A dispatcher that
+> **The external daemon's column is a deployed shape, not a thought experiment.** A dispatcher that
 > binds sessions by *a named person delegating a ticket* writes no pin, so it lands in that
 > column entire — and it is what a `local-daemon` backend looks like today
 > ([ADR 2026-09-05](adr/2026-09-05-stage-e-under-a-delegation-bound-dispatcher.md)). Read
@@ -103,7 +106,7 @@ say which attempt it is honestly. It is the last column that surprises people.
 > head GitHub reports and the clock, and the review basis's snapshot is taken by the driver
 > at a person's delegation. None of the three reads anything the counted party can write.
 
-### The last column: a daemon that starts sessions from tracker events
+### The external daemon's column: a daemon that starts sessions from tracker events
 
 A daemon that watches the tracker, creates a worktree on assignment and starts a session
 in it is **a dispatcher too** — just not one this kit ships, and not one that has agreed

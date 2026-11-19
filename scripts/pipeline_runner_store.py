@@ -34,6 +34,11 @@ The runner checks every request against the tracker's history before it starts a
 (scripts/pipeline_runner.py). What keeps a session from writing a request at all is the walls below,
 and its sandbox. What this file checks is the shape, and that the named caller may ask for that kind.
 
+EACH PROJECT'S LANES (KIT-866, KIT-645).  lane_flags() is the one reading of a project's `lanes`:
+absent is every lane off. The runner reads its settings through it, and so does a caller asking
+caller_lane() whether to ask the runner or keep to its old way. A caller that cannot read the
+runner's settings is held, never sent the old way: could not read is not off.
+
 A REVIEW'S START (KIT-644).  The review job's start carries the review's facts as its text, up to
 REVIEW_TEXT_MAX characters since they hold the diff, and says its tier: `standard`, or `guarded` for
 a change to a guarded path, which gets the stronger model. The job chooses the request's id
@@ -50,6 +55,10 @@ OUTPUT_MAX characters, in outputs/<run>.json. The caller reads it with run_outpu
 None when the run left no result at all, or StoreError when one is there and cannot be read. The
 message is the session's own words, so it is data to its caller and never part of a run's record.
 
+A CALLER'S OWN REQUESTS (KIT-705).  asked() gives a caller every request it made for one kind,
+waiting or answered, so it can count its starts and find a request whose record it lost. When
+withdraw() (above) says False, the runner took the request first, so the caller reads its answer.
+
 THE WALLS.  A session must never write here: a request it wrote could start a session nobody
 approved. So the store must be an absolute path, outside every git working tree, a real folder
 (not a link), owned by this account, and writable by no one else. walls() says what is wrong, and
@@ -64,6 +73,7 @@ import contextlib
 import fcntl
 import json
 import os
+import pwd
 import re
 import stat
 import sys
@@ -115,10 +125,12 @@ LIMIT_REASONS = ("limit:time", "limit:memory", "limit:disk")
 STARTED_FOR = ("request", "interrupted", "session-gone")
 RUNNERS_OWN = ("interrupted", "session-gone")
 AUTO_RESUME = ("pending", "started", "refused")
-# How a run was let start: the owner's move or creation, a resume of a run of the same session,
-# a fresh session in the workspace of a run whose session was gone, or the approval its ticket's
-# code run recorded (KIT-644: a review follows the coding it judges).
-HOW = ("move", "creation", "resumed-run", "fresh-session", "code-run")
+# How a run was let start: the owner's move or creation, a plan he approved in Slack or the
+# validator in his place (each as the queue's own judge names it, KIT-645), a resume of a run of
+# the same session, a fresh session in the workspace of a run whose session was gone, or the
+# approval its ticket's code run recorded (KIT-644: a review follows the coding it judges).
+APPROVALS = ("move", "creation", "slack", "validator")
+HOW = APPROVALS + ("resumed-run", "fresh-session", "code-run")
 FOLLOWS = ("resumed-run", "fresh-session")              # a run that carries on another run
 
 TICKET_RE = re.compile(r"^[A-Z][A-Z0-9]{0,15}-[0-9]{1,9}\Z")
@@ -169,6 +181,50 @@ def may(caller, action, kind):
             or kind not in CALLERS[caller]:
         return False
     return action != "start" or kind in STARTS
+
+
+def lane_flags(raw):
+    """{kind: on} from a project's `lanes`, or None when it is not one: the one rule the runner and
+    each caller read (KIT-866). Absent is every lane off, and a kind left out is off."""
+    lanes = {} if raw is None else raw
+    if not (isinstance(lanes, dict) and all(k in KINDS and isinstance(v, bool)
+                                            for k, v in lanes.items())):
+        return None
+    return dict((k, lanes.get(k) is True) for k in KINDS)
+
+
+def caller_lane(settings_path, project, kind):
+    """("on" | "off" | "held", store_dir, why) for a caller choosing between the runner and its old
+    way (KIT-645), read from the runner's own settings file. "on": the runner is switched on and the
+    project's lane is on, so the caller asks it, in `store_dir`. "off": the lane is off, so the
+    caller's old way stands. "held": the caller cannot tell, or the lane is on while the runner is
+    off. Nothing starts either way then, and `why` says so in words, never with a value from the
+    file. Could not read is never "off" (contract section 13)."""
+    if not (isinstance(settings_path, str) and os.path.isabs(settings_path)):
+        return "held", None, "the runner's settings file is not named by an absolute path"
+    try:
+        doc = read_json(settings_path)
+    except StoreError as exc:
+        return "held", None, "the runner's settings could not be read: %s" % exc
+    projects = doc.get("projects") if isinstance(doc, dict) else None
+    if not (isinstance(projects, dict) and isinstance(doc.get("enabled"), bool)):
+        return "held", None, "the runner's settings are not the runner's: no projects or no switch"
+    if not isinstance(projects.get(project), dict):
+        return "held", None, "the runner's settings have no project %s" % project
+    flags = lane_flags(projects[project].get("lanes"))
+    if flags is None:
+        return "held", None, "project %s's lanes in the runner's settings are not usable" % project
+    if not flags.get(kind):
+        return "off", None, "the %s lane is off for project %s" % (kind, project)
+    if not doc["enabled"]:
+        return "held", None, ("project %s's %s lane is on, but the runner is switched off"
+                              % (project, kind))
+    where = doc.get("store_dir")
+    if isinstance(where, str) and (where == "~" or where.startswith("~/")):
+        where = os.path.join(pwd.getpwuid(os.getuid()).pw_dir, where[2:])
+    if not (isinstance(where, str) and os.path.isabs(where) and "\0" not in where):
+        return "held", None, "the runner's settings name no store to ask in"
+    return "on", where, ""
 
 
 def _plain(text, limit):
@@ -544,6 +600,62 @@ def answer(store, request_id):
     return doc["answer"]
 
 
+def asked(store, caller, kind, since=None):
+    """Every request one caller made for one kind, waiting or answered, for that caller to read
+    back (KIT-705): {"asked": [{"id", "request", "answer"}], "unread": n}, oldest first. `answer`
+    is None while it waits. `since` (seconds) passes over requests asked before it, judged first
+    by each file's time, which is never earlier than its asking, so a long-lived store is not
+    read whole each time. A file that cannot be read, or holds no well-formed request, is counted
+    in `unread`, never passed over in silence. `unread` is store-wide: such a file cannot say whose
+    it is, so every caller's read counts it, and each caller says how it judges one. StoreError
+    when a folder cannot be listed: "could not read" is never "none asked" (contract section 13)."""
+    if caller not in CALLERS or kind not in CALLERS[caller]:
+        raise ValueError("the %s job asks for no %s session" % (caller, kind))
+    found, unread = {}, set()
+    # The waiting ones first: the runner writes a request's answer before it removes the request,
+    # so one answered between the two listings is in the second, and never in neither.
+    for folder in ("requests", "taken"):
+        path = os.path.join(store, folder)
+        bad = walls(path)
+        if bad:
+            raise StoreError(bad[0])
+        try:
+            names = sorted(os.listdir(path))
+        except OSError as exc:
+            raise StoreError("the %s could not be listed (%s)" % (folder, type(exc).__name__))
+        for name in names:
+            rid = name[:-5] if name.endswith(".json") else ""
+            if not REQUEST_RE.match(rid):
+                continue
+            full = os.path.join(path, name)
+            try:
+                if since is not None and os.lstat(full).st_mtime < since:
+                    continue
+                doc = read_json(full)
+            except FileNotFoundError:
+                continue                     # answered between the list and the read
+            except (OSError, StoreError):
+                unread.add(rid)
+                continue
+            req, ans = (doc.get("request"), doc.get("answer")) if folder == "taken" and \
+                isinstance(doc, dict) else (doc, None)
+            try:
+                ok = (isinstance(req, dict) and not request_problems(req) and req["id"] == rid
+                      and (folder == "requests" or isinstance(ans, dict)))
+            except (TypeError, ValueError, AttributeError):
+                ok = False
+            if not ok:
+                unread.add(rid)
+                continue
+            unread.discard(rid)
+            found.pop(rid, None)
+            if (req["caller"], req["kind"]) == (caller, kind) and (
+                    since is None or req["at"] >= iso(since)):
+                found[rid] = {"id": rid, "request": req, "answer": ans}
+    rows = sorted(found.values(), key=lambda r: (r["request"]["at"], r["id"]))
+    return {"asked": rows, "unread": len(unread)}
+
+
 # --------------------------------------------------------------------------- #
 # Run records
 # --------------------------------------------------------------------------- #
@@ -823,6 +935,53 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
     expect("…never one that is not a request a caller may make",
            taken_request(store, "rq-" + "9" * 32), None)
 
+    # KIT-705: a caller reads back its own requests, waiting or answered, and takes one back.
+    mine = os.path.join(root, "mine")
+    prepare(mine)
+    p1 = ask(mine, "planner", "start", "plan", "app", "ENG-7", text="Idea: ENG-7", now=1700000000)
+    p2 = ask(mine, "planner", "start", "plan", "app", "ENG-8", now=1700086400)
+    ask(mine, "queue", "start", "code", "app", "ENG-7", now=1700000000)
+    settle(mine, p1, read_json(os.path.join(mine, "requests", p1 + ".json")), True,
+           "run-" + "7" * 32, "", 1700000005)
+    got = asked(mine, "planner", "plan")
+    expect("asked gives the caller's own requests of that kind, oldest first, answered or waiting",
+           ([(r["id"], (r["answer"] or {}).get("run")) for r in got["asked"]], got["unread"]),
+           ([(p1, "run-" + "7" * 32), (p2, None)], 0))
+    expect("…its text and ticket as asked", (got["asked"][0]["request"]["text"],
+                                            got["asked"][1]["request"]["ticket"]), ("Idea: ENG-7", "ENG-8"))
+    os.utime(os.path.join(mine, "taken", p1 + ".json"), (1700000005, 1700000005))
+    expect("`since` passes over what was asked before it, by the file's time and then the request's",
+           [r["id"] for r in asked(mine, "planner", "plan", since=1700080000)["asked"]], [p2])
+    with open(os.path.join(mine, "requests", "rq-" + "8" * 32 + ".json"), "w") as fh:
+        fh.write("{not json")
+    write_json(os.path.join(mine, "taken", "rq-" + "6" * 32 + ".json"), {"request": {"id": "x"}})
+    got = asked(mine, "planner", "plan")
+    expect("a file it cannot read, or that holds no request, is counted, never passed over in silence",
+           (len(got["asked"]), got["unread"]), (2, 2))
+    expect("…by every caller's read: such a file cannot say whose it is, so `unread` is store-wide",
+           asked(mine, "queue", "code")["unread"], 2)
+    expect("a caller asks only for its own kinds", refused(lambda: asked(mine, "planner", "code")),
+           "the planner job asks for no code session")
+    os.chmod(os.path.join(mine, "taken"), 0o777)
+    expect("a folder that fails its walls is an error, never none asked",
+           refused(lambda: asked(mine, "planner", "plan")),
+           "others can read or write the store: it must be mode 0700")
+    os.chmod(os.path.join(mine, "taken"), 0o700)
+    expect("withdraw takes back a waiting request, once",
+           (withdraw(mine, p2), withdraw(mine, p2), answer(mine, p2),
+            [r["id"] for r in asked(mine, "planner", "plan")["asked"]]), (True, False, None, [p1]))
+    expect("…never an answered one: its answer stays", (withdraw(mine, p1), answer(mine, p1)["run"]),
+           (False, "run-" + "7" * 32))
+    # The moment between the runner's two writes: its answer is there, and the waiting file still.
+    p3 = ask(mine, "planner", "start", "plan", "app", "ENG-9", now=1700090000)
+    write_json(os.path.join(mine, "taken", p3 + ".json"),
+               {"request": read_json(os.path.join(mine, "requests", p3 + ".json")),
+                "answer": {"at": iso(1700090001), "ok": True, "run": "run-" + "5" * 32, "why": ""}})
+    expect("…nor one the runner has answered and not yet removed from the waiting ones",
+           (withdraw(mine, p3), os.path.exists(os.path.join(mine, "requests", p3 + ".json"))),
+           (False, True))
+    expect("…and only by a request id", refused(lambda: withdraw(mine, "../x")), "not a request id")
+
     # Run records.
     rec = dict((k, None) for k in RUN_KEYS)
     rec.update(schema=RUN_SCHEMA, run="run-" + "e" * 32, request=rid, caller="queue", kind="code",
@@ -895,6 +1054,58 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
     expect("a runs folder that fails its walls gives None, never an empty list",
            (got["state"], got["runs"]), ("could-not-read", None))
     os.chmod(os.path.join(store, "runs"), 0o700)
+
+    # ---- KIT-645: how a start was approved, as the queue's judge names it ----- #
+    for how in ("slack", "validator"):
+        expect("a start the queue's judge let through by %s is a record" % how,
+               run_problems(dict(rec, how=how)), [])
+    expect("…and a start that names no approval is not one",
+           run_problems(dict(rec, how="limits")), ["the record's how is not valid"])
+
+    # ---- the lanes, read one way by the runner and by each caller (KIT-866, KIT-645) ---- #
+    expect("lanes: absent is every lane off", lane_flags(None), dict.fromkeys(KINDS, False))
+    expect("lanes: a kind left out is off",
+           (lane_flags({"code": True})["code"], lane_flags({"code": True})["fix"]), (True, False))
+    expect("lanes: a kind that is none, or a word for true, is not lanes at all",
+           (lane_flags({"deploy": True}), lane_flags({"code": "yes"}), lane_flags([])), (None, None, None))
+    settings = os.path.join(root, "runner.json")
+
+    def lane_of(doc, project="app", kind="code"):
+        if doc is not None:
+            with open(settings, "w", encoding="utf-8") as fh:
+                fh.write(doc if isinstance(doc, str) else json.dumps(doc))
+        return caller_lane(settings, project, kind)
+    on = {"enabled": True, "store_dir": store, "projects": {"app": {"lanes": {"code": True}}}}
+    expect("caller: the runner on and the project's lane on is on, with the store to ask in",
+           lane_of(on), ("on", store, ""))
+    expect("caller: another kind of the same project is off, and its old way stands",
+           lane_of(None, kind="review"), ("off", None, "the review lane is off for project app"))
+    expect("caller: a project with no lanes is off", lane_of(dict(on, projects={"app": {}})),
+           ("off", None, "the code lane is off for project app"))
+    expect("caller: the lane on while the runner is off is held, never the old way",
+           lane_of(dict(on, enabled=False)),
+           ("held", None, "project app's code lane is on, but the runner is switched off"))
+    expect("caller: a project the runner does not have is held",
+           lane_of(on, project="web"), ("held", None, "the runner's settings have no project web"))
+    expect("caller: settings that are not JSON are held, never off",
+           lane_of("{not json")[:2], ("held", None))
+    expect("caller: settings that are gone are held, never off",
+           (os.unlink(settings), caller_lane(settings, "app", "code")[:2])[1], ("held", None))
+    expect("caller: lanes that are not lanes are held",
+           lane_of(dict(on, projects={"app": {"lanes": {"code": "on"}}})),
+           ("held", None, "project app's lanes in the runner's settings are not usable"))
+    expect("caller: settings with no switch are not the runner's",
+           lane_of({"projects": on["projects"]})[:2], ("held", None))
+    expect("caller: a store under ~/ is this account's home, from the account database",
+           lane_of(dict(on, store_dir="~/runner/store"))[1],
+           os.path.join(pwd.getpwuid(os.getuid()).pw_dir, "runner", "store"))
+    expect("caller: a relative store is held", lane_of(dict(on, store_dir="store"))[:2], ("held", None))
+    expect("caller: a settings path that is not absolute is held",
+           caller_lane("runner.json", "app", "code")[0], "held")
+    link = os.path.join(root, "runner-link.json")
+    lane_of(on)
+    os.symlink(settings, link)
+    expect("caller: settings read through a link are held", caller_lane(link, "app", "code")[0], "held")
 
     # The session's final message, kept by the runner when a run ends (KIT-858).
     one, two = "run-" + "5" * 32, "run-" + "6" * 32

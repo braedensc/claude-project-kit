@@ -3749,6 +3749,13 @@ def selftest():
               plan_receipt("KIT-777", "") in fakeP.issues[0]["description"], True)
         check("retry-summary-carries-receipt",
               PLAN_RECEIPT_PREFIX + "KIT-777/" in fakeP.comments[0][1], True)
+        # KIT-705: the planner's call on our own runner's lane pins the idea itself and names no
+        # idea apart, as above: the epic's receipt names the idea, the report lands on it, and
+        # the checks are the same ones (a retarget is refused below, with this same pin).
+        check("pinned-on-the-idea-itself: receipt and report name the idea (KIT-705)",
+              (fakeP.issues[0]["description"].count(PLAN_RECEIPT_PREFIX + "KIT-777/"),
+               fakeP.comments[0][0], fakeP.resolved_ideas[:1]),
+              (1, "idea-KIT-777", ["KIT-777"]))
         check("retry-second-run-ok", run(_tree(), client=fakeP), EXIT_OK)
         check("retry-second-run-files-nothing",
               (len(fakeP.issues), len(fakeP.projects), len(fakeP.comments)), first)

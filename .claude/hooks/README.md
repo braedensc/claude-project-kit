@@ -177,8 +177,9 @@ of every row):
 | Session state | Own ticket | Another ticket | No resolvable target |
 |---|---|---|---|
 | pipeline off, or no pin, no ledger row expecting one, and no lane marker (a human's ad-hoc session) | allow | allow | allow |
-| a pin the ledger says was written and never released is **gone**, or the pin store **could not be read** (KIT-674) | **deny every write** | **deny** | **deny** |
-| **lane marker** present, or the hook could not check for one (a dispatcher that binds by delegation, KIT-241); a pin is then not read | allow (the ticket the worktree folder, or its parent, is named after) | **deny** | **deny** for issue writes and creates (fail closed); allow for comments |
+| a pin the ledger says was written and never released is **gone**, or the pin store **could not be read** (KIT-674; beside the lane marker, an unreadable store adds nothing, below) | **deny every write** | **deny** | **deny** |
+| **lane marker** present, or the hook could not check for one (a dispatcher that binds by delegation, KIT-241); a pin there adds rules only when it is our own runner's, next row, and any other binds nothing | allow (the ticket the worktree folder, or its parent, is named after) | **deny** | **deny** for issue writes and creates (fail closed); allow for comments |
+| …and **our own runner's pin** for the ticket the workspace folder is named after (KIT-645) | allow (that ticket) | **deny** | as the row above; and grader paths and the ticket branch, as for a pinned `ticket` session |
 | …and the worktree folder names **no ticket** | — | **deny** any write naming a ticket | **deny** for issue writes and creates; allow for comments |
 | `ticket` mode | allow | **deny** | **deny** for issue writes (fail closed); allow for comments |
 | `ticket` mode, **create**-type call (no target) | — | — | **deny** — a session never creates a ticket *directly*. File a finding through the safe-outputs `ticket-create` request (contract §8), which a credential-holding executor applies into the backlog as `provenance:agent`, out of session |
@@ -194,10 +195,16 @@ owns all the way down, written by the Stage E installer's card CK-10 and measure
 `<pinsRoot>/dispatched-lane/<OS account>`, still counts — either one makes the lane —
 but the role account created the pins root and can rename the folders under it, which
 takes that one out of sight; it cannot rename root's `/etc`. Looked for with `lstat`, so
-the entry counts, not what it points at. **The marker wins over a pin:** no dispatcher
-writes a pin for a marked account, so a pin found for one was forged (the pins root is
-that account's to write when its sandbox lets a write leave the worktree), and the hook
-does not read it at all — a forged maintenance pin used to switch the lane off. With the
+the entry counts, not what it points at. **The marker's rules always hold, and a pin can
+only add to them (KIT-645):** the pins root is that account's to write when its sandbox
+lets a write leave the worktree, and a forged maintenance pin used to switch the lane off.
+Only one pin adds anything there: one our own runner wrote (`pinned_by` starts with
+`runner:`) for a `ticket` session on the ticket the workspace folder is named after. It
+adds grader-path protection and the ticket branch beside the lane's rules, which still
+hold. Any other pin there binds nothing, and neither does a pin store the hook cannot
+read: no session can make it unreadable past its walls, and a read error must never stop
+the lane's own sessions. A runner pin the ledger expects and cannot find, a lapsed one,
+and a pin that cannot be parsed or names another worktree fail closed. With the
 marker, protected labels and direct creates are refused, writes must name the ticket the
 worktree folder is named after (the dispatcher cuts `<base>/<ISSUE-ID>`, or
 `<base>/<ISSUE-ID>/<repo>` for several repositories; a grandparent folder does not
@@ -210,8 +217,8 @@ account and its home are read from the account database, never `$USER`, `$LOGNAM
 `$HOME`, because the dispatcher loads a worktree's env file into the next session
 (KIT-240). **Could not check is not absent:** only "no such file" means no marker; any
 other error, or an account the database cannot name, counts as the lane. Grader-path
-protection stays pinned-only: turning it on changes what a live coding session may edit,
-so it is the owner's call, and two battery cases pin it off.
+protection stays pinned-only: on the lane it holds for a session with our own runner's
+pin, and two battery cases pin it off for one with none, the old dispatcher's.
 
 **Fail direction is tested, not just asserted.** Write-blocking guards, state
 transitions and pin checks fail **closed**; checks that merely *withhold* autonomy from
@@ -245,8 +252,9 @@ the repo raise the cost of deleting or rewriting a pin without making it impossi
 pin deleted within a day of its writing is caught by the ledger (KIT-674), but a session
 that can delete its pin can edit the ledger beside it too, and a pin row more than a day
 old expects nothing, so the ledger raises the cost of that tamper and makes it visible
-without making it impossible. On the dispatcher's lane a pin is not read at all, so
-neither forging nor deleting one changes anything there. A comment or relation naming
+without making it impossible. On the dispatcher's lane a pin can only add rules, so
+forging one cannot lift any, and a runner pin deleted there is caught by the ledger as
+anywhere. A comment or relation naming
 another ticket by an internal UUID passes on that lane, as the contract allows a target
 the guard cannot resolve (§4 reporting). Tracker mutations are recognized by tool **verb**
 plus self-identifying payload values (a configured state/label ID, or a

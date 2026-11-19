@@ -160,3 +160,17 @@ after the other.
 - Whether the built-in sandbox needs a certificate, and whether the code host's command-line tool works inside it.
   KIT-704.
 - The size of the build. It is counted in pieces, not measured in time or usage.
+
+## Update 2026-11-18: coding sessions move, and a runner's pin adds to the lane's rules (KIT-645)
+
+- **The guard reads the runner's pin under the marker, always, and only to add.** A pin the runner
+  wrote for a `ticket` session on the ticket its workspace is named after adds the pinned rules
+  (grader paths, the ticket branch) beside the lane's, which still hold. Any other pin there binds
+  nothing, as before. It is not behind a lane's setting, as item 2 above planned: only a lane that
+  is on makes a runner pin, and a pin can only add rules there. The hook change is the owner's: his
+  own apply script commits it to this change's pull request, which cannot merge without it.
+- **A code start is judged by the queue's own reader and judge,** strictly: a named approver, or
+  no start. An agent-filed finding the queue's limits admit is refused on this lane.
+- **The runner's one tracker write** moves a code start's ticket into its working state, as the
+  session writer.
+- **Section 9's count is the runner's own run records** on this lane, as item 3 planned.
