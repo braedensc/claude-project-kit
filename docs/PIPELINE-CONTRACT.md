@@ -2075,19 +2075,19 @@ A reader says "I couldn't check" for a source that is not `read`. It never guess
 
 ### The kit copy
 
-A merged fix runs nowhere until the role account's clone moves, and only the one command moves it (KIT-309). The status job runs from that clone, so it can say when the clone is behind. It reads the clone's head from the files in `.git` (no process), reads which files the jobs run out of the clone's own copy of the installer's lists (`REQUIRED_SCRIPTS`, the sibling jobs' files and `RUNTIME_DATA_DIRS`, with `ast.literal_eval` and no import), and asks GitHub one read-only question: compare the head with the branch (`kit_repo`, `kit_branch`; `kit_clone` names another checkout). It does not count against `sources`, and a question it cannot answer never fails the pass.
+A merged fix runs nowhere until the role account's clone moves, and only the one command moves it (KIT-309). The status job runs from that clone, so it can say when the clone is behind. It reads the clone's head from the files in `.git` (no process), reads which files the jobs run out of the clone's own copy of the installer's lists (`REQUIRED_SCRIPTS`, the sibling jobs' files and their own data, and `RUNTIME_DATA_DIRS`, with `ast.literal_eval` and no import), and asks GitHub one read-only question: compare the head with the branch (`kit_repo`, `kit_branch`; `kit_clone` names another checkout). It does not count against `sources`, and a question it cannot answer never fails the pass.
 
 | Field | Type | Notes |
 |---|---|---|
-| `state` | `current` \| `behind` \| `unknown` | `behind`: a file the jobs run, or data they read (a schema, or a session kind the runner starts, KIT-880), changed between the head and the branch. `current`: none did (a document or a test may have): the same rule `verify` in the Stage E installer uses, so it does not cry wolf on every merge. `unknown`: the question could not be answered, or GitHub listed too few of the changed files to say none was a job file; never read as current. |
+| `state` | `current` \| `behind` \| `unknown` | `behind`: a file the jobs run, or data they read (a schema, or a session kind the runner starts, KIT-880), changed between the head and the branch. A job's own data counts only where that job is installed (KIT-889): the kit's guards, `.claude/hooks/`, where the runner's job is, and the look tool's profile, `templates/sandbox/look.sb`, where the acceptance job is. Which jobs are installed is read from their LaunchDaemon files, as the installer reads them; when it cannot be told, every job's data counts. `current`: none did (a document or a test may have): the same rule `verify` in the Stage E installer uses, so it does not cry wolf on every merge. `unknown`: the question could not be answered, or GitHub listed too few of the changed files to say none was a job file; never read as current. |
 | `head` | string \| null | The checkout's head commit, twelve characters. |
 | `merges_behind` | integer \| null | How many commits the branch is ahead. |
-| `files` | string[] | At most ten of the changed job files. A name is kept only when it is one of the jobs' own files under `scripts/`, `schemas/` or `session-kinds/`. |
+| `files` | string[] | At most ten of the changed job files. A name is kept only when it is one of the jobs' own files under `scripts/`, `schemas/`, `session-kinds/`, `.claude/hooks/` or `templates/sandbox/`. |
 | `files_total` | integer \| null | How many changed job files there were. Null when GitHub listed too few to say. |
 | `checked_at` | time \| null | When this pass asked. |
 | `reason` | string \| null | Why it is `unknown`, in fixed words (no .git, a HEAD it does not read, an installer it cannot read, GitHub not knowing the head, no token, a checkout holding commits the branch lacks, more files changed than GitHub lists); also on a `behind` that GitHub's cut-off list shows is true but whose count is only a floor (`files_total` is then null). |
 
-The stand-up says `behind` in one plain line in both rundowns while it stands, and `unknown` as not known. It says nothing when the copy is current or the field is absent. A clone with local edits, and a job not installed on this machine, are not seen here: the line counts every job's files.
+The stand-up says `behind` in one plain line in both rundowns while it stands, and `unknown` as not known. It says nothing when the copy is current or the field is absent. A clone with local edits is not seen here, and nor is a job not installed on this machine: the line counts every job's scripts. A job's own data counts only where the job is installed (KIT-889).
 
 ### The queue's room
 

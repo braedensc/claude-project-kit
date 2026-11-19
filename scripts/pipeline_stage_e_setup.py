@@ -478,13 +478,20 @@ DAEMON_ENTRY_SCRIPTS = ("pipeline_review_poller.py", "pipeline_bounce_local.py",
 # Each job's entry script, then every script it loads beyond REQUIRED_SCRIPTS. The selftest
 # reads the entries out of those installers' own job commands, derives each list with `ast` as
 # it does REQUIRED_SCRIPTS, and fails on any drift.
+#
+# THEN THE DATA IT READS FROM THE CLONE (KIT-889), beyond RUNTIME_DATA_DIRS: folders and files,
+# each a path from the clone's top. A change to one alone changes what that job does, so it counts
+# as "behind" too, and only where that job is installed: the kit's guards change often, and a
+# machine with no runner must not be told "behind" for them. The selftest checks each path
+# against the module that reads it. The status job reads this list with `ast`, so every part of
+# it stays a literal.
 ROLE_KIT_CLONE_PATH = "~/.stage-e/kit"
 SIBLING_JOBS = (
     # The notifier, and the module its pages from the review poller's records come from
     # (KIT-336). Every job that loads the writer loads the runner's one command-line builder with it
     # (pipeline_harness_claude.py, KIT-708).
     ("pipeline_notify_local.py", ("pipeline_harness_claude.py", "pipeline_notify_local.py",
-                                  "pipeline_notify_events.py", "pipeline_voice.py")),
+                                  "pipeline_notify_events.py", "pipeline_voice.py"), ()),
     # The bridge and the modules split out of it (KIT-312: KIT-388, KIT-407, part 3), the
     # daily stand-up it posts (KIT-349), the queue it asks what may start (KIT-454), and the
     # tech lead's turn with the tool server it starts (KIT-489).
@@ -504,7 +511,7 @@ SIBLING_JOBS = (
                             "pipeline_sprint_review.py", "pipeline_standup.py",
                             "pipeline_tech_lead_tools.py",
                             "pipeline_tech_lead_turn.py", "pipeline_validator_settings.py",
-                            "pipeline_voice.py", "pipeline_window.py")),
+                            "pipeline_voice.py", "pipeline_window.py"), ()),
     # The bridge's always-on job (KIT-561): Slack's push connection, run by its own LaunchDaemon from
     # the same clone. It loads the bridge, and the standard-library WebSocket client it reads Slack with.
     ("pipeline_bridge_push.py", ("pipeline_bridge.py", "pipeline_bridge_answers.py",
@@ -524,9 +531,9 @@ SIBLING_JOBS = (
                                 "pipeline_tech_lead_tools.py", "pipeline_tech_lead_turn.py",
                                 "pipeline_validator_settings.py", "pipeline_voice.py",
                                 "pipeline_window.py",
-                                "pipeline_ws_client.py")),
+                                "pipeline_ws_client.py"), ()),
     # The queue's two jobs (KIT-456): the usage job, and the morning job.
-    ("pipeline_usage_local.py", ("pipeline_usage_local.py",)),
+    ("pipeline_usage_local.py", ("pipeline_usage_local.py",), ()),
     ("pipeline_morning.py", ("pipeline_bridge.py", "pipeline_bridge_answers.py",
                              "pipeline_bridge_bind.py", "pipeline_bridge_config.py",
                              "pipeline_bridge_direct.py", "pipeline_bridge_handover.py",
@@ -545,24 +552,26 @@ SIBLING_JOBS = (
                              "pipeline_tech_lead_tools.py",
                              "pipeline_tech_lead_turn.py", "pipeline_usage_local.py",
                              "pipeline_validator_settings.py", "pipeline_voice.py",
-                             "pipeline_window.py")),
+                             "pipeline_window.py"), ()),
     # The bridge installer's verify runs the writer's probe from the clone (KIT-297).
     ("pipeline_voice.py", ("pipeline_harness_claude.py", "pipeline_voice.py", "pipeline_notify_events.py",
-                           "pipeline_notify_local.py")),
+                           "pipeline_notify_local.py"), ()),
     # The bridge installer's verify runs the tech lead's turn's probe, and checks the tool server
     # it starts, from the clone (KIT-498).
     ("pipeline_tech_lead_tools.py", ("pipeline_bridge_transport.py", "pipeline_harness_claude.py",
                                      "pipeline_notify_events.py", "pipeline_notify_local.py",
-                                     "pipeline_tech_lead_tools.py", "pipeline_voice.py")),
+                                     "pipeline_tech_lead_tools.py", "pipeline_voice.py"), ()),
     ("pipeline_tech_lead_turn.py", ("pipeline_bridge_transport.py", "pipeline_harness_claude.py",
                                     "pipeline_notify_events.py", "pipeline_notify_local.py",
                                     "pipeline_tech_lead_tools.py", "pipeline_tech_lead_turn.py",
-                                    "pipeline_voice.py")),
+                                    "pipeline_voice.py"), ()),
     # The sweep (KIT-464, KIT-467): it loads nothing beyond REQUIRED_SCRIPTS.
-    ("pipeline_sweep.py", ("pipeline_sweep.py",)),
+    ("pipeline_sweep.py", ("pipeline_sweep.py",), ()),
     # The acceptance check's live pass (KIT-571), run from this clone by its own LaunchDaemon, which the acceptance installer
     # puts in place (KIT-326). It loads the poller that decides and judges, and the look tool's record reader.
-    ("pipeline_acceptance_run.py", ("pipeline_acceptance_poller.py", "pipeline_acceptance_run.py", "pipeline_look.py")),
+    ("pipeline_acceptance_run.py", ("pipeline_acceptance_poller.py", "pipeline_acceptance_run.py", "pipeline_look.py"),
+     # Its data (KIT-889): the look tool's sandbox profile, which its every browser check runs under.
+     ("templates/sandbox/look.sb",)),
     # The runner (KIT-859), our own dispatcher's always-on job. Its installer now runs it from a root-owned copy of
     # the kit at this clone's commit (KIT-919), so `run` finds and stops it only while an older install runs it here.
     ("pipeline_runner.py", ("pipeline_bridge.py", "pipeline_bridge_answers.py", "pipeline_bridge_bind.py",
@@ -578,16 +587,20 @@ SIBLING_JOBS = (
                             "pipeline_session_kinds.py", "pipeline_session_tools.py", "pipeline_sprint.py",
                             "pipeline_sprint_changes.py", "pipeline_sprint_plan.py", "pipeline_sprint_review.py",
                             "pipeline_standup.py", "pipeline_tech_lead_tools.py", "pipeline_tech_lead_turn.py",
-                            "pipeline_validator_settings.py", "pipeline_voice.py", "pipeline_window.py")),
+                            "pipeline_validator_settings.py", "pipeline_voice.py", "pipeline_window.py"),
+     # Its data (KIT-889): the kit's guards, which the runner's guard launcher runs on every tool call of every
+     # session it starts (scripts/pipeline_runner_guard.py). They count only while an older install runs the runner
+     # from this clone; its root-owned copy is refreshed from this clone's commit by the runner's installer (KIT-919).
+     (".claude/hooks",)),
 )
-SIBLING_ENTRY_SCRIPTS = tuple(entry for entry, _files in SIBLING_JOBS)
+SIBLING_ENTRY_SCRIPTS = tuple(entry for entry, _files, _data in SIBLING_JOBS)
 
 # Every script a job that execs from the clone can load. It is not what "all scripts present"
 # demands: a machine with no notifier or bridge needs none of their files. Nor is it always
 # what `verify` compares: a sibling's files count only where that job is installed
 # (`compared_scripts`).
 CLONE_JOB_SCRIPTS = REQUIRED_SCRIPTS + tuple(sorted(
-    set(f for _entry, files in SIBLING_JOBS for f in files) - set(REQUIRED_SCRIPTS)))
+    set(f for _entry, files, _data in SIBLING_JOBS for f in files) - set(REQUIRED_SCRIPTS)))
 
 # Directories of DATA the jobs read at run time out of the same clone. A review is
 # judged against schemas/review-findings.schema.json and a telemetry row against
@@ -600,6 +613,9 @@ CLONE_JOB_SCRIPTS = REQUIRED_SCRIPTS + tuple(sorted(
 # machine, not only where the runner is installed: those files change rarely (one merge in the 60
 # days to 18 Nov 2026, alongside a script that counted already), so no machine is told "behind"
 # for nothing. The selftest checks that the folder pipeline_session_kinds.py reads is listed here.
+#
+# These count on every machine. Data only one job reads, such as the kit's guards for the runner,
+# is listed beside that job's entry in SIBLING_JOBS, and counts only where it is installed (KIT-889).
 RUNTIME_DATA_DIRS = ("schemas", "session-kinds")
 
 # The colour of a label this installer creates.
@@ -817,12 +833,18 @@ CONF_DEFAULTS = {
     # Empty checks the one OAuth-application webhook the key can see. With several, the
     # check cannot tell which is the dispatcher's and says so: name it here.
     "CATCHUP_WEBHOOK_ID": "",
-    # KIT-765: the repositories whose fixes go to our own runner as a resume of the pull
-    # request's own coding session, not as a reply in the tracker thread. Comma-separated
-    # OWNER/NAME:TEAM:PROJECT entries; empty is off. TEAM leaves the catch-up job, which is not
-    # installed when no team is left. RUNNER_STORE_DIR is the runner's store.
+    # KIT-765, KIT-707: each repository wired to our own runner, as comma-separated
+    # OWNER/NAME:TEAM:PROJECT entries; empty is none. It switches nothing by itself: the runner's
+    # own lanes do. A fix goes to the PR's own coding session as a resume while the runner's `fix`
+    # lane is on for PROJECT, and TEAM is left out of the catch-up job's pass while that lane is on
+    # for each of its projects. RUNNER_STORE_DIR is the runner's store.
     "RUNNER_LANE_REPOS": "",
     "RUNNER_STORE_DIR": "",
+    # KIT-892: where our own runner's settings file is, as the role account sees it. The review job
+    # reads each project's review lane there. Empty: the file the runner's installed job reads (its
+    # LaunchDaemon's `--config`), found when this installer runs; with no runner job, nothing is
+    # written and the review job keeps its own default.
+    "RUNNER_SETTINGS": "",
     # The watcher's hold file (KIT-527). Empty: the bounce driver and the catch-up job read no
     # hold, and say so on every pass. Set: while the file exists neither sends a re-prompt.
     # An absolute path, or ~/ for the role account's home, in a folder no worker can write.
@@ -1164,7 +1186,9 @@ _LANE_PROJECT_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")    # the runner's pr
 
 def runner_lane(conf):
     """[(OWNER/NAME, TEAM, PROJECT)] from RUNNER_LANE_REPOS (KIT-765), in order; [] while it is
-    empty, which is off: every repository's fixes go by the tracker thread."""
+    empty: every repository's fixes go by the tracker thread. It is wiring, and switches nothing
+    (KIT-707): the runner's own lanes, which the bounce driver and the catch-up job read from its
+    store each pass, move a project to the runner and back."""
     out = []
     for entry in split_list(conf.get("RUNNER_LANE_REPOS", "")):
         parts = entry.split(":")
@@ -1198,14 +1222,107 @@ def runner_lane_errors(conf, repos):
     if seen and not (os.path.isabs(store) or store.startswith("~/")):
         errors.append("RUNNER_STORE_DIR must be the runner's store_dir, an absolute path or one "
                       "under ~/, when RUNNER_LANE_REPOS names a repository (got %r)" % store)
+    settings = (conf.get("RUNNER_SETTINGS") or "").strip()
+    if settings and not (_RUNNER_SETTINGS_RE.match(settings) and (os.path.isabs(settings)
+                                                                   or settings.startswith("~/"))):
+        errors.append("RUNNER_SETTINGS must be the runner's settings file, an absolute path or one "
+                      "under ~/, or empty for the file its installed job reads (got %r)" % settings)
     return errors
 
 
+# KIT-892. A path the review job's config may carry for the runner's settings: printable, with no
+# quote or backslash, the shape the runner's installer writes into its job's command line.
+_RUNNER_SETTINGS_RE = re.compile(r'^[^\x00-\x1f\x7f"\\]{1,300}$')
+RUNNER_ENTRY = "pipeline_runner.py"
+# The settings file in the runner's job: `… pipeline_runner.py" run --config "<file>" # kit …`, as
+# scripts/pipeline_runner_setup.py's job_command writes it. `$HOME/` is the role account's ~/.
+_RUNNER_CONFIG_RE = re.compile(r'/scripts/pipeline_runner\.py"? run --config "([^"\x00-\x1f]{1,300})"')
+
+
+def role_path(path, home):
+    """A path as the role account names it in a job's config: `$HOME/x` and `<home>/x` are ~/x."""
+    if path.startswith("$HOME/"):
+        return "~/" + path[len("$HOME/"):]
+    if home and path.startswith(home.rstrip("/") + "/"):
+        return "~/" + path[len(home.rstrip("/")) + 1:]
+    return path
+
+
+def runner_job_settings(ctx, listed):
+    """The settings file the runner's installed job reads, as the role account names it, or None
+    when no runner job is installed here (KIT-892). `listed` is every job that runs from the
+    clone, as `verify` finds them (`_clone_job_files`), and the runner's own file says which
+    settings it reads. Raises Unknown when that file could not be read: where the runner's
+    settings are is a fact to measure, and "could not tell" is never "no runner"."""
+    found = [plist for entry, plist in listed if entry == RUNNER_ENTRY]
+    if not found:
+        return None
+    if len(found) > 1:
+        raise Unknown("two jobs run the runner from the role account's clone (%s), so which "
+                      "settings it reads cannot be told" % ", ".join(found),
+                      "unload and remove the one you do not use, then run this again")
+    got = ctx.runner.as_root(["cat", found[0]])
+    try:
+        import plistlib
+        args = plistlib.loads((got.out or "").encode("utf-8")).get("ProgramArguments") if got.ok else None
+    except Exception:  # noqa: BLE001 — plistlib's failures have no one class; any is "not read"
+        args = None
+    said = [m.group(1) for a in (args if isinstance(args, list) else []) if isinstance(a, str)
+            for m in [_RUNNER_CONFIG_RE.search(a)] if m]
+    if len(said) != 1:
+        raise Unknown("the runner's job %s could not be read for the settings file it runs with" % found[0],
+                      "`sudo plutil -p %s` shows its command, which ends `run --config <file>`. Set "
+                      "RUNNER_SETTINGS in stage-e.conf to that file, or reinstall the runner with "
+                      "scripts/pipeline_runner_setup.py, then run this again" % found[0])
+    return role_path(said[0], ctx.role_home)
+
+
+def runner_settings_place(ctx):
+    """(where the review job reads the runner's settings, a note or None): KIT-892. RUNNER_SETTINGS
+    when it is set, else the file the runner's installed job reads, else None: no runner here, so
+    nothing is written and the review job keeps its own default. A key that names another file
+    than the installed job reads is refused, both named: the review job would read settings the
+    runner does not, and a lane switched on there would quietly do nothing.
+
+    A jobs listing it could not read stops the step where this conf names the runner (either key
+    set): where its settings are is then a fact the step must have. With neither key, the machine
+    is not wired to a runner, and such a listing is said in a note instead, with nothing written,
+    as before this key: one unreadable LaunchDaemon file never blocks a machine with no runner. A
+    runner job it found and could not read stops the step either way: a runner is there."""
+    said = (ctx.conf.get("RUNNER_SETTINGS") or "").strip()
+    try:
+        listed = _clone_job_files(ctx)
+    except Unknown as exc:
+        if said or runner_lane(ctx.conf):
+            raise
+        return None, ("where a runner job is installed could not be read (%s), so no runner_settings "
+                      "was written and the review job keeps its default, %s. Set RUNNER_SETTINGS in "
+                      "stage-e.conf if a runner runs here" % (exc.what[:200], "~/.pipeline-runner/runner.json"))
+    installed = runner_job_settings(ctx, listed)
+    if said and installed and os.path.normpath(role_path(said, ctx.role_home)) != os.path.normpath(installed):
+        raise SetupError("RUNNER_SETTINGS names %s, but the runner's installed job reads %s. The review "
+                         "job would read settings the runner does not. Nothing was written. Set "
+                         "RUNNER_SETTINGS to %s, or empty it, then run this again" % (said, installed, installed))
+    return (role_path(said, ctx.role_home) if said else installed), None
+
+
 def catchup_teams(conf):
-    """The work teams the catch-up poller covers: every managed team but the runner lane's
-    (KIT-765), whose hand-offs no longer travel through the tracker."""
-    lane = set(team for _, team, _ in runner_lane(conf))
-    return [k.upper() for k in split_list(conf.get("MANAGED_TEAM_KEYS", "")) if k.upper() not in lane]
+    """The work teams the catch-up poller covers: every managed team (KIT-707). A team wired to the
+    runner (RUNNER_LANE_REPOS) is left out pass by pass, while the runner's own `fix` lane is on for
+    each of its projects, by the job itself (`catchup_lane`): so one setting moves it, both ways."""
+    return [k.upper() for k in split_list(conf.get("MANAGED_TEAM_KEYS", ""))]
+
+
+def catchup_lane(conf):
+    """The catch-up job's `runner_lane` (KIT-707): the runner's store, and each wired team's projects
+    there. {} while RUNNER_LANE_REPOS names none: every team is caught up, as before."""
+    teams = {}
+    for _repo, team, project in runner_lane(conf):
+        if project not in teams.setdefault(team, []):
+            teams[team].append(project)
+    if not teams:
+        return {}
+    return {"store_dir": (conf.get("RUNNER_STORE_DIR") or "").strip(), "teams": teams}
 
 
 def catchup_off_by_name(conf):
@@ -1214,18 +1331,16 @@ def catchup_off_by_name(conf):
 
 
 def catchup_off(conf):
-    """The catch-up poller is off: declined by name, or, with every managed team on the runner
-    lane (KIT-765), left with no team to catch up. Either way it is not installed, and one an
-    earlier run installed is unloaded and its plist removed."""
-    return catchup_off_by_name(conf) or not catchup_teams(conf)
+    """The catch-up poller is off: declined by name. It is then not installed, and one an earlier
+    run installed is unloaded and its plist removed. A team whose fixes the runner takes is left
+    out by the job, pass by pass (KIT-707), never here: an install-time choice would need an
+    installer run to move a project back."""
+    return catchup_off_by_name(conf)
 
 
 def catchup_off_words(conf):
-    """Why the catch-up poller is off, in words: by name, or because no team is left for it."""
-    if catchup_off_by_name(conf):
-        return "OFF by conf (CATCHUP_INTERVAL_SECONDS=off)"
-    return ("OFF by conf: every managed team's fixes go to the runner (RUNNER_LANE_REPOS), so "
-            "no team is left for it")
+    """Why the catch-up poller is off, in words: it was declined by name."""
+    return "OFF by conf (CATCHUP_INTERVAL_SECONDS=off)"
 
 
 # The status job (KIT-335, KIT-411): its config, its log and, by default, its file, under the
@@ -2101,7 +2216,9 @@ CARDS = {
         "why": ("Its first real pass replies once to every delegation from the past week that "
                 "the dispatcher never answered, and each reply starts a paid session. Some "
                 "were dropped on purpose, and some you may not want any more. The dry-run "
-                "lines above name every one. Only you know which you want started."),
+                "lines above name every one. Only you know which you want started. A team "
+                "whose fixes our own runner takes, its `fix` lane on there, is left out of "
+                "every pass, so of the count too (KIT-707): that team is not this job's."),
         "do": ["Nothing else waits on this: until you sign, the catch-up poller is simply",
                "not installed, and every run says so. To decline it for good, set",
                "CATCHUP_INTERVAL_SECONDS=off in stage-e.conf.",
@@ -2841,12 +2958,13 @@ def _clone_differs_from_origin(ctx):
     return local.out.strip() != fields[0], None
 
 
-def job_files_moved_sh(kit, names=CLONE_JOB_SCRIPTS):
-    """The shell `_job_files_moved` runs as the role account, comparing `names` (see
-    `compared_scripts`). A module-level function so the selftest can EXECUTE it against real
-    repositories — a shell fragment nobody has run is a guess about a shell."""
+def job_files_moved_sh(kit, names=CLONE_JOB_SCRIPTS, data=None):
+    """The shell `_job_files_moved` runs as the role account, comparing the scripts `names` and
+    the data paths `data` (see `compared_scripts` and `compared_data`; None is every job's data).
+    A module-level function so the selftest can EXECUTE it against real repositories — a shell
+    fragment nobody has run is a guess about a shell."""
     paths = " ".join(shlex.quote("scripts/" + name) for name in names)
-    paths += " " + " ".join(shlex.quote(d) for d in RUNTIME_DATA_DIRS)
+    paths += " " + " ".join(shlex.quote(d) for d in (compared_data(None) if data is None else data))
     return ("git -C {kit} fetch --quiet --no-tags origin HEAD 2>/dev/null || exit 7; "
             "printf 'FETCH_HEAD %s\\n' \"$(git -C {kit} rev-parse FETCH_HEAD 2>/dev/null)\"; "
             "git -C {kit} diff --name-only HEAD FETCH_HEAD -- {paths} 2>/dev/null || exit 8"
@@ -2889,10 +3007,11 @@ def clone_health(ctx):
     return None
 
 
-def _job_files_moved(ctx, names=CLONE_JOB_SCRIPTS):
+def _job_files_moved(ctx, names=CLONE_JOB_SCRIPTS, data=None):
     """(moved, why_unknown, origin_short). `moved` is the list of files the jobs run or
     read that differ between the clone's HEAD and origin's; None when it could not tell.
-    `names` are the scripts compared: `compared_scripts` says which.
+    `names` are the scripts compared and `data` the data paths: `compared_scripts` and
+    `compared_data` say which (None is every job's data).
 
     CALLED ONLY WHEN THE TWO HEADS DIFFER, to answer the narrower question that matters:
     would the daemons behave differently at origin HEAD? Before KIT-149 `verify` asked
@@ -2912,7 +3031,7 @@ def _job_files_moved(ctx, names=CLONE_JOB_SCRIPTS):
     Exit 7 is "could not fetch", 8 is "could not compare" — two different could-nots,
     and neither is ever read as "nothing moved" (contract §13).
     """
-    res = ctx.runner.as_role(ctx.account, job_files_moved_sh("%s/kit" % ctx.stage_home, names))
+    res = ctx.runner.as_role(ctx.account, job_files_moved_sh("%s/kit" % ctx.stage_home, names, data))
     if res.rc == 7:
         return None, "could not fetch origin HEAD into the clone (no network, or no such remote)", ""
     lines = [ln.strip() for ln in (res.out or "").splitlines() if ln.strip()]
@@ -2931,8 +3050,28 @@ def compared_scripts(entries):
     "behind", never toward done (contract §13)."""
     if entries is None:
         return CLONE_JOB_SCRIPTS
-    extra = set(f for entry, files in SIBLING_JOBS if entry in entries for f in files)
+    extra = set(f for entry, files, _data in SIBLING_JOBS if entry in entries for f in files)
     return tuple(f for f in CLONE_JOB_SCRIPTS if f in REQUIRED_SCRIPTS or f in extra)
+
+
+def compared_data(entries):
+    """The data paths `verify` compares with origin HEAD (KIT-889): RUNTIME_DATA_DIRS, which
+    count on every machine, then the data of each sibling job whose entry script is in
+    `entries`, the ones installed here. The kit's guards count only where the runner is
+    installed, and the look tool's profile only where the acceptance job is. None means the
+    listing could not be read: then every job's data is compared, failing toward "behind",
+    never toward done (contract §13)."""
+    extra = []
+    for entry, _files, data in SIBLING_JOBS:
+        if entries is None or entry in entries:
+            extra.extend(d for d in data if d not in RUNTIME_DATA_DIRS and d not in extra)
+    return RUNTIME_DATA_DIRS + tuple(sorted(extra))
+
+
+def data_said(data):
+    """The data paths, as `verify` names them: a folder of RUNTIME_DATA_DIRS with its slash, a
+    job's data path as listed (KIT-889)."""
+    return [d + "/" if d in RUNTIME_DATA_DIRS else d for d in data]
 
 
 def clone_jobs_sh(account, daemons="/Library/LaunchDaemons"):
@@ -2964,16 +3103,12 @@ def clone_jobs_sh(account, daemons="/Library/LaunchDaemons"):
             ).format(d=shlex.quote(daemons), user=user, runs=runs, binary=binary)
 
 
-def clone_jobs(ctx):
-    """[(label, loaded, entry)]: every job another installer put in /Library/LaunchDaemons that
-    runs from the role account's clone, whether launchd holds it now, and the entry script it
-    runs (KIT-199, KIT-280). Today that is the notifier and the Slack bridge. Each is found by
-    what its plist RUNS, never by a conf key: neither installer tells this one its label.
-
-    Raises Unknown when the plists or launchd could not be read. Which jobs `run` is about to
-    stop is a fact to measure, not to guess."""
-    r = ctx.runner
-    res = r.as_root(["/bin/sh", "-c", clone_jobs_sh(ctx.account)])
+def _clone_job_files(ctx):
+    """[(entry, plist)]: every LaunchDaemon file whose job runs one of SIBLING_ENTRY_SCRIPTS from
+    the role account's clone, as that account, read by `clone_jobs_sh` as root. `clone_jobs` asks
+    launchd about each; the configs step reads the runner's own file (KIT-892). Raises Unknown when
+    the files could not all be read."""
+    res = ctx.runner.as_root(["/bin/sh", "-c", clone_jobs_sh(ctx.account)])
     lines = [ln.strip() for ln in (res.out or "").splitlines() if ln.strip()]
     found = [ln.split(" ", 1) for ln in lines[:-1]]
     if not res.ok or not lines or lines[-1] != "END" or any(
@@ -2990,8 +3125,20 @@ def clone_jobs(ctx):
             "owner and flags, and a plist root could not read is named above. Once root can "
             "read them all as text, run the same command again: `run` must know which jobs run "
             "from the clone before it stops any of them")
+    return [(entry, path) for entry, path in found]
+
+
+def clone_jobs(ctx):
+    """[(label, loaded, entry)]: every job another installer put in /Library/LaunchDaemons that
+    runs from the role account's clone, whether launchd holds it now, and the entry script it
+    runs (KIT-199, KIT-280). Today that is the notifier and the Slack bridge. Each is found by
+    what its plist RUNS, never by a conf key: neither installer tells this one its label.
+
+    Raises Unknown when the plists or launchd could not be read. Which jobs `run` is about to
+    stop is a fact to measure, not to guess."""
+    r = ctx.runner
     jobs = []
-    for entry, path in found:
+    for entry, path in _clone_job_files(ctx):
         label = os.path.basename(path)[:-len(".plist")]
         got = r.as_root(["launchctl", "print", "system/" + label])
         text = (got.out or "") + (got.err or "")
@@ -3321,8 +3468,9 @@ def step_code(ctx, apply_it):
             jobs, unknown = clone_jobs(ctx), None
         except Unknown as exc:
             jobs, unknown = None, exc
-        names = compared_scripts(None if jobs is None else set(e for _l, _on, e in jobs))
-        moved, why_moved, origin = _job_files_moved(ctx, names)
+        entries = None if jobs is None else set(e for _l, _on, e in jobs)
+        names, data = compared_scripts(entries), compared_data(entries)
+        moved, why_moved, origin = _job_files_moved(ctx, names, data)
         if moved is None:
             raise Unknown(
                 "the clone at %s/kit is not at origin HEAD, and whether any file the jobs run "
@@ -3341,7 +3489,7 @@ def step_code(ctx, apply_it):
                           _clone_jobs_notes(jobs, unknown, owed, held)
         same = ("every file the jobs run is identical at origin HEAD (%s): %d scripts and %s. "
                 "The clone's other files are older (%s), and no job reads them"
-                % (origin or "?", len(names), "/, ".join(RUNTIME_DATA_DIRS) + "/", here))
+                % (origin or "?", len(names), ", ".join(data_said(data)), here))
         if ctx.runner.dry_run:
             # A dry run names what `run` would do, and `run` still fast-forwards a clone
             # whose HEAD differs — it restarts the jobs to do it. Saying ALREADY-DONE here
@@ -4123,6 +4271,18 @@ def step_configs(ctx, apply_it):
         poller["github_app"] = {"app_id": int(conf["GITHUB_APP_ID"].strip()),
                                 "key_file": (conf.get("GITHUB_APP_KEY_FILE") or "").strip(),
                                 "login": (conf.get("GITHUB_APP_LOGIN") or "").strip()}
+    # KIT-892: where the runner's settings are, from RUNNER_SETTINGS or the runner's installed job,
+    # and which repositories this conf names as runner projects (RUNNER_LANE_REPOS). For those, the
+    # review job says so when it cannot find or read the settings, and pages: it never reads that
+    # as "lane off". Each is composed only when there is one, so a machine with no runner and no
+    # lane still composes, byte for byte, the config it always did.
+    place, place_note = runner_settings_place(ctx)
+    if place:
+        poller["runner_settings"] = place
+    if place_note:
+        notes = list(notes) + [place_note]
+    if runner_lane(conf):
+        poller["runner_projects"] = dict((repo, project) for repo, _team, project in runner_lane(conf))
     bounce = {
         "state_dir": "~/.stage-e/state",
         "repos": split_list(conf["REVIEW_REPOS"]),
@@ -4165,8 +4325,8 @@ def step_configs(ctx, apply_it):
     # its own state dir, so its heartbeat and ledger collide with nothing. The age floor
     # stays the script's default on purpose: the owner chose it (2026-10-27), and the
     # script refuses anything inside Linear's retry ladder.
-    # KIT-765: a team whose fixes go to the runner is left out; with none left the job is off
-    # (catchup_off), and this file is still written, as it is for CATCHUP_INTERVAL_SECONDS=off.
+    # KIT-707: every managed team, and, for the teams wired to the runner, where its lanes are: the
+    # job leaves such a team out of a pass while the runner's `fix` lane is on for its projects.
     catchup = {
         "agent_user_id": ids["agent_user_id"],
         "teams": catchup_teams(conf),
@@ -4181,6 +4341,10 @@ def step_configs(ctx, apply_it):
     # before the key existed is still, byte for byte, the composed one.
     if (conf.get("HOLD_FILE") or "").strip():
         bounce["hold"] = catchup["hold"] = {"file": conf["HOLD_FILE"].strip()}
+    # KIT-707: composed only when RUNNER_LANE_REPOS names a repository, so a conf without it still
+    # composes, byte for byte, the config it always did.
+    if catchup_lane(conf):
+        catchup["runner_lane"] = catchup_lane(conf)
     # KIT-765: the runner lane, composed only when it names a repository, so a conf without it
     # still composes, byte for byte, the config it always did.
     if runner_lane(conf):
@@ -4285,6 +4449,21 @@ def step_configs(ctx, apply_it):
                              "config and review nothing. Nothing was written. Leave GITHUB_APP_ID, "
                              "GITHUB_APP_LOGIN and GITHUB_APP_KEY_FILE empty until origin carries "
                              "the change, then run this again.")
+    lane_keys = [k for k in ("runner_settings", "runner_projects") if k in poller]
+    if "poller.json" in stale and lane_keys:
+        # KIT-892, the hazard of KIT-418 above: a review poller from before a key refuses its WHOLE
+        # config, and then no PR is reviewed at all.
+        code = r.as_role(ctx.account, "cat %s/kit/scripts/pipeline_review_poller.py "
+                         "2>/dev/null" % ctx.stage_home)
+        if not code.ok and not code.skipped:
+            raise Unknown("could not read the review poller's own code, to see whether it knows "
+                          "where the runner's settings are", "run this from a terminal as yourself")
+        unknown_keys = [k for k in lane_keys if code.ok and '"%s"' % k not in (code.out or "")]
+        if unknown_keys:
+            raise SetupError("the role account's clone runs a review poller from before %s, which "
+                             "would refuse its whole config and review nothing. Nothing was written. "
+                             "Run this again once origin carries the change: the `code` step moves "
+                             "the clone first." % " and ".join(unknown_keys))
     if "config.json" in stale and "runner_lane" in bounce:
         # KIT-765, the hazard of the hold below: a bounce driver from before the key ignores it,
         # and every fix would still go by the thread while the conf says the runner.
@@ -4298,6 +4477,19 @@ def step_configs(ctx, apply_it):
                              "driver from before that key, which would ignore it and send every fix "
                              "by the thread. Nothing was written. Leave RUNNER_LANE_REPOS empty "
                              "until origin carries the change, then run this again.")
+    if "catchup/poller.json" in stale and "runner_lane" in catchup:
+        # KIT-707, the hazard of the hold below: a catch-up job from before the key refuses its
+        # WHOLE config, and then no lost delegation is re-sent for any team.
+        code = r.as_role(ctx.account, "cat %s/kit/scripts/pipeline_catchup_poller.py 2>/dev/null"
+                         % ctx.stage_home)
+        if not code.ok and not code.skipped:
+            raise Unknown("could not read the catch-up job's own code, to see whether it knows "
+                          "RUNNER_LANE_REPOS", "run this from a terminal as yourself")
+        if code.ok and '"runner_lane"' not in (code.out or ""):
+            raise SetupError("RUNNER_LANE_REPOS is set, but the role account's clone runs a catch-up "
+                             "job from before it reads the runner's lanes, which would refuse its "
+                             "whole config and re-send nothing. Nothing was written. Run this again "
+                             "once origin carries the change: the `code` step moves the clone first.")
     for fname, script, job in (("config.json", "pipeline_bounce_local.py", "bounce driver"),
                                ("catchup/poller.json", "pipeline_catchup_poller.py",
                                 "catch-up job")):
@@ -7344,8 +7536,7 @@ def step_catchup(ctx, apply_it):
     if catchup_off(conf):
         if not loaded and not installed:
             return True, (catchup_off_words(conf) + ": a delegation lost while the dispatcher "
-                          "was down stays lost" if catchup_off_by_name(conf)
-                          else catchup_off_words(conf)), []
+                          "was down stays lost"), []
         if not apply_it:
             return False, ("OFF by conf, and %s is still %s — would unload it and remove its "
                            "plist" % (label, "loaded" if loaded else "installed")), []
@@ -8470,9 +8661,7 @@ def _unloaded_notice(ctx, off=None):
             say("    system/%s%s" % (label, "  (%s)" % off[label] if off.get(label) else ""))
     if clabel in ctx.unloaded and catchup_off(ctx.conf):
         say("")
-        say("The catch-up poller was stopped too. %s, so leave it"
-            % ("CATCHUP_INTERVAL_SECONDS=off" if catchup_off_by_name(ctx.conf)
-               else "Every managed team's fixes go to the runner (RUNNER_LANE_REPOS)"))
+        say("The catch-up poller was stopped too. CATCHUP_INTERVAL_SECONDS=off, so leave it")
         say("unloaded. The `catch-up` step removes its plist; until that step runs, the next")
         say("boot loads it again.")
     if slabel in ctx.unloaded and status_off(ctx.conf):
@@ -13114,14 +13303,20 @@ def _selftest_body():
                "RUNNER_LANE_REPOS=%r, RUNNER_STORE_DIR=%r was not refused with %r: %r"
                % (value, store, needle, errs))
     two_teams = dict(lane_on, MANAGED_TEAM_KEYS="KIT,TOD")
-    expect("runner-lane-catchup-teams",
-           (runner_lane(goodL), catchup_teams(goodL), catchup_off(goodL),
+    two_repos = dict(lane_on, REVIEW_REPOS="example-org/kit,example-org/docs",
+                     RUNNER_LANE_REPOS="example-org/kit:KIT:kit,example-org/docs:KIT:docs")
+    # KIT-707: the wiring switches nothing. Every managed team stays in the catch-up job's config,
+    # and the job is never off for it: the job leaves a wired team out pass by pass, while the
+    # runner's own fix lane is on for each of its projects (test:catchup), so one setting moves it.
+    expect("KIT-707 runner-lane-catchup-teams",
+           (runner_lane(goodL), catchup_teams(goodL), catchup_off(goodL), catchup_lane(goodL),
             catchup_teams(two_teams), catchup_off(two_teams),
-            catchup_teams(lane_on), catchup_off(lane_on), catchup_off_by_name(lane_on),
-            "RUNNER_LANE_REPOS" in catchup_off_words(lane_on))
-           == ([], ["KIT"], False, ["TOD"], False, [], True, False, True),
-           "the catch-up poller's teams do not leave out the runner lane's, or it is not off when "
-           "none is left")
+            catchup_teams(lane_on), catchup_off(lane_on), catchup_lane(lane_on), catchup_lane(two_repos))
+           == ([], ["KIT"], False, {}, ["KIT", "TOD"], False, ["KIT"], False,
+               {"store_dir": store_l, "teams": {"KIT": ["kit"]}},
+               {"store_dir": store_l, "teams": {"KIT": ["kit", "docs"]}}),
+           "the catch-up job's teams, or the lane it reads, are not every team with the wired ones' "
+           "projects: %r" % ((catchup_teams(lane_on), catchup_off(lane_on), catchup_lane(lane_on)),))
     composedL = {}
     for lane_value in ("", "example-org/kit:KIT:kit"):      # the fixture's one team, KIT
         ctxL, fakeL = _settled_ctx(dict(conf, RUNNER_LANE_REPOS=lane_value,
@@ -13130,6 +13325,8 @@ def _selftest_body():
                          ("cat $HOME/.stage-e/catchup/poller.json", 0, ""),
                          ("cat $HOME/.stage-e/kit/scripts/pipeline_bounce_local.py", 0,
                           'cfg["runner_lane"] = 1\n'),
+                         ("cat $HOME/.stage-e/kit/scripts/pipeline_review_poller.py", 0, POLLER_KNOWS_LANES),
+                         ("cat $HOME/.stage-e/kit/scripts/pipeline_catchup_poller.py", 0, '"runner_lane"\n'),
                          ("mkdir -p", 0, ""), ("cat > ", 0, "")] + list(fakeL.answers)
         step_configs(ctxL, apply_it=True)
         composedL[lane_value] = dict(
@@ -13142,15 +13339,53 @@ def _selftest_body():
            and offL["catchup/poller.json"]["teams"] == ["KIT"]
            and onL["config.json"].get("runner_lane") == {"store_dir": store_l,
                                                           "repos": {"example-org/kit": "kit"}}
-           and onL["catchup/poller.json"]["teams"] == []
+           and onL["catchup/poller.json"]["teams"] == ["KIT"]
+           and "runner_lane" not in offL["catchup/poller.json"]
+           and onL["catchup/poller.json"].get("runner_lane") == {"store_dir": store_l, "teams": {"KIT": ["kit"]}}
            and dict(onL["config.json"], runner_lane=None) == dict(offL["config.json"], runner_lane=None)
-           and dict(onL["catchup/poller.json"], teams=None) == dict(offL["catchup/poller.json"], teams=None),
+           and dict(onL["catchup/poller.json"], runner_lane=None)
+           == dict(offL["catchup/poller.json"], runner_lane=None),
            "the lane reached the configs wrongly: off %r, on %r" % (offL, onL))
+    # KIT-707: the catch-up job's own loader takes the config this composes, its lane included.
+    import pipeline_catchup_poller as _cpl707
+    with tempfile.TemporaryDirectory() as tmpCL:
+        loadedCL = []
+        for docCL in (offL["catchup/poller.json"], onL["catchup/poller.json"]):
+            pathCL = os.path.join(tmpCL, "poller.json")
+            with open(pathCL, "w") as fh:
+                json.dump(docCL, fh)
+            try:
+                loadedCL.append(_cpl707.load_config(pathCL)["runner_lane"])
+            except _cpl707.ConfigError as exc:
+                loadedCL.append("refused: %s" % exc)
+    expect("KIT-707 the catch-up job's own loader takes the config this composes",
+           loadedCL == [{}, {"store_dir": os.path.realpath(os.path.expanduser(store_l)), "teams": {"KIT": ["kit"]}}],
+           "the composed catch-up configs loaded as %r" % (loadedCL,))
+    # KIT-707: a catch-up job in the clone from before it reads the runner's lanes would refuse its
+    # whole config, and re-send nothing for any team: it is given nothing.
+    ctxLA, fakeLA = _settled_ctx(dict(conf, RUNNER_LANE_REPOS="example-org/kit:KIT:kit",
+                                      RUNNER_STORE_DIR=store_l))
+    fakeLA.answers = [("cat $HOME/.stage-e/config.json", 0, ""),
+                      ("cat $HOME/.stage-e/catchup/poller.json", 0, ""),
+                      ("cat $HOME/.stage-e/kit/scripts/pipeline_bounce_local.py", 0, 'cfg["runner_lane"] = 1\n'),
+                      ("cat $HOME/.stage-e/kit/scripts/pipeline_review_poller.py", 0, POLLER_KNOWS_LANES),
+                      ("cat $HOME/.stage-e/kit/scripts/pipeline_catchup_poller.py", 0, '"hold_file"\n'),
+                      ("mkdir -p", 0, ""), ("cat > ", 0, "")] + list(fakeLA.answers)
+    try:
+        step_configs(ctxLA, apply_it=True)
+        refusedA = ""
+    except SetupError as exc:
+        refusedA = str(exc)
+    expect("KIT-707 runner-lane-old-catchup-job-refused",
+           "Nothing was written" in refusedA and "catch-up job" in refusedA and "RUNNER_LANE_REPOS" in refusedA
+           and not [w for w in fakeLA.writes if "cat >" in _fmt(w["argv"])],
+           "a clone whose catch-up job would refuse the lane was handed it: %r" % refusedA)
     ctxLO, fakeLO = _settled_ctx(dict(conf, RUNNER_LANE_REPOS="example-org/kit:KIT:kit",
                                       RUNNER_STORE_DIR=store_l))
     fakeLO.answers = [("cat $HOME/.stage-e/config.json", 0, ""),
                       ("cat $HOME/.stage-e/catchup/poller.json", 0, ""),
                       ("cat $HOME/.stage-e/kit/scripts/pipeline_bounce_local.py", 0, 'cfg.get("x")\n'),
+                      ("cat $HOME/.stage-e/kit/scripts/pipeline_review_poller.py", 0, POLLER_KNOWS_LANES),
                       ("mkdir -p", 0, ""), ("cat > ", 0, "")] + list(fakeLO.answers)
     try:
         step_configs(ctxLO, apply_it=True)
@@ -13169,11 +13404,126 @@ def _selftest_body():
         (okLC, detLC, _n), _p = _quiet(lambda: step_catchup(ctxLC, apply_it=True))
     except Exception as exc:        # taken for on, the step would install it, or stop on its card
         okLC, detLC = False, "the step raised %s: %s" % (type(exc).__name__, exc)
-    expect("runner-lane-catchup-off", okLC is True and "RUNNER_LANE_REPOS" in detLC
-           and "stays lost" not in detLC and not fakeLC.writes
-           and "the catch-up poller" not in _privilege_reason("run", False, "x", conf_lane),
-           "with every team on the runner lane the catch-up poller was not a quiet, named off: %r"
-           % detLC)
+    # KIT-707: every team wired is not every team off. The job stays the step's to install, so the
+    # runner's fix lane, switched off for a project, brings its catch-up back with no installer run.
+    expect("KIT-707 runner-lane-never-turns-the-catch-up-job-off",
+           okLC is not True and "OFF by conf" not in detLC
+           and "the catch-up poller" in _privilege_reason("run", False, "x", conf_lane),
+           "with every team wired to the runner the catch-up job was turned off: %r" % detLC)
+
+    # -- KIT-892. WHERE THE RUNNER'S SETTINGS ARE: a key, and the runner's installed place -----
+    # The review job reads each project's review lane in the runner's settings. The installer
+    # writes where they are: RUNNER_SETTINGS, else the file the runner's installed job reads. The
+    # job's file is the runner installer's own (scripts/pipeline_runner_setup.py), so a change to
+    # how it names its settings fails here.
+    cases += 1
+    import pipeline_runner_setup as rsetup
+    import pipeline_review_poller as _prp_892
+    for value, ok in (("", True), ("/srv/runner/runner.json", True), ("~/.pipeline-runner/runner.json", True),
+                      ("runner.json", False), ('/srv/"x"/runner.json', False), ("/srv/a\nb.json", False)):
+        errs892 = [e for e in validate_conf(dict(conf, RUNNER_SETTINGS=value))[1] if "RUNNER_SETTINGS" in e]
+        expect("KIT-892 RUNNER_SETTINGS %r is %s" % (value, "taken" if ok else "refused"), (not errs892) == ok,
+               "RUNNER_SETTINGS=%r: %r" % (value, errs892))
+    rconf = dict(rsetup.CONF_DEFAULTS, ROLE_ACCOUNT=conf["ROLE_ACCOUNT"], CLAUDE_BIN="/usr/local/bin/claude",
+                 OWNER_USER_IDS="u-owner", DISPATCHER_USER_IDS="u-agent", PROJECTS="kit=~/repos/kit")
+    rlabel = rconf["JOB_LABEL"]
+    rplist = "/Library/LaunchDaemons/%s.plist" % rlabel
+
+    def _runner_body(runner_dir):
+        return rsetup.plist_body(dict(rconf, RUNNER_DIR=runner_dir), "/Users/<role-account>", "abc1234")
+
+    def _configs_892(conf892, listing=None, body=None, poller_code=None):
+        """step_configs on a settled machine whose jobs listing is `listing`, the runner's file
+        `body`: (raised, the poller config written or None, every write)."""
+        ctx892, fake892 = _settled_ctx(conf892)
+        fake892.answers = ([("/Library/LaunchDaemons/*.plist",) + listing] if listing else []) \
+            + ([("cat " + rplist, 0, body)] if body is not None else []) \
+            + [("cat $HOME/.stage-e/poller.json", 0, ""), ("mkdir -p", 0, ""), ("cat > ", 0, ""),
+               ("cat $HOME/.stage-e/kit/scripts/pipeline_review_poller.py", 0,
+                POLLER_KNOWS_LANES if poller_code is None else poller_code),
+               ("cat $HOME/.stage-e/kit/scripts/pipeline_bounce_local.py", 0, 'cfg["runner_lane"] = 1\n'),
+               ("cat $HOME/.stage-e/kit/scripts/pipeline_catchup_poller.py", 0, '"runner_lane"\n')] \
+            + list(fake892.answers)
+        notes892[:] = []
+        try:
+            (_ok892, _d892, got_notes), _p892 = _quiet(lambda: step_configs(ctx892, apply_it=True))
+            notes892.extend(got_notes)
+            raised = None
+        except (SetupError, Unknown) as exc:
+            raised = "%s: %s" % (type(exc).__name__, exc)
+        wrote = [json.loads(w["stdin"]) for w in fake892.writes
+                 if "cat >" in _fmt(w["argv"]) and ".stage-e/poller.json" in _fmt(w["argv"])]
+        return raised, (wrote[0] if wrote else None), fake892.writes
+    notes892 = []                                   # the last _configs_892 step's notes
+
+    runner_listed = (0, "pipeline_runner.py %s\nEND\n" % rplist)
+    r892, p892, _w = _configs_892(conf, runner_listed, _runner_body("~/.pipeline-runner"))
+    expect("KIT-892 the runner's installed place is written into the review job's config",
+           r892 is None and (p892 or {}).get("runner_settings") == _prp_892.DEFAULT_RUNNER_SETTINGS,
+           "a runner installed at its default place gave %r, %r" % (r892, (p892 or {}).get("runner_settings")))
+    r892, p892, _w = _configs_892(conf, runner_listed, _runner_body("~/elsewhere/runner"))
+    expect("KIT-892 a runner installed somewhere else is followed there",
+           r892 is None and (p892 or {}).get("runner_settings") == "~/elsewhere/runner/runner.json",
+           "a moved runner gave %r, %r" % (r892, (p892 or {}).get("runner_settings")))
+    r892, p892, _w = _configs_892(dict(conf, RUNNER_SETTINGS="/Users/<role-account>/elsewhere/runner/runner.json"),
+                                  runner_listed, _runner_body("~/elsewhere/runner"))
+    expect("KIT-892 a key that names the installed job's file, spelled from the home, is that file",
+           r892 is None and (p892 or {}).get("runner_settings") == "~/elsewhere/runner/runner.json",
+           "the same file, spelled two ways, gave %r, %r" % (r892, (p892 or {}).get("runner_settings")))
+    r892, p892, w892 = _configs_892(dict(conf, RUNNER_SETTINGS="~/old/runner.json"), runner_listed,
+                                    _runner_body("~/elsewhere/runner"))
+    expect("KIT-892 a key that names another file than the installed job reads is refused, both named",
+           r892 and r892.startswith("SetupError") and "~/old/runner.json" in r892
+           and "~/elsewhere/runner/runner.json" in r892 and p892 is None
+           and not [w for w in w892 if "cat >" in _fmt(w["argv"])],
+           "a key at odds with the installed job gave %r, %r" % (r892, p892))
+    r892, p892, _w = _configs_892(dict(conf, RUNNER_SETTINGS="/srv/runner/runner.json"))
+    expect("KIT-892 with no runner job here, a key is written as given",
+           r892 is None and (p892 or {}).get("runner_settings") == "/srv/runner/runner.json",
+           "a key and no runner job gave %r, %r" % (r892, (p892 or {}).get("runner_settings")))
+    r892, p892, _w = _configs_892(conf)
+    expect("KIT-892 with no runner job and no key, nothing is written for it",
+           r892 is None and p892 is not None and "runner_settings" not in p892 and "runner_projects" not in p892,
+           "no runner and no key gave %r, %r" % (r892, p892))
+    for label, listing, body in (
+            ("a runner's file that could not be read", runner_listed, "not a plist"),
+            ("a runner's file with no settings in its command", runner_listed,
+             _runner_body("~/.pipeline-runner").replace(" run --config ", " run ")),
+            ("two runner jobs", (0, "pipeline_runner.py %s\npipeline_runner.py /Library/LaunchDaemons/b.plist\n"
+                                    "END\n" % rplist), None)):
+        r892, p892, w892 = _configs_892(conf, listing, body)
+        expect("KIT-892 %s is not known, and nothing is written" % label,
+               r892 and r892.startswith("Unknown") and not [w for w in w892 if "cat >" in _fmt(w["argv"])],
+               "%s gave %r, %r" % (label, r892, p892))
+    store892 = "~/.pipeline-runner/store"
+    # A jobs listing it could not read: where this conf names the runner, the step cannot be judged;
+    # with neither key, the machine is not wired to a runner, and it is a note, with nothing written.
+    for label, conf892 in (("RUNNER_SETTINGS set", dict(conf, RUNNER_SETTINGS="/srv/runner/runner.json")),
+                           ("RUNNER_LANE_REPOS set", dict(conf, RUNNER_LANE_REPOS="example-org/kit:KIT:kit",
+                                                          RUNNER_STORE_DIR=store892))):
+        r892, p892, w892 = _configs_892(conf892, (9, ""))
+        expect("KIT-892 a jobs listing that could not be read, with %s, is not known" % label,
+               r892 and r892.startswith("Unknown") and not [w for w in w892 if "cat >" in _fmt(w["argv"])],
+               "%s and an unread listing gave %r" % (label, r892))
+    r892, p892, _w = _configs_892(conf, (9, ""))
+    expect("KIT-892 with neither key, a jobs listing that could not be read is a note, and nothing is written for it",
+           r892 is None and p892 is not None and "runner_settings" not in p892
+           and any("no runner_settings was written" in n for n in notes892),
+           "no keys and an unread listing gave %r, %r, notes %r" % (r892, p892, notes892))
+    r892, p892, _w = _configs_892(dict(conf, RUNNER_LANE_REPOS="example-org/kit:KIT:kit",
+                                       RUNNER_STORE_DIR=store892), runner_listed, _runner_body("~/.pipeline-runner"))
+    expect("KIT-892 the repositories named as runner projects are written beside it",
+           r892 is None and (p892 or {}).get("runner_projects") == {"example-org/kit": "kit"},
+           "RUNNER_LANE_REPOS gave %r, %r" % (r892, p892))
+    for code892, missing in (('"routing_signoff_file"\n', "runner_settings and runner_projects"),
+                             ('"routing_signoff_file" "runner_settings"\n', "runner_projects")):
+        r892, p892, w892 = _configs_892(dict(conf, RUNNER_LANE_REPOS="example-org/kit:KIT:kit",
+                                             RUNNER_STORE_DIR=store892), runner_listed,
+                                        _runner_body("~/.pipeline-runner"), poller_code=code892)
+        expect("KIT-892 a review poller in the clone that would refuse %s is given nothing" % missing,
+               r892 and r892.startswith("SetupError") and missing in r892 and "Nothing was written" in r892
+               and not [w for w in w892 if "cat >" in _fmt(w["argv"])],
+               "an older review poller gave %r" % r892)
 
     # -- KIT-411. THE STATUS JOB: its conf, its config, its plist, its dry run, its step -------
     cases += 1
@@ -13614,6 +13964,34 @@ def _selftest_body():
         re.search(r"(^|\s)session-kinds(\s|$)", f) for f in fetched),
         "the comparison did not name session-kinds among the paths it diffs: %r" % [f[-200:] for f in fetched][:2])
 
+    # KIT-889: a job's own data is compared only where that job is installed. The comparison
+    # `verify` runs names the kit's guards where the runner's job is installed, the look tool's
+    # profile where the acceptance job is, neither where no such job is, and both where the job
+    # list could not be read (failing toward "behind").
+    def _data_compared(found):
+        ctxD8, fakeD8, _apiD8 = _healthy_ctx(conf)
+        fakeD8.answers = ([("/Library/LaunchDaemons/*.plist",) + found,
+                           ("launchctl print system/", 0, "\tstate = running\n"),
+                           ("ls-remote origin HEAD", 0, "beef000000000000000000000000000000000000\tHEAD\n"),
+                           (_fetch, 0, "FETCH_HEAD beef00000000\n")]
+                          + [a for a in fakeD8.answers if a[0] != "ls-remote origin HEAD"])
+        _quiet(lambda: step_code(ctxD8, apply_it=False))
+        said = [_fmt(a) for a in fakeD8.reads if _fetch in _fmt(a)]
+        return [(bool(re.search(r"(^|\s)\.claude/hooks(\s|$)", f)),
+                 bool(re.search(r"(^|\s)templates/sandbox/look\.sb(\s|$)", f))) for f in said]
+
+    cases += 1
+    for label, found, want in (
+            ("the runner's job installed", (0, "pipeline_runner.py /Library/LaunchDaemons/local.r.plist\nEND\n"),
+             (True, False)),
+            ("the acceptance job installed",
+             (0, "pipeline_acceptance_run.py /Library/LaunchDaemons/local.a.plist\nEND\n"), (False, True)),
+            ("neither installed", (0, "END\n"), (False, False)),
+            ("a job list that could not be read", (9, ""), (True, True))):
+        got889 = _data_compared(found)
+        expect("KIT-889 verify compares a job's data only where it is installed: %s" % label,
+               got889 == [want], "the comparison named (hooks, look profile) %r, wanted [%r]" % (got889, want))
+
     cases += 1
     (oB, dB), _f = _code_row_when_behind((_fetch, 7, ""))
     expect("KIT-149 behind-could-not-fetch-is-unknown", oB == UNKNOWN,
@@ -13693,9 +14071,12 @@ def _selftest_body():
             os.makedirs(os.path.join(origin_dir, "scripts"))
             os.makedirs(os.path.join(origin_dir, "schemas"))
             os.makedirs(os.path.join(origin_dir, "session-kinds"))
+            os.makedirs(os.path.join(origin_dir, ".claude", "hooks"))
+            os.makedirs(os.path.join(origin_dir, "templates", "sandbox"))
             _git("init", "-q", origin_dir)
             for rel in ("README.md", "scripts/pipeline_bounce_local.py",
-                        "schemas/review-findings.schema.json", "session-kinds/code.json"):
+                        "schemas/review-findings.schema.json", "session-kinds/code.json",
+                        ".claude/hooks/guard.py", "templates/sandbox/look.sb"):
                 with open(os.path.join(origin_dir, rel), "w") as fh:
                     fh.write("v1\n")
             _git("add", "-A", cwd=origin_dir)
@@ -13728,6 +14109,28 @@ def _selftest_body():
             expect("KIT-880 behind-shell-names-a-session-kind", rcG == 0
                    and linesG[1:] == ["session-kinds/code.json"],
                    "a commit to a session kind's data alone: rc %s, %r" % (rcG, linesG))
+            # KIT-889: a job's own data alone, compared where that job is installed and only there.
+            data_of = globals().get("compared_data")
+            expect("KIT-889 behind-shell-names-a-jobs-data", callable(data_of), "no compared_data")
+            for rel, mine, other in ((".claude/hooks/guard.py", "pipeline_runner.py",
+                                      "pipeline_acceptance_run.py"),
+                                     ("templates/sandbox/look.sb", "pipeline_acceptance_run.py",
+                                      "pipeline_runner.py")):
+                if not callable(data_of):
+                    break
+                _git("merge", "--ff-only", "-q", "FETCH_HEAD", cwd=kit_dir)
+                with open(os.path.join(origin_dir, rel), "a") as fh:
+                    fh.write("more\n")
+                _git("commit", "-qam", "touch " + rel, cwd=origin_dir)
+                seen889 = []
+                for entries in ({mine}, {other}, set(), None):
+                    res = Runner().read(["/bin/sh", "-c", fragment(
+                        kit_dir, compared_scripts(entries), data_of(entries))])
+                    seen889.append((res.rc, [ln for ln in res.out.splitlines() if ln.strip()][1:]))
+                expect("KIT-889 behind-shell-names-a-jobs-data: %s" % rel,
+                       seen889 == [(0, [rel]), (0, []), (0, []), (0, [rel])],
+                       "a commit to %s alone, compared with its job installed, another job only, "
+                       "none, and an unread list: %r" % (rel, seen889))
             gone = Runner().read(["/bin/sh", "-c", fragment(os.path.join(tmpG, "nope"))])
             expect("KIT-149 behind-shell-runs", gone.rc == 7,
                    "a clone that cannot fetch must exit 7, got %s" % gone.rc)
@@ -16933,9 +17336,10 @@ def _selftest_body():
     # ROLE_KIT_CLONE names its entry script the same way, so the entries are read out of the
     # installers themselves: one that names the clone and no entry fails here, never passes.
     # The settings folder (KIT-853) names ROLE_KIT_CLONE only as a setting it writes into the part
-    # files, and starts nothing. It is passed over only while that stays true: once it names an
-    # entry or imports subprocess, it fails here like any other.
-    key_only = ("pipeline_settings.py",)
+    # files, and the status job (KIT-889) only as this file's ROLE_KIT_CLONE_PATH, which it reads to
+    # tell which jobs are installed. Neither starts anything. Each is passed over only while that
+    # stays true: once it names an entry or imports subprocess, it fails here like any other.
+    key_only = ("pipeline_settings.py", "pipeline_status_local.py")
 
     def _kit280_closure():
         nonlocal cases
@@ -16966,7 +17370,7 @@ def _selftest_body():
         # …each one's own list is what it can load beyond Stage E's (review M3: `verify`
         # compares a job's files only where it runs, so each list must be right alone)…
         cases += 1
-        jobs = dict(globals().get("SIBLING_JOBS") or ())
+        jobs = dict((job[0], job[1]) for job in globals().get("SIBLING_JOBS") or ())
         drift = dict((entry, (sorted(_closure([entry]) - set(REQUIRED_SCRIPTS)),
                               list(jobs.get(entry) or ())))
                      for entry in sorted(entries)
@@ -16996,6 +17400,35 @@ def _selftest_body():
     expect("KIT-880 the-runners-kinds-are-compared", kinds_rel in RUNTIME_DATA_DIRS,
            "the runner reads its kinds from %s/, and RUNTIME_DATA_DIRS lists %s"
            % (kinds_rel, list(RUNTIME_DATA_DIRS)))
+
+    # KIT-889: each job's own data is named by the module that reads it, never by a second copy of
+    # the name. The runner's guard launcher runs the kit's guards from the one part of the engine
+    # that holds every hook it runs; the look tool runs every check under its own profile. Each
+    # listed path is in the kit, from its top, and no other job lists data.
+    cases += 1
+    import pipeline_runner_guard as _guard
+    import pipeline_look as _look
+    kit_top = os.path.dirname(here)
+    data_by = dict((job[0], tuple(job[2])) for job in SIBLING_JOBS)
+    guard_dirs = tuple(p for p in _guard.ENGINE_PARTS
+                       if all(os.path.isfile(os.path.join(kit_top, p, h)) for h in _guard.HOOKS.values()))
+    expect("KIT-889 the-runners-guards-are-its-data",
+           len(guard_dirs) == 1 and data_by.get("pipeline_runner.py") == guard_dirs,
+           "the runner's guards run from %s, and its entry lists %s"
+           % (list(guard_dirs), list(data_by.get("pipeline_runner.py") or ())))
+    look_rel = os.path.relpath(_look.PROFILE, kit_top)
+    expect("KIT-889 the-look-profile-is-the-acceptance-jobs-data",
+           data_by.get("pipeline_acceptance_run.py") == (look_rel,),
+           "the look tool's profile is %s, and the acceptance job's entry lists %s"
+           % (look_rel, list(data_by.get("pipeline_acceptance_run.py") or ())))
+    stray = sorted("%s: %s" % (e, d) for e, ds in data_by.items() for d in ds
+                   if os.path.isabs(d) or ".." in d.split("/") or d in RUNTIME_DATA_DIRS
+                   or not os.path.exists(os.path.join(kit_top, d)))
+    others = sorted(e for e, ds in data_by.items()
+                    if ds and e not in ("pipeline_runner.py", "pipeline_acceptance_run.py"))
+    expect("KIT-889 each-jobs-data-is-in-the-kit", not stray and not others,
+           "data paths that are not the kit's own, or repeat RUNTIME_DATA_DIRS: %s; jobs listing data "
+           "nothing reads: %s" % (stray, others))
 
     # -- THE HEARTBEAT MONITOR STEP (KIT-127): the job that reads the three heartbeats --
     # Named ticket, `off` by name, or a card — never a silent absence. Proved to exist and
@@ -18784,6 +19217,11 @@ STATUS_DRY_RUN_OK = ("status job: 2026-11-03T10:00:00Z (dry run)\n"
                      "  dry run: would write ~/.stage-e/status/pipeline-status.json\n")
 
 
+# A review poller that knows where the runner's settings are, and the repositories named as runner
+# projects (KIT-892): what a clone at or after that change answers to `cat`.
+POLLER_KNOWS_LANES = '"routing_signoff_file" "runner_settings" "runner_projects"\n'
+
+
 def _settled_ctx(conf):
     """A context whose machine already holds everything a settled install has.
     Used to prove a second pass writes nothing."""
@@ -18919,6 +19357,9 @@ def _settled_ctx(conf):
          '"routing_signoff_file"\n'),
         # …and the review poller's seen-set: none yet, so nothing in flight.
         ("state/seen-prs.json", 0, "no-seen-set"),
+        # KIT-892: no job runs from the clone here, so no runner's settings to write. Last, so a
+        # case that lists jobs answers first.
+        ("/Library/LaunchDaemons/*.plist", 0, "END\n"),
     ]
     fake.answers = answers
     return ctx, fake

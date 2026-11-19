@@ -128,7 +128,8 @@ copy of the kit, and the board reads Done in between. If the status file says th
   not be live yet.* It never repeats the job's own reason.
 
 It needs `kit_repo` (OWNER/REPO) in the status job's config; without it the field is `null` and nothing is
-said. It counts every job's files, installed here or not, and cannot see local edits in the clone.
+said. It counts every job's scripts, installed here or not, and a job's own data only where that
+job is installed (KIT-889). It cannot see local edits in the clone.
 
 Good: *behind main by 1 merge, in files the jobs run: scripts/pipeline_notify_local.py.*
 Not that: a line on every merge, or a blank where the copy could not be checked.
