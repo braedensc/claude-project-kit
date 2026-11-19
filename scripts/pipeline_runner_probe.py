@@ -793,7 +793,7 @@ def probe(claude, out_dir, wanted, model, work, token, timeout=RUN_TIMEOUT, say=
         shutil.rmtree(root, ignore_errors=True)
     walls = [r for r in rows if r["class"] == "wall"]
     meta.update(when=time.strftime("%Y-%m-%d %H:%M:%S %Z"), claude=claude, model=model,
-                account=_account(), uid=os.getuid(), engine=ENGINE,
+                account=_account(), uid=os.getuid(), engine=ENGINE, commit=engine_commit(ENGINE),
                 engine_problems=guard_launcher.engine_problems(ENGINE), kinds=list(wanted),
                 walls_passed=sum(r["verdict"] == PASS for r in walls), walls=len(walls))
     with open(os.path.join(out_dir, "results.json"), "w") as fh:
@@ -818,6 +818,19 @@ def probe(claude, out_dir, wanted, model, work, token, timeout=RUN_TIMEOUT, say=
 def _account():
     import pwd
     return pwd.getpwuid(os.getuid()).pw_name
+
+
+def engine_commit(engine):
+    """The commit of the kit copy the probe ran from, or None when it is not a git checkout or git cannot
+    say. The owner's live-run tool (scripts/pipeline_runner_live.py, KIT-916) passes a result only at a
+    commit that holds main's last change to the session kinds, and None never passes."""
+    try:
+        r = subprocess.run(["git", "-C", engine, "rev-parse", "--verify", "HEAD"], capture_output=True,
+                           universal_newlines=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    head = r.stdout.strip() if r.returncode == 0 else ""
+    return head if re.match(r"^[0-9a-f]{40}\Z", head) else None
 
 
 def main(argv=None):
@@ -1068,6 +1081,12 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                                         "CLOUDSDK_PROXY_PASSWORD (by net-unlisted)")
         with open(os.path.join(tmp, "out-tight", "results.json")) as fh:
             kept = fh.read()
+        # KIT-916: the result names the commit it ran at, for the owner's live-run tool. A copy of the kit that is
+        # not a git checkout says none, never a guess.
+        here = subprocess.run(["git", "-C", ENGINE, "rev-parse", "--verify", "HEAD"], capture_output=True,
+                              universal_newlines=True).stdout.strip() or None
+        expect("KIT-916: the result names the kit commit it ran at, or none outside a checkout",
+               (json.loads(kept)["meta"].get("commit", "missing"), engine_commit(tmp)), (here, None))
         pushed = dict((r["row"], (r["verdict"], r["note"])) for r in json.loads(kept)["rows"]
                       if r["row"].endswith(":push-token") or r["row"].endswith(":git-credential"))
         expect("KIT-886: a push-token row per kind, by name: present for code, absent for review and acceptance; "

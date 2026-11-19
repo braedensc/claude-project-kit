@@ -437,6 +437,9 @@ npm run test:runner-limits   # the runner's limits (KIT-643): stand-ins that gro
 npm run test:runner-setup    # the runner's installer (KIT-859): every lane off for every project; on
                              #   within its first-pass ceiling, else left off and never started at boot;
                              #   one rows document; its answer piped, never typed; refused under a model
+npm run test:runner-live     # the owner's live run of one lane (KIT-916): every prerequisite named, UNKNOWN
+                             #   never OK; one typed yes; the lane on, its chain, the checks; the lane off
+                             #   after any failure, and nothing after it; refused under a model
 npm run test:session-tools   # a session's own tracker tools (KIT-706): five tools tied to its run, no
                              #   ticket argument; hostile text refused or made inert; §8's caps; each
                              #   comment read by its job; only the fixed requests sent; real stdio

@@ -391,6 +391,9 @@ A row the session never tried is NOT MEASURED, never PASS. A refusal counts as t
 when its own words are seen. Exit 0 means every wall held; 1 a wall failed; 2 some wall was not
 measured; 3 it could not run.
 
+Its results name the kit commit it ran at (KIT-916). Run it from the copy the runner runs from, with
+`--out <RUNNER_DIR>/probe`: the live-run tool reads its last result there ("Proving a lane live").
+
 ## The session's own tracker tools
 
 A code, fix or conflict run gets one tool server of its own when `session_tools` is set:
@@ -632,6 +635,52 @@ npm run test:session-tools
 The session tools' selftest checks every refusal and every cap. It checks that only the fixed
 requests reach the tracker, and that no answer, log line or file holds the key. It holds each
 comment against the job that reads it, then runs the real server over stdio.
+
+## Proving a lane live
+
+One script proves one lane on one test project, from off to on and back to off (KIT-916). You run
+it, in your own terminal. It refuses a model's environment and root, and asks for your Mac password
+once.
+
+```bash
+python3 scripts/pipeline_runner_live.py check --lane code --project <key> --ticket <ID>   # changes nothing
+python3 scripts/pipeline_runner_live.py run   --lane code --project <key> --ticket <ID>   # one typed yes
+python3 scripts/pipeline_runner_live.py off   --lane code --project <key>                 # only switches off
+```
+
+The lanes are `code`, `fix`, `review`, `plan` and `acceptance`. The project is a key of the runner's
+settings, and the ticket is the one its chain is about: the ticket to code, the coded ticket to fix or
+review, the idea to plan, or the piece to check.
+
+1. **Check.** Sixteen rows, each OK, MISSING with what to do, or NOT NEEDED for this lane. Anything it
+   cannot read is UNKNOWN, never OK, and stops the run. The rows: the runner installed and on; its job
+   running from a copy the role account cannot change (KIT-919 builds it); the kit clone at main's head;
+   the project's clone, HTTPS, reached; `RUNNER_STORE` for the queue; each key file the role account's,
+   mode 0600; a dry-run push with the push token; the writer key answering as its user; the probe passing
+   at a commit with main's session kinds; `delivery.json` on main passing the kit's validator; the
+   project's `docs/SESSION-BRIEF.md` naming the ticket tools; now inside the working window; the lane
+   off; the settings with it on taken by the runner's own loader; no other approved ticket waiting; and
+   the ticket ready.
+2. **Show and ask.** It says what it will switch, then waits for you to type `yes`.
+3. **Switch on.** It sets `lanes.<lane>` for that one project, as the role account, and waits until the
+   runner says so in its store.
+4. **Wait.** It tells you your one step, if the lane has one (the coding lane: move the ticket into
+   Todo). Then it reads the store once every 20 seconds, up to the lane's time limit (`--minutes`).
+5. **Switch off.** The same setting, back to false, confirmed by the runner. It watches three minutes
+   that nothing of the lane starts after. A failure, Ctrl-C or a closed terminal switches it off first.
+6. **Compare and print.** The run record, the tracker's history, the pull request and the ledger, where
+   the lane's proof asks. Then one result block to post on the proof's ticket, with what did not work.
+
+No key reaches the script, its output or a command line. Each key file is looked at with `stat`. The
+dry run hands the push token to git as a session's git gets it, and the writer key is asked who it is by
+the runner's own code, both inside the role account's own processes. The tracker is read by the runner's
+own reader, as the role account. GitHub is read with your own `gh` login.
+
+Exits: 0 passed and off · 1 a step failed or did not agree, and off · 2 arguments · 3 refused · 4 not
+ready, nothing changed · 5 no sudo · 6 the lane may still be on: run the `off` line it prints · 10 not yes.
+
+Good: `check` says every row OK. `run`, `yes`, move the ticket into Todo. The result says PASSED.
+Not: the lane switched on by hand in `runner.json` for a proof. Nothing then checks it, or switches it back.
 
 ## When it refuses
 
