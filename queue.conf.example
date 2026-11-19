@@ -61,5 +61,8 @@ USAGE_FILE=~/.stage-e/usage/usage.json
 BRIDGE_CONFIG=~/.stage-e/bridge.json
 BRIDGE_STATE_FILE=~/.stage-e/state/bridge-state.json
 FINDINGS_FILE=~/.stage-e/finding/seen.json
+# The runner's store_dir (runner.json), once a lane moves to the runner: the usage job counts its runs beside the
+# old dispatcher's, so they count against the day and the week. Empty: off, and the usage file says `off`.
+RUNNER_STORE=
 USAGE_INTERVAL_SECONDS=900
 MORNING_INTERVAL_SECONDS=600

@@ -228,6 +228,20 @@ If a caller cannot write a row, its own log says so, and the call itself still r
 ledger, so the usage job says the call was not counted. Only a disk that takes no write at all loses the mark too.
 For example, `morning.log` says `NOTE: could not record the planner call's spend in ...`.
 
+## The runner's runs
+
+Our own runner (docs/RUNNER.md) keeps one record for each run it starts, and no dispatcher log holds those runs. The
+usage job counts them beside the logs once `RUNNER_STORE` in `queue.conf` names the runner's `store_dir` (KIT-860). Set
+it before the first lane moves to the runner, then run the installer again, or that lane's runs do not count against
+the day and the week.
+
+Each day and the week say where their runs came from, in `by_source`: the logs, the runner, the spend ledgers and the
+judge. The four add up to the totals. A run both the logs and the runner hold is counted once, from its log.
+
+Good: `runner   read            asked 1, answered 1`. Not that: `runner   could-not-read  asked 1, answered 0: the
+runner's store could not be read (the store does not exist)`. Then check `RUNNER_STORE`. None of the runner's runs is
+counted, never as zero, and the pass is `partial`. Empty, the line says `off`.
+
 ## Pausing it
 
 Unload a job: `sudo launchctl bootout system/<label>`. `disable` it too to survive a restart. The installer never reloads

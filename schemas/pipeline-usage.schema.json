@@ -33,13 +33,14 @@
     },
     "sources": {
       "type": "object",
-      "required": ["logs", "ledger", "planner"],
+      "required": ["logs", "ledger", "planner", "runner"],
       "additionalProperties": false,
       "description": "One entry per source this job reads.",
       "properties": {
         "logs": {"$ref": "#/$defs/source", "description": "The dispatcher's session logs: every run's cost, how long it ran, how it signed in, and Anthropic's usage events."},
         "ledger": {"$ref": "#/$defs/source", "description": "Stage E's bounce ledger and review records: which later run was a bounce fix or a conflict fix."},
-        "planner": {"$ref": "#/$defs/source", "description": "The idea gate's record of planning runs: which ticket is a planning run."}
+        "planner": {"$ref": "#/$defs/source", "description": "The idea gate's record of planning runs: which ticket is a planning run."},
+        "runner": {"$ref": "#/$defs/source", "description": "The runner's run records, read through its store's one reader (§28, KIT-860): each run's kind, cost and length. `off` until the config names the store."}
       }
     },
     "judge": {
@@ -115,11 +116,12 @@
           "maxItems": 500,
           "items": {
             "type": "object",
-            "required": ["id", "at"],
+            "required": ["id", "at", "source"],
             "additionalProperties": false,
             "properties": {
               "id": {"$ref": "#/$defs/ticket_id"},
-              "at": {"$ref": "#/$defs/time", "description": "When the run started."}
+              "at": {"$ref": "#/$defs/time", "description": "When the run started."},
+              "source": {"$ref": "#/$defs/run_source"}
             }
           },
           "description": "Each run on a ticket that signed in any way but the plan's own (`none` or `oauth`): a key, a key helper, another source the SDK names, or `other`. The newest first. A chat run is counted in `counts`, never listed, and so is a run whose source was `not seen`."
@@ -186,7 +188,7 @@
       "properties": {
         "state": {
           "enum": ["read", "partly-read", "could-not-read", "off"],
-          "description": "`read`: every question asked was answered. `partly-read`: some were not, and `reason` names the first. `could-not-read`: none was, or it could not be asked. `off`: the config turns it off (`ledger` and `planner` only)."
+          "description": "`read`: every question asked was answered. `partly-read`: some were not, and `reason` names the first. `could-not-read`: none was, or it could not be asked. `off`: the config turns it off (`ledger`, `planner` and `runner` only)."
         },
         "asked": {"$ref": "#/$defs/count", "description": "Questions this pass put to the source: run files and placeholders read, older logs read for a total, folders that could not be listed; the ledger, and each review record; the idea gate's record."},
         "answered": {"$ref": "#/$defs/count", "description": "How many of them it answered. A ledger or record that does not exist yet is an answer: nothing yet."},
@@ -201,6 +203,32 @@
       "properties": {
         "runs": {"$ref": "#/$defs/count"},
         "usd": {"$ref": "#/$defs/usd"}
+      }
+    },
+    "run_source": {
+      "enum": ["logs", "runner"],
+      "description": "Where the run was counted from (KIT-860): `logs`, the old dispatcher's session logs, or `runner`, the runner's run records. A run both hold is counted once, from its log."
+    },
+    "source_total": {
+      "type": "object",
+      "required": ["runs", "unpriced", "usd"],
+      "additionalProperties": false,
+      "properties": {
+        "runs": {"$ref": "#/$defs/count"},
+        "unpriced": {"$ref": "#/$defs/count"},
+        "usd": {"$ref": "#/$defs/usd"}
+      }
+    },
+    "source_totals": {
+      "type": "object",
+      "required": ["logs", "runner", "spend", "judge"],
+      "additionalProperties": false,
+      "description": "Runs, unpriced runs and spend by where each run was counted from (KIT-860). Every counted run is under exactly one, so each adds up to the totals beside it. `logs`: the old dispatcher's session logs. `runner`: the runner's run records. `spend`: the spend ledgers (§30). `judge`: the watcher judge's record.",
+      "properties": {
+        "logs": {"$ref": "#/$defs/source_total"},
+        "runner": {"$ref": "#/$defs/source_total"},
+        "spend": {"$ref": "#/$defs/source_total"},
+        "judge": {"$ref": "#/$defs/source_total"}
       }
     },
     "kind_totals": {
@@ -271,7 +299,7 @@
     },
     "week": {
       "type": "object",
-      "required": ["known", "starts_at", "resets_at", "usd", "runs", "unpriced", "seconds", "by_kind", "by_model"],
+      "required": ["known", "starts_at", "resets_at", "usd", "runs", "unpriced", "seconds", "by_kind", "by_source", "by_model"],
       "additionalProperties": false,
       "description": "Since the plan's weekly reset. When `known` is false every other field is null: the week is unknown, never zero.",
       "properties": {
@@ -283,12 +311,13 @@
         "unpriced": {"$ref": "#/$defs/count_or_null", "description": "Runs with no usable total (a crash, or a run still going), counted in `runs`, never in `usd`."},
         "seconds": {"$ref": "#/$defs/count_or_null", "description": "How long the week's sessions ran, summed over runs, each from its first to its last line."},
         "by_kind": {"oneOf": [{"$ref": "#/$defs/kind_totals"}, {"type": "null"}]},
+        "by_source": {"oneOf": [{"$ref": "#/$defs/source_totals"}, {"type": "null"}]},
         "by_model": {"oneOf": [{"$ref": "#/$defs/model_usd"}, {"type": "null"}]}
       }
     },
     "day": {
       "type": "object",
-      "required": ["date", "usd", "runs", "unpriced", "seconds", "by_kind"],
+      "required": ["date", "usd", "runs", "unpriced", "seconds", "by_kind", "by_source"],
       "additionalProperties": false,
       "properties": {
         "date": {"$ref": "#/$defs/date"},
@@ -296,7 +325,8 @@
         "runs": {"$ref": "#/$defs/count"},
         "unpriced": {"$ref": "#/$defs/count"},
         "seconds": {"$ref": "#/$defs/count", "description": "How long the day's sessions ran, summed over runs."},
-        "by_kind": {"$ref": "#/$defs/kind_totals"}
+        "by_kind": {"$ref": "#/$defs/kind_totals"},
+        "by_source": {"$ref": "#/$defs/source_totals"}
       }
     },
     "piece": {
@@ -313,7 +343,7 @@
     },
     "limit_stop": {
       "type": "object",
-      "required": ["ticket", "kind", "ended_at", "window", "resets_at"],
+      "required": ["ticket", "kind", "source", "ended_at", "window", "resets_at"],
       "additionalProperties": false,
       "properties": {
         "ticket": {
@@ -321,6 +351,7 @@
           "description": "The run's ticket, or null for a run in a folder that is not a ticket id (a chat thread)."
         },
         "kind": {"enum": ["tech_lead", "review", "planner", "coding", "bounce_fix", "conflict_fix", "catch_up", "other_later"], "description": "The run's kind (§17, What a run was)."},
+        "source": {"$ref": "#/$defs/run_source"},
         "ended_at": {"$ref": "#/$defs/time", "description": "The run's last line, or its start when it has none."},
         "window": {"enum": ["five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet", "seven_day_overage_included", "overage", "other"], "description": "The window that rejected the run (the newest rejection, when there were several). `other`: a window this list does not have, or none."},
         "resets_at": {"$ref": "#/$defs/time_or_null", "description": "When that window resets, as the rejection said. Null when the rejection gave no reset, or one that is not a time."}

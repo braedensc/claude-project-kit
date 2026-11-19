@@ -90,13 +90,15 @@ CONF_DEFAULTS = {
     "BRIDGE_STATE_FILE": "~/.stage-e/state/bridge-state.json", "FINDINGS_FILE": "~/.stage-e/finding/seen.json",
     "QUEUE_CONFIG": "~/.stage-e/queue/queue.json", "USAGE_CONFIG": "~/.stage-e/usage/usage-config.json",
     "USAGE_FILE": usage_job.DEFAULT_OUT, "USAGE_INTERVAL_SECONDS": "900", "MORNING_INTERVAL_SECONDS": "600",
+    # KIT-860: the runner's store_dir, whose runs the usage job counts beside the logs. Empty: off, until a lane moves.
+    "RUNNER_STORE": "",
 }
 CONF_KEYS = set(CONF_REQUIRED) | set(CONF_DEFAULTS)
 # Left invalid on purpose, so an unedited copy of the example cannot run.
 CONF_UNEDITED = {"OWNER_USER_IDS": "owner-user-id-1", "DISPATCHER_USER_IDS": "dispatcher-user-id-1",
                  "REPO_BY_TEAM": "ENG=acme/app"}
 PATH_KEYS = ("ROLE_KIT_CLONE", "ENV_FILE", "QUEUE_CONFIG", "USAGE_CONFIG", "USAGE_FILE", "BRIDGE_CONFIG",
-             "BRIDGE_STATE_FILE", "FINDINGS_FILE")      # the last two may be empty: that record is then off
+             "BRIDGE_STATE_FILE", "FINDINGS_FILE", "RUNNER_STORE")   # the last three may be empty: that source is off
 
 
 def whole(text):
@@ -269,7 +271,7 @@ def compose(c):
                         **({"sprint_plan_file": c["SPRINT_PLAN_FILE"]} if c["SPRINT_PLAN_FILE"] else {})),
     }
     return queue, {"reviews_team_key": c["REVIEWS_TEAM_KEY"], "out": c["USAGE_FILE"],
-                   "spend_ledgers": spend_ledgers_of(queue)}
+                   "spend_ledgers": spend_ledgers_of(queue), "runner_store": c["RUNNER_STORE"]}
 
 
 def spend_ledgers_of(queue):
@@ -1070,6 +1072,23 @@ def _cases(check, tmp):
          ("the bridge's ledgers guessed at the usage job's defaults", {"spend_ledgers_of": lambda queue: dict(
              o["spend_ledgers_of"](queue), standup=usage_job.SPEND_LEDGER_PATHS["standup"],
              tech_lead=usage_job.SPEND_LEDGER_PATHS["tech_lead"])}))
+
+    # KIT-860: the runner's store, named in the usage job's config when a lane moves; empty is off
+    def runner_store(**over):
+        conf, errs = parse(text(**over))
+        if errs:
+            return errs
+        queue, usage = compose(conf)
+        validate_composed(queue, usage, None)
+        return usage["runner_store"]
+    case("KIT-860 compose: RUNNER_STORE is the usage job's runner_store, off when empty; the usage job's own loader "
+         "accepts it, and a path that is not one is refused by key",
+         lambda: [runner_store(), runner_store(RUNNER_STORE="~/.pipeline-runner/store"),
+                  runner_store(RUNNER_STORE="runner/store")],
+         ["", "~/.pipeline-runner/store",
+          ["RUNNER_STORE must be `~/…` (the role account's home) or an absolute path, with no `..`"]],
+         ("the store left out of the usage config", {"compose": lambda conf: (lambda q, u: (q, dict(
+             (k, v) for k, v in u.items() if k != "runner_store")))(*o["compose"](conf))}))
 
     # KIT-596: review tickets on the work teams are told by their marks, so the Reviews team's key may be left out
     def no_reviews_team():
