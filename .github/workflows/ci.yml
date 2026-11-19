@@ -124,6 +124,12 @@ jobs:
           python3 scripts/check_label_gate.py
       - name: Label gate policy selftest (the owner's allow for pull_request_target)
         run: python3 scripts/pipeline_gate_policy.py --selftest
+      # KIT-911. The owner's script that makes main's branch rule require a pull request. Offline,
+      # against a stand-in for gh: refused under a model or as root, ON only on a whole read, the
+      # commits that skipped a pull request listed before the one yes, and a read-back that is
+      # NOT DONE when the required checks or admin enforcement moved.
+      - name: Branch rule selftest (main also requires a pull request; one yes; read back)
+        run: python3 scripts/pipeline_branch_rule.py --selftest
       # KIT-788. The stack template's label gate runs the default branch's workflow, never the PR's.
       - name: Template label gate check (the gate runs from the default branch)
         run: |
