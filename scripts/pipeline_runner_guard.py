@@ -325,6 +325,29 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                                 cwd=tmp, timeout=30)
         expect("…while run on its own with no anchor it judges another folder, and lets the edit through",
                direct.returncode, 0)
+
+        # KIT-886: a code, fix or conflict run holds the push token. On its own branch, through the
+        # launcher, the kit's guard still refuses a push to main, a bare force push and a merge.
+        subprocess.run(["git", "-C", repo, "checkout", "--quiet", "-b", "feat/eng-1-push-token"], env=genv_git,
+                       check=True, capture_output=True)
+        holding = dict(genv_git, GH_TOKEN="fake-push-token-for-the-selftest")
+        for what, command, words in (
+                ("refuses a push to main", "git push origin HEAD:main", "Pushing to main/master is not allowed"),
+                ("refuses a bare force push", "git push --force origin HEAD", "Bare --force/-f push is blocked"),
+                ("refuses a merge", "gh pr merge 7 --squash", "`gh pr merge` (including --auto) is not allowed"),
+                ("lets the run's own push through", "git push -u origin feat/eng-1-push-token", None)):
+            bash = json.dumps({"tool_name": "Bash", "cwd": repo, "session_id": "s", "hook_event_name": "PreToolUse",
+                               "tool_input": {"command": command, "description": "x"}}).encode()
+            err, out = io.StringIO(), io.StringIO()
+            real = sys.stderr, sys.stdout
+            sys.stderr, sys.stdout = err, out
+            try:
+                code = main(["--workspace", repo, "--hook", "pre-tool-use"], stdin=io.BytesIO(bash),
+                            environ=holding, engine=ENGINE, timeout=30)
+            finally:
+                sys.stderr, sys.stdout = real
+            expect("in a run that holds the push token, the kit's guard %s, in its own words" % what,
+                   (code, words in err.getvalue()) if words else code, (2, True) if words else 0)
     else:
         print("  (skipped: no kit guard at %s)" % kit_guard)
 

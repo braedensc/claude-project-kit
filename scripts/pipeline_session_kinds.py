@@ -33,7 +33,10 @@ Each file says what a session of that kind is given and what walls it runs behin
                   program (row r5a). The two cannot be combined (row r5b: Bash does not start)
     hosts         "project" (the project's allowed_hosts) or a list; [] for a kind without Bash,
                   since nothing of it reaches a host
-    env           the names of the only environment variables the program is given
+    env           the names of the only environment variables the program is given. The push
+                  token's names (PUSH_ENV, KIT-886) are for a kind that does a ticket's work, with
+                  Bash inside the built-in sandbox: code, fix and conflict. Such a kind names all
+                  of them or none
     guards        the kit's guards the session's tool calls go through, run from the engine's
                   own folder (scripts/pipeline_runner_guard.py)
     tool_servers  tool servers the session may get: `ticket`, its own five ticket tools, for
@@ -85,6 +88,13 @@ GUARDS = ("pre-tool-use",)
 # scripts/pipeline_session_tools.py), given only while the runner's `session_tools` is set.
 TOOL_SERVERS = ("ticket",)
 LIMIT_KEYS = ("wall_minutes", "memory_mb", "disk_mb")
+# KIT-886. The sessions' push token: the code host's token, under the one name git's helper and the
+# kit's GitHub fallback read, then git's own helper for it, given by the environment. A session
+# that holds it can push its branch and open its pull request. Only a kind that does a ticket's
+# work, with Bash held to its host list by the built-in sandbox, may name these, and it names all.
+PUSH_TOKEN_ENV = "GH_TOKEN"
+PUSH_ENV = (PUSH_TOKEN_ENV, "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0",
+            "GIT_CONFIG_KEY_1", "GIT_CONFIG_VALUE_1")
 WORD_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,29}\Z")
 ENV_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}\Z")
 HOST_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+\Z")
@@ -180,6 +190,17 @@ def problems(doc, name):
     if not (isinstance(env, list) and env and all(isinstance(e, str) and ENV_RE.match(e) for e in env)
             and len(set(env)) == len(env)):
         say("env: a list of distinct variable names")
+    else:
+        # KIT-886: the push token reaches only a kind that does a ticket's work, and only through
+        # Bash the built-in sandbox holds to its host list. A kind without Bash runs inside our own
+        # sandbox, which walls files and not the network.
+        named = [e for e in PUSH_ENV if e in env]
+        if named and not (doc["mode"] == "ticket" and shell and doc["wall"] == "built-in-sandbox"):
+            say("env: %s is the push token's, so only a kind that does a ticket's work, with Bash "
+                "inside the built-in sandbox, may name it (KIT-886)" % named[0])
+        elif named and len(named) != len(PUSH_ENV):
+            say("env: the push token goes with git's helper for it: %s, all or none"
+                % ", ".join(PUSH_ENV))
     guards = doc["guards"]
     if not (isinstance(guards, list) and all(g in GUARDS for g in guards) and "pre-tool-use" in guards
             and len(set(guards)) == len(guards)):
@@ -325,6 +346,11 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
     kinds, bad = load()
     expect("the kit's own kinds load with nothing wrong", bad, [])
     expect("every kind the store knows has its data", sorted(kinds), sorted(store.KINDS))
+    if bad:                             # nothing below can be judged without the kit's own kinds
+        print("FAIL: pipeline_session_kinds selftest")
+        for f in failures:
+            print("  - " + f)
+        return 1
     for name, doc in sorted(kinds.items()):
         shell = "Bash" in doc["tools"]
         expect("%s: no file tool is allowed by name" % name,
@@ -338,6 +364,15 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
            sorted(k for k, d in kinds.items() if d["wall"] == "own-sandbox"), ["plan", "review"])
     expect("a resume keeps its run's branch: fix and conflict have none",
            sorted(k for k, d in kinds.items() if d["branch"] is None), ["conflict", "fix"])
+    # KIT-886: the push token, by name, for code, fix and conflict, and for no other kind.
+    expect("the kinds that hold the push token are code, fix and conflict",
+           sorted(k for k, d in kinds.items() if PUSH_TOKEN_ENV in d["env"]), ["code", "conflict", "fix"])
+    expect("…each with git's helper for it, all of its names",
+           sorted(k for k, d in kinds.items() if all(e in d["env"] for e in PUSH_ENV)),
+           ["code", "conflict", "fix"])
+    expect("…and review, plan and acceptance name none of them",
+           [(k, e) for k, d in sorted(kinds.items()) if k in ("review", "plan", "acceptance")
+            for e in PUSH_ENV if e in d["env"]], [])
 
     # The reviewer's and the planner's tools are an allow list, the same sets the old lane's
     # live probes check against (pipeline_stage_e_setup.py, pipeline_stage_a_setup.py).
@@ -411,10 +446,25 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
             ("an approval no list counts", {"approval": {"newest_move": True, "states": "fix"}},
              "code: approval: {newest_move: true or false, states: one of code, review, plan, "
              "acceptance}, or {from_run: code} for a starting kind that follows a code run"),
-            ("a starting kind with no branch", {"branch": None}, "code: branch: a kind that starts needs one")):
+            ("a starting kind with no branch", {"branch": None}, "code: branch: a kind that starts needs one"),
+            ("the push token without git's helper for it",
+             {"env": [e for e in good["env"] if e not in PUSH_ENV[1:]]},
+             "code: env: the push token goes with git's helper for it: %s, all or none" % ", ".join(PUSH_ENV)),
+            ("git's helper without the push token", {"env": [e for e in good["env"] if e != PUSH_TOKEN_ENV]},
+             "code: env: the push token goes with git's helper for it: %s, all or none" % ", ".join(PUSH_ENV))):
         doc = copy.deepcopy(good)
         doc.update(change)
         expect("refused: %s" % what, problems(doc, "code")[:1], [want])
+    for name, extra in (("review", [PUSH_TOKEN_ENV]), ("plan", list(PUSH_ENV)), ("acceptance", list(PUSH_ENV))):
+        doc = dict(kinds[name], env=kinds[name]["env"] + extra)
+        expect("refused: the push token in a %s session, which does no ticket's work (KIT-886)" % name,
+               problems(doc, name), ["%s: env: GH_TOKEN is the push token's, so only a kind that does a "
+                                     "ticket's work, with Bash inside the built-in sandbox, may name it "
+                                     "(KIT-886)" % name])
+    expect("refused: the push token in a ticket kind without Bash, whose own sandbox walls no host",
+           problems(dict(kinds["review"], mode="ticket", env=kinds["review"]["env"] + list(PUSH_ENV)), "review"),
+           ["review: env: GH_TOKEN is the push token's, so only a kind that does a ticket's work, with Bash "
+            "inside the built-in sandbox, may name it (KIT-886)"])
     review = copy.deepcopy(kinds["review"])
     review.update(tools=["Read", "Grep", "Glob", "Bash"], allow=dict(review["allow"], Bash="name"))
     expect("refused: Bash added to a kind inside our own sandbox", problems(review, "review"),
