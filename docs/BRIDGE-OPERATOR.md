@@ -335,6 +335,9 @@ A planning run still going on our runner's lane is read from the runner's store,
 `runner_lane` setting, and a replan is refused while one is open (KIT-908), in the same words
 as for a planning ticket. If the bridge cannot read the runner's settings or store, it says so
 and asks nothing: it never reads "cannot read" as "no run open".
+One request file in the store that cannot be read, from any job, stops every replan until
+it is repaired or removed by hand, since it may be the idea's. A replan already under way,
+whose store cannot be read before it moves the idea back, ends there and is asked again.
 
 To tell the next run something, add a note in your direct messages with the bridge. Put it
 after `note:`, and send one idea at a time. The question shows your note word for word, as

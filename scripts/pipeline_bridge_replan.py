@@ -1219,6 +1219,23 @@ def cases_replan(kit):
         check("replan-refused-in-words-when-a-request-file-cannot-be-read (KIT-908)",
               outcome(corrupt_case), (True, [], []))
 
+        def no_record_case():
+            def setup(store, rid):
+                doc = rstore_mod.pending(store)[0][1]
+                rstore_mod.settle(store, rid, doc, True, "run-" + "c" * 32, "", now)
+            (text, kinds, moves), _rid = runner_idea("norecord", setup)
+            return text.startswith(cannot), kinds, moves
+        check("replan-refused-in-words-when-a-run-record-cannot-be-read (KIT-908)",
+              outcome(no_record_case), (True, [], []))
+
+        def no_folder_case():
+            def setup(store, rid):
+                os.rename(os.path.join(store, "taken"), os.path.join(store, "taken-gone"))
+            (text, kinds, moves), _rid = runner_idea("nofolder", setup)
+            return text.startswith(cannot + "the runner's store could not be read"), kinds, moves
+        check("replan-refused-in-words-when-the-store-cannot-be-listed (KIT-908)",
+              outcome(no_folder_case), (True, [], []))
+
         # KIT-444: a plan that still stands is offered for cancelling, in the re-plan's own
         # question; the yes cancels it alone, then plans the idea again.
         from pipeline_bridge_config import CREDIT_BIND
