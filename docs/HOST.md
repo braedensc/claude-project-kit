@@ -72,6 +72,7 @@ The other installers check less:
 | Sweep | Home reads | `scripts/pipeline_sweep_setup.py:241` |
 | Watcher | Makes its own account; refuses one with a login shell | `scripts/pipeline_watcher_setup.py:475` |
 | Conflict waker | Not root; a screen login; Python 3.8+ and the coding CLI on your PATH | `scripts/pipeline_conflict_waker_setup.py:414` |
+| Validator | Not root; your own login, no account; a main checkout; Python, the coding CLI and `gh` by full path | `scripts/pipeline_validator_setup.py:714` |
 
 **No installer reads** the account's groups, its home mode, its hidden flag, or the state folder's
 mode. None tests the boundary between the role and you. Check those yourself, below.

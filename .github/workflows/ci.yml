@@ -453,6 +453,12 @@ jobs:
       # that is said when the watcher cannot take it.
       - name: Validator route selftest (send back on Stage E's budget; escalate; holds in closed words)
         run: python3 scripts/pipeline_validator_route.py --selftest
+      # The validator's install (KIT-547), under the user's own login. A fake launchd answers every
+      # launchctl call; /bin/sh runs for real, so the env probe, the rehearsal and the job's own
+      # line run as written. No sudo, no account; every switch is off after a fresh install, a
+      # settings file that is there is never written, no key or token value reaches any output.
+      - name: Validator installer selftest (every switch off; no sudo; no credential in any output)
+        run: python3 scripts/pipeline_validator_setup.py --selftest
       # The usage runs (KIT-422, contract §17): the dispatcher's logs, and the Stage E and
       # idea-gate records beside them, read into runs. Offline, reading only, in a temp folder:
       # a run's spend is its share of its session's running totals, a crash is unpriced and

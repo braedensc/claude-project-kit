@@ -28,6 +28,9 @@ WHAT IS HERE
               the agent taken off and put back, since Linear starts a session only for a
               real change), the sessions read back for a retry (none new: nothing was
               retried, and it says so), then the comment naming who said yes.
+  Our runner  a ticket whose project codes on our own runner (KIT-645) is neither retried nor
+              started here: the runner starts one only on its approver's move, and the
+              question says so. A runner whose settings cannot be read refuses it too.
 """
 import os
 import sys
@@ -174,6 +177,17 @@ class HandoverMixin(object):
         if state.get("type") in ENDED_STATES:
             return ("%s is %s, so there's nothing to hand over."
                     % (ident, notify.safe_title(state.get("name") or "closed")), "", "closed")
+        # KIT-645: a project switched to our own runner codes only through it, and the runner starts
+        # a ticket only on its approver's move. A hand-over there would start the old dispatcher.
+        route, held_why = self.runner_route_of(issue)
+        if route == "runner":
+            return ("%s's project codes on our own runner now. It starts a ticket only when its "
+                    "approver moves it into %s, so I won't hand it to the agent. Move it there "
+                    "yourself, and the queue asks the runner." % (ident, self.cfg["ready_state"]),
+                    "", "runner lane")
+        if route == "held":
+            return ("I can't tell whether %s's project codes on our own runner (%s), so I won't "
+                    "hand it over." % (ident, held_why), "", "runner lane")
         statuses = [n.get("status") for n in sessions]
         if any(s in SESSION_RUNNING for s in statuses):
             return ("A dev is working on %s now, so I won't hand it over again." % ident, "",
@@ -497,7 +511,34 @@ def cases_handover(kit):
             t.issues[ident].update(fields)
 
         ended = [{"id": "s-6", "status": "complete", "createdAt": created(now)}]
+        # KIT-645: a project switched to our own runner. The queue's own settings route PROD to
+        # acme/app, and its working window never opens here, so no pass starts anything.
+        rfolder = os.path.join(_tmp, "runner-handover")
+        os.makedirs(os.path.join(rfolder, "store"))
+        qconf, rsettings = os.path.join(rfolder, "queue.json"), os.path.join(rfolder, "runner.json")
+        with open(qconf, "w", encoding="utf-8") as fh:
+            json.dump({"pool": {"owner_user_ids": ["owner-1"], "team_keys": ["PROD"],
+                                "dispatcher_user_ids": ["agent-1"]},
+                       "reader": {"repo_by_team": {"PROD": "acme/app"},
+                                  "inputs_file": os.path.join(rfolder, "in.json")},
+                       "window": {"days": dict((d, None) for d in (
+                           "mon", "tue", "wed", "thu", "fri", "sat", "sun"))}}, fh)
+        with open(rsettings, "w", encoding="utf-8") as fh:
+            json.dump({"enabled": True, "store_dir": os.path.join(rfolder, "store"),
+                       "projects": {"app": {"lanes": {"code": True}}}}, fh)
+        switched = dict(queue_config=qconf, runner_lane={"settings_file": rsettings,
+                                                         "repos": {"acme/app": "app"}})
+        unread = dict(queue_config=qconf, runner_lane={
+            "settings_file": os.path.join(rfolder, "gone.json"), "repos": {"acme/app": "app"}})
         rows = (
+            ("ho-runner-start", "start PROD-6", readied, switched,
+             "PROD-6's project codes on our own runner now. It starts a ticket only when its "
+             "approver moves it into Todo, so I won't hand it to the agent. Move it there "
+             "yourself, and the queue asks the runner."),
+            ("ho-runner-unread", "retry PROD-6", lambda t_: held(t_, sessions=lost), unread,
+             "I can't tell whether PROD-6's project codes on our own runner (the runner's settings "
+             "could not be read: it could not be opened (FileNotFoundError)), so I won't hand it "
+             "over."),
             ("ho-no-agent", "start PROD-6", readied, dict(agent_user_name=""),
              "I can't hand anything to the agent: no agent account is named here."),
             ("ho-unknown-agent", "start PROD-6", readied, dict(agent_user_name="Nobody"),

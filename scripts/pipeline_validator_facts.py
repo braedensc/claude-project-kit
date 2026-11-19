@@ -40,9 +40,10 @@ WHERE EACH FACT COMES FROM, each through the reader of the part that owns it:
   ticket       the tracker's attachment for the pull request's address, by Stage E's own reader
                (pipeline_bounce_local.linear_ticket_for_pr_url): Linear's record, never the branch name
   origin       piece, then its plan, then the planning run, then the idea, then the queue pool's own
-               rule for a ticket the owner filed: the bridge config's plan_run() and run_idea(), and
-               the limits' idea_origin(). A ticket with no plan is judged by the same rule itself. A
-               plan starts at its own receipt.
+               rule for a ticket the owner filed: the bridge config's plan_run() and receipt_idea()
+               (run_idea() for a planning ticket; on our own runner's lane the plan's receipt names
+               the idea itself, KIT-705), and the limits' idea_origin(). A ticket with no plan is
+               judged by the same rule itself. A plan starts at its own receipt.
                Agent-filed work's generation is the pool's to certify, and is not read here.
   pr, paths    the pull request and every file it changes, a rename's old name too, from GitHub. A
                plan's paths: the ones its own text and every piece's name (the limits' named_paths)
@@ -267,8 +268,9 @@ def _idea_of_plan(cfg, pcfg, plan_node):
     if len(runs) != 1:
         raise Unread("plan %s names no planning run filed with the owner's key" % plan)
     run_node = _issue(cfg, runs[0])
-    ideas = [i for i in (bridge_config.run_idea(run_node, owner) for owner in pcfg["owner_user_ids"])
-             if i]
+    # KIT-705: on our own runner's lane the receipt names the idea itself (receipt_idea).
+    ideas = sorted(set(i for i in (bridge_config.receipt_idea(run_node, owner)
+                                   for owner in pcfg["owner_user_ids"]) if i))
     if len(ideas) != 1:
         raise Unread("the planning run of %s names no idea" % plan)
     return _issue(cfg, ideas[0])
@@ -914,6 +916,16 @@ def selftest():
                     if fact in d[part]:
                         return d[part][fact]
                 return d.get(fact)
+            # KIT-705: on our own runner's lane the executor is pinned to the idea, so the plan's
+            # receipt names the idea itself, with no planning ticket between them.
+            runner_plan = dict(PLAN, description=PLAN["description"].replace(
+                "Plan id: TOD-5/", "Plan id: TOD-4/"))
+            got_r = facts_with(tickets_over={"TOD-13": issue(
+                "TOD-13", labels=(), parent=runner_plan, description="Change `src/a.py`.")})
+            check("a plan whose receipt names the idea itself reads back to that idea, and its "
+                  "origin is judged on it (KIT-705)",
+                  (got_r["ticket"], got_r["plan"], got_r["idea"], got_r["limits"]["origin"],
+                   got_r["unread"]), ("TOD-13", "TOD-10", "TOD-4", "owner", {}))
             bad_hold = put("watcher/bad-hold.json", "{ not a hold")
             # Each limits fact's own reason when it is unread: the limits name what they could not tell.
             UNKNOWN = {"origin": "provenance-unknown", "paths": "paths-unknown",
@@ -951,6 +963,15 @@ def selftest():
                         "TOD-5": stage_e.BounceError("down")}}, "origin"),
                     ("a planning run read with a timeout", {"tickets_over": {
                         "TOD-5": TimeoutError("timed out")}}, "origin"),
+                    # Stage E on #644: a planning ticket that lost its trigger line is no run of
+                    # the planner's, and never reads as the owner's idea (KIT-705), even with
+                    # every mark an idea of his carries.
+                    ("a planning run whose trigger line was edited away", {"tickets_over": {
+                        "TOD-5": dict(run_ticket, labels={"nodes": [{"name": "provenance:human"}]},
+                                      description="\n".join(
+                                          ln for ln in run_ticket["description"].splitlines()
+                                          if not ln.startswith("Planning-run trigger:")))}},
+                     "origin"),
                     ("a ticket under a plan the idea gate did not file", {"tickets_over": {
                         "TOD-13": issue("TOD-13", labels=(), parent=dict(PLAN, labels={"nodes": []}))}},
                      "origin"),

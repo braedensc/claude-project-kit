@@ -57,7 +57,9 @@ THE CONFIG.  The queue's one file (see scripts/pipeline_queue_read.py): the read
 `order` and `reader`, `window` is pipeline_window's, and the usage file is the one the `morning`
 section names. The ledger is the reader's `reader.ledger_file`, so both read the same file.
 
-WHERE IT CANNOT HELP.  It starts nothing itself: the bridge's delegation is part 3b. Lanes keep no
+WHERE IT CANNOT HELP.  It starts nothing itself: the bridge does, by delegation (part 3b), or on a
+project that codes on our own runner by a code request the runner judges with this queue's own reader
+and pool (KIT-645), whose refusal ends the bridge's pass loud. Lanes keep no
 footprint between passes yet, so a repository runs one lane unless its merge gate is ready: the
 safe side. The preview reads, prints counts, ids and words, and writes nothing.
 """

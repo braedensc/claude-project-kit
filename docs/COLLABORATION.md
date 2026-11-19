@@ -595,8 +595,10 @@ Stop hook between them:
      root still counts, but the role account can rename its folders), and with it the
      tracker guards apply as for a pinned `ticket` session, its own ticket read from
      the name of the session's worktree folder, or its parent (KIT-241). A marker the
-     hook cannot check for counts as there, and with a marker no pin is read: none is
-     written for that account, so one found there was forged. `~` in the pins root is
+     hook cannot check for counts as there. With a marker a pin can only add rules: our
+     own runner's pin for the workspace's own ticket adds grader paths and the ticket
+     branch beside the lane's (KIT-645), and any other pin there binds nothing, since the
+     pins root is that account's to write. `~` in the pins root is
      the account's home from the account database, never `$HOME`, for the pin as
      for the marker; and moving `delivery.json` out of the working tree leaves the pipeline on while
      a commit still holds it. An
