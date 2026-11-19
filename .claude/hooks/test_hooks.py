@@ -2576,6 +2576,83 @@ def main():
         ("gh pr merge blocked", bash("gh pr merge 7 --squash"), BLOCK, HOOK),
         ("gh pr merge --auto blocked", bash("gh pr merge --auto --squash"), BLOCK, HOOK),
         ("gh pr merge --disable-auto allowed", bash("gh pr merge 7 --disable-auto"), ALLOW, HOOK),
+        # KIT-897: the same merge sent straight to the API. A session that can push can
+        # merge a green PR in one call, because branch protection decides WHAT may merge,
+        # not WHO merges it. Blocked in the spellings the self-approval guard handles for
+        # a review: `gh api` (REST and GraphQL), `curl`, a chained command. Every READ of
+        # a PR, its checks and its merge state stays allowed.
+        ("API merge: gh api -X PUT /pulls/N/merge blocked",
+         bash("gh api -X PUT repos/o/r/pulls/7/merge"), BLOCK, HOOK),
+        ("API merge: gh api --method PUT with a field blocked",
+         bash("gh api --method PUT repos/o/r/pulls/7/merge -f merge_method=squash"),
+         BLOCK, HOOK),
+        ("API merge: --method=PUT after the path blocked",
+         bash("gh api repos/o/r/pulls/7/merge --method=PUT"), BLOCK, HOOK),
+        ("API merge: -XPUT (value attached) blocked",
+         bash("gh api -XPUT repos/o/r/pulls/7/merge"), BLOCK, HOOK),
+        ("API merge: a flag cluster ending in X, a $N number and an --input body blocked",
+         bash("gh api -iX PUT repos/o/r/pulls/$N/merge --input body.json"), BLOCK, HOOK),
+        # A method the hook cannot read on the merge endpoint fails CLOSED, as an
+        # approval whose event hides in a file does.
+        ("API merge: a method held in a variable fails closed",
+         bash('gh api -X "$M" repos/o/r/pulls/7/merge'), BLOCK, HOOK),
+        ("API merge: GraphQL mergePullRequest blocked",
+         bash("gh api graphql -f query='mutation { mergePullRequest(input: "
+              '{pullRequestId: "x"}) { clientMutationId } }\''), BLOCK, HOOK),
+        ("API merge: GraphQL enablePullRequestAutoMerge blocked (auto-merge is a merge)",
+         bash("gh api graphql -f query='mutation($id: ID!) { enablePullRequestAutoMerge("
+              "input: {pullRequestId: $id, mergeMethod: SQUASH}) { clientMutationId } }' "
+              "-f id=x"), BLOCK, HOOK),
+        ("API merge: GraphQL enqueuePullRequest blocked (a merge queue merges it)",
+         bash("gh api graphql -f query='mutation { enqueuePullRequest(input: "
+              '{pullRequestId: "x"}) { clientMutationId } }\''), BLOCK, HOOK),
+        # api.github.com is on the EGRESS allowlist, so nothing else in the hook stops
+        # a hand-rolled curl at the merge endpoint.
+        ("API merge: curl -X PUT to the merge endpoint blocked",
+         bash('curl -X PUT -H "Authorization: bearer $T" '
+              "https://api.github.com/repos/o/r/pulls/7/merge "
+              "-d '{\"merge_method\":\"squash\"}'"), BLOCK, HOOK),
+        ("API merge: curl --request PUT blocked",
+         bash("curl --request PUT https://api.github.com/repos/o/r/pulls/7/merge"),
+         BLOCK, HOOK),
+        ("API merge: curl -sT blocked (an upload is a PUT, with no method flag)",
+         bash("curl -sT body.json https://api.github.com/repos/o/r/pulls/7/merge"),
+         BLOCK, HOOK),
+        ("API merge: curl POST of a GraphQL mergePullRequest blocked",
+         bash("curl -X POST https://api.github.com/graphql -d '{\"query\":\"mutation { "
+              'mergePullRequest(input: {pullRequestId: \\"x\\"}) { clientMutationId } }"}\''),
+         BLOCK, HOOK),
+        ("API merge: in a CHAINED command still blocked",
+         bash("git push && gh api -X PUT repos/o/r/pulls/7/merge"), BLOCK, HOOK),
+        # allow: every read of a PR, its checks and its merge state.
+        ("API read: GET of a PR allowed", bash("gh api repos/o/r/pulls/7"), ALLOW, HOOK),
+        ("API read: GET of the merge endpoint (has it merged?) allowed",
+         bash("gh api repos/o/r/pulls/7/merge"), ALLOW, HOOK),
+        ("API read: an explicit -X GET of the merge endpoint allowed",
+         bash("gh api -X GET repos/o/r/pulls/7/merge"), ALLOW, HOOK),
+        ("API read: curl GET of the merge endpoint allowed",
+         bash('curl -sf -H "Authorization: bearer $T" '
+              "https://api.github.com/repos/o/r/pulls/7/merge"), ALLOW, HOOK),
+        ("API read: a commit's check runs allowed",
+         bash("gh api repos/o/r/commits/abc123/check-runs --jq '.check_runs[].conclusion'"),
+         ALLOW, HOOK),
+        ("API read: gh pr checks allowed", bash("gh pr checks 7"), ALLOW, HOOK),
+        ("API read: a GraphQL query of the merge state allowed",
+         bash("gh api graphql -f query='query { repository(owner: \"o\", name: \"r\") { "
+              "pullRequest(number: 7) { mergeable mergeStateStatus autoMergeRequest "
+              "{ enabledAt } } } }'"), ALLOW, HOOK),
+        ("API read: gh pr view --json mergeable,mergeStateStatus allowed",
+         bash("gh pr view 7 --json mergeable,mergeStateStatus,mergedAt,autoMergeRequest"),
+         ALLOW, HOOK),
+        # allow: undoing an auto-merge, a PR write that is not the merge, and naming a
+        # merge mutation without sending one.
+        ("API: GraphQL disablePullRequestAutoMerge allowed (as --disable-auto is)",
+         bash("gh api graphql -f query='mutation { disablePullRequestAutoMerge(input: "
+              '{pullRequestId: "x"}) { clientMutationId } }\''), ALLOW, HOOK),
+        ("API: PUT /pulls/N/update-branch allowed (updating a branch is not merging it)",
+         bash("gh api -X PUT repos/o/r/pulls/7/update-branch"), ALLOW, HOOK),
+        ("API: a grep for a merge mutation's name allowed (naming is not sending)",
+         bash("grep -rn enablePullRequestAutoMerge scripts/"), ALLOW, HOOK),
 
         # ── self-approval guard: an approval is a SECOND pair of eyes ─────────
         # A session holds Bash and a working `gh` credential, so approving its own
@@ -3718,6 +3795,27 @@ def main():
          bash("gh pr review 7 --approve"), "`--comment` review is still allowed", HOOK),
         ("stderr reason: the bare-review block names the event as the reason",
          bash("gh pr review 7"), "interactive prompt", HOOK),
+        # KIT-897: an API merge is refused by the never-merge guard, in words that say
+        # why, route the merge to the human and say which reads stay free.
+        ("stderr reason: an API merge block is the never-merge guard's",
+         bash("gh api -X PUT repos/o/r/pulls/7/merge"),
+         "merging PRs is the human's action only", HOOK),
+        ("stderr reason: a REST merge block says the write is the merge itself",
+         bash("curl -X PUT https://api.github.com/repos/o/r/pulls/7/merge"),
+         "is the merge itself", HOOK),
+        ("stderr reason: an unreadable method on the merge endpoint is the reason",
+         bash('gh api -X "$M" repos/o/r/pulls/7/merge'),
+         "a method this hook cannot read", HOOK),
+        ("stderr reason: a GraphQL merge block names what the mutation does",
+         bash("gh api graphql -f query='mutation { enablePullRequestAutoMerge(input: "
+              '{pullRequestId: "x"}) { clientMutationId } }\''),
+         "switches on its auto-merge", HOOK),
+        ("stderr reason: an API merge block routes the merge to the human",
+         bash("gh api -X PUT repos/o/r/pulls/7/merge"),
+         "print the command for the human", HOOK),
+        ("stderr reason: an API merge block says reads stay allowed",
+         bash("gh api -X PUT repos/o/r/pulls/7/merge"),
+         "its checks and its merge state through the API stays allowed", HOOK),
         # KIT-107: the marker-scrub block names the marker, says what the refusal it
         # walks around protects, and says to stop and report rather than respell.
         ("stderr reason: the marker-scrub block names the marker it saw removed",
