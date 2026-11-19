@@ -535,6 +535,18 @@ except BaseException:
 os.chmod(path, 0o600)
 print("wrote %s (%d characters, mode 600)" % (path, len(token)))
 '''
+# The installed settings' `session_tools.key_file`, as typed, or nothing: what the runner reads the writer's key
+# from. Run as the role account; the key file's own text is never touched.
+SETTINGS_KEY_PY = r'''
+import json, os, sys
+try:
+    with open(os.path.expanduser(sys.argv[1])) as fh:
+        st = json.load(fh).get("session_tools")
+    held = st.get("key_file") if isinstance(st, dict) else None
+    print(held if isinstance(held, str) else "")
+except (OSError, ValueError, AttributeError):
+    print("")
+'''
 TOKEN_STATE_WORDS = {
     "link": "is a link, which the runner never reads",
     "not-file": "is not a regular file",
@@ -567,6 +579,14 @@ def key_spec(name):
             "make": "Make a tracker API key for the user named in `session_tools.writer_user_id` first (never an "
                     "owner), with an end date if the tracker lets you set one.",
             "kinds": list(session_tools.STAGES)}
+
+
+def installed_key_file(run, conf):
+    """The `session_tools.key_file` the role account's installed settings name, or None. A read that fails is
+    None too: the conf's path is then used, which `check` will say is not the runner's if it differs."""
+    res = run.as_role(conf["ROLE_ACCOUNT"], py(SETTINGS_KEY_PY, conf["RUNNER_DIR"].rstrip("/") + "/runner.json"))
+    word = (res.out or "").strip()
+    return word if res.ok and word and "\n" not in word and path_ok(word) else None
 
 
 def py(program, *args):
@@ -661,7 +681,7 @@ def step_key(name, ctx, apply_it):
     if days < 0:
         raise SetupError("the %s ended on %s (%d day%s ago): make a new one and run `%s`"
                          % (label, when.isoformat(), -days, "" if days == -1 else "s", name))
-    return True, "%s is present, the role account's own, mode 0600, and ends on %s (in %d day%s); the health watch " \
+    return True, "%s is present, the role account's own and closed to group and others, and ends on %s (in %d day%s); the health watch " \
                  "warns %d days ahead" % (path, when.isoformat(), days, "" if days == 1 else "s", warn)
 
 
@@ -866,7 +886,8 @@ def cmd_key(name, args, env, machine=None, reader=None, date_reader=None, tty=No
     spec, today = key_spec(name), today or _today()
     label, path = spec["label"], spec["path"](conf, {})
     say("The %s: written to %s as %s, mode 0600, and its end date recorded for the health watch."
-        % (label, path, conf["ROLE_ACCOUNT"]))
+        % (label, path + (" (or the key file your installed settings name)" if name == "writer-key" and
+                          conf.get("WRITER_KEY_UNSET") else ""), conf["ROLE_ACCOUNT"]))
     say(spec["make"])
     value = ((reader or getpass.getpass)(spec["prompt"]) or "").strip()
     if not spec["pattern"].match(value):
@@ -886,6 +907,8 @@ def cmd_key(name, args, env, machine=None, reader=None, date_reader=None, tty=No
         say("NOT WRITTEN: no administrator access. Run this again.")
         return EX_NOPRIV
     run.dry_run = False
+    if name == "writer-key" and conf.get("WRITER_KEY_UNSET"):       # the file the runner will read, as `check` does
+        path = spec["path"](conf, {"session_tools": {"key_file": installed_key_file(run, conf)}})
     res = run.as_role(conf["ROLE_ACCOUNT"], py(TOKEN_WRITE_PY, path, spec["pattern"].pattern, spec["shape"]),
                       stdin=value + "\n", why="write the %s into %s" % (label, path), secret_stdin=True)
     for line in (res.out or "").splitlines():
@@ -1766,7 +1789,7 @@ def _cases(check, tmp):  # noqa: C901  (one battery, read top to bottom)
             lane = row(lanes={"code": True})
             return ((absent[0], "yet: run `%s`" % cmd in absent[1]),
                     (nodate[0], "no end date on record" in nodate[1]),
-                    (ok[0], "present, the role account's own, mode 0600, and ends on %s (in 200 days)" % ON(200) in ok[1]),
+                    (ok[0], "present, the role account's own and closed to group and others, and ends on %s (in 200 days)" % ON(200) in ok[1]),
                     (ended[0], "ended on" in ended[1]), (loose[0], "mode 0600" in loose[1]),
                     (nowatch[0], "could not be read" in nowatch[1]), lane[0],
                     KEY in repr((absent, nodate, ok, ended, loose, lane)), [x[2] for x in (absent, nodate, ok)])
@@ -1811,6 +1834,22 @@ def _cases(check, tmp):  # noqa: C901  (one battery, read top to bottom)
          ("~/.config/wk", ALREADY_DONE, True, [True] * 8, "~/.pipeline-runner/writer-key"),
          ("the installed path overwritten", [(me, "writer_path", lambda c, was: c["WRITER_KEY_FILE"])]),
          ("the path rules dropped", [(me, "path_problems", lambda c, home, skip=(): [])]))
+
+    def writer_step_path():
+        fake = world()
+        go(fake, "apply")
+        edit_settings(fake, lambda d: d.update(session_tools={"key_file": "~/.config/wk", "writer_user_id": "w-1"}))
+        code, words, asked, sudo_asked = step(fake, token=KEY, date=ON(300), cmd="writer-key")
+        there = lambda leaf: os.path.exists(fake.home + "/" + leaf)             # noqa: E731
+        fresh = world()
+        go(fresh, "apply")
+        step(fresh, token=KEY, date=ON(300), cmd="writer-key")
+        return (code, there(".config/wk"), there(".pipeline-runner/writer-key"), sudo_asked,
+                os.path.exists(fresh.home + "/.pipeline-runner/writer-key"))
+    case("writer-key: with WRITER_KEY_FILE unset the step writes the key file the installed settings name, the one "
+         "`check` and the runner read; with none installed, the default", writer_step_path,
+         (0, True, False, 1, True),
+         ("the installed file ignored", [(me, "installed_key_file", lambda run, conf: None)]))
 
     def keys_warn():
         fake = world()

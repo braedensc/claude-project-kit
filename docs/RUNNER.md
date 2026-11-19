@@ -480,7 +480,7 @@ others can read and a link are FAILED. No file yet is no fault, except the write
 fix or conflict lane is on. The installer does not choose which tracker user the writer is: that is
 `session_tools.writer_user_id`, yours.
 
-Good: `check` says `writer-key` is present, the role account's own, mode 0600, and ends in 200 days.
+Good: `check` says `writer-key` is present, the role account's own and closed to group and others, and ends in 200 days.
 Not: a key file that others can read. The row fails and says the mode, and the runner will not read it.
 
 ## The coding lane
