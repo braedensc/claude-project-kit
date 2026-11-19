@@ -457,6 +457,9 @@ REQUIRED_SCRIPTS = ("pipeline_review_poller.py", "pipeline_bounce_local.py",
                     "pipeline_spend_ledger.py",
                     # The one lock a pass of the review poller and the bounce driver takes (KIT-681).
                     "pipeline_pass_lock.py",
+                    # A review's fixed words, which the review poller and the runner's review runs
+                    # share (KIT-644).
+                    "pipeline_review_brief.py",
                     # Their `--selftest` runs inside one run folder it removes (KIT-450).
                     "scratch_run.py")
 

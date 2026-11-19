@@ -11,7 +11,10 @@ Each file says what a session of that kind is given and what walls it runs behin
     branch        {type, word}: the workspace's branch (word "title" is the ticket title's slug);
                   null for a kind that is only ever a resume, which keeps its run's branch
     approval      {newest_move, states}: the owner's newest move must be the approval, or any
-                  of his moves; and which of the project's approval_states lists counts
+                  of his moves; and which of the project's approval_states lists counts. Or
+                  {from_run: code}, for a kind that follows the coding it judges: it is let start
+                  by the approval the runner recorded when it started that ticket's code run
+                  (KIT-644, the review kind), and by nothing else
     brief         the fixed words the session is told first
     permissions   "deny-unlisted": anything no allow rule covers is refused, never asked.
                   It is the only value there is: no kind can say "skip every check"
@@ -130,9 +133,13 @@ def problems(doc, name):
     elif kind not in store.STARTS:
         say("branch: a kind that is only ever a resume keeps its run's branch, so it has none")
     ap = doc["approval"]
-    if not (isinstance(ap, dict) and sorted(ap) == ["newest_move", "states"]
-            and isinstance(ap["newest_move"], bool) and ap["states"] in store.STARTS):
-        say("approval: {newest_move: true or false, states: one of %s}" % ", ".join(store.STARTS))
+    by_states = (isinstance(ap, dict) and sorted(ap) == ["newest_move", "states"]
+                 and isinstance(ap["newest_move"], bool) and ap["states"] in store.STARTS)
+    by_run = (isinstance(ap, dict) and sorted(ap) == ["from_run"] and ap["from_run"] == "code"
+              and kind in store.STARTS and kind != "code")
+    if not (by_states or by_run):
+        say("approval: {newest_move: true or false, states: one of %s}, or {from_run: code} for a "
+            "starting kind that follows a code run" % ", ".join(store.STARTS))
     if doc["permissions"] not in PERMISSIONS:
         say("permissions: must be deny-unlisted; no kind may skip the checks")
     tools = doc["tools"]
@@ -353,6 +360,27 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
     expect("…and none is in the planner's fence",
            [t for t in kinds["plan"]["tools"] if t in _read_tuple(stage_a, "DISALLOWED_BUILTINS")], [])
 
+    # KIT-644: a review is let start by the approval its ticket's code run recorded, and the
+    # review kind's brief speaks of the facts it is given, not of a ticket it is not given.
+    expect("the review kind is approved by its ticket's code run, by nothing of its own",
+           kinds["review"]["approval"], {"from_run": "code"})
+    expect("...and every other kind by the owner's moves",
+           sorted(k for k, d in kinds.items() if "states" in d["approval"]),
+           sorted(k for k in kinds if k != "review"))
+    expect("the review kind's brief names its facts, not a ticket", ("facts" in kinds["review"]["brief"],
+           "ticket describes" in kinds["review"]["brief"]), (True, False))
+    approved = dict(kinds["review"])
+    for what, value in (("the code kind itself", ("code", {"from_run": "code"})),
+                        ("a run of another kind", ("review", {"from_run": "plan"})),
+                        ("both shapes at once", ("review", {"from_run": "code", "states": "code"})),
+                        ("a kind that is only a resume", ("fix", {"from_run": "code"}))):
+        name, ap = value
+        doc = dict(kinds[name], approval=ap)
+        expect("refused: an approval from a run for %s" % what, problems(doc, name)[:1],
+               ["%s: approval: {newest_move: true or false, states: one of %s}, or {from_run: code} "
+                "for a starting kind that follows a code run" % (name, ", ".join(store.STARTS))])
+    expect("the review kind as shipped loads", problems(approved, "review"), [])
+
     # Each refusal, one change at a time from a good kind.
     good = kinds["code"]
     for what, change, want in (
@@ -381,7 +409,8 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
             ("an environment name in lower case", {"env": good["env"] + ["path"]},
              "code: env: a list of distinct variable names"),
             ("an approval no list counts", {"approval": {"newest_move": True, "states": "fix"}},
-             "code: approval: {newest_move: true or false, states: one of code, review, plan, acceptance}"),
+             "code: approval: {newest_move: true or false, states: one of code, review, plan, "
+             "acceptance}, or {from_run: code} for a starting kind that follows a code run"),
             ("a starting kind with no branch", {"branch": None}, "code: branch: a kind that starts needs one")):
         doc = copy.deepcopy(good)
         doc.update(change)

@@ -3355,7 +3355,7 @@ One JSON file, written whole by `ask()`, mode 0600.
 | Field | Type | Notes |
 | --- | --- | --- |
 | `schema` | `"pipeline-runner-request/1"` | Anything else is refused. |
-| `id` | `rq-` and 32 hex characters | Made by `ask()`. |
+| `id` | `rq-` and 32 hex characters | Made by `ask()`, or one its caller chose and recorded before asking (KIT-644). An id already waiting or answered is refused, so one request is never asked twice. |
 | `at` | time, UTC, to the second | Stamped by `ask()`, never by the caller. |
 | `caller` | `queue` \| `review` \| `planner` \| `fix-driver` \| `acceptance` | The job that asks. |
 | `action` | `start` \| `resume` \| `stop` | |
@@ -3363,7 +3363,8 @@ One JSON file, written whole by `ask()`, mode 0600.
 | `project` | a key of the runner's `projects` | Which repository. |
 | `ticket` | ticket id | The ticket the session is for. |
 | `run` | `run-` and 32 hex characters, or null | The run to resume or stop. Null for a start. |
-| `text` | text of 1 to 20000 characters, or null | A resume's words, or a start's facts, written by the caller's own code (KIT-858). A resume must carry it, a start may, and a stop never does. |
+| `text` | text of 1 to 20000 characters, or null | A resume's words, or a start's facts, written by the caller's own code (KIT-858). A resume must carry it, a start may, and a stop never does. A review's start must carry it, up to 150000: its facts hold the diff (KIT-644). |
+| `tier` | `standard` \| `guarded`; absent for any other request | A review's start must say it (KIT-644): `guarded` is a change to a guarded path, which runs on the runner's `guarded_model` (KIT-418). |
 
 **Who may ask, each for its own kinds.**
 
@@ -3376,12 +3377,21 @@ One JSON file, written whole by `ask()`, mode 0600.
 | `acceptance`, the acceptance job | `acceptance` | |
 
 A caller may start, resume and stop only its own kinds. A `fix` or `conflict` is never a start.
+A request is written as UTF-8, not ASCII escapes, so the largest review's request still fits the
+store's 1 MiB document limit. A caller may withdraw its own request while it still waits
+(`withdraw()`). The runner holds a lock on a request's file while it judges and answers it, and a
+withdrawal takes the same lock without waiting: it lands before the runner comes to the request,
+which then gets no answer, or it is refused, and the caller reads the run.
 
 **The caller's word is not the authority.** Before anything starts, the runner reads the ticket and
 its whole history from the tracker. It needs the owner's own move into one of the kind's approved
 states: the newest move for a `code` or `plan` start, any move for the kinds that follow an approved
 ticket. A ticket the owner made in such a state, with no move recorded, counts as his move. The old
-dispatcher's own user never approves. A history that cannot be read whole approves nothing.
+dispatcher's own user never approves. A history that cannot be read whole approves nothing. **A
+review follows the coding it judges (KIT-644).** Its kind's data says `approval: {from_run: code}`:
+it is let start only by the approval the runner recorded when it started the ticket's newest code
+run, one started by the owner's move or creation, while its approver is still the owner. Its record
+says `how: code-run`. A ticket coded on the old dispatcher has no such run, so its review is refused.
 
 **Who asked is reporting.** Under one account any process that can write the store can name any
 caller, so `caller` narrows what a request may ask and nothing more. What keeps a session from
@@ -3392,7 +3402,9 @@ text, whoever wrote it, reaches the session only fenced as data.
 "ok", "run", "why"}}`. A request the runner cannot judge now waits, and is not answered: the tracker
 did not answer, git could not fetch, or the watcher's hold (§20) is set. Everything else is answered
 `ok: false` with the reason in words. A start refused after its workspace was made removes the
-workspace and its branch. Off (`enabled` false), the runner takes no request and resumes nothing.
+workspace and its branch. A stop follows the run it names on through the runner's own resumes of
+it: their newest run is stopped, and a resume still to come is called off, its record saying
+`auto_resume: refused` (KIT-644). It never reaches a run that a caller asked for. Off (`enabled` false), the runner takes no request and resumes nothing.
 
 **Each project's lanes (KIT-866).** A project's `lanes` say, for each kind, whether the runner takes
 it for that project. Absent is off. A start or resume for a lane that is off, the runner's own
@@ -3421,7 +3433,7 @@ removed, and the start is refused. A code run's workspace is never removed this 
 | `kind`, `project`, `ticket` | as in the request | |
 | `resumes` | run id, or null | The run this one resumed, or carries on afresh. |
 | `started_for` | `request` \| `interrupted` \| `session-gone` | `session-gone`: the fresh start after a resume found its session gone. |
-| `approved_by`, `approved_at`, `how` | user id; time or null; `move` \| `creation` \| `resumed-run` \| `fresh-session` | Who approved, as the check found it. |
+| `approved_by`, `approved_at`, `how` | user id; time or null; `move` \| `creation` \| `resumed-run` \| `fresh-session` \| `code-run` | Who approved, as the check found it. `code-run`: a review, by its ticket's code run's approval (KIT-644). |
 | `session_id` | UUID | Given to the program at the start, kept by a resume. A fresh start gets a new one. |
 | `gone_session` | UUID, or null | The session a fresh start could not resume. Set on a fresh start, and only there. |
 | `workspace`, `branch` | absolute path; branch name | `<work_dir>/<kind>/<TICKET>`, on one fixed pattern. |
@@ -3485,16 +3497,19 @@ list (§13). The usage job reads the runs through it when its config names the s
 
 **A run's final message (KIT-858).** When a run ends, and before its record says so, the runner keeps
 the final message the program reported in `<store>/outputs/<run>.json`: `{"schema":
-"pipeline-runner-output/1", "run", "at", "is_error", "subtype", "text", "cut"}`. `text` is the
-message's last 150,000 characters, or null when the program's result carried none, and `cut` says it
-was longer. The runner reads the program's result line whole up to 8 MiB; a longer one counts as no
+"pipeline-runner-output/1", "run", "at", "is_error", "subtype", "text", "cut", "model", "tokens"}`.
+`text` is the message's last 150,000 characters, or null when the program's result carried none, and
+`cut` says it was longer. `model` is the model the run billed most and `tokens` its token count, each
+null when the result did not say (KIT-644). The runner reads the program's result line whole up to 8 MiB; a longer one counts as no
 result. A run that left no result at all has no file. The runner alone writes it, outside the
 run's folder. The caller that asked for the run reads it with `run_output()`: the document, `None`
 when there is none, or an error when one is there and cannot be read (§13). The text is the
 session's own words: data for its caller, checked by the caller's own rules, never part of the record.
 
-**Fields only.** No ticket text is in a request or a record. A start's or a resume's `text` reaches
-the session fenced as data. Each run's own folder also holds its command's inputs, the program's
+**Fields only.** No ticket text is in a request's fields or a record, but its `text`. A start's or a
+resume's `text` reaches the session fenced as data. A review's reaches it line by line, inside a tag
+whose end carries a mark the text does not hold, and with no read of the ticket beside it: the
+review's instructions are its run's rules, from the kit (KIT-644). Each run's own folder also holds its command's inputs, the program's
 output and its exit. Those are the run's. Only the runner reads them, except the run's own tool server, which
 reads its run file and keeps its counts there (below).
 

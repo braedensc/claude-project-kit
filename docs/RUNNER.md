@@ -13,9 +13,12 @@ The formats it reads and writes: `docs/PIPELINE-CONTRACT.md` section 28, and sec
 - **No lane uses it yet.** Each lane moves later, one at a time, on the owner's yes, a drill repository first.
 - **Its installer puts it in place with every lane off** for every project. See "Installing it".
 - **No real session goes through it yet.** Its selftest runs it against a stand-in program.
+- **The review lane is built (KIT-644).** The review job asks for a review run of a project whose
+  `review` lane is on, and files no review ticket. No project's is on yet.
 
-A lane runs through the runner only when both switches are on: the caller's own (the job that asks)
-and the runner's lane for that project. Either one off is the way back.
+A lane runs through the runner only when the runner's lane for that project is on, and the caller's
+own switch too where the caller keeps one. Either one off is the way back. The review job keeps
+none: the runner's `lanes.review` is the review lane's one switch.
 
 **Its runs count against the day and the week** once `RUNNER_STORE` in `queue.conf` names its
 `store_dir` (KIT-860). The usage job reads every run record through the store's one reader, beside
@@ -39,7 +42,11 @@ Each pass, every few seconds:
    *interrupted*, and is resumed once. A lock only the wrapper holds says a run is alive; the
    session never gets it, so it cannot fake its own end.
 2. **Answers each waiting request, oldest first.** It starts, resumes or stops a session, or refuses
-   with a reason. A request it cannot judge now waits for a later pass.
+   with a reason. A request it cannot judge now waits for a later pass. It holds a lock on each
+   request while it judges and answers it, so its caller cannot withdraw it meanwhile: a request
+   withdrawn before the runner came to it is skipped, and gets no answer (KIT-644). A stop follows
+   the run it names on through the runner's own resumes of it: their newest run is stopped, and a
+   resume still to come is called off.
 
 **A resume whose session is gone starts afresh, once.** The program may no longer have the
 conversation a resume names. Then the runner starts one new session in the same workspace, given
@@ -59,13 +66,19 @@ characters, marked `cut` when the message was longer. The runner reads the progr
 whole up to 8 MiB; a longer one counts as no result. The caller reads it with `run_output()` once
 the run's record says it ended. `None` means the run left no result at all. A result that carried
 no message is kept as one with none, never as an empty message. The message is the session's own
-words: data for its caller, never part of the run's record.
+words: data for its caller, never part of the run's record. Beside it the runner keeps the model the
+run billed most and its token count, each none when the result did not say (KIT-644): a review's
+comment names them.
 
 Before it starts anything, it checks the request against the tracker:
 
 - The ticket's whole history must show the owner's own move into an approved state for that kind.
 - The newest move counts for a code or plan start. Any of his moves counts for the kinds that follow.
 - The old dispatcher's own user never approves. A history it cannot read whole approves nothing.
+- **A review follows its ticket's code run (KIT-644).** It is let start only by the approval this
+  runner recorded when it started that ticket's code run: the newest one started by the owner's move
+  or creation, while its approver is still the owner. Its record says `how: code-run`. A ticket
+  coded on the old dispatcher has no such run, so its review is refused, in those words.
 
 Good: the owner moved ENG-12 to Todo. The queue asks for a code session. It starts.
 Not: someone else moved ENG-12 to Todo. The request is refused, and says why.
@@ -156,6 +169,8 @@ loader refuses it:
 - **An environment name the adapter has no source for,** so no API key, proxy or address can pass.
 - **A review tool outside the reviewer's read-only set.** The selftest checks the review kind
   against the same allow list the old lane's probe uses, and the plan kind against the planner's.
+- **An approval from a run, for any kind but one that follows the coding it judges.** The review
+  kind says `approval: {from_run: code}`. Every other kind is approved by the owner's moves.
 
 The files sit behind the `hooks-change` label: a change to one changes what a session may reach.
 
@@ -175,6 +190,12 @@ Not: the runner starts sessions behind the old walls until some script changes t
 - **Nothing from its workspace.** No settings, hooks, tool servers or `CLAUDE.md` load from it.
 - **The project's instructions,** read from its default branch by the runner, handed in as a file.
 - **The ticket,** as the runner read it, fenced as data. A resume's text is fenced the same way.
+- **A review: its facts and its instructions, and no ticket (KIT-644).** The review job resolved the
+  basis it judges against, and the ticket may have been edited since, so no read of it is given.
+  The prompt holds the review's facts, the request's text, line by line, so a finding can cite a
+  diff line. The closing tag carries a mark the text does not hold, and a forged one is escaped.
+  The rules hold the review's instructions, from `scripts/pipeline_review_brief.py`, the same words
+  the old lane's review ticket uses. A change to a guarded path runs on `guarded_model`.
 - **Its kind's tools, each file tool by the workspace's path.** None is allowed by its bare name.
 - **Deny rules** for the runner's store, the pins and the tracker key, for every file tool. In the
   sessions' shared home, no file tool may write anywhere, and none may read the program's own state
@@ -342,7 +363,8 @@ One JSON file, which the installer writes from `runner.conf` (see "Installing it
 | `work_dir` | Where workspaces go. | required |
 | `session_home` | The sessions' own home folder. Holds nothing of the account's setup. | required |
 | `claude_bin` | The program's full path: 2.1.259 or later, because the command line uses `--permission-prompts`. A copy the sessions' account cannot change, never that account's own. | required |
-| `model` | The model for every session. | `sonnet` |
+| `model` | The model for every session, but a guarded review. | `sonnet` |
+| `guarded_model` | The model for a review whose request says `guarded`: a change to a guarded path (KIT-418, KIT-644). | `opus` |
 | `token_env` | The NAME of the variable that holds the sign-in token. | `CLAUDE_WRITER_OAUTH_TOKEN` |
 | `linear_key_file` | The tracker key, in a file of this account's, mode 0600. | required |
 | `owner_user_ids` | The owner's tracker user ids. Only his moves approve. | required |
@@ -350,6 +372,7 @@ One JSON file, which the installer writes from `runner.conf` (see "Installing it
 | `poll_seconds` | Time between passes. | `5` |
 | `stop_grace_seconds` | After a stop, how long before the session is killed. | `30` |
 | `max_starts_per_ticket` | A runaway's limit on starts of one ticket and kind. | `20` |
+| `max_review_starts_per_ticket` | The same limit for reviews: above a full loop of parts and re-reviews (KIT-644). | `100` |
 | `hold` | The watcher's hold file (contract section 20). Set, nothing starts. | none |
 | `limits` | `wall_minutes`, `memory_mb`, `disk_mb`, `check_seconds` (how often trees and folders are measured) and `room` (the floor). See "Its limits". | above |
 | `session_tools` | `key_file`, the session writer's tracker key, and `writer_user_id`, the user it must belong to, never an owner. See "The session's own tracker tools". Absent, no session gets tracker tools. | none |
@@ -362,7 +385,8 @@ The four folders must not sit inside one another.
 `lanes`. The runner refuses a start or resume for a lane that is off, before it makes or reads
 anything, and says so in the request's answer. Its own resume of an interrupted run on such a lane
 is refused too, and the run's record says `auto_resume: refused`. A stop is always taken. A lane that
-is on needs its approved states in `approval_states`: `fix` and `conflict` use the `code` states.
+is on needs its approved states in `approval_states`: `fix` and `conflict` use the `code` states,
+and `review` needs none, since it follows its code run.
 `enabled` stays the runner's own switch: off, it takes nothing, whatever the lanes say.
 
 Good: `"lanes": {"review": true}` for the drill repository. Only reviews of it go through the runner.
@@ -447,6 +471,8 @@ Each refusal says why, in the request's answer (`<store_dir>/taken/<id>.json`).
 | It says | What to do |
 | --- | --- |
 | the ticket's newest move was not the owner's | The owner moves the ticket himself. |
+| `<ticket>` was not coded by a code run of this runner's | The ticket's coding ran on the old dispatcher, so no approval is recorded for its review. Review it by hand, or move its project's coding to the runner first. |
+| a review's start says its tier | The review job's request said neither `standard` nor `guarded`: a fault in that job. |
 | a workspace is there already | For a code start: the ticket's earlier code run keeps its workspace for its fixes, so remove it before a new start. For a review, plan or acceptance start: no run of the runner's left that folder, so it is never removed for you. Look at what it is first. |
 | an earlier run is still going or is to be resumed | Wait. A review, plan or acceptance start can follow once that run has ended. |
 | the project has no committed delivery.json | The project is not set up for the pipeline. |
@@ -478,6 +504,9 @@ The runner refuses to start from inside a Claude session, or as root.
 - That the acceptance kind's look tool can start its own sandbox in an acceptance session. It is
   a tool server, started outside Bash's sandbox, so nothing should nest. It joins that kind with
   the acceptance lane (KIT-708), and the probe gains a row for it then.
+- That a real review runs through the runner on the owner's Mac, and that its comment matches the
+  old lane's (KIT-644's last criterion). It needs the runner installed (KIT-859), and a ticket
+  coded through the runner (KIT-645), since a review follows only the runner's own code run.
 - That a real session calls its own tracker tools, and that Linear takes their comments. Their
   selftest runs the real server over stdio against a stand-in tracker. The first coding lane on
   the runner (KIT-645) is the first live run.
