@@ -230,6 +230,10 @@ human-only steps at the end.
    # Edit its "contexts" first if your CI job names differ — they must match your
    # app CI's job names, NOT the kit's old "Kit checks".
    ```
+   The example also requires a pull request, with no approving review, so nothing is
+   pushed straight to `main`. Read it back with
+   `python3 scripts/pipeline_branch_rule.py check --repo <you>/<repo>`; on a rule that
+   lacks the pull request setting, its `run` mode adds it after one typed yes.
 2. **GitHub security toggles**: secret scanning, push protection, Dependabot.
 3. **Service dashboards**: create projects, set secrets (`supabase secrets set …`,
    host env vars, Actions secrets) — the three stores are isolated; walk all of them.

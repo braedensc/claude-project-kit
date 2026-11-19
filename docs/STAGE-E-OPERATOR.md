@@ -223,7 +223,9 @@ Read its log first.
 script the five jobs load, their imports included, and `schemas/`, which a review and a
 telemetry row are judged against. `session-kinds/` counts too: the runner reads each kind of
 session's walls from it when it starts (KIT-880). They include the notifier's and the Slack bridge's files
-on a machine that runs that job. A merge that touched none of them — a doc, an ADR,
+on a machine that runs that job. A job's own data counts the same way, only where that job is
+installed (KIT-889): `.claude/hooks/` where the runner runs, since its guard runs the kit's guards
+from the clone on every tool call, and `templates/sandbox/look.sb` where the acceptance job runs. A merge that touched none of them — a doc, an ADR,
 another project's script, a bridge file on a machine with no bridge — leaves `verify` at
 `ALREADY-DONE`, naming both commits. If the list of jobs cannot be read, every job's files
 count. `run`
@@ -739,9 +741,16 @@ ticket again. A review already asked finishes on the lane it started on.
 
 - **Which repository.** A project's repository is the one its committed `delivery.json` names
   (`github.owner` and `github.repo`), read from the runner's own clone.
-- **Where the settings are.** `runner_settings` in `poller.json`, by default
+- **Where the settings are.** `runner_settings` in `poller.json`. The installer writes it from
+  `RUNNER_SETTINGS` in `stage-e.conf`, or, with that empty, from the runner's installed job: the
+  `--config` its LaunchDaemon runs with (KIT-892). Move the runner's folder, and the next run of
+  the installer follows it. A key that names another file than the installed job reads is
+  refused, with both named. With no runner job and no key, nothing is written, and the job reads
   `~/.pipeline-runner/runner.json`, where the runner's installer puts them. No file there means
   the runner is not installed, and every review goes by review ticket.
+- **A runner project's settings must be there.** A repository `RUNNER_LANE_REPOS` names is a runner
+  project (`runner_projects` in `poller.json`). Its settings missing, or unreadable, stop the pass:
+  the log names each one, and the heartbeat monitor pages you. It is never read as "lane off".
 - **A file it cannot read stops the pass.** Nothing is filed or asked, on either lane, until it
   can be read again. A lane never changes because a file could not be read.
 
@@ -790,7 +799,7 @@ Not that: a review ticket filed for a repository whose review lane is on.
 | Finding poller | The same account, a third system LaunchDaemon | Same env file, same clone, **its own** state directory and config. Reads one tracker key. Creates backlog tickets, links each to its source, posts receipts and cap notes on the source ticket, and comments the finding-filed mark on the new ticket — nothing else. Not a session. |
 | Reviewer | The same account, sandboxed, the Reviews entry | Reads files and its ticket body, and nothing else. No shell, edits, fetch, scheduling or messaging tools, and none of the dispatcher's MCP servers: the fence names the four it injects and every one its platform MCP configs add (KIT-132). |
 | Coding session | The same account, sandboxed, the managed-repo entry | Unchanged. Receives bounces, and conflict fixes, as thread comments. |
-| Catch-up poller | The same account, a fourth system LaunchDaemon, installed only once you sign its first count (`CK-11`), unless `CATCHUP_INTERVAL_SECONDS=off` or every team is on the runner lane (step 5a) | Same env file, same clone, **its own** state directory and config. Reads one tracker key and the dispatcher's local status. Its only tracker write is one reply under a delegation the dispatcher never answered (`docs/CATCH-UP.md`). Not a session. |
+| Catch-up poller | The same account, a fourth system LaunchDaemon, installed only once you sign its first count (`CK-11`), unless `CATCHUP_INTERVAL_SECONDS=off`. A team whose fixes the runner takes is left out of each pass (step 5a) | Same env file, same clone, **its own** state directory and config. Reads one tracker key and the dispatcher's local status. Its only tracker write is one reply under a delegation the dispatcher never answered (`docs/CATCH-UP.md`). Not a session. |
 | Heartbeat monitor | The same account, a fifth system LaunchDaemon, unless `HEARTBEAT_MONITOR_TICKET=off` | Reads the daemons' heartbeats (the catch-up poller's once it is installed) — and the notifier's, when `NOTIFIER_JOB_LABEL` names it, and the health watch's status file, when `HEALTH_STATUS_FILE` names it — and one tracker key. Posts one comment per incident on one ticket, and nothing else. Its comments carry a mark the notifier pings on; its code reads no chat token. Not a session. |
 | Conflict waker | **You**, a user LaunchAgent, only while you are logged in | Uses your own `claude` and `gh` logins. Each fix session is held to its worktree in Claude Code's sandbox and reads none of your home but what its tools need (KIT-676, KIT-786). It still pushes with your GitHub login, so the waker takes only worktrees your own Claude Code worked in, and refuses to run as the role account. |
 | State | `<role-account home>/.stage-e/state`, `…/.stage-e/finding` for the finding poller, and `…/.stage-e/catchup` for the catch-up poller | The sandbox denies sessions every read under that home. Same uid, so the sandbox is the whole boundary — see *Accepted risks*. |
@@ -1749,8 +1758,9 @@ refused by name. The example below is the work-team shape the installer writes:
   directory for the basis resolver). `reviews_team_key` and `reviews_team_id` belong to the
   older Reviews-team shape only: beside the sign-off they are refused by name.
 - Optional too: `runner_settings`, where our own runner's settings are (default
-  `~/.pipeline-runner/runner.json`). It is a place, not a switch: see *Reviews through our own
-  runner* above.
+  `~/.pipeline-runner/runner.json`), and `runner_projects`, the repositories Stage E's settings
+  name as runner projects (KIT-892). Each is a place or a name, not a switch: see *Reviews
+  through our own runner* above.
 
 `~/.stage-e/config.json` — the bounce driver's default path, so its commands need no
 `--config` at all:
@@ -1990,7 +2000,9 @@ The last three rows have their own installer steps, after `enable` loads the fir
 - **The catch-up poller** is installed only once you sign its first count (card `CK-11`).
   Until then it has no plist at all, so no reboot can start it, and every run says so.
   Nothing else waits on it. `CATCHUP_INTERVAL_SECONDS=off` declines it by name, and removes
-  one an earlier run installed. So does a `RUNNER_LANE_REPOS` that covers every team (step 5a).
+  one an earlier run installed. A team whose fixes the runner takes is left out of each pass
+  instead, while the runner's `fix` lane is on for it (step 5a, KIT-707): no setting here turns
+  the job off for it, so that lane alone moves the team back.
 - **The status job** writes one file of where every plan stands, which the Slack tech lead
   reads instead of GitHub (contract §16). Its dry run must read the tracker before it is
   installed (card `CK-12`). It writes that file and one small count of how long the tracker and
@@ -2601,16 +2613,16 @@ RUNNER_STORE_DIR=~/.pipeline-runner/store
 ```
 
 Each entry is `OWNER/NAME:TEAM:PROJECT`. The repository is one you review, the team is its
-tracker team, and the project is its key in the runner's settings. Remove the entry and run
-the installer again to switch it back.
+tracker team, and the project is its key in the runner's settings. The entry is wiring: it
+switches nothing by itself (KIT-707).
 
 **The runner's own lanes switch each kind** (KIT-708). The runner writes the lanes it takes into
 its store, and the driver reads them each pass. A fix goes to the runner only while the runner's
 `fix` lane is on for the project, and a conflict only while its `conflict` lane is on. Off, that
 kind goes by the session's thread, as before. Lanes the driver cannot read are said on the pull
 request, and nothing is sent. So the entry here names the repository once, and the runner's
-`lanes` setting moves each kind and moves it back. The catch-up poller still leaves the team out
-while the entry is here: to move a team back to the thread for good, remove its entry too.
+`lanes` setting moves each kind and moves it back. The catch-up poller reads the same lanes each
+pass (KIT-707), so the `fix` lane moves its cover too: no installer run either way.
 
 - **What stays the same.** The ledger rows, the fix budget, the re-review request, exhaustion
   and the page when a fix is never pushed. The visible record line goes on the ticket as one
@@ -2620,10 +2632,11 @@ while the entry is here: to move a team back to the thread for good, remove its 
   request says a person is needed. While that run is still going, the fix waits for it to end
   and spends nothing. Past `blocked_after_seconds` that wait is said on the pull request
   instead, since the runner may be down.
-- **The catch-up poller** leaves that repository's team out. With every team on this lane it
-  is not installed, as with `CATCHUP_INTERVAL_SECONDS=off`. It works by team, so a team leaves
-  it as a whole: name every repository of that team, or none. A repository of it still on the
-  thread would no longer have its lost delegations re-sent.
+- **The catch-up poller** leaves that repository's team out of each pass while the runner's
+  `fix` lane is on for every repository named for the team, and covers it again once the lane is
+  off. A pass with no team left reads nothing and says so; lanes it cannot read leave no team
+  out, and page. It works by team, so name every repository of a team: one not named would lose
+  the re-sending of its lost delegations while the team is left out.
 - **A conflict** goes to the runner too, while the runner's `conflict` lane is on (KIT-708): a
   `conflict` resume of the same coding run, with the same ledger rows and ack (step 6).
 - **Name a repository only once its coding sessions run through the runner too.** Until then

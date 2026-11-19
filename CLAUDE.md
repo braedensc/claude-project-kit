@@ -473,6 +473,9 @@ npm run test:label-gate      # the label gate runs the default branch's workflow
                              #   pull_request_target, never the PR's: one closed reason per rule (KIT-668)
 npm run test:gate-policy     # the owner's Actions policy that lets the gate run after 2 Dec 2026:
                              #   check, show, one typed yes, one POST, read back; refused under a model
+npm run test:branch-rule     # the owner's script that makes main's rule require a pull request (KIT-911):
+                             #   ON/OFF/UNKNOWN, never ON on a failed read; lists commits that skipped
+                             #   a pull request; one yes; checks and admins read back unchanged
 npm run test:template-label-gate  # the stack template's label gate runs the default branch's workflow on
                              #   pull_request_target, never the PR's: one closed reason per rule (KIT-788)
 npm run test:alert-pages     # alert templates page a person (ALERT_PAGE_TO, else a user

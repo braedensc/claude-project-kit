@@ -1346,7 +1346,7 @@ def _cases(check, tmp):
         source = fh.read()
 
     def registered():
-        jobs = dict(se.SIBLING_JOBS)
+        jobs = dict((job[0], job[1]) for job in se.SIBLING_JOBS)   # (entry, scripts, data): KIT-889
         return [sorted(jobs.get(e, ())) == sorted(set(runtime_closure((e,))) - set(se.REQUIRED_SCRIPTS))
                 for e in (USAGE_SCRIPT, MORNING_SCRIPT)], READER_SCRIPT in REQUIRED_SCRIPTS
     case("Stage E: SIBLING_JOBS lists what each job can load", registered, ([True, True], True),

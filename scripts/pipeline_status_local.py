@@ -115,13 +115,21 @@ GITHUB_COMPARE_FILES = 300            # GitHub lists no more files than this for
 GIT_SMALL_BYTES = 4096
 GIT_PACKED_BYTES = 8 * 1024 * 1024
 INSTALLER_BYTES = 8 * 1024 * 1024
-INSTALLER_LISTS = ("REQUIRED_SCRIPTS", "SIBLING_JOBS", "RUNTIME_DATA_DIRS")
+INSTALLER_LISTS = ("REQUIRED_SCRIPTS", "SIBLING_JOBS", "RUNTIME_DATA_DIRS", "ROLE_KIT_CLONE_PATH")
 CUT_OFF_REASON = "more files changed than GitHub lists, so the jobs' files cannot all be checked"
 REF_RE = re.compile(r"^ref: (refs/heads/[A-Za-z0-9._/-]{1,100})\Z")
 # The shape of a file name it passes on: one of the installer's data folders (RUNTIME_DATA_DIRS:
-# the schemas, and the session kinds the runner reads, KIT-880) or scripts. The selftest checks it
-# against the installer's own list, and against the status schema's pattern.
-JOB_FILE_RE = re.compile(r"^(?:scripts|schemas|session-kinds)/[A-Za-z0-9._-]{1,100}\Z")
+# the schemas, and the session kinds the runner reads, KIT-880), a job's own data (the kit's guards
+# the runner runs, and the look tool's sandbox profile, KIT-889) or scripts. The selftest checks it
+# against the installer's own lists, and against the status schema's pattern.
+JOB_FILE_RE = re.compile(
+    r"^(?:scripts|schemas|session-kinds|\.claude/hooks|templates/sandbox)/[A-Za-z0-9._-]{1,100}\Z")
+# KIT-889: which jobs are installed on this Mac, read the way the Stage E installer's own listing
+# reads it: a LaunchDaemon file (root's, readable by every account) whose job runs as this account
+# and runs one of the jobs' entry scripts from the clone. A job's own data counts only where it is.
+LAUNCH_DAEMONS = "/Library/LaunchDaemons"
+PLIST_BYTES = 1024 * 1024
+DAEMONS_MAX = 2000
 # KIT-415: how long a source may stay unread, in AWAKE time, before it fires. Dark wakes with
 # no network all night never add up to it. The catch-up poller's own number and its way of
 # counting: pass by pass, from a clock that stops while the Mac sleeps.
@@ -1279,9 +1287,11 @@ def read_clone_head(root):
 
 
 def job_files(root):
-    """(the set of paths the jobs run or read, None) or (None, why): the installer's own lists
-    (REQUIRED_SCRIPTS, the sibling jobs' files, RUNTIME_DATA_DIRS), read out of the checkout's
-    copy of it with `ast.literal_eval` and no import, so nothing in that file runs."""
+    """(the paths the jobs run or read, None) or (None, why): the installer's own lists
+    (REQUIRED_SCRIPTS, the sibling jobs' files and their own data, RUNTIME_DATA_DIRS, and where
+    the jobs' clone sits), read out of the checkout's copy of it with `ast.literal_eval` and no
+    import, so nothing in that file runs. An entry of the jobs' list is (entry, its scripts), as
+    before KIT-889, or (entry, its scripts, its own data): folders or files, from the clone's top."""
     text = _plain_file(os.path.join(root, "scripts", "pipeline_stage_e_setup.py"), INSTALLER_BYTES)
     if text is None or len(text) > INSTALLER_BYTES:
         return None, "the checkout's installer could not be read to tell which files the jobs run"
@@ -1293,22 +1303,80 @@ def job_files(root):
                     and node.targets[0].id in INSTALLER_LISTS):
                 found[node.targets[0].id] = ast.literal_eval(node.value)
         names = set(found["REQUIRED_SCRIPTS"])
+        job_data = {}
         for entry in found["SIBLING_JOBS"]:
             names.update(entry[1])
+            data = tuple(entry[2]) if len(entry) > 2 else ()
+            if not isinstance(entry[0], str) or not all(isinstance(d, str) for d in data):
+                raise ValueError("not names")
+            job_data[entry[0]] = job_data.get(entry[0], ()) + data
         folders = tuple(found["RUNTIME_DATA_DIRS"])
-        if not all(isinstance(n, str) for n in names) or not all(isinstance(f, str) for f in folders):
+        clone_path = found.get("ROLE_KIT_CLONE_PATH")
+        if not all(isinstance(n, str) for n in names) or not all(isinstance(f, str) for f in folders) \
+                or not (clone_path is None or isinstance(clone_path, str)):
             raise ValueError("not names")
     except (SyntaxError, ValueError, KeyError, TypeError, IndexError, RecursionError, MemoryError):
         return None, "the checkout's installer does not list the files the jobs run in a way this job reads"
-    return {"scripts": set("scripts/" + n for n in names), "folders": folders}, None
+    return {"scripts": set("scripts/" + n for n in names), "folders": folders, "job_data": job_data,
+            "clone_path": clone_path}, None
 
 
-def read_kit_clone(cfg, ask, now):
+def installed_jobs(entries, clone_path, daemons=LAUNCH_DAEMONS, account=None):
+    """(the entry scripts of the jobs installed on this Mac, None), or (None, why) when it cannot
+    tell (KIT-889). A job is installed when a LaunchDaemon file runs it as this account, from the
+    clone: the Stage E installer's own rule (`clone_jobs_sh`). Each file is read as a property
+    list, XML or binary, and nothing in it runs. A file it cannot read, or cannot read as a property
+    list while it names one of the entry scripts out of the clone, could be one of them: that is
+    "cannot tell", and the caller then counts every job's data, never too little."""
+    import plistlib
+    if not (isinstance(clone_path, str) and clone_path.startswith("~/")):
+        return None, "the installer does not say where the jobs' clone is"
+    if account is None:
+        import pwd
+        account = pwd.getpwuid(os.getuid()).pw_name
+    marks = dict((e, clone_path[1:].rstrip("/") + "/scripts/" + e) for e in entries)
+    try:
+        names = sorted(os.listdir(daemons))
+    except OSError:
+        return None, "the LaunchDaemons folder could not be listed"
+    if len(names) > DAEMONS_MAX:
+        return None, "the LaunchDaemons folder holds more files than this job reads"
+    found = set()
+    for name in names:
+        path = os.path.join(daemons, name)
+        if not name.endswith(".plist") or not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "rb") as fh:
+                raw = fh.read(PLIST_BYTES + 1)
+        except OSError:
+            return None, "a LaunchDaemon file could not be read"
+        try:
+            if len(raw) > PLIST_BYTES:
+                raise ValueError("larger than a job's file")
+            doc = plistlib.loads(raw)
+        except Exception:  # noqa: BLE001 — plistlib's failures have no one class; any is "not read"
+            if any(m.encode("utf-8") in raw for m in marks.values()):
+                return None, "a LaunchDaemon file that names a job could not be read as a property list"
+            continue
+        if not isinstance(doc, dict) or doc.get("UserName") != account:
+            continue
+        args = doc.get("ProgramArguments")
+        said = [a for a in (args if isinstance(args, list) else []) + [doc.get("Program")] if isinstance(a, str)]
+        found.update(e for e, m in marks.items() if any(m in a for a in said))
+    return found, None
+
+
+def read_kit_clone(cfg, ask, now, daemons=LAUNCH_DAEMONS, account=None):
     """The status file's `kit_clone` (KIT-581). None: the job is not told a repository. Else the
     checkout's state: `behind` when a file the jobs run, or a schema they read, changed between
     its head and the branch; `current` when nothing they run did (a doc or a test only); and
     `unknown` for any question it could not answer, with a reason in fixed words and never
-    `current`. One GET. Fields only: a file name is kept only when it is one of the job files."""
+    `current`. One GET. Fields only: a file name is kept only when it is one of the job files.
+
+    A job's own data (KIT-889: the kit's guards for the runner, the look tool's profile for the
+    acceptance job) counts only where that job is installed, read from `daemons` and only when
+    such a file changed. When which jobs are installed cannot be told, every job's data counts."""
     repo = cfg.get("kit_repo")
     if not repo:
         return None
@@ -1346,8 +1414,17 @@ def read_kit_clone(cfg, ask, now):
     if not isinstance(listed, list):
         return doc("unknown", short, ahead, reason="GitHub's answer did not list the changed files")
     names = [f.get("filename") for f in listed if isinstance(f, dict)]
-    moved = sorted(set(n for n in names if isinstance(n, str) and JOB_FILE_RE.match(n)
-                       and (n in jobs["scripts"] or any(n.startswith(d + "/") for d in jobs["folders"]))))
+
+    def under(n, paths):
+        return any(n == d or n.startswith(d + "/") for d in paths)
+    shaped = set(n for n in names if isinstance(n, str) and JOB_FILE_RE.match(n))
+    moved = set(n for n in shaped if n in jobs["scripts"] or under(n, jobs["folders"]))
+    theirs = set(n for n in shaped - moved if under(n, [d for ds in jobs["job_data"].values() for d in ds]))
+    if theirs:
+        installed, _why = installed_jobs(sorted(jobs["job_data"]), jobs["clone_path"], daemons, account)
+        here = [d for e, ds in jobs["job_data"].items() if installed is None or e in installed for d in ds]
+        moved.update(n for n in theirs if under(n, here))
+    moved = sorted(moved)
     cut_off = len(listed) >= GITHUB_COMPARE_FILES
     if moved:
         # A job file did change, so behind is true; the count is a floor when the list was cut off.
@@ -2423,6 +2500,87 @@ def selftest():
               (why_real, [d for d in (real_jobs or {}).get("folders", ())
                           if not (JOB_FILE_RE.match(d + "/x.json") and re.match(files_pattern, d + "/x.json"))]),
               (None, []))
+
+        # -- KIT-889: a job's own data counts only where that job is installed ----------------------
+        import plistlib
+        real_data = sorted(d for ds in ((real_jobs or {}).get("job_data") or {}).values() for d in ds)
+        named = [d + "/x.py" if os.path.isdir(os.path.join(KIT_ROOT, d)) else d for d in real_data]
+        check("the installer lists the runner's guards and the look profile, and each can be named here and in "
+              "the file's schema (KIT-889)",
+              (real_data, [n for n in named if not (JOB_FILE_RE.match(n) and re.match(files_pattern, n))]),
+              ([".claude/hooks", "templates/sandbox/look.sb"], []))
+        data_inst = ("REQUIRED_SCRIPTS = ('pipeline_review_poller.py',)\n"
+                     "SIBLING_JOBS = (('pipeline_notify_local.py', ('pipeline_notify_local.py',)),\n"
+                     "    ('pipeline_runner.py', ('pipeline_runner.py',), ('.claude/hooks',)),\n"
+                     "    ('pipeline_acceptance_run.py', ('pipeline_acceptance_run.py',), ('templates/sandbox/look.sb',)))\n"
+                     "RUNTIME_DATA_DIRS = ('schemas', 'session-kinds')\n"
+                     "ROLE_KIT_CLONE_PATH = '~/.stage-e/kit'\n")
+        data_root = fake_clone("c-data", installer=data_inst)
+        got_j = job_files(data_root)[0]
+        check("each job's own data is read beside its entry, and an entry from before KIT-889 has none",
+              (got_j["job_data"], got_j["clone_path"]),
+              ({"pipeline_notify_local.py": (), "pipeline_runner.py": (".claude/hooks",),
+                "pipeline_acceptance_run.py": ("templates/sandbox/look.sb",)}, "~/.stage-e/kit"))
+        check("an entry whose data is not names gives no list",
+              job_files(fake_clone("c-data-bad", installer=data_inst.replace("('.claude/hooks',)", "(7,)")))[0], None)
+
+        def daemons_with(name, jobs, raw=()):
+            """A LaunchDaemons folder: each (file, account, entry, binary) is a job's file, and each
+            (file, bytes) in `raw` a file as it is."""
+            where = os.path.join(tmp, name)
+            os.makedirs(where)
+            for fname, user, entry, binary in jobs:
+                body = {"Label": fname[:-len(".plist")], "UserName": user, "ProgramArguments": [
+                    "/bin/sh", "-c", 'exec /usr/bin/python3 "$HOME/.stage-e/kit/scripts/%s" run' % entry]}
+                with open(os.path.join(where, fname), "wb") as fh:
+                    fh.write(plistlib.dumps(body, fmt=plistlib.FMT_BINARY if binary else plistlib.FMT_XML))
+            for fname, data in raw:
+                with open(os.path.join(where, fname), "wb") as fh:
+                    fh.write(data)
+            return where
+        entries_j = sorted(got_j["job_data"])
+        check("a job is installed when a LaunchDaemon file runs it as this account from the clone, XML or binary",
+              installed_jobs(entries_j, "~/.stage-e/kit", daemons_with("d-both", [
+                  ("local.r.plist", "role-x", "pipeline_runner.py", False),
+                  ("local.a.plist", "role-x", "pipeline_acceptance_run.py", True),
+                  ("other.plist", "someone-else", "pipeline_notify_local.py", False),
+                  ("unrelated.plist", "role-x", "pipeline_unrelated.py", False)],
+                  raw=[("notes.txt", b"pipeline_notify_local.py"), ("vendor.plist", b"not a property list")]),
+                  account="role-x"),
+              ({"pipeline_runner.py", "pipeline_acceptance_run.py"}, None))
+        unreadable_d = daemons_with("d-locked", [("local.r.plist", "role-x", "pipeline_runner.py", False)])
+        os.chmod(os.path.join(unreadable_d, "local.r.plist"), 0)
+        tells = [installed_jobs(entries_j, "~/.stage-e/kit", d, account="role-x")[0] for d in (
+            os.path.join(tmp, "d-none-such"),
+            daemons_with("d-broken", [], raw=[("x.plist", b"<garbage> $HOME/.stage-e/kit/scripts/pipeline_runner.py")]),
+            unreadable_d)]
+        tells.append(installed_jobs(entries_j, None, daemons_with("d-noclone", []), account="role-x")[0])
+        os.chmod(os.path.join(unreadable_d, "local.r.plist"), 0o644)
+        check("a folder it cannot list, a file that names a job and is no property list, a file it cannot read, "
+              "and an installer that does not say where the clone is: it cannot tell",
+              tells, [None, None, None, None])
+
+        def data_says(files, daemons):
+            got = read_kit_clone(kit_cfg(data_root), lambda p: compare("ahead", 1, files), lambda: T,
+                                 daemons=daemons, account="role-x")
+            return got["state"], got["files"]
+        runner_only = daemons_with("d-runner", [("local.r.plist", "role-x", "pipeline_runner.py", False)])
+        accept_only = daemons_with("d-accept", [("local.a.plist", "role-x", "pipeline_acceptance_run.py", False)])
+        nothing_d = daemons_with("d-nothing", [])
+        check("a change to the kit's guards alone is behind where the runner is installed, and only there",
+              [data_says((".claude/hooks/guard.py", "docs/A.md"), d) for d in (runner_only, accept_only, nothing_d)],
+              [("behind", [".claude/hooks/guard.py"]), ("current", []), ("current", [])])
+        check("a change to the look profile alone is behind where the acceptance job is installed, and only there",
+              [data_says(("templates/sandbox/look.sb",), d) for d in (accept_only, runner_only, nothing_d)],
+              [("behind", ["templates/sandbox/look.sb"]), ("current", []), ("current", [])])
+        check("when which jobs are installed cannot be told, every job's data counts",
+              data_says((".claude/hooks/guard.py", "templates/sandbox/look.sb"), os.path.join(tmp, "d-gone")),
+              ("behind", [".claude/hooks/guard.py", "templates/sandbox/look.sb"]))
+        check("a script and a job's data together, the job not installed: only the script is named",
+              data_says(("scripts/pipeline_runner.py", ".claude/hooks/guard.py"), nothing_d),
+              ("behind", ["scripts/pipeline_runner.py"]))
+        check("a file under another hooks or templates folder is no job's data",
+              data_says(("templates/workflows/x.yml", ".claude/skills/a.md"), runner_only), ("current", []))
         crowd = ["scripts/pipeline_review_poller.py"] + ["schemas/s%02d.json" % i for i in range(14)]
         got_k = kit_says(compare("ahead", 2, crowd))[0]
         check("at most ten files are named, out of all of them",

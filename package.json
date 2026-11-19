@@ -134,6 +134,7 @@
     "test:agent-trigger": "python3 scripts/check_agent_trigger_author.py --selftest && python3 scripts/check_agent_trigger_author.py",
     "test:label-gate": "python3 scripts/check_label_gate.py --selftest && python3 scripts/check_label_gate.py",
     "test:gate-policy": "python3 scripts/pipeline_gate_policy.py --selftest",
+    "test:branch-rule": "python3 scripts/pipeline_branch_rule.py --selftest",
     "test:runner-pin": "python3 scripts/check_runner_pin.py --selftest && python3 scripts/check_runner_pin.py",
     "test:stdlib-only": "python3 scripts/check_stdlib_only.py --selftest",
     "lint:stdlib-only": "python3 scripts/check_stdlib_only.py",
