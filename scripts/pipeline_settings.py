@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""The pipeline's settings, in one folder on this Mac (KIT-853, KIT-854).
+"""The pipeline's settings, in one folder on this Mac (KIT-853, KIT-854, KIT-855).
 
     python3 scripts/pipeline_settings.py where  [--settings-dir DIR]   # where everything is
     python3 scripts/pipeline_settings.py init   [--settings-dir DIR]   # make the folder and machine.conf
     python3 scripts/pipeline_settings.py gather [--settings-dir DIR] [--parts-dir DIR] [--apply]
     python3 scripts/pipeline_settings.py check  [--settings-dir DIR]   # the folder's rules, read-only
     python3 scripts/pipeline_settings.py write  [--settings-dir DIR] [--apply]
+    python3 scripts/pipeline_settings.py export --to FILE [--settings-dir DIR]
+    python3 scripts/pipeline_settings.py import --from FILE [--settings-dir DIR] [--apply]
     python3 scripts/pipeline_settings.py map                           # where each value goes
     python3 scripts/pipeline_settings.py --selftest
 
@@ -13,7 +15,7 @@ WHY. Eleven settings files repeat the same values: the pipeline's account, the d
 names the keys are stored under, the clone the jobs run from. A value changed in one file and
 missed in another breaks a part quietly. Settings live on the machine, never in a repository.
 So one private folder holds them, each value is typed once, and each part's own settings file is
-written from it. (Hand edits, and export and import, come in the last piece of this work.)
+written from it.
 
 THE FOLDER. `~/Library/Application Support/claude-pipeline/settings`, yours, mode 700. Its own
 place is a setting too: `--settings-dir`, else the PIPELINE_SETTINGS_DIR variable, else that
@@ -49,6 +51,21 @@ shows it again and asks for a typed yes, reads the part files once more, and wri
 only where no settings are yet: a folder that is not there, is empty, or holds the file `init` makes,
 untouched. It writes the whole folder or nothing: a failure part way removes what that run made.
 
+HAND EDITS. `write --apply` and `gather --apply` keep RECORD beside machine.conf: what the folder last
+gave each part file. On the next `write`, a key whose value in the file is neither that nor the
+folder's was changed by hand: it is shown with both values, and nothing is written. `write --apply`
+then asks, for each one, which wins. `folder` writes the folder's value back into the file. `file`
+puts the file's value in that part's own section of machine.conf, so it stays in that file alone
+and a shared value still reaches the others. A value shaped like a secret is never taken, nor a key
+the file no longer sets. With no record yet, a difference is the folder's own change, shown as such.
+
+A NEW MAC. `export --to FILE` writes one plain file: machine.conf and every project's file, each
+under a `=== <path>` line, and which part files were on this Mac. Never the record, never a secret:
+`check` must pass first. `import --from FILE` shows the folder the file makes, and anything it names
+that is not on this Mac, and writes nothing. `import --apply` asks for a typed yes and writes the
+folder, whole or nothing, only where no settings are yet. It never writes a part file: copy the
+examples of the parts you want on, then `write`.
+
 WHAT `write` DOES. For each part file on this Mac it works out what the folder changes, and shows
 each change: the file, the key, the value now and the value after. It writes nothing. With
 `--apply`, run by you in your own terminal, it writes them. Every other byte of the file stays, and
@@ -78,14 +95,16 @@ WHAT `check` FAILS ON (`write` runs it first, so a folder that fails it is never
               installer refuses a team with no repository.
 
 WHAT IT NEVER DOES (asserted in --selftest). It runs no installer and no other program, loads no
-job, and opens no connection. It reads the folder, the kit's parts list and examples, and the part
-files. Only `init`, `gather --apply` and `write --apply` write: the first two the folder, the last
-the part files.
+job, and opens no connection. It reads the folder, the kit's parts list and examples, the part
+files, and an export file it is given. Only `init`, `gather --apply`, `import --apply`, `export`
+and `write --apply` write: the folder, the export file, and the part files with the record. It
+removes nothing but what a failed run of its own just made.
 
 Exit: 0 done, or nothing to do (the words say which) · 1 a write failed (the file is named)
       · 2 the folder or a part file needs fixing first, or a usage error · 3 refused (inside a
-      Claude session, or as root) · 4 something could not be read · 10 `write` or `gather` found
-      something to write and wrote none, or the yes was not given.
+      Claude session, or as root) · 4 something could not be read · 10 `write`, `gather` or `import`
+      found something to write and wrote none, a hand edit waits for its choice, or the yes was not
+      given.
 """
 import argparse
 import json
@@ -185,6 +204,12 @@ LIST_KEYS = frozenset((entry[1], entry[2]) for entry in COMPOSED)
 KIND_WORDS = {"repo": "OWNER/NAME repositories", "team": "team keys", "team=repo": "TEAM=OWNER/NAME pairs"}
 PROJECTS = "projects"
 PROJECT_KEYS = ("REPO", "TEAM_KEY", "PARTS")
+# What the folder last gave each part file, kept beside machine.conf: this Mac's state, never a setting, so
+# an export never carries it. The next write tells a hand edit from a change of the folder's by it.
+RECORD = "written.json"
+RECORD_SCHEMA = "pipeline-settings-written/1"
+EXPORT_MARK = "=== "
+MISSING = object()
 PROJECT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}\Z")
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 TEAM_RE = re.compile(r"^[A-Z0-9]{1,10}\Z")
@@ -690,11 +715,19 @@ def part_values(folder, name):
 
 
 class Plan(object):
-    """One part file: its state (off, empty, same, change, held, unread), the changes, and why."""
+    """One part file: its state (off, empty, same, change, held, unread), the changes, the hand edits found
+    in it, and why."""
 
     def __init__(self, name, path, source):
         self.name, self.path, self.source = name, path, source
         self.state, self.why, self.changes, self.old, self.new = "same", "", [], None, None
+        self.edits = []                          # (key, the file's value, the folder's, from)
+
+
+def hand_edited(name, key, have, recorded):
+    """The file no longer holds what the folder last wrote there, so a person changed it since. With no
+    record of the key (a first write), a difference is the folder's own change."""
+    return recorded is not MISSING and not same_value(name, key, have, recorded)
 
 
 def unsafe_part(st, uid):
@@ -706,7 +739,9 @@ def unsafe_part(st, uid):
     return "belongs to another account" if foreign(st, uid) else ""
 
 
-def plan_file(folder, kit, name, uid):
+def plan_file(folder, kit, name, uid, record=None, force=()):
+    """What the folder changes in one part file. `record` is what it last wrote there; a key the file
+    changed since is a hand edit, held for the person's choice, unless `force` names it (the folder won)."""
     path, source = part_path(folder, kit, name)
     plan, wanted = Plan(name, path, source), part_values(folder, name)
     try:
@@ -731,9 +766,13 @@ def plan_file(folder, kit, name, uid):
         return plan
     have, plan.new = conf_values(plan.old), plan.old
     for key, value, src in wanted:
-        if not same_value(name, key, have.get(key), value):
-            plan.new = set_line(plan.new, key, value)
-            plan.changes.append((key, have.get(key), value, src))
+        if same_value(name, key, have.get(key), value):
+            continue
+        if key not in force and hand_edited(name, key, have.get(key), (record or {}).get(key, MISSING)):
+            plan.edits.append((key, have.get(key), value, src))
+            continue
+        plan.new = set_line(plan.new, key, value)
+        plan.changes.append((key, have.get(key), value, src))
     together = TOGETHER.get(name, ())
     after = conf_values(plan.new)
     if (set(k for k, _o, _n, _s in plan.changes) & set(together)
@@ -866,6 +905,141 @@ def undo(made):
         except OSError:
             left.append(path)
     return left
+
+
+# --------------------------------------------------------------------------- #
+# Hand edits: the record of what was last written, and the person's choice
+# --------------------------------------------------------------------------- #
+def read_record(sdir):
+    """{part file: {key: value}} the folder last gave each part file; {} when there is no record yet.
+    Raises ValueError for a file that is not one: a hand edit must never slip by as "no record"."""
+    path = os.path.join(sdir, RECORD)
+    if not os.path.lexists(path):
+        return {}
+    doc = json.loads(read_text(path))
+    files = doc.get("files") if isinstance(doc, dict) and doc.get("schema") == RECORD_SCHEMA else None
+    if not isinstance(files, dict) or not all(
+            isinstance(values, dict) and all(isinstance(k, str) and isinstance(v, str) for k, v in values.items())
+            for values in files.values()):
+        raise ValueError("it is not a record of what was written")
+    return files
+
+
+def record_text(files):
+    return json.dumps({"schema": RECORD_SCHEMA, "files": files}, indent=1, sort_keys=True) + "\n"
+
+
+def record_of(folder, plans, written):
+    """{part file: {key: value}}: what the folder now gives each file it reached, and was written or found
+    level. A file it gives nothing is dropped."""
+    out = {}
+    for p in plans:
+        if p.state == "same" or (p.state == "change" and p.name in written):
+            out[p.name] = dict((k, v) for k, v, _src in part_values(folder, p.name))
+    return dict((name, values) for name, values in out.items() if values)
+
+
+def save_record(sdir, old, folder, plans, written):
+    """Keep the record, so the next write can tell a hand edit. None, or why it could not be kept."""
+    reached = set(p.name for p in plans if p.state in ("same", "empty") or (p.state == "change" and p.name in written))
+    new = dict((name, values) for name, values in old.items() if name not in reached)   # a failed file keeps its old one
+    new.update(record_of(folder, plans, written))
+    if new == old and os.path.lexists(os.path.join(sdir, RECORD)):
+        return None
+    try:
+        put_file(os.path.join(sdir, RECORD), record_text(new), FILE_MODE)
+    except OSError as exc:
+        return type(exc).__name__
+    return None
+
+
+def own_section(name):
+    """The section a part file's own value goes in: its own, so the shared value still reaches the others."""
+    return name
+
+
+def set_section_line(text, section, key, value):
+    """machine.conf's text with KEY=value in [section]: its line there replaced, or added at the end of the
+    section, or the section added at the end of the file. Every other byte stays."""
+    lines, start, end = text.splitlines(True), None, None
+    for i, raw in enumerate(lines):
+        m = SECTION_RE.match(raw.strip())
+        if m and start is not None and end is None:
+            end = i
+        if m and m.group(1) == section and start is None:
+            start = i
+    if start is None:
+        return text + ("" if not text or text.endswith("\n") else "\n") + "\n[%s]\n%s=%s\n" % (section, key, value)
+    end = len(lines) if end is None else end
+    for i in range(start + 1, end):
+        s = lines[i].strip()
+        if s and not s.startswith("#") and s.partition("=")[0].strip() == key:
+            lines[i] = "%s=%s\n" % (key, value)
+            return "".join(lines)
+    at = end
+    while at > start + 1 and not lines[at - 1].strip():
+        at -= 1
+    if not lines[at - 1].endswith("\n"):
+        lines[at - 1] += "\n"
+    lines.insert(at, "%s=%s\n" % (key, value))
+    return "".join(lines)
+
+
+def takeable(name, key, have):
+    """Why a file's own value cannot go in the folder, or None."""
+    if have is None:
+        return "%s no longer sets %s, so only the folder's value can win" % (name, key)
+    if (have and secret_labels(have)) or (have and SECRET_NAME_RE.search(key)):
+        return "the value in %s %s is shaped like a secret, so it can never go in the folder" % (name, key)
+    return None
+
+
+def ask_choices(edits, ask, out):
+    """{(part file, key): "file" or "folder"} from the person, one answer per hand edit; None when any answer
+    is not one of the two (and then nothing is written)."""
+    choices = {}
+    for p, (key, have, want, _src) in edits:
+        try:
+            answer = (ask("Which wins for %s %s: the file's (%s) or the folder's (%s)? Type file or folder: "
+                          % (p.name, key, shown(have), shown(want))) or "").strip()
+        except EOFError:
+            answer = ""
+        why = takeable(p.name, key, have) if answer == "file" else None
+        if answer not in ("file", "folder") or why:
+            out("Nothing was written: %s." % (why or "each hand edit needs `file` or `folder`"))
+            return None
+        choices[(p.name, key)] = answer
+    return choices
+
+
+def folder_problems(text, kit, projects):
+    """Everything check would refuse in a machine.conf of this text beside these projects: its lines, its
+    places, anything shaped like a secret, and the rules that read both (the queue's)."""
+    folder, problems = parse_machine(text, kit)
+    folder.projects = projects
+    return problems + secret_problems(text) + queue_problems(folder)
+
+
+def take_from_files(sdir, kit, takes):
+    """Put each file's own value in its part's own section of machine.conf, so the folder takes it. None, or
+    why not (then machine.conf is as it was). The new machine.conf must pass every rule check has."""
+    path = os.path.join(sdir, MACHINE)
+    try:
+        text = read_text(path)
+        pdir = os.path.join(sdir, PROJECTS)
+        projects = read_projects(pdir)[0] if os.path.lexists(pdir) else {}
+    except (OSError, ValueError) as exc:
+        return "the settings could not be read (%s)" % type(exc).__name__
+    for name, key, value in takes:
+        text = set_section_line(text, own_section(name), key, value)
+    problems = folder_problems(text, kit, projects)
+    if problems:
+        return "machine.conf would not pass check with them: %s" % "; ".join(problems)
+    try:
+        put_file(path, text, FILE_MODE)
+    except OSError as exc:
+        return "machine.conf could not be written (%s)" % type(exc).__name__
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -1073,8 +1247,9 @@ def folder_state(sdir, kit):
     return "empty", ""
 
 
-def write_folder(sdir, g, kit):
-    """Write the gathered folder whole, or leave the folder as it was. None, or why not in words.
+def write_folder(sdir, g, kit, extra=None):
+    """Write the gathered folder whole, or leave the folder as it was. None, or why not in words. `extra`
+    names more files to make in it: {name: text}, such as the record.
     A folder that is not there yet is built beside it and renamed into place. Into init's untouched folder,
     the projects go first and machine.conf last. A failure part way removes what this run made."""
     made, fresh, target = [], not os.path.lexists(sdir), sdir
@@ -1095,6 +1270,9 @@ def write_folder(sdir, g, kit):
         for name in sorted(g.projects):
             put_file(os.path.join(pdir, name + ".conf"), g.projects[name], FILE_MODE, new=True)
             made.append(os.path.join(pdir, name + ".conf"))
+        for name, text in sorted((extra or {}).items()):
+            put_file(os.path.join(target, name), text, FILE_MODE, new=True)
+            made.append(os.path.join(target, name))
         machine = os.path.join(target, MACHINE)
         if os.path.lexists(machine):
             if read_text(machine) != template(kit):
@@ -1120,6 +1298,83 @@ def said_yes(answer):
 def unchanged(g, again):
     """The part files still make the folder the person read."""
     return (g.machine, g.projects, g.stops) == (again.machine, again.projects, again.stops)
+
+
+# --------------------------------------------------------------------------- #
+# Moving to a new Mac: one plain export file, and its import
+# --------------------------------------------------------------------------- #
+def bundle_files(sdir):
+    """[(path in the folder, text)]: machine.conf, then each project's file. Never the record, which is this
+    Mac's own state, and never anything else in the folder."""
+    out = [(MACHINE, read_text(os.path.join(sdir, MACHINE)))]
+    pdir = os.path.join(sdir, PROJECTS)
+    if os.path.isdir(pdir):
+        out += [("%s/%s" % (PROJECTS, e), read_text(os.path.join(pdir, e))) for e in sorted(os.listdir(pdir))
+                if e.endswith(".conf")]
+    return out
+
+
+def export_text(files, on):
+    lines = ["# The pipeline's settings, exported by scripts/pipeline_settings.py. Names, paths, numbers and",
+             "# switches only: no key, token or password. On another Mac: pipeline_settings.py import --from <this file>",
+             "# On the Mac it came from, these part files were on: %s." % (", ".join(on) or "none")]
+    for path, text in files:
+        lines += [EXPORT_MARK + path] + text.splitlines()
+    return "\n".join(lines) + "\n"
+
+
+def bundle_path_ok(path):
+    """Only machine.conf and projects/<name>.conf: no other file, no folder above, no trick in the name."""
+    stem = path[len(PROJECTS) + 1:-len(".conf")] if path.startswith(PROJECTS + "/") and path.endswith(".conf") else ""
+    return path == MACHINE or (bool(PROJECT_NAME_RE.match(stem)) and path == "%s/%s.conf" % (PROJECTS, stem))
+
+
+def parse_export(text):
+    """({path in the folder: text}, the part files that were on where it came from, problems)."""
+    files, on, problems, cur = {}, [], [], None
+    for raw in text.splitlines():
+        if raw.startswith(EXPORT_MARK):
+            path, cur = raw[len(EXPORT_MARK):].strip(), None
+            if not bundle_path_ok(path):
+                problems.append("it names a file that is not one of the settings' (%s)" % (
+                    path if re.match(r"^[A-Za-z0-9_./-]{1,80}\Z", path) else "a name of another shape"))
+            elif path in files:
+                problems.append("it names %s twice" % path)
+            else:
+                files[path], cur = [], path
+        elif cur is not None:
+            files[cur].append(raw)
+        elif raw.startswith("# On the Mac it came from"):
+            on = [n.strip() for n in raw.partition(":")[2].strip().rstrip(".").split(",") if n.strip()]
+        elif raw.strip() and not raw.startswith("#"):
+            problems.append("a line before the first file is not a comment")
+    if MACHINE not in files:
+        problems.append("it holds no machine.conf")
+    return dict((p, "\n".join(lines) + "\n") for p, lines in files.items()), on, problems
+
+
+def ended(text):
+    """A file's text as an export carries it: ending in one newline."""
+    return text if text.endswith("\n") else text + "\n"
+
+
+def same_export(again, text):
+    """The export file still says what the person read."""
+    return again == text
+
+
+def import_problems(files, kit):
+    """(the folder the export makes, read as check reads one; everything check would refuse in it)."""
+    problems = []
+    for path in sorted(files):
+        problems += ["%s %s" % (path, p) for p in secret_problems(files[path])]
+    folder, found = parse_machine(files.get(MACHINE, ""), kit)
+    problems += found
+    for path in sorted(p for p in files if p != MACHINE):
+        name = path[len(PROJECTS) + 1:-len(".conf")]
+        folder.projects[name], found = parse_project(name, files[path])
+        problems += found
+    return folder, problems + duplicate_problems(folder.projects) + queue_problems(folder)
 
 
 # --------------------------------------------------------------------------- #
@@ -1172,18 +1427,7 @@ def cmd_check(sdir, kit, uid, out, stop=None):
     return EX_OK
 
 
-def cmd_write(sdir, kit, uid, apply, out, stop=None):
-    state, folder, problems, notes = load(sdir, kit, uid, stop)
-    if state == "absent" and not problems:
-        out("No settings at %s yet, so there is nothing to write from. `init` makes the folder." % sdir)
-        return EX_OK
-    if problems:
-        say_problems(problems, out)
-        out("Nothing was written: `check` must pass first.")
-        return EX_FIX
-    for note in notes:
-        out("NOTE: %s." % note)
-    plans = [plan_file(folder, kit, name, uid) for name in kit.files]
+def show_plans(plans, out):
     for p in plans:
         if p.state in ("held", "unread"):
             out("%s (%s): NOT WRITTEN: it %s." % (p.name, p.path, p.why))
@@ -1192,20 +1436,78 @@ def cmd_write(sdir, kit, uid, apply, out, stop=None):
                                                     "" if len(p.changes) == 1 else "s"))
             for key, old, new, src in p.changes:
                 out("  %s: %s -> %s   (%s)" % (key, shown(old), shown(new), src))
+        for key, have, want, src in p.edits:
+            out("HAND EDIT %s %s: the file says %s, the folder says %s (%s). It was changed in the file after "
+                "the last write." % (p.name, key, shown(have), shown(want), src))
     for state, words in (("same", "Already what the folder says"),
                          ("empty", "Nothing in the folder for them"),
                          ("off", "Off on this Mac (no settings file, so nothing is written for them)")):
-        names = [p.name for p in plans if p.state == state]
+        names = [p.name for p in plans if p.state == state and not p.edits]
         if names:
             out("%s: %s." % (words, ", ".join(names)))
+
+
+def cmd_write(sdir, kit, uid, apply, out, stop=None, ask=input):
+    state, folder, problems, notes = load(sdir, kit, uid, stop)
+    if state == "absent" and not problems:
+        out("No settings at %s yet, so there is nothing to write from. `init` makes the folder." % sdir)
+        return EX_OK
+    if problems:
+        say_problems(problems, out)
+        out("Nothing was written: `check` must pass first.")
+        return EX_FIX
+    try:
+        record = read_record(sdir)
+    except (OSError, ValueError) as exc:
+        out("Nothing was written: %s, the record of what was last written, could not be read (%s). Without it a "
+            "hand edit cannot be told from the folder's own change. Move it aside to start a new one." % (
+                RECORD, type(exc).__name__))
+        return EX_FIX
+    for note in notes:
+        out("NOTE: %s." % note)
+    plans = [plan_file(folder, kit, name, uid, record.get(name)) for name in kit.files]
+    show_plans(plans, out)
     stop_all = blocked(plans)
     if stop_all:
         out(stop_all[1])
         return stop_all[0]
+    edits = [(p, e) for p in plans for e in p.edits]
+    if edits:
+        if not apply:
+            out("Nothing was written. %d hand edit%s above: `write --apply` asks, for each one, whether the "
+                "file's value or the folder's wins." % (len(edits), "" if len(edits) == 1 else "s"))
+            return EX_WAITING
+        choices = ask_choices(edits, ask, out)
+        if choices is None:
+            return EX_WAITING
+        takes = [(p.name, e[0], e[1]) for p, e in edits if choices[(p.name, e[0])] == "file"]
+        if takes:
+            why = take_from_files(sdir, kit, takes)
+            if why:
+                out("Nothing was written: %s." % why)
+                return EX_FIX
+            for name, key, _value in takes:
+                out("The folder now takes %s %s from the file, in [%s]." % (name, key, own_section(name)))
+            state, folder, problems, notes = load(sdir, kit, uid, stop)
+            if problems:
+                say_problems(problems, out)
+                return EX_FIX
+        force = dict((name, set(k for (n, k), c in choices.items() if n == name and c == "folder"))
+                     for name in kit.files)
+        plans = [plan_file(folder, kit, name, uid, record.get(name), force[name]) for name in kit.files]
+        if [p for p in plans if p.edits] or blocked(plans):
+            out("A part file changed again while you chose. Nothing more was written. Run write again.")
+            return EX_FIX
     todo = [p for p in plans if p.state == "change"]
     count = sum(len(p.changes) for p in todo)
     if not todo:
         out("Nothing to write: every part file on this Mac already says what the folder says.")
+        if apply:
+            why = save_record(sdir, record, folder, plans, set())
+            if why:
+                out("FAILED: %s could not be kept (%s), so a later hand edit will read as the folder's change."
+                    % (RECORD, why))
+                return EX_FAILED
         return EX_OK
     if not apply:
         out("Nothing was written. `write --apply` writes these %d change%s to %d file%s."
@@ -1217,19 +1519,23 @@ def cmd_write(sdir, kit, uid, apply, out, stop=None):
             out("NOT WRITTEN: %s %s." % (p.path, why))
         out("Nothing was written: a part file changed after it was read. Run write again.")
         return EX_FIX
-    failed = 0
+    failed, written = 0, set()
     for p in todo:
         why = apply_plan(p)
         if why:
             failed += 1
             out("FAILED: %s %s." % (p.path, why))
         else:
+            written.add(p.name)
             out("Wrote %s and read it back: it matches." % p.path)
+    lost = save_record(sdir, record, folder, plans, written)
+    if lost:
+        out("FAILED: %s could not be kept (%s), so a later hand edit will read as the folder's change."
+            % (RECORD, lost))
     if failed:
         out("%d of %d files were not written, part way through the write. The lines above name each file: "
             "Wrote, or FAILED and as it was, or check it by hand." % (failed, len(todo)))
-        return EX_FAILED
-    return EX_OK
+    return EX_FAILED if failed or lost else EX_OK
 
 
 def template(kit):
@@ -1325,12 +1631,125 @@ def cmd_gather(sdir, kit, uid, parts_dir, apply, out, ask, stop=None):
     if not unchanged(g, gather(kit, parts_dir, uid)) or folder_state(sdir, kit) != ("empty", ""):
         out("The part files or the folder changed while you read this. Nothing was written. Run gather again.")
         return EX_FIX
-    why = write_folder(sdir, g, kit)
+    folder = parse_machine(g.machine, kit)[0]
+    for name, text in g.projects.items():
+        folder.projects[name] = parse_project(name, text)[0]
+    folder.places.setdefault("PARTS_DIR", parts_dir)
+    record = record_of(folder, [plan_file(folder, kit, name, uid) for name in kit.files], set())
+    why = write_folder(sdir, g, kit, extra={RECORD: record_text(record)})
     if why:
         out("FAILED: the folder %s." % why)
         return EX_FAILED
     out("Wrote %s and %d project file%s." % (os.path.join(sdir, MACHINE), len(g.projects),
                                              "" if len(g.projects) == 1 else "s"))
+    return cmd_check(sdir, kit, uid, out, stop)
+
+
+def export_blocked(problems):
+    """A folder that fails check is never exported: no secret and nothing broken leaves it."""
+    return bool(problems)
+
+
+def cmd_export(sdir, kit, uid, to, out, stop=None):
+    state, folder, problems, _notes = load(sdir, kit, uid, stop)
+    if state == "absent" and not problems:
+        out("No settings at %s yet, so there is nothing to export." % sdir)
+        return EX_OK
+    if export_blocked(problems):
+        say_problems(problems, out)
+        out("Nothing was exported: `check` must pass first, so no secret and nothing broken leaves the folder.")
+        return EX_FIX
+    repo = git_tree(os.path.dirname(to), stop)
+    if repo:
+        out("REFUSED: %s is inside a git working tree (%s). Your settings never go in a repository. Nothing was "
+            "written." % (to, repo))
+        return EX_FIX
+    files = bundle_files(sdir)
+    on = [name for name in kit.files if os.path.lexists(part_path(folder, kit, name)[0])]
+    text = export_text(files, on)
+    if secret_problems(text):
+        out("Nothing was exported: something in it is shaped like a secret.")
+        return EX_FIX
+    try:
+        put_file(to, text, FILE_MODE, new=True)
+        back = parse_export(read_text(to))
+    except (OSError, ValueError) as exc:
+        out("FAILED: %s could not be written (%s)%s. Nothing was written." % (
+            to, type(exc).__name__, ": a file is already there" if isinstance(exc, FileExistsError) else ""))
+        return EX_FAILED
+    if back[2] or back[0] != dict((p, ended(t)) for p, t in files):
+        out("FAILED: %s was written but reads back differently. Check it by hand." % to)
+        return EX_FAILED
+    out("Wrote %s: machine.conf and %d project file%s, and no secret. Copy it to the other Mac and run "
+        "`import --from` there." % (to, len(files) - 1, "" if len(files) == 2 else "s"))
+    return EX_OK
+
+
+def cmd_import(sdir, kit, uid, src, apply, out, ask, stop=None):
+    try:
+        text = read_text(src)
+    except (OSError, ValueError) as exc:
+        out("COULD NOT RUN: %s could not be read (%s). Nothing was written." % (src, type(exc).__name__))
+        return EX_UNREAD
+    state, why = folder_state(sdir, kit)
+    if state == "unread":
+        out("COULD NOT RUN: %s: %s. Nothing was changed." % (sdir, why))
+        return EX_UNREAD
+    if state == "filled":
+        out("%s already holds settings (%s). `import` only fills a folder that is empty, or holds the file "
+            "`init` makes, untouched. Nothing was changed." % (sdir, why))
+        return EX_OK
+    repo = git_tree(sdir, stop)
+    if repo:
+        out("REFUSED: %s is inside a git working tree (%s). Settings never go in a repository. Nothing was "
+            "written." % (sdir, repo))
+        return EX_FIX
+    files, on, problems = parse_export(text)
+    folder, found = import_problems(files, kit) if not problems else (Folder(), [])
+    out("Read %s: %s." % (src, ", ".join(sorted(files)) or "no settings file"))
+    for p in problems + found:
+        out("STOP: %s." % p)
+    if problems or found:
+        out("Nothing was written: the export file needs fixing first.")
+        return EX_FIX
+    on = [n for n in on if n in kit.files]
+    missing = [n for n in on if not os.path.lexists(part_path(folder, kit, n)[0])]
+    if on:
+        out("NOTE: on the Mac it came from, these part files were on: %s." % ", ".join(on))
+    if missing:
+        out("NOTE: here, %s %s not there yet. Each of those parts stays off until its file is: copy its example "
+            "(such as cp %s.example %s), then run `write`." % (", ".join(missing), "is" if len(missing) == 1 else
+                                                                "are", missing[0], missing[0]))
+    for key, value in sorted(folder.places.items()):
+        if value and (key == "PARTS_DIR" or key in kit.conf_keys) and not os.path.exists(value):
+            out("NOTE: [places] %s names %s, which is not on this Mac. Change it in machine.conf after the "
+                "import." % (key, value))
+    for path in sorted(files, key=lambda p: (p != MACHINE, p)):
+        out("--- %s would hold:" % os.path.join(sdir, path))
+        for line in files[path].splitlines():
+            out("    " + line)
+    if not apply:
+        out("Nothing was written. `import --apply` writes it, after your yes. It never writes a part file.")
+        return EX_WAITING
+    if not said_yes(ask("Write this to %s? Type yes: " % sdir)):
+        out("Nothing was written.")
+        return EX_WAITING
+    try:
+        again = read_text(src)
+    except (OSError, ValueError):
+        again = None
+    if not same_export(again, text) or folder_state(sdir, kit) != ("empty", ""):
+        out("The export file or the folder changed while you read this. Nothing was written. Run import again.")
+        return EX_FIX
+    g = Gathered()
+    g.machine = files[MACHINE]
+    g.projects = dict((p[len(PROJECTS) + 1:-len(".conf")], t) for p, t in files.items() if p != MACHINE)
+    why = write_folder(sdir, g, kit)
+    if why:
+        out("FAILED: the folder %s." % why)
+        return EX_FAILED
+    out("Wrote %s and %d project file%s. No part file was touched: `write` shows what reaches each one."
+        % (os.path.join(sdir, MACHINE), len(g.projects), "" if len(g.projects) == 1 else "s"))
     return cmd_check(sdir, kit, uid, out, stop)
 
 
@@ -1377,13 +1796,17 @@ def main(argv=None, environ=None, out=print, uid=None, kit_root=KIT, stop=None, 
     ap = argparse.ArgumentParser(description="The pipeline's settings, in one folder on this Mac.")
     ap.add_argument("--selftest", action="store_true")
     sub = ap.add_subparsers(dest="cmd")
-    for name in ("where", "init", "gather", "check", "write"):
+    for name in ("where", "init", "gather", "check", "write", "export", "import"):
         p = sub.add_parser(name)
         p.add_argument("--settings-dir")
-        if name in ("write", "gather"):
+        if name in ("write", "gather", "import"):
             p.add_argument("--apply", action="store_true")
         if name == "gather":
             p.add_argument("--parts-dir", help="where the part files are (default: this kit folder)")
+        if name == "export":
+            p.add_argument("--to", required=True, help="the export file to make (never one that is there)")
+        if name == "import":
+            p.add_argument("--from", dest="source", required=True, help="the export file to read")
     sub.add_parser("map")
     args = ap.parse_args(argv)
     if args.selftest:
@@ -1394,8 +1817,9 @@ def main(argv=None, environ=None, out=print, uid=None, kit_root=KIT, stop=None, 
         return EX_FIX
     environ = os.environ if environ is None else environ
     uid = os.getuid() if uid is None else uid
-    writes = args.cmd == "init" or (args.cmd in ("write", "gather") and args.apply)
-    if writes and refused("%s%s" % (args.cmd, " --apply" if args.cmd != "init" else ""), environ, uid, out):
+    writes = args.cmd in ("init", "export") or (args.cmd in ("write", "gather", "import") and args.apply)
+    if writes and refused("%s%s" % (args.cmd, " --apply" if args.cmd not in ("init", "export") else ""),
+                          environ, uid, out):
         return EX_REFUSED
     try:
         kit = Kit(kit_root)
@@ -1419,7 +1843,12 @@ def main(argv=None, environ=None, out=print, uid=None, kit_root=KIT, stop=None, 
             return cmd_gather(sdir, kit, uid, parts_dir, args.apply, out, ask, stop)
         if args.cmd == "check":
             return cmd_check(sdir, kit, uid, out, stop)
-        return cmd_write(sdir, kit, uid, args.apply, out, stop)
+        if args.cmd == "export":
+            return cmd_export(sdir, kit, uid, os.path.abspath(os.path.expanduser(args.to)), out, stop)
+        if args.cmd == "import":
+            return cmd_import(sdir, kit, uid, os.path.abspath(os.path.expanduser(args.source)), args.apply, out,
+                              ask, stop)
+        return cmd_write(sdir, kit, uid, args.apply, out, stop, ask)
     except (OSError, ValueError) as exc:
         out("COULD NOT RUN: the settings could not be read (%s). Nothing was written." % type(exc).__name__)
         return EX_UNREAD
@@ -1488,6 +1917,10 @@ def battery():
 
     def settings(body):
         put(machine, "[places]\nPARTS_DIR=%s\n%s" % (parts, body))
+
+    def forget():                       # a case that rewrites part files itself starts the record afresh
+        if os.path.lexists(os.path.join(sdir, RECORD)):
+            os.remove(os.path.join(sdir, RECORD))
 
     # 1. The folder's own place is a setting: the default under the user's Library, the variable, the flag.
     home = os.path.expanduser("~")
@@ -1566,6 +1999,7 @@ def battery():
 
     # 4. A part's own value wins, and check says so.
     put(os.path.join(parts, "stage-a.conf"), get(kit.examples["stage-a.conf"]))
+    forget()
     settings("[shared]\nROLE_ACCOUNT=_pipeline\n[stage-a.conf]\nROLE_ACCOUNT=_planner\n")
     code, said = run("check", *sd)
     check("check notes a part's own value that stops a shared one",
@@ -1629,8 +2063,8 @@ def battery():
           True)
     real_plan = globals()["plan_file"]
 
-    def plan_then_edit(folder, kit, name, uid):      # the last file changes after it is read
-        plan = real_plan(folder, kit, name, uid)
+    def plan_then_edit(folder, kit, name, uid, record=None, force=()):    # the last file changes after it is read
+        plan = real_plan(folder, kit, name, uid, record, force)
         if name == "watcher.conf":
             with open(os.path.join(parts, name), "a", encoding="utf-8") as fh:
                 fh.write("# edited while write ran\n")
@@ -1638,6 +2072,7 @@ def battery():
 
     def others():
         return dict((k, v) for k, v in snapshot(parts).items() if not k.endswith("watcher.conf"))
+    forget()                            # the cases above wrote stage-e.conf past the record
     before = others()
     globals()["plan_file"] = plan_then_edit
     try:
@@ -1649,6 +2084,7 @@ def battery():
           (EX_FIX, True, True))
     crlf = os.path.join(parts, "bridge.conf")
     put(crlf, "ROLE_ACCOUNT=_old\r\nJOB_LABEL=com.test.bridge\r\n# no final newline\r\nTEAM_KEYS=X", 0o600)
+    forget()
     settings("[shared]\nROLE_ACCOUNT=_crlf\n")
     run("write", "--apply", *sd)
     check("CRLF endings and a missing final newline are kept",
@@ -1751,6 +2187,7 @@ def battery():
     put(machine, "[shared]\nROLE_ACCOUNT=_only\n")
     for name in kit.files:
         put(os.path.join(parts, name), get(kit.examples[name]))
+    forget()
     upd = os.path.join(parts, "update.conf")
     put(upd, get(upd).replace("DISPATCHER_SERVICE=com.example.dispatcher", "DISPATCHER_SERVICE=").replace(
         "ROLE_ACCOUNT=_exdispatch", "ROLE_ACCOUNT=").replace("DISPATCHER_ENV_FILE=/opt/example-dispatcher/.env",
@@ -1780,6 +2217,7 @@ def battery():
     # 14. One file per project, composed into each part's list keys.
     for name in kit.files:
         put(os.path.join(parts, name), get(kit.examples[name]))
+    forget()
     pdir = os.path.join(sdir, PROJECTS)
     os.makedirs(pdir, 0o700, exist_ok=True)
     os.chmod(pdir, 0o700)
@@ -1998,6 +2436,9 @@ def battery():
     check("a part file that changes before the yes stops the write",
           (run("gather", "--apply", "--settings-dir", os.path.join(tmp, "g4"), "--parts-dir", gparts,
                ask=edit_then_yes)[0], os.path.lexists(os.path.join(tmp, "g4", MACHINE))), (EX_FIX, False))
+    check("gather keeps the record, so a hand edit made after it is found",
+          any("HAND EDIT sweep.conf SWEEP_IDLE_DAYS: the file says 9, the folder says 3" in s
+              for s in run("write", "--settings-dir", gdir)[1]), True)
     lparts = os.path.join(tmp, "lparts")
     os.makedirs(lparts)
     fill("queue.conf", folder=lparts, **pipe)
@@ -2017,6 +2458,152 @@ def battery():
     os.makedirs(empty)
     check("no part file at all: nothing to gather, said",
           run("gather", "--settings-dir", os.path.join(tmp, "g7"), "--parts-dir", empty)[0], EX_OK)
+
+    # 16. A hand edit: found before the next write, shown with both values, and the person chooses.
+    for name in kit.files:
+        put(os.path.join(parts, name), get(kit.examples[name]))
+    for entry in os.listdir(pdir):
+        os.remove(os.path.join(pdir, entry))
+    forget()
+    settings("[shared]\nROLE_ACCOUNT=_one\n[stage-e.conf]\nPOLL_INTERVAL_SECONDS=150\nGITHUB_APP_LOGIN=bot-login\n")
+    rec = os.path.join(sdir, RECORD)
+    code = run("write", "--apply", *sd)[0]
+    check("a first write asks nothing, and keeps a private record of what it wrote",
+          (code, mode_of(rec), (read_record(sdir) if os.path.exists(rec) else {}).get("stage-e.conf", {}).get(
+              "POLL_INTERVAL_SECONDS")), (EX_OK, "0o600", "150"))
+    stage_e, bridge = os.path.join(parts, "stage-e.conf"), os.path.join(parts, "bridge.conf")
+    put(stage_e, set_line(get(stage_e), "POLL_INTERVAL_SECONDS", "300"))
+    put(bridge, set_line(get(bridge), "ROLE_ACCOUNT", "_hand"))
+    before = snapshot(parts)
+    code, said = run("write", *sd)
+    text = "\n".join(said)
+    check("a hand edit is found before the next write, and shown with both values", (
+        code, "HAND EDIT stage-e.conf POLL_INTERVAL_SECONDS: the file says 300, the folder says 150" in text,
+        "HAND EDIT bridge.conf ROLE_ACCOUNT: the file says _hand, the folder says _one" in text,
+        snapshot(parts) == before), (EX_WAITING, True, True, True))
+    check("…and write --apply writes nothing until the person chooses",
+          (run("write", "--apply", *sd, ask=lambda p: "")[0], snapshot(parts) == before), (EX_WAITING, True))
+
+    def choose(prompt):                 # the file wins for the interval, the folder for the account
+        return "file" if " POLL_INTERVAL_SECONDS:" in prompt else "folder"
+    code = run("write", "--apply", *sd, ask=choose)[0]
+    mine = parse_machine(get(machine), kit)[0]
+    check("the file's value, chosen, stays in the file and goes in that part's own section", (
+        code, conf_values(get(stage_e)).get("POLL_INTERVAL_SECONDS"),
+        mine.parts.get("stage-e.conf", {}).get("POLL_INTERVAL_SECONDS")), (EX_OK, "300", "300"))
+    check("the folder's value, chosen, is written back, and the shared value is untouched", (
+        conf_values(get(bridge)).get("ROLE_ACCOUNT"), mine.shared.get("ROLE_ACCOUNT"),
+        conf_values(get(os.path.join(parts, "queue.conf"))).get("ROLE_ACCOUNT")), ("_one", "_one", "_one"))
+    check("…and the next write finds nothing: the record holds what was chosen", run("write", *sd)[0], EX_OK)
+    put(stage_e, set_line(get(stage_e), "GITHUB_APP_LOGIN", samples[0]))
+    kept_machine = get(machine)
+    code, said = run("write", "--apply", *sd, ask=lambda p: "file")
+    check("a file's value shaped like a secret is never taken into the folder, nor shown", (
+        code, get(machine) == kept_machine, any("can never go in the folder" in s for s in said),
+        any(samples[0] in s for s in said)), (EX_WAITING, True, True, False))
+    run("write", "--apply", *sd, ask=lambda p: "folder")
+    check("…while the folder's value can still win", conf_values(get(stage_e)).get("GITHUB_APP_LOGIN"), "bot-login")
+    put(stage_e, "".join(l for l in get(stage_e).splitlines(True) if not l.startswith("POLL_INTERVAL_SECONDS=")))
+    code, said = run("write", "--apply", *sd, ask=lambda p: "file")
+    check("a key the file no longer sets cannot be taken from it",
+          (code, any("no longer sets POLL_INTERVAL_SECONDS" in s for s in said)), (EX_WAITING, True))
+    run("write", "--apply", *sd, ask=lambda p: "folder")
+    check("…and the folder's value goes back in", conf_values(get(stage_e)).get("POLL_INTERVAL_SECONDS"), "300")
+    project("ops", "TEAM_KEY=OPS\nPARTS=work-queue\n")
+    with open(machine, "a", encoding="utf-8") as fh:
+        fh.write("[queue.conf]\nREPO_BY_LABEL=repo:ops=acme/ops\n")
+    run("write", "--apply", *sd)
+    queue = os.path.join(parts, "queue.conf")
+    put(queue, set_line(get(queue), "REPO_BY_LABEL", ""))
+    kept_machine = get(machine)
+    code, said = run("write", "--apply", *sd, ask=lambda p: "file")
+    check("a file's value that would leave the folder failing check is never taken: machine.conf stays as it was",
+          (code, get(machine) == kept_machine, any("would not pass check" in s for s in said)), (EX_FIX, True, True))
+    run("write", "--apply", *sd, ask=lambda p: "folder")
+    os.remove(os.path.join(pdir, "ops.conf"))
+    put(rec, "{not a record")
+    check("a record that cannot be read stops the write, and never reads as no record",
+          run("write", *sd)[0], EX_FIX)
+    forget()
+
+    # 17. A new Mac: one plain export file, and its import, which writes nothing before a yes.
+    project("app", "REPO=acme/app\nTEAM_KEY=ENG\nPARTS=review\n")
+    run("write", "--apply", *sd)                 # the record exists, and must not travel
+    carry = os.path.join(tmp, "carry")
+    os.makedirs(carry)
+    export = os.path.join(carry, "settings.txt")
+    code = run("export", "--to", export, *sd)[0]
+    bundle = get(export) if os.path.exists(export) else ""
+    check("export writes one private file: machine.conf and each project, under their names", (
+        code, mode_of(export), "=== machine.conf" in bundle, "=== projects/app.conf" in bundle),
+        (EX_OK, "0o600", True, True))
+    check("…never the record, and nothing shaped like a secret", (RECORD in bundle, secret_problems(bundle)),
+          (False, []))
+    check("…and it reads back as the folder's own files",
+          parse_export(bundle)[0], dict((p, ended(t)) for p, t in bundle_files(sdir)))
+    check("export never writes over a file that is there",
+          (run("export", "--to", export, *sd)[0], get(export) == bundle), (EX_FAILED, True))
+    check("export is refused in a session",
+          run("export", "--to", os.path.join(carry, "s2.txt"), *sd, environ={"CLAUDECODE": "1"})[0], EX_REFUSED)
+    check("export never writes inside a git working tree", (
+        run("export", "--to", os.path.join(repo, "s.txt"), *sd)[0], os.path.lexists(os.path.join(repo, "s.txt"))),
+        (EX_FIX, False))
+    mine = get(machine)
+    for label, extra in (("a secret", "# saved: %s\n" % samples[1]), ("a broken line", "[nope]\n")):
+        put(machine, mine + extra)
+        target = os.path.join(carry, "s3.txt")
+        check("export refuses a folder that fails check (%s): nothing leaves it" % label,
+              (run("export", "--to", target, *sd)[0], os.path.lexists(target)), (EX_FIX, False))
+    put(machine, mine)
+    newmac = os.path.join(tmp, "newmac")
+    nsd = ("--settings-dir", newmac, "--from", export)
+    before = snapshot(parts)
+    code, said = run("import", *nsd)
+    text = "\n".join(said)
+    check("import shows the folder the file makes, and writes nothing", (
+        code, os.path.lexists(newmac), "--- %s would hold:" % os.path.join(newmac, MACHINE) in text,
+        "these part files were on" in text), (EX_WAITING, False, True, True))
+    check("import --apply without a yes writes nothing",
+          (run("import", "--apply", *nsd, ask=lambda p: "no")[0], os.path.lexists(newmac)), (EX_WAITING, False))
+    check("import --apply is refused in a session", (
+        run("import", "--apply", *nsd, environ={"CLAUDECODE": "1"}, ask=lambda p: "yes")[0],
+        os.path.lexists(newmac)), (EX_REFUSED, False))
+
+    def edit_export_then_yes(prompt):   # the export file changes while the person reads
+        put(export, bundle + "# a line added late\n")
+        return "yes"
+    check("an export file that changes before the yes stops the import", (
+        run("import", "--apply", *nsd, ask=edit_export_then_yes)[0], os.path.lexists(newmac)), (EX_FIX, False))
+    put(export, bundle)
+    code = run("import", "--apply", *nsd, ask=lambda p: "yes")[0]
+    check("with the yes it writes the folder, private, as the export holds it, with no record and no part file", (
+        code, mode_of(newmac), get(os.path.join(newmac, MACHINE)) if os.path.isdir(newmac) else None,
+        get(os.path.join(newmac, PROJECTS, "app.conf")) if os.path.isdir(newmac) else None,
+        os.path.lexists(os.path.join(newmac, RECORD)), snapshot(parts) == before),
+        (EX_OK, "0o700", ended(get(machine)), ended(get(os.path.join(pdir, "app.conf"))), False, True))
+    held = get(os.path.join(newmac, MACHINE)) if os.path.isdir(newmac) else None
+    check("import never fills a folder that already holds settings",
+          (run("import", "--apply", *nsd, ask=lambda p: "yes")[0],
+           get(os.path.join(newmac, MACHINE)) if os.path.isdir(newmac) else None), (EX_OK, held))
+    for n, (label, body, words) in enumerate((
+            ("a secret", bundle + "# token: %s\n" % samples[2], "shaped like"),
+            ("a path outside the folder", bundle.replace("=== projects/app.conf", "=== ../app.conf"),
+             "not one of the settings'"),
+            ("a file that is not a setting", bundle + "=== notes.txt\nx\n", "not one of the settings'"),
+            ("a line check refuses", bundle.replace("=== machine.conf\n", "=== machine.conf\n[nope]\n"),
+             "is not a section"),
+            ("no machine.conf", "=== projects/app.conf\nREPO=acme/app\nPARTS=review\n", "holds no machine.conf"))):
+        source, target = os.path.join(carry, "bad-%d.txt" % n), os.path.join(tmp, "newmac-%d" % n)
+        put(source, body)
+        code, said = run("import", "--apply", "--settings-dir", target, "--from", source, ask=lambda p: "yes")
+        check("import refuses an export with %s, writes nothing, and never shows a secret" % label, (
+            code, os.path.lexists(target), any(words in s for s in said), any(samples[2] in s for s in said)),
+            (EX_FIX, False, True, False))
+    elsewhere = os.path.join(carry, "elsewhere.txt")
+    put(elsewhere, bundle.replace("PARTS_DIR=%s" % parts, "PARTS_DIR=/no/such/folder"))
+    check("import says when a place it names is not on this Mac", any(
+        "PARTS_DIR names /no/such/folder, which is not on this Mac" in s
+        for s in run("import", "--settings-dir", os.path.join(tmp, "newmac-place"), "--from", elsewhere)[1]), True)
 
     # 13. What it never does.
     with open(os.path.abspath(__file__), encoding="utf-8") as fh:
@@ -2078,7 +2665,8 @@ def selftest():
         ("a part's own value no longer stops the shared one or the projects", dict(own_wins=lambda own, key: False)),
         ("check no longer says where a part's own value wins", dict(overrides=lambda folder: [])),
         ("write without --apply writes",
-         dict(cmd_write=lambda sdir, kit, uid, apply, out, stop=None: o["cmd_write"](sdir, kit, uid, True, out, stop))),
+         dict(cmd_write=lambda sdir, kit, uid, apply, out, stop=None, ask=input: o["cmd_write"](
+             sdir, kit, uid, True, out, stop, ask))),
         ("a Claude session is not refused", dict(AGENT_ENV_MARKERS=())),
         ("root is not refused",
          dict(refused=lambda what, environ, uid, out: o["refused"](what, environ, uid or 501, out))),
@@ -2128,7 +2716,24 @@ def selftest():
         ("gather writes without --apply",
          dict(cmd_gather=lambda sdir, kit, uid, parts_dir, apply, out, ask, stop=None: o["cmd_gather"](
              sdir, kit, uid, parts_dir, True, out, lambda prompt: "yes", stop))),
-        ("gather takes any answer for a yes", dict(said_yes=lambda answer: True)),
+        ("gather and import take any answer for a yes", dict(said_yes=lambda answer: True)),
+        ("a hand edit reads as the folder's own change", dict(hand_edited=lambda name, key, have, recorded: False)),
+        ("a hand edit is decided without the person",
+         dict(ask_choices=lambda edits, ask, out: dict(((p.name, e[0]), "folder") for p, e in edits))),
+        ("the file's value goes in [shared], not its own section", dict(own_section=lambda name: "shared")),
+        ("a file's value is taken whatever it holds", dict(takeable=lambda name, key, have: None)),
+        ("the record is not kept", dict(save_record=lambda *a: None)),
+        ("export carries the record",
+         dict(bundle_files=lambda sdir: o["bundle_files"](sdir) + [(RECORD, read_text(os.path.join(sdir, RECORD)))])),
+        ("export takes a folder that fails check", dict(export_blocked=lambda problems: False)),
+        ("import takes a file of any name", dict(bundle_path_ok=lambda path: True)),
+        ("import takes settings check would refuse", dict(import_problems=lambda files, kit: (Folder(), []))),
+        ("import writes what the export said before it changed", dict(same_export=lambda again, text: True)),
+        ("a file's value is taken though the folder would then fail check",
+         dict(folder_problems=lambda text, kit, projects: [])),
+        ("import writes without --apply",
+         dict(cmd_import=lambda sdir, kit, uid, src, apply, out, ask, stop=None: o["cmd_import"](
+             sdir, kit, uid, src, True, out, lambda prompt: "yes", stop))),
         ("gather writes what the part files said before they changed", dict(unchanged=lambda g, again: True)),
     )
     missed = [label for label, patched in mutants if not caught(**patched)]

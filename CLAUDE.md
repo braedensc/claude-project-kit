@@ -276,7 +276,9 @@ npm run test:settings        # the settings folder (KIT-853): one machine.conf u
                              #   value written to every part file the map names, shown first, --apply
                              #   refused under a model; no secret, no other reader, no link, no repo;
                              #   a file per project composed into the parts' lists, and a first-run
-                             #   gather that copies no secret and writes nothing before a yes (KIT-854)
+                             #   gather that copies no secret and writes nothing before a yes (KIT-854);
+                             #   a hand edit shown with both values for the person's choice, and a
+                             #   plain export (no secret, no record) and an import on a new Mac (KIT-855)
 npm run test:chat-lane-setup # chat-lane composer: owner's grant, fence keeps defaults, verify agent-refused
 npm run test:model-switch    # the dispatcher's chat-model switch (KIT-385): the pair alone or no
                              #   go, every open pipeline ticket on the default tagged first
