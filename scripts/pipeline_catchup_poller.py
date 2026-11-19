@@ -356,7 +356,7 @@ def runner_lane_split(cfg):
         lanes = runner_store.read_lanes(lane["store_dir"])
     except runner_store.StoreError as exc:
         return teams, [], {"kind": "runner-lanes", "state": FIRING, "summary": (
-            "the runner's lanes could not be read (%s), so no team was left out: a lost delegation "
+            "the runner's lanes could not be used (%s), so no team was left out: a lost delegation "
             "of any team is still re-sent. The bounce driver cannot tell either, and says so on "
             "each pull request it holds" % exc)}
     left = [t for t in teams if (lane["teams"].get(t) or []) and all(

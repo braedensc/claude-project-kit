@@ -140,12 +140,20 @@ from `stage-e.conf`:
 | `CATCHUP_MAX_PAGES` | `10` | Pages of 50 sessions read per pass; raise it only when the job says its read was cut short |
 | `HOLD_FILE` | empty | The watcher's hold file, shared with the bounce driver. While it exists, nothing is re-prompted |
 
-The teams are the installer's `MANAGED_TEAM_KEYS`, less any team in `RUNNER_LANE_REPOS`. Fixes
-for those teams' repositories go to our own runner, which keeps its own requests, so a lost fix
-hand-off is not this job's to re-send. Name a team there only once its coding sessions run
-through the runner too. Until then a lost delegation of its is no longer re-sent. With no team
-left the job is not installed, as with `CATCHUP_INTERVAL_SECONDS=off`
-(docs/STAGE-E-OPERATOR.md, step 5a). The review team is never caught up: the review poller times
+The teams are the installer's `MANAGED_TEAM_KEYS`. A team that `RUNNER_LANE_REPOS` wires to our
+own runner is left out pass by pass (KIT-707): each pass reads the lanes the runner says it takes,
+from its store, as the bounce driver does. While the runner's `fix` lane is on for every one of
+that team's projects, its fixes go by resume through the runner, and the pass leaves it out. Switch
+that lane off and the next pass catches the team up again. So one setting, the runner's `fix` lane,
+moves a project's fixes and this job together, both ways, with no installer run
+(docs/STAGE-E-OPERATOR.md, step 5a). Switch a project's fix lane on only once its coding sessions
+run through the runner too: until then a lost delegation of its team is no longer re-sent.
+
+A pass that leaves every team out reads nothing and re-prompts nothing, not even the route or the
+webhook, and says so. Lanes it cannot read leave no team out, and fire: the monitor pages you.
+
+Good: `OK runner-lane nothing to catch up: the runner takes every team's fixes by resume (KIT)`.
+Not: a team left out because `RUNNER_LANE_REPOS` names it while the runner's `fix` lane is off. The review team is never caught up: the review poller times
 its own sessions out. It uses the tracker key Stage E already stores, so
 it needs no new credential. `--example-config` prints every key of its own config file.
 
