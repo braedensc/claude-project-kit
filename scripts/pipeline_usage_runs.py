@@ -24,6 +24,12 @@ WHAT IT READS.
      scripts/pipeline_spend_ledger.py: the morning job's planner calls, the stand-up's turns,
      the tech lead's turns and the conflict waker's fix sessions. Each call is a run of its
      caller's kind, priced by the CLI's own total or unpriced, with no length and no ticket.
+  4. The runner's run records, when the config names its store (`runner_store`), through the
+     store's one reader, scripts/pipeline_runner_store.py (KIT-860, contract §28). Each record is
+     one run: its kind is the record's own, and its spend is its share of its session's running
+     total, as a log's run's is, or unpriced. A run whose program never started is no run. A
+     runner run that the logs hold too (the same session, started within a minute) is counted
+     once, from its log, with the kind its record gives.
 
 WHAT IT GIVES.  Each log file is one run: its kind (tech lead, review, planner, coding, bounce
 fix, conflict fix, catch-up or other later), its own spend and tokens, its length in seconds,
@@ -37,10 +43,12 @@ window holds (`None` when the logs folder could not be listed), each a dict: `wo
 `seconds`, `last`, `key_source`, `events`, `weekly` and `event_times`. `baselines` are older
 runs read for their total only and never counted. `pendings` are the placeholders, and
 `unmatched_placeholders(scanned)` picks out the runs that never reached the model. `sources`
-holds a record for each of `logs`, `ledger` and `planner`. `spend` holds, for each caller in
-pipeline_spend_ledger.CALLERS, {"note", "calls"}: the reader's note, and its calls as runs
+holds a record for each of `logs`, `ledger`, `planner` and `runner`. `spend` holds, for each caller
+in pipeline_spend_ledger.CALLERS, {"note", "calls"}: the reader's note, and its calls as runs
 (`last`, `cost`, `seconds` 0, `kind`, `model`, `billing`), or None, never an empty list, for a
-ledger that is off or could not be read.
+ledger that is off or could not be read. `runner` holds the runner's runs as runs, each with the
+keys a log's run has, or None, never an empty list, when the store is off or could not be read.
+Every run says where it was counted from: `source` is `logs` or `runner`.
 
 FIELDS ONLY.  Numbers, ticket ids, model names that match a strict pattern, and words from
 closed lists. No prompt, reply, comment or title is kept, and no error line quotes an
@@ -69,11 +77,18 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 import pipeline_spend_ledger as spend_ledger  # noqa: E402  (the spend ledgers' one reader, §30)
+import pipeline_runner_store as runner_store  # noqa: E402  (the runner's records' one reader, §28)
 
 EXIT_USAGE = 2
 
 READ, PARTLY, COULD_NOT, OFF = "read", "partly-read", "could-not-read", "off"
-SOURCES = ("logs", "ledger", "planner")
+SOURCES = ("logs", "ledger", "planner", "runner")
+# Where a run was counted from (KIT-860): the old dispatcher's logs, or the runner's records.
+LOGS, RUNNER = "logs", "runner"
+# The usage file's kind for each of the runner's (contract §28), and how close a log's start must
+# be to a runner run's for the two to be one run.
+RUNNER_KINDS = runner_store.USAGE_KINDS
+TWIN_SECONDS = 60
 
 # The kinds of work a run can be, in the order the usage file lists them.
 KINDS = ("tech_lead", "review", "planner", "coding", "bounce_fix", "conflict_fix", "catch_up",
@@ -742,6 +757,102 @@ def read_spend(cfg, now):
     return out
 
 
+def runner_run(rec, now_at):
+    """One of the runner's records as a run (KIT-860, contract §17), or None for a run whose
+    program never started, which spent nothing. Its kind is the record's own. Its `total` is the
+    record's `cost_usd`, the program's result total: for a resumed session, the session's running
+    total, as a log's result line is (Stage E on #636). price_runner() turns it into the run's
+    own share. A cost the record does not give is unpriced, and so is a zero from a run that did
+    not end with exit 0, as a crash's zeroed total is: never zero. A run still going counts on the
+    day it started, unpriced, and its length so far is its seconds. Fields only: the ticket, the
+    run and session ids, the times, the kind and the figures."""
+    if rec["reason"] == "could-not-start":
+        return None
+    started = epoch(rec["started_at"])
+    ended = epoch(rec["ended_at"]) if rec["ended_at"] else None
+    if started is None:
+        return None
+    total = money(rec["cost_usd"])
+    if total == 0 and not (rec["state"] == "ended" and rec["exit"] == 0):
+        total = None
+    if rec["seconds"] is not None:
+        seconds = finite(rec["seconds"], 0.0, 1e9) or 0.0
+    elif rec["state"] in runner_store.LIVE:
+        seconds = max(0.0, now_at - started)
+    else:
+        seconds = 0.0
+    return {"source": RUNNER, "run": rec["run"], "workspace": rec["ticket"],
+            "session": rec["session_id"], "kind": RUNNER_KINDS[rec["kind"]],
+            "how": "runner record", "total": total, "cost": None,
+            "start": started, "last": ended if ended is not None else started,
+            "seconds": int(seconds), "models": {},
+            "tokens": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0},
+            "key_source": None, "events": {}, "weekly": None, "event_times": [],
+            "limit_stop": None, "started": None}
+
+
+def price_runner(runs):
+    """Each runner run's own share of its session's running total (Stage E on #636), as price()
+    gives a log's run: its total less the total of the session's previous run that gave one, in
+    the order the runs started. The chain is every record of the session the store holds, older
+    ones past the logs' reach included, so a resume's base is never lost. A smaller total means
+    the session started again, so the whole total is the share. A run with no usable total is
+    unpriced and is never the next run's base: its spend lands in the next priced run."""
+    chains = {}
+    for r in runs:
+        chains.setdefault(r["session"], []).append(r)
+    for chain in chains.values():
+        chain.sort(key=lambda r: (r["start"], r["run"]))
+        prev = None
+        for r in chain:
+            r["cost"] = None
+            if r["total"] is None:
+                continue
+            restart = prev is not None and r["total"] < prev
+            r["cost"] = round(r["total"] if prev is None or restart else r["total"] - prev, 6)
+            prev = r["total"]
+
+
+def read_runner(cfg, now):
+    """(the runner's runs the logs' reach holds, or None, and its source): every record through
+    the store's one reader, pipeline_runner_store.read_runs() (contract §28). Off when the config
+    names no store. A store that cannot be read is said, and gives no runs at all, never an empty
+    list; a record that cannot be read is said, and the others are counted."""
+    src = Source(now, off=not cfg.get("runner_store"))
+    if src.off:
+        return None, src
+    src.ask()
+    got = runner_store.read_runs(cfg["runner_store"])
+    if got["runs"] is None:
+        src.fail("the runner's store could not be read (%s): is runner_store right? Set it to "
+                 "\"\" to turn this source off" % got["why"])
+        return None, src
+    src.answer()
+    if got["state"] != READ:
+        src.fail("the runner's store was read in part: %s" % got["why"])
+    now_at = now()
+    reach = now_at - (cfg["lookback_days"] + 1) * 86400
+    every = [r for r in (runner_run(rec, now_at) for rec in got["runs"]) if r is not None]
+    price_runner(every)                 # the whole chain of each session, older runs included
+    return [r for r in every if r["last"] >= reach], src
+
+
+def twins(runs, runner_runs):
+    """KIT-860: the runner's runs that no log holds. A runner run whose session the dispatcher's
+    logs hold too, in a run that started within TWIN_SECONDS of it, is that one run: it is counted
+    once, from its log, which says more of it (its models, tokens, sign-in and usage events), and
+    the log's run takes the kind the runner's record gives."""
+    alone = []
+    for rr in runner_runs:
+        twin = next((r for r in runs if r["session"] == rr["session"]
+                     and abs(r["start"] - rr["start"]) <= TWIN_SECONDS), None)
+        if twin is None:
+            alone.append(rr)
+        else:
+            twin["kind"], twin["how"] = rr["kind"], "runner record"
+    return alone
+
+
 def scan(cfg, now):
     """Everything one pass reads, priced and classified. Pure over files: --selftest calls
     it, and compares each run with what its log was written to say."""
@@ -750,20 +861,24 @@ def scan(cfg, now):
     reviewers = read_reviewers(cfg, ledger_src)
     logs_src = Source(now)
     found = read_logs(cfg, now, logs_src)
+    runner_runs, runner_src = read_runner(cfg, now)
     scanned = {"planners": planners, "reprompts": reprompts, "runs": None, "baselines": [],
                "reviewers": reviewers or frozenset(),
                "pendings": [], "sources": {"logs": logs_src, "ledger": ledger_src,
-                                           "planner": planner_src},
-               "spend": read_spend(cfg, now)}
+                                           "planner": planner_src, "runner": runner_src},
+               "spend": read_spend(cfg, now), "runner": runner_runs}
     if found is None:
         return scanned
     runs, baselines, pendings, firsts = found
     classify(runs, cfg, planners, reprompts, firsts, reviewers or frozenset())
     price(runs, baselines)
     for r in runs:
+        r["source"] = LOGS
         r["seconds"] = (int(max(0.0, r["last_at"] - r["first_at"]))
                         if r["last_at"] is not None else 0)
         r["last"] = r["last_at"] if r["last_at"] is not None else r["start"]
+    if runner_runs is not None:
+        scanned["runner"] = twins(runs, runner_runs)
     scanned.update(runs=runs, baselines=baselines, pendings=pendings)
     return scanned
 
@@ -1076,6 +1191,66 @@ def selftest_kit():
                            "tokens": {"input": 10, "output": 5, "cache_read": 0,
                                       "cache_write": 0}})
 
+    def runner_rec(n, kind, ticket, started, ended=None, state="ended", reason="ended", code=0,
+                   cost=None, seconds=None, session=None):
+        """One of the runner's run records, as its store keeps it (contract §28)."""
+        live = state in runner_store.LIVE
+        rec = dict.fromkeys(runner_store.RUN_KEYS)
+        rec.update(schema=runner_store.RUN_SCHEMA, run="run-%032x" % n, request="rq-%032x" % n,
+                   caller="queue", kind=kind, project="app", ticket=ticket,
+                   started_for="request", approved_by="owner-1", approved_at=started, how="move",
+                   session_id=session or sid(100 + n), workspace="/work/%s/%s" % (kind, ticket),
+                   branch="feat/%s-x" % ticket.lower(), state=state, started_at=started,
+                   ended_at=None if live else ended, seconds=seconds,
+                   exit=None if live else code, reason=None if live else reason, cost_usd=cost)
+        return rec
+
+    # The runner's world (KIT-860), each record labelled. R1, R2 and R3 are one session: R3 left no
+    # total, so it is no base, and R2 resumed R1, whose $1.25 its $1.65 running total holds (Stage
+    # E on #636). R7 never started its program, R8 is past the logs' reach, and R9 is a run the
+    # logs hold too: E14's session, ten seconds after it. R11 shares B0's and B1's session, two
+    # hours after B1: a run of its own.
+    RUNNER_RECS = [
+        ("R1", runner_rec(1, "code", "ENG-30", "2026-11-03T08:00:00Z", "2026-11-03T08:30:00Z",
+                          cost=1.25, seconds=1800.0)),
+        ("R2", runner_rec(2, "fix", "ENG-30", "2026-11-03T09:00:00Z", "2026-11-03T09:10:00Z",
+                          cost=1.65, seconds=600.0, session=sid(101))),
+        ("R3", runner_rec(3, "conflict", "ENG-30", "2026-11-02T20:00:00Z", "2026-11-02T20:05:00Z",
+                          state="interrupted", reason="interrupted", code=None, seconds=300.0,
+                          session=sid(101))),
+        ("R4", runner_rec(4, "review", "ENG-31", "2026-11-03T07:00:00Z", "2026-11-03T07:05:00Z",
+                          code=1, cost=0, seconds=300.0)),
+        ("R5", runner_rec(5, "plan", "ENG-32", "2026-11-02T10:00:00Z", "2026-11-02T10:01:00Z",
+                          cost=0, seconds=60.0)),
+        ("R6", runner_rec(6, "acceptance", "ENG-33", "2026-11-03T11:30:00Z", state="running")),
+        ("R7", runner_rec(7, "code", "ENG-34", "2026-11-03T06:00:00Z", "2026-11-03T06:00:01Z",
+                          state="failed", reason="could-not-start", code=None)),
+        ("R8", runner_rec(8, "code", "ENG-35", "2026-10-01T10:00:00Z", "2026-10-01T10:30:00Z",
+                          cost=2.0, seconds=1800.0)),
+        ("R9", runner_rec(9, "fix", "ENG-14", "2026-11-03T05:00:10Z", "2026-11-03T05:00:40Z",
+                          cost=0.5, seconds=30.0, session=sid(8))),
+        ("R10", runner_rec(10, "code", "ENG-36", "2026-11-03T01:00:00Z", "2026-11-03T07:00:00Z",
+                           state="stopped", reason="limit:time", code=None, seconds=21600.0)),
+        ("R11", runner_rec(11, "fix", "ENG-13", "2026-11-03T09:00:00Z", "2026-11-03T09:01:00Z",
+                           cost=0.3, seconds=60.0, session=sid(7))),
+    ]
+
+    def runner_world(root, recs=None, broken=0):
+        """The runner's store under `root`, holding `recs` (RUNNER_RECS by default) and `broken`
+        records that are not records. Returns the store's path, for `runner_store`."""
+        store = os.path.join(root, "runner-store")
+        problems = runner_store.prepare(store)
+        if problems:
+            raise AssertionError(problems[0])
+        for _label, rec in (RUNNER_RECS if recs is None else recs):
+            runner_store.write_run(store, rec)
+        for n in range(broken):
+            folder = os.path.join(store, "runs", "run-%032x" % (900 + n))
+            os.makedirs(folder, mode=0o700)
+            with open(os.path.join(folder, "run.json"), "w", encoding="utf-8") as fh:
+                fh.write("{\"schema\": \"pipeline-runner-run/1\", \"words\": \"%s\"}" % LEAK)
+        return store
+
     def spend_world(root, **over):
         """A spend ledger for each caller under `root`, each in its own folder, holding its
         SPEND_ROWS. `over` gives a caller its own lines instead (a row's tuple, or raw text),
@@ -1161,7 +1336,8 @@ def selftest_kit():
         figures=figures,
         week_event=week_event, std_world=std_world, hostile_world=hostile_world,
         CONFLICT=CONFLICT, BOUNCE=BOUNCE, CATCHUP=CATCHUP, Watch=Watch,
-        SPEND_ROWS=SPEND_ROWS, spend_line=spend_line, spend_world=spend_world)
+        SPEND_ROWS=SPEND_ROWS, spend_line=spend_line, spend_world=spend_world,
+        RUNNER_RECS=RUNNER_RECS, runner_rec=runner_rec, runner_world=runner_world)
 
 
 def _cases(check):
@@ -1275,6 +1451,81 @@ def _cases(check):
         return dict((names[(r["workspace"], r["start"])], r["limit_stop"])
                     for r in scan(cfg_l, lambda: T)["runs"])
 
+    # The runner's world (KIT-860): what each record is as a run, by its label.
+    RUNNER_EXPECT = {
+        "R1": ("coding", 1.25, 1800, "2026-11-03T08:30:00Z"),
+        "R2": ("bounce_fix", 0.4, 600, "2026-11-03T09:10:00Z"),
+        "R3": ("conflict_fix", None, 300, "2026-11-02T20:05:00Z"),
+        "R4": ("review", None, 300, "2026-11-03T07:05:00Z"),
+        "R5": ("planner", 0.0, 60, "2026-11-02T10:01:00Z"),
+        "R6": ("other_later", None, 1800, "2026-11-03T11:30:00Z"),
+        "R10": ("coding", None, 21600, "2026-11-03T07:00:00Z"),
+        "R11": ("bounce_fix", 0.3, 60, "2026-11-03T09:01:00Z"),
+    }
+    RUNNER_LABELS = dict(((rec["ticket"], U(rec["started_at"])), label)
+                         for label, rec in kit.RUNNER_RECS)
+
+    def runner_facts(root):
+        """What the reader makes of the runner's world: each runner run by its label; the kind,
+        how and cost of E14, the log's run R9 is; where the runs were counted from; and the
+        runner source's state, asked, answered and reason."""
+        cfg_r, ids_r = std_world(root, runner_store=kit.runner_world(root))
+        got = scan(cfg_r, lambda: T)
+        rec = got["sources"]["runner"].record()
+        return (dict((RUNNER_LABELS[(r["workspace"], r["start"])],
+                      (r["kind"], r["cost"], r["seconds"], _iso(r["last"])))
+                     for r in got["runner"] or []),
+                [(r["kind"], r["how"], r["cost"]) for r in got["runs"] or []
+                 if ids_r[(r["workspace"], r["start"])] == "E14"],
+                sorted(set(r["source"] for r in got["runs"] or []))
+                + sorted(set(r["source"] for r in got["runner"] or [])),
+                (rec["state"], rec["asked"], rec["answered"], rec["reason"]))
+    RUNNER_FACTS = (RUNNER_EXPECT, [("bounce_fix", "runner record", 0.5)], ["logs", "runner"],
+                    (READ, 1, 1, None))
+
+    # A runner run's spend is its share of its session's running total (Stage E on #636). P1 is a
+    # base past the logs' reach; P4's smaller total is a session that started again; P6 left no
+    # total between P5 and P7, so it is no base.
+    rr = kit.runner_rec
+    PRICED_RECS = [
+        ("P1", rr(41, "code", "ENG-40", "2026-10-02T10:00:00Z", "2026-10-02T10:30:00Z",
+                  cost=2.0, seconds=1800.0, session=sid(140))),
+        ("P2", rr(42, "fix", "ENG-40", "2026-11-03T10:00:00Z", "2026-11-03T10:05:00Z",
+                  cost=2.3, seconds=300.0, session=sid(140))),
+        ("P3", rr(43, "code", "ENG-41", "2026-11-03T02:00:00Z", "2026-11-03T02:30:00Z",
+                  cost=0.9, seconds=1800.0, session=sid(141))),
+        ("P4", rr(44, "conflict", "ENG-41", "2026-11-03T03:00:00Z", "2026-11-03T03:10:00Z",
+                  cost=0.3, seconds=600.0, session=sid(141))),
+        ("P5", rr(45, "code", "ENG-42", "2026-11-03T04:00:00Z", "2026-11-03T04:30:00Z",
+                  cost=1.0, seconds=1800.0, session=sid(142))),
+        ("P6", rr(46, "fix", "ENG-42", "2026-11-03T05:00:00Z", "2026-11-03T05:10:00Z",
+                  state="interrupted", reason="interrupted", code=None, seconds=600.0,
+                  session=sid(142))),
+        ("P7", rr(47, "conflict", "ENG-42", "2026-11-03T06:00:00Z", "2026-11-03T06:10:00Z",
+                  cost=1.5, seconds=600.0, session=sid(142))),
+    ]
+    PRICED_LABELS = dict(RUNNER_LABELS)
+    PRICED_LABELS.update(((rec["ticket"], U(rec["started_at"])), label)
+                         for label, rec in PRICED_RECS)
+    PRICED_EXPECT = {"R1": 1.25, "R2": 0.4, "R3": None, "P2": 0.3, "P3": 0.9, "P4": 0.3,
+                     "P5": 1.0, "P6": None, "P7": 0.5}
+
+    def priced_facts(root):
+        """Each runner run's spend in the priced world, by its label, for the chains above."""
+        cfg_p, _ = std_world(root, runner_store=kit.runner_world(
+            root, recs=kit.RUNNER_RECS + PRICED_RECS))
+        got = scan(cfg_p, lambda: T)
+        return dict((PRICED_LABELS[(r["workspace"], r["start"])], r["cost"])
+                    for r in got["runner"] or []
+                    if PRICED_LABELS[(r["workspace"], r["start"])] in PRICED_EXPECT)
+
+    def missing_facts(root):
+        """The runner's runs and its source, for a config that names a store that is not there."""
+        cfg_m, _ = std_world(root, runner_store=os.path.join(root, "no-store"))
+        got = scan(cfg_m, lambda: T)
+        rec = got["sources"]["runner"].record()
+        return got["runner"], (rec["state"], rec["asked"], rec["answered"], rec["reason"])
+
     LIMIT_EXPECT = {
         "rejected then an error": {"window": "five_hour", "resets_at": U(LIMIT_AT)},
         "rejected and never ended": {"window": "seven_day", "resets_at": U("2026-11-06T09:00:00Z")},
@@ -1299,12 +1550,14 @@ def _cases(check):
         recs = dict((s, scanned["sources"][s].record()) for s in SOURCES)
         check("a read only reads: every log, ledger and record is left as it was found",
               snapshot(*inputs), before)
-        check("every source read, each saying what it was asked and what it answered",
+        check("every source read, each saying what it was asked and what it answered; the "
+              "runner's store, which the config does not name, is off (KIT-860)",
               [(s, recs[s]["state"], recs[s]["asked"], recs[s]["answered"], recs[s]["read_at"])
                for s in SOURCES],
               [("logs", READ, 48, 48, "2026-11-03T12:00:00Z"),
                ("ledger", READ, 4, 4, "2026-11-03T12:00:00Z"),   # KIT-596: + the review record
-               ("planner", READ, 1, 1, "2026-11-03T12:00:00Z")])
+               ("planner", READ, 1, 1, "2026-11-03T12:00:00Z"),
+               ("runner", OFF, 0, 0, None)])
         check("a placeholder no run follows is a run that never reached the model: three of the "
               "25 read, one of them with no start, and none of the 22 that match",
               (sorted(str(p["started"]) for p in unmatched_placeholders(scanned)),
@@ -1716,6 +1969,44 @@ def _cases(check):
         check("a ledger with a line that is not a row is partly read: said, and the rows it "
               "read are its calls", (got_p["note"]["state"], len(got_p["calls"])), (PARTLY, 2))
 
+        # -- the runner's runs (KIT-860): each record through the store's one reader ----------
+        rf = runner_facts(os.path.join(tmp, "runner"))
+        root_w = os.path.join(tmp, "runner-watch")
+        cfg_w, _ = std_world(root_w, runner_store=kit.runner_world(root_w))
+        with Watch() as w:
+            scan(cfg_w, lambda: T)
+        check("the runner's records are read, each one run of its own kind, at the program's own "
+              "total or unpriced (no cost, or a zero from a run that ended badly; a clean zero is "
+              "zero); a run still going counts its time so far; a run whose program never started, "
+              "and one past the logs' reach, are no run", rf[0], RUNNER_EXPECT)
+        check("…a resumed run's spend is its share of its session's running total, as a log's "
+              "run's is: less the previous total, a base past the logs' reach included; a smaller "
+              "total is a session begun again; a run with no total is never the base (Stage E "
+              "on #636)", priced_facts(os.path.join(tmp, "runner-priced")), PRICED_EXPECT)
+        check("…a run the logs hold too (its session, started within a minute) is counted once, "
+              "from its log, with its record's kind; a run of a session the logs hold that started "
+              "two hours apart is a run of its own", (rf[1], "R9" in rf[0], "R11" in rf[0]),
+              ([("bounce_fix", "runner record", 0.5)], False, True))
+        check("…every run says where it was counted from, and the store was read",
+              (rf[2], rf[3]), (["logs", "runner"], (READ, 1, 1, None)))
+        check("…and reading the store writes nothing and opens no socket", (w.wrote, w.net),
+              ([], []))
+        check("a store the config does not name is off: no runs, never an empty list",
+              (scanned["runner"], scanned["sources"]["runner"].record()["state"]), (None, OFF))
+        check("a store that is not there could not be read: said with the config key to check, "
+              "and no runs at all, never an empty list", missing_facts(os.path.join(tmp, "nostore")),
+              (None, (COULD_NOT, 1, 0, "the runner's store could not be read (the store does not "
+                                       "exist): is runner_store right? Set it to \"\" to turn "
+                                       "this source off")))
+        root_b = os.path.join(tmp, "runner-broken")
+        cfg_b, _ = std_world(root_b, runner_store=kit.runner_world(root_b, broken=2))
+        got_b = scan(cfg_b, lambda: T)
+        rec_b = got_b["sources"]["runner"].record()
+        check("a record that is not one is said, never quoted, and the others are counted",
+              (rec_b["state"], rec_b["reason"], len(got_b["runner"]), LEAK in json.dumps(rec_b)),
+              (PARTLY, "the runner's store was read in part: 2 record(s) could not be read, the "
+                       "first run-%032x" % 900, len(RUNNER_EXPECT), False))
+
         # -- the reader opens no socket, starts no process and writes nothing -----------------
         source = inspect.getsource(sys.modules[__name__]).split("\ndef selftest():")[0]
         check("the reader opens no socket, starts no process, reads no environment variable and "
@@ -1736,7 +2027,8 @@ def _cases(check):
     # -- mutants: a check that cannot fail checks nothing -------------------------------------
     with tempfile.TemporaryDirectory() as tmp:
         tmp = os.path.realpath(tmp)
-        original = dict((n, globals()[n]) for n in ("parse_run", "price", "PROMPT_MARKS"))
+        original = dict((n, globals()[n]) for n in ("parse_run", "price", "PROMPT_MARKS",
+                                                    "runner_run", "read_runner", "price_runner"))
         status_word_original = status_word
 
         def reply_usage_parse(path):
@@ -1830,8 +2122,93 @@ def _cases(check):
               limit_caught("m7", parse_run=needs_a_result_parse), True)
         check("mutant: a reset that is no time guessed rather than null is caught",
               limit_caught("m8", parse_run=reset_guessed_parse), True)
+        # The runner's rules (KIT-860), one mutant each.
+        def zero_counted_run(rec, now_at):
+            """runner_run, with a zero from a run that ended badly counted as zero."""
+            run = original["runner_run"](rec, now_at)
+            if run is not None and run["total"] is None and money(rec["cost_usd"]) == 0:
+                run["total"] = 0.0
+            return run
+
+        def never_started_run(rec, now_at):
+            """runner_run, with a run whose program never started counted as one."""
+            if rec["reason"] == "could-not-start":
+                rec = dict(rec, reason="ended")
+            return original["runner_run"](rec, now_at)
+
+        def unread_as_none(cfg_u, now_u):
+            """read_runner, with a store that could not be read read as one with no runs."""
+            runs_u, src_u = original["read_runner"](cfg_u, now_u)
+            return ([], Source(now_u)) if runs_u is None and not src_u.off else (runs_u, src_u)
+
+        def runner_caught(name, **patched):
+            saved = dict((k, globals()[k]) for k in patched)
+            globals().update(patched)
+            try:
+                return runner_facts(os.path.join(tmp, name)) != RUNNER_FACTS
+            finally:
+                globals().update(saved)
+        check("mutant: a zero from a runner run that ended badly counted as zero is caught",
+              runner_caught("m9", runner_run=zero_counted_run), True)
+        check("mutant: every runner run counted as coding, its record's kind ignored, is caught",
+              runner_caught("m10", RUNNER_KINDS=dict((k, "coding") for k in RUNNER_KINDS)), True)
+        check("mutant: a run the logs and the runner both hold counted twice is caught",
+              runner_caught("m11", twins=lambda runs_t, runner_t: list(runner_t)), True)
+        check("mutant: a runner run whose program never started counted is caught",
+              runner_caught("m12", runner_run=never_started_run), True)
+        check("mutant: a log's run said to come from the runner is caught",
+              runner_caught("m13", LOGS=RUNNER), True)
+        saved_read = globals()["read_runner"]
+        globals()["read_runner"] = unread_as_none
+        try:
+            unread = missing_facts(os.path.join(tmp, "m14"))
+        finally:
+            globals()["read_runner"] = saved_read
+        check("mutant: a store that could not be read read as no runs is caught",
+              unread != missing_facts(os.path.join(tmp, "m14-clean")), True)
+        # Stage E on #636: a runner run's spend is its share of its session's running total.
+        def raw_total_price(runs_p):
+            """price_runner, with each run priced at its whole running total."""
+            for r in runs_p:
+                r["cost"] = r["total"]
+
+        def no_total_as_base_price(runs_p):
+            """price_runner, with a run that left no total taken as the next run's base."""
+            chains = {}
+            for r in runs_p:
+                chains.setdefault(r["session"], []).append(r)
+            for chain in chains.values():
+                prev = None
+                for r in sorted(chain, key=lambda x: (x["start"], x["run"])):
+                    r["cost"] = None if r["total"] is None else round(
+                        r["total"] if prev is None or r["total"] < prev else r["total"] - prev, 6)
+                    prev = r["total"]
+
+        def reach_only_read(cfg_u, now_u):
+            """read_runner, with each session priced from the runs in the logs' reach alone."""
+            runs_u, src_u = original["read_runner"](cfg_u, now_u)
+            if runs_u:
+                original["price_runner"](runs_u)
+            return runs_u, src_u
+
+        def priced_caught(name, **patched):
+            saved = dict((k, globals()[k]) for k in patched)
+            globals().update(patched)
+            try:
+                return priced_facts(os.path.join(tmp, name)) != PRICED_EXPECT
+            finally:
+                globals().update(saved)
+        check("mutant: a resumed runner run priced at its whole running total is caught",
+              priced_caught("m15", price_runner=raw_total_price), True)
+        check("mutant: a runner run that left no total taken as the next run's base is caught",
+              priced_caught("m16", price_runner=no_total_as_base_price), True)
+        check("mutant: a resume's base past the logs' reach lost is caught",
+              priced_caught("m17", read_runner=reach_only_read), True)
         check("…and with every mutant undone the job is as it was",
-              facts(os.path.join(tmp, "clean")) == EXPECT, True)
+              (facts(os.path.join(tmp, "clean")) == EXPECT,
+               runner_facts(os.path.join(tmp, "clean-runner")) == RUNNER_FACTS,
+               priced_facts(os.path.join(tmp, "clean-priced")) == PRICED_EXPECT),
+              (True, True, True))
 
 
 if __name__ == "__main__":
