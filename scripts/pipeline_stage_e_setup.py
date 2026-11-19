@@ -457,6 +457,9 @@ REQUIRED_SCRIPTS = ("pipeline_review_poller.py", "pipeline_bounce_local.py",
                     "pipeline_spend_ledger.py",
                     # The one lock a pass of the review poller and the bounce driver takes (KIT-681).
                     "pipeline_pass_lock.py",
+                    # A review's fixed words, which the review poller and the runner's review runs
+                    # share (KIT-644).
+                    "pipeline_review_brief.py",
                     # Their `--selftest` runs inside one run folder it removes (KIT-450).
                     "scratch_run.py")
 
@@ -558,6 +561,22 @@ SIBLING_JOBS = (
     # The acceptance check's live pass (KIT-571), run from this clone by its own LaunchDaemon, which the acceptance installer
     # puts in place (KIT-326). It loads the poller that decides and judges, and the look tool's record reader.
     ("pipeline_acceptance_run.py", ("pipeline_acceptance_poller.py", "pipeline_acceptance_run.py", "pipeline_look.py")),
+    # The runner (KIT-859), our own dispatcher's always-on job, run from this clone by the LaunchDaemon its installer
+    # puts in place. `run` stops it around the clone's move and loads it again, so it runs the moved kit.
+    ("pipeline_runner.py", ("pipeline_bridge.py", "pipeline_bridge_answers.py", "pipeline_bridge_bind.py",
+                            "pipeline_bridge_config.py", "pipeline_bridge_direct.py", "pipeline_bridge_handover.py",
+                            "pipeline_bridge_pings.py", "pipeline_bridge_plans.py", "pipeline_bridge_replan.py",
+                            "pipeline_bridge_requests.py", "pipeline_bridge_tech_lead.py", "pipeline_bridge_tracker.py",
+                            "pipeline_bridge_transport.py", "pipeline_bridge_watch.py", "pipeline_harness_claude.py",
+                            "pipeline_notify_events.py", "pipeline_notify_local.py", "pipeline_plan_brief.py",
+                            "pipeline_plan_executor.py",
+                            "pipeline_plan_poller.py", "pipeline_queue_order.py", "pipeline_queue_pool.py",
+                            "pipeline_queue_read.py", "pipeline_queue_settings.py", "pipeline_queue_start.py",
+                            "pipeline_runner.py", "pipeline_runner_guard.py", "pipeline_runner_limits.py",
+                            "pipeline_session_kinds.py", "pipeline_session_tools.py", "pipeline_sprint.py",
+                            "pipeline_sprint_changes.py", "pipeline_sprint_plan.py", "pipeline_sprint_review.py",
+                            "pipeline_standup.py", "pipeline_tech_lead_tools.py", "pipeline_tech_lead_turn.py",
+                            "pipeline_validator_settings.py", "pipeline_voice.py", "pipeline_window.py")),
 )
 SIBLING_ENTRY_SCRIPTS = tuple(entry for entry, _files in SIBLING_JOBS)
 
@@ -572,7 +591,14 @@ CLONE_JOB_SCRIPTS = REQUIRED_SCRIPTS + tuple(sorted(
 # judged against schemas/review-findings.schema.json and a telemetry row against
 # schemas/telemetry-block.schema.json, so a schema change changes what the daemons do
 # without touching a single script.
-RUNTIME_DATA_DIRS = ("schemas",)
+#
+# session-kinds/ (KIT-880): the runner reads each kind of session's data (its tools, rules, wall
+# and limits) from the clone when it starts. Left out, a merge that changed only a kind's data read
+# as level, and the runner went on starting sessions behind the old walls. It counts on every
+# machine, not only where the runner is installed: those files change rarely (one merge in the 60
+# days to 18 Nov 2026, alongside a script that counted already), so no machine is told "behind"
+# for nothing. The selftest checks that the folder pipeline_session_kinds.py reads is listed here.
+RUNTIME_DATA_DIRS = ("schemas", "session-kinds")
 
 # The colour of a label this installer creates.
 STATE_COLOR = "#95a2b3"
@@ -13574,6 +13600,18 @@ def _selftest_body():
            and "schemas/review-findings.schema.json" in dB,
            "a moved schema the jobs read at run time read %s: %r" % (oB, dB[:160]))
 
+    # KIT-880: a kind of session's data alone, which the runner reads from the clone at its start.
+    cases += 1
+    (oB, dB), _f = _code_row_when_behind(
+        (_fetch, 0, "FETCH_HEAD beef00000000\nsession-kinds/code.json\n"))
+    expect("KIT-880 behind-session-kind-moved-is-named", oB == WOULD_CHANGE
+           and "session-kinds/code.json" in dB,
+           "a moved session kind the runner reads at its start read %s: %r" % (oB, dB[:160]))
+    fetched = [_fmt(a) for a in _f.reads if _fetch in _fmt(a)]
+    expect("KIT-880 behind-compares-the-session-kinds", fetched and all(
+        re.search(r"(^|\s)session-kinds(\s|$)", f) for f in fetched),
+        "the comparison did not name session-kinds among the paths it diffs: %r" % [f[-200:] for f in fetched][:2])
+
     cases += 1
     (oB, dB), _f = _code_row_when_behind((_fetch, 7, ""))
     expect("KIT-149 behind-could-not-fetch-is-unknown", oB == UNKNOWN,
@@ -13652,9 +13690,10 @@ def _selftest_body():
             origin_dir, kit_dir = os.path.join(tmpG, "origin"), os.path.join(tmpG, "kit")
             os.makedirs(os.path.join(origin_dir, "scripts"))
             os.makedirs(os.path.join(origin_dir, "schemas"))
+            os.makedirs(os.path.join(origin_dir, "session-kinds"))
             _git("init", "-q", origin_dir)
             for rel in ("README.md", "scripts/pipeline_bounce_local.py",
-                        "schemas/review-findings.schema.json"):
+                        "schemas/review-findings.schema.json", "session-kinds/code.json"):
                 with open(os.path.join(origin_dir, rel), "w") as fh:
                     fh.write("v1\n")
             _git("add", "-A", cwd=origin_dir)
@@ -13681,6 +13720,12 @@ def _selftest_body():
             expect("KIT-149 behind-shell-runs", rcG == 0
                    and "schemas/review-findings.schema.json" in linesG[1:],
                    "a schema commit: rc %s, %r" % (rcG, linesG))
+            # KIT-880: the clone moved level with origin first, so this diff is the kind alone.
+            _git("merge", "--ff-only", "-q", "FETCH_HEAD", cwd=kit_dir)
+            rcG, linesG = _moved_after("session-kinds/code.json")
+            expect("KIT-880 behind-shell-names-a-session-kind", rcG == 0
+                   and linesG[1:] == ["session-kinds/code.json"],
+                   "a commit to a session kind's data alone: rc %s, %r" % (rcG, linesG))
             gone = Runner().read(["/bin/sh", "-c", fragment(os.path.join(tmpG, "nope"))])
             expect("KIT-149 behind-shell-runs", gone.rc == 7,
                    "a clone that cannot fetch must exit 7, got %s" % gone.rc)
@@ -16940,6 +16985,15 @@ def _selftest_body():
                                          sorted(set(compared) - every)))
 
     _kit280_closure()
+
+    # KIT-880: the data the runner reads at its start counts too. Its kinds' folder is named by the
+    # module that reads it, never by a second copy of the name, so a moved folder fails here.
+    cases += 1
+    import pipeline_session_kinds as _kinds_data
+    kinds_rel = os.path.relpath(_kinds_data.FOLDER, os.path.dirname(here))
+    expect("KIT-880 the-runners-kinds-are-compared", kinds_rel in RUNTIME_DATA_DIRS,
+           "the runner reads its kinds from %s/, and RUNTIME_DATA_DIRS lists %s"
+           % (kinds_rel, list(RUNTIME_DATA_DIRS)))
 
     # -- THE HEARTBEAT MONITOR STEP (KIT-127): the job that reads the three heartbeats --
     # Named ticket, `off` by name, or a card — never a silent absence. Proved to exist and

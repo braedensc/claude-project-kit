@@ -82,7 +82,7 @@ ALLOWED_ARGS = frozenset({
     "merge", "push", "--dry-run", "--apply", "--conf", "--json",
     "stage-e.conf", "stage-a.conf", "notifier.conf", "bridge.conf", "chat-lane.conf",
     "conflict-waker.conf", "queue.conf", "sweep.conf", "watcher.conf", "update.conf",
-    "acceptance.conf",
+    "acceptance.conf", "runner.conf",
 })
 
 # (earlier, later): the later part must need the earlier one, directly or through others.
@@ -436,7 +436,7 @@ def rule_docs(parts):
 
 
 # Placeholders a job row may hold that are no settings key: where the code itself decides.
-JOB_PLACEHOLDERS = frozenset({"role home", "owner home", "kit", "python", "claude", "conf file"})
+JOB_PLACEHOLDERS = frozenset({"role home", "owner home", "kit", "python", "claude", "conf file", "commit"})
 _PLACEHOLDER = re.compile(r"<([^<>]+)>")
 
 
