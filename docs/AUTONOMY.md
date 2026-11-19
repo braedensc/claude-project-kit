@@ -315,10 +315,14 @@ repository you can reach — do not use one here.
 
 ### What it does *not* buy the agent
 
-Nothing about this credential lets a session merge. `gh pr merge` is hook-blocked in
-every form, and the platform-side gate is branch protection, which lives in repository
-settings. Grant the App or PAT no permission beyond the two above — in particular not
-*Administration* or *Workflows* — and the ruleset in tier 3 stays outside its reach.
+It does not buy a merge the hook will run: `gh pr merge` is hook-blocked in every form,
+and so is the same merge sent straight to the API (KIT-897). Both blocks are advisory,
+though, and *Contents: Read and write* is enough to merge a pull request whose checks are
+green. Branch protection decides what may merge, not who, so what would make this
+credential's merge fail on the server is a rule on who may update the default branch
+(docs/SECURITY.md, the merge row). Grant the App or PAT no permission beyond the two
+above — in particular not *Administration* or *Workflows* — and the ruleset in tier 3
+stays outside its reach.
 
 ---
 
