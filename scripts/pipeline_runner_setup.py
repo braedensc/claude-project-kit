@@ -136,6 +136,7 @@ def parse_conf(text, source=DEFAULT_CONF):
 def validate_conf(values, user=None):
     """(conf, errors): every fault in one pass, by key; the runner's own loader judges the rest."""
     c, e = dict(CONF_DEFAULTS, **values), []
+    c["PUSH_TOKEN_UNSET"] = not c["PUSH_TOKEN_FILE"]       # then the installed path, if any, is the owner's and kept
     if not c["PUSH_TOKEN_FILE"]:       # unset: beside the tracker key, in the runner's own folder
         c["PUSH_TOKEN_FILE"] = c["RUNNER_DIR"].rstrip("/") + "/push-token"
 
@@ -219,6 +220,13 @@ OWNED = ("enabled", "store_dir", "work_dir", "session_home", "claude_bin", "toke
 PROJECT_OWNED = ("repo", "base")
 
 
+def push_path(c, was):
+    """The push token's file as the settings should name it. A conf that sets PUSH_TOKEN_FILE decides. One that
+    leaves it unset keeps a path the owner already installed by hand (KIT-886), and only else uses the default."""
+    held = was.get("push_token_file") if isinstance(was, dict) else None
+    return held if c.get("PUSH_TOKEN_UNSET") and isinstance(held, str) and held else c["PUSH_TOKEN_FILE"]
+
+
 def compose(c, on, was=None):
     """The runner's settings: the keys it owns from the conf, the rest of `was` (the installed settings) as it
     is. A project the conf names keeps its own lanes, approved states and hosts; a new one gets every lane off.
@@ -228,7 +236,7 @@ def compose(c, on, was=None):
     doc = dict((k, v) for k, v in was.items() if k not in OWNED)
     doc.update({"enabled": bool(on), "store_dir": d + "/store", "work_dir": d + "/work", "session_home": d + "/home",
                 "claude_bin": c["CLAUDE_BIN"], "token_env": c["TOKEN_ENV"], "linear_key_file": d + "/tracker-key",
-                "push_token_file": c["PUSH_TOKEN_FILE"], "owner_user_ids": split_list(c["OWNER_USER_IDS"]),
+                "push_token_file": push_path(c, was), "owner_user_ids": split_list(c["OWNER_USER_IDS"]),
                 "dispatcher_user_ids": split_list(c["DISPATCHER_USER_IDS"]), "projects": {}})
     for k, (repo, base) in sorted(projects(c["PROJECTS"])[0].items()):
         mine = old.get(k) if isinstance(old.get(k), dict) else {}
@@ -298,6 +306,7 @@ class Ctx(object):
         self.conf, self.runner, self.live, self.ceiling, self.scripts = conf, runner, live, ceiling, scripts
         self.agent = agent_markers(env)
         self.home = self.commit = self.on = self.left_off = self.first = None
+        self.was = None
         self.watch_conf, self.today = os.path.join(KIT, "update.conf"), None      # the push token's end date
 
     account = property(lambda self: self.conf["ROLE_ACCOUNT"])
@@ -426,6 +435,7 @@ def step_settings(ctx, apply_it):
     c, path = ctx.conf, settings_path(ctx.conf)
     have, mode, was = installed(ctx, path)
     ctx.on, why = decide(ctx, was, path)
+    ctx.was = was
     body = settings_body(c, ctx.on, ctx.home, was)
     said = "enabled %s (%s); installed: %s" % ("true" if ctx.on else "false", why, lanes_said(was))
     if have == body and mode == "600":
@@ -449,18 +459,18 @@ def step_settings(ctx, apply_it):
 # Run as the role account, with the file's path as typed (`~/` included: the program expands it with the
 # account's own home). The file's text is never read here: only what kind of file it is.
 TOKEN_STATE_PY = r'''
-import errno, os, stat, sys
+import os, stat, sys
 try:
-    fd = os.open(os.path.expanduser(sys.argv[1]), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    st = os.lstat(os.path.expanduser(sys.argv[1]))
 except FileNotFoundError:
     print("absent")
     sys.exit(0)
-except OSError as exc:
-    print("link" if exc.errno == errno.ELOOP else "unread")
+except OSError:
+    print("unread")
     sys.exit(0)
-st = os.fstat(fd)
-os.close(fd)
-if not stat.S_ISREG(st.st_mode):
+if stat.S_ISLNK(st.st_mode):
+    print("link")
+elif not stat.S_ISREG(st.st_mode):
     print("not-file")
 elif st.st_uid != os.getuid():
     print("other-owner")
@@ -564,14 +574,26 @@ def record_end(watch_conf, when):
     return None
 
 
+def pushing_lanes(was):
+    """[(project, kind)] for each lane that is on in the installed settings whose sessions hold the push token."""
+    kinds = [k for k in store.KINDS if runner_job.PUSH_TOKEN_ENV in (runner_job.KINDS.get(k) or {}).get("env", ())]
+    projs = was.get("projects") if isinstance(was, dict) and isinstance(was.get("projects"), dict) else {}
+    return [(name, k) for name, proj in sorted(projs.items()) if isinstance(proj, dict)
+            for k in kinds if isinstance(proj.get("lanes"), dict) and proj["lanes"].get(k) is True]
+
+
 def step_push_token(ctx, apply_it):
     """The push token's file and its end date, measured and never changed here: `push-token` is the step that
     writes them. A file that is there with no date on record is NOT MEASURED, never current."""
     if not ctx.home:
         raise Unknown("waits on `home`", "clear that row first")
-    path = ctx.conf["PUSH_TOKEN_FILE"]
+    path = push_path(ctx.conf, ctx.was)
     word = token_file_state(lambda script: ctx.as_role(script, "reading the push token file's kind"), path)
     if word == "absent":
+        pushing = pushing_lanes(ctx.was)
+        if pushing:
+            raise SetupError("%s has a %s lane on, and no push token file at %s: every start of it is held. Run "
+                             "`push-token`, or switch the lane off" % (pushing[0][0], pushing[0][1], path))
         return True, ("no push token file at %s yet; a code, fix or conflict lane cannot be switched on without "
                       "one: run `push-token`" % path)
     if word == "unread":
@@ -1498,6 +1520,67 @@ def _cases(check, tmp):  # noqa: C901  (one battery, read top to bottom)
          ("no date taken as fine", [(me, "recorded_end", lambda wc: (today + datetime.timedelta(days=200), "", 30))]),
          ("an ended date taken as fine", [(me, "recorded_end", lambda wc: (today + datetime.timedelta(days=1), "", 30))]),
          ("a loose file taken as fine", [(me, "token_file_state", lambda call, path: "ok")]))
+
+    def edit_settings(fake, fn):
+        path = fake.home + "/.pipeline-runner/runner.json"
+        with open(path) as fh:
+            doc = json.load(fh)
+        fn(doc)
+        _put(path, json.dumps(doc, indent=2, sort_keys=True) + "\n")
+        os.chmod(path, 0o600)
+
+    def lane_on_no_file():
+        fake = world()
+        go(fake, "apply")
+        watch_conf(fake)
+        edit_settings(fake, lambda d: d["projects"]["app"]["lanes"].update(code=True))
+        code, doc, _err, _left = go(fake)
+        row = [r for r in doc["rows"] if r["step"] == "push-token"][0]
+        edit_settings(fake, lambda d: d["projects"]["app"]["lanes"].update(code=False, review=True))
+        quiet = [r for r in go(fake)[1]["rows"] if r["step"] == "push-token"][0]["outcome"]
+        return code, row["outcome"], "app has a code lane on" in row["detail"], quiet
+    case("check: a code, fix or conflict lane on with no push token file is FAILED; a lane that holds no token is not",
+         lane_on_no_file, (1, FAILED, True, ALREADY_DONE),
+         ("lanes not looked at", [(me, "pushing_lanes", lambda was: [])]))
+
+    def custom_path():
+        fake = world()
+        go(fake, "apply")
+        edit_settings(fake, lambda d: d.update(push_token_file="~/.config/pt"))
+        go(fake, "apply")
+        with open(fake.home + "/.pipeline-runner/runner.json") as fh:
+            kept = json.load(fh)["push_token_file"]
+        _put(fake.home + "/.config/pt", TOKEN + "\n")
+        os.chmod(fake.home + "/.config/pt", 0o600)
+        watch_conf(fake, "%s:%s" % (PUSH_CLOCK, ON(200)))
+        row = [r for r in go(fake)[1]["rows"] if r["step"] == "push-token"][0]
+        fresh = world(PUSH_TOKEN_FILE="~/.config/other")
+        go(fresh, "apply")
+        with open(fresh.home + "/.pipeline-runner/runner.json") as fh:
+            return kept, row["outcome"], "~/.config/pt holds a token" in row["detail"], json.load(fh)["push_token_file"]
+    case("apply: an unset PUSH_TOKEN_FILE keeps a path the owner installed, and `check` measures that path; a "
+         "conf that sets one decides", custom_path, ("~/.config/pt", ALREADY_DONE, True, "~/.config/other"),
+         ("the installed path overwritten", [(me, "push_path", lambda c, was: c["PUSH_TOKEN_FILE"])]))
+
+    def someone_elses():
+        real, out = os.lstat, io.StringIO()
+        target = tmp + "/some-token"
+        _put(target, "x\n")
+        os.chmod(target, 0o600)
+        os.lstat = lambda p: (lambda r: os.stat_result((r.st_mode, r.st_ino, r.st_dev, r.st_nlink, r.st_uid + 1,
+                                                        r.st_gid, r.st_size, 0, 0, 0)))(real(p))
+        saved = sys.argv
+        sys.argv = ["x", target]
+        try:
+            with contextlib.redirect_stdout(out):
+                exec(TOKEN_STATE_PY, {"__name__": "state"})      # noqa: S102  (the role program, run in place)
+        finally:
+            os.lstat, sys.argv = real, saved
+        return out.getvalue().strip()
+    case("the push token file's kind: a 0600 file another account owns is `other-owner`, not unread", someone_elses,
+         "other-owner",
+         ("the owner never compared", [(me, "TOKEN_STATE_PY", TOKEN_STATE_PY.replace("elif st.st_uid != os.getuid():",
+                                                                                      "elif False:"))]))
 
     def health_watch_warns():
         fake = world()

@@ -296,7 +296,8 @@ today. Taking the token out of sessions, with the runner pushing for them, is KI
   (`pipeline-parts.json`), so `pipeline_watch.py dates` lists it, `missing` until a date is on record.
   The runner's `check` has a `push-token` row. A token file with no end date on record is NOT MEASURED,
   never current. An ended token, a file others can read and a link are FAILED. No file yet is no fault
-  while no code, fix or conflict lane is on.
+  while no code, fix or conflict lane is on, and FAILED once one is. A path you installed by hand stays:
+  with `PUSH_TOKEN_FILE` unset in `runner.conf`, `apply` keeps it. Set it to replace the path.
 - **Who reads it.** The runner, at each start or resume of a code, fix or conflict run, and never
   for another kind. A file it cannot read, or one that holds anything but one GitHub token, holds the
   request. The answer says why, never what the file holds.
