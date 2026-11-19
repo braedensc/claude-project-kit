@@ -90,8 +90,11 @@ it anyway. If a guard is in your way, say so and stop — never respell the comm
   (the commit would be stranded). Branch fresh off updated `main`.
 - **Never-merge guard** — **`gh pr merge` (including `--auto`) is blocked. Merging is
   the human's action only.** Open the PR (`gh pr create`) and stop. Never enable
-  auto-merge. (Even *mentioning* `gh pr merge` in a shell command — e.g. a grep
-  pattern — trips it; that's expected.)
+  auto-merge. The same merge sent straight to the API is blocked too (KIT-897): a write
+  to `/pulls/<n>/merge` by `gh api`, `curl` or `wget`, and the GraphQL
+  `mergePullRequest`, `enablePullRequestAutoMerge` and `enqueuePullRequest` mutations.
+  Reading a PR, its checks and its merge state stays allowed. (Even *mentioning*
+  `gh pr merge` in a shell command — e.g. a grep pattern — trips it; that's expected.)
 - **Self-approval guard** — **you cannot approve a PR** (`gh pr review --approve`/`-a`,
   the bare `gh pr review`, or an `event: APPROVE` write via `gh api`/GraphQL/`curl`).
   An approval claims that someone *else* read the code; supplying your own makes that

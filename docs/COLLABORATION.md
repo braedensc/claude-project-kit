@@ -421,7 +421,8 @@ Stop hook between them:
    > is unbypassable; the **Bash** guards below are regular expressions over raw command
    > text that bash rewrites before it runs — quote collapsing, `$IFS`, command
    > substitution. Measured 2026-08-26 against the GuardFall research, re-run with the
-   > stacked-branch guard on 2026-09-20: **95 probes, all seven Bash pattern guards
+   > stacked-branch guard on 2026-09-20 and with the never-merge guard's API half on
+   > 2026-11-18: **107 probes, all seven Bash pattern guards
    > classified advisory, none robust** (`npm run test:bypass`,
    > full results and the layer-by-layer breakdown in docs/SECURITY.md §
    > *What the pattern guards actually carry*). A cooperating agent that mistypes is
@@ -505,9 +506,19 @@ Stop hook between them:
      running CI). Fails open if `gh`/network is unavailable.
    - Blocks `gh pr merge` outright, including `--auto` — **merging is the human's
      action only**; Claude opens the PR and stops. (`--disable-auto` is exempt: it
-     only *undoes* an auto-merge.) The matcher knows the `gh pr merge` subcommand,
-     not the REST endpoint behind it; what makes the merge actually impossible is
-     branch protection plus the platform merge gate, in repository settings.
+     only *undoes* an auto-merge.) Since KIT-897 it blocks the same merge sent
+     straight to the API too: a write to `/pulls/<n>/merge` from `gh api`, `curl`
+     or `wget`, in the method-flag spellings they parse (`curl -T` is a PUT as
+     well), and the GraphQL `mergePullRequest`, `enablePullRequestAutoMerge` and
+     `enqueuePullRequest` mutations, chained or not. A method it cannot read on the
+     merge endpoint fails closed. Reads stay allowed: a PR, its checks and its merge
+     state (a GET of the merge endpoint, a GraphQL query), and
+     `disablePullRequestAutoMerge`, which only undoes an auto-merge. It is advisory
+     like the rest: a respelt path or mutation name, or a query held in a file, gets
+     past it. Branch protection decides *what* may merge (the required checks), not
+     *who*, so a session that can push could merge a green PR if this matcher missed
+     it; a rule on who may update the default branch is the durable layer, and it is
+     the owner's decision (docs/SECURITY.md).
    - Blocks the reachable spellings of **approving a PR** — `gh pr review --approve`/`-a`
      (including pflag shorthand clusters like `-ab`), the **bare** `gh pr review`,
      `gh api`/GraphQL writes carrying `event: APPROVE`, and a hand-rolled `curl` at
