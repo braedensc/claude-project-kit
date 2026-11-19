@@ -29,17 +29,22 @@ WHAT A BOUNCE IS NOW (and what it is no longer)
 
 ON THE RUNNER LANE (KIT-765)
 
-  A repository named in the config's `runner_lane` gets the same bounce by another road: a
-  resume request to our own runner (scripts/pipeline_runner.py, contract §28), which resumes
-  the pull request's own coding session in its own workspace, the findings fenced as data. The
+  A repository named in the config's `runner_lane` gets the same bounce by another road, while
+  the runner says its `fix` lane is on for that repository's project (KIT-708: the runner writes
+  the lanes it takes into its own store, and this driver reads them; lanes it cannot read are a
+  Decline, never "off"): a resume request to our own runner (scripts/pipeline_runner.py,
+  contract §28), which resumes the pull request's own coding session in its own workspace, the
+  findings fenced as data. The
   coding run is found in the runner's own records, by project, ticket and branch, never by
   anything a session wrote. No such run is a Decline and spends nothing; a run still going is a
   hold, and spends nothing either, until it has been going past `blocked_after_seconds`: then the
   runner may be down, and it is a Decline too. The ledger rows, the budget, the re-review request and the
   no-push page are the same as on the thread, and the visible record line goes on the ticket as
   a top-level comment. The runner judges the request against the tracker before it starts
-  anything. A conflict still goes by the thread. This lane is for a repository whose coding
-  sessions also run through the runner; until they do, a fix finds no run there and says so.
+  anything. A conflict goes the same way while the runner's `conflict` lane is on (KIT-708, see
+  below). This lane is for a repository whose coding sessions also run through the runner; until
+  they do, a fix finds no run there and says so. So each kind is switched for a project by the
+  runner's one `lanes` setting, and switched back by it.
 
 WHAT HAPPENS WHEN NOTHING NEEDS BOUNCING (the conclusion)
 
@@ -155,6 +160,10 @@ WHAT HAPPENS WHEN A PULL REQUEST GOES CONFLICTING (the dispatched lane)
   pull request a conflict is a notice, like any other change. The ack counts on GitHub only
   when the token this driver posts with belongs to a writer; if it does not, the monitor
   pages while the session works — loud, never silent.
+
+  ON THE RUNNER'S CONFLICT LANE (KIT-708) the fix is a `conflict` resume request to our own
+  runner for the pull request's own coding run, found as a bounce's is, and held while that run
+  is still going. The rows and the ack are the same, and no thread reply is made.
 
 WHAT HAPPENS WHEN THE VALIDATOR SENDS IT BACK (KIT-542)
 
@@ -428,10 +437,12 @@ CONFIG (--config FILE — the same file the poller reads; keys are shared)
                                                    Empty ⇒ the validator's send-backs are OFF
                                                    here; set ⇒ a `sent-back` row at a PR's
                                                    current head is a bounce trigger
-   "runner_lane": {"store_dir": "~/…/store",     KIT-765: repositories whose fixes go to our
-                   "repos": {"OWNER/REPO": "app"}},  own runner as a resume, by the runner's
-                                                   project key. Absent or empty: the thread for
-                                                   every repository, as before
+   "runner_lane": {"store_dir": "~/…/store",     KIT-765: the runner's store, and each
+                   "repos": {"OWNER/REPO": "app"}},  repository's project key there. A fix or a
+                                                   conflict goes to the runner as a resume only
+                                                   while the runner says that lane is on for the
+                                                   project (KIT-708). Absent or empty: the thread
+                                                   for every repository, as before
    "poll_seconds": 300, "diff_cap_chars": 120000}  poller keys, same file
 
   A config an older Stage E installer wrote may still carry `reviews_team_id`,
@@ -997,12 +1008,25 @@ def runner_lane_setting(raw):
     return {"store_dir": os.path.realpath(os.path.expanduser(store_dir)), "repos": dict(repos)}, []
 
 
-def runner_route(cfg, owner_repo):
-    """(store_dir, project) when this repository's fixes go to the runner (KIT-765), else None:
-    the tracker thread, exactly as before."""
+def runner_route(cfg, owner_repo, kind="fix"):
+    """((store_dir, project), "") when this repository's `kind` (fix or conflict) goes to the runner
+    (KIT-765, KIT-708): `runner_lane` names it, and the runner says, in its own store, that its
+    lane for that kind is on for the repository's project. (None, "") for the tracker thread,
+    exactly as before: not named, the runner has said nothing, or that lane is off. So the
+    runner's own `lanes` setting switches each kind for a project, and switches it back.
+    (None, why) when the runner's lanes cannot be read: which road is not known, never "off"."""
     lane = cfg.get("runner_lane") or {}
     project = (lane.get("repos") or {}).get(owner_repo)
-    return (lane["store_dir"], project) if project else None
+    if not project:
+        return None, ""
+    try:
+        lanes = runner_store.read_lanes(lane["store_dir"])
+    except runner_store.StoreError as exc:
+        return None, ("the runner's lanes could not be read (%s), so whether this %s goes to the "
+                      "runner or to the session's thread is not known" % (exc, kind))
+    if not runner_store.lane_on(lanes, project, kind):
+        return None, ""
+    return (lane["store_dir"], project), ""
 
 
 def state_dir_problems(state_dir):
@@ -1353,6 +1377,39 @@ def render_conflict_reprompt(*, conflict_no, limit, episode, branch, base, pr_nu
         "to the SAME branch %s (never --force). Do not open a new PR; do not edit the PR "
         "title/body." % branch,
         "5. Watch CI: `gh pr checks %d --watch`." % pr_number,
+        "",
+        "Never merge or approve, and never add or remove a label.",
+        "",
+        "_%s %s#%d episode=%d k=%d — conflict fix %d of %d, sent by the Stage E bounce driver in "
+        "answer to the conflict monitor's request. The driver's ledger and the monitor's request "
+        "count are the budget; this line is their visible record._"
+        % (CONFLICT_MARKER, owner_repo, pr_number, episode, conflict_no, conflict_no, limit),
+    ])
+
+
+def render_conflict_request(*, conflict_no, limit, episode, branch, base, pr_number, pr_url, owner_repo):
+    """The conflict fix as a resume request to our own runner (KIT-708): the thread reply's facts and
+    steps, for a session with no tracker thread, which says what contradicts on its ticket. The
+    runner fences all of it as data, and the conflict kind's brief says what to do with it. No step
+    watches CI with the code host's own tool: it cannot reach the host from the session's sandbox
+    (docs/RUNNER.md, "The probe"). The visible record line is the same."""
+    return "\n".join([
+        "**Stage E conflict fix %d of %d**: from the bounce driver, for PR #%d (%s). Nobody is "
+        "watching this session live: never try to ask an interactive user anything."
+        % (conflict_no, limit, pr_number, pr_url),
+        "",
+        "`%s` moved after this pull request went green, and GitHub now reports it CONFLICTING, "
+        "so its required checks are not running. Resolve it in this workspace, on branch %s:"
+        % (base, branch),
+        "",
+        "1. Confirm `git status` is clean and you are on %s." % branch,
+        "2. `git fetch origin %s && git merge origin/%s`: merge, never rebase, since a rebase ends in "
+        "a force-push." % (base, base),
+        "3. Resolve each conflict by reading BOTH sides and keeping both intents. Where they "
+        "genuinely contradict, push nothing: say what contradicts on your ticket, and stop.",
+        "4. Run the project's local checks, commit the merge with `git commit -F`, and `git push` "
+        "to the SAME branch %s (never --force). Do not open a new PR; do not edit the PR "
+        "title/body." % branch,
         "",
         "Never merge or approve, and never add or remove a label.",
         "",
@@ -3584,6 +3641,31 @@ def describe(sit, verdict):
     return "%s: %s — %s" % (tag, head, verdict["reason"])
 
 
+def runner_coding_run(store_dir, project, sit, verdict, cfg, what):
+    """The pull request's own coding run to resume on the runner's lane (KIT-765), or None when it
+    is still going: a hold that spends nothing, said, and asked again next pass. A Decline when
+    there is no such run, or the wait is past `blocked_after_seconds`: the runner's own time limit
+    is shorter, so the runner may be down. That is a could-not, said on the PR (§13). `what` names
+    what waits: the fix, or the conflict fix (KIT-708)."""
+    run, why = coding_run(store_dir, project, sit.get("ticket_id"), sit["branch"])
+    if run is None:
+        raise Decline(why, sit)
+    if run["state"] in runner_store.LIVE or run["auto_resume"] == "pending":
+        since = _parse_iso(run["ended_at"] or run["started_at"])
+        waited = (datetime.now(timezone.utc) - since).total_seconds() if since else None
+        if waited is not None and waited > float(cfg.get("blocked_after_seconds")
+                                                 or DEFAULT_BLOCKED_AFTER_SECONDS):
+            raise Decline("the coding session (runner run %s) has been %s for %s, longer than "
+                          "the driver waits for it, so the runner may be down. Nothing was sent, "
+                          "no bounce was spent, and a person is needed"
+                          % (run["run"], "running" if run["state"] in runner_store.LIVE
+                             else "waiting for the runner's own resume", _duration(waited)), sit)
+        print("%s — held, nothing spent: the coding session (runner run %s) is still going; "
+              "%s is asked once it ends" % (describe(sit, verdict), run["run"], what))
+        return None
+    return run
+
+
 def perform_bounce(sit, verdict, cfg, state_dir, dry_run):
     """Ledger row FIRST, then the thread reply. A reply that fails after the row exists is
     exit 2 — the bounce is spent and a person must know why nothing arrived. Three refusals
@@ -3600,7 +3682,9 @@ def perform_bounce(sit, verdict, cfg, state_dir, dry_run):
     spends nothing. The ledger rows, the budget, the re-review request and the no-push page are
     the same on both routes; the visible record line goes on the ticket as a top-level comment,
     since there is no thread to carry it."""
-    route = runner_route(cfg, sit["repo"])
+    route, unknown = runner_route(cfg, sit["repo"], "fix")
+    if unknown:
+        raise Decline("%s. Nothing was sent, no bounce was spent, and a person is needed" % unknown, sit)
     app_user = cfg.get("dispatcher_app_user_id") or ""
     if not route and not app_user:
         raise Decline("config 'dispatcher_app_user_id' is unset — the driver cannot tell the "
@@ -3629,24 +3713,8 @@ def perform_bounce(sit, verdict, cfg, state_dir, dry_run):
     issue = sit.get("issue") or {}
     if route:
         store_dir, project = route
-        run, why = coding_run(store_dir, project, sit.get("ticket_id"), sit["branch"])
+        run = runner_coding_run(store_dir, project, sit, verdict, cfg, "the fix")
         if run is None:
-            raise Decline(why, sit)
-        if run["state"] in runner_store.LIVE or run["auto_resume"] == "pending":
-            # Not a bounce yet: a resume needs the run ended, and the next pass asks again. But a
-            # wait past blocked_after_seconds is no longer a wait: the runner's own time limit is
-            # shorter, so the runner may be down. That is a could-not, said on the PR (§13).
-            since = _parse_iso(run["ended_at"] or run["started_at"])
-            waited = (datetime.now(timezone.utc) - since).total_seconds() if since else None
-            if waited is not None and waited > float(cfg.get("blocked_after_seconds")
-                                                     or DEFAULT_BLOCKED_AFTER_SECONDS):
-                raise Decline("the coding session (runner run %s) has been %s for %s, longer than "
-                              "the driver waits for it, so the runner may be down. Nothing was sent, "
-                              "no bounce was spent, and a person is needed"
-                              % (run["run"], "running" if run["state"] in runner_store.LIVE
-                                 else "waiting for the runner's own resume", _duration(waited)), sit)
-            print("%s — held, nothing spent: the coding session (runner run %s) is still going; "
-                  "the fix is asked once it ends" % (describe(sit, verdict), run["run"]))
             return EXIT_OK
         where = "runner resume of run %s (project %s)" % (run["run"], project)
         via = "runner"
@@ -4216,34 +4284,51 @@ def perform_conflict(sit, verdict, cfg, state_dir, dry_run):
     page while the session works — loud, never silent.
 
     No telemetry artifact: §4 records a session's outcome, and this is a prompt. Its record
-    is the ledger rows, the thread reply's visible line and the ack."""
-    app_user = cfg.get("dispatcher_app_user_id") or ""
-    if not app_user:
-        raise Decline("config 'dispatcher_app_user_id' is unset — the driver cannot tell the "
-                      "dispatcher's agent session from another app's, so no conflict fix was sent; "
-                      "the conflict monitor pages the owner", sit)
+    is the ledger rows, the thread reply's visible line and the ack.
+
+    ON THE RUNNER'S CONFLICT LANE (KIT-708) the same fix goes as a `conflict` resume request to
+    our own runner, for the pull request's own coding run, found in the runner's records as a
+    fix's is (KIT-765). No dispatcher app user and no thread are needed there. No such run is a
+    Decline; a run still going is a hold that counts nothing. The ledger rows and the ack are the
+    same, and nothing is replied in a thread."""
+    route, unknown = runner_route(cfg, sit["repo"], "conflict")
+    if unknown:
+        raise Decline("%s. No conflict fix was sent, and the conflict monitor pages the owner" % unknown, sit)
     issue = sit.get("issue") or {}
-    thread_id, _session = pick_agent_thread(issue, app_user)
-    if not (thread_id and issue.get("id")):
-        raise Decline("GitHub reports this PR CONFLICTING and the original ticket has no agent-session "
-                      "thread: a conflict fix only ever goes to the session that owns the branch, inside "
-                      "its sandbox, so nothing was sent and the conflict monitor pages the owner", sit)
+    if not route:
+        app_user = cfg.get("dispatcher_app_user_id") or ""
+        if not app_user:
+            raise Decline("config 'dispatcher_app_user_id' is unset — the driver cannot tell the "
+                          "dispatcher's agent session from another app's, so no conflict fix was sent; "
+                          "the conflict monitor pages the owner", sit)
+        thread_id, _session = pick_agent_thread(issue, app_user)
+        if not (thread_id and issue.get("id")):
+            raise Decline("GitHub reports this PR CONFLICTING and the original ticket has no agent-session "
+                          "thread: a conflict fix only ever goes to the session that owns the branch, inside "
+                          "its sandbox, so nothing was sent and the conflict monitor pages the owner", sit)
     meta = sit.get("pr_meta") or {}
     base = str(meta.get("baseRefName") or sit.get("default_branch") or "")
     if not (prc.BRANCH_RE.match(sit["branch"]) and prc.BRANCH_RE.match(base)):
         raise Decline("the branch or base name has characters the driver will not put in a prompt; "
                       "no conflict fix was sent and the conflict monitor pages the owner", sit)
+    run = None
+    if route:
+        store_dir, project = route
+        run = runner_coding_run(store_dir, project, sit, verdict, cfg, "the conflict fix")
+        if run is None:
+            return EXIT_OK
     episode, conflict_no, limit = verdict["episode"], verdict["conflict_no"], verdict["limit"]
-    body = render_conflict_reprompt(conflict_no=conflict_no, limit=limit, episode=episode,
-                                    branch=sit["branch"], base=base, pr_number=sit["pr"],
-                                    pr_url=sit.get("pr_url") or "", owner_repo=sit["repo"])
+    render = render_conflict_request if route else render_conflict_reprompt
+    body = render(conflict_no=conflict_no, limit=limit, episode=episode, branch=sit["branch"], base=base,
+                  pr_number=sit["pr"], pr_url=sit.get("pr_url") or "", owner_repo=sit["repo"])
     ack = render_conflict_ack(episode, conflict_no, limit)
     hits = secret_hits("\n".join((body, ack)))
     if hits:
         raise Decline("%s (%s); no conflict fix was sent" % (SECRET_DECLINE_REASON, ", ".join(hits)), sit)
     if dry_run:
         print("[dry-run] %s" % describe(sit, verdict))
-        print("=== [dry-run] thread reply on comment %s ===\n%s" % (thread_id, body))
+        print("=== [dry-run] %s ===\n%s" % ("runner resume of run %s (project %s)" % (run["run"], route[1])
+                                           if route else "thread reply on comment %s" % thread_id, body))
         print("=== [dry-run] PR comment ===\n%s\n=== [dry-run] end — nothing written ===" % ack)
         return EXIT_OK
 
@@ -4252,19 +4337,30 @@ def perform_conflict(sit, verdict, cfg, state_dir, dry_run):
                outcome="conflict", episode=episode, conflict_no=conflict_no,
                head_sha=sit.get("head_sha"))
     try:
-        ref = linear_reply_in_thread(issue["id"], thread_id, body, cfg)
+        if route:
+            try:
+                ref = runner_store.ask(route[0], "fix-driver", "resume", "conflict", route[1],
+                                       sit.get("ticket_id"), run=run["run"], text=body)
+            except ValueError as exc:          # the store's own fixed words, no path in them
+                raise BounceError("the runner's request could not be written: %s" % exc)
+            except OSError as exc:             # its words could name a local path: never on a PR
+                raise BounceError("the runner's request could not be written (%s)" % type(exc).__name__)
+        else:
+            ref = linear_reply_in_thread(issue["id"], thread_id, body, cfg)
     except BounceError as exc:
         append_row(lpath, repo=sit["repo"], pr=sit["pr"], outcome="conflict-send-failed",
                    episode=episode, conflict_no=conflict_no, error=str(exc))
         sys.stderr.write("FAIL: %s#%d: conflict fix %d was counted but could not be delivered: %s\n"
                          % (sit["repo"], sit["pr"], conflict_no, exc))
         announce_could_not(sit, "Stage E conflict fix %d of %d was counted but could not be delivered "
-                                "to the session's thread (%s); nothing claimed the fix request, so the "
+                                "to the session's %s (%s); nothing claimed the fix request, so the "
                                 "conflict monitor pages the owner"
-                           % (conflict_no, limit, exc.public or exc), state_dir, False)
+                           % (conflict_no, limit, "runner" if route else "thread", exc.public or exc),
+                           state_dir, False)
         return EXIT_USAGE
     append_row(lpath, repo=sit["repo"], pr=sit["pr"], outcome="conflict-delivered",
-               episode=episode, conflict_no=conflict_no, ref=ref)
+               episode=episode, conflict_no=conflict_no, ref=ref,
+               **({"via": "runner"} if route else {}))
     try:
         post_pr_comment(sit["pr"], ack, sit["repo"], False)
     except Exception as exc:    # delivery failed (IOError) or the publisher's own scrub refused
@@ -4272,8 +4368,9 @@ def perform_conflict(sit, verdict, cfg, state_dir, dry_run):
                          "not be posted (%s: %s); the conflict monitor will page while the session "
                          "works\n" % (sit["repo"], sit["pr"], conflict_no, exc.__class__.__name__, exc))
         return EXIT_USAGE
-    print("%s — delivered in the session's thread (%s) and acknowledged on the PR"
-          % (describe(sit, verdict), ref))
+    print("%s — delivered %s (%s) and acknowledged on the PR"
+          % (describe(sit, verdict), "to the runner as a resume of run %s" % run["run"] if route
+             else "in the session's thread", ref))
     return EXIT_OK
 
 
@@ -6351,7 +6448,10 @@ def selftest():
                    and (want_bad or "") in why_lane) if want_bad else (got_lane, why_lane),
                   (None, True) if want_bad else ({}, ""))
         check("KIT-765 off: no runner_lane, and every repository goes by the thread",
-              (cfg["runner_lane"], runner_route(cfg, "o/r")), ({}, None))
+              (cfg["runner_lane"], runner_route(cfg, "o/r")), ({}, (None, "")))
+        # KIT-708: the runner's own lanes, as it writes them in its store, switch each kind.
+        lanes_on = {"schema": runner_store.LANES_SCHEMA, "enabled": True, "work_dir": "/w",
+                    "look_config_dir": None, "projects": {"app": ["fix", "conflict"]}}
 
         def lane_record(run, kind, at, state="ended", resumes=None, branch="feat/eng-41-x",
                         auto_resume=None):
@@ -6373,6 +6473,18 @@ def selftest():
                 contextlib.redirect_stderr(err):
             rstore = os.path.join(rtmp, "runner-store")
             check("KIT-765 the runner's store is made for the cases", runner_store.prepare(rstore), [])
+            runner_store.write_lanes(rstore, dict(lanes_on, projects={"app": ["conflict"]}))
+            off_lane = validate_config(dict(cfg, runner_lane={"store_dir": rstore, "repos": {"o/r": "app"}}))
+            calls.clear()
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = run_one(41, "o/r", off_lane, tmp, "bounce", False)
+            check("KIT-708 a repository the lane names, while the runner says its fix lane is off, goes by "
+                  "the thread: the runner's one setting switches it back",
+                  (rc, kinds(), os.listdir(os.path.join(rstore, "requests"))),
+                  (EXIT_OK, ["reply", "telemetry"], []))
+            os.unlink(ledger_path(tmp))
+            os.unlink(rereview_request_path(tmp, "o/r", 41))
+            runner_store.write_lanes(rstore, lanes_on)
             code_run, fix_run = "run-" + "a" * 32, "run-" + "b" * 32
             runner_store.write_run(rstore, lane_record(code_run, "code", "2026-11-17T10:00:00Z"))
             runner_store.write_run(rstore, lane_record(fix_run, "fix", "2026-11-17T11:00:00Z",
@@ -6473,10 +6585,15 @@ def selftest():
                  (EXIT_USAGE, ["prComment"], False, 0, "did not run through the runner")),
                 ("records that cannot be read whole are a decline, never 'no run'",
                  lambda s: os.chmod(os.path.join(s, "runs"), 0o755),
-                 (EXIT_USAGE, ["prComment"], False, 0, "could not be read whole"))):
+                 (EXIT_USAGE, ["prComment"], False, 0, "could not be read whole")),
+                # KIT-708: lanes that cannot be read never read as off, and send nothing anywhere.
+                ("lanes the runner wrote that cannot be read are a decline on the PR, never 'off'",
+                 lambda s: open(os.path.join(s, runner_store.LANES_FILE), "w").write("{not json"),
+                 (EXIT_USAGE, ["prComment"], False, 0, "the runner's lanes could not be read"))):
             with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(err):
                 rstore = os.path.join(tmp, "runner-store")
                 runner_store.prepare(rstore)
+                runner_store.write_lanes(rstore, lanes_on)
                 runner_store.write_run(rstore, lane_record("run-" + "a" * 32, "code", "2026-11-17T10:00:00Z"))
                 runner_store.write_run(rstore, lane_record("run-" + "b" * 32, "fix", "2026-11-17T11:00:00Z",
                                                            resumes="run-" + "a" * 32))
@@ -6495,6 +6612,7 @@ def selftest():
         with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(err):
             rstore = os.path.join(tmp, "runner-store")
             runner_store.prepare(rstore)
+            runner_store.write_lanes(rstore, lanes_on)
             runner_store.write_run(rstore, lane_record("run-" + "a" * 32, "code", "2026-11-17T10:00:00Z"))
             lane_f = validate_config(dict(cfg, runner_lane={"store_dir": rstore, "repos": {"o/r": "app"}}))
             real_ask = runner_store.ask
@@ -8228,6 +8346,63 @@ def selftest():
                   (rc, kinds()), (EXIT_OK, ["ticketComment"]))
             check("…of kind conflict", "merge conflicts" in body_of("ticketComment"), True)
             world["delivery"] = delivery_ok
+
+        # 10q-708. THE RUNNER'S CONFLICT LANE (KIT-708). While the runner says its conflict lane is on
+        #          for the repository's project, the same fix is a `conflict` resume request for the
+        #          PR's own coding run: the same ledger rows and ack, and no thread reply. Off, the thread.
+        def conflict_lane(tmp, lanes, run_state="ended", started="2026-11-17T10:00:00Z"):
+            rstore = os.path.join(tmp, "runner-store")
+            runner_store.prepare(rstore)
+            runner_store.write_lanes(rstore, lanes)
+            runner_store.write_run(rstore, lane_record("run-" + "a" * 32, "code", started, state=run_state))
+            calls.clear()
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = run_one(41, "o/r", validate_config(dict(cfg, dispatcher_app_user_id="", runner_lane={
+                    "store_dir": rstore, "repos": {"o/r": "app"}})), tmp, "bounce", False)
+            return rc, buf.getvalue(), rstore
+
+        world.update(pr=conflicted, pr_comments=[request1], issue=live_issue, delivery=delivery_ok)
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(err):
+            rc, out, rstore = conflict_lane(tmp, lanes_on)
+            asked = runner_store.pending(rstore)
+            req = asked[0][1] if len(asked) == 1 else {}
+            check("KIT-708 on the runner's conflict lane the fix is one `conflict` resume request for the PR's own "
+                  "coding run, then the ack, and no thread reply, with no dispatcher app user",
+                  (rc, kinds(), [req.get(k) for k in ("caller", "action", "kind", "project", "ticket", "run")]),
+                  (EXIT_OK, ["prComment"], ["fix-driver", "resume", "conflict", "app", "ENG-41", "run-" + "a" * 32]))
+            text = req.get("text") or ""
+            check("KIT-708 …its text the conflict fix's facts and steps, with no thread and no CI watch",
+                  ("conflict fix 1 of %d" % prc.fix_limit(None) in text, "git merge origin/main" in text,
+                   "SAME branch feat/eng-41-x" in text, CONFLICT_MARKER in text, "thread" in text,
+                   "gh pr checks" in text, len(text) <= runner_store.TEXT_MAX),
+                  (True, True, True, True, False, False, True))
+            check("KIT-708 …the ledger rows are a conflict's: counted before the send, then delivered by the runner",
+                  [(r["outcome"], r.get("via"), r.get("ref")) for r in read_ledger(ledger_path(tmp))],
+                  [("conflict", None, None), ("conflict-delivered", "runner", asked[0][0] if asked else None)])
+            check("KIT-708 …and the PR gets the monitor's own ack, as on the thread",
+                  body_of("prComment").startswith("<!-- pr-conflict:ack"), True)
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(err):
+            rc, out, rstore = conflict_lane(tmp, dict(lanes_on, projects={"app": ["fix"]}))
+            check("KIT-708 with the runner's conflict lane off, the conflict needs the thread, as before",
+                  (rc, runner_store.pending(rstore), "dispatcher_app_user_id" in body_of("prComment")),
+                  (EXIT_USAGE, [], True))
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(err):
+            rc, out, rstore = conflict_lane(tmp, lanes_on, run_state="running", started=_now_iso())
+            check("KIT-708 a coding run still going holds the conflict fix: nothing counted, nothing asked, said",
+                  (rc, kinds(), os.path.exists(ledger_path(tmp)), runner_store.pending(rstore),
+                   "the conflict fix is asked once it ends" in out), (EXIT_OK, [], False, [], True))
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(err):
+            rc, out, rstore = conflict_lane(tmp, lanes_on)
+            os.unlink(ledger_path(tmp))
+            open(os.path.join(rstore, runner_store.LANES_FILE), "w").write("[]")
+            calls.clear()
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = run_one(41, "o/r", validate_config(dict(cfg, runner_lane={
+                    "store_dir": rstore, "repos": {"o/r": "app"}})), tmp, "bounce", False)
+            check("KIT-708 lanes that cannot be read are a decline on the PR, never 'off': nothing counted",
+                  (rc, kinds(), os.path.exists(ledger_path(tmp)), "lanes could not be read" in body_of("prComment")),
+                  (EXIT_USAGE, ["prComment"], False, True))
 
         world.update(pr=dict(open_pr, mergeable="MERGEABLE"), pr_comments=[request1], comment_reads=0)
         with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(err):

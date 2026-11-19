@@ -12,7 +12,14 @@ WHAT IT BUILDS, for one run of one kind (scripts/pipeline_session_kinds.py), and
                    folder, and for a kind with Bash the built-in sandbox with its host list and
                    deny-read list (rows r3, r3b)
     mcp()          the tool-server file with no server: the runner writes the session's own
-                   ticket tools' server itself (scripts/pipeline_session_tools.py, KIT-706)
+                   ticket tools' server (scripts/pipeline_session_tools.py, KIT-706) and the
+                   acceptance kind's look tool (KIT-708) itself
+
+THE ONE BUILDER (KIT-708).  line() spells every option of the program this file passes, in one
+order, from the options its caller names. command() builds each session's line with it, and so do
+the program's other callers: the tech lead's turn (scripts/pipeline_tech_lead_turn.py) and the
+one-shot writer (scripts/pipeline_voice.py). Each names its own options and values; line() only
+spells and orders them. It has no option for a mode that skips the checks.
     profile()      for a kind without Bash, our own macOS sandbox around the whole program
                    (row r5a): no write but the program's own home and the run's temp folder, and no
                    read of the store, the pins or a key
@@ -53,14 +60,16 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 try:
-    import pipeline_session_kinds as kinds_data
+    # The writer's own token name, path and language. The kinds' data is read by the selftest alone:
+    # the writer builds its line here too (KIT-708), and a job that only writes loads nothing more.
     import pipeline_voice as voice
 except ImportError as exc:  # a packaging accident, never a state to run in
     sys.exit("FAIL: %s. The adapter uses those files' own code and keeps no copy." % exc)
 try:
-    # KIT-886: the push token's names, by name from the kinds' own data, and so re-exported here: this
-    # file needs them whatever else it imports from that module.
-    from pipeline_session_kinds import PUSH_ENV, PUSH_TOKEN_ENV
+    # KIT-886: the push token's names, re-exported here, from the one place they are spelled: the
+    # runner's store, which the session kinds re-export too. Not from the kinds' module, whose checks
+    # load the runner's limits and the queue with them, which a job that only writes never needs.
+    from pipeline_runner_store import PUSH_ENV, PUSH_TOKEN_ENV
 except ImportError as exc:  # a packaging accident, never a state to run in
     sys.exit("FAIL: %s. The adapter uses those files' own code and keeps no copy." % exc)
 
@@ -94,7 +103,17 @@ GIT_PUSH_CONFIG = (("credential.helper", ""), ("credential.%s.helper" % GIT_PUSH
 COVERED_BY_READ = ("Grep", "Glob")
 FILE_RULE_TOOLS = ("Read", "Edit", "Write")         # the tools every wall is denied to, by rule
 OUTPUTS = {"json": ["--output-format", "json"],
-           "stream": ["--output-format", "stream-json", "--verbose"]}
+           "stream": ["--output-format", "stream-json", "--verbose"],
+           # the tech lead's turn streams the model's text as it comes (KIT-565)
+           "stream-partial": ["--output-format", "stream-json", "--verbose", "--include-partial-messages"]}
+# The outputs a session the runner starts, or the probe, is read in. The third is the turn's alone.
+RUNNER_OUTPUTS = ("json", "stream")
+# The only permission mode line() writes: anything no allow rule covers is refused, never asked.
+PERMISSION_MODES = ("dontAsk",)
+# The tool servers this adapter knows a session may get. The runner writes each one's entry itself:
+# `ticket`, the session's own ticket tools (KIT-706), and `look`, the acceptance kind's look tool
+# (KIT-708), started from the engine's own folder on the runner's `look_config_dir`.
+TOOL_SERVERS = ("ticket", "look")
 # Variables the program reads from its environment. If a dotenv file in its working folder were
 # ever loaded into it, one of these would change how it signs in (an API key bills a card instead
 # of the plan's usage window), where its traffic goes (a base address, a proxy, a certificate), or
@@ -145,10 +164,10 @@ def check(spec):
         if tool in (spec.get("tools") or []) and allow.get("Read") != "workspace":
             bad.append("%s: allow: %s is held by Read's rule, so Read must be allowed by the "
                        "workspace's path" % (name, tool))
-    others = [s for s in spec.get("tool_servers") or [] if s != "ticket"]
+    others = [s for s in spec.get("tool_servers") or [] if s not in TOOL_SERVERS]
     if others:
         bad.append("%s: tool_servers: the %s adapter has no tool server but the session's own ticket "
-                   "tools, which the runner writes with its session_tools setting" % (name, NAME))
+                   "tools and the look tool, which the runner writes itself" % (name, NAME))
     return bad
 
 
@@ -322,18 +341,70 @@ def profile(spec, run):
         + [""])
 
 
+def _option_value(name, value):
+    """One option's value as the program is given it: text, never read as an option of its own."""
+    if not isinstance(value, str) or "\0" in value or (value.startswith("-") and value != "-"):
+        raise ValueError("%s: its value must be text that is not an option" % name)
+    return value
+
+
+def line(program, model, output="json", session_id=None, resume=False, persist=True,
+         setting_sources=None, strict_mcp=False, mcp_config=None, settings=None, tools=None,
+         allowed=None, permission_mode=None, permission_prompts=None, system_prompt=None,
+         append_system_prompt_file=None, max_turns=None, max_budget_usd=None):
+    """One headless command line of the program (KIT-708), every option in one fixed order, from
+    the options its caller names. A caller's values go in as given: it formats its own numbers.
+    The prompt is never in it: it goes on stdin. ValueError for an option it cannot spell safely:
+    a permission mode that skips the checks, or a value the program would read as an option."""
+    if output not in OUTPUTS:
+        raise ValueError("output: one of %s" % ", ".join(sorted(OUTPUTS)))
+    argv = [_option_value("program", program), "-p", "--model", _option_value("model", model)]
+    argv += OUTPUTS[output]
+    if session_id is not None:
+        argv += ["--resume" if resume else "--session-id", _option_value("session", session_id)]
+    if not persist:
+        argv.append("--no-session-persistence")
+    if setting_sources is not None:
+        argv += ["--setting-sources", _option_value("setting_sources", setting_sources)]
+    if strict_mcp:
+        argv.append("--strict-mcp-config")
+    if mcp_config is not None:
+        argv += ["--mcp-config", _option_value("mcp_config", mcp_config)]
+    if settings is not None:
+        argv += ["--settings", _option_value("settings", settings)]
+    if tools is not None:
+        argv += ["--tools", ",".join(_option_value("tools", t) for t in tools)]
+    if allowed:
+        argv += ["--allowedTools"] + [_option_value("allowed", rule) for rule in allowed]
+    if permission_mode is not None:
+        if permission_mode not in PERMISSION_MODES:
+            raise ValueError("permission_mode: only %s: no mode that skips the checks"
+                             % ", ".join(PERMISSION_MODES))
+        argv += ["--permission-mode", permission_mode]
+    if permission_prompts is not None:
+        argv += ["--permission-prompts", _option_value("permission_prompts", permission_prompts)]
+    if system_prompt is not None:
+        argv += ["--system-prompt", _option_value("system_prompt", system_prompt)]
+    if append_system_prompt_file is not None:
+        argv += ["--append-system-prompt-file",
+                 _option_value("append_system_prompt_file", append_system_prompt_file)]
+    if max_turns is not None:
+        argv += ["--max-turns", _option_value("max_turns", str(max_turns))]
+    if max_budget_usd is not None:
+        argv += ["--max-budget-usd", _option_value("max_budget_usd", str(max_budget_usd))]
+    return argv
+
+
 def command(spec, run, output="json"):
-    """The one command line. The prompt is not in it: it goes on stdin."""
-    argv = ([run["claude_bin"], "-p", "--model", run["model"]] + OUTPUTS[output]
-            + ["--resume" if run["resume"] else "--session-id", run["session_id"],
-               "--setting-sources", "", "--strict-mcp-config",
-               "--mcp-config", os.path.join(run["run_dir"], "mcp.json"),
-               "--settings", os.path.join(run["run_dir"], "settings.json"),
-               "--tools", ",".join(spec["tools"]), "--allowedTools"] + allowed(spec, run)
-            + ["--permission-mode", "dontAsk", "--permission-prompts", "none",
-               "--append-system-prompt-file", os.path.join(run["run_dir"], "rules.md"),
-               "--max-turns", str(run["budget"]["maxTurns"]),
-               "--max-budget-usd", "%g" % run["budget"]["maxUsd"]])
+    """The one command line of a session the runner starts, from the kind's data. The prompt is not
+    in it: it goes on stdin."""
+    argv = line(run["claude_bin"], run["model"], output=output, session_id=run["session_id"],
+                resume=run["resume"], setting_sources="", strict_mcp=True,
+                mcp_config=os.path.join(run["run_dir"], "mcp.json"),
+                settings=os.path.join(run["run_dir"], "settings.json"), tools=spec["tools"],
+                allowed=allowed(spec, run), permission_mode="dontAsk", permission_prompts="none",
+                append_system_prompt_file=os.path.join(run["run_dir"], "rules.md"),
+                max_turns=run["budget"]["maxTurns"], max_budget_usd="%g" % run["budget"]["maxUsd"])
     if spec["wall"] == "own-sandbox":
         argv = [SANDBOX_EXEC, "-f", os.path.join(run["run_dir"], "sandbox.sb")] + argv
     return argv
@@ -358,7 +429,7 @@ def flags_used(specs):
     found = set()
     for spec in specs:
         for resume in (False, True):
-            for output in OUTPUTS:
+            for output in RUNNER_OUTPUTS:
                 found.update(a for a in command(spec, dict(run, resume=resume), output) if a.startswith("--"))
     return sorted(found)
 
@@ -442,6 +513,7 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
     import shutil
     import subprocess
     import tempfile
+    import pipeline_session_kinds as kinds_data
     failures, counted = [], [0]
 
     def expect(name, got, want):
@@ -449,10 +521,51 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
         if got != want:
             failures.append("%s: got %r, want %r" % (name, got, want))
 
+    def refused(fn):
+        try:
+            fn()
+        except ValueError as exc:
+            return str(exc)
+        return None
+
     kinds, bad = kinds_data.load()
     expect("the kinds load", bad, [])
     for name, spec in sorted(kinds.items()):
         expect("%s: this adapter can build every part of it" % name, check(spec), [])
+    expect("the look tool is a server this adapter knows; another is said",
+           (check(dict(kinds["acceptance"], tool_servers=["look"])),
+            check(dict(kinds["acceptance"], tool_servers=["tracker"]))),
+           ([], ["acceptance: tool_servers: the claude adapter has no tool server but the session's own "
+                 "ticket tools and the look tool, which the runner writes itself"]))
+
+    # ---- the one builder (KIT-708): every option, in its one order ----------- #
+    expect("line(): every option it spells, in its one order",
+           line("/bin/claude", "sonnet", output="stream", session_id="s-1", resume=True, persist=False,
+                setting_sources="", strict_mcp=True, mcp_config="/r/mcp.json", settings="/r/settings.json",
+                tools=["Bash", "Read"], allowed=["Bash", "Read(//w/**)"], permission_mode="dontAsk",
+                permission_prompts="none", system_prompt="be brief", append_system_prompt_file="/r/rules.md",
+                max_turns=3, max_budget_usd="0.5"),
+           ["/bin/claude", "-p", "--model", "sonnet", "--output-format", "stream-json", "--verbose",
+            "--resume", "s-1", "--no-session-persistence", "--setting-sources", "", "--strict-mcp-config",
+            "--mcp-config", "/r/mcp.json", "--settings", "/r/settings.json", "--tools", "Bash,Read",
+            "--allowedTools", "Bash", "Read(//w/**)", "--permission-mode", "dontAsk",
+            "--permission-prompts", "none", "--system-prompt", "be brief",
+            "--append-system-prompt-file", "/r/rules.md", "--max-turns", "3", "--max-budget-usd", "0.5"])
+    expect("line(): only what a caller names; no tools at all is an empty --tools",
+           line("claude", "haiku", tools=[], persist=False),
+           ["claude", "-p", "--model", "haiku", "--output-format", "json", "--no-session-persistence",
+            "--tools", ""])
+    expect("line(): the turn's streamed output adds partial messages and changes nothing else",
+           line("c", "m", output="stream-partial")[4:], ["--output-format", "stream-json", "--verbose",
+                                                         "--include-partial-messages"])
+    for what, kw, want in (
+            ("a mode that skips the checks", {"permission_mode": "bypassPermissions"},
+             "permission_mode: only dontAsk: no mode that skips the checks"),
+            ("an allow rule the program would read as an option",
+             {"allowed": ["--dangerously-skip-permissions"]}, "allowed: its value must be text that is not an option"),
+            ("a tool named like an option", {"tools": ["--add-dir"]}, "tools: its value must be text that is not an option"),
+            ("an output it does not know", {"output": "text"}, "output: one of json, stream, stream-partial")):
+        expect("line() refuses %s" % what, refused(lambda: line("c", "m", **kw)), want)
 
     tmp = os.path.realpath(tempfile.mkdtemp(prefix="harness-"))
     P = dict((k, os.path.join(tmp, k)) for k in ("store", "pins", "home", "work", "engine", "outside"))

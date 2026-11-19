@@ -40,9 +40,14 @@ Each file says what a session of that kind is given and what walls it runs behin
     guards        the kit's guards the session's tool calls go through, run from the engine's
                   own folder (scripts/pipeline_runner_guard.py)
     tool_servers  tool servers the session may get: `ticket`, its own five ticket tools, for
-                  code, fix and conflict, only while the runner's `session_tools` is set
+                  code, fix and conflict, only while the runner's `session_tools` is set; and
+                  `look`, the look tool, for the acceptance kind alone: it reads the acceptance
+                  job's own configs (KIT-708)
     limits        the kind's own time, memory and disk ceilings; the runner holds each run to
                   the smaller of these and its settings' limits
+    rules         optional: the kind's own steps, one line each, written into the run's rules
+                  file after its brief (KIT-708). The acceptance check's steps live here, so the
+                  request's text carries only its facts, fenced as data
 
 One small adapter turns a kind into the program's command line (scripts/pipeline_harness_claude.py).
 This file knows nothing of any one program: a second harness would read the same data.
@@ -74,6 +79,8 @@ SCHEMA = "pipeline-session-kind/1"
 FOLDER = os.path.join(os.path.dirname(HERE), "session-kinds")
 FIELDS = ("schema", "kind", "about", "brief", "mode", "branch", "approval", "permissions", "tools",
           "allow", "deny", "wall", "hosts", "env", "guards", "tool_servers", "limits")
+OPTIONAL = ("rules",)                     # KIT-708: a kind's own steps, for its rules file
+RULES_MAX, RULE_MAX = 20, 300
 MODES = ("ticket", "diagnosis", "planning")
 BRANCH_TYPES = ("feat", "fix", "chore", "refactor", "docs")
 PERMISSIONS = ("deny-unlisted",)
@@ -85,16 +92,18 @@ DENY_PLACES = ("store", "pins", "keys", "home")
 WALLS = ("built-in-sandbox", "own-sandbox")
 GUARDS = ("pre-tool-use",)
 # The tool servers a kind may name. `ticket` is the session's own ticket tools (KIT-706,
-# scripts/pipeline_session_tools.py), given only while the runner's `session_tools` is set.
-TOOL_SERVERS = ("ticket",)
+# scripts/pipeline_session_tools.py), given only while the runner's `session_tools` is set. `look`
+# is the look tool (scripts/pipeline_look.py, KIT-708), the acceptance kind's alone.
+TOOL_SERVERS = ("ticket", "look")
+SERVER_KINDS = {"look": ("acceptance",)}
 LIMIT_KEYS = ("wall_minutes", "memory_mb", "disk_mb")
 # KIT-886. The sessions' push token: the code host's token, under the one name git's helper and the
 # kit's GitHub fallback read, then git's own helper for it, given by the environment. A session
 # that holds it can push its branch and open its pull request. Only a kind that does a ticket's
 # work, with Bash held to its host list by the built-in sandbox, may name these, and it names all.
-PUSH_TOKEN_ENV = "GH_TOKEN"
-PUSH_ENV = (PUSH_TOKEN_ENV, "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0",
-            "GIT_CONFIG_KEY_1", "GIT_CONFIG_VALUE_1")
+# The names are spelled once, in the runner's store, so the command-line adapter reads them without
+# loading these checks and the runner's limits with them: the writer builds its line there (KIT-708).
+PUSH_TOKEN_ENV, PUSH_ENV = store.PUSH_TOKEN_ENV, store.PUSH_ENV
 WORD_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,29}\Z")
 ENV_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}\Z")
 HOST_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+\Z")
@@ -115,7 +124,7 @@ def problems(doc, name):
     if not isinstance(doc, dict):
         return ["%s: not an object" % name]
     bad = []
-    extra = sorted(repr(k)[:40] for k in doc if k not in FIELDS)
+    extra = sorted(repr(k)[:40] for k in doc if k not in FIELDS + OPTIONAL)
     if extra:
         bad.append("%s: %s is not a field" % (name, extra[0]))
     missing = [k for k in FIELDS if k not in doc]
@@ -208,7 +217,16 @@ def problems(doc, name):
     servers = doc["tool_servers"]
     if not (isinstance(servers, list) and all(s in TOOL_SERVERS for s in servers)
             and len(set(servers)) == len(servers)):
-        say("tool_servers: only the session's own ticket tools (%s) are offered" % ", ".join(TOOL_SERVERS))
+        say("tool_servers: only the session's own ticket tools and the look tool (%s) are offered"
+            % ", ".join(TOOL_SERVERS))
+    else:
+        for server in servers:
+            if kind not in SERVER_KINDS.get(server, (kind,)):
+                say("tool_servers: %s is the %s kind's alone" % (server, " and ".join(SERVER_KINDS[server])))
+    rules = doc.get("rules")
+    if "rules" in doc and not (isinstance(rules, list) and 0 < len(rules) <= RULES_MAX
+                               and all(_plain(r, RULE_MAX) for r in rules)):
+        say("rules: a list of 1 to %d lines, each at most %d characters" % (RULES_MAX, RULE_MAX))
     lim = doc["limits"]
     if not (isinstance(lim, dict) and sorted(lim) == sorted(LIMIT_KEYS)
             and all(_int_in(lim[k], limits.FLOORS[k], limits.CEILINGS[k]) for k in LIMIT_KEYS)):
@@ -364,6 +382,14 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
            sorted(k for k, d in kinds.items() if d["wall"] == "own-sandbox"), ["plan", "review"])
     expect("a resume keeps its run's branch: fix and conflict have none",
            sorted(k for k, d in kinds.items() if d["branch"] is None), ["conflict", "fix"])
+    expect("the look tool is the acceptance kind's alone (KIT-708)",
+           sorted(k for k, d in kinds.items() if "look" in d["tool_servers"]), ["acceptance"])
+    expect("…and the acceptance kind has its own steps, for its rules file, with the result block's "
+           "schema and the second look in them",
+           ([k for k, d in sorted(kinds.items()) if d.get("rules")],
+            any("pipeline-acceptance/1" in r for r in kinds["acceptance"]["rules"]),
+            any("second look" in r for r in kinds["acceptance"]["rules"])),
+           (["acceptance"], True, True))
     # KIT-886: the push token, by name, for code, fix and conflict, and for no other kind.
     expect("the kinds that hold the push token are code, fix and conflict",
            sorted(k for k, d in kinds.items() if PUSH_TOKEN_ENV in d["env"]), ["code", "conflict", "fix"])
@@ -434,7 +460,14 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
             ("a wall left out", {"deny": ["store", "pins", "home"]},
              "code: deny: must list every one of store, pins, keys, home, once"),
             ("a tool server nobody offers", {"tool_servers": ["tracker"]},
-             "code: tool_servers: only the session's own ticket tools (ticket) are offered"),
+             "code: tool_servers: only the session's own ticket tools and the look tool (ticket, look) are "
+             "offered"),
+            ("the look tool on a kind that is not the acceptance check", {"tool_servers": ["ticket", "look"]},
+             "code: tool_servers: look is the acceptance kind's alone"),
+            ("rules that are not lines", {"rules": ["one", "two\nthree"]},
+             "code: rules: a list of 1 to 20 lines, each at most 300 characters"),
+            ("no rules at all, given", {"rules": []},
+             "code: rules: a list of 1 to 20 lines, each at most 300 characters"),
             ("no guard", {"guards": []},
              "code: guards: must hold pre-tool-use, and only the kit's own guards (pre-tool-use)"),
             ("a field it does not know", {"sandbox": False}, "code: 'sandbox' is not a field"),

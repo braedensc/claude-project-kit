@@ -3244,7 +3244,7 @@ A follow-up the acceptance check asks the finding path to file.
 
 | Part | Notes |
 |---|---|
-| The mark | Line 1, alone. `plan` is the epic the comment is on; `head` the pull-request head the check judged; `run` the check's own acceptance ticket, so two checks of one head are two runs (KIT-607). |
+| The mark | Line 1, alone. `plan` is the epic the comment is on; `head` the pull-request head the check judged; `run` the check's own acceptance ticket, so two checks of one head are two runs (KIT-607). On the runner's lane (KIT-708), `run` is the check's start request to the runner, `rq-` and 32 hex characters. |
 | The block | One `pipeline-finding/1` request, the shape the finding poller reads (`docs/FINDING-POLLER.md`): a `title` and a `body`, nothing else, in a three-backtick `json` fence. It asks for no size, no track and no label, so the ticket it becomes waits for a person. |
 
 **How to read it.**
@@ -3302,9 +3302,10 @@ The rest of the comment is for people.
 ## 27. Acceptance second look
 
 Before a problem is filed or holds a plan, the acceptance poller's live pass asks the same session to look again
-(KIT-608). It replies in the session's own thread on the acceptance ticket, the route the bounce driver uses. The reply
-names each problem, its screenshot, and the block to send back for it. The session answers with **one fenced block per
-problem**:
+(KIT-608). It replies in the session's own thread on the acceptance ticket, the route the bounce driver uses. On the
+runner's lane (KIT-708) it asks the runner to resume the check's own run instead, and reads the answer from that
+resume's final message. The reply names each problem, its screenshot, and the block to send back for it. The session
+answers with **one fenced block per problem**:
 
 ```json
 {"schema": "pipeline-acceptance-second-look/1", "plan": "TOD-100", "head": "<40 hex>", "id": "white-card",
@@ -3349,9 +3350,10 @@ The runner is our own dispatcher's one always-on job (`scripts/pipeline_runner.p
 When the tracker on the machine is built, these records move into it.
 
 **Built beside the old dispatcher, and off.** Every lane is off for every project until the owner
-switches it on. Four lanes can ask it, each only for a project whose lane is on in the runner's own
-`lanes`: the review job (KIT-644), the planner job (KIT-705), the coding lane (KIT-645) and the fix
-lane (KIT-765). Each lane moves on the owner's yes, behind its own setting.
+switches it on. Six lanes can ask it, each only for a project whose lane is on in the runner's own
+`lanes`: the review job (KIT-644), the planner job (KIT-705), the coding lane (KIT-645), the fix
+lane (KIT-765), and the conflict and acceptance lanes (KIT-708). Each lane moves on the owner's yes,
+behind its own setting.
 
 **Where it lives.** One folder, the runner's `store_dir`: an absolute path, outside every git
 working tree, a real folder owned by the runner's account, writable by no one else (mode 0700).
@@ -3364,6 +3366,7 @@ session nobody approved.
 <store>/runs/<run>/run.json    the run's record
 <store>/trees/<run>.json       the processes the runner remembered of the run (KIT-739)
 <store>/outputs/<run>.json     the session's final message, kept when the run ends (KIT-858)
+<store>/lanes.json             the lanes the runner takes, for the jobs that ask it (KIT-708)
 ```
 
 ### A request
@@ -3469,8 +3472,23 @@ runs the plan executor pinned to the idea.
 it for that project. Absent is off. A start or resume for a lane that is off, the runner's own
 included, is refused with "the <kind> lane is off for project <key>", before anything is made or
 read: a request's answer says `ok: false`, and an interrupted run's record says `auto_resume:
-refused`. A stop is always taken. A lane runs only when the caller's own switch and the runner's lane
-are both on.
+refused`. A stop is always taken.
+
+**The lanes it takes, for the jobs that ask it (KIT-708).** Each pass writes `lanes.json`, whole, from
+its own checked settings, when they change. The runner alone writes it.
+
+```json
+{"schema": "pipeline-runner-lanes/1", "enabled": true, "work_dir": "/abs", "look_config_dir": "/abs",
+ "projects": {"app": ["acceptance", "conflict"]}}
+```
+
+`enabled` is the runner's own switch, `work_dir` and `look_config_dir` its real paths (the second
+null when unset), and each project lists the kinds whose lane is on. A job reads it with
+`read_lanes()` and asks `lane_on()`: true only while `enabled` is true and the kind is listed for the
+project. No file is every lane off: the runner has said nothing. A file that cannot be read, or is
+not this shape, is an error, never "off" (§13). So a job sends a kind to the runner only while its
+lane is on, and takes its old road otherwise: each project's `lanes` is the one switch. The runner
+still refuses any request for a lane that is off, whatever a job read.
 
 **A kind that changes nothing gets a fresh workspace at each start (KIT-858).** Before a review, plan
 or acceptance start makes its workspace, the runner removes, through git, the workspace and branch an

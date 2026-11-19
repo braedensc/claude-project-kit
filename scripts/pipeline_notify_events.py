@@ -161,8 +161,9 @@ ACCEPTANCE_PAGE_KEYS = ("holds", "failed_runs", "followups", "mechanical", "shot
 ACCEPTANCE_SHOT_RE = re.compile(
     r"^([0-9]{3,4}-[0-9]{8}T[0-9]{6}Z)/([A-Za-z0-9][A-Za-z0-9._-]{0,199}\.png)\Z")
 ACCEPTANCE_MAX_SHOTS = 4
-# A check's own record folder under look_record_dir: its acceptance ticket's id (the live pass).
-ACCEPTANCE_FOLDER_RE = re.compile(r"^[A-Z][A-Z0-9]{1,9}-[0-9]{1,6}\Z")
+# A check's own record folder under look_record_dir: its acceptance ticket's id, or on the runner's
+# lane its start request's id (the live pass; KIT-708).
+ACCEPTANCE_FOLDER_RE = re.compile(r"^(?:[A-Z][A-Z0-9]{1,9}-[0-9]{1,6}|rq-[0-9a-f]{32})\Z")
 ACCEPTANCE_MAX_BYTES = 2 * 1024 * 1024
 SHA_RE = re.compile(r"^[0-9a-f]{40}\Z")
 # The poller writes `writing`, posts, then writes `written`, in seconds. One still `writing` after
@@ -372,7 +373,7 @@ def _acceptance_page_problem(page, word):
         return "do not hold exactly the page's fields"
     if "folder" in page and not (isinstance(page["folder"], str)
                                  and ACCEPTANCE_FOLDER_RE.match(page["folder"])):
-        return "name a record folder that is not a ticket id"
+        return "name a record folder that is not a check's"
     for key in ("holds", "failed_runs", "followups"):
         if type(page[key]) is not int or not 0 <= page[key] <= 999:
             return "hold a %s that is not a whole number from 0 to 999" % key

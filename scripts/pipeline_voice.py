@@ -21,7 +21,8 @@ exactly true, and with it off nothing is started.
 
 HOW IT CALLS THE MODEL. One `claude -p` run with no tools, no MCP servers, no settings
 files, no saved session, one turn and a spend cap (the flags were measured on the CLI's
-2.1.287 help). The facts go on stdin, never in argv, so they do not show in `ps`. The
+2.1.287 help). The line is built by the runner's one builder (pipeline_harness_claude.py,
+KIT-708). The facts go on stdin, never in argv, so they do not show in `ps`. The
 child runs in a fresh empty folder that is also its HOME and TMPDIR, so no CLAUDE.md,
 memory, settings or login of this account is read, and the folder is removed afterwards.
 `--bare` is not used: it accepts only an API key, never a subscription token.
@@ -246,13 +247,15 @@ def settings(cfg):
 
 
 def build_argv(s):
-    """The one command line. The prompt is not in it: that goes on stdin."""
-    return [s["writer_bin"], "-p", "--model", s["writer_model"], "--output-format", "json",
-            "--tools", "", "--setting-sources", "", "--strict-mcp-config",
-            "--no-session-persistence", "--max-turns", "1",
-            "--max-budget-usd", str(s["writer_max_budget_usd"]),
-            "--permission-mode", "dontAsk",
-            "--system-prompt", SYSTEM_PROMPT % s["writer_max_chars"]]
+    """The one command line, built by the runner's own builder (KIT-708): no tools, no settings, no
+    tool server but none, no saved session, one turn, a spend cap and our system prompt. The prompt
+    is not in it: that goes on stdin. The adapter imports this file, so it is imported here, at the
+    call."""
+    import pipeline_harness_claude as harness
+    return harness.line(s["writer_bin"], s["writer_model"], persist=False, setting_sources="",
+                        strict_mcp=True, tools=[], permission_mode="dontAsk",
+                        system_prompt=SYSTEM_PROMPT % s["writer_max_chars"], max_turns=1,
+                        max_budget_usd=str(s["writer_max_budget_usd"]))
 
 
 def child_env(home, token):
@@ -857,13 +860,23 @@ def selftest():
         check("one-call-per-message", len(r.calls), 1)
         c = r.calls[0]
 
-        # 2. ARGV PINNED: tools off, no permission bypass, no prompt or facts in it.
+        # 2. ARGV PINNED: tools off, no permission bypass, no prompt or facts in it. Its flags
+        #    and values are the writer's own; their order is the runner's one builder's (KIT-708).
         argv = c["argv"]
         check("argv-is-pinned", argv,
               ["claude", "-p", "--model", "haiku", "--output-format", "json",
-               "--tools", "", "--setting-sources", "", "--strict-mcp-config",
-               "--no-session-persistence", "--max-turns", "1", "--max-budget-usd", "0.05",
-               "--permission-mode", "dontAsk", "--system-prompt", SYSTEM_PROMPT % 900])
+               "--no-session-persistence", "--setting-sources", "", "--strict-mcp-config",
+               "--tools", "", "--permission-mode", "dontAsk",
+               "--system-prompt", SYSTEM_PROMPT % 900, "--max-turns", "1", "--max-budget-usd", "0.05"])
+        import pipeline_harness_claude as harness
+        real_line, seen_line = harness.line, []
+        harness.line = lambda *a, **k: seen_line.append((a, k)) or ["from the runner's builder"]
+        try:
+            built = build_argv(settings(dict(cfg, writer_bin="/opt/claude"))[0])
+        finally:
+            harness.line = real_line
+        check("argv-comes-from-the-runners-own-builder",
+              (built, [a for a, _k in seen_line]), (["from the runner's builder"], [("/opt/claude", "haiku")]))
         check("argv-turns-every-tool-off", argv[argv.index("--tools") + 1], "")
         check("argv-never-bypasses-permissions",
               [a for a in argv if a in ("--dangerously-skip-permissions", "--bare",
@@ -873,10 +886,11 @@ def selftest():
         check("argv-carries-no-facts-prompt-or-token",
               (TITLE in joined, LINK in joined, FACTS_OPEN in joined, PLAIN in joined,
                TOKEN in joined), (False,) * 5)
-        check("system-prompt-states-the-limit", "at most 900 characters" in argv[-1], True)
+        system = argv[argv.index("--system-prompt") + 1]
+        check("system-prompt-states-the-limit", "at most 900 characters" in system, True)
         check("system-prompt-leaves-the-reply-to-the-bind",
-              ("never tell him how to reply" in argv[-1], "a fixed line after your message"
-               in argv[-1]), (True, True))
+              ("never tell him how to reply" in system, "a fixed line after your message"
+               in system), (True, True))
 
         # 3. ENV PINNED: seven keys, the token under the CLI's name, never an API key.
         env = c["env"]

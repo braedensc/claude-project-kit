@@ -2604,6 +2604,14 @@ Each entry is `OWNER/NAME:TEAM:PROJECT`. The repository is one you review, the t
 tracker team, and the project is its key in the runner's settings. Remove the entry and run
 the installer again to switch it back.
 
+**The runner's own lanes switch each kind** (KIT-708). The runner writes the lanes it takes into
+its store, and the driver reads them each pass. A fix goes to the runner only while the runner's
+`fix` lane is on for the project, and a conflict only while its `conflict` lane is on. Off, that
+kind goes by the session's thread, as before. Lanes the driver cannot read are said on the pull
+request, and nothing is sent. So the entry here names the repository once, and the runner's
+`lanes` setting moves each kind and moves it back. The catch-up poller still leaves the team out
+while the entry is here: to move a team back to the thread for good, remove its entry too.
+
 - **What stays the same.** The ledger rows, the fix budget, the re-review request, exhaustion
   and the page when a fix is never pushed. The visible record line goes on the ticket as one
   top-level comment.
@@ -2616,7 +2624,8 @@ the installer again to switch it back.
   is not installed, as with `CATCHUP_INTERVAL_SECONDS=off`. It works by team, so a team leaves
   it as a whole: name every repository of that team, or none. A repository of it still on the
   thread would no longer have its lost delegations re-sent.
-- **A conflict** still goes by the thread. That move comes later.
+- **A conflict** goes to the runner too, while the runner's `conflict` lane is on (KIT-708): a
+  `conflict` resume of the same coding run, with the same ledger rows and ack (step 6).
 - **Name a repository only once its coding sessions run through the runner too.** Until then
   every fix finds no run there, and says so on the pull request.
 
@@ -2645,7 +2654,7 @@ at the next request.
 
 | The pull request was opened by | Answered by | Where the fix runs |
 |---|---|---|
-| A dispatcher's session | the **bounce driver** (already installed, above) | that session, resumed in its own thread, worktree and sandbox |
+| A dispatcher's session | the **bounce driver** (already installed, above) | that session, resumed in its own thread, worktree and sandbox; or on the runner's conflict lane, resumed by our own runner (6a) |
 | One of your own local sessions | your **conflict waker** | a new capped session in that worktree, as you, held to it (KIT-676) |
 
 Why the split matters: a waker's session is held to its worktree, but it pushes with **your**
@@ -2671,6 +2680,15 @@ It is on as soon as the bounce driver is. Each pass reads GitHub's merge state. 
 
 If the session pushes and it is still conflicted, the driver posts `outcome=unresolved`
 once. The monitor then pages you. Nothing here spends a bounce.
+
+**On the runner's conflict lane (KIT-708)** step 2 is a `conflict` resume request to our own
+runner, for the pull request's own coding run, in place of the thread reply. It holds while that
+run is still going, and counts nothing. Steps 1 and 3 are the same. The repository must be named
+in `RUNNER_LANE_REPOS` (step 5a), and the runner's `conflict` lane on for its project. Your own
+conflict waker is not touched.
+
+- Good: `delivered to the runner as a resume of run run-… (rq-…) and acknowledged on the PR`.
+- Not: a reply in the ticket's agent-session thread for a repository on that lane.
 
 **One requirement:** the token in `~/.stage-e/env` must belong to a **writer** on the
 repository. The monitor only counts an `ack` from a writer.

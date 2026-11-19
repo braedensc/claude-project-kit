@@ -242,8 +242,50 @@ it when it reads it.
 | `time_limit_minutes` | Default 90. |
 | `required_checks` | `{"owner/repo": [names]}`. Absent for a repository: every check run on the head must pass. |
 | `max_starts_per_pass`, `run_timeout_seconds` | Defaults 2 and 300. |
+| `runner_lane` | `{"store_dir": the runner's store, "repos": {"owner/repo": its project key}}`: where our own runner is. It switches nothing. See "On the runner's lane". |
 
 Every problem in the config is named at once.
+
+### On the runner's lane (KIT-708)
+
+A repository can have its checks run by our own runner (`docs/RUNNER.md`) in place of the old dispatcher.
+**The switch is the runner's own `lanes.acceptance` for the repository's project.** The runner writes the lanes it
+takes into its store, and each pass reads them. With the lane on, the check is asked of the runner. Off, the check
+files its ticket as before. A check already running stays on the road it started on.
+
+Set up once:
+
+- `runner_lane` in this config: the runner's store, and the repository's project key there. The installer writes it
+  from `ACCEPTANCE_RUNNER_LANE_REPOS` (`OWNER/NAME:PROJECT` entries) and `ACCEPTANCE_RUNNER_STORE_DIR` in
+  `acceptance.conf`.
+- `look_config_dir` in the runner's settings: the same folder as this config's `look_config_dir`. The runner starts the
+  look tool on it. A different folder is said, and the check waits.
+- The acceptance approved states in the runner's project settings: the states a piece is approved in. The runner needs
+  the owner's own move of the piece into one of them.
+
+**What a check on this lane does.**
+
+1. **The start.** The ledger row first, as always. Then the look config, naming the runner's workspace for the plan's
+   last piece (`<work_dir>/acceptance/<piece>`) and the check's own record folder. Then one `acceptance` start request
+   for that piece. After the merge, the piece is the plan's last done piece. The request's text is the check's facts:
+   the plan, the repository, the pull request or branch, the head, how to fetch it, and the check blocks. The steps are
+   the acceptance kind's own rules. No ticket is filed.
+2. **The check's name** is its start request's id (`rq-…`). The look tool needs its record folder before the session
+   starts, before any run id exists. The record folder, the page's folder and the follow-up mark's `run=` all carry it.
+3. **The result** comes from the final message the runner kept, with the look tool's record, judged as above. A request
+   the runner refused is `could-not-check`, in the runner's own words.
+4. **The second look** is a resume of the check's own run, with the problems as its text. Its answer is the resume's
+   final message.
+5. **Past the time limit,** a run still going is asked to stop, once. A request the runner has not taken yet is
+   withdrawn, and looked at again a pass later. The verdict is `could-not-check`.
+6. **The epic's comments are the only tracker writes:** the follow-ups and the verdict. Nothing is filed or moved.
+
+**A start waits, unrecorded,** while the runner's lanes cannot be read (said on a `NOT DONE:` line), or while the
+runner still holds an earlier check of the same piece. The runner runs one acceptance check per piece at a time.
+
+**Good:** `TOD-100    started: asked the runner for TOD-102's acceptance check (rq-…), for acme/app #7 at aaaaaaaaaaaa`.
+**Not:** `NOT DONE: TOD-100: its check waits: the runner's lanes could not be read`. Look at the runner's store: its
+`lanes.json` is there and cannot be read. Nothing starts until it can be.
 
 ### Exit codes
 
