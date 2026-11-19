@@ -15,7 +15,8 @@ request you open yourself still merges. docs/SECURITY.md says which layer stops 
 
 WHAT IT CHANGES. One setting of one rule. The required checks (each with the app it must come
 from), admin enforcement and every other setting go back exactly as GitHub shows them. It reads
-the rule back after the change: NOT DONE if the pull request setting is not on, or anything else
+the rule again after your yes, and stops if it changed while the question waited. It reads the
+rule back after the change: NOT DONE if the pull request setting is not on, or anything else
 moved. It never creates a rule, never edits a ruleset, and never changes who may merge (that is
 KIT-37: a session stops holding your token). To undo it: the repository's Settings, Branches, the
 branch's rule, and untick "Require a pull request before merging".
@@ -478,6 +479,12 @@ def cmd_run(io, repo, branch_arg):
     if io.ask("Type yes to go on: ").strip() != "yes":
         io.say("You did not type yes. Nothing changed.")
         return EXIT_NOT_YES
+    # Read it again: a change made elsewhere while the question waited would be sent back over.
+    kind, fresh = read_rule(io, repo, branch)
+    if kind != "rule" or _norm(fresh) != _norm(rule):
+        io.say("Nothing changed: the rule could not be read again, or it changed while the question "
+               "waited. Run it again to see it as it is now.")
+        return EXIT_UNCHECKED
     ok, _out, err = io.gh(["api", "-X", "PUT", "repos/%s/branches/%s/protection" % (repo, branch),
                            "--input", "-"], stdin=json.dumps(body))
     if not ok:
@@ -600,6 +607,8 @@ class _FakeIO(IO):
 
     def ask(self, prompt):
         self.asked.append(prompt)
+        if "while_asked" in self.world:             # someone changes the rule while the question waits
+            self.world["rule"] = self.world.pop("while_asked")
         return self.answer
 
     def say(self, text):
@@ -906,13 +915,20 @@ def selftest():
     check("run: a rule with no required checks keeps none", (rc, json.loads(writes(io)[0][1])["required_status_checks"]),
           (EXIT_OK, None))
 
+    for label, extra in (("changed while the question waited", {"while_asked": _rule(admins=False)}),
+                         ("could not be read again after the yes", {"reads_left": 1})):
+        io, rc = run(dict({"rule": _rule(), "history": [[]]}, **extra), "run")
+        check("run: a rule that %s is not sent back over: nothing changed" % label,
+              (rc, writes(io), io.lines[-1].startswith("Nothing changed: the rule could not be read again")),
+              (EXIT_UNCHECKED, [], True))
+
     # 6. run: NOT DONE, never DONE, when the change did not hold or something else moved.
     for label, extra, word in (
             ("GitHub refuses the PUT", {"put": "fail"}, "Validation Failed"),
             ("the PUT changes nothing", {"put": "ignore"}, "says OFF"),
             ("a required check is gone after it", {"put": "drop-check"}, "required_status_checks"),
             ("admins are left out after it", {"put": "admins-off"}, "says OFF"),
-            ("the rule cannot be read back", {"reads_left": 1}, "says UNKNOWN")):
+            ("the rule cannot be read back", {"reads_left": 2}, "says UNKNOWN")):
         world = dict({"rule": _rule(), "history": [[]]}, **extra)
         io, rc = run(world, "run")
         check("run: %s is NOT DONE, named" % label,
