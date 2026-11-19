@@ -118,7 +118,10 @@ INSTALLER_BYTES = 8 * 1024 * 1024
 INSTALLER_LISTS = ("REQUIRED_SCRIPTS", "SIBLING_JOBS", "RUNTIME_DATA_DIRS")
 CUT_OFF_REASON = "more files changed than GitHub lists, so the jobs' files cannot all be checked"
 REF_RE = re.compile(r"^ref: (refs/heads/[A-Za-z0-9._/-]{1,100})\Z")
-JOB_FILE_RE = re.compile(r"^(?:scripts|schemas)/[A-Za-z0-9._-]{1,100}\Z")
+# The shape of a file name it passes on: one of the installer's data folders (RUNTIME_DATA_DIRS:
+# the schemas, and the session kinds the runner reads, KIT-880) or scripts. The selftest checks it
+# against the installer's own list, and against the status schema's pattern.
+JOB_FILE_RE = re.compile(r"^(?:scripts|schemas|session-kinds)/[A-Za-z0-9._-]{1,100}\Z")
 # KIT-415: how long a source may stay unread, in AWAKE time, before it fires. Dark wakes with
 # no network all night never add up to it. The catch-up poller's own number and its way of
 # counting: pass by pass, from a clock that stops while the Mac sleeps.
@@ -2406,6 +2409,20 @@ def selftest():
               (got_k["state"], got_k["merges_behind"], got_k["files"], got_k["files_total"]),
               ("behind", 2, ["schemas/x.schema.json", "scripts/pipeline_review_poller.py",
                              "scripts/pipeline_voice.py"], 3))
+        kinds_inst = ("REQUIRED_SCRIPTS = ('pipeline_review_poller.py',)\nSIBLING_JOBS = ()\n"
+                      "RUNTIME_DATA_DIRS = ('schemas', 'session-kinds')\n")
+        got_k = kit_says(compare("ahead", 1, ("docs/A.md", "session-kinds/code.json")),
+                         root=fake_clone("c-kinds", installer=kinds_inst))[0]
+        check("behind on a session kind's data alone is behind, and names it (KIT-880)",
+              (got_k["state"], got_k["files"], got_k["files_total"]), ("behind", ["session-kinds/code.json"], 1))
+        real_jobs, why_real = job_files(KIT_ROOT)
+        with open(os.path.join(KIT_ROOT, "schemas", "pipeline-status.schema.json"), encoding="utf-8") as fh:
+            files_pattern = json.load(fh)["properties"]["kit_clone"]["oneOf"][1]["properties"]["files"][
+                "items"]["pattern"]
+        check("every data folder the installer compares can be named here, and in the file's schema (KIT-880)",
+              (why_real, [d for d in (real_jobs or {}).get("folders", ())
+                          if not (JOB_FILE_RE.match(d + "/x.json") and re.match(files_pattern, d + "/x.json"))]),
+              (None, []))
         crowd = ["scripts/pipeline_review_poller.py"] + ["schemas/s%02d.json" % i for i in range(14)]
         got_k = kit_says(compare("ahead", 2, crowd))[0]
         check("at most ten files are named, out of all of them",

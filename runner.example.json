@@ -5,6 +5,7 @@
   "session_home": "~/.pipeline-runner/home",
   "claude_bin": "/opt/homebrew/bin/claude",
   "model": "sonnet",
+  "guarded_model": "opus",
   "token_env": "CLAUDE_WRITER_OAUTH_TOKEN",
   "linear_key_file": "~/.pipeline-runner/tracker-key",
   "owner_user_ids": ["<the owner's tracker user id>"],
@@ -12,6 +13,7 @@
   "poll_seconds": 5,
   "stop_grace_seconds": 30,
   "max_starts_per_ticket": 20,
+  "max_review_starts_per_ticket": 100,
   "hold": {"file": ""},
   "limits": {
     "wall_minutes": 360,
@@ -31,7 +33,6 @@
       "base": "main",
       "approval_states": {
         "code": ["<the ready state's id>"],
-        "review": ["<the ready state's id>"],
         "plan": ["<the plan-it state's id>"],
         "acceptance": ["<the ready state's id>"]
       },
