@@ -368,6 +368,9 @@ npm run test:validator-run   # the validator agent's run (KIT-537): one tool-les
                              #   environment pinned, a failure a hold in fixed words, only its job starts it
 npm run test:validator-merge  # the merge path (KIT-539): GitHub's own auto-merge on one pull request at a
                              #   time, the next updated and judged again; never merges, approves or labels
+npm run test:validator-setup  # the validator's install (KIT-547): one LaunchAgent under your own login, no
+                             #   sudo; every switch off, a settings file there never written; `check` rows,
+                             #   `apply` answers through a pipe, a first-pass ceiling of 0; no key in any output
 npm run test:validator-pieces  # the validator approves a piece starting (KIT-543): the ticket as written,
                              #   against its plan's criteria; it records, and the queue's pool starts it
 npm run test:day-planner     # the day planner (KIT-439): ticket text fenced as data in its brief, one

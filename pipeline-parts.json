@@ -2223,12 +2223,13 @@
       "id": "validator",
       "name": "Approves and merges in your place, inside hard limits",
       "internal_name": "the validator",
-      "does": "Would approve a plan, a piece or a merge in your place, only inside switches and size limits you set. Its evidence reader, settings, ledger, brief, agent's run, merge path and piece pass are built; no job is installed to run them.",
+      "does": "Would approve a plan, a piece or a merge in your place, only inside switches and size limits you set. Its job runs every few minutes under your own login, and every switch ships off.",
       "scope": "machine",
       "state": "built-off",
       "needs": [
         "review",
-        "review-identity"
+        "review-identity",
+        "watcher"
       ],
       "scripts": [
         "scripts/pipeline_validator_evidence.py",
@@ -2242,25 +2243,97 @@
         "scripts/pipeline_validator_app.py",
         "scripts/pipeline_validator_run.py",
         "scripts/pipeline_validator_merge.py",
-        "scripts/pipeline_validator_pieces.py"
+        "scripts/pipeline_validator_pieces.py",
+        "scripts/pipeline_validator_setup.py"
       ],
-      "installer": null,
-      "check": null,
-      "apply": null,
-      "no_command_reason": "Not installable yet: no job runs it, and every switch ships off.",
-      "restarts": [],
-      "settings": {
-        "file": "validator settings",
-        "example": "validator-settings.example.json",
-        "keys": [
-          "approve",
-          "limits",
-          "allow"
+      "installer": "scripts/pipeline_validator_setup.py",
+      "check": {
+        "script": "scripts/pipeline_validator_setup.py",
+        "args": [
+          "check",
+          "--conf",
+          "validator.conf"
         ]
       },
-      "secrets": [],
-      "jobs": [],
+      "apply": {
+        "script": "scripts/pipeline_validator_setup.py",
+        "args": [
+          "apply",
+          "--conf",
+          "validator.conf"
+        ]
+      },
+      "no_command_reason": null,
+      "restarts": [],
+      "settings": {
+        "file": "validator.conf",
+        "example": "validator.conf.example",
+        "keys": [
+          "JOB_LABEL",
+          "INTERVAL_SECONDS",
+          "HOLD_FILE",
+          "APP_KEY_FILE",
+          "LEDGER_FILE"
+        ]
+      },
+      "secrets": [
+        {
+          "key": "LINEAR_KEY_ENV",
+          "default_name": "VALIDATOR_LINEAR_API_KEY",
+          "what": "A read-only tracker key, in the validator's own env file.",
+          "ends": "unknown",
+          "clock": "validator-tracker-key",
+          "date_from": "The key's page in the tracker's settings, if it shows an end date."
+        },
+        {
+          "key": "AGENT_TOKEN_ENV",
+          "default_name": "CLAUDE_WRITER_OAUTH_TOKEN",
+          "what": "A Claude setup token, for the validator's one read-only agent run.",
+          "ends": "one-year",
+          "clock": "claude-writer-token",
+          "date_from": "The day you made it with `claude setup-token`, plus one year."
+        }
+      ],
+      "jobs": [
+        {
+          "label": "local.validator",
+          "from_key": "JOB_LABEL",
+          "account": "owner",
+          "loaded_by": "installer",
+          "command": {
+            "program": "/bin/sh",
+            "args": [
+              "-c",
+              "set -a; . <ENV_FILE>; set +a; rc=0; <PYTHON> <kit>/scripts/pipeline_validator_merge.py run --config <owner home>/.validator/config.json; r=$?; [ \"$r\" -gt \"$rc\" ] && rc=$r; <PYTHON> <kit>/scripts/pipeline_validator_pieces.py run --config <owner home>/.validator/config.json; r=$?; [ \"$r\" -gt \"$rc\" ] && rc=$r; printf '{\"schema\": \"validator-pass/1\", \"at\": \"%s\", \"exit\": %d}\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" \"$rc\" > <owner home>/.validator/last-pass.json.tmp && mv -f <owner home>/.validator/last-pass.json.tmp <owner home>/.validator/last-pass.json; exit $rc"
+            ]
+          },
+          "schedule": "interval",
+          "interval_key": "INTERVAL_SECONDS",
+          "log": "<owner home>/.validator/validator.log",
+          "switch": null,
+          "switch_reason": "No settings key; every pass reads the switches in the validator's settings file, which ship off.",
+          "watched_by": "not-watched"
+        }
+      ],
       "person_steps": [
+        {
+          "card": "CK-V1",
+          "card_in": "scripts/pipeline_validator_setup.py",
+          "kind": "only-a-person",
+          "words": "Make the validator's own app first, with its own script."
+        },
+        {
+          "card": "CK-V2",
+          "card_in": "scripts/pipeline_validator_setup.py",
+          "kind": "only-a-person",
+          "words": "Write the validator's env file: a read-only tracker key and a setup token."
+        },
+        {
+          "card": "CK-V3",
+          "card_in": "scripts/pipeline_validator_setup.py",
+          "kind": "machine-could-fake",
+          "words": "Switch the validator's job on yourself, when the install left it off or you paused it."
+        },
         {
           "card": null,
           "card_in": null,
@@ -2268,8 +2341,11 @@
           "words": "Turn on each switch by hand, one at a time, in the settings file."
         }
       ],
-      "ceiling": null,
-      "consent": [],
+      "ceiling": 0,
+      "consent": [
+        "Installs a job under your own login that reads the validator's switches every few minutes. Every switch ships off, so it approves nothing until you turn one on.",
+        "Switches its job on by itself only when its first pass would decide nothing; above that the job stays off, and the end says why."
+      ],
       "docs": {
         "guide": "docs/VALIDATOR-OPERATOR.md",
         "lesson": null,
