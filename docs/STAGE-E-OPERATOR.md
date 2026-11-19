@@ -221,7 +221,8 @@ Read its log first.
 
 **`verify` reads `behind` only when a file the jobs run changed.** Those files are every
 script the five jobs load, their imports included, and `schemas/`, which a review and a
-telemetry row are judged against. They include the notifier's and the Slack bridge's files
+telemetry row are judged against. `session-kinds/` counts too: the runner reads each kind of
+session's walls from it when it starts (KIT-880). They include the notifier's and the Slack bridge's files
 on a machine that runs that job. A merge that touched none of them — a doc, an ADR,
 another project's script, a bridge file on a machine with no bridge — leaves `verify` at
 `ALREADY-DONE`, naming both commits. If the list of jobs cannot be read, every job's files

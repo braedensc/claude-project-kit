@@ -159,6 +159,17 @@ loader refuses it:
 
 The files sit behind the `hooks-change` label: a change to one changes what a session may reach.
 
+**The runner never starts a session from kinds the kit no longer has (KIT-880).** It reads the
+files once, when it starts, and keeps a hash of the bytes it read. Before each start and resume
+it reads the folder again and compares, with no network call. When they differ, nothing starts:
+the request waits, and the runner says why. A restart loads the new files. A folder it cannot read
+is never taken as unchanged. Stage E's `verify` counts `session-kinds/` too, so a merge that
+changed only these files moves the clone.
+
+Good: a merge changes `code.json` alone. `verify` says the clone is behind, and a runner still
+holding the old file holds every start until it restarts.
+Not: the runner starts sessions behind the old walls until some script changes too.
+
 ## What a session is given
 
 - **Nothing from its workspace.** No settings, hooks, tool servers or `CLAUDE.md` load from it.
@@ -445,6 +456,8 @@ Each refusal says why, in the request's answer (`<store_dir>/taken/<id>.json`).
 | the workspace's `.env` names a variable the program reads | Take the variable out of that file, or out of the project's committed copy. |
 | the engine's folder could be changed by this account | The runner runs from its own copy of the kit, owned by root. The request waits until it does. |
 | the session kinds could not be loaded | A kind's data file is missing or wrong: `python3 scripts/pipeline_session_kinds.py --check` says which. |
+| the kit's session kinds changed after this runner loaded them | The kit moved after the runner started. Restart the runner: it loads them, and the request starts. |
+| the kit's session kinds could not be read to compare | The folder, or a kind's file in it, cannot be read (a link, say). `python3 scripts/pipeline_session_kinds.py --check` says which. The request waits. |
 
 The runner refuses to start from inside a Claude session, or as root.
 
