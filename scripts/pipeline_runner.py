@@ -9,7 +9,8 @@ docs/adr/2026-11-11-our-own-dispatcher-built-new-beside-the-old-one.md).
 
 BESIDE THE OLD DISPATCHER, AND OFF.  This is built beside the third-party dispatcher, which keeps
 doing everything. `enabled` ships false: then a pass takes no request. No lane asks it for anything
-yet, and no job loads it: each lane moves later, on the owner's yes. Docs: docs/RUNNER.md.
+yet: its installer (scripts/pipeline_runner_setup.py) loads its job with every lane off, and each lane
+moves later, on the owner's yes. Docs: docs/RUNNER.md.
 
 EACH LANE, PER PROJECT (KIT-866).  A project's `lanes` say, for each kind of session, whether the
 runner takes it for that project. Absent is off. A request for a lane that is off is refused in words

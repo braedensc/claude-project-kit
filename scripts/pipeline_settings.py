@@ -138,11 +138,11 @@ OTHER_ACCESS = 0o077                         # any of these bits, and another ac
 MAP = (
     ("ROLE_ACCOUNT", "the pipeline's own account, the one the review jobs and the dispatcher run as",
      "stage-e stage-a stage-a:DISPATCHER_ACCOUNT acceptance bridge chat-lane notifier queue sweep "
-     "update watcher"),
+     "update watcher runner"),
     ("ROLE_KIT_CLONE", "that account's clone of this kit, the one the review jobs run from",
-     "acceptance bridge notifier queue sweep"),
+     "acceptance bridge notifier queue sweep runner"),
     ("ENV_FILE", "that account's own env file, the one the review installer keeps its keys in",
-     "acceptance bridge notifier queue sweep chat-lane:ROLE_ENV_FILE"),
+     "acceptance bridge notifier queue sweep chat-lane:ROLE_ENV_FILE runner"),
     ("LINEAR_KEY_ENV", "the NAME the pipeline's tracker key is stored under",
      "stage-e stage-a acceptance bridge notifier queue sweep"),
     ("GITHUB_TOKEN_ENV", "the NAME the review jobs' code host token is stored under",
