@@ -364,7 +364,7 @@ lane write the rest:
 | `needs-human-session` (KIT-282) | a stopped working session, any author | it stopped for good; a person takes it from here | `agent:needs-human` |
 | `needs-human-routing` (KIT-282) | planner job, accepted only from `executor_actor_ids` | the `agent:needs-human` planner row above, under a mark of its own | `agent:needs-human`, on that dead planning ticket |
 | `fixes-spent` (KIT-282) | bounce driver, accepted only from `bounce_actor_ids` | the `agent:needs-human` bounce-driver row above, under a mark of its own | `agent:needs-human` |
-| `planning-failed` (KIT-338) | planner job, accepted only from `executor_actor_ids` | planning stopped without a plan: how, and what to do next | no — the run is over and its ticket closed, so the page is the cue |
+| `planning-failed` (KIT-338) | planner job, accepted only from `executor_actor_ids` | planning stopped without a plan: how, and what to do next | no — the run is over, so the page is the cue |
 | review "NOT reviewed" | review publisher (§14) | a review could not run | no — it is a CI-visible verdict, not a person's decision (paged since 2026-11-04 as `review-declined`, below) |
 | `fix-not-pushed` (KIT-336) | bounce driver, accepted only from `bounce_actor_ids` | a fix was asked for six hours ago, and nothing was pushed | no — the driver applies `agent:needs-human` with its notice |
 | `review-declined` (KIT-336) | the review poller's outcome records, never a comment | a review could not run; why, from a fixed list | no — the review is stuck, not the work |
@@ -490,6 +490,15 @@ notifier cannot page on never exists silently.
 > a push that fixed the pull request pages nothing. `status_file` names the file; empty, all
 > three are off and every pass says so. Decision 2 holds: each page is its mark's words alone,
 > with an empty `detail`.
+
+> **Note, 2026-11-18: a planning run on our own runner (KIT-705).** Where a project's
+> `lanes.plan` is on, the planner job asks our own runner for a plan run on the idea itself,
+> and makes no planning ticket. Its `planning-failed` page then sits on the idea. Its line 2
+> may say `Ended: not-started`, when the runner would not start the session, and the page says
+> "the runner wouldn't start its session". A `stopped` run now reads "it was stopped before it
+> finished", true on either lane. The page still adds no label, since the run is over; the
+> KIT-338 note's reason, a closed ticket, holds on the old lane only. Decision 2 holds: the new
+> word is one more key in the same fixed list.
 
 ## Update 2026-09-17 — the conversational lane, the front door, paging and the relay
 

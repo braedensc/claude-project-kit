@@ -2600,11 +2600,21 @@ def _pin_path(cfg) -> str:
 # /etc cannot be renamed by it. Removing the old marker gains nothing once the new one is
 # there, which is why the two are OR'd and neither is required alone.
 #
-# THE MARKER WINS OVER A PIN. A dispatcher that writes no pin runs on this account, and
-# none writes a pin for it. A pin found for a session on a marked account is one the
-# session (or its predecessor) forged in the pins root, which that account can write when
-# its sandbox lets a write leave the worktree; read as a pin, it switched the lane off. So
-# the marker is read first, and with it the pin is not read at all (_pipeline_guards).
+# THE MARKER'S RULES ALWAYS HOLD, AND A PIN CAN ONLY ADD TO THEM (KIT-645, G4). A
+# dispatcher that writes no pin runs on this account, and the pins root is that account's
+# own, which a session can write when its sandbox lets a write leave the worktree. A pin
+# forged there used to switch the lane off: read as a pin, a maintenance pin opened every
+# create. So with the marker the lane's rules hold whatever any pin says. Our own runner
+# runs as the same account and writes a pin for each session it starts (contract section
+# 28); a pin it wrote for a `ticket` session on the ticket the workspace folder is named
+# after ADDS the pinned rules (grader paths, the ticket branch, the own ticket, no create)
+# beside the lane's. Any other pin found there binds nothing and is ignored. A forged one
+# that passed as the runner's could only add rules, never lift one. A pin the ledger
+# expects and cannot find, and a pin that cannot be parsed or names another worktree, are
+# broken, as with no marker: each could only have added rules, so each fails closed. A pin
+# store the hook cannot read adds nothing, and the lane's rules hold as they did: no
+# session can make the store unreadable past its walls, and a read error there must never
+# stop the lane's own sessions (_pipeline_guards).
 LANE_MARKER_DIR = "dispatched-lane"
 LANE_MARKER_SYSTEM_DIR = "/etc/claude-pipeline/dispatched-lane"
 _TICKET_DIR_RE = re.compile(r"^([A-Z][A-Z0-9]*)-(\d+)$")
@@ -2672,6 +2682,19 @@ def _lane_marker(cfg) -> str:
         return unchecked or ("<the pins root does not resolve, so the marker under it %s>"
                              % LANE_UNCHECKED)
     return unchecked
+
+
+def _runner_pin_for(pin, own) -> bool:
+    """KIT-645 (G4): `pin` is one our own runner wrote for a `ticket` session on `own`, the
+    ticket the workspace folder is named after (_worktree_ticket). Only such a pin adds its
+    rules on the lane: one naming another ticket, another mode or another writer binds
+    nothing there, whoever forged it."""
+    if not (isinstance(pin, dict) and own):
+        return False
+    ticket = pin.get("ticket") if isinstance(pin.get("ticket"), dict) else {}
+    return (str(pin.get("pinned_by") or "").startswith("runner:")
+            and str(pin.get("session_mode") or "").strip().lower() == "ticket"
+            and str(ticket.get("id") or "").strip().upper() == own)
 
 
 def _worktree_ticket() -> str:
@@ -3264,7 +3287,9 @@ def _tracker_write_guards(kind, inp, cfg, pin, mode, ticket, pinned_id, lane="",
     ready = _clean_id(((cfg.get("linear") or {}).get("stateIds") or {}).get("ready"))
     targets = _payload_ticket_ids(inp)
     foreign = {t for t in targets if team and not t.startswith(team + "-")}
-    # The lane and a pin never meet: with the marker, no pin is read (_pipeline_guards).
+    # With the marker the lane's rules always hold. A pin is here with it only when our own
+    # runner wrote it for the workspace's own ticket, and then its rules hold beside them
+    # (_pipeline_guards, KIT-645).
     own = _worktree_ticket() if lane else ""
     m = _MCP_NAME_RE.match(tool or "")
     verb = m.group("tool").lower() if m else ""
@@ -3324,9 +3349,9 @@ def _tracker_write_guards(kind, inp, cfg, pin, mode, ticket, pinned_id, lane="",
         if foreign:
             block(TEAM_SCOPE_HELP.format(
                 team=team, mode=mode, targets=", ".join(sorted(foreign))))
-    elif lane:
-        # B8: the account carries the dispatcher's lane marker (and any pin went unread,
-        # see _pipeline_guards). The pinned
+    if lane:
+        # B8: the account carries the dispatcher's lane marker. These rules hold whatever a
+        # pin says, and beside the rules of a pin our own runner wrote (KIT-645, G4). The pinned
         # `ticket` rules, with the own ticket read from the worktree's folder name. An
         # issue write the guard cannot tie to that ticket fails CLOSED, and so does a
         # comment naming any ticket when the folder names none (as a pin with no ticket
@@ -3374,14 +3399,18 @@ def _pipeline_guards(tool, inp) -> None:
             return
         block(PINS_ROOT_HELP.format(path=bad_pins))
 
-    # The lane marker FIRST, and it wins over a pin (see LANE_MARKER_SYSTEM_DIR): no
-    # dispatcher writes a pin for an account that carries the marker, so a pin found
-    # there was forged. It is not read at all: not as a binding, and not as a broken one.
+    # The lane marker FIRST: with it, the lane's rules hold whatever any pin says (see
+    # LANE_MARKER_SYSTEM_DIR). A pin our own runner wrote for this workspace's own ticket
+    # ADDS the pinned `ticket` rules to them, and never replaces one (KIT-645, G4). Any
+    # other pin found there binds nothing and is ignored, and so is a pin store the hook
+    # cannot read: the lane's rules hold as they did. A pin the ledger expects and cannot
+    # find, and a pin that cannot be parsed or names another worktree, are broken below,
+    # as with no marker: each fails closed.
     lane = _lane_marker(cfg)
-    if lane:
+    pin, pin_status, pin_file = _read_pin(cfg)
+    if lane and (pin_status == "unreadable" or (
+            pin_status in ("ok", "expired") and not _runner_pin_for(pin, _worktree_ticket()))):
         pin, pin_status, pin_file = None, "ignored", ""
-    else:
-        pin, pin_status, pin_file = _read_pin(cfg)
     # A pin the ledger says must be here is MISSING, and a pin store the hook cannot read
     # is UNREADABLE (KIT-674). Either way the binding cannot be checked, so every write
     # fails closed whatever the mode, which the ledger row does not carry. For `missing`

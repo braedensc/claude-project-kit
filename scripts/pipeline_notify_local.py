@@ -142,8 +142,8 @@ WHAT THIS IS
 
   THE PLANNING-FAILED MARK (KIT-338) is the planner job's page on every way it stops without
   filing a plan: a refusal before a run, a time-out, a give-up, a plan for the wrong team, a
-  run someone stopped, and a refused or empty run, whose executor page the job now holds
-  back on every run. It counts from `executor_actor_ids`, like the executor's four, and
+  run someone stopped, a run our own runner would not start (KIT-705), and a refused or empty
+  run, whose executor page the job now holds back on every run. It counts from `executor_actor_ids`, like the executor's four, and
   carries no label. Its page is built from one exact-shape line, line 2 of that comment:
   `Ended: <how>[; runs: <n>]; filed: nothing|not certain[; replan: <idea>]`. A line in any
   other shape gives the page's general words. Where the page goes to direct messages, the
@@ -586,7 +586,11 @@ FAILED_HOW = {
     "gave-up": "filing the plan kept failing",
     "team-mismatch": "the plan belongs on another team",
     "could-not-tell": "what the run came to couldn't be read",
-    "stopped": "its planning ticket was closed",
+    # KIT-705: true on both planning lanes. On the old dispatcher's, a run stops when its planning
+    # ticket is closed; on our own runner, when someone asks the runner to stop it.
+    "stopped": "it was stopped before it finished",
+    # KIT-705: our own runner refused to start the run's session (its lane off, a setting).
+    "not-started": "the runner wouldn't start its session",
 }
 FAILED_BEFORE = {
     "not-owner": "someone other than you moved it to be planned",
@@ -738,7 +742,7 @@ MARKS = {
                 "and what to do next.",
         "needs_you": True,
         "label": None,
-        "why_no_label": "the run is over and its ticket closed, so the page is the cue",
+        "why_no_label": "the run is over, so the page is the cue",
     },
     ESC_BLOCKED: {
         "page": "A dev stopped work on this to ask you something, and needs your answer to "
@@ -4905,6 +4909,13 @@ def selftest():
         ({"ended": "team-mismatch", "unsure": False, "runs": 1},
          "Planning this idea ended without a plan: the plan belongs on another team. Nothing "
          "was filed. The ticket says how to fix the setup."),
+        # KIT-705: the runner lane's two ways to stop, in words true on both lanes.
+        ({"ended": "not-started", "unsure": False, "runs": 1, "replan": "TOD-140", "bind": True},
+         "Planning this idea ended without a plan: the runner wouldn't start its session. "
+         "Nothing was filed."),
+        ({"ended": "stopped", "unsure": False, "runs": 1, "replan": "TOD-140", "bind": True},
+         "Planning this idea ended without a plan: it was stopped before it finished. Nothing "
+         "was filed."),
         ({"ended": "could-not-tell", "unsure": True},
          "Planning this idea ended without a plan: what the run came to couldn't be read. Some "
          "of it may have been filed, so look at the ticket first. The ticket says what to do "
