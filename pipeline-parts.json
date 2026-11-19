@@ -504,7 +504,8 @@
           "POLL_INTERVAL_SECONDS",
           "BOUNCE_INTERVAL_SECONDS",
           "RUNNER_LANE_REPOS",
-          "RUNNER_STORE_DIR"
+          "RUNNER_STORE_DIR",
+          "RUNNER_SETTINGS"
         ]
       },
       "secrets": [
@@ -705,7 +706,7 @@
       "id": "catch-up",
       "name": "Re-sends a hand-off the session runner missed",
       "internal_name": "the catch-up poller",
-      "does": "If the machine slept past the tracker's retries and a hand-off was lost, it prompts that ticket once more, in its own thread. It leaves out a team whose fixes go to the runner, and is not installed when no team is left.",
+      "does": "If the machine slept past the tracker's retries and a hand-off was lost, it prompts that ticket once more, in its own thread. It is not installed for a project whose fixes the runner takes: each pass leaves that team out while the runner's fix lane is on for it, and a pass with no team left reads nothing and says so.",
       "scope": "machine",
       "state": "live",
       "needs": [
@@ -739,7 +740,8 @@
         "keys": [
           "CATCHUP_INTERVAL_SECONDS",
           "CATCHUP_DISPATCHER_URL",
-          "RUNNER_LANE_REPOS"
+          "RUNNER_LANE_REPOS",
+          "RUNNER_STORE_DIR"
         ]
       },
       "secrets": [

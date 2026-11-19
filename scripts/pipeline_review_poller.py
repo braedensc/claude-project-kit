@@ -653,7 +653,11 @@ CONFIG_KEYS = {
     "runner_settings": "optional: our own runner's settings file (default %s). A project there whose "
                        "review lane is on gets its reviews from the runner, with no review ticket "
                        "(KIT-644); the lane is the runner's switch, not this file's. No file: every "
-                       "review goes by review ticket" % DEFAULT_RUNNER_SETTINGS,
+                       "review goes by review ticket, unless runner_projects names a repository" % DEFAULT_RUNNER_SETTINGS,
+    "runner_projects": "optional: {\"OWNER/NAME\": \"project\"}, the repositories Stage E's own "
+                       "settings name as runner projects (RUNNER_LANE_REPOS, KIT-892). While it names "
+                       "one, runner settings that are not there or cannot be read stop the pass and "
+                       "page: never read as \"lane off\"",
 }
 # Each pair is (name key, id override key): one of the two must be given. Names are the
 # documented way — a UUID pasted from a URL bar rots silently and reads as noise. The
@@ -766,6 +770,7 @@ def load_config(path):
         "session_log_root": raw.get("session_log_root") or "",
         "basis_snapshot_dir": raw.get("basis_snapshot_dir") or "",
         "runner_settings": raw.get("runner_settings") or DEFAULT_RUNNER_SETTINGS,
+        "runner_projects": raw.get("runner_projects") or {},
     }
     parts = cfg["max_review_parts"]
     if type(parts) is not int or parts < 1:
@@ -776,6 +781,13 @@ def load_config(path):
             and (os.path.isabs(where) or where.startswith("~/"))):
         raise PollerError("config 'runner_settings' must be the runner's settings file, an "
                           "absolute path or one under ~/, got %r" % (where,))
+    named = cfg["runner_projects"]
+    if not (isinstance(named, dict) and all(
+            isinstance(k, str) and _GITHUB_REPO_RE.match(k) and isinstance(v, str)
+            and runner_store.PROJECT_RE.match(v) for k, v in named.items())):
+        raise PollerError("config 'runner_projects' must map each OWNER/NAME to its project key in "
+                          "the runner's settings (KIT-892), got %r" % (named,))
+    cfg["runner_projects"] = dict((k.lower(), v) for k, v in named.items())
     keep = cfg["state_keep_days"]
     if type(keep) is not int or keep < 0:
         raise PollerError("config 'state_keep_days' must be a whole number of days, 0 or more "
@@ -4571,17 +4583,31 @@ def runner_review_lanes(cfg, git=None):
     ticket, as before, and that is ({}, ""). A file that cannot be read, a field the runner would
     refuse, or a project with the lane on whose repository cannot be read is ({}, problem): the
     caller files nothing this pass, on either lane. A lane is never changed by a file that could
-    not be read (§13)."""
+    not be read (§13).
+
+    KIT-892: no file while Stage E's own settings name a repository as a runner project
+    (`runner_projects`, from RUNNER_LANE_REPOS) is not "no runner": the runner's folder moved, or
+    its settings went. That is ({}, problem) too, in words naming each repository, and the pass
+    ends in error, which the heartbeat monitor pages. It is never read as "lane off"."""
     path = _account_path(cfg.get("runner_settings") or DEFAULT_RUNNER_SETTINGS)
+    said = "the runner's settings at %s" % path
+    named = cfg.get("runner_projects") or {}
+    owed = "; ".join("%s is runner project %s" % (repo, named[repo]) for repo in sorted(named))
     if not os.path.lexists(path):
+        if named:
+            return {}, ("%s are not there, and Stage E's settings name runner projects (%s, "
+                        "RUNNER_LANE_REPOS): whether their reviews go to the runner cannot be told. "
+                        "Set RUNNER_SETTINGS in stage-e.conf to the runner's settings file, or run "
+                        "the installer again to take it from the runner's installed job" % (said, owed))
         return {}, ""
     git = git or _runner_git
-    said = "the runner's settings at %s" % path
     try:
         with open(path, encoding="utf-8") as fh:
             raw = json.load(fh)
     except (OSError, ValueError, RecursionError) as exc:
-        return {}, "%s could not be read (%s)" % (said, type(exc).__name__)
+        return {}, "%s could not be read (%s)%s" % (said, type(exc).__name__,
+                                                    ", and Stage E's settings name runner projects (%s)"
+                                                    % owed if named else "")
     if not isinstance(raw, dict):
         return {}, "%s are not an object" % said
     enabled, store_dir = raw.get("enabled", False), _account_path(raw.get("store_dir"))
@@ -7760,6 +7786,38 @@ def selftest():
             json.dump({"agent_user_name": "Dispatcher Agent", "reviews_team_key": "REV"}, fh)
         check("KIT-644 runner_settings defaults to the runner's own place",
               load_config(cfg_file)["runner_settings"], DEFAULT_RUNNER_SETTINGS)
+
+        # KIT-892: a repository Stage E's settings name as a runner project needs the runner's
+        # settings. Not there, or not readable, is said with each one named, and the pass stops
+        # (EXIT_ERROR, which the heartbeat monitor pages): never "lane off". The names switch
+        # nothing: with the settings read, the runner's own lane decides.
+        named_cfg = dict(cfg, runner_projects={"o/r": "app"})
+        moved = os.path.join(rl_tmp, "moved", "runner.json")
+        got, why = runner_review_lanes(dict(named_cfg, runner_settings=moved), git=rl_git)
+        check("KIT-892 runner settings that are not there, for a named runner project, are said, never 'lane off'",
+              (got, moved in why, "o/r is runner project app" in why, "cannot be told" in why),
+              ({}, True, True, True))
+        runner_file(["app"], raw="{not json")
+        got, why = runner_review_lanes(dict(named_cfg, runner_settings=settings), git=rl_git)
+        check("KIT-892 …and settings that cannot be read say so, naming the runner project",
+              (got, "could not be read" in why, "o/r is runner project app" in why), ({}, True, True))
+        runner_file([])
+        check("KIT-892 a named runner project whose review lane is off is off: Stage E's settings switch nothing",
+              runner_review_lanes(dict(named_cfg, runner_settings=settings), git=rl_git), ({}, ""))
+        check("KIT-892 with no runner project named, no settings file is still no runner",
+              runner_review_lanes(dict(cfg, runner_projects={}, runner_settings=moved), git=rl_git), ({}, ""))
+        for named_value, ok in (({"O/R": "app"}, True), ({}, True), ({"not-a-repo": "app"}, False),
+                                ({"O/R": "App"}, False), (["O/R"], False)):
+            with open(cfg_file, "w") as fh:
+                json.dump({"agent_user_name": "Dispatcher Agent", "reviews_team_key": "REV",
+                           "runner_projects": named_value}, fh)
+            check("KIT-892 runner_projects %r is %s" % (named_value, "taken" if ok else "refused"),
+                  _raises(lambda: load_config(cfg_file), PollerError), not ok)
+        with open(cfg_file, "w") as fh:
+            json.dump({"agent_user_name": "Dispatcher Agent", "reviews_team_key": "REV",
+                       "runner_projects": {"O/R": "app"}}, fh)
+        check("KIT-892 runner_projects is looked up whatever the case of the name",
+              load_config(cfg_file)["runner_projects"], {"o/r": "app"})
 
     # 6. The drivers end to end — GitHub, Linear, the publisher, the basis resolver and the
     #    telemetry sibling all stubbed. Happy path posts exactly one comment, creates exactly
