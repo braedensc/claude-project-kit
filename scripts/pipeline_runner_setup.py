@@ -4,7 +4,7 @@ always-on job, checked or applied with its answers given (KIT-655). Guide: docs/
 
     python3 scripts/pipeline_runner_setup.py check [--conf runner.conf]
     echo '{"schema": "runner-answers/1", "consent": "yes"}' | python3 scripts/pipeline_runner_setup.py apply
-    python3 scripts/pipeline_runner_setup.py push-token [--conf runner.conf] [--watch-conf update.conf]
+    python3 scripts/pipeline_runner_setup.py push-token|tracker-key|writer-key [--conf runner.conf] [--watch-conf update.conf]
     python3 scripts/pipeline_runner_setup.py --selftest
 
 Both print one JSON document of rows on stdout, on every exit, and every human word on stderr, as the
@@ -43,6 +43,11 @@ token reaches the role account on standard input only: never an argument, never 
 prints no JSON document. `check` and `apply` carry a `push-token` row: a token file with no recorded end date
 is NOT MEASURED, never current.
 
+TRACKER-KEY and WRITER-KEY (KIT-928).  The same step, file and end date for the runner's own tracker key
+(`tracker-key` in RUNNER_DIR, filed as `runner-tracker-key`) and the session writer's key (WRITER_KEY_FILE, else
+the installed `session_tools.key_file`, filed as `runner-writer-key`). Each has its own `check` row, which says
+the file's owner, mode and presence in words and never its text.
+
 Exits: 0 done or current · 1 failed · 2 settings · 3 refused · 4 not measured · 5 no live sudo
 (apply) · 10 work to do (check), or not agreed, or left off.
 """
@@ -70,6 +75,8 @@ import pipeline_notifier_setup as ns  # noqa: E402  (its shell fragments, path r
 import pipeline_queue_setup as qs  # noqa: E402  (the closure walk, the role-file read, `~` made a home)
 import pipeline_bridge_push_setup as push  # noqa: E402  (the kept-alive plist, installed disabled)
 import pipeline_runner as runner_job  # noqa: E402  (its own loader judges what this composes)
+import pipeline_session_tools as session_tools  # noqa: E402  (which lanes hold the session writer's key)
+import pipeline_tech_lead_tools as tl_tools  # noqa: E402  (the tracker key's one shape)
 import pipeline_runner_store as store  # noqa: E402
 import pipeline_queue_pool as pool  # noqa: E402
 import pipeline_update as pu  # noqa: E402  (the health watch's conf and its credential dates)
@@ -85,8 +92,10 @@ ANSWERS_MAX_BYTES = 64 * 1024
 CONF_REQUIRED = ("ROLE_ACCOUNT", "CLAUDE_BIN", "OWNER_USER_IDS", "DISPATCHER_USER_IDS", "PROJECTS")
 CONF_DEFAULTS = {"ROLE_KIT_CLONE": se.ROLE_KIT_CLONE_PATH, "ENV_FILE": "~/.stage-e/env",
                  "JOB_LABEL": "local.pipeline-runner", "RUNNER_DIR": "~/.pipeline-runner",
-                 "TOKEN_ENV": "CLAUDE_WRITER_OAUTH_TOKEN", "PUSH_TOKEN_FILE": ""}
+                 "TOKEN_ENV": "CLAUDE_WRITER_OAUTH_TOKEN", "PUSH_TOKEN_FILE": "", "WRITER_KEY_FILE": ""}
 PUSH_CLOCK = "runner-push-token"       # the name its end date is filed under in CREDENTIAL_EXPIRIES
+TRACKER_CLOCK, WRITER_CLOCK = "runner-tracker-key", "runner-writer-key"
+KEY_COMMANDS = ("push-token", "tracker-key", "writer-key")      # the owner's steps, one per key file (KIT-928)
 PUSH_DATE_YEARS = 5                    # a date further off than this is a typo, not a token's end
 # Left invalid on purpose, so an unedited copy of the example cannot run.
 CONF_UNEDITED = {"OWNER_USER_IDS": "owner-user-id-1", "DISPATCHER_USER_IDS": "dispatcher-user-id-1"}
@@ -139,6 +148,9 @@ def validate_conf(values, user=None):
     c["PUSH_TOKEN_UNSET"] = not c["PUSH_TOKEN_FILE"]       # then the installed path, if any, is the owner's and kept
     if not c["PUSH_TOKEN_FILE"]:       # unset: beside the tracker key, in the runner's own folder
         c["PUSH_TOKEN_FILE"] = c["RUNNER_DIR"].rstrip("/") + "/push-token"
+    c["WRITER_KEY_UNSET"] = not c["WRITER_KEY_FILE"]       # then the session writer's installed path is the owner's
+    if not c["WRITER_KEY_FILE"]:
+        c["WRITER_KEY_FILE"] = c["RUNNER_DIR"].rstrip("/") + "/writer-key"
 
     def need(ok, why):
         if not ok:
@@ -158,7 +170,8 @@ def validate_conf(values, user=None):
          "OWNER_USER_IDS lists the dispatcher's own user, which never approves")
     need(not c.get("CLAUDE_BIN") or c["CLAUDE_BIN"].startswith("/") and path_ok(c["CLAUDE_BIN"]),
          "CLAUDE_BIN must be an absolute path")
-    bad = [k for k in ("ROLE_KIT_CLONE", "ENV_FILE", "RUNNER_DIR", "PUSH_TOKEN_FILE") if not path_ok(c[k])]
+    bad = [k for k in ("ROLE_KIT_CLONE", "ENV_FILE", "RUNNER_DIR", "PUSH_TOKEN_FILE", "WRITER_KEY_FILE")
+           if not path_ok(c[k])]
     e.extend("%s must be `~/…` (the role account's home) or an absolute path, with no `..`" % k for k in bad)
     need("ROLE_KIT_CLONE" in bad or c["ROLE_KIT_CLONE"].rstrip("/") == se.ROLE_KIT_CLONE_PATH,
          "ROLE_KIT_CLONE is not Stage E's clone, %s" % se.ROLE_KIT_CLONE_PATH)
@@ -171,20 +184,22 @@ def validate_conf(values, user=None):
 
 def path_problems(c, home, skip=()):
     """RUNNER_DIR inside the clone, a git working tree a session can write, or holding the env file."""
-    p = dict((k, ns.resolve_path(c[k], home)) for k in ("ROLE_KIT_CLONE", "ENV_FILE", "RUNNER_DIR", "PUSH_TOKEN_FILE")
-             if k not in skip)
+    p = dict((k, ns.resolve_path(c[k], home))
+             for k in ("ROLE_KIT_CLONE", "ENV_FILE", "RUNNER_DIR", "PUSH_TOKEN_FILE", "WRITER_KEY_FILE") if k not in skip)
     under = lambda a, b: a in p and b in p and ns._under(p[a], p[b])      # noqa: E731
     found = ["RUNNER_DIR %s" % why for bad, why in (
         (under("RUNNER_DIR", "ROLE_KIT_CLONE"), "is inside ROLE_KIT_CLONE, a git working tree"),
         (under("ENV_FILE", "RUNNER_DIR"), "holds ENV_FILE")) if bad]
-    if "PUSH_TOKEN_FILE" in p and "RUNNER_DIR" in p:
-        d = p["RUNNER_DIR"].rstrip("/")
-        found += ["PUSH_TOKEN_FILE %s" % why for bad, why in (
-            (under("PUSH_TOKEN_FILE", "ROLE_KIT_CLONE"), "is inside ROLE_KIT_CLONE, a git working tree"),
-            (p["PUSH_TOKEN_FILE"] in (p.get("ENV_FILE"), d + "/tracker-key", d + "/runner.json"),
-             "is the env file, the tracker key's file or the settings file: it holds the token alone"),
-            (any(ns._under(p["PUSH_TOKEN_FILE"], d + "/" + sub) for sub in ("work", "home", "store")),
-             "is in the runner's work, home or store folder, where a session can write")) if bad]
+    for key, other in (("PUSH_TOKEN_FILE", "WRITER_KEY_FILE"), ("WRITER_KEY_FILE", "PUSH_TOKEN_FILE")):
+        if key in p and "RUNNER_DIR" in p:
+            d = p["RUNNER_DIR"].rstrip("/")
+            found += ["%s %s" % (key, why) for bad, why in (
+                (under(key, "ROLE_KIT_CLONE"), "is inside ROLE_KIT_CLONE, a git working tree"),
+                (p[key] in (p.get("ENV_FILE"), p.get(other), d + "/tracker-key", d + "/runner.json"),
+                 "is the env file, the tracker key's file, the settings file or the other key file: it holds "
+                 "one key alone"),
+                (any(ns._under(p[key], d + "/" + sub) for sub in ("work", "home", "store")),
+                 "is in the runner's work, home or store folder, where a session can write")) if bad]
     return found
 
 
@@ -225,6 +240,15 @@ def push_path(c, was):
     leaves it unset keeps a path the owner already installed by hand (KIT-886), and only else uses the default."""
     held = was.get("push_token_file") if isinstance(was, dict) else None
     return held if c.get("PUSH_TOKEN_UNSET") and isinstance(held, str) and held else c["PUSH_TOKEN_FILE"]
+
+
+def writer_path(c, was):
+    """The session writer's key file: the conf's WRITER_KEY_FILE decides; unset, the `session_tools.key_file` the
+    owner installed is kept, and only else the default beside the tracker key. Never written into the settings:
+    `session_tools` is the owner's whole."""
+    st = was.get("session_tools") if isinstance(was, dict) else None
+    held = st.get("key_file") if isinstance(st, dict) else None
+    return held if c.get("WRITER_KEY_UNSET") and isinstance(held, str) and held else c["WRITER_KEY_FILE"]
 
 
 def compose(c, on, was=None):
@@ -455,7 +479,7 @@ def step_settings(ctx, apply_it):
                   "(%s)" % (path, keys, "true" if ctx.on else "false", why)
 
 
-# ── the push token (KIT-907): its file, and the day it ends ─────────────────────────────────────────────────
+# ── the runner's three key files (KIT-907, KIT-928): each one's file, and the day it ends ───────────────────
 # Run as the role account, with the file's path as typed (`~/` included: the program expands it with the
 # account's own home). The file's text is never read here: only what kind of file it is.
 TOKEN_STATE_PY = r'''
@@ -481,14 +505,14 @@ elif st.st_size == 0:
 else:
     print("ok")
 '''
-# The token is read from standard input and judged by the runner's own pattern (argument 2) before a byte is
-# written. It goes to a new file beside the target, mode 0600, and is moved into place.
+# The key is read from standard input and judged by the owner of its shape (argument 2) before a byte is
+# written; argument 3 is what that shape is called, in words. It goes to a new file beside the target, mode 0600, and is moved into place.
 TOKEN_WRITE_PY = r'''
 import os, re, sys
 path = os.path.expanduser(sys.argv[1])
 token = sys.stdin.read().strip()
 if not re.match(sys.argv[2], token):
-    print("REFUSED: what was given is not one GitHub token. Nothing was written.")
+    print("REFUSED: what was given is not %s. Nothing was written." % sys.argv[3])
     sys.exit(3)
 if os.path.islink(path):
     print("REFUSED: %s is a link, which is never written through. Nothing was written." % path)
@@ -520,6 +544,31 @@ TOKEN_STATE_WORDS = {
 }
 
 
+def key_spec(name):
+    """What one key file is: its words, its shape, the name its end date is filed under, where its file is and
+    which lanes cannot start without it. Looked up at each use, so a shape changed in its own module is the
+    shape here. The path function is given the conf and the installed settings."""
+    dirs = lambda c: c["RUNNER_DIR"].rstrip("/")      # noqa: E731
+    if name == "push-token":
+        return {"label": "push token", "clock": PUSH_CLOCK, "pattern": runner_job.PUSH_TOKEN_RE, "path": push_path,
+                "shape": "one GitHub token", "prompt": "The push token (hidden): ",
+                "make": "Make it on the code host first: one token that can push branches and open pull requests, "
+                        "with an end date.",
+                "kinds": [k for k in store.KINDS if runner_job.PUSH_TOKEN_ENV in (runner_job.KINDS.get(k) or {}).get("env", ())]}
+    if name == "tracker-key":
+        return {"label": "runner's tracker key", "clock": TRACKER_CLOCK, "pattern": tl_tools.KEY_RE,
+                "path": lambda c, was: dirs(c) + "/tracker-key", "shape": "one tracker key",
+                "prompt": "The runner's tracker key (hidden): ",
+                "make": "Make a tracker API key for the runner's own tracker user first (it reads tickets and the "
+                        "queue's records), with an end date if the tracker lets you set one.",
+                "kinds": []}
+    return {"label": "session writer's key", "clock": WRITER_CLOCK, "pattern": tl_tools.KEY_RE, "path": writer_path,
+            "shape": "one tracker key", "prompt": "The session writer's key (hidden): ",
+            "make": "Make a tracker API key for the user named in `session_tools.writer_user_id` first (never an "
+                    "owner), with an end date if the tracker lets you set one.",
+            "kinds": list(session_tools.STAGES)}
+
+
 def py(program, *args):
     """One program for the role account's shell, its arguments quoted; the token is never one of them."""
     import shlex
@@ -534,7 +583,7 @@ def token_file_state(runner_call, path):
     return word if res.ok and (word in ("absent", "ok", "unread") or word in TOKEN_STATE_WORDS) else "unread"
 
 
-def recorded_end(watch_conf):
+def recorded_end(watch_conf, clock=PUSH_CLOCK):
     """(the date on record or None, why it is not known, the warn days) from the health watch's conf. A conf
     that is missing or will not read is a reason, never a quiet 'no date'; both leave the token without a
     date, and a row says which."""
@@ -546,18 +595,18 @@ def recorded_end(watch_conf):
     if problems:
         return None, "CREDENTIAL_EXPIRIES could not be read", None
     warn = int(conf.get("CREDENTIAL_WARN_DAYS") or 30)
-    return dict(clocks).get(PUSH_CLOCK), "", warn
+    return dict(clocks).get(clock), "", warn
 
 
-def record_end(watch_conf, when):
-    """Write `runner-push-token:<date>` into CREDENTIAL_EXPIRIES with the watch's own writer, every other line as
-    it was, and read it back. None when it is on record; else the reason, in words."""
+def record_end(watch_conf, when, clock=PUSH_CLOCK):
+    """Write `<clock>:<date>` into CREDENTIAL_EXPIRIES with the watch's own writer, every other line as it was,
+    and read it back. None when it is on record; else the reason, in words."""
     try:
         conf = pu.load_conf(watch_conf)
         clocks, problems = pu.credential_clocks(conf.get("CREDENTIAL_EXPIRIES"))
         if problems:
             return "CREDENTIAL_EXPIRIES could not be read"
-        value, merged = watch.merged_expiries(clocks, [(PUSH_CLOCK, when)])
+        value, merged = watch.merged_expiries(clocks, [(clock, when)])
         if len(merged) > pu.CREDENTIAL_ENTRIES_MAX:
             return "that would make more than %d entries in CREDENTIAL_EXPIRIES" % pu.CREDENTIAL_ENTRIES_MAX
         path = conf["__source__"]
@@ -574,43 +623,58 @@ def record_end(watch_conf, when):
     return None
 
 
-def pushing_lanes(was):
-    """[(project, kind)] for each lane that is on in the installed settings whose sessions hold the push token."""
-    kinds = [k for k in store.KINDS if runner_job.PUSH_TOKEN_ENV in (runner_job.KINDS.get(k) or {}).get("env", ())]
+def pushing_lanes(was, kinds=None):
+    """[(project, kind)] for each lane of `kinds` (default: those whose sessions hold the push token) that is on
+    in the installed settings."""
+    kinds = kinds if kinds is not None else key_spec("push-token")["kinds"]
     projs = was.get("projects") if isinstance(was, dict) and isinstance(was.get("projects"), dict) else {}
     return [(name, k) for name, proj in sorted(projs.items()) if isinstance(proj, dict)
             for k in kinds if isinstance(proj.get("lanes"), dict) and proj["lanes"].get(k) is True]
 
 
-def step_push_token(ctx, apply_it):
-    """The push token's file and its end date, measured and never changed here: `push-token` is the step that
-    writes them. A file that is there with no date on record is NOT MEASURED, never current."""
+def step_key(name, ctx, apply_it):
+    """One key file and its end date, measured and never changed here: the owner's step of its own name writes
+    them. Its owner, mode and presence are said in words, never its text. A file that is there with no date on
+    record is NOT MEASURED, never current; one that cannot be read is UNKNOWN."""
     if not ctx.home:
         raise Unknown("waits on `home`", "clear that row first")
-    path = push_path(ctx.conf, ctx.was)
-    word = token_file_state(lambda script: ctx.as_role(script, "reading the push token file's kind"), path)
+    spec = key_spec(name)
+    label, path = spec["label"], spec["path"](ctx.conf, ctx.was)
+    word = token_file_state(lambda script: ctx.as_role(script, "reading the %s file's kind" % label), path)
     if word == "absent":
-        pushing = pushing_lanes(ctx.was)
+        pushing = pushing_lanes(ctx.was, spec["kinds"])
         if pushing:
-            raise SetupError("%s has a %s lane on, and no push token file at %s: every start of it is held. Run "
-                             "`push-token`, or switch the lane off" % (pushing[0][0], pushing[0][1], path))
-        return True, ("no push token file at %s yet; a code, fix or conflict lane cannot be switched on without "
-                      "one: run `push-token`" % path)
+            raise SetupError("%s has a %s lane on, and no %s file at %s: every start of it is held. Run "
+                             "`%s`, or switch the lane off" % (pushing[0][0], pushing[0][1], label, path, name))
+        return True, ("no %s file at %s yet: run `%s`%s" % (label, path, name,
+                      "; a code, fix or conflict lane cannot be switched on without it" if spec["kinds"] else ""))
     if word == "unread":
-        raise Unknown("the push token file's kind could not be read", "check the account's folder, then run this again")
+        raise Unknown("the %s file's kind could not be read" % label, "check the account's folder, then run this again")
     if word != "ok":
-        raise SetupError("the push token file %s %s" % (path, TOKEN_STATE_WORDS[word]))
-    when, why, warn = recorded_end(ctx.watch_conf)
+        raise SetupError("the %s file %s %s" % (label, path, TOKEN_STATE_WORDS[word]))
+    when, why, warn = recorded_end(ctx.watch_conf, spec["clock"])
     if when is None:
-        raise Unknown("the push token has no end date on record (%s)" % (why or "%s is not in CREDENTIAL_EXPIRIES"
-                                                                          % PUSH_CLOCK),
-                      "run `python3 scripts/pipeline_runner_setup.py push-token` to record it")
+        raise Unknown("the %s has no end date on record (%s)" % (label, why or "%s is not in CREDENTIAL_EXPIRIES"
+                                                                 % spec["clock"]),
+                      "run `python3 scripts/pipeline_runner_setup.py %s` to record it" % name)
     days = (when - (ctx.today or _today())).days
     if days < 0:
-        raise SetupError("the push token ended on %s (%d day%s ago): make a new one and run `push-token`"
-                         % (when.isoformat(), -days, "" if days == -1 else "s"))
-    return True, "%s holds a token that ends on %s (in %d day%s); the health watch warns %d days ahead" % (
-        path, when.isoformat(), days, "" if days == 1 else "s", warn)
+        raise SetupError("the %s ended on %s (%d day%s ago): make a new one and run `%s`"
+                         % (label, when.isoformat(), -days, "" if days == -1 else "s", name))
+    return True, "%s is present, the role account's own, mode 0600, and ends on %s (in %d day%s); the health watch " \
+                 "warns %d days ahead" % (path, when.isoformat(), days, "" if days == 1 else "s", warn)
+
+
+def step_push_token(ctx, apply_it):
+    return step_key("push-token", ctx, apply_it)
+
+
+def step_tracker_key(ctx, apply_it):
+    return step_key("tracker-key", ctx, apply_it)
+
+
+def step_writer_key(ctx, apply_it):
+    return step_key("writer-key", ctx, apply_it)
 
 
 def _today():
@@ -697,7 +761,7 @@ def step_job(ctx, apply_it):
 
 
 STEPS = (("home", step_home), ("kit", step_kit), ("settings", step_settings), ("job", step_job),
-         ("push-token", step_push_token))
+         ("push-token", step_push_token), ("tracker-key", step_tracker_key), ("writer-key", step_writer_key))
 _SEVERITY = (FAILED, UNKNOWN, WOULD_CHANGE)
 
 
@@ -773,11 +837,11 @@ def parse_end_date(text, today):
     return when, ""
 
 
-def cmd_push_token(args, env, machine=None, reader=None, date_reader=None, tty=None, today=None):
-    """The owner's one step for the push token (KIT-907): a hidden prompt for the token, a question for its end
-    date, the role account writing a 0600 file, the date recorded for the health watch. Human words on stderr,
-    no JSON document; the token is never in an argument, an output or a log. `machine` is (runner, sudo
-    session) in the selftest."""
+def cmd_key(name, args, env, machine=None, reader=None, date_reader=None, tty=None, today=None):
+    """The owner's one step for a key file (KIT-907 for the push token, KIT-928 for the other two): a hidden
+    prompt for the key, a question for its end date, the role account writing a 0600 file, the date recorded for
+    the health watch. Human words on stderr, no JSON document; the key is never in an argument, an output or a
+    log. `machine` is (runner, sudo session) in the selftest."""
     import getpass
     import pipeline_root_guard as _rg
     if _rg.refusal():
@@ -785,11 +849,11 @@ def cmd_push_token(args, env, machine=None, reader=None, date_reader=None, tty=N
         return EX_REFUSED
     found = agent_markers(env)       # BEFORE anything is read: a session never handles the owner's credential
     if found:
-        say("REFUSED: `push-token` takes the owner's credential and writes it as the role account, and this is an "
-            "agent environment (%s set). A person runs it, in a terminal." % ", ".join(found))
+        say("REFUSED: `%s` takes the owner's credential and writes it as the role account, and this is an "
+            "agent environment (%s set). A person runs it, in a terminal." % (name, ", ".join(found)))
         return EX_REFUSED
     if not (tty if tty is not None else sys.stdin.isatty()):
-        say("BLOCKED: `push-token` asks for the token at a hidden prompt, and this is not a terminal.")
+        say("BLOCKED: `%s` asks for the key at a hidden prompt, and this is not a terminal." % name)
         return EX_BLOCKED
     try:
         conf, errors = load_conf(args.conf, ns.invoking_user())
@@ -799,47 +863,46 @@ def cmd_push_token(args, env, machine=None, reader=None, date_reader=None, tty=N
     if errors:
         say("Your conf has %d problem(s), all of them:\n  - %s" % (len(errors), "\n  - ".join(errors)))
         return EX_USAGE
-    today = today or _today()
-    say("The push token: written to %s as %s, mode 0600, and its end date recorded for the health watch."
-        % (conf["PUSH_TOKEN_FILE"], conf["ROLE_ACCOUNT"]))
-    say("Make it on the code host first: one token that can push branches and open pull requests, with an end date.")
-    value = ((reader or getpass.getpass)("The push token (hidden): ") or "").strip()
-    if not runner_job.PUSH_TOKEN_RE.match(value):
-        say("REFUSED: that is not one GitHub token (ghp_, gho_, ghu_, ghs_, ghr_ or github_pat_ then letters and "
-            "digits). Nothing was written.")
+    spec, today = key_spec(name), today or _today()
+    label, path = spec["label"], spec["path"](conf, {})
+    say("The %s: written to %s as %s, mode 0600, and its end date recorded for the health watch."
+        % (label, path, conf["ROLE_ACCOUNT"]))
+    say(spec["make"])
+    value = ((reader or getpass.getpass)(spec["prompt"]) or "").strip()
+    if not spec["pattern"].match(value):
+        say("REFUSED: that is not %s. Nothing was written." % spec["shape"])
         return EX_USAGE
     when, why = parse_end_date((date_reader or input)("The day it ends, as YYYY-MM-DD (the expiry you chose "
                                                        "when you made it): "), today)
     if when is None:
-        say("REFUSED: %s. Nothing was written: a token with no end date on record is one nobody is warned about."
+        say("REFUSED: %s. Nothing was written: a key with no end date on record is one nobody is warned about."
             % why)
         return EX_USAGE
     run, sudo = machine or (Runner(), se.SudoSession())
     try:
-        sudo.acquire("`push-token` writes the push token as %s." % conf["ROLE_ACCOUNT"], "push-token")
+        sudo.acquire("`%s` writes the %s as %s." % (name, label, conf["ROLE_ACCOUNT"]), name)
     except se.NoPrivilege as exc:
         say(str(exc).split("\n")[0])
         say("NOT WRITTEN: no administrator access. Run this again.")
         return EX_NOPRIV
     run.dry_run = False
-    path = conf["PUSH_TOKEN_FILE"]
-    res = run.as_role(conf["ROLE_ACCOUNT"], py(TOKEN_WRITE_PY, path, runner_job.PUSH_TOKEN_RE.pattern),
-                      stdin=value + "\n", why="write the push token into %s" % path, secret_stdin=True)
+    res = run.as_role(conf["ROLE_ACCOUNT"], py(TOKEN_WRITE_PY, path, spec["pattern"].pattern, spec["shape"]),
+                      stdin=value + "\n", why="write the %s into %s" % (label, path), secret_stdin=True)
     for line in (res.out or "").splitlines():
         say("  " + _s(line))
     if res.rc == 3:
         return EX_REFUSED
     state = token_file_state(lambda script: run.as_role(conf["ROLE_ACCOUNT"], script), path) if res.ok else None
     if state != "ok":
-        say("FAILED: the push token could not be written into %s as %s, or reading it back does not match (%s). "
-            "No end date was recorded." % (path, conf["ROLE_ACCOUNT"], _s((res.err or "").strip())[:200] or state))
+        say("FAILED: the %s could not be written into %s as %s, or reading it back does not match (%s). "
+            "No end date was recorded." % (label, path, conf["ROLE_ACCOUNT"], _s((res.err or "").strip())[:200] or state))
         return EX_FAILED
-    failed = record_end(args.watch_conf, when)
+    failed = record_end(args.watch_conf, when, spec["clock"])
     if failed:
-        say("FAILED: the token is in %s, but its end date is NOT on record: %s. Put `%s:%s` into CREDENTIAL_EXPIRIES "
-            "in %s, or run this again." % (path, failed, PUSH_CLOCK, when.isoformat(), args.watch_conf))
+        say("FAILED: the key is in %s, but its end date is NOT on record: %s. Put `%s:%s` into CREDENTIAL_EXPIRIES "
+            "in %s, or run this again." % (path, failed, spec["clock"], when.isoformat(), args.watch_conf))
         return EX_FAILED
-    say("DONE: %s holds the token (mode 0600, the role account's own); it ends on %s, which the health watch "
+    say("DONE: %s holds the key (mode 0600, the role account's own); it ends on %s, which the health watch "
         "has on record, and warns before." % (path, when.isoformat()))
     return EX_OK
 
@@ -847,23 +910,23 @@ def cmd_push_token(args, env, machine=None, reader=None, date_reader=None, tty=N
 def main(argv=None, env=None, stdin=None, machine=None, stand_ins=None):
     """`check` or `apply`: every human word on stderr, and ONE JSON document of rows on stdout, on every exit
     past the arguments, so a program never has to tell prose from rows. `machine` stands in for (runner, sudo
-    live, this checkout's scripts, the folder its parts list is read from) in the selftest. `push-token` is
-    the owner's own step: words only, no document; `stand_ins` replaces its prompts and sudo in the selftest."""
+    live, this checkout's scripts, the folder its parts list is read from) in the selftest. `push-token`, `tracker-key`
+    and `writer-key` are the owner's own steps: words only, no document; `stand_ins` replaces its prompts and sudo in the selftest."""
     p = argparse.ArgumentParser(prog="pipeline_runner_setup.py", description="Install the runner, every lane off.")
-    p.add_argument("command", nargs="?", default="check", choices=["check", "apply", "push-token"])
+    p.add_argument("command", nargs="?", default="check", choices=["check", "apply"] + list(KEY_COMMANDS))
     p.add_argument("--conf", default=DEFAULT_CONF)
     p.add_argument("--watch-conf", default=os.path.join(KIT, "update.conf"),
-                   help="the health watch's conf, where the push token's end date is recorded")
+                   help="the health watch's conf, where each key's end date is recorded")
     p.add_argument("--selftest", action="store_true")
     args = p.parse_args(argv)
     if args.selftest:
         from scratch_run import contained   # KIT-450: its temp folders go when it ends
         import pipeline_root_guard as _rg   # KIT-693: the root case ends every installer's own selftest
         return contained(selftest, "runner-setup-selftest-run-") or _rg.root_case_rc(main, ["check"])
-    if args.command == "push-token":
+    if args.command in KEY_COMMANDS:
         real_out, sys.stdout = sys.stdout, sys.stderr
         try:
-            return cmd_push_token(args, os.environ if env is None else env, **(stand_ins or {}))
+            return cmd_key(args.command, args, os.environ if env is None else env, **(stand_ins or {}))
         finally:
             sys.stdout = real_out
     real_out, sys.stdout = sys.stdout, sys.stderr
@@ -1157,7 +1220,8 @@ def _cases(check, tmp):  # noqa: C901  (one battery, read top to bottom)
             a for a in fake.sudo if a[2] not in ("-u", "launchctl") or a[3] not in ("print", "print-disabled", "_exrunner")]
     case("check on a fresh machine: exit 10 in one document, settings and job would change, nothing written",
          fresh_check, (10, 10, {"home": ALREADY_DONE, "kit": ALREADY_DONE, "settings": WOULD_CHANGE,
-                                "job": WOULD_CHANGE, "push-token": ALREADY_DONE}, True, [], None, []),
+                                "job": WOULD_CHANGE, "push-token": ALREADY_DONE, "tracker-key": ALREADY_DONE,
+                                "writer-key": ALREADY_DONE}, True, [], None, []),
          ("a check that applies", [(me, "run_steps", lambda ctx, apply_it, real=run_steps: real(ctx, True))]))
 
     # 3. Apply on a fresh machine: within the ceiling, so on; every lane off; the job enabled and loaded.
@@ -1368,14 +1432,15 @@ def _cases(check, tmp):  # noqa: C901  (one battery, read top to bottom)
             if not self.ok:
                 raise se.NoPrivilege("no administrator access")
 
-    def step(fake, token=TOKEN, date=None, tty=True, env=None, sudo=None, put_watch=True, expiries=None):
-        """(exit, its words, prompts asked, sudo asked) for one `push-token` run at a pretend terminal."""
+    def step(fake, token=TOKEN, date=None, tty=True, env=None, sudo=None, put_watch=True, expiries=None,
+             cmd="push-token"):
+        """(exit, its words, prompts asked, sudo asked) for one key step's run at a pretend terminal."""
         if put_watch:
             watch_conf(fake, expiries)
         asked, err, out, sudo = [], io.StringIO(), io.StringIO(), sudo or FakeSudo()
         fake.dry_run, fake.writes = False, []
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            code = main(["push-token", "--conf", fake.root + "/runner.conf", "--watch-conf", fake.root + "/update.conf"],
+            code = main([cmd, "--conf", fake.root + "/runner.conf", "--watch-conf", fake.root + "/update.conf"],
                         env=env or {}, stand_ins=dict(
                             machine=(fake, sudo), tty=tty, today=today,
                             reader=lambda prompt: asked.append("token") or token,
@@ -1402,7 +1467,7 @@ def _cases(check, tmp):  # noqa: C901  (one battery, read top to bottom)
          ("a file others can read", [(me, "TOKEN_WRITE_PY", TOKEN_WRITE_PY.replace(
              "O_EXCL | os.O_NOFOLLOW, 0o600)", "O_EXCL | os.O_NOFOLLOW, 0o644)").replace(
              "os.chmod(path, 0o600)", "pass"))]),
-         ("the date not recorded", [(me, "record_end", lambda watch_conf_path, when: None)]),
+         ("the date not recorded", [(me, "record_end", lambda watch_conf_path, when, clock=None: None)]),
          ("the token printed", [(me, "TOKEN_WRITE_PY", TOKEN_WRITE_PY.replace(
              '"wrote %s (%d characters, mode 600)" % (path, len(token))', '"wrote %s (%s)" % (path, token)')),
                           (me, "_s", lambda text: text)]))
@@ -1435,8 +1500,8 @@ def _cases(check, tmp):  # noqa: C901  (one battery, read top to bottom)
         return code, asked, sudo_asked, os.path.exists(pt_path(fake))
     case("push-token with no terminal: blocked before any prompt, as a pipe could hold the token in a file",
          no_terminal, (10, [], 0, False),
-         ("a terminal never asked for", [(me, "cmd_push_token", lambda args, env, real=cmd_push_token, **kw:
-                                          real(args, env, **dict(kw, tty=True)))]))
+         ("a terminal never asked for", [(me, "cmd_key", lambda name, args, env, real=cmd_key, **kw:
+                                          real(name, args, env, **dict(kw, tty=True)))]))
 
     def no_admin():
         fake = world()
@@ -1451,7 +1516,7 @@ def _cases(check, tmp):  # noqa: C901  (one battery, read top to bottom)
         return code, os.path.exists(pt_path(fake)), "%s:%s" % (PUSH_CLOCK, ON(300)) in words, "NOT on record" in words
     case("push-token when the date cannot be recorded: FAILED, the file is said to be written, the exact entry "
          "is given to put in by hand", no_date_home, (1, True, True, True),
-         ("a record that does not check", [(me, "record_end", lambda watch_conf_path, when: None)]))
+         ("a record that does not check", [(me, "record_end", lambda watch_conf_path, when, clock=None: None)]))
 
     def over_old():
         fake = world()
@@ -1517,8 +1582,8 @@ def _cases(check, tmp):  # noqa: C901  (one battery, read top to bottom)
          check_rows,
          ((ALREADY_DONE, True), (4, UNKNOWN, True, True), (0, ALREADY_DONE, True), (FAILED, True), (FAILED, True),
           (FAILED, True), (UNKNOWN, True), [[]] * 4),
-         ("no date taken as fine", [(me, "recorded_end", lambda wc: (today + datetime.timedelta(days=200), "", 30))]),
-         ("an ended date taken as fine", [(me, "recorded_end", lambda wc: (today + datetime.timedelta(days=1), "", 30))]),
+         ("no date taken as fine", [(me, "recorded_end", lambda wc, clock=None: (today + datetime.timedelta(days=200), "", 30))]),
+         ("an ended date taken as fine", [(me, "recorded_end", lambda wc, clock=None: (today + datetime.timedelta(days=1), "", 30))]),
          ("a loose file taken as fine", [(me, "token_file_state", lambda call, path: "ok")]))
 
     def edit_settings(fake, fn):
@@ -1541,7 +1606,7 @@ def _cases(check, tmp):  # noqa: C901  (one battery, read top to bottom)
         return code, row["outcome"], "app has a code lane on" in row["detail"], quiet
     case("check: a code, fix or conflict lane on with no push token file is FAILED; a lane that holds no token is not",
          lane_on_no_file, (1, FAILED, True, ALREADY_DONE),
-         ("lanes not looked at", [(me, "pushing_lanes", lambda was: [])]))
+         ("lanes not looked at", [(me, "pushing_lanes", lambda was, kinds=None: [])]))
 
     def custom_path():
         fake = world()
@@ -1557,7 +1622,7 @@ def _cases(check, tmp):  # noqa: C901  (one battery, read top to bottom)
         fresh = world(PUSH_TOKEN_FILE="~/.config/other")
         go(fresh, "apply")
         with open(fresh.home + "/.pipeline-runner/runner.json") as fh:
-            return kept, row["outcome"], "~/.config/pt holds a token" in row["detail"], json.load(fh)["push_token_file"]
+            return kept, row["outcome"], "~/.config/pt is present" in row["detail"], json.load(fh)["push_token_file"]
     case("apply: an unset PUSH_TOKEN_FILE keeps a path the owner installed, and `check` measures that path; a "
          "conf that sets one decides", custom_path, ("~/.config/pt", ALREADY_DONE, True, "~/.config/other"),
          ("the installed path overwritten", [(me, "push_path", lambda c, was: c["PUSH_TOKEN_FILE"])]))
@@ -1612,6 +1677,157 @@ def _cases(check, tmp):  # noqa: C901  (one battery, read top to bottom)
     case("the parts list records the push token with its end date, and `dates` shows it missing and fails until "
          "one is on record", parts_record_it, (1, "set-when-made", 1, 10, None, None),
          ("another clock name", [(me, "PUSH_CLOCK", "other-name")]))
+
+    # 12c. The tracker key and the session writer's key (KIT-928): the same step, the same file and the same
+    #      end date as the push token, one rule at a time. The keys are stand-ins built at runtime.
+    KEY = "lin_" + "api_" + "SelfTestStandInKey0123456789"
+    NAMES = (("tracker-key", "runner-tracker-key", "tracker-key"), ("writer-key", "runner-writer-key", "writer-key"))
+    kpath = lambda fake, leaf: fake.home + "/.pipeline-runner/" + leaf          # noqa: E731
+
+    def leaked(fake, words):
+        return KEY in words or KEY in json.dumps(fake.writes) or KEY in json.dumps(fake.sudo)
+
+    def key_happy(cmd, clock, leaf):
+        def run():
+            fake = world()
+            code, words, asked, sudo_asked = step(fake, token=KEY, date=ON(300), cmd=cmd)
+            there = os.path.exists(kpath(fake, leaf))
+            mode = oct(os.stat(kpath(fake, leaf)).st_mode & 0o777) if there else None
+            body = open(kpath(fake, leaf)).read() if there else None
+            return (code, mode, body, "%s:%s" % (clock, ON(300)) in (watch_text(fake) or ""), asked, sudo_asked,
+                    leaked(fake, words), all(a[1] == "-n" for a in fake.sudo), os.path.exists(pt_path(fake)))
+        return run
+
+    def key_bad(cmd, leaf):
+        def run():
+            got = []
+            for key, date in (("short", ON(300)), ("has a space in it 0123", ON(300)), (KEY, ""), (KEY, ON(-1)),
+                              (KEY, ON(0)), (KEY, ON(366 * PUSH_DATE_YEARS + 30))):
+                fake = world()
+                code, words, asked, sudo_asked = step(fake, token=key, date=date or " ", cmd=cmd)
+                got.append((code, sudo_asked, os.path.exists(kpath(fake, leaf)), fake.sudo))
+            return got
+        return run
+
+    def key_guards(cmd, leaf):
+        def run():
+            got = []
+            for kw in ({"env": {AGENT_ENV_MARKERS[0]: "1"}}, {"tty": False}, {"sudo": FakeSudo(ok=False)}):
+                fake = world()
+                code, words, asked, sudo_asked = step(fake, token=KEY, cmd=cmd, **kw)
+                got.append((code, asked, os.path.exists(kpath(fake, leaf)), "runner-" in (watch_text(fake) or "")))
+            return got
+        return run
+    for cmd, clock, leaf in NAMES:
+        case("%s: a 0600 file with the key alone, the end date on record under its own name, the push token's file "
+             "untouched, each prompt asked once, and the key in no argument, output or log" % cmd,
+             key_happy(cmd, clock, leaf), (0, "0o600", KEY + "\n", True, ["token", "date"], 1, False, True, False),
+             ("a file others can read", [(me, "TOKEN_WRITE_PY", TOKEN_WRITE_PY.replace(
+                 "O_EXCL | os.O_NOFOLLOW, 0o600)", "O_EXCL | os.O_NOFOLLOW, 0o644)").replace(
+                 "os.chmod(path, 0o600)", "pass"))]),
+             ("the date not recorded", [(me, "record_end", lambda watch_conf_path, when, clock=None: None)]),
+             ("the date filed under the push token's name", [(me, "TRACKER_CLOCK", PUSH_CLOCK),
+                                                              (me, "WRITER_CLOCK", PUSH_CLOCK)]),
+             ("the key printed", [(me, "TOKEN_WRITE_PY", TOKEN_WRITE_PY.replace(
+                 '"wrote %s (%d characters, mode 600)" % (path, len(token))', '"wrote %s (%s)" % (path, token)')),
+                                  (me, "_s", lambda text: text)]))
+        case("%s: a key of no shape, or an end date that is missing, not a day, past, today or years off, is refused "
+             "before sudo is asked for: nothing written" % cmd, key_bad(cmd, leaf), [(2, 0, False, [])] * 6,
+             ("any key taken", [(tl_tools, "KEY_RE", re.compile(".*"))]),
+             ("any date taken", [(me, "parse_end_date", lambda text, today: (today + datetime.timedelta(days=9), ""))]))
+        case("%s: under a model it is refused, with no terminal it is blocked, without administrator access it is "
+             "exit 5: each before any write and any date" % cmd, key_guards(cmd, leaf),
+             [(3, [], False, False), (10, [], False, False), (5, ["token", "date"], False, False)],
+             ("no agent check", [(me, "agent_markers", lambda env: [])]),
+             ("a terminal never asked for", [(me, "cmd_key", lambda name, args, env, real=cmd_key, **kw:
+                                              real(name, args, env, **dict(kw, tty=True)))]),
+             ("sudo not asked for", [(FakeSudo, "acquire", lambda self, why, resume: None)]))
+
+    def key_rows(cmd, clock, leaf):
+        def run():
+            def row(state=None, expiries=None, lanes=None, put_watch=True):
+                fake = world()
+                go(fake, "apply")
+                if lanes:
+                    edit_settings(fake, lambda d: (d["projects"]["app"]["lanes"].update(lanes), d.update(
+                        session_tools={"key_file": "~/.pipeline-runner/writer-key", "writer_user_id": "writer-1"})))
+                if state is not None:
+                    _put(kpath(fake, leaf), KEY + "\n")
+                    os.chmod(kpath(fake, leaf), state)
+                if put_watch:
+                    watch_conf(fake, expiries)
+                code, doc, _e, _l = go(fake)
+                r = [x for x in doc["rows"] if x["step"] == cmd][0]
+                return r["outcome"], r["detail"], fake.writes
+            dated = "%s:%s" % (clock, ON(200))
+            absent, nodate, ok = row(), row(0o600), row(0o600, dated)
+            ended, loose = row(0o600, "%s:%s" % (clock, ON(-3))), row(0o644, dated)
+            nowatch = row(0o600, put_watch=False)
+            lane = row(lanes={"code": True})
+            return ((absent[0], "yet: run `%s`" % cmd in absent[1]),
+                    (nodate[0], "no end date on record" in nodate[1]),
+                    (ok[0], "present, the role account's own, mode 0600, and ends on %s (in 200 days)" % ON(200) in ok[1]),
+                    (ended[0], "ended on" in ended[1]), (loose[0], "mode 0600" in loose[1]),
+                    (nowatch[0], "could not be read" in nowatch[1]), lane[0],
+                    KEY in repr((absent, nodate, ok, ended, loose, lane)), [x[2] for x in (absent, nodate, ok)])
+        return run
+    for cmd, clock, leaf in NAMES:
+        case("check: the %s file's presence, owner and mode are said in words, never its text; no end date on record "
+             "or no conf to read it from is NOT MEASURED; ended or loose FAILS; a missing file is a fault only for "
+             "the writer's key with a code lane on" % cmd, key_rows(cmd, clock, leaf),
+             ((ALREADY_DONE, True), (UNKNOWN, True), (ALREADY_DONE, True), (FAILED, True), (FAILED, True),
+              (UNKNOWN, True), FAILED if cmd == "writer-key" else ALREADY_DONE, False, [[]] * 3),
+             ("no date taken as fine", [(me, "recorded_end", lambda wc, clock=None: (today + datetime.timedelta(days=200), "", 30))]),
+             ("a loose file taken as fine", [(me, "token_file_state", lambda call, path: "ok")]),
+             ("the contents shown", [(me, "TOKEN_STATE_PY", TOKEN_STATE_PY.replace(
+                 'print("ok")', 'print("ok " + open(os.path.expanduser(sys.argv[1])).read())'))]),
+             *([("lanes not looked at", [(me, "pushing_lanes", lambda was, kinds=None: [])])] if cmd == "writer-key" else []))
+
+    def writer_paths():
+        fake = world()
+        go(fake, "apply")
+        edit_settings(fake, lambda d: d.update(session_tools={"key_file": "~/.config/wk", "writer_user_id": "w-1"}))
+        go(fake, "apply")
+        with open(fake.home + "/.pipeline-runner/runner.json") as fh:
+            kept = json.load(fh)["session_tools"]["key_file"]
+        _put(fake.home + "/.config/wk", KEY + "\n")
+        os.chmod(fake.home + "/.config/wk", 0o600)
+        watch_conf(fake, "%s:%s" % (WRITER_CLOCK, ON(200)))
+        row = [r for r in go(fake)[1]["rows"] if r["step"] == "writer-key"][0]
+        got = []
+        for over in ({"WRITER_KEY_FILE": "~/.pipeline-runner/tracker-key"}, {"WRITER_KEY_FILE": "~/.pipeline-runner/work/k"},
+                     {"WRITER_KEY_FILE": "~/.pipeline-runner/home/k"}, {"WRITER_KEY_FILE": "~/.stage-e/kit/k"},
+                     {"WRITER_KEY_FILE": "~/.stage-e/env"}, {"WRITER_KEY_FILE": "rel/k"},
+                     {"WRITER_KEY_FILE": "~/.pipeline-runner/push-token"},
+                     {"PUSH_TOKEN_FILE": "~/.pipeline-runner/writer-key"}):
+            errors = validate_conf(parse_conf(text(**over))[0], "selftest-person")[1]
+            got.append(any(e.startswith(("WRITER_KEY_FILE ", "PUSH_TOKEN_FILE ")) or "WRITER_KEY_FILE must" in e
+                           for e in errors))
+        return (kept, row["outcome"], "~/.config/wk is present" in row["detail"], got,
+                validate_conf(parse_conf(text())[0], "p")[0]["WRITER_KEY_FILE"])
+    case("conf: an unset WRITER_KEY_FILE keeps the key file the owner's `session_tools` names and `check` measures "
+         "it; one that is the tracker key's, the push token's, in a folder a session writes, in the kit clone, the "
+         "env file or not absolute is refused by key", writer_paths,
+         ("~/.config/wk", ALREADY_DONE, True, [True] * 8, "~/.pipeline-runner/writer-key"),
+         ("the installed path overwritten", [(me, "writer_path", lambda c, was: c["WRITER_KEY_FILE"])]),
+         ("the path rules dropped", [(me, "path_problems", lambda c, home, skip=(): [])]))
+
+    def keys_warn():
+        fake = world()
+        for cmd, clock, leaf in NAMES:
+            step(fake, token=KEY, date=ON(300), cmd=cmd, put_watch=cmd == NAMES[0][0])
+        conf = pu.load_conf(fake.root + "/update.conf")
+
+        class At(object):
+            def __init__(self, days):
+                self.now = lambda: datetime.datetime.combine(
+                    today + datetime.timedelta(days=days), datetime.time(12), datetime.timezone.utc).timestamp()
+        far, near = watch.check_credentials(At(0), conf), watch.check_credentials(At(280), conf)
+        return far["state"], near["state"], all("%s expires on %s" % (c, ON(300)) in near["summary"]
+                                                for _n, c, _l in NAMES)
+    case("the health watch warns before the tracker key's and the session writer's end dates, naming each",
+         keys_warn, (watch.OK, watch.FIRING, True),
+         ("the dates filed under another name", [(me, "TRACKER_CLOCK", "other-name"), (me, "WRITER_CLOCK", "other-two")]))
 
     # 13. The parts list's own ceiling and commands.
     import pipeline_parts
