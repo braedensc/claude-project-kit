@@ -563,8 +563,8 @@ SIBLING_JOBS = (
     # The acceptance check's live pass (KIT-571), run from this clone by its own LaunchDaemon, which the acceptance installer
     # puts in place (KIT-326). It loads the poller that decides and judges, and the look tool's record reader.
     ("pipeline_acceptance_run.py", ("pipeline_acceptance_poller.py", "pipeline_acceptance_run.py", "pipeline_look.py")),
-    # The runner (KIT-859), our own dispatcher's always-on job, run from this clone by the LaunchDaemon its installer
-    # puts in place. `run` stops it around the clone's move and loads it again, so it runs the moved kit.
+    # The runner (KIT-859), our own dispatcher's always-on job. Its installer now runs it from a root-owned copy of
+    # the kit at this clone's commit (KIT-919), so `run` finds and stops it only while an older install runs it here.
     ("pipeline_runner.py", ("pipeline_bridge.py", "pipeline_bridge_answers.py", "pipeline_bridge_bind.py",
                             "pipeline_bridge_config.py", "pipeline_bridge_direct.py", "pipeline_bridge_handover.py",
                             "pipeline_bridge_pings.py", "pipeline_bridge_plans.py", "pipeline_bridge_replan.py",

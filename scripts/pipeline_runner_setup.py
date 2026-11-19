@@ -10,8 +10,9 @@ Both print one JSON document of rows on stdout, on every exit, and every human w
 notifier's installer does (KIT-850). `check` reads and changes nothing. It asks nothing: every sudo
 call is `sudo -n`, so with no live sudo session, or under a model, a row that needs one says UNKNOWN,
 never current. Its rows: the role account's home; the kit the job runs (the clone's commit, the
-runner's scripts level with this checkout); the runner's settings as installed, with each project's
-lanes; and the job (its file, whether it starts at boot, what launchd runs).
+runner's scripts level with this checkout); the root-owned copy the job runs from; the runner's settings
+as installed, with each project's lanes; and the job (its file, whether it starts at boot, what launchd
+runs).
 
 `apply` is refused under a model before it reads anything. Its answers come through a pipe from the
 program that runs it, never a terminal, a file or an argument: {"schema": "runner-answers/1",
@@ -28,8 +29,22 @@ its unfinished runs. At or below the part's ceiling in pipeline-parts.json it is
 true, `launchctl enable`, loaded. Above it, or with a ceiling it cannot read, it is installed and left
 off: `enabled` false, `launchctl disable`, not loaded. The document's `left_off` says why, in one line.
 
-ITS JOB.  One LaunchDaemon as the role account, kept alive, running the runner from Stage E's kit
-clone, which Stage E's `run` moves and restarts it around. The file says Disabled, so the file alone
+THE KEYS IT CARRIES (KIT-919).  runner.conf also carries the runner keys the owner would otherwise write by
+hand: the session tools' key file and writer, the queue's settings file, the look tool's folder, and each
+project's approved states and allowed hosts. A key the conf names decides, and `off` writes the off itself.
+A key it leaves out keeps what is installed: the owner's own value, or an off he set.
+
+THE COPY (KIT-919).  The runner holds every start while the sessions' account could change the folder it
+runs from (pipeline_runner_guard.engine_problems). So it runs from ENGINE_DIR: a copy of the kit at the
+commit Stage E's clone is at, every entry root's and closed to group and others. `check` compares the copy
+file by file with that commit's tree, and runs the runner's own check of the copy for the role account and
+for you. `apply` makes or refreshes it, and nothing else does: the files come from this checkout's own git
+objects at that commit, never from the role's clone, and only a commit on origin/main is copied. A root
+program writes them beside the old copy and swaps the two, and the copy is read back. It never moves back
+to an older commit.
+
+ITS JOB.  One LaunchDaemon as the role account, kept alive, running the runner from the copy, which the
+clone's move does not touch. The file says Disabled, so the file alone
 never starts at boot: only `launchctl enable` does. The command ends with a shell comment naming the
 clone's commit, so a moved clone is a changed job, and launchd's own copy says which kit it runs.
 
@@ -38,12 +53,15 @@ Exits: 0 done or current · 1 failed · 2 settings · 3 refused · 4 not measure
 """
 import argparse
 import hashlib
+import io
 import json
 import os
 import plistlib
 import re
 import stat
+import subprocess
 import sys
+import tarfile
 from xml.sax.saxutils import escape as _esc
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -60,6 +78,7 @@ import pipeline_notifier_setup as ns  # noqa: E402  (its shell fragments, path r
 import pipeline_queue_setup as qs  # noqa: E402  (the closure walk, the role-file read, `~` made a home)
 import pipeline_bridge_push_setup as push  # noqa: E402  (the kept-alive plist, installed disabled)
 import pipeline_runner as runner_job  # noqa: E402  (its own loader judges what this composes)
+import pipeline_runner_guard as runner_guard  # noqa: E402  (its own check of the folder it runs from)
 import pipeline_runner_store as store  # noqa: E402
 import pipeline_queue_pool as pool  # noqa: E402
 
@@ -110,7 +129,7 @@ def parse_conf(text, source=DEFAULT_CONF):
             errors.append("%s: not KEY=value" % where)
         elif key in seen:
             errors.append("%s: duplicate %s (line %d)" % (where, key, seen[key]))
-        elif key not in CONF_REQUIRED and key not in CONF_DEFAULTS:
+        elif not known_key(key):
             errors.append("%s: unknown key %s" % (where, key))
         elif ns.credential_shape(val):
             errors.append("%s: %s carries a CREDENTIAL SHAPE; no key here holds one (not shown)" % (where, key))
@@ -149,6 +168,7 @@ def validate_conf(values, user=None):
     need(not items, "PROJECTS item %s is not KEY=PATH@BASE (a lower-case key, the runner's own clone, its "
                     "base branch), or repeats a KEY" % ", ".join(map(str, items)))
     e.extend(path_problems(c, ns.ROLE_HOME_SENTINEL, bad))
+    e.extend(engine_dir_problems(c["ENGINE_DIR"]) + carried(c)[2])     # KIT-919
     return c, e
 
 
@@ -173,6 +193,109 @@ def load_conf(path, user=None):
     return conf, errors + more
 
 
+# ── KIT-919: the copy the runner runs from, and the runner keys runner.conf carries ───────────────────────────
+ENGINE_DEFAULT = "/usr/local/pipeline-runner/kit"
+CONF_DEFAULTS["ENGINE_DIR"] = ENGINE_DEFAULT
+# Where an account's own sessions can write: never the copy's place.
+UNSAFE_PREFIXES = ("/Users/", "/tmp/", "/private/tmp/", "/var/tmp/", "/private/var/tmp/", "/var/folders/",
+                   "/private/var/folders/")
+OFF = "off"
+CARRIED_PATHS = (("QUEUE_CONFIG", "queue_config"), ("LOOK_CONFIG_DIR", "look_config_dir"))
+SESSION_KEY_FILE, SESSION_WRITER = "SESSION_TOOLS_KEY_FILE", "SESSION_TOOLS_WRITER_USER_ID"
+CONF_UNEDITED[SESSION_WRITER] = "writer-user-id-1"
+# Per project: APPROVAL_STATES_<KEY> and ALLOWED_HOSTS_<KEY>, the project's key in capitals with `-` as `_`.
+PER_PROJECT = (("APPROVAL_STATES_", "approval_states"), ("ALLOWED_HOSTS_", "allowed_hosts"))
+
+
+def known_key(key):
+    return (key in CONF_REQUIRED or key in CONF_DEFAULTS or key in (SESSION_KEY_FILE, SESSION_WRITER)
+            or key in dict(CARRIED_PATHS) or project_key(key) is not None)
+
+
+def project_key(conf_key):
+    """(the setting, the project) a per-project key names: ALLOWED_HOSTS_MY_APP is my-app's allowed_hosts."""
+    for prefix, setting in PER_PROJECT:
+        if conf_key.startswith(prefix) and len(conf_key) > len(prefix):
+            return setting, conf_key[len(prefix):].lower().replace("_", "-")
+    return None
+
+
+def states_of(text):
+    """{kind: [state id, ...]} from `KIND:STATE_ID, ...`, {} for off, None when any item is not one."""
+    if text == OFF:
+        return {}
+    out = {}
+    for item in split_list(text):
+        kind, colon, state = (p.strip() for p in item.partition(":"))
+        if not (colon and kind in store.STARTS and runner_job.STATE_ID_RE.match(state)):
+            return None
+        out[kind] = out.get(kind, []) + ([] if state in out.get(kind, []) else [state])
+    return out or None
+
+
+def hosts_of(text):
+    """[host, ...], [] for off, None when any is not a host name."""
+    if text == OFF:
+        return []
+    hosts = []
+    for host in split_list(text):
+        if not runner_job.HOST_RE.match(host):
+            return None
+        hosts += [] if host in hosts else [host]
+    return hosts or None
+
+
+def carried(c):
+    """({setting: value}, {project: {setting: value}}, [problems]): what the conf names of the carried keys. A key it
+    leaves out is in neither, so the installed value stays: the owner's own, or an off."""
+    top, per, bad = {}, {}, []
+    for key, setting in CARRIED_PATHS:
+        v = c.get(key)
+        if v == OFF:
+            top[setting] = None
+        elif v is not None and path_ok(v):
+            top[setting] = v
+        elif v is not None:
+            bad.append("%s must be `~/…` (the role account's home), an absolute path with no `..`, or off" % key)
+    kf, writer = c.get(SESSION_KEY_FILE), c.get(SESSION_WRITER)
+    if kf == OFF and writer is None:
+        top["session_tools"] = None
+    elif kf is not None or writer is not None:
+        if kf in (None, OFF) or not path_ok(kf):
+            bad.append("%s must be the session writer's key file (`~/…` or an absolute path), set with %s; or off, "
+                       "alone" % (SESSION_KEY_FILE, SESSION_WRITER))
+        elif not (writer and pool.ID_RE.match(writer)):
+            bad.append("%s must be the session writer's tracker user id" % SESSION_WRITER)
+        elif writer in split_list(c.get("OWNER_USER_IDS")):
+            bad.append("%s is an owner's id: a session never writes as the owner" % SESSION_WRITER)
+        else:
+            top["session_tools"] = {"key_file": kf, "writer_user_id": writer}
+    names = projects(c.get("PROJECTS"))[0]
+    for key in sorted(k for k in c if project_key(k)):
+        setting, project = project_key(key)
+        value = (states_of if setting == "approval_states" else hosts_of)(c[key])
+        if project not in names:
+            bad.append("%s names project %s, which PROJECTS does not list" % (key, project))
+        elif value is None:
+            bad.append("%s must be %s, or off" % (key, "host names" if setting == "allowed_hosts" else
+                                                   "KIND:STATE_ID items, a kind being one of " + ", ".join(store.STARTS)))
+        else:
+            per.setdefault(project, {})[setting] = value
+    return top, per, bad
+
+
+def engine_dir_problems(v):
+    """ENGINE_DIR: an absolute path of plain characters, in a folder of its own, never where a session can write."""
+    if not (re.match(r"^/[A-Za-z0-9._/-]+$", v or "") and "/../" not in v + "/" and "/./" not in v + "/"
+            and os.path.dirname(v.rstrip("/")) not in ("", "/")):
+        return ["ENGINE_DIR must be an absolute path two folders deep at least, of letters, digits and . _ - /, "
+                "with no `..`"]
+    if (v.rstrip("/") + "/").startswith(UNSAFE_PREFIXES):
+        return ["ENGINE_DIR is where an account's own sessions can write: pick a system folder, such as %s"
+                % ENGINE_DEFAULT]
+    return []
+
+
 def part_ceiling(root=KIT):
     """The part's first-pass ceiling, from pipeline-parts.json in this checkout: the one place it is
     declared. None when it cannot be read, and no ceiling is never "no limit": the part is then left off."""
@@ -195,8 +318,8 @@ PROJECT_OWNED = ("repo", "base")
 
 def compose(c, on, was=None):
     """The runner's settings: the keys it owns from the conf, the rest of `was` (the installed settings) as it
-    is. A project the conf names keeps its own lanes, approved states and hosts; a new one gets every lane off.
-    No line here switches a lane on."""
+    is. A project the conf names keeps its own lanes, and its approved states and hosts unless the conf names
+    them (KIT-919); a new one gets every lane off. No line here switches a lane on."""
     d, was = c["RUNNER_DIR"].rstrip("/"), was if isinstance(was, dict) else {}
     old = was.get("projects") if isinstance(was.get("projects"), dict) else {}
     doc = dict((k, v) for k, v in was.items() if k not in OWNED)
@@ -209,6 +332,16 @@ def compose(c, on, was=None):
         p = dict((pk, pv) for pk, pv in mine.items() if pk not in PROJECT_OWNED)
         p.setdefault("lanes", dict.fromkeys(store.KINDS, False))
         doc["projects"][k] = dict(p, repo=repo, base=base)
+    return carry(c, doc)
+
+
+def carry(c, doc):
+    """`doc` with what the conf names of the carried keys: its value, or `off` as the off itself (KIT-919). A key it
+    leaves out is not touched, so a rerun keeps the owner's own value and an off he set."""
+    top, per, _bad = carried(c)
+    doc.update(top)
+    for key, settings in per.items():
+        doc["projects"][key].update(settings)
     return doc
 
 
@@ -226,7 +359,8 @@ def settings_path(c):
 
 
 def job_command(c, commit):
-    script = c["ROLE_KIT_CLONE"].rstrip("/") + "/scripts/" + RUNNER_SCRIPT
+    """The runner from its root-owned copy (KIT-919), never from the role account's clone."""
+    script = c["ENGINE_DIR"].rstrip("/") + "/scripts/" + RUNNER_SCRIPT
     return ns.exec_prefix(c) + "%s run --config %s # kit %s" % (ns._q(script), ns._q(settings_path(c)), commit)
 
 
@@ -262,6 +396,31 @@ class Runner(se.Runner):
         argv = ["sudo", "-n"] + list(argv)
         return self.read(argv, stdin, timeout) if why is None else self.write(why, argv, stdin, timeout)
 
+    # KIT-919: the copy's files go to root as bytes, and the accounts' ids come from the account database.
+    ROOT_UID = 0
+
+    def _exec(self, argv, stdin, timeout, cwd=None):
+        if not isinstance(stdin, bytes):
+            return se.Runner._exec(self, argv, stdin, timeout, cwd=cwd)
+        try:
+            p = subprocess.run(argv, input=stdin, capture_output=True, timeout=timeout, cwd=cwd or "/")
+        except FileNotFoundError as exc:
+            return se.Result(127, "", str(exc))
+        except subprocess.TimeoutExpired:
+            return se.Result(124, "", "timed out after %ss" % timeout)
+        return se.Result(p.returncode, p.stdout.decode("utf-8", "replace"), p.stderr.decode("utf-8", "replace"))
+
+    def uid_of(self, account):
+        """The account's user id, or None when the account database has none."""
+        import pwd
+        try:
+            return pwd.getpwnam(account).pw_uid
+        except KeyError:
+            return None
+
+    def user_uid(self):
+        return os.getuid()
+
 
 def agent_markers(env):
     return [m for m in AGENT_ENV_MARKERS if m in env]      # presence, not truthiness
@@ -287,9 +446,9 @@ class Ctx(object):
         self._may(what)
         return self.runner.as_role(self.account, script, stdin=stdin, why=why, timeout=timeout)
 
-    def as_root(self, argv, what, why=None):
+    def as_root(self, argv, what, why=None, stdin=None, timeout=300):
         self._may(what)
-        return self.runner.as_root(argv, why=why)
+        return self.runner.as_root(argv, why=why, stdin=stdin, timeout=timeout)
 
 
 # ── the steps: each returns (ok, detail) or raises Unknown / SetupError ───────────────────────────────────
@@ -342,6 +501,256 @@ def step_kit(ctx, apply_it):
     ctx.commit = head.group(1)
     return True, "kit %s, from %s: its %d runner scripts are this checkout's" % (
         ctx.commit[:12], clone, len(RUNNER_SCRIPTS))
+
+
+# ── KIT-919: the root-owned copy of the kit the runner runs from ──────────────────────────────────────────────
+ENGINE_MARK = ".engine-commit"          # the commit the copy holds, written by the root program beside the files
+ENGINE_TIMEOUT = 600
+# Run as root: `python3 -I -c ENGINE_PY <copy> <uid> <gid> <commit>`, the kit's files as one tar on standard input.
+# It takes plain files and folders only, writes them into <copy>.new beside the old copy, gives every entry to
+# uid:gid, closed to group and others, then swaps the two. The folder above the copy must be root's and closed.
+ENGINE_PY = r'''
+import io, os, shutil, stat, sys, tarfile
+dest, uid, gid, commit = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+top, new, old = os.path.dirname(dest), dest + ".new", dest + ".old"
+
+
+def refuse(words):
+    sys.stdout.write("refused: %s\n" % words)
+    sys.exit(3)
+
+
+def gone(path):
+    if os.path.isdir(path) and not os.path.islink(path):
+        shutil.rmtree(path)
+    elif os.path.lexists(path):
+        os.unlink(path)
+
+
+try:
+    os.umask(0o022)
+    if not os.path.lexists(top):
+        os.mkdir(top, 0o755)
+        os.lchown(top, uid, gid)
+    st = os.lstat(top)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != uid or st.st_mode & 0o022:
+        refuse("%s is not a folder of root's alone" % top)
+    data = sys.stdin.buffer.read()
+    for path in (new, old):
+        gone(path)
+    os.mkdir(new, 0o700)
+    count = 0
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as tar:
+        for m in tar:
+            parts = m.name.split("/")
+            if m.name.startswith("/") or any(p in ("", ".", "..") for p in parts):
+                refuse("the files name a path outside their folder")
+            path = os.path.join(new, *parts)
+            if m.isdir():
+                os.makedirs(path, 0o755, exist_ok=True)
+                continue
+            if not m.isreg():
+                refuse("%s is not a plain file" % m.name)
+            os.makedirs(os.path.dirname(path), 0o755, exist_ok=True)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o755 if m.mode & 0o100 else 0o644)
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(tar.extractfile(m).read())
+            count += 1
+    with open(os.path.join(new, "@MARK@"), "w") as fh:
+        fh.write(commit + "\n")
+    for here, dirs, names in os.walk(new):
+        for name in dirs + names:
+            os.lchown(os.path.join(here, name), uid, gid)
+    os.lchown(new, uid, gid)
+    os.chmod(new, 0o755)
+    if os.path.lexists(dest):
+        os.rename(dest, old)
+    os.rename(new, dest)
+    gone(old)
+except Exception as exc:
+    sys.stdout.write("failed: %s: %s\n" % (type(exc).__name__, exc))
+    sys.exit(1)
+sys.stdout.write("copied %s %d\n" % (commit, count))
+'''.replace("@MARK@", ENGINE_MARK)
+
+
+def _git(checkout, args, stdin=None):
+    """(exit, output bytes): git in this checkout, as you. It reads the checkout's own objects only."""
+    env = dict((k, v) for k, v in os.environ.items() if not k.startswith("GIT_"))
+    try:
+        p = subprocess.run(["git", "-C", checkout] + list(args), input=stdin, capture_output=True, env=env,
+                           timeout=300)
+    except (OSError, subprocess.SubprocessError):
+        return 127, b""
+    return p.returncode, p.stdout
+
+
+def blob_id(data, width=40):
+    """git's own id of a file's bytes: sha1, or sha256 in a repository that uses it."""
+    return (hashlib.sha1 if width == 40 else hashlib.sha256)(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+def plain_file(mode, kind):
+    """A plain file in git's tree: never a link (120000) or a submodule (160000)."""
+    return kind == b"blob" and mode in (b"100644", b"100755")
+
+
+def kit_tree(checkout, commit):
+    """{path: (executable, object id)} of every file at `commit`. A link or a submodule is refused: the copy takes
+    plain files only."""
+    rc, out = _git(checkout, ["ls-tree", "-r", "-z", "--full-tree", commit])
+    tree = {}
+    for entry in out.split(b"\0") if rc == 0 else ():
+        meta, _tab, path = entry.partition(b"\t")
+        mode, kind, oid = (meta.split(b" ") + [b"", b""])[:3]
+        if entry and not plain_file(mode, kind):
+            raise SetupError("kit %s holds %s, which is not a plain file: the runner's copy takes files only"
+                             % (commit[:12], path.decode("utf-8", "replace")))
+        if entry:
+            tree[path.decode("utf-8", "surrogateescape")] = (mode == b"100755", oid.decode("ascii", "replace"))
+    if not tree:
+        raise Unknown("this checkout's git could not list the files of kit %s (exit %d)" % (commit[:12], rc),
+                      "run it again")
+    return tree
+
+
+def kit_tar(checkout, tree):
+    """The tree's files as one tar, from this checkout's objects (`git cat-file --batch`, which runs no filter), each
+    checked against its own id."""
+    oids = sorted(set(oid for _exe, oid in tree.values()))
+    rc, out = _git(checkout, ["cat-file", "--batch"], ("\n".join(oids) + "\n").encode("ascii"))
+    blobs, at = {}, 0
+    for oid in oids if rc == 0 else ():
+        end = out.find(b"\n", at)
+        head = out[at:end].split(b" ") if end >= 0 else []
+        size = int(head[2]) if len(head) == 3 and head[2].isdigit() else -1
+        data = out[end + 1:end + 1 + size] if size >= 0 else b""
+        if head[:2] != [oid.encode("ascii"), b"blob"] or blob_id(data, len(oid)) != oid:
+            break
+        blobs[oid], at = data, end + 2 + size
+    if len(blobs) != len(oids):
+        raise Unknown("this checkout's git did not give every file of the kit whole (exit %d)" % rc, "run it again")
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w", format=tarfile.PAX_FORMAT) as tar:
+        for name in sorted(tree):
+            exe, oid = tree[name]
+            info = tarfile.TarInfo(name)
+            info.size, info.mode = len(blobs[oid]), 0o755 if exe else 0o644
+            tar.addfile(info, io.BytesIO(blobs[oid]))
+    return buf.getvalue()
+
+
+def entry_problem(st, root_uid):
+    """Why an entry of the copy is not root's alone, or ''."""
+    return ("is a link" if stat.S_ISLNK(st.st_mode) else "is not root's" if st.st_uid != root_uid else
+            "may be written by group or others" if st.st_mode & 0o022 else "")
+
+
+def copy_diff(tree, files):
+    """(differ, missing, extra): the copy's files against the commit's tree, by content and executable bit."""
+    return (sorted(n for n in tree if n in files and files[n] != tree[n]), sorted(set(tree) - set(files)),
+            sorted(set(files) - set(tree)))
+
+
+def read_copy(dest, root_uid, width=40):
+    """(files, problems, mark), or None when there is no copy. files is {path: (executable, object id)}; a problem is
+    an entry that is a link, not root's, or open to group or others, named inside the copy; mark is the commit the
+    copy says it holds. Unknown when any of it cannot be read: a copy never read whole is never taken as fine."""
+    files, problems, mark = {}, [], None
+
+    def look(path, st):
+        why = entry_problem(st, root_uid)
+        if why:
+            problems.append("%s %s" % ("its folder" if path == dest else os.path.relpath(path, dest), why))
+
+    def unread(exc):
+        raise exc
+    try:
+        look(dest, os.lstat(dest))
+    except FileNotFoundError:
+        return None
+    try:
+        for here, dirs, names in os.walk(dest, onerror=unread):
+            for name in sorted(dirs) + sorted(names):
+                path = os.path.join(here, name)
+                st = os.lstat(path)
+                look(path, st)
+                if not stat.S_ISREG(st.st_mode):
+                    continue
+                with open(path, "rb") as fh:
+                    data = fh.read()
+                rel = os.path.relpath(path, dest)
+                if rel == ENGINE_MARK:
+                    mark = data.decode("ascii", "replace").strip()
+                else:
+                    files[rel] = (bool(st.st_mode & 0o100), blob_id(data, width))
+    except OSError as exc:
+        raise Unknown("the copy %s could not be read whole (%s)" % (dest, exc.strerror or type(exc).__name__),
+                      "make it readable, or let `apply` make it again")
+    return files, problems, mark if re.match(r"^[0-9a-f]{40}([0-9a-f]{24})?$", mark or "") else None
+
+
+def engine_state(ctx):
+    """(current, words, tree): the copy against the commit Stage E's clone is at, read as you, no sudo."""
+    dest, commit, checkout = ctx.conf["ENGINE_DIR"].rstrip("/"), ctx.commit, os.path.dirname(ctx.scripts)
+    if _git(checkout, ["cat-file", "-e", commit + "^{commit}"])[0] != 0:
+        raise Unknown("this checkout (%s) does not have kit %s, the commit Stage E's clone is at" % (checkout, commit[:12]),
+                      "git -C %s fetch origin, then run this again" % checkout)
+    rc = _git(checkout, ["merge-base", "--is-ancestor", commit, "origin/main"])[0]
+    if rc == 1:
+        raise SetupError("kit %s, the commit Stage E's clone is at, is not on this checkout's origin/main: only a "
+                         "reviewed and merged commit is copied for the runner" % commit[:12])
+    if rc != 0:
+        raise Unknown("whether kit %s is on origin/main could not be told (git exit %d)" % (commit[:12], rc),
+                      "run it again")
+    tree, have = kit_tree(checkout, commit), read_copy(dest, ctx.runner.ROOT_UID, len(commit))
+    if have is None:
+        return False, "no copy at %s yet; Stage E's clone is at kit %s" % (dest, commit[:12]), tree
+    files, problems, mark = have
+    if mark and mark != commit:
+        rc = _git(checkout, ["merge-base", "--is-ancestor", commit, mark])[0]
+        if rc == 0:
+            raise SetupError("Stage E's clone is at kit %s, older than the copy's kit %s: the copy never moves back. "
+                             "Let Stage E's `run` move the clone forward" % (commit[:12], mark[:12]))
+        if rc != 1:
+            raise Unknown("whether kit %s is older than the copy's kit %s could not be told (git exit %d)"
+                          % (commit[:12], mark[:12], rc), "git -C %s fetch origin, then run this again" % checkout)
+    for who, uid in (("the role account", ctx.runner.uid_of(ctx.account)), ("you", ctx.runner.user_uid())):
+        if uid is None:
+            raise Unknown("the role account %s has no user id" % ctx.account, "install Stage E first")
+        problems += ["for %s: %s" % (who, p) for p in runner_guard.engine_problems(dest, uid=uid)]
+    differ, missing, extra = copy_diff(tree, files)
+    if not (differ or missing or extra or problems or mark != commit):
+        return True, "the copy at %s is kit %s, the commit Stage E's clone is at: %d files, each root's, and none " \
+                     "of it or above it the role account or you can change" % (dest, commit[:12], len(tree)), tree
+    said = ["%d %s" % (len(v), w) for v, w in ((differ, "differ"), (missing, "missing"), (extra, "extra")) if v]
+    return False, "the copy at %s holds kit %s, and Stage E's clone is at kit %s%s%s" % (
+        dest, (mark or "unknown")[:12], commit[:12], ": " + ", ".join(said) + " file(s)" if said else "",
+        "; " + "; ".join(problems[:3]) + (" and %d more" % (len(problems) - 3) if len(problems) > 3 else "")
+        if problems else ""), tree
+
+
+def step_engine(ctx, apply_it):
+    """The root-owned copy of the kit the runner runs from. Only `apply` makes or refreshes it, as root."""
+    if None in (ctx.home, ctx.commit):
+        raise Unknown("waits on `home` and `kit`", "clear those rows first")
+    dest = ctx.conf["ENGINE_DIR"].rstrip("/")
+    if ns._under(os.path.realpath(dest), os.path.realpath(ctx.home)):
+        raise SetupError("ENGINE_DIR %s is in the role account's home, which that account can change" % dest)
+    current, words, tree = engine_state(ctx)
+    if current or not apply_it:
+        return current, words if current else "would copy kit %s there as root: %s" % (ctx.commit[:12], words)
+    res = ctx.as_root(["/usr/bin/python3", "-I", "-c", ENGINE_PY, dest, "0", "0", ctx.commit],
+                      "copying kit %s to %s" % (ctx.commit[:12], dest), why="copy kit %s to %s, root's"
+                      % (ctx.commit[:12], dest), stdin=kit_tar(os.path.dirname(ctx.scripts), tree), timeout=ENGINE_TIMEOUT)
+    last = ((res.out or "").strip().splitlines() or [""])[-1]
+    if not res.ok or last != "copied %s %d" % (ctx.commit, len(tree)):
+        raise SetupError("could not copy kit %s to %s as root (exit %d): %s" % (
+            ctx.commit[:12], dest, res.rc, _s(last or (res.err or "").strip())[:200] or "it said nothing"))
+    again, words, _tree = engine_state(ctx)
+    if not again:
+        raise SetupError("copied kit %s to %s, and reading it back does not match: %s" % (ctx.commit[:12], dest, words))
+    return False, "copied as root, then read back: %s" % words
 
 
 def first_pass(ctx):
@@ -496,7 +905,8 @@ def step_job(ctx, apply_it):
     return False, "did: %s; now: %s" % (", ".join(todo), now)
 
 
-STEPS = (("home", step_home), ("kit", step_kit), ("settings", step_settings), ("job", step_job))
+STEPS = (("home", step_home), ("kit", step_kit), ("engine", step_engine), ("settings", step_settings),
+         ("job", step_job))
 _SEVERITY = (FAILED, UNKNOWN, WOULD_CHANGE)
 
 
@@ -653,26 +1063,49 @@ def _put(path, body):
 
 
 class FakeMachine(Runner):
-    """A role home in a folder: Stage E's clone (a real git repository) level with a fake checkout, and launchd
-    as data. `sudo -n -u <role> -H /bin/sh -c` runs a REAL /bin/sh with HOME there. A sudo without `-n` would
-    ask for a password, so it fails here."""
+    """A role home in a folder: Stage E's clone (a real git repository) cloned from a fake checkout of the kit, and
+    launchd as data. `sudo -n -u <role> -H /bin/sh -c` runs a REAL /bin/sh with HOME there, and the copy's root
+    program runs for real, giving the files to this account, which stands in for root (KIT-919). A sudo without
+    `-n` would ask for a password, so it fails here."""
+    ROOT_UID = os.getuid()
 
     def __init__(self, root):
         Runner.__init__(self)
-        self.root, self.home, self.scripts = root, root + "/role-home", root + "/checkout"
+        self.root, self.home, self.checkout = root, root + "/role-home", root + "/checkout"
+        self.scripts, self.clone, self.engine = self.checkout + "/scripts", self.home + "/.stage-e/kit", root + "/engine/kit"
         self.plists, self.loaded, self.boot, self.sudo, self.print_rc = {}, {}, {}, [], None
-        for where in (self.home + "/.stage-e/kit/scripts", self.scripts):
-            for name in RUNNER_SCRIPTS:
-                _put(where + "/" + name, "# a stand-in for %s\n" % name)
+        for name in RUNNER_SCRIPTS:
+            _put(self.scripts + "/" + name, "# a stand-in for %s\n" % name)
+        for part in ("session-kinds/code.json", ".claude/hooks/" + runner_guard.HOOKS["pre-tool-use"],
+                     "templates/sandbox/look.sb"):
+            _put(self.checkout + "/" + part, "# a stand-in for %s\n" % part)
+        self.git(self.checkout, "init", "-q")
         self.commit("first")
 
-    def commit(self, message):
+    def git(self, where, *argv):
         import subprocess
-        for argv in (["init", "-q"], ["add", "-A"], ["-c", "user.name=t", "-c", "user.email=t@example.invalid",
-                                                     "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false",
-                                                     "commit", "-q", "--allow-empty", "-m", message]):
-            subprocess.run(["git", "-C", self.home + "/.stage-e/kit"] + argv, check=True, capture_output=True,
-                           env=dict(_GIT_ENV, HOME=self.home))
+        return subprocess.run(["git", "-C", where] + list(argv), check=True, capture_output=True, text=True,
+                              env=dict(_GIT_ENV, HOME=self.home)).stdout.strip()
+
+    def commit(self, message, reviewed=True):
+        """A commit in the checkout, on its origin/main when `reviewed`, and Stage E's clone moved to it."""
+        self.git(self.checkout, "add", "-A")
+        self.git(self.checkout, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c",
+                 "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", message)
+        if reviewed:
+            self.git(self.checkout, "update-ref", "refs/remotes/origin/main", "HEAD")
+        if os.path.isdir(self.clone + "/.git"):
+            self.git(self.clone, "pull", "-q", "--ff-only")
+        else:
+            os.makedirs(os.path.dirname(self.clone), exist_ok=True)
+            self.git(self.root, "clone", "-q", self.checkout, self.clone)
+        return self.git(self.checkout, "rev-parse", "HEAD")
+
+    def uid_of(self, account):
+        return os.getuid() + 1          # never this account: the copy is checked against another one
+
+    def user_uid(self):
+        return os.getuid() + 2
 
     def _exec(self, argv, stdin, timeout, cwd=None):
         import subprocess
@@ -689,6 +1122,13 @@ class FakeMachine(Runner):
         if argv[1] != "-n":
             return se.Result(1, "", "sudo: a password is required")
         argv = argv[2:]
+        if argv[0] == "/usr/bin/python3":         # the copy's root program, run for real as this account
+            if not argv[4].startswith(self.root + "/"):
+                return se.Result(99, "", "the root program names a copy outside this machine's folder")
+            done = subprocess.run([sys.executable] + argv[1:5] + [str(os.getuid()), str(os.getgid()), argv[7]],
+                                  input=stdin, capture_output=True, timeout=timeout)
+            return se.Result(done.returncode, done.stdout.decode("utf-8", "replace"),
+                             done.stderr.decode("utf-8", "replace"))
         if argv[0] == "-u":
             if [p for p in re.findall(r'"(/[^"]*)"', argv[5]) if not p.startswith(self.root)]:
                 return se.Result(99, "", "a role script names a path outside its home")
@@ -731,24 +1171,26 @@ def selftest():
         print("[%s] %s%s" % ("PASS" if got == want else "FAIL", name, "" if got == want else "  (got %r, want %r)"
                              % (got, want)))
         fails.extend([name] * (got != want))
-    saved, pause = dict(os.environ), se._pause
+    me, saved, pause = sys.modules[__name__], dict(os.environ), se._pause
+    unsafe = me.UNSAFE_PREFIXES
     for marker in AGENT_ENV_MARKERS:                # the battery owns its environment
         os.environ.pop(marker, None)
     se._pause = lambda seconds: None
+    me.UNSAFE_PREFIXES = ("/unsafe-selftest/",)     # its copies are made in temp folders; case 14 checks the rule
     try:
         with tempfile.TemporaryDirectory(prefix="runner-setup-selftest-") as tmp:
-            _cases(check, tmp)
+            _cases(check, tmp, unsafe)
     except Exception as exc:                                      # noqa: BLE001
         check("the battery ran to its end", "%s: %s" % (type(exc).__name__, str(exc)[:300]), "")
     finally:
-        se._pause = pause
+        se._pause, me.UNSAFE_PREFIXES = pause, unsafe
         os.environ.clear()
         os.environ.update(saved)
     print("\n%d/%d checks passed" % (ran[0] - len(fails), ran[0]))
     return 1 if fails else 0
 
 
-def _cases(check, tmp):  # noqa: C901  (one battery, read top to bottom)
+def _cases(check, tmp, unsafe):  # noqa: C901  (one battery, read top to bottom)
     import contextlib
     import io
     import tempfile
@@ -768,7 +1210,7 @@ def _cases(check, tmp):  # noqa: C901  (one battery, read top to bottom)
 
     def world(**over):
         root = tempfile.mkdtemp(dir=tmp)
-        _put(root + "/runner.conf", text(**over))
+        _put(root + "/runner.conf", text(**dict({"ENGINE_DIR": root + "/engine/kit"}, **over)))
         return FakeMachine(root)
 
     def go(fake, command="check", answers=yes, env=None, live=True, stdin=None, parts=KIT):
@@ -855,8 +1297,8 @@ def _cases(check, tmp):  # noqa: C901  (one battery, read top to bottom)
         return code, doc["exit"], rows(doc), "-- steps --" in err, fake.writes, settings(fake), [
             a for a in fake.sudo if a[2] not in ("-u", "launchctl") or a[3] not in ("print", "print-disabled", "_exrunner")]
     case("check on a fresh machine: exit 10 in one document, settings and job would change, nothing written",
-         fresh_check, (10, 10, {"home": ALREADY_DONE, "kit": ALREADY_DONE, "settings": WOULD_CHANGE,
-                                "job": WOULD_CHANGE}, True, [], None, []),
+         fresh_check, (10, 10, {"home": ALREADY_DONE, "kit": ALREADY_DONE, "engine": WOULD_CHANGE,
+                                "settings": WOULD_CHANGE, "job": WOULD_CHANGE}, True, [], None, []),
          ("a check that applies", [(me, "run_steps", lambda ctx, apply_it, real=run_steps: real(ctx, True))]))
 
     # 3. Apply on a fresh machine: within the ceiling, so on; every lane off; the job enabled and loaded.
@@ -1037,6 +1479,209 @@ def _cases(check, tmp):  # noqa: C901  (one battery, read top to bottom)
     check("the parts list names this installer's check and apply, and a ceiling",
           (part["check"]["args"][0], part["apply"]["args"][0], part_ceiling() == part["ceiling"] is not None),
           ("check", "apply", True))
+
+    # 14. KIT-919: the runner keys the conf carries, and the root-owned copy the runner runs from.
+    def doc_of(fake):
+        with open(fake.home + "/.pipeline-runner/runner.json") as fh:
+            return json.load(fh)
+
+    def reconf(fake, **over):
+        _put(fake.root + "/runner.conf", text(**dict({"ENGINE_DIR": fake.engine}, **over)))
+
+    def faults_of(**over):
+        values, errors = parse_conf(text(**over))
+        return errors + validate_conf(values, "selftest-person")[1]
+
+    def carried_faults():
+        found = [any(want in e for e in faults_of(**over)) for over, want in (
+            ({SESSION_WRITER: "writer-1"}, "SESSION_TOOLS_KEY_FILE must"),
+            ({SESSION_KEY_FILE: "~/k", SESSION_WRITER: "owner-1"}, "SESSION_TOOLS_WRITER_USER_ID is an owner's id"),
+            ({"QUEUE_CONFIG": "rel/q.json"}, "QUEUE_CONFIG must"),
+            ({"APPROVAL_STATES_APP": "code:s1, merge:s2"}, "APPROVAL_STATES_APP must"),
+            ({"ALLOWED_HOSTS_WEB": "not a host"}, "ALLOWED_HOSTS_WEB must"),
+            ({"ALLOWED_HOSTS_NOPE": "github.com"}, "ALLOWED_HOSTS_NOPE names project nope"),
+            ({"ENGINE_DIR": "/unsafe-selftest/x/kit"}, "ENGINE_DIR is where"),
+            ({"ENGINE_DIR": "/kit"}, "ENGINE_DIR must"))]
+        good = faults_of(**{SESSION_KEY_FILE: "~/k", SESSION_WRITER: "writer-1", "QUEUE_CONFIG": "off",
+                            "LOOK_CONFIG_DIR": "/var/looks", "APPROVAL_STATES_APP": "code:s-1, plan:s-2",
+                            "ALLOWED_HOSTS_WEB": "off"})
+        return found, good, all(p in unsafe for p in ("/Users/", "/tmp/", "/var/folders/", "/private/var/folders/"))
+    case("conf: each carried key and the copy's place are judged by key; a good set has no fault; the places a "
+         "session writes are refused", carried_faults, ([True] * 8, [], True),
+         ("any states taken", [(me, "states_of", lambda t: {})]),
+         ("any hosts taken", [(me, "hosts_of", lambda t: [])]),
+         ("any path taken", [(me, "path_ok", lambda v: True)]),
+         ("a key for a project not listed taken", [(me, "project_key", lambda k, real=project_key: (
+             lambda r: r and (r[0], "app"))(real(k)))]),
+         ("the places a session writes dropped", [(me, "UNSAFE_PREFIXES", ())]),
+         ("the copy's place not judged", [(me, "engine_dir_problems", lambda v: [])]))
+
+    def carried_written():
+        fake = world(**{SESSION_KEY_FILE: "~/.keys/writer", SESSION_WRITER: "writer-1", "QUEUE_CONFIG": "~/.queue/q.json",
+                        "LOOK_CONFIG_DIR": "~/.looks", "APPROVAL_STATES_APP": "code:ready-1, acceptance:ready-1, plan:plan-1",
+                        "ALLOWED_HOSTS_APP": "github.com, api.github.com, registry.npmjs.org"})
+        code = go(fake, "apply")[0]
+        doc, again = doc_of(fake), go(fake)
+        app = doc["projects"]["app"]
+        return (code, doc.get("session_tools"), doc.get("queue_config"), doc.get("look_config_dir"),
+                app.get("approval_states"), app.get("allowed_hosts"), "allowed_hosts" in doc["projects"]["web"],
+                again[0], rows(again[1])["settings"])
+    case("the carried keys: written into runner.json from the conf, and a rerun finds them current", carried_written,
+         (0, {"key_file": "~/.keys/writer", "writer_user_id": "writer-1"}, "~/.queue/q.json", "~/.looks",
+          {"code": ["ready-1"], "acceptance": ["ready-1"], "plan": ["plan-1"]},
+          ["github.com", "api.github.com", "registry.npmjs.org"], False, 0, ALREADY_DONE),
+         ("the conf's keys never written", [(me, "carry", lambda c, doc: doc)]))
+
+    def kept_and_off():
+        fake = world()
+        go(fake, "apply")
+        doc = doc_of(fake)
+        doc.update(queue_config="~/.mine/q.json", session_tools=None)
+        doc["projects"]["app"].update(allowed_hosts=[], approval_states={"review": ["st-1"]})
+        _put(fake.home + "/.pipeline-runner/runner.json", json.dumps(doc, indent=2, sort_keys=True) + "\n")
+        go(fake, "apply")                                            # the conf names none of them
+        kept, app = doc_of(fake), doc_of(fake)["projects"]["app"]
+        reconf(fake, QUEUE_CONFIG="off", APPROVAL_STATES_APP="off", ALLOWED_HOSTS_APP="github.com")
+        go(fake, "apply")
+        off = doc_of(fake)
+        reconf(fake)                                                 # and none of them again
+        code = go(fake, "apply")[0]
+        return ((kept.get("queue_config"), "session_tools" in kept, kept.get("session_tools"), app.get("allowed_hosts"),
+                 app.get("approval_states")), (off.get("queue_config"), "queue_config" in off,
+                                               off["projects"]["app"].get("approval_states"),
+                                               off["projects"]["app"].get("allowed_hosts")), code, doc_of(fake) == off)
+    case("a rerun keeps the owner's own values and an off he set; `off` writes the off, and a rerun keeps it",
+         kept_and_off, (("~/.mine/q.json", True, None, [], {"review": ["st-1"]}), (None, True, {}, ["github.com"]), 0,
+                        True),
+         ("the installed values dropped", [(me, "OWNED", OWNED + ("queue_config", "session_tools"))]),
+         ("a project's installed hosts dropped", [(me, "PROJECT_OWNED", PROJECT_OWNED + ("allowed_hosts",))]),
+         ("`off` read as a path", [(me, "OFF", "no-such-word")]))
+
+    def mark_of(fake):
+        with open(fake.engine + "/" + ENGINE_MARK) as fh:
+            return fh.read().strip()
+
+    def copy_made():
+        fake = world()
+        look = go(fake)[1]
+        code = go(fake, "apply")[0]
+        again = go(fake)[1]
+        cmd = plistlib.loads(fake.plists[plist].encode("utf-8"))["ProgramArguments"][-1]
+        return (rows(look)["engine"], code, rows(again)["engine"], mark_of(fake) == fake.git(fake.clone, "rev-parse", "HEAD"),
+                sorted(os.listdir(fake.engine + "/scripts")) == sorted(RUNNER_SCRIPTS),
+                fake.engine + "/scripts/" + RUNNER_SCRIPT in cmd, ".stage-e/kit/" in cmd)
+    case("the copy: check says it would be made; apply makes it at the clone's commit and reads it back current; the "
+         "job runs from it, never from the clone", copy_made, (WOULD_CHANGE, 0, ALREADY_DONE, True, True, True, False),
+         ("the job run from the clone", [(me, "job_command", lambda c, commit: ns.exec_prefix(c) + "%s run # kit %s" % (
+             c["ROLE_KIT_CLONE"] + "/scripts/" + RUNNER_SCRIPT, commit))]),
+         ("a copy taken as current unread", [(me, "engine_state", lambda ctx, real=engine_state:
+                                              (True, "unread", real(ctx)[2]))]))
+
+    def copy_mended():
+        fake = world()
+        _put(fake.checkout + "/docs/notes.md", "# a file outside the walls\n")
+        fake.commit("notes")
+        go(fake, "apply")
+        _put(fake.engine + "/scripts/" + RUNNER_SCRIPT, "# changed\n")
+        _put(fake.engine + "/scripts/extra.py", "# extra\n")
+        os.chmod(fake.engine + "/docs/notes.md", 0o666)
+        code, doc, _err, _left = go(fake)
+        words = said(doc)
+        return (code, rows(doc)["engine"], ["1 differ" in words, "1 extra" in words, "notes.md may be written by group "
+                                            "or others" in words], go(fake, "apply")[0], rows(go(fake)[1])["engine"])
+    case("a changed, an extra and an open file in the copy: check names each, and apply makes it whole again",
+         copy_mended, (10, WOULD_CHANGE, [True, True, True], 0, ALREADY_DONE),
+         ("contents never compared", [(me, "copy_diff", lambda tree, files: ([], [], []))]),
+         ("an open entry not seen", [(me, "entry_problem", lambda st, root_uid: "")]))
+
+    def copy_moved():
+        fake = world()
+        go(fake, "apply")
+        first, second = mark_of(fake), fake.commit("second")      # the same files, at a newer commit
+        code, doc, _err, _left = go(fake)
+        go(fake, "apply")
+        return (code, rows(doc)["engine"], "holds kit %s, and Stage E's clone is at kit %s" % (first[:12], second[:12])
+                in said(doc), mark_of(fake) == second, rows(go(fake)[1])["engine"])
+    case("a moved clone: check says the copy holds the older kit; the same owner step refreshes it", copy_moved,
+         (10, WOULD_CHANGE, True, True, ALREADY_DONE),
+         ("an existing copy taken as current", [(me, "engine_state", lambda ctx, real=engine_state: (
+             True, "x", None) if os.path.lexists(ctx.conf["ENGINE_DIR"]) else real(ctx))]),
+         ("a root program that copies nothing and says it did", [(me, "ENGINE_PY", "import sys; print('copied %%s %d' %% "
+                                                                   "sys.argv[4])" % (len(RUNNER_SCRIPTS) + 3))]))
+
+    def reviewed_only():
+        fake = world()
+        fake.commit("not reviewed", reviewed=False)
+        code, doc, _err, _left = go(fake, "apply")
+        return code, rows(doc)["engine"], os.path.lexists(fake.engine), settings(fake)
+    case("only a commit on origin/main is copied: another fails at `engine`, and nothing is written", reviewed_only,
+         (1, FAILED, False, None),
+         ("any commit copied", [(me, "_git", lambda checkout, args, stdin=None, real=_git: (0, b"") if args[:2] == [
+             "merge-base", "--is-ancestor"] else real(checkout, args, stdin))]))
+
+    def never_back():
+        fake = world()
+        first = fake.git(fake.clone, "rev-parse", "HEAD")
+        fake.commit("second")
+        go(fake, "apply")
+        fake.git(fake.clone, "reset", "-q", "--hard", first)
+        code, doc, _err, _left = go(fake, "apply")
+        return code, rows(doc)["engine"], "never moves back" in said(doc), mark_of(fake) != first
+    case("the copy never moves back: a clone moved to an older commit fails at `engine`, and the copy is kept",
+         never_back, (1, FAILED, True, True),
+         ("an older commit copied", [(me, "_git", lambda checkout, args, stdin=None, real=_git: (1, b"") if args[:2] == [
+             "merge-base", "--is-ancestor"] and args[3] != "origin/main" else real(checkout, args, stdin))]))
+
+    def unreadable():
+        fake = world()
+        go(fake, "apply")
+        os.chmod(fake.engine + "/session-kinds", 0)
+        try:
+            code, doc, _err, _left = go(fake)
+        finally:
+            os.chmod(fake.engine + "/session-kinds", 0o755)
+        return code, rows(doc)["engine"], "could not be read whole" in said(doc)
+    case("a copy that cannot be read whole is not measured, never current", unreadable, (4, UNKNOWN, True),
+         ("an unread copy taken as none", [(me, "read_copy", lambda dest, root_uid, width=40: None)]))
+
+    def open_above():
+        fake = world()
+        os.makedirs(fake.root + "/engine")
+        os.chmod(fake.root + "/engine", 0o777)
+        try:
+            code, doc, _err, _left = go(fake, "apply")
+        finally:
+            os.chmod(fake.root + "/engine", 0o755)
+        return code, rows(doc)["engine"], "is not a folder of root's alone" in said(doc), os.path.lexists(fake.engine)
+    case("a folder above the copy that others can write: the root program refuses in its words, and makes no copy",
+         open_above, (1, FAILED, True, False),
+         ("the refusal dropped", [(me, "ENGINE_PY", ENGINE_PY.replace("st.st_mode & 0o022", "False"))]))
+
+    def kit_with_link():
+        fake = world()
+        os.symlink("look.sb", fake.checkout + "/templates/sandbox/other.sb")
+        fake.commit("a link")
+        code, doc, _err, _left = go(fake, "apply")
+        return code, rows(doc)["engine"], "not a plain file" in said(doc), os.path.lexists(fake.engine)
+    case("a kit commit that holds a link: refused, and never copied", kit_with_link, (1, FAILED, True, False),
+         ("links taken", [(me, "plain_file", lambda mode, kind: True)]))
+
+    def not_roots():
+        fake = world()
+        go(fake, "apply")
+        fake.ROOT_UID = os.getuid() + 9                  # as if every entry were another account's
+        code, doc, _err, _left = go(fake)
+        return code, rows(doc)["engine"], "is not root's" in said(doc)
+    case("a copy whose entries are not root's: never current, and said", not_roots, (10, WOULD_CHANGE, True),
+         ("ownership never looked at", [(me, "entry_problem", lambda st, root_uid: "")]))
+
+    def in_role_home():
+        fake = world()
+        _put(fake.root + "/runner.conf", text(ENGINE_DIR=fake.home + "/engine/kit"))
+        code, doc, _err, _left = go(fake, "apply")
+        return code, rows(doc)["engine"], os.path.lexists(fake.home + "/engine/kit")
+    case("a copy's place in the role account's home: FAILED at `engine`, and no copy made", in_role_home,
+         (1, FAILED, False), ("the role's home not refused", [(ns, "_under", lambda child, parent: False)]))
 
 
 if __name__ == "__main__":
