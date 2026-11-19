@@ -10,12 +10,14 @@ The formats it reads and writes: `docs/PIPELINE-CONTRACT.md` section 28, and sec
 ## Where it stands
 
 - **Built, and off.** It is built beside the third-party dispatcher, which still runs every session.
-- **No lane is on yet.** The review, coding and fix lanes are built. Each is switched on later, one
-  project at a time, on the owner's yes, a drill repository first. See "The coding lane".
+- **No lane is on yet.** The review, planning, coding and fix lanes are built. Each is switched on
+  later, one project at a time, on the owner's yes, a drill repository first. See "The coding lane".
 - **Its installer puts it in place with every lane off** for every project. See "Installing it".
 - **No real session goes through it yet.** Its selftest runs it against a stand-in program.
 - **The review lane is built (KIT-644).** The review job asks for a review run of a project whose
   `review` lane is on, and files no review ticket. No project's is on yet.
+- **The planning lane is built (KIT-705).** The planner job asks for a plan run on the idea itself
+  when a project's `lanes.plan` is on, and files no planning ticket ("The planning lane", below).
 
 A lane runs through the runner only when the runner's lane for that project is on, and the caller's
 own switch too where the caller keeps one. Either one off is the way back. The review job keeps
@@ -180,6 +182,8 @@ loader refuses it:
 - **Bash inside our own sandbox,** or a kind without Bash outside it.
 - **Less than the four walls:** the store, the pins, the keys and the sessions' own state.
 - **An environment name the adapter has no source for,** so no API key, proxy or address can pass.
+- **The push token in a kind that does no ticket's work,** or in one whose Bash the built-in
+  sandbox does not hold. A kind names the token and git's helper for it together, or neither.
 - **A review tool outside the reviewer's read-only set.** The selftest checks the review kind
   against the same allow list the old lane's probe uses, and the plan kind against the planner's.
 - **An approval from a run, for any kind but one that follows the coding it judges.** The review
@@ -202,6 +206,8 @@ Not: the runner starts sessions behind the old walls until some script changes t
 
 - **Nothing from its workspace.** No settings, hooks, tool servers or `CLAUDE.md` load from it.
 - **The project's instructions,** read from its default branch by the runner, handed in as a file.
+- **A plan run's brief** comes before them, in the same file: how to plan, what one document to
+  answer with, and that the idea is its ticket (`scripts/pipeline_plan_brief.py`, KIT-705).
 - **The ticket,** as the runner read it, fenced as data. A resume's text is fenced the same way.
 - **A review: its facts and its instructions, and no ticket (KIT-644).** The review job resolved the
   basis it judges against, and the ticket may have been edited since, so no read of it is given.
@@ -227,7 +233,8 @@ Not: the runner starts sessions behind the old walls until some script changes t
   file there, and on 18 Nov 2026 it refused its own settings file when it could not.
 - **The kit's guard on every tool call,** from the engine's own folder (below).
 - **A short environment,** exactly its kind's names: the path (the program's own folder first),
-  a home, a temp folder, the language, the sign-in token, and two switches.
+  a home, a temp folder, the language, the sign-in token, and two switches. Code, fix and conflict
+  also get the push token and git's helper for it ("The push token", below).
 - **No tracker sign-in.** No tracker key is in its environment, its `mcp.json` lists no tracker
   server, and every tracker key file is walled from its file tools and from Bash. With
   `session_tools` set, a code, fix or conflict session gets five tracker tools of its own instead.
@@ -240,6 +247,42 @@ move the lane from the plan's usage window to a card, and a base address or a pr
 traffic elsewhere. The runner checks the dotenv files a loader reads by itself (`.env`, `.env.local`
 and the like) before every start and resume. It names the file and the variable, never the value.
 `.env.example` is documentation, and is not read.
+
+## The push token
+
+A code, fix or conflict session pushes its own branch and opens its own pull request (KIT-886). It
+uses the sessions' push token: the code host's token that sessions on the old dispatcher hold
+today. Taking the token out of sessions, with the runner pushing for them, is KIT-37.
+
+- **Where it lives.** One file, named by `push_token_file`. It is the role account's own, mode
+  0600, and holds one GitHub token and nothing else. The runner refuses it inside the work or home
+  folder, or inside a git working tree.
+- **Who reads it.** The runner, at each start or resume of a code, fix or conflict run, and never
+  for another kind. A file it cannot read, or one that holds anything but one GitHub token, holds the
+  request. The answer says why, never what the file holds.
+- **Who gets it.** Code, fix and conflict, under `GH_TOKEN`, where git's helper and
+  `scripts/gh_fallback.py` read it. Review, plan and acceptance never do: their data names neither
+  the token nor git's helper. The loader refuses either name in a kind that does no ticket's work.
+- **git's helper.** The same environment gives git one credential helper. First it clears every
+  helper git would read from its other settings, the keychain's among them. Then it hands git the
+  token for github.com, and for no other host. No command line holds the token.
+- **Its walls.** The file is walled from every kind, the three that hold the token included, as
+  each key file is. The token adds no host: Bash still reaches only the project's `allowed_hosts`.
+- **The guards still hold.** In these runs the kit's guard refuses a push to main, a bare force
+  push and `gh pr merge`, as in any session. The guard launcher's selftest proves each one.
+- **Keep it out of the keychain.** The file is the token's only home. A session's Bash could ask
+  the account's keychain itself. The probe fails if git's stored helpers hand an acceptance session
+  a GitHub password.
+
+**What the guard does not catch.** The guard knows command shapes. A merge sent straight to the
+code host's API, with `curl` or Python, is not one of them. A token that can push a branch can
+merge a green pull request that way. Only the default branch's own rules can stop that account
+from merging. Nothing in the runner can, until KIT-37 takes the token out of the session.
+
+Good: `push_token_file` names `~/.pipeline-runner/push-token`, mode 0600, holding the token alone.
+A code session runs `git push -u origin HEAD`, then `scripts/gh_fallback.py pr-create`.
+Not: `push_token_file` names the tracker key's file. Every code start waits, and its answer says
+the file does not hold one GitHub token. Nothing reaches a session.
 
 ## Guards from the engine's own folder
 
@@ -292,8 +335,8 @@ python3 scripts/pipeline_runner_probe.py run --claude <the role's claude> --out 
 
 | Its rows | Must |
 | --- | --- |
-| Walls: its tools are only its kind's; nothing in the workspace loads; no read outside, of the store, the pins, the key or another session's transcript; the guard refuses a `.env` read and write; no write outside, nor into the sessions' home, by a file tool or Bash; Bash reaches no unlisted host and no inbox socket; every name in Bash's environment that looks like a key is proven useless in the same run | PASS |
-| Work: the instructions arrive; reads, searches and writes inside work; Bash writes its workspace and temp folder; `git status` and a commit; a listed host is reached | WORKS, or the lane cannot move |
+| Walls: its tools are only its kind's; nothing in the workspace loads; no read outside, of the store, the pins, the key, the push token's file or another session's transcript; the guard refuses a `.env` read and write; no write outside, nor into the sessions' home, by a file tool or Bash; Bash reaches no unlisted host and no inbox socket; every name in Bash's environment that looks like a key is proven useless in the same run; `push-token`, one row a kind: the token present by name for code, fix and conflict, absent for the rest; in acceptance, git's stored helpers hand it no GitHub password; in a push kind, the guard refuses a push to main, a bare force push and a merge | PASS |
+| Work: the instructions arrive; reads, searches and writes inside work; Bash writes its workspace and temp folder; `git status` and a commit; a listed host is reached; in a push kind, git's helper hands git the push token | WORKS, or the lane cannot move |
 | Facts: whether the code host's command-line tool, Python and git each get through TLS in the sandbox, and whether the program reads a `.env` in its working folder | recorded |
 
 **What else is in Bash's environment.** The program and its built-in sandbox add names the runner
@@ -312,9 +355,9 @@ program keeps from Bash (`bash-token` says whether it did).
 
 **No kind needs `gh` in a session.** `gh` fails TLS inside the built-in sandbox (`x509: OSStatus
 -26276`, measured 18 Nov 2026): the sandbox keeps the system's trust service from it, and the fix is
-not a wider network. A coding session will push with git and open its pull request through the kit's
-plain HTTPS fallback, `scripts/gh_fallback.py`, once it has a GitHub credential (see "The coding
-lane"). The probe measures the TLS of both, so the `gh` row stays information.
+not a wider network. A coding session pushes with git and opens its pull request through the kit's
+plain HTTPS fallback, `scripts/gh_fallback.py`, with the push token (see "The push token"). The
+probe measures the TLS of both, so the `gh` row stays information.
 
 Before any session, the probe asks the program for its version and its help. If the help lacks an
 option the command line uses, the probe stops and names it: a program that meets an unknown option
@@ -384,20 +427,17 @@ setting switches a project, and setting it back to false switches it back.
    pin beside the lane marker: its rules are added to the lane's, which still hold (contract
    section 3). That guard change is the owner's to apply, as every hook change is.
 5. **The session uses its five tools** for its ticket, and has no other way to write to the tracker.
+   It pushes its branch and opens its pull request with the push token (see "The push token").
 6. **The bridge reads the answer** each pass. A start gets the comment naming who approved it. A
    refusal ends the bridge's pass loud once, in the runner's words. So does a request with no
    answer in 30 minutes. A ticket refused for one approval is asked again only on a newer one.
 
-To switch a project on, the runner's settings need `session_tools` and `queue_config`, and the
-bridge's `runner_lane` names the repository's runner project. The fix driver's own setting sends
-its fixes to the runner (KIT-765).
+To switch a project on, the runner's settings need `session_tools`, `queue_config` and
+`push_token_file`, and the bridge's `runner_lane` names the repository's runner project. The fix
+driver's own setting sends its fixes to the runner (KIT-765).
 
 **Not on this lane yet.**
 
-- **Its pull request.** A session holds no GitHub credential yet: the adapter has no source for one.
-  So a code session can commit but not push or open its pull request. The next piece (KIT-886)
-  gives code, fix and conflict runs the dispatcher's push token, read by the runner from a file no
-  session can read. The lane's first live run waits on it.
 - **The tech lead's own start.** On a switched project, the tech lead refuses `start` and `retry`
   in Slack, in words, and the queue lets go of a piece the plan's limit stopped. The runner starts
   a ticket only on its approver's move. The runner's own way to start, retry and resume a piece
@@ -407,6 +447,42 @@ Good: the owner moves ENG-12 into Todo on a switched project. The queue asks the
 moves to In Progress as the session writer, and the session's comments come through its own tools.
 Not: the owner types `start ENG-12` in Slack on a switched project. The tech lead says to move it
 into Todo instead, and nothing is handed to the old dispatcher.
+
+## The planning lane
+
+The planner job (`scripts/pipeline_plan_poller.py`) is the first caller (KIT-705). When the owner
+moves an idea to Plan it, the planner asks the runner for one `plan` start on the idea itself.
+
+- **The switch is the runner's.** A repository plans here when `lanes.plan` is on for the runner's
+  project whose committed `delivery.json` names it. The planner's `runner_settings`
+  (`RUNNER_SETTINGS` in `stage-a.conf`) only says where this file is. Empty, every repository plans
+  on the old dispatcher.
+- **No planning ticket, no routing label.** The request names the idea. Its text opens with three
+  lines, `Planning-run trigger:`, `Idea:` and `Repository:`, then any earlier attempts and the
+  owner's note. The session gets that text and the idea, each fenced as data.
+- **The owner's move still decides.** The runner checks the idea's own history for his newest move
+  into an approved plan state. So the team's Plan it state must be in the project's
+  `approval_states.plan`. Until it is, the planner starts nothing on this lane, and says why.
+- **The same plan document.** The session ends with the one fenced block it always did. The
+  planner reads the run's record and final message, then runs the plan executor unchanged, pinned
+  to the idea. The plan's receipt names the idea.
+- **Notes and pages land on the idea.** Nothing is moved, because no ticket was made.
+- **The caps count from the store.** A day's runs and re-runs are the planner's own requests here,
+  added to the old lane's. A store the planner cannot read starts nothing.
+- **Past the planner's time-out,** a request still waiting is taken back, and a run still going is
+  asked to stop, once. A request the runner refuses ends the attempt with the runner's reason.
+
+The old lane's probe sign-off, its version check and its routing stop do not hold this lane:
+nothing here is routed. Settings the planner cannot read start nothing on either lane.
+
+**The way back.** Turn `lanes.plan` off. A run already asked finishes on the runner, and the planner
+still reads it back. Empty `RUNNER_SETTINGS` only once no run there is in flight: the day's caps
+still count the runner's runs from the planner's own records, but a run whose record was lost is
+found again only through the store.
+
+Good: `"lanes": {"plan": true}` for the drill repository. Its next idea becomes one plan run, and
+the plan lands on the idea.
+Not: a planning ticket for that idea on the work team. On this lane none is made.
 
 ## Settings
 
@@ -424,6 +500,7 @@ One JSON file, which the installer writes from `runner.conf` (see "Installing it
 | `guarded_model` | The model for a review whose request says `guarded`: a change to a guarded path (KIT-418, KIT-644). | `opus` |
 | `token_env` | The NAME of the variable that holds the sign-in token. | `CLAUDE_WRITER_OAUTH_TOKEN` |
 | `linear_key_file` | The tracker key, in a file of this account's, mode 0600. | required |
+| `push_token_file` | The sessions' push token: one GitHub token, in a file of this account's, mode 0600, outside the work and home folders and every git working tree. See "The push token". No code, fix or conflict lane may be on without it. | none |
 | `owner_user_ids` | The owner's tracker user ids. Only his moves approve. | required |
 | `dispatcher_user_ids` | The old dispatcher's own users. Never an approver. | required |
 | `poll_seconds` | Time between passes. | `5` |
@@ -532,7 +609,7 @@ Each refusal says why, in the request's answer (`<store_dir>/taken/<id>.json`).
 | the queue's judge does not admit ENG-12 (a reason) | The judge's own reason, from the queue's pool: the owner moves it, or it is not ready. |
 | the queue's judge admitted ENG-12 by its limits, with no named approver | An agent-filed finding: the owner's move into the ready state starts it. |
 | the ticket could not be moved to its working state | Nothing to do: nothing was made, the request waits, and the next pass tries again. |
-| a code lane that is on needs session_tools, or queue_config | Settings: set both before switching a project's code lane on. |
+| a code lane that is on needs session_tools, queue_config or push_token_file | Settings: set all three before switching a project's code lane on. |
 | `<ticket>` was not coded by a code run of this runner's | The ticket's coding ran on the old dispatcher, so no approval is recorded for its review. Review it by hand, or move its project's coding to the runner first. |
 | a review's start says its tier | The review job's request said neither `standard` nor `guarded`: a fault in that job. |
 | a workspace is there already | For a code start: the ticket's earlier code run keeps its workspace for its fixes, so remove it before a new start. For a review, plan or acceptance start: no run of the runner's left that folder, so it is never removed for you. Look at what it is first. |
@@ -540,6 +617,7 @@ Each refusal says why, in the request's answer (`<store_dir>/taken/<id>.json`).
 | the project has no committed delivery.json | The project is not set up for the pipeline. |
 | `<name>` is not set | The sign-in token's variable is missing from the job's environment. |
 | the tracker could not be read | Nothing to do: the request waits, and the next pass tries again. |
+| the push token file could not be read, can be read by others, or does not hold one GitHub token | Fix the file `push_token_file` names: this account's, mode 0600, one GitHub token. The request waits and starts on a later pass. |
 | the machine is below its floor | Free disk or memory. The request waits; it starts when there is room. |
 | the workspace's `.env` names a variable the program reads | Take the variable out of that file, or out of the project's committed copy. |
 | the engine's folder could be changed by this account | The runner runs from its own copy of the kit, owned by root. The request waits until it does. |
@@ -557,6 +635,9 @@ The runner refuses to start from inside a Claude session, or as root.
   as an error result or as the last line of its errors. The tech lead's turn relies on the same
   words. The selftest's stand-in prints them. One live check is owed.
 - That one sign-in serves the runner and the tech lead together (KIT-629).
+- That a real push signs in with the push token from inside the built-in sandbox. The adapter's
+  selftest runs git's own `git credential fill` against its helper, and the probe asks it as the
+  role account. The first live run (KIT-882) pushes for real, after the owner re-runs the probe.
 - Each kind's walls as the role account: the probe above has not been run live yet. Until it
   passes, no real session goes through the runner. It also measures what is still open here: that
   sandboxed Bash may write its temp folder, that a commit works in a workspace whose git folder sits
@@ -578,3 +659,6 @@ The runner refuses to start from inside a Claude session, or as root.
 - How the owner's answer to a session's question reaches the work again on this lane. The
   notifier pages the question as today. Taking the answer back to the session by resume is
   KIT-707's.
+- That a plan run through the runner files a plan live. The planner's selftest runs every case on
+  both lanes against a stand-in runner over a real store. The first live run is its own ticket
+  (KIT-887), once the runner is installed.

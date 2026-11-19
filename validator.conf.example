@@ -1,0 +1,60 @@
+# The validator's install: its job, under your own login, with every switch off (KIT-547).
+# Guide: docs/VALIDATOR-OPERATOR.md, "Install it".
+#
+#   cp validator.conf.example validator.conf && chmod 600 validator.conf
+#   $EDITOR validator.conf                                    # the watcher's two paths, at least
+#   python3 scripts/pipeline_validator_setup.py run --dry-run # read it first: changes nothing
+#   python3 scripts/pipeline_validator_setup.py run           # shows, asks one typed yes, applies
+#
+# It makes no account and asks for no Mac password: everything it writes is yours, in your own
+# home. It writes ~/.validator/settings.json ONCE, when it is absent, with every switch off. It
+# never writes that file again, so no update can turn a switch on. The switches are yours to turn
+# on, one at a time (the guide, section 1).
+#
+# No value here is a secret. Credentials are named, never given: the keys go in ENV_FILE, which
+# you write, and the app's key stays in APP_KEY_FILE, which this installer never opens. A value
+# shaped like a credential is refused, and every bad value is listed in one pass.
+
+# The job: one LaunchAgent under your login. A reverse-DNS label, and how often a pass runs, in
+# seconds (60 to 3600).
+JOB_LABEL=local.validator
+INTERVAL_SECONDS=300
+
+# The file the job reads its keys from, before each pass: mode 600, yours, outside every
+# repository. Two lines, NAME=value, the names below (card CK-V2 says how to write it).
+ENV_FILE=~/.validator/env
+# A READ-ONLY tracker key's NAME, which the facts read the tickets with. Empty: the tracker is not
+# read, every fact from it is said as unread, and nothing is approved.
+LINEAR_KEY_ENV=VALIDATOR_LINEAR_API_KEY
+# A `claude setup-token` token's NAME, for the agent's run.
+AGENT_TOKEN_ENV=CLAUDE_WRITER_OAUTH_TOKEN
+
+# The validator's own app key, as scripts/pipeline_validator_app.py wrote it. Read by `openssl`
+# in the job only; this installer checks its mode and never opens it. The app's id is read from
+# that script's own record (~/.validator-app/state.json).
+APP_KEY_FILE=~/.validator/app.pem
+
+# The ledger: one row per decision, written only by the job. The watcher and the stand-up read it
+# from their own accounts, so name a folder they can reach (the guide, "Who else reads the
+# ledger"). A folder of its own that is not there yet is made, mode 755.
+LEDGER_FILE=~/.validator/ledger.json
+
+# The watcher's hold and its status file, as the watcher's own install placed them
+# (watcher.conf's STATE_DIR). Both are required: a hold the job cannot read holds every pass.
+HOLD_FILE=/var/claw-watcher/hold.json
+WATCHER_STATUS=/var/claw-watcher/watcher-status.json
+
+# Programs the job runs, by full path: a scheduled job's PATH is short. Empty for the claude and
+# gh CLIs: the one `command -v` finds in your shell, written into the job as a full path.
+PYTHON=/usr/bin/python3
+AGENT_BIN=
+GH_BIN=
+
+# The facts' other sources (docs/VALIDATOR-OPERATOR.md, section 8). Absolute paths, or empty for
+# none: every fact from an empty one is said as unread, and the pull request waits.
+# TEAM_KEYS: the work teams a pull request's ticket may belong to, comma-separated keys.
+TEAM_KEYS=
+QUEUE_CONFIG=
+STAGE_E_LEDGER=
+SNAPSHOT_DIR=
+ACCEPTANCE_LEDGER=

@@ -327,8 +327,9 @@ the bridge asks about the idea in every case, and says which ticket you named. I
 Good: *You named PROD-71, a piece of plan PROD-70, made from idea PROD-6.*
 
 A plan or a piece leads back to its idea only through tickets your own key filed: the plan's
-`Plan id:` line, its planning run, and the piece's place under the plan. A replan reached
-that way always asks, even with direct asks on.
+`Plan id:` line, its planning run, and the piece's place under the plan. On our own runner's
+lane there is no planning run: the `Plan id:` line names the idea itself (KIT-705). A replan
+reached that way always asks, even with direct asks on.
 
 To tell the next run something, add a note in your direct messages with the bridge. Put it
 after `note:`, and send one idea at a time. The question shows your note word for word, as
