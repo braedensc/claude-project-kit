@@ -2618,6 +2618,9 @@ def main():
         ("API merge: curl -sT blocked (an upload is a PUT, with no method flag)",
          bash("curl -sT body.json https://api.github.com/repos/o/r/pulls/7/merge"),
          BLOCK, HOOK),
+        ("API merge: wget --method=PUT to the merge endpoint blocked",
+         bash('wget --method=PUT --header "Authorization: bearer $T" '
+              "https://api.github.com/repos/o/r/pulls/7/merge"), BLOCK, HOOK),
         ("API merge: curl POST of a GraphQL mergePullRequest blocked",
          bash("curl -X POST https://api.github.com/graphql -d '{\"query\":\"mutation { "
               'mergePullRequest(input: {pullRequestId: \\"x\\"}) { clientMutationId } }"}\''),
@@ -2633,6 +2636,11 @@ def main():
         ("API read: curl GET of the merge endpoint allowed",
          bash('curl -sf -H "Authorization: bearer $T" '
               "https://api.github.com/repos/o/r/pulls/7/merge"), ALLOW, HOOK),
+        # -T is an upload (a PUT) only to curl: wget's -T is a timeout, so a wget read
+        # of the merge state with a timeout stays allowed.
+        ("API read: wget -T (a timeout) GET of the merge endpoint allowed",
+         bash("wget -q -T 10 -O - https://api.github.com/repos/o/r/pulls/7/merge"),
+         ALLOW, HOOK),
         ("API read: a commit's check runs allowed",
          bash("gh api repos/o/r/commits/abc123/check-runs --jq '.check_runs[].conclusion'"),
          ALLOW, HOOK),
