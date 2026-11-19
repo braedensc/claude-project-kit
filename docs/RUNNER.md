@@ -279,6 +279,24 @@ today. Taking the token out of sessions, with the runner pushing for them, is KI
 - **Where it lives.** One file, named by `push_token_file`. It is the role account's own, mode
   0600, and holds one GitHub token and nothing else. The runner refuses it inside the work or home
   folder, or inside a git working tree.
+- **How it gets there (KIT-907).** The installer owns the setting: `PUSH_TOKEN_FILE` in `runner.conf`
+  (unset, it is `push-token` in `RUNNER_DIR`). The file is made by one step, run by a person at a
+  terminal and refused inside a Claude session:
+
+      python3 scripts/pipeline_runner_setup.py push-token
+
+  Make the token on the code host first, with an end date. The step asks for the token at a hidden
+  prompt, then for the day it ends (`YYYY-MM-DD`, after today and within five years). It judges both
+  before it asks for your password. Then the role account writes the file, mode 0600, and the date is
+  filed in the health watch's `CREDENTIAL_EXPIRIES` as `runner-push-token`, which is where its yearly
+  credential warning reads it. The token goes to the role account on standard input only: it is in no
+  command line, no output and no log. Run it again to replace a token: the new date takes the old one's
+  place. A token that never ends gets the day you will review it, so the warning still comes.
+- **Its end date.** The parts list records the token as a stored key that ends when it was made
+  (`pipeline-parts.json`), so `pipeline_watch.py dates` lists it, `missing` until a date is on record.
+  The runner's `check` has a `push-token` row. A token file with no end date on record is NOT MEASURED,
+  never current. An ended token, a file others can read and a link are FAILED. No file yet is no fault
+  while no code, fix or conflict lane is on.
 - **Who reads it.** The runner, at each start or resume of a code, fix or conflict run, and never
   for another kind. A file it cannot read, or one that holds anything but one GitHub token, holds the
   request. The answer says why, never what the file holds.
@@ -523,7 +541,7 @@ One JSON file, which the installer writes from `runner.conf` (see "Installing it
 | `guarded_model` | The model for a review whose request says `guarded`: a change to a guarded path (KIT-418, KIT-644). | `opus` |
 | `token_env` | The NAME of the variable that holds the sign-in token. | `CLAUDE_WRITER_OAUTH_TOKEN` |
 | `linear_key_file` | The tracker key, in a file of this account's, mode 0600. | required |
-| `push_token_file` | The sessions' push token: one GitHub token, in a file of this account's, mode 0600, outside the work and home folders and every git working tree. See "The push token". No code, fix or conflict lane may be on without it. | none |
+| `push_token_file` | The sessions' push token: one GitHub token, in a file of this account's, mode 0600, outside the work and home folders and every git working tree. The installer writes it from `PUSH_TOKEN_FILE`, and `push-token` makes the file. See "The push token". No code, fix or conflict lane may be on without it. | `<RUNNER_DIR>/push-token` |
 | `owner_user_ids` | The owner's tracker user ids. Only his moves approve. | required |
 | `dispatcher_user_ids` | The old dispatcher's own users. Never an approver. | required |
 | `poll_seconds` | Time between passes. | `5` |
@@ -570,9 +588,10 @@ installer also runs alone:
 ```bash
 python3 scripts/pipeline_runner_setup.py check          # reads, changes nothing, asks nothing
 echo '{"schema": "runner-answers/1", "consent": "yes"}' | python3 scripts/pipeline_runner_setup.py apply
+python3 scripts/pipeline_runner_setup.py push-token     # the owner's step: the push token and its end date
 ```
 
-Each prints one JSON document of rows on standard output (`runner-setup-rows/1`), whatever its exit,
+`check` and `apply` print one JSON document of rows on standard output (`runner-setup-rows/1`), whatever its exit,
 and every word for a person on standard error, as the notifier's installer does.
 
 - **Every lane off.** It writes `<RUNNER_DIR>/runner.json` as the role account, and gives a new

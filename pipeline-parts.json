@@ -2416,6 +2416,14 @@
           "ends": "one-year",
           "clock": "claude-writer-token",
           "date_from": "The day you made it with `claude setup-token`, plus one year."
+        },
+        {
+          "key": "PUSH_TOKEN_FILE",
+          "default_name": "PUSH_TOKEN_FILE",
+          "what": "The sessions' push token, in a file of the pipeline's account, by the setting that names the file.",
+          "ends": "set-when-made",
+          "clock": "runner-push-token",
+          "date_from": "The expiry date you chose when you made the token; the push-token step asks for it and records it."
         }
       ],
       "jobs": [
@@ -2442,7 +2450,14 @@
           "watched_by": "not-watched"
         }
       ],
-      "person_steps": [],
+      "person_steps": [
+        {
+          "card": null,
+          "card_in": null,
+          "kind": "only-a-person",
+          "words": "Make the sessions' push token on the code host with an end date, then run `python3 scripts/pipeline_runner_setup.py push-token` in a terminal and give it the token and the end date at its prompts."
+        }
+      ],
       "ceiling": 0,
       "consent": [
         "Installs an always-on job under the pipeline's account that starts the sessions the pipeline asks for, each held to its ticket's budget.",
