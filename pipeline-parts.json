@@ -79,22 +79,25 @@
       "id": "kit-checks",
       "name": "Checks on every pull request, and nothing merges red",
       "internal_name": "kit CI and branch protection",
-      "does": "Runs every test battery and the secret scan on each pull request, and fails a stacked one. Branch protection makes the required checks block a merge.",
+      "does": "Runs every test battery and the secret scan on each pull request, and fails a stacked one. Branch protection makes the required checks block a merge, and asks for a pull request, so nothing is pushed straight to main.",
       "scope": "project",
       "state": "live",
       "needs": [],
-      "scripts": [],
+      "scripts": [
+        "scripts/pipeline_branch_rule.py"
+      ],
       "installer": null,
       "check": null,
       "apply": null,
-      "no_command_reason": "The workflows are committed. Branch protection is a setting in the code host, set by hand.",
+      "no_command_reason": "The workflows are committed. Branch protection is a setting in the code host: a person sets its required checks, then runs scripts/pipeline_branch_rule.py with the repository's name to add the pull request setting, so no fixed command fits here.",
       "restarts": [],
       "settings": {
         "file": "branch protection",
         "example": "docs/examples/protection.json",
         "keys": [
           "required_status_checks",
-          "enforce_admins"
+          "enforce_admins",
+          "required_pull_request_reviews"
         ]
       },
       "secrets": [],
@@ -105,11 +108,17 @@
           "card_in": null,
           "kind": "only-a-person",
           "words": "Turn on branch protection for main, with the required checks and admins included."
+        },
+        {
+          "card": null,
+          "card_in": null,
+          "kind": "only-a-person",
+          "words": "Run python3 scripts/pipeline_branch_rule.py run --repo OWNER/NAME and type yes, so main also asks for a pull request. Its check mode reads it back."
         }
       ],
       "ceiling": null,
       "consent": [
-        "Never changes branch protection: a person sets it in the code host."
+        "Never changes branch protection: a person sets it in the code host, by hand or with its own script."
       ],
       "docs": {
         "guide": "docs/TESTING.md",

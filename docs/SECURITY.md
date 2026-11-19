@@ -280,6 +280,27 @@ is one setting: require a review, and do not count one from the pull request's o
 Until then this row promises an adopter a team's layer, and an adopter running solo
 inherits the three controls above instead. KIT-87 holds the decision and the measurement.
 
+**Which layer stops a direct push, and which stops a merge by a session's token (KIT-911).**
+These are two ways onto `main`, and different layers stop them.
+
+- **A direct push:** a commit pushed straight to `main`, with no pull request. The hook's
+  push guard is the first line, and it is advisory. The durable layer is main's branch rule
+  with *Require a pull request before merging* on, admins included. GitHub then refuses every
+  push to `main`, the owner's own included, so a change arrives only as a merged pull request.
+  The required checks alone never did this. They decide *what* may merge, so a commit whose
+  checks were already green could be pushed straight in. `scripts/pipeline_branch_rule.py` is
+  the owner's step that turns the setting on, after one typed yes. First it lists the last 30
+  days of commits that skipped a pull request. It keeps the required checks and admin
+  enforcement as they are, and asks for no approving review, for the solo reason above. Its
+  `check` mode reads the rule back and says ON, OFF or UNKNOWN. With the setting on,
+  `GET /branches/main/protection` shows `required_pull_request_reviews` with a count of 0:
+  a pull request, and still no review.
+- **A merge by a session's token:** a pull request merged through the API, with the token a
+  session holds. Branch protection does not stop this: once the checks are green, any token
+  that can push may merge. The never-merge guard is the first line, and it is advisory. The
+  durable layer is taking the owner's token out of the session (KIT-37), so that a session's
+  merge carries an identity a rule can refuse. Until then, nothing durable stops it.
+
 **Not measured (out of scope, KIT-36 step 1):** the Bash arm of *self-protection*
 (`_SELF_MUTATE_RE`) is built from the same regex scaffold and should be assumed to share
 the weakness; its Edit/Write arm is a `realpath` comparison and does not. The guarantee
