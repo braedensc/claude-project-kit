@@ -1,0 +1,25 @@
+# runner.conf.example — what the runner's installer reads (docs/RUNNER.md, "Installing it").
+#   cp runner.conf.example runner.conf && chmod 600 runner.conf; edit it; none of it is secret
+#   python3 scripts/pipeline_runner_setup.py check     # read it first; the one command runs `apply`
+# Runs beside an EXISTING Stage E install, from its clone. KEY=value, parsed never sourced; no key holds a
+# credential. `~` is the ROLE ACCOUNT's home. Every fault is reported at once, by key and never by value.
+# The installer writes every lane off for every project. Switching one on is your yes, per project.
+
+ROLE_ACCOUNT=_exrunner
+ROLE_KIT_CLONE=~/.stage-e/kit
+ENV_FILE=~/.stage-e/env
+JOB_LABEL=local.pipeline-runner
+
+# The runner's own folder: its settings (runner.json), log, store, workspaces, the sessions' home, and
+# tracker-key, a file of the role account's (mode 0600) that holds the tracker key once a lane is on.
+RUNNER_DIR=~/.pipeline-runner
+# The claude program's full path, and the NAME of the variable in ENV_FILE that holds its sign-in token.
+CLAUDE_BIN=/opt/homebrew/bin/claude
+TOKEN_ENV=CLAUDE_WRITER_OAUTH_TOKEN
+
+# Tracker user ids: the owner's, and the old dispatcher's own users (which never approve).
+OWNER_USER_IDS=owner-user-id-1
+DISPATCHER_USER_IDS=dispatcher-user-id-1
+
+# Each project: KEY=PATH@BASE. A lower-case key, the runner's own clone of it, and its base branch.
+PROJECTS=app=~/repos/app@main
