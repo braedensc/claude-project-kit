@@ -225,7 +225,9 @@ telemetry row are judged against. `session-kinds/` counts too: the runner reads 
 session's walls from it when it starts (KIT-880). They include the notifier's and the Slack bridge's files
 on a machine that runs that job. A job's own data counts the same way, only where that job is
 installed (KIT-889): `.claude/hooks/` where the runner runs, since its guard runs the kit's guards
-from the clone on every tool call, and `templates/sandbox/look.sb` where the acceptance job runs. A merge that touched none of them — a doc, an ADR,
+on every tool call, and `templates/sandbox/look.sb` where the acceptance job runs. The runner runs
+from a root-owned copy of the clone's commit, which its own installer refreshes after the clone moves
+(KIT-919, docs/RUNNER.md). A merge that touched none of them — a doc, an ADR,
 another project's script, a bridge file on a machine with no bridge — leaves `verify` at
 `ALREADY-DONE`, naming both commits. If the list of jobs cannot be read, every job's files
 count. `run`

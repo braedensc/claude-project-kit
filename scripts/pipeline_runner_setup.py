@@ -11,9 +11,9 @@ Both print one JSON document of rows on stdout, on every exit, and every human w
 notifier's installer does (KIT-850). `check` reads and changes nothing. It asks nothing: every sudo
 call is `sudo -n`, so with no live sudo session, or under a model, a row that needs one says UNKNOWN,
 never current. Its rows: the role account's home; the kit the job runs (the clone's commit, the
-runner's scripts level with this checkout); the root-owned copy the job runs from; the runner's settings
-as installed, with each project's lanes; and the job (its file, whether it starts at boot, what launchd
-runs).
+runner's scripts level with this checkout); the runner's settings as installed, with each project's
+lanes; the root-owned copy the job runs from; and the job (its file, whether it starts at boot, what
+launchd runs).
 
 `apply` is refused under a model before it reads anything. Its answers come through a pipe from the
 program that runs it, never a terminal, a file or an argument: {"schema": "runner-answers/1",
@@ -43,10 +43,12 @@ file by file with that commit's tree, and runs the runner's own check of the cop
 for you. `apply` makes or refreshes it, and nothing else does: the files come from this checkout's own git
 objects at that commit, never from the role's clone, and only a commit on origin/main is copied. A root
 program writes them beside the old copy and swaps the two, and the copy is read back. It never moves back
-to an older commit.
+to an older commit. A job that runs from the copy is stopped before the swap: the `job` row loads it again,
+and a refresh that fails loads it again at once.
 
-ITS JOB.  One LaunchDaemon as the role account, kept alive, running the runner from the copy, which the
-clone's move does not touch. The file says Disabled, so the file alone
+ITS JOB.  One LaunchDaemon as the role account, kept alive, running the runner from the copy. Stage E's
+`run` finds it there, stops it around the clone's move and loads it again; the copy moves only with `apply`
+here. The file says Disabled, so the file alone
 never starts at boot: only `launchctl enable` does. The command ends with a shell comment naming the
 clone's commit, so a moved clone is a changed job, and launchd's own copy says which kit it runs.
 
@@ -783,17 +785,54 @@ def step_engine(ctx, apply_it):
     current, words, tree = engine_state(ctx)
     if current or not apply_it:
         return current, words if current else "would copy kit %s there as root: %s" % (ctx.commit[:12], words)
-    res = ctx.as_root(["/usr/bin/python3", "-I", "-c", ENGINE_PY, dest, "0", "0", ctx.commit],
-                      "copying kit %s to %s" % (ctx.commit[:12], dest), why="copy kit %s to %s, root's"
-                      % (ctx.commit[:12], dest), stdin=kit_tar(os.path.dirname(ctx.scripts), tree), timeout=ENGINE_TIMEOUT)
-    last = ((res.out or "").strip().splitlines() or [""])[-1]
-    if not res.ok or last != "copied %s %d" % (ctx.commit, len(tree)):
-        raise SetupError("could not copy kit %s to %s as root (exit %d): %s" % (
-            ctx.commit[:12], dest, res.rc, _s(last or (res.err or "").strip())[:200] or "it said nothing"))
-    again, words, _tree = engine_state(ctx)
-    if not again:
-        raise SetupError("copied kit %s to %s, and reading it back does not match: %s" % (ctx.commit[:12], dest, words))
-    return False, "copied as root, then read back: %s" % words
+    body = kit_tar(os.path.dirname(ctx.scripts), tree)
+    stopped = stop_for_swap(ctx, dest)
+    try:
+        res = ctx.as_root(["/usr/bin/python3", "-I", "-c", ENGINE_PY, dest, "0", "0", ctx.commit],
+                          "copying kit %s to %s" % (ctx.commit[:12], dest), why="copy kit %s to %s, root's"
+                          % (ctx.commit[:12], dest), stdin=body, timeout=ENGINE_TIMEOUT)
+        last = ((res.out or "").strip().splitlines() or [""])[-1]
+        if not res.ok or last != "copied %s %d" % (ctx.commit, len(tree)):
+            raise SetupError("could not copy kit %s to %s as root (exit %d): %s" % (
+                ctx.commit[:12], dest, res.rc, _s(last or (res.err or "").strip())[:200] or "it said nothing"))
+        again, words, _tree = engine_state(ctx)
+        if not again:
+            raise SetupError("copied kit %s to %s, and reading it back does not match: %s"
+                             % (ctx.commit[:12], dest, words))
+    except SetupError as exc:           # never leave the runner stopped for a refresh that did not happen
+        if stopped:
+            raise SetupError("%s; %s" % (load_again(ctx), exc))       # the job's state first, then why
+        raise
+    except Unknown as exc:
+        if stopped:
+            raise Unknown("%s; %s" % (load_again(ctx), exc.what), exc.remedy)
+        raise
+    return False, "copied as root, then read back: %s%s" % (
+        words, "; its job was stopped for the swap, and the `job` row loads it again" if stopped else "")
+
+
+def stop_for_swap(ctx, dest):
+    """Stop the runner's job before its copy is swapped, when launchd runs it from that copy: a late import, or the
+    guard a running session starts for a tool call, never comes from a copy half moved. True when it stopped it."""
+    label = ctx.conf["JOB_LABEL"]
+    up, args = loaded(ctx, label)
+    if not (up and any(dest + "/scripts/" in str(a) for a in args or ())):
+        return False
+    res = ctx.as_root(["launchctl", "bootout", "system/" + label], "stopping system/" + label,
+                      why="stop system/%s while its copy is swapped" % label)
+    if not (res.ok and se._wait_until_gone(ctx.runner, label, 60)[0]):
+        raise SetupError("could not stop system/%s before its copy is swapped (exit %d): nothing was swapped"
+                         % (label, res.rc))
+    return True
+
+
+def load_again(ctx):
+    """Load the runner's job again, as its file is, after a refresh that failed: words that say what happened."""
+    label = ctx.conf["JOB_LABEL"]
+    res = ctx.as_root(["launchctl", "bootstrap", "system", se._dispatcher_plist(label)], "loading system/" + label,
+                      why="load system/%s again" % label)
+    return ("its job, stopped for the swap, was loaded again" if res.ok else
+            "its job, stopped for the swap, could NOT be loaded again (exit %d): run `apply` again" % res.rc)
 
 
 def first_pass(ctx):
@@ -1118,7 +1157,8 @@ def step_job(ctx, apply_it):
     return False, "did: %s; now: %s" % (", ".join(todo), now)
 
 
-STEPS = (("home", step_home), ("kit", step_kit), ("engine", step_engine), ("settings", step_settings),
+# The copy comes right before the job: a refresh stops a job that runs from it, and the `job` row loads it again.
+STEPS = (("home", step_home), ("kit", step_kit), ("settings", step_settings), ("engine", step_engine),
          ("job", step_job), ("push-token", step_push_token))
 _SEVERITY = (FAILED, UNKNOWN, WOULD_CHANGE)
 
@@ -2211,9 +2251,9 @@ def _cases(check, tmp, unsafe):  # noqa: C901  (one battery, read top to bottom)
         fake = world()
         fake.commit("not reviewed", reviewed=False)
         code, doc, _err, _left = go(fake, "apply")
-        return code, rows(doc)["engine"], os.path.lexists(fake.engine), settings(fake)
-    case("only a commit on origin/main is copied: another fails at `engine`, and nothing is written", reviewed_only,
-         (1, FAILED, False, None),
+        return code, rows(doc)["engine"], os.path.lexists(fake.engine), job(fake)
+    case("only a commit on origin/main is copied: another fails at `engine`, no copy is made and no job loaded",
+         reviewed_only, (1, FAILED, False, (False, False, False, None)),
          ("any commit copied", [(me, "_git", lambda checkout, args, stdin=None, real=_git: (0, b"") if args[:2] == [
              "merge-base", "--is-ancestor"] else real(checkout, args, stdin))]))
 
@@ -2293,6 +2333,44 @@ def _cases(check, tmp, unsafe):  # noqa: C901  (one battery, read top to bottom)
          (0, True, None, 0, None, ALREADY_DONE),
          ("an installed off refilled with the default", [(me, "push_path", lambda c, was: None if c[
              "PUSH_TOKEN_FILE"] == OFF else c["PUSH_TOKEN_FILE"])]))
+
+    # The real runner's byte path, the one that hands the copy's files to root: bytes in, its exit and its words
+    # back, run from `/` (Stage E review).
+    def bytes_through():
+        real = Runner()
+        echoed = real._exec(["/bin/sh", "-c", "cat; pwd"], b"tar\x00bytes\n", 30)
+        failed = real._exec(["/bin/sh", "-c", "cat >/dev/null; echo no >&2; exit 3"], b"x", 30)
+        return echoed.rc, echoed.out, failed.rc, failed.err
+    case("the real runner hands bytes to a program and reads back its exit and words, from /", bytes_through,
+         (0, "tar\x00bytes\n/\n", 3, "no\n"),
+         ("bytes sent as text", [(Runner, "_exec", lambda self, argv, stdin, timeout, cwd=None:
+                                  se.Runner._exec(self, argv, stdin, timeout, cwd=cwd))]))
+
+    # A refresh never swaps the copy under a job that runs from it (Stage E review).
+    def swap_stopped():
+        fake = world()
+        go(fake, "apply")                                          # the job, loaded, runs from the copy
+        fake.commit("second")
+        del fake.sudo[:]
+        code = go(fake, "apply")[0]
+        stop = [i for i, a in enumerate(fake.sudo) if a[2:4] == ["launchctl", "bootout"]]
+        copy = [i for i, a in enumerate(fake.sudo) if a[2] == "/usr/bin/python3"]
+        return code, bool(stop and copy and stop[0] < copy[0]), job(fake)[2:] == (True, head(fake))
+    case("a refresh stops the job that runs from the copy before the swap, and the `job` row loads it again",
+         swap_stopped, (0, True, True), ("swapped under a running job", [(me, "stop_for_swap", lambda ctx, dest: False)]))
+
+    def swap_failed():
+        fake = world()
+        go(fake, "apply")
+        fake.commit("second")
+        os.chmod(fake.root + "/engine", 0o777)                     # the root program refuses this folder
+        try:
+            code, doc, _err, _left = go(fake, "apply")
+        finally:
+            os.chmod(fake.root + "/engine", 0o755)
+        return code, rows(doc)["engine"], "was loaded again" in said(doc), job(fake)[2]
+    case("a refresh that fails after the job was stopped loads the job again at once, and says so", swap_failed,
+         (1, FAILED, True, True), ("left stopped", [(me, "load_again", lambda ctx: "not loaded")]))
 
 
 if __name__ == "__main__":

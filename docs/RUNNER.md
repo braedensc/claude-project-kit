@@ -633,11 +633,13 @@ and every word for a person on standard error, as the notifier's installer does.
   - Only a commit on `origin/main` is copied, and the copy never moves back to an older commit.
   - A small root program writes the files beside the old copy and swaps the two. Then the copy is read
     back. A copy that cannot be read is NOT MEASURED, never current.
+  - A job that runs from the copy is stopped before the swap, so no session's guard comes from a copy
+    half moved. The `job` row loads it again. A refresh that fails loads it again at once, and says so.
 - **Its job.** One LaunchDaemon as the role account, kept alive, running the runner from its copy of the
-  kit. A move of Stage E's clone does not touch the copy, so Stage E's `run` no longer stops the job.
-  After the copy is refreshed, `apply` loads the job again. The job file says
-  `Disabled`, so it starts at boot only after `launchctl enable`, which only an install that switches
-  it on runs.
+  kit. Stage E's `run` finds it there, stops it around a move of the clone and loads it again, still
+  on the old copy. The copy moves only with this installer's `apply`, which then loads the job again.
+  The job file says `Disabled`, so it starts at boot only after `launchctl enable`, which only an
+  install that switches it on runs.
 - **Its switch and its ceiling.** `enabled` is the part's own switch. Once installed it is kept: on
   stays on, and off is never switched back on by the installer. To switch it on, set `enabled` to true
   in `runner.json`. A first install counts its first pass: the requests waiting in its store and its

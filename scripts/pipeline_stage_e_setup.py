@@ -572,8 +572,9 @@ SIBLING_JOBS = (
     ("pipeline_acceptance_run.py", ("pipeline_acceptance_poller.py", "pipeline_acceptance_run.py", "pipeline_look.py"),
      # Its data (KIT-889): the look tool's sandbox profile, which its every browser check runs under.
      ("templates/sandbox/look.sb",)),
-    # The runner (KIT-859), our own dispatcher's always-on job. Its installer now runs it from a root-owned copy of
-    # the kit at this clone's commit (KIT-919), so `run` finds and stops it only while an older install runs it here.
+    # The runner (KIT-859), our own dispatcher's always-on job. Its installer runs it from a root-owned copy of this
+    # clone's commit (KIT-919) and refreshes the copy after the clone moves. `run` finds its job there
+    # (clone_jobs_sh), stops it around the clone's move and loads it again.
     ("pipeline_runner.py", ("pipeline_bridge.py", "pipeline_bridge_answers.py", "pipeline_bridge_bind.py",
                             "pipeline_bridge_config.py", "pipeline_bridge_direct.py", "pipeline_bridge_handover.py",
                             "pipeline_bridge_pings.py", "pipeline_bridge_plans.py", "pipeline_bridge_replan.py",
@@ -589,8 +590,7 @@ SIBLING_JOBS = (
                             "pipeline_standup.py", "pipeline_tech_lead_tools.py", "pipeline_tech_lead_turn.py",
                             "pipeline_validator_settings.py", "pipeline_voice.py", "pipeline_window.py"),
      # Its data (KIT-889): the kit's guards, which the runner's guard launcher runs on every tool call of every
-     # session it starts (scripts/pipeline_runner_guard.py). They count only while an older install runs the runner
-     # from this clone; its root-owned copy is refreshed from this clone's commit by the runner's installer (KIT-919).
+     # session it starts (scripts/pipeline_runner_guard.py), from the runner's copy of this clone's commit.
      (".claude/hooks",)),
 )
 SIBLING_ENTRY_SCRIPTS = tuple(entry for entry, _files, _data in SIBLING_JOBS)
@@ -3088,15 +3088,21 @@ def clone_jobs_sh(account, daemons="/Library/LaunchDaemons"):
     binary plist's bytes in a UTF-8 locale, and every binary plist, anyone's, would read so.
 
     `END` closes a listing that ran to the end. Exit 9 is a plist it could not read, and a
-    listing with no `END` did not finish: neither is ever "no such job" (contract §13)."""
+    listing with no `END` did not finish: neither is ever "no such job" (contract §13).
+
+    THE RUNNER RUNS FROM A COPY (KIT-919). Its installer runs it from a root-owned copy of the
+    clone's commit, in the folder ENGINE_DIR names in runner.conf, so its job is found by its entry
+    under any folder. It is still a job of the clone's: its files count toward "behind", and `run`
+    stops it around the clone's move and loads it again."""
     user = shlex.quote("<key>UserName</key><string>%s</string>" % account)
+
+    def where(name):
+        return ("/scripts/" if name == RUNNER_ENTRY else ROLE_KIT_CLONE_PATH[1:] + "/scripts/") + name
     runs = " ".join('case "$c" in *%s*) printf "%%s %%s\\n" %s "$f" ;; esac;'
-                    % (shlex.quote(ROLE_KIT_CLONE_PATH[1:] + "/scripts/" + name),
-                       shlex.quote(name)) for name in SIBLING_ENTRY_SCRIPTS)
+                    % (shlex.quote(where(name)), shlex.quote(name)) for name in SIBLING_ENTRY_SCRIPTS)
     binary = " ".join('case "$c" in *%s*) echo "$f is binary. Make it text: sudo plutil '
                       '-convert xml1 $f" >&2; exit 9 ;; esac;'
-                      % shlex.quote(ROLE_KIT_CLONE_PATH[1:] + "/scripts/" + name)
-                      for name in SIBLING_ENTRY_SCRIPTS)
+                      % shlex.quote(where(name)) for name in SIBLING_ENTRY_SCRIPTS)
     return ('LC_ALL=C; export LC_ALL; for f in {d}/*.plist; do [ -f "$f" ] || continue; '
             'c=$(tr -d "[:space:]" < "$f") || exit 9; case "$c" in *{user}*) ;; '
             '*"<plist"*) continue ;; *) {binary} continue ;; esac; {runs} done; echo END'
@@ -14224,6 +14230,11 @@ def _selftest_body():
                     return os.path.join(tmpJ, label + ".plist")
                 want = [_put("com.example.bridge", _bs_m.render_plist(b_conf, homeJ)),
                         _put("com.example.notifier", _ns_m.render_plist(n_conf, homeJ))]
+                # KIT-919: the runner's job, as its installer renders it, runs from its root-owned copy.
+                import pipeline_runner_setup as _rs_m
+                r_conf = dict(_rs_m.CONF_DEFAULTS, ROLE_ACCOUNT=acct, CLAUDE_BIN="/usr/local/bin/claude",
+                              OWNER_USER_IDS="u-owner", DISPATCHER_USER_IDS="u-agent", PROJECTS="kit=~/repos/kit")
+                want.append(_put("local.pipeline-runner", _rs_m.plist_body(r_conf, homeJ, "abc1234")))
                 # A Stage E daemon, another account's notifier, a bridge on a clone of its own
                 # (which nothing here moves, and its installer now refuses), and a stranger.
                 _put("com.example.stage-e-poller", PLIST.format(
@@ -14240,7 +14251,8 @@ def _selftest_body():
                 expect("KIT-280 clone-jobs-shell-finds-the-notifier-and-the-bridge",
                        got.rc == 0 and got.out.splitlines() == [
                            "pipeline_bridge.py " + want[0], "pipeline_notify_local.py " + want[1],
-                           "END"], "rc %s: %r" % (got.rc, got.out))
+                           "pipeline_runner.py " + want[2], "END"] and "/.stage-e/kit/" not in
+                       open(want[2], encoding="utf-8").read(), "rc %s: %r" % (got.rc, got.out))
                 none = Runner().read(["/bin/sh", "-c", finder(acct, os.path.join(tmpJ, "none"))])
                 expect("KIT-280 clone-jobs-shell-finds-the-notifier-and-the-bridge",
                        none.rc == 0 and none.out.split() == ["END"],
@@ -17352,7 +17364,9 @@ def _selftest_body():
                 src = fh.read()
             if "ROLE_KIT_CLONE" not in src:
                 continue
-            named = re.findall(r'ROLE_KIT_CLONE"\]\.rstrip\("/"\) \+ "/scripts/" \+ (\w+)', src)
+            # The runner's installer names its entry under ENGINE_DIR, its root-owned copy of the
+            # clone's commit (KIT-919); clone_jobs_sh finds that job there.
+            named = re.findall(r'(?:ROLE_KIT_CLONE|ENGINE_DIR)"\]\.rstrip\("/"\) \+ "/scripts/" \+ (\w+)', src)
             if fname in key_only:
                 if named or "import subprocess" in src:
                     silent.append(fname + " (it names the key only, yet it can start a job)")
