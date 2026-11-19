@@ -876,6 +876,94 @@ def _self_approval_in(cmd: str):
     return None
 
 
+# ── Never-merge guard, API half: a merge is a merge by any route (KIT-897) ───────
+# Added 2026-11-18. The never-merge guard (in the Bash guards below) matches the `gh pr
+# merge` subcommand, and the merge it refuses was one API call away: `gh api -X PUT
+# repos/o/r/pulls/7/merge`, the GraphQL `mergePullRequest` mutation, or `curl` at the
+# same endpoint. A session holding a token that can push can merge a green pull request
+# that way, because branch protection decides WHAT may merge (the required checks), not
+# WHO merges it. The self-approval guard above covers the same routes for a review, and
+# this half follows its shapes.
+#
+# Refused: a write to `/pulls/<n>/merge` (the merge is a PUT there, and no other write
+# has a use), and a GraphQL mutation that merges a pull request (`mergePullRequest`),
+# switches on its auto-merge (`enablePullRequestAutoMerge`) or queues it to merge
+# (`enqueuePullRequest`, what `gh pr merge` sends on a merge-queue branch). Allowed:
+# every READ (a GET of the PR, of its checks or of the merge endpoint itself, which is
+# GitHub's "has this merged?" check, and any GraphQL query) and
+# `disablePullRequestAutoMerge`, which only undoes an auto-merge, as
+# `gh pr merge --disable-auto` does.
+#
+# Matched against the WHOLE command, like the self-approval guard's API arm:
+# api.github.com is on the egress allowlist, so nothing else stops a hand-rolled `curl`.
+# A method this hook cannot read on the merge endpoint (`-X "$M"`) fails CLOSED, as a
+# review whose event hides in a file does. The GraphQL arm wants the `mutation` keyword
+# beside the name, which every mutation document carries, so a grep for the name stays
+# free.
+#
+# Scope, as plainly as the guards above state it: a first line over command SHAPES. A
+# respelt path or mutation name, a mangled method flag (it reads as a GET, and a GET must
+# stay allowed) or a query held in a file gets past it; `npm run test:bypass` records
+# which. The durable half would be a rule in repository settings on WHO may update the
+# default branch (docs/SECURITY.md).
+_PR_MERGE_PATH_RE = re.compile(r"/pulls/[^/\s'\"]+/merge\b")
+# A method flag in every spelling gh, curl and wget parse: `-X PUT`, `-XPUT`, `-X=PUT`, a
+# short-flag cluster ending in X (`-sX PUT`, `-iXPUT`), `--method PUT`, `--method=PUT` and
+# `--request PUT`. Group 1 is the method as written, quotes aside.
+_HTTP_METHOD_RE = re.compile(
+    r"(?<![\w-])(?:-[A-Za-z]*X\s*=?|--(?:method|request)(?:\s*=|\s))\s*['\"]?([^\s'\";&|)]*)")
+_HTTP_WRITE_METHODS = ("PUT", "POST", "PATCH", "DELETE")
+_HTTP_READ_METHODS = ("GET", "HEAD")
+# curl's -T/--upload-file sends a PUT with no method flag at all, clustered or not. Read
+# only inside a curl command: wget's -T is a timeout.
+_CURL_RE = re.compile(r"\bcurl\b([^#\n;&|]*)")
+_CURL_UPLOAD_RE = re.compile(r"(?<![\w-])(?:-[A-Za-z]*T|--upload-file(?![\w-]))")
+_GRAPHQL_MERGE_RE = re.compile(
+    r"(?<![\w-])(?:mergePullRequest|enablePullRequestAutoMerge|enqueuePullRequest)(?![\w-])")
+_GRAPHQL_MUTATION_RE = re.compile(r"(?<![\w-])mutation(?![\w-])")
+
+API_MERGE_HELP = (
+    "🔒 This merges a pull request through the API, and merging PRs is the human's action "
+    "only, by `gh pr merge` or by any other route. {why} Do not reach for another tool or "
+    "a shell workaround. Open the PR (`gh pr create`) and stop there; if it should merge, "
+    "print the command for the human to run themselves:\n"
+    "  gh pr merge <number> --squash\n"
+    "(Reading a PR, its checks and its merge state through the API stays allowed, and so "
+    "does `disablePullRequestAutoMerge`, which only undoes an auto-merge.)"
+)
+_API_MERGE_WHY = {
+    "rest": "A write to `/pulls/<n>/merge` is the merge itself, whichever client sends it.",
+    "opaque": ("This writes to `/pulls/<n>/merge` with a method this hook cannot read, so "
+               "it fails closed. A read names no method, or GET."),
+    "graphql": ("`mergePullRequest` merges the PR, `enablePullRequestAutoMerge` switches on "
+                "its auto-merge and `enqueuePullRequest` queues it to merge: each one means "
+                "the agent caused the merge."),
+}
+
+
+def _api_merge_in(cmd: str):
+    """Why this command would merge a pull request through the API, else None.
+
+    Read paths never match: a GET of a PR, of its checks or of its merge endpoint, a
+    GraphQL query, and `disablePullRequestAutoMerge` all stay frictionless. It runs on the
+    prose-stripped command, so a mutation merely NAMED in a quoted PR body is not one sent
+    to the API."""
+    if _GRAPHQL_MERGE_RE.search(cmd) and _GRAPHQL_MUTATION_RE.search(cmd):
+        return "graphql"
+    if not _PR_MERGE_PATH_RE.search(cmd):
+        return None
+    for m in _HTTP_METHOD_RE.finditer(cmd):
+        method = m.group(1).upper()
+        if method in _HTTP_WRITE_METHODS:
+            return "rest"
+        if method not in _HTTP_READ_METHODS:
+            return "opaque"
+    for m in _CURL_RE.finditer(cmd):
+        if _PR_MERGE_PATH_RE.search(m.group(1)) and _CURL_UPLOAD_RE.search(m.group(1)):
+            return "rest"
+    return None
+
+
 # ── Config-anchor guard: the git ref store is a trust anchor, not scratch space ──
 # Added 2026-08-24 (docs/adr/2026-08-24-config-anchor-and-pin-expiry.md).
 # Several guards deliberately read a value from the DEFAULT BRANCH rather than from
@@ -3764,6 +3852,11 @@ def _dispatch(data) -> None:
                 "there. (`gh pr merge --disable-auto` is still allowed, to undo an "
                 "auto-merge that shouldn't have been enabled.)"
             )
+        # The same merge sent straight to the API (KIT-897): a write to
+        # /pulls/<n>/merge, or a GraphQL mutation that merges, auto-merges or queues a PR.
+        _api_merge = _api_merge_in(scan)
+        if _api_merge:
+            block(API_MERGE_HELP.format(why=_API_MERGE_WHY[_api_merge]))
 
         # Approving a pull request is a SIGNAL TO A HUMAN that someone else looked at
         # the work — the same class of action as merging it, and the same answer.
