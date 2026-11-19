@@ -598,10 +598,16 @@ def row_runner(ctx):
     rows = dict((r.get("step"), r) for r in doc["rows"] if isinstance(r, dict))
     if not rows:
         raise Unknown("the runner's installer check could not run: %s" % (doc.get("why") or "no reason"))
-    for step in ("home", "kit", "settings", "job"):
+    # Every row it reports, the four it always has first; its push token's row only for a lane that pushes
+    # (KIT-907: that row also judges the token's end date).
+    steps = ["home", "kit", "settings", "job"] + sorted(s for s in rows if s not in ("home", "kit", "settings", "job"))
+    for step in steps:
+        if step == "push-token" and ctx.lane not in PUSH_LANES:
+            continue
         r = rows.get(step)
         if r is None or r.get("outcome") == setup.UNKNOWN:
-            raise Unknown("its installer's `%s` row: %s" % (step, (r or {}).get("detail") or "not reported"))
+            raise Unknown("its installer's `%s` row: %s" % (step, short((r or {}).get("detail"), 240) or
+                                                          "not reported"))
         if r.get("outcome") != setup.ALREADY_DONE:
             raise Missing("its installer's `%s` row is %s: %s. Run the runner's installer" % (
                 step, r.get("outcome"), short(r.get("detail"), 240)))
@@ -2178,7 +2184,8 @@ class World(object):
         return Res(1, "", "gh: not stood in for")
 
     def installer(self):
-        rows = [{"step": s, "outcome": setup.ALREADY_DONE, "detail": "fine"} for s in ("home", "kit", "settings", "job")]
+        rows = [{"step": s, "outcome": setup.ALREADY_DONE, "detail": "fine"}
+                for s in ("home", "kit", "settings", "job", "push-token")]
         left = None
         if self.f["installer"] == "job":
             rows[3] = {"step": "job", "outcome": setup.WOULD_CHANGE, "detail": "would load it; now: not loaded"}
@@ -2186,6 +2193,9 @@ class World(object):
             rows[1] = {"step": "kit", "outcome": setup.UNKNOWN, "detail": "NOT MEASURED: no live sudo"}
         elif self.f["installer"] == "left_off":
             left = "left off: its settings say enabled is false"
+        elif self.f["installer"] == "token-undated":
+            rows[4] = {"step": "push-token", "outcome": setup.UNKNOWN,
+                       "detail": "NOT MEASURED: the push token has no end date on record"}
         return Res(10 if left else 0, json.dumps({"schema": setup.ROWS_SCHEMA, "exit": 0, "rows": rows,
                                                   "left_off": left, "why": None}))
 
@@ -2568,6 +2578,10 @@ def _cases(check_, tmp):  # noqa: C901  (one battery, read top to bottom)
     case("the installer could not measure a row: UNKNOWN, never OK", lambda: broken(installer="unknown")[:2],
          (EXIT_MISSING, {"runner": UNKNOWN}))
     case("the runner switched off: MISSING", lambda: broken(installer="left_off")[1], {"runner": MISSING})
+    case("the installer's push-token row (its end date) holds a lane that pushes, and no other",
+         lambda: [broken(installer="token-undated")[1], broken("plan", installer="token-undated")[1]],
+         [{"runner": UNKNOWN}, {}],
+         ("the installer's later rows not read", [(me, "row_runner", lambda ctx: "ok")]))
     case("the kit clone behind main: MISSING", lambda: broken(kit_main="e" * 40)[1], {"kit clone": MISSING},
          ("the clone's head not compared", [(me, "row_kit_clone", lambda ctx: (
              ctx.before.update(kinds_commit=KINDS_COMMIT), "ok")[1])]))
