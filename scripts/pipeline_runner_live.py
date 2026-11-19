@@ -18,8 +18,8 @@ arguments, so a new user proves a lane on a project of their own before a real o
 
     1. CHECK every prerequisite, and name each one missing in words: the runner installed, switched on and
        its job loaded; the folder its job runs from one the role account cannot change (the root-owned
-       copy, KIT-919); the kit clone at main's head; the project's clone with an HTTPS origin the role
-       account's git reaches; RUNNER_STORE set for the queue, in queue.conf and installed; each key file
+       copy, KIT-919); the job running main's head (the commit its job file names, against main on the
+       kit's origin); the project's clone with an HTTPS origin the role account's git reaches; RUNNER_STORE set for the queue, in queue.conf and installed; each key file
        the role account's and mode 0600, looked at and never read; for a lane that pushes, the push token
        pushing to the project in a dry run; for a lane with ticket tools, the session writer's key answering
        as its user and the project's session brief naming the tools; the role-account probe's last result
@@ -49,7 +49,8 @@ line. Each key file is looked at with `stat`, never opened. Two checks need a ke
 inside the role account's own processes, as the runner itself does: the dry-run push hands the push token
 to git through the adapter's own helper, and the session writer's key is asked who it is by the runner's
 own code. The tracker is read only by the runner's own reader (pipeline_runner.LinearTracker), run as the
-role account from the kit clone the runner runs from, with the runner's own key file: only fields come back
+role account from the folder the runner's job runs from (its job file says which), with the runner's own
+key file: only fields come back
 (ids, states, times, label names, verdict marks), never a title, a body or a key. GitHub is read with `gh`,
 under your own login, which this script never sees. Every role-account call is `sudo -n`: it asks for your
 password once, with `sudo -v`, and keeps that session alive while it waits.
@@ -65,7 +66,6 @@ import base64
 import calendar
 import json
 import os
-import plistlib
 import re
 import shlex
 import signal
@@ -73,6 +73,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from xml.sax.saxutils import unescape
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 KIT = os.path.dirname(HERE)
@@ -136,6 +137,7 @@ PUSH_LANES = ("code", "fix")      # the kinds that hold the push token (the sess
 WRITER_LANES = tuple(k for k in LANES if k in session_tools.STAGES)   # the kinds given the five ticket tools
 BRIEF = "docs/SESSION-BRIEF.md"   # the project's session brief, which must name those tools
 DRY_RUN_REF = "refs/heads/runner-live-dry-run-"   # a branch name no push ever creates: the push is a dry run
+MASKED = ("SIGINT", "SIGTERM", "SIGHUP")           # ignored while the lane is switched off: Ctrl-C, a stop, a hang-up
 
 
 class Missing(Exception):
@@ -208,9 +210,9 @@ class IO(object):
         import pwd
         return pwd.getpwnam(account).pw_dir
 
-    def role_scripts(self, clone):
-        """Where the role account's programs import the kit from: the clone the runner runs from."""
-        return [clone + "/scripts"]
+    def role_scripts(self, engine):
+        """Where the role account's programs import the runner's own modules from: the folder its job runs."""
+        return [engine + "/scripts"]
 
     def read_text(self, path):
         """A file anyone may read (the runner's job file, root's, mode 0644), or None."""
@@ -292,7 +294,7 @@ def under_home(ctx, path):
 # --------------------------------------------------------------------------- #
 # The role-account readers. Each is a fixed program; only fields come back.
 # --------------------------------------------------------------------------- #
-# The store, read through the store's own module from the kit clone the runner runs from: the lanes the
+# The store, read through the store's own module from the folder the runner runs from: the lanes the
 # runner says it takes, one caller's requests for one kind (their text left out), the project's runs, the pin
 # of a live run of the ticket (its budget, mode and criteria counted, never its words), the final message of
 # an ended run (its size and error flag, never its words), and a few files a lane's ledger lives in.
@@ -486,10 +488,6 @@ print(json.dumps(out))
 '''
 
 # Shell looks, as the role account. Each prints fixed words; none prints a file's content.
-GIT_KIT_SH = ('# live-run:git-kit\nc=@C@; h=$(git -C "$c" rev-parse --verify HEAD 2>/dev/null) || h=none; '
-              'm=$(git -C "$c" ls-remote origin refs/heads/main 2>/dev/null | cut -f1) || m=; '
-              'k=$(git -C "$c" log -1 --format=%H HEAD -- session-kinds 2>/dev/null) || k=; '
-              'echo "head $h"; echo "main ${m:-none}"; echo "kinds ${k:-none}"')
 GIT_PROJECT_SH = ('# live-run:git-project\nr=@R@; b=@B@; [ -d "$r" ] || { echo "absent"; exit 0; }; '
                   'u=$(git -C "$r" config --get remote.origin.url 2>/dev/null) || u=; '
                   'p=$(git -C "$r" remote get-url --push origin 2>/dev/null) || p=; '
@@ -508,8 +506,16 @@ PUSH_SH = ('# live-run:push\nr=@R@; f=@F@; [ -d "$r" ] && [ -f "$f" ] || { echo 
            'GIT_CONFIG_VALUE_0=@V0@ GIT_CONFIG_KEY_1=@K1@ GIT_CONFIG_VALUE_1=@V1@ '
            'git -C "$r" -c core.hooksPath=/dev/null push --dry-run --quiet origin @SRC@:@DST@ >/dev/null 2>&1; '
            'echo "push $?"')
-ANCESTOR_SH = ('# live-run:ancestor\nc=@C@; git -C "$c" merge-base --is-ancestor @K@ @P@ 2>/dev/null; '
-               'r=$?; echo "ancestor $r"')
+# The runner's job file, read as text: the folder its command runs the runner from, the home it sets, and the
+# kit commit the installer wrote at the command's end ("# kit <commit>"). Read, never parsed as a job to write.
+JOB_SCRIPT_RE = re.compile(r'"([^"]+)/scripts/pipeline_runner\.py"|([^\s<>"]+)/scripts/pipeline_runner\.py')
+JOB_HOME_RE = re.compile(r"<key>HOME</key>\s*<string>([^<]+)</string>")
+JOB_KIT_RE = re.compile(r"# kit ([0-9a-f]{40})\b")
+
+
+def kit_git(ctx, *argv):
+    """git in this checkout of the kit, as you: main's head, its history, and whether one commit holds another."""
+    return ctx.io.run(["git", "-C", KIT] + list(argv), timeout=120)
 
 
 # --------------------------------------------------------------------------- #
@@ -523,9 +529,9 @@ class Ctx(object):
         self.lane, self.project, self.ticket = args.lane, args.project, getattr(args, "ticket", None)
         self.spec = SPEC[self.lane]
         self.kind = self.spec["kind"]
-        self.conf = self.role = self.home = self.settings_path = self.clone = None
+        self.conf = self.role = self.home = self.settings_path = self.engine = None
         self.settings = self.cfg = self.proj = self.store_dir = self.slug = None
-        self.role_scripts, self.https = None, False
+        self.role_scripts, self.https, self.engine_why = None, False, ""
         self.rows = []                 # (name, state, words) of the check
         self.steps = dict((s, None) for s in self.spec["chain"] + self.spec["after_chain"])
         self.agree = []                # (name, result, words)
@@ -562,24 +568,49 @@ def load(ctx):
     except KeyError:
         raise SetupError("the role account %s does not exist on this Mac" % ctx.role)
     ctx.settings_path = under_home(ctx, setup.settings_path(conf))
-    ctx.clone = under_home(ctx, conf["ROLE_KIT_CLONE"].rstrip("/"))
-    ctx.role_scripts = ctx.io.role_scripts(ctx.clone)
+    locate_engine(ctx)
     text, _mode = read_role_file(ctx, ctx.settings_path)
     if text is None:
         raise Missing("no runner settings are installed at %s: run the runner's installer first" % ctx.settings_path)
-    try:
-        ctx.settings = json.loads(text)
-    except ValueError:
-        raise Missing("%s is not JSON, so nothing can be switched in it" % ctx.settings_path)
-    ctx.cfg, bad = runner_job.load_config(qs.with_home(ctx.settings, ctx.home))
-    if not isinstance(ctx.settings, dict) or not isinstance(ctx.settings.get("projects"), dict) \
-            or ctx.project not in ctx.settings["projects"]:
+    ctx.settings = parse_settings(ctx, text)
+    if not isinstance(ctx.settings.get("projects"), dict) or ctx.project not in ctx.settings["projects"]:
         raise Missing("the runner's settings have no project %s: add it to PROJECTS in runner.conf and run "
                       "the installer" % ctx.project)
+    ctx.cfg, bad = runner_job.load_config(qs.with_home(ctx.settings, ctx.home))
     if bad:
         ctx.notes.append("the installed settings do not load as they are: %s" % bad[0])
     ctx.proj = (ctx.cfg or {}).get("projects", {}).get(ctx.project) or {}
     ctx.store_dir = under_home(ctx, ctx.settings.get("store_dir"))
+
+
+def parse_settings(ctx, text):
+    """The installed settings as one JSON object, or Missing: nothing is switched in anything else."""
+    try:
+        doc = json.loads(text)
+    except ValueError:
+        raise Missing("%s is not JSON, so nothing can be switched in it" % ctx.settings_path)
+    if not isinstance(doc, dict):
+        raise Missing("%s is not one JSON object, so nothing can be switched in it" % ctx.settings_path)
+    return doc
+
+
+def locate_engine(ctx):
+    """Where the runner's job runs it from, and the kit commit it runs, from its job file (root's, readable by
+    anyone). The role account's readers import the runner's own modules from there. Never raises: a job file it
+    cannot read leaves no engine, and every read that needs one says UNKNOWN."""
+    path = _dispatcher_plist(ctx.conf["JOB_LABEL"])
+    text = ctx.io.read_text(path)
+    m = JOB_SCRIPT_RE.search(unescape(text)) if text is not None else None
+    if not m:
+        ctx.engine_why = "the runner's job file %s %s" % (path, "could not be read" if text is None else
+                                                          "names no runner script")
+        return
+    home = JOB_HOME_RE.search(unescape(text))
+    home = home.group(1) if home else ctx.home
+    ctx.engine = (m.group(1) or m.group(2)).replace("${HOME}", home).replace("$HOME", home)
+    kit = JOB_KIT_RE.search(text)
+    ctx.before["job_commit"] = kit.group(1) if kit else None
+    ctx.role_scripts = ctx.io.role_scripts(ctx.engine)
 
 
 # --------------------------------------------------------------------------- #
@@ -621,19 +652,23 @@ def git_lines(res):
     return dict(ln.split(" ", 1) for ln in res.out.splitlines() if " " in ln) if res.ok else None
 
 
-def row_kit_clone(ctx):
-    """The kit clone the runner runs from, at main's head."""
-    res = as_role(ctx, GIT_KIT_SH.replace("@C@", shlex.quote(ctx.clone)))
-    got = git_lines(res)
-    if not got or got.get("head", "none") == "none":
-        raise Unknown("the kit clone %s could not be read as %s (exit %d)" % (ctx.clone, ctx.role, res.rc))
-    if got.get("main", "none") == "none":
-        raise Unknown("main's head could not be read from the kit clone's origin, as %s" % ctx.role)
-    ctx.before["kit_head"], ctx.before["kinds_commit"] = got["head"], got.get("kinds")
-    if got["head"] != got["main"]:
-        raise Missing("the kit clone %s is at %s and main is at %s: let Stage E's run move it, then check again"
-                      % (ctx.clone, short(got["head"]), short(got["main"])))
-    return "at main's head, %s" % short(got["head"])
+def row_kit(ctx):
+    """The runner runs main's head: the kit commit its job file names (the installer writes it there, and its
+    own `job` row holds launchd to that file), against main's head on the kit's origin."""
+    have = ctx.before.get("job_commit")
+    if not have:
+        raise Unknown("the kit commit the runner's job runs is not known: %s" % (
+            ctx.engine_why or "its job file names none"))
+    res = kit_git(ctx, "ls-remote", "origin", "refs/heads/main")
+    m = re.match(r"^([0-9a-f]{40})\s", res.out or "") if res.ok else None
+    if not m:
+        raise Unknown("main's head could not be read from the kit's origin with this checkout's git (exit %d)"
+                      % res.rc)
+    ctx.before["main_head"] = m.group(1)
+    if have != m.group(1):
+        raise Missing("the runner's job runs kit %s and main is at %s: let Stage E's run move the clone (the runner "
+                      "is loaded again on the new commit), then check again" % (short(have), short(m.group(1))))
+    return "the runner's job runs main's head, %s" % short(have)
 
 
 def row_project_clone(ctx):
@@ -784,19 +819,9 @@ def row_writer_key(ctx):
 def row_engine(ctx):
     """The folder the runner's job runs from: the role account can change none of it, or the runner holds every
     start (docs/RUNNER.md, "Guards from the engine's own folder"). The root-owned copy is KIT-919's."""
-    plist = _dispatcher_plist(ctx.conf["JOB_LABEL"])
-    text = ctx.io.read_text(plist)
-    try:
-        doc = plistlib.loads(text.encode("utf-8")) if text is not None else None
-        args = " ".join(str(a) for a in doc["ProgramArguments"])
-        home = (doc.get("EnvironmentVariables") or {}).get("HOME") or ctx.home
-    except (ValueError, TypeError, KeyError, AttributeError, plistlib.InvalidFileException):
-        raise Unknown("the runner's job file %s could not be read" % plist)
-    m = re.search(r'"([^"]+)/scripts/pipeline_runner\.py"', args) or re.search(r"(\S+)/scripts/pipeline_runner\.py",
-                                                                                 args)
-    if not m:
-        raise Unknown("the runner's job file %s names no runner script" % plist)
-    engine = m.group(1).replace("${HOME}", home).replace("$HOME", home)
+    engine = ctx.engine
+    if not engine:
+        raise Unknown(ctx.engine_why or "the folder the runner's job runs from is not known")
     got = role_python(ctx, ENGINE_PY, {"engine": engine})
     if got.get("state") != "read":
         raise Unknown("whether %s could change %s %s" % (ctx.role, engine, got.get("state")))
@@ -906,6 +931,17 @@ def row_todo(ctx):
     return "no other approved ticket waits in %s" % team
 
 
+def ran_as(meta, role):
+    """The probe ran as the role account: the walls it measured are that account's."""
+    return meta.get("account") == role
+
+
+def probe_commit(meta):
+    """The kit commit the probe's results name, or None: none is never a pass."""
+    commit = meta.get("commit")
+    return commit if isinstance(commit, str) and re.match(r"^[0-9a-f]{40}\Z", commit) else None
+
+
 def probe_path(ctx):
     given = ctx.args.probe or (ctx.conf["RUNNER_DIR"].rstrip("/") + "/probe")
     return under_home(ctx, given.rstrip("/")) + "/results.json"
@@ -925,25 +961,31 @@ def row_probe(ctx):
         walls = [r for r in rows if r.get("class") == "wall"]
     except (ValueError, KeyError, TypeError, AttributeError):
         raise Unknown("the probe's results %s are not the probe's" % path)
-    if meta.get("account") != ctx.role:
+    if not ran_as(meta, ctx.role):
         raise Missing("the probe at %s ran as %s, not as %s" % (path, meta.get("account"), ctx.role))
     failed = [r.get("row") for r in walls if r.get("verdict") != "PASS"]
     if not walls or failed:
         raise Missing("the probe's last result did not pass: %s" % (
             "no wall was measured" if not walls else "%d wall(s) not PASS, the first %s" % (len(failed), failed[0])))
-    commit = meta.get("commit")
-    if not (isinstance(commit, str) and re.match(r"^[0-9a-f]{40}\Z", commit)):
-        raise Missing("the probe's results name no commit: run the probe again from the kit clone (it records "
-                      "its commit since KIT-916)")
-    kinds = ctx.before.get("kinds_commit")
-    if not (isinstance(kinds, str) and re.match(r"^[0-9a-f]{40}\Z", kinds)):
-        raise Unknown("main's last change to the session kinds is not known (the kit clone row did not read it)")
-    res = as_role(ctx, ANCESTOR_SH.replace("@C@", shlex.quote(ctx.clone)).replace("@K@", kinds).replace("@P@", commit))
-    m = re.search(r"^ancestor (\d+)$", res.out or "", re.M) if res.ok else None
-    if not m or m.group(1) not in ("0", "1"):
-        raise Unknown("whether the probe's commit %s holds the session kinds' %s could not be told" % (
-            short(commit), short(kinds)))
-    if m.group(1) != "0":
+    commit = probe_commit(meta)
+    if not commit:
+        raise Missing("the probe's results name no commit: run it again from a git checkout of the kit (it "
+                      "records its commit since KIT-916)")
+    main = ctx.before.get("main_head")
+    if not main:
+        raise Unknown("main's head is not known (the kit row could not read it)")
+    if not kit_git(ctx, "cat-file", "-e", main + "^{commit}").ok:
+        raise Unknown("this checkout does not hold main's head %s yet: git fetch origin main, then check again"
+                      % short(main))
+    res = kit_git(ctx, "log", "-1", "--format=%H", main, "--", "session-kinds")
+    kinds = (res.out or "").strip() if res.ok else ""
+    if not re.match(r"^[0-9a-f]{40}\Z", kinds):
+        raise Unknown("main's last change to the session kinds could not be read with this checkout's git")
+    res = kit_git(ctx, "merge-base", "--is-ancestor", kinds, commit)
+    if res.rc not in (0, 1):
+        raise Unknown("whether the probe's commit %s holds main's session kinds (%s) could not be told: this "
+                      "checkout may not hold that commit (git fetch origin)" % (short(commit), short(kinds)))
+    if res.rc == 1:
         raise Missing("the probe ran at %s, before main's last change to the session kinds (%s): run it again"
                       % (short(commit), short(kinds)))
     return "%d of %d walls PASS, as %s, at %s (%s)" % (len(walls), len(walls), ctx.role, short(commit),
@@ -999,8 +1041,7 @@ def row_ticket(ctx):
     mine = [r for r in snap["runs"]["rows"] if r["ticket"] == ctx.ticket]
     approved = (ctx.proj.get("approval_states") or {})
     if ctx.lane in ("code", "plan"):
-        states = approved.get(ctx.kind) or []
-        if node.get("state_id") in states:
+        if approved_already(node, approved.get(ctx.kind) or []):
             raise Missing("%s is in an approved %s state already: move it back out first, so the move this run "
                           "watches is a new one" % (ctx.ticket, ctx.kind))
         live = [r for r in mine if r["kind"] == ctx.kind and r["state"] in store.LIVE]
@@ -1008,7 +1049,7 @@ def row_ticket(ctx):
             raise Missing("a %s run of %s is still going (%s)" % (ctx.kind, ctx.ticket, live[-1]["run"]))
         if ctx.lane == "code":
             ws = os.path.join(ctx.store_work(), "code", ctx.ticket)
-            if snapshot(ctx, exists=[ws])["exists"].get(ws):
+            if workspace_there(ctx, ws):
                 raise Missing("a code workspace for %s is there already (%s): a code start needs a fresh one" % (
                     ctx.ticket, ws))
         return "%s, read by the runner's own reader; not approved yet" % ctx.ticket
@@ -1035,13 +1076,23 @@ def coded(runs):
     return done[-1] if done else None
 
 
+def approved_already(node, states):
+    """The ticket sits in an approved state now: the owner's move this run watches would not be a new one."""
+    return node.get("state_id") in states
+
+
+def workspace_there(ctx, path):
+    """A workspace is there already, as the role account sees it: a code start would be refused."""
+    return bool(snapshot(ctx, exists=[path])["exists"].get(path))
+
+
 class NotNeededRow(Exception):
     """A row this lane does not need."""
 
 
 # In order: a row may read what an earlier one learned (the repository, main's session-kinds commit, the
 # project's delivery.json), and says UNKNOWN when that row could not learn it.
-ROWS = (("runner", "row_runner"), ("engine", "row_engine"), ("kit clone", "row_kit_clone"),
+ROWS = (("runner", "row_runner"), ("engine", "row_engine"), ("kit", "row_kit"),
         ("project clone", "row_project_clone"), ("queue store", "row_queue_store"), ("keys", "row_keys"),
         ("push", "row_push"), ("writer key", "row_writer_key"), ("probe", "row_probe"),
         ("delivery", "row_delivery"), ("brief", "row_brief"), ("window", "row_window"),
@@ -1075,8 +1126,15 @@ def check(ctx):
 # --------------------------------------------------------------------------- #
 # The readers the steps share
 # --------------------------------------------------------------------------- #
+def runner_code(ctx):
+    """Where the role account's readers import the runner's own modules from, or Unknown."""
+    if not ctx.role_scripts:
+        raise Unknown("the runner's own readers cannot be found: %s" % (ctx.engine_why or "no engine"))
+    return ctx.role_scripts
+
+
 def snapshot(ctx, since=None, all_runs=False, exists=(), **extra):
-    args = {"scripts": ctx.role_scripts, "store": ctx.store_dir, "project": ctx.project, "ticket": ctx.ticket,
+    args = {"scripts": runner_code(ctx), "store": ctx.store_dir, "project": ctx.project, "ticket": ctx.ticket,
             "caller": None if all_runs else ctx.spec["caller"], "kind": ctx.kind, "since": since,
             "exists": list(exists)}
     args.update(extra)
@@ -1087,7 +1145,7 @@ def snapshot(ctx, since=None, all_runs=False, exists=(), **extra):
 
 
 def tracker(ctx, tickets, marks_of=(), writer=False, waiting=None):
-    doc = role_python(ctx, TRACKER_PY, {"scripts": ctx.role_scripts, "settings": ctx.settings_path,
+    doc = role_python(ctx, TRACKER_PY, {"scripts": runner_code(ctx), "settings": ctx.settings_path,
                                         "tickets": list(tickets), "marks_of": list(marks_of), "writer": writer,
                                         "waiting": waiting})
     if doc.get("schema") != "runner-live-tracker/1":
@@ -1201,13 +1259,15 @@ def switch_on(ctx):
 
 
 def switch_off(ctx):
-    """Switch the lane off and confirm the runner took it. Never raises. True when confirmed. A second
-    Ctrl-C cannot stop it half way."""
-    old = signal.getsignal(signal.SIGINT)
-    try:
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
-    except (ValueError, OSError):                 # not the main thread: nothing to mask
-        old = None
+    """Switch the lane off and confirm the runner took it. Never raises. True when confirmed. No second
+    Ctrl-C, stop or closed terminal can interrupt it half way: each of their signals is ignored meanwhile."""
+    olds = {}
+    for name in MASKED:
+        sig = getattr(signal, name, None)
+        try:
+            olds[sig] = signal.signal(sig, signal.SIG_IGN)
+        except (TypeError, ValueError, OSError):  # not the main thread, or no such signal: nothing to mask
+            pass
     try:
         for attempt in (1, 2):
             if not keep_sudo(ctx):
@@ -1234,8 +1294,8 @@ def switch_off(ctx):
         ctx.problem("switching the lane off failed: %s: %s" % (type(exc).__name__, short(str(exc), 200)))
         return False
     finally:
-        if old is not None:
-            signal.signal(signal.SIGINT, old)
+        for sig, old in olds.items():
+            signal.signal(sig, old)
 
 
 # --------------------------------------------------------------------------- #
@@ -1350,12 +1410,17 @@ def after_code(ctx):
     return True
 
 
+def head_moved(ctx, head):
+    """The pull request's head is not the one it had before the switch: something was pushed."""
+    return bool(head) and head != ctx.before.get("head")
+
+
 def watch_fix(ctx, snap):
     run = follow_run(ctx, snap)
     if ctx.run is not None and ctx.steps["pushed"] is None:
         view = pr_view(ctx, ctx.pr["number"])
         head = (view or {}).get("headRefOid")
-        if head and head != ctx.before.get("head"):
+        if head_moved(ctx, head):
             ctx.pr = dict(ctx.pr, headRefOid=head, commits=view.get("commits") or [])
             mark(ctx, "pushed", "pull request #%s moved from %s to %s" % (ctx.pr["number"], short(ctx.before.get("head")),
                                                                           short(head)))
@@ -1364,7 +1429,7 @@ def watch_fix(ctx, snap):
     end_step(ctx, run)
     if ctx.steps["pushed"] is None:
         view = pr_view(ctx, ctx.pr["number"]) or {}
-        if view.get("headRefOid") and view["headRefOid"] != ctx.before.get("head"):
+        if head_moved(ctx, view.get("headRefOid")):
             ctx.pr = dict(ctx.pr, headRefOid=view["headRefOid"], commits=view.get("commits") or [])
             mark(ctx, "pushed", "pull request #%s moved to %s" % (ctx.pr["number"], short(view["headRefOid"])))
         else:
@@ -1462,9 +1527,14 @@ def waiting_for(ctx, names):
     return left[0] if left else None
 
 
+def deadline_of(ctx):
+    """The lane's time limit, counted from the switch on."""
+    return ctx.on_at + 60 * ctx.minutes
+
+
 def watch(ctx):
     """Wait for the runner's part of the chain. None when it is done, else what went wrong, in words."""
-    deadline = ctx.on_at + 60 * ctx.minutes
+    deadline = deadline_of(ctx)
     while True:
         if not keep_sudo(ctx):
             return "your sudo session ended while it waited, so the store could not be read"
@@ -1761,7 +1831,8 @@ def result_block(ctx, failed, off_ok, quiet_ok):
     lines = ["### Live run: the %s lane, project %s, ticket %s" % (ctx.kind, ctx.project, ctx.ticket), "",
              "**Result: %s.**" % head,
              "Run with scripts/pipeline_runner_live.py, kit %s, on %s UTC." % (
-                 short(ctx.before.get("kit_head")) or "unknown", time.strftime("%Y-%m-%d", time.gmtime(ctx.on_at or 0))),
+                 short(ctx.before.get("job_commit")) or "unknown",
+                 time.strftime("%Y-%m-%d", time.gmtime(ctx.on_at or 0))),
              "",
              "**The switch.** lanes.%s for %s: on at %s (the runner took it %s), off at %s (taken %s). %s" % (
                  ctx.kind, ctx.project, hms(ctx.on_at), hms(ctx.on_seen), hms(ctx.off_at), hms(ctx.off_seen),
@@ -1799,6 +1870,16 @@ def refused(io):
                 "so a person runs it, in their own terminal. Nothing was read or changed." % ", ".join(found))
     import pipeline_root_guard as rg      # KIT-693: the one refusal every installer shares
     return rg.refusal(io.uid())
+
+
+def sudo_ready(io):
+    """Your password, once, at `sudo -v`: every role-account call after it is `sudo -n`."""
+    return io.sudo_validate() == 0
+
+
+def typed_yes(ctx, question):
+    """Exactly `yes`, typed. Anything else, an empty line or a closed input, is no."""
+    return ctx.io.ask(question).strip() == "yes"
 
 
 def parse(argv):
@@ -1843,7 +1924,7 @@ def main(argv=None, io=None):
     ctx = Ctx(io, args)
     ctx.minutes = args.minutes or ctx.spec["minutes"]
     ctx.after_minutes = args.after_minutes or ctx.spec["after"]
-    if io.sudo_validate() != 0:
+    if not sudo_ready(io):
         io.say("NO SUDO: it reads and switches the runner's settings as the role account, which needs your "
                "Mac password. Nothing was read or changed.")
         return EXIT_NOPRIV
@@ -1896,7 +1977,7 @@ def command_run(ctx):
     ctx.say("  5. Check that the run record, the tracker, the pull request and the ledger agree, and print the "
             "result.")
     ctx.say("A failure or Ctrl-C at any point switches the lane off first.")
-    if ctx.io.ask("Type yes to switch the %s lane on for %s: " % (ctx.kind, ctx.project)).strip() != "yes":
+    if not typed_yes(ctx, "Type yes to switch the %s lane on for %s: " % (ctx.kind, ctx.project)):
         ctx.say("Not yes, so nothing was changed.")
         return EXIT_NOT_YES
     olds = {}
@@ -1944,10 +2025,19 @@ def command_run(ctx):
 # Stage E, GitHub, the tracker and the role account's git and stat looks are stood in for. A mutant for each
 # rule: a check that cannot fail checks nothing.
 # --------------------------------------------------------------------------- #
-ROLE, OWNER, WRITER, DISP = "_exrunner", "owner-1", "writer-1", "disp-1"
+def _me():
+    import pwd
+    return pwd.getpwuid(os.getuid()).pw_name
+
+
+# The role account is this battery's own user, so its key looks run for real (`stat` names the owner) against
+# key files that hold a planted value; only an owner nobody here can be is answered by a stand-in.
+ROLE, OWNER, WRITER, DISP = _me(), "owner-1", "writer-1", "disp-1"
+KEY_NAMES = ("tracker-key", "writer-key", "push-token")
 T0 = calendar.timegm((2026, 11, 20, 9, 0, 0, 0, 0, 0))
 H0, H1, KIT_HEAD, KINDS_COMMIT = "a" * 40, "b" * 40, "c" * 40, "d" * 40
 SLUG, PR_NO = "acme/app", 7
+SSH_ORIGIN = "git" + "@" + "github.com:acme/app.git"        # built at runtime: no line here reads as an address
 PLANTED = "gh" + "p_" + "LIVERUNSELFTEST" + "Q" * 25        # built at runtime: no fixture looks like a key
 TICKETS = {"code": "ENG-12", "fix": "ENG-12", "review": "ENG-12", "plan": "ENG-40", "acceptance": "ENG-50"}
 STUB_RUNNER = '''# A stand-in for pipeline_runner in the live-run tool's selftest: the tracker is a data file.
@@ -2011,16 +2101,17 @@ class status_job(object):
         return {"viewer": {"id": _data().get("writer_viewer")}}
 '''
 FLAGS = {
-    "installer": "ok", "kit_main": KIT_HEAD, "origin": "https://github.com/acme/app.git", "reach": True,
+    "installer": "ok", "kit_main": KIT_HEAD, "main_known": True, "job_commit": KIT_HEAD,
+    "origin": "https://github.com/acme/app.git", "reach": True,
     "runner_store": "~/.pipeline-runner/store", "usage_store": "~/.pipeline-runner/store",
     "keys": {}, "probe_walls": "PASS", "probe_commit": KIT_HEAD, "probe_account": ROLE,
-    "engine": "/opt/kit-engine", "engine_problems": [], "push": "0", "writer_viewer": WRITER, "todo": [],
+    "job_file": True, "engine_problems": [], "push": "0", "writer_viewer": WRITER, "todo": [],
     "delivery": "ok", "brief_tools": True, "window_start": "08:00",
     "ancestor": "0", "lanes": None, "session_tools": True, "ticket_state": "st-backlog", "workspace": False,
     "refuse": None, "silent": False, "frozen": None, "stray": False, "ignore_off": False, "move_in_history": True,
     "no_review": False, "interrupt_at": None, "lose_sudo_at": None, "ledger_ref": "same", "review_ticket": None,
     "mark_word": "passed", "gh_down": False, "no_old_review": False, "no_push": False, "no_role": False,
-    "gh_after_on": False,
+    "gh_after_on": False, "term_in_off": False, "settings_list": False,
 }
 
 
@@ -2072,8 +2163,11 @@ class World(object):
             self.installed = fh.read()
         for d in (self.work, os.path.join(self.rd, "home"), self.pins):
             os.makedirs(d, exist_ok=True)
-        for name in ("tracker-key", "writer-key", "push-token"):      # real files, each holding a planted value
-            _put(os.path.join(self.rd, name), PLANTED + "\n")
+        for name in KEY_NAMES:                       # real files, each holding a planted value, unless a case says
+            spec = self.f["keys"].get(name)
+            if spec != "absent":
+                _put(os.path.join(self.rd, name), "" if spec == "empty" else PLANTED + "\n",
+                     0o644 if spec == "mode644" else 0o600)
         if store.prepare(self.store):
             raise AssertionError("the selftest's store could not be made")
         walls = [{"row": "%s:tools" % k, "class": "wall", "verdict": "PASS"} for k in ("code", "review")]
@@ -2111,6 +2205,8 @@ class World(object):
                 {"state_dir": "~/.stage-e/acceptance", "look_record_dir": "~/.stage-e/acceptance/looks"}))
         if self.f["no_role"]:
             os.chmod(self.settings, 0)
+        if self.f["settings_list"]:
+            _put(self.settings, "[]\n")
         self.save()
 
     # -- the tracker and GitHub, as data ----------------------------------- #
@@ -2143,12 +2239,23 @@ class World(object):
             os.utime(path, (self.now, self.now))
         return rid
 
-    def plist(self):
-        command = ('set -a; . "$HOME/.stage-e/env"; set +a; exec /usr/bin/python3 "%s/scripts/pipeline_runner.py" '
-                   'run --config "$HOME/.pipeline-runner/runner.json" # kit %s' % (self.f["engine"], KIT_HEAD))
-        return plistlib.dumps({"Label": "local.pipeline-runner", "UserName": ROLE,
-                               "EnvironmentVariables": {"HOME": self.home},
-                               "ProgramArguments": ["/bin/sh", "-c", command]}).decode("utf-8")
+    def job_file(self):
+        """The runner's job file as its own installer writes it, for this world's conf."""
+        conf = setup.load_conf(self.conf, "selftest-person")[0]
+        return setup.plist_body(conf, self.home, self.f["job_commit"])
+
+    def git(self, argv):
+        """This checkout's git, as the tool asks it: main's head, its session-kinds history, ancestry."""
+        f, rest = self.f, argv[3:]
+        if rest[:1] == ["ls-remote"]:
+            return Res(0, "%s\trefs/heads/main\n" % f["kit_main"])
+        if rest[:2] == ["cat-file", "-e"]:
+            return Res(0 if f["main_known"] else 128, "", "" if f["main_known"] else "fatal: not a valid object")
+        if rest[:1] == ["log"]:
+            return Res(0, KINDS_COMMIT + "\n")
+        if rest[:2] == ["merge-base", "--is-ancestor"]:
+            return Res(int(f["ancestor"]))
+        return Res(1, "", "git: not stood in for")
 
     def gh_api(self, path):
         f, base = self.f, "repos/%s/contents/" % SLUG
@@ -2199,24 +2306,26 @@ class World(object):
         return Res(10 if left else 0, json.dumps({"schema": setup.ROWS_SCHEMA, "exit": 0, "rows": rows,
                                                   "left_off": left, "why": None}))
 
+    def canned(self, tag, script):
+        """Which role-account looks the world answers: the project clone's git, the dry-run push and the engine's
+        walls, and a key file's look only when the case names an owner nobody here can be."""
+        if tag in ("git-project", "push", "engine"):
+            return True
+        return tag == "key" and any(n in script and self.f["keys"].get(n) == "other" for n in KEY_NAMES)
+
     def shell(self, tag, script):
         f = self.f
-        if tag == "git-kit":
-            return Res(0, "head %s\nmain %s\nkinds %s\n" % (KIT_HEAD, f["kit_main"], KINDS_COMMIT))
+        if tag == "key":
+            return Res(0, "stat 600 someone 41\n")
         if tag == "git-project":
             return Res(0, "url %s\npush %s\nremote %s\nlocal %s\n" % (f["origin"], f["origin"],
                                                                       H0 if f["reach"] else "none", H0))
-        if tag == "key":
-            name = next((n for n in ("tracker-key", "writer-key", "push-token") if n in script), "")
-            return Res(0, f["keys"].get(name, "stat 600 %s 41" % ROLE) + "\n")
         if tag == "push":
             if "credential.https://github.com.helper" not in script or "--dry-run" not in script:
                 return Res(0, "push 99\n")         # only the adapter's helper, and only a dry run, may push
             return Res(0, "push %s\n" % f["push"])
         if tag == "engine":
             return Res(0, json.dumps({"state": "read", "problems": f["engine_problems"]}) + "\n")
-        if tag == "ancestor":
-            return Res(0, "ancestor %s\n" % f["ancestor"])
         return Res(1, "", "no such look")
 
     # -- the stand-in runner and the lane's job ---------------------------- #
@@ -2248,6 +2357,9 @@ class World(object):
             doc = json.load(fh)
         flags = store.lane_flags(doc["projects"]["app"].get("lanes")) or {}
         on = bool(doc.get("enabled")) and bool(flags.get(self.kind))
+        if f["term_in_off"] and self.on_seen is not None and not flags.get(self.kind):
+            f["term_in_off"] = False             # a stop arrives while the lane is being switched off
+            os.kill(os.getpid(), signal.SIGTERM)
         frozen = f["frozen"] == "always" or (f["frozen"] == "after-on" and self.on_seen is not None)
         if not frozen:
             store.write_lanes(self.store, {"schema": store.LANES_SCHEMA, "enabled": bool(doc.get("enabled")),
@@ -2396,7 +2508,7 @@ class FakeIO(IO):
 
     def __init__(self, w, typed="yes", env=None, uid=501, sudo_rc=0):
         self.w, self.typed, self._env, self._uid, self.sudo_rc = w, typed, env or {}, uid, sudo_rc
-        self.said, self.asked, self.calls = [], [], []
+        self.said, self.asked, self.calls, self.outs = [], [], [], []
 
     def env(self):
         return self._env
@@ -2429,13 +2541,16 @@ class FakeIO(IO):
                 return Res(1, "", "sudo: a password is required")
             script = argv[-1]
             tag = re.search(r"# live-run:([a-z-]+)", script + "\n" + (stdin or ""))
-            if tag:
+            if tag and w.canned(tag.group(1), script):
                 return w.shell(tag.group(1), script)
             if "cat >" in script:
                 w.writes += 1
             p = subprocess.run(["/bin/sh", "-c", script], input=stdin, capture_output=True, universal_newlines=True,
                                env={"HOME": w.home, "PATH": "/usr/bin:/bin"}, timeout=timeout)
+            self.outs.append(p.stdout + p.stderr)              # everything the role account's commands said
             return Res(p.returncode, p.stdout, p.stderr)
+        if argv[:3] == ["git", "-C", KIT]:
+            return w.git(argv)
         if argv[:2] == ["gh", "api"]:
             return w.gh_api(argv[2])
         if argv[:1] == ["gh"]:
@@ -2447,7 +2562,7 @@ class FakeIO(IO):
         return Res(127, "", "not stood in for")
 
     def read_text(self, path):
-        return self.w.plist() if path == _dispatcher_plist("local.pipeline-runner") else None
+        return self.w.job_file() if path == _dispatcher_plist("local.pipeline-runner") and self.w.f["job_file"] else None
 
     def now(self):
         return self.w.now
@@ -2551,7 +2666,8 @@ def _cases(check_, tmp):  # noqa: C901  (one battery, read top to bottom)
          lambda: [main(["run", "--lane", "deploy", "--project", "app", "--ticket", "ENG-1"], FakeIO(world())),
                   main(["run", "--lane", "code", "--project", "app"], FakeIO(world()))], [EXIT_USAGE, EXIT_USAGE])
     case("sudo refused: exit 5, and no role-account read", lambda: (lambda r: (r[0], r[1].calls))(
-        go(world(), sudo_rc=1)), (EXIT_NOPRIV, []))
+        go(world(), sudo_rc=1)), (EXIT_NOPRIV, []),
+         ("a refused sudo gone past", [(me, "sudo_ready", lambda io: True)]))
 
     # 3. check: every prerequisite OK on a ready Mac, and nothing changed.
     def ready_check():
@@ -2582,25 +2698,29 @@ def _cases(check_, tmp):  # noqa: C901  (one battery, read top to bottom)
          lambda: [broken(installer="token-undated")[1], broken("plan", installer="token-undated")[1]],
          [{"runner": UNKNOWN}, {}],
          ("the installer's later rows not read", [(me, "row_runner", lambda ctx: "ok")]))
-    case("the kit clone behind main: MISSING", lambda: broken(kit_main="e" * 40)[1], {"kit clone": MISSING},
-         ("the clone's head not compared", [(me, "row_kit_clone", lambda ctx: (
-             ctx.before.update(kinds_commit=KINDS_COMMIT), "ok")[1])]))
+    case("the runner's job behind main: MISSING", lambda: broken(kit_main="e" * 40)[1], {"kit": MISSING},
+         ("the job's commit not compared", [(me, "row_kit", lambda ctx: (
+             ctx.before.update(main_head=ctx.before.get("job_commit")), "ok")[1])]))
+    case("the runner's job file unreadable: the engine, the kit and every runner read are UNKNOWN, never OK",
+         lambda: (lambda r: (r[0], set(r[1].values()), "engine" in r[1], "kit" in r[1]))(broken(job_file=False)),
+         (EXIT_MISSING, {UNKNOWN}, True, True))
+    case("this checkout does not hold main's head: the probe's age is UNKNOWN, with the fetch to run",
+         lambda: broken(main_known=False)[1], {"probe": UNKNOWN})
     case("an SSH origin: MISSING, and the push's dry run waits on it; GitHub's rows still read",
-         lambda: broken(origin="git@github.com:acme/app.git")[1], {"project clone": MISSING, "push": UNKNOWN},
-         ("the origin's scheme not judged", [(me, "GITHUB_TOKENISH", re.compile(
-             r"^(?:https://github\.com/|git@github\.com:)([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?\Z"))]))
+         lambda: broken(origin=SSH_ORIGIN)[1], {"project clone": MISSING, "push": UNKNOWN},
+         ("the origin's scheme not judged", [(me, "GITHUB_TOKENISH", GITHUB_ANY)]))
     case("origin not reached by the role account's git: MISSING", lambda: broken(reach=False)[1],
          {"project clone": MISSING})
     case("RUNNER_STORE unset for the queue: MISSING", lambda: broken(runner_store="")[1], {"queue store": MISSING},
          ("RUNNER_STORE not read", [(me, "row_queue_store", lambda ctx: "ok")]))
     case("the installed usage job not reading the store yet: MISSING",
          lambda: broken(usage_store="~/elsewhere")[1], {"queue store": MISSING})
-    case("the push token's file mode 0644: MISSING", lambda: broken(keys={"push-token": "stat 644 %s 41" % ROLE})[1],
+    case("the push token's file mode 0644: MISSING", lambda: broken(keys={"push-token": "mode644"})[1],
          {"keys": MISSING},
          ("the keys' modes not judged", [(me, "row_keys", lambda ctx: "ok")]))
     case("the tracker key absent, the writer key another account's, the push token empty: each MISSING",
-         lambda: [broken(keys={"tracker-key": "absent"})[1], broken(keys={"writer-key": "stat 600 someone 41"})[1],
-                  broken(keys={"push-token": "stat 600 %s 0" % ROLE})[1]], [{"keys": MISSING}] * 3)
+         lambda: [broken(keys={"tracker-key": "absent"})[1], broken(keys={"writer-key": "other"})[1],
+                  broken(keys={"push-token": "empty"})[1]], [{"keys": MISSING}] * 3)
     case("a lane with no push and no ticket tools needs no dry run, writer key, brief or Todo check",
          lambda: (lambda r: (r[1], sorted(k for k, v in rows(r[0]).items() if v == NOT_NEEDED)))(
              broken_io("plan", push="128", writer_viewer="someone", brief_tools=False, todo=["ENG-77"])),
@@ -2643,10 +2763,12 @@ def _cases(check_, tmp):  # noqa: C901  (one battery, read top to bottom)
          {"probe": MISSING})
     case("the probe ran at a commit before main's session kinds: MISSING", lambda: broken(ancestor="1")[1],
          {"probe": MISSING},
-         ("the commit's age not judged", [(me, "ANCESTOR_SH", "# live-run:none\necho ancestor 0")]))
-    case("the probe's results name no commit, or ran as another account: MISSING",
-         lambda: [broken(probe_commit=None)[1], broken(probe_account="someone")[1]],
-         [{"probe": MISSING}, {"probe": MISSING}])
+         ("the commit's age not judged", [(me, "kit_git", lambda ctx, *a, real=kit_git: Res(0) if a[0] == "merge-base"
+                                           else real(ctx, *a))]))
+    case("the probe's results name no commit: MISSING", lambda: broken(probe_commit=None)[1], {"probe": MISSING},
+         ("a result with no commit passed", [(me, "probe_commit", lambda meta: KIT_HEAD)]))
+    case("the probe ran as another account: MISSING", lambda: broken(probe_account="someone")[1], {"probe": MISSING},
+         ("the probe's account not judged", [(me, "ran_as", lambda meta, role: True)]))
     case("whether the probe's commit holds the kinds cannot be told: UNKNOWN", lambda: broken(ancestor="128")[1],
          {"probe": UNKNOWN})
     case("the lane already on: MISSING, and the run never asks", lambda: (lambda r: (r[1], r[3]))(
@@ -2655,9 +2777,11 @@ def _cases(check_, tmp):  # noqa: C901  (one battery, read top to bottom)
     case("no session tools: the writer's key, its check and the runner's own loader each say so",
          lambda: broken(session_tools=False)[1], {"keys": MISSING, "writer key": MISSING, "switch": MISSING},
          ("the loader not asked", [(me, "row_switch", lambda ctx: "ok")]))
-    case("the ticket approved already, or its workspace there: MISSING",
-         lambda: [broken(ticket_state="st-todo")[1], broken(workspace=True)[1]],
-         [{"ticket": MISSING}, {"ticket": MISSING}])
+    case("the ticket approved already: MISSING", lambda: broken(ticket_state="st-todo")[1], {"ticket": MISSING},
+         ("an approved ticket let through", [(me, "approved_already", lambda node, states: False)]))
+    case("a code workspace for the ticket there already: MISSING", lambda: broken(workspace=True)[1],
+         {"ticket": MISSING},
+         ("the workspace not looked for", [(me, "workspace_there", lambda ctx, path: False)]))
     case("the settings unreadable as the role account: it cannot start, and nothing changes",
          lambda: (lambda w: (lambda r: (r[0], r[1].said[-1].startswith("CANNOT START"), r[1].asked))(go(w)))(
              world(no_role=True)), (EXIT_MISSING, True, []))
@@ -2671,7 +2795,9 @@ def _cases(check_, tmp):  # noqa: C901  (one battery, read top to bottom)
         w = world()
         rc, io = go(w, typed="y")
         return rc, w.writes, lane_now(w), len(io.asked)
-    case("anything but a typed yes changes nothing", not_yes, (EXIT_NOT_YES, 0, False, 1))
+    case("anything but a typed yes changes nothing", not_yes, (EXIT_NOT_YES, 0, False, 1),
+         ("`y` taken as yes", [(me, "typed_yes", lambda ctx, q: ctx.io.ask(q).strip() in ("yes", "y"))]),
+         ("the question skipped", [(me, "typed_yes", lambda ctx, q: True)]))
 
     # 6. The coding lane, end to end: on, the owner's move, a run, its pin, a pull request, its end, the switch
     #    off, Stage E's review, and the three checks.
@@ -2683,7 +2809,7 @@ def _cases(check_, tmp):  # noqa: C901  (one battery, read top to bottom)
     def happy():
         w, rc, io, text = code_run(stray=True)
         unseen = [ln.split("|")[1].strip() for ln in text.splitlines() if ln.startswith("| ") and "not seen" in ln]
-        leaked = PLANTED in "\n".join(io.said) or any(PLANTED in " ".join(c) for c in io.calls)
+        leaked = PLANTED in "\n".join(io.said + io.outs) or any(PLANTED in " ".join(c) for c in io.calls)
         return (rc, lane_now(w), w.writes, "**Result: PASSED" in text, unseen, text.count("| AGREE |"),
                 "mode ticket; budget 40 turns, 5.0 USD, 60 min; 3 criteria, 1 out of scope" in text,
                 "Nothing of the lane started after it; 1 request(s) after it were refused (the code lane is off "
@@ -2692,7 +2818,8 @@ def _cases(check_, tmp):  # noqa: C901  (one battery, read top to bottom)
          "refused, and no key in any output or command line",
          happy, (EXIT_OK, False, 2, True, [], 3, True, True, True, False),
          ("the switch off dropped", [(me, "set_lane", lambda ctx, on, real=set_lane: real(ctx, on) if on else None)]),
-         ("the checks skipped", [(me, "agree_code", lambda ctx: None)]))
+         ("the checks skipped", [(me, "agree_code", lambda ctx: None)]),
+         ("a key look that reads the key", [(me, "KEY_SH", KEY_SH + '; cat "$f"')]))
     case("the runner refuses the start: FAILED in its words, and the lane off",
          lambda: (lambda r: (r[1], lane_now(r[0]), "FAILED: the runner refused it: the queue's judge does not admit"
                              in r[3]))(code_run(refuse="the queue's judge does not admit ENG-12 (held)")),
@@ -2701,9 +2828,11 @@ def _cases(check_, tmp):  # noqa: C901  (one battery, read top to bottom)
          lambda: (lambda r: (r[1], lane_now(r[0]), "stopped by you" in r[3]))(code_run(interrupt_at=50)),
          (EXIT_FAILED, False, True),
          ("no switch off after a failure", [(me, "switch_off", lambda ctx: True)]))
-    case("a runner that never answers: the time limit ends it, the lane off",
-         lambda: (lambda r: (r[1], lane_now(r[0]), "started did not happen within 5 minutes" in r[3]))(
-             code_run(("--minutes", "5"), silent=True)), (EXIT_FAILED, False, True))
+    case("a runner that never answers: the time limit ends it on time, the lane off",
+         lambda: (lambda r: (r[1], lane_now(r[0]), "started did not happen within 5 minutes" in r[3],
+                             (r[0].off_seen - r[0].on_seen) // 60))(code_run(("--minutes", "5"), silent=True)),
+         (EXIT_FAILED, False, True, 5),
+         ("the limit counted wrong", [(me, "deadline_of", lambda ctx: ctx.on_at + 120 * ctx.minutes)]))
     case("a start after the switch off: FAILED, named",
          lambda: (lambda r: (r[1], "started after the switch off" in r[3]))(code_run(stray=True, ignore_off=True)),
          (EXIT_FAILED, True),
@@ -2712,6 +2841,14 @@ def _cases(check_, tmp):  # noqa: C901  (one battery, read top to bottom)
          lambda: (lambda r: (r[1], "| who approved | DISAGREE |" in r[3]))(code_run(move_in_history=False)),
          (EXIT_FAILED, True),
          ("the approval not compared", [(me, "agree_code", lambda ctx: agreed(ctx, "who approved", True, "x"))]))
+    case("a stop (SIGTERM) while the lane is being switched off is ignored: the switch off finishes, confirmed",
+         lambda: (lambda r: (r[1], lane_now(r[0]), r[0].off_seen is not None))(code_run(term_in_off=True)),
+         (EXIT_OK, False, True),
+         ("only Ctrl-C masked", [(me, "MASKED", ("SIGINT",))]))
+    case("settings that are JSON but not one object: it cannot start, said in words",
+         lambda: (lambda r: (r[0], r[1].said[-1].startswith("CANNOT START") and "not one JSON object" in r[1].said[-1]))(
+             go(world(settings_list=True))), (EXIT_MISSING, True),
+         ("any JSON taken as settings", [(me, "parse_settings", lambda ctx, text: json.loads(text))]))
     case("sudo ends while it waits: your password is asked, and the lane goes off",
          lambda: (lambda r: (r[1], lane_now(r[0]), r[0].validations, "sudo session ended" in r[3]))(
              code_run(lose_sudo_at=T0 + 60)), (EXIT_FAILED, False, 2, True))
@@ -2744,7 +2881,8 @@ def _cases(check_, tmp):  # noqa: C901  (one battery, read top to bottom)
     case("the fix lane: a ledger row naming another request DISAGREEs",
          lambda: "| the bounce ledger | DISAGREE |" in lane_run("fix", ledger_ref="other")[2], True)
     case("the fix lane: nothing pushed is FAILED",
-         lambda: (lambda r: (r[0], "nothing was pushed" in r[2]))(lane_run("fix", no_push=True)), (EXIT_FAILED, True))
+         lambda: (lambda r: (r[0], "nothing was pushed" in r[2]))(lane_run("fix", no_push=True)), (EXIT_FAILED, True),
+         ("an unmoved head read as a push", [(me, "head_moved", lambda ctx, head: True)]))
     case("the review lane: the published comment, its marks beside the old lane's, and no review ticket",
          lambda: (lambda r: (r[0], r[1], r[2].count("| AGREE |"), "**Result: PASSED" in r[2]))(lane_run("review")),
          (EXIT_OK, False, 3, True),
@@ -2773,7 +2911,8 @@ def _cases(check_, tmp):  # noqa: C901  (one battery, read top to bottom)
         rc2, _io = go(w2, "off")
         return rc, lane_now(w), rc2, lane_now(w2), io.asked
     case("off: switched off and confirmed, with no yes asked; unconfirmed is exit 6", off,
-         (EXIT_OK, False, EXIT_STILL_ON, False, []))
+         (EXIT_OK, False, EXIT_STILL_ON, False, []),
+         ("off that switches nothing", [(me, "command_off", lambda ctx: EXIT_OK)]))
 
     # 9. Only fields leave the role account: no title, no comment's body, no session's words.
     def fields_only():
@@ -2781,11 +2920,17 @@ def _cases(check_, tmp):  # noqa: C901  (one battery, read top to bottom)
         for lane in ("code", "plan"):
             w = world(lane)
             _rc, io = go(w)
-            out.append("\n".join(io.said))
+            out.append("\n".join(io.said + io.outs))
         said = "\n".join(out)
         return [s in said for s in ("Here is the plan", "A finding.", "add the thing", "Planning-run trigger")]
-    case("the session's words, a comment's body and a ticket's title never reach the output", fields_only,
-         [False, False, False, False])
+    case("the session's words, a comment's body and a ticket's title never leave the role account, nor reach "
+         "the output", fields_only, [False, False, False, False],
+         ("the final message read whole", [(me, "SNAPSHOT_PY", SNAPSHOT_PY.replace(
+             '"chars": len(doc["text"] or ""),', '"chars": len(doc["text"] or ""), "text": doc["text"],'))]),
+         ("the ticket's title read", [(me, "TRACKER_PY", TRACKER_PY.replace(
+             '"identifier": node.get("identifier"),', '"identifier": node.get("identifier"), "title": node.get("title"),'))]),
+         ("the request's text read", [(me, "SNAPSHOT_PY", SNAPSHOT_PY.replace(
+             '"ticket", "run"))', '"ticket", "run", "text"))'))]))
 
 
 if __name__ == "__main__":

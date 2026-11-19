@@ -678,8 +678,9 @@ settings, and the ticket is the one its chain is about: the ticket to code, the 
 review, the idea to plan, or the piece to check.
 
 1. **Check.** Sixteen rows, each OK, MISSING with what to do, or NOT NEEDED for this lane. Anything it
-   cannot read is UNKNOWN, never OK, and stops the run. The rows: the runner installed and on; its job
-   running from a copy the role account cannot change (KIT-919 builds it); the kit clone at main's head;
+   cannot read is UNKNOWN, never OK, and stops the run. The rows: the runner installed and on (its
+   installer's own `check`, the push token's end date among its rows); its job running from a copy the role
+   account cannot change (KIT-919 builds it); its job running main's head (the commit its job file names);
    the project's clone, HTTPS, reached; `RUNNER_STORE` for the queue; each key file the role account's,
    mode 0600; a dry-run push with the push token; the writer key answering as its user; the probe passing
    at a commit with main's session kinds; `delivery.json` on main passing the kit's validator; the

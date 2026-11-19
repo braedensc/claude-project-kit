@@ -820,13 +820,17 @@ def _account():
     return pwd.getpwuid(os.getuid()).pw_name
 
 
-def engine_commit(engine):
+def engine_commit(engine, run=subprocess.run):
     """The commit of the kit copy the probe ran from, or None when it is not a git checkout or git cannot
     say. The owner's live-run tool (scripts/pipeline_runner_live.py, KIT-916) passes a result only at a
-    commit that holds main's last change to the session kinds, and None never passes."""
+    commit that holds main's last change to the session kinds, and None never passes. The copy the runner
+    runs from belongs to another account (root's, KIT-919), and git refuses a checkout another user owns
+    ("dubious ownership") unless `safe.directory` names it in protected configuration, which a `-c` on
+    the command line is. So this one read names it there, and trusts no other folder. `run` stands in for
+    subprocess.run in the selftest."""
     try:
-        r = subprocess.run(["git", "-C", engine, "rev-parse", "--verify", "HEAD"], capture_output=True,
-                           universal_newlines=True, timeout=30)
+        r = run(["git", "-c", "safe.directory=%s" % engine, "-C", engine, "rev-parse", "--verify", "HEAD"],
+                capture_output=True, universal_newlines=True, timeout=30)
     except (OSError, subprocess.SubprocessError):
         return None
     head = r.stdout.strip() if r.returncode == 0 else ""
@@ -1087,6 +1091,18 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                               universal_newlines=True).stdout.strip() or None
         expect("KIT-916: the result names the kit commit it ran at, or none outside a checkout",
                (json.loads(kept)["meta"].get("commit", "missing"), engine_commit(tmp)), (here, None))
+
+        def owned_by_another(argv, **_kw):
+            """git as it answers in a checkout another user owns: refused, unless -c names it safe."""
+            safe = "safe.directory=/opt/kit-copy" in argv[:3] and argv[1] == "-c"
+            return subprocess.CompletedProcess(argv, 0 if safe else 128, "f" * 40 + "\n" if safe else "",
+                                               "" if safe else "fatal: detected dubious ownership in repository")
+        expect("KIT-916: a copy another account owns (root's) still names its commit: git is told it is safe, "
+               "on the command line, for that one folder",
+               (engine_commit("/opt/kit-copy", run=owned_by_another),
+                engine_commit("/opt/kit-copy", run=lambda argv, **kw: owned_by_another(
+                    [a for a in argv if not a.startswith("safe.directory") and a != "-c"], **kw))),
+               ("f" * 40, None))
         pushed = dict((r["row"], (r["verdict"], r["note"])) for r in json.loads(kept)["rows"]
                       if r["row"].endswith(":push-token") or r["row"].endswith(":git-credential"))
         expect("KIT-886: a push-token row per kind, by name: present for code, absent for review and acceptance; "
