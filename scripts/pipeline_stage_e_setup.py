@@ -1227,8 +1227,8 @@ def runner_lane_errors(conf, repos):
     return errors
 
 
-# KIT-892. A path the review job's config may carry for the runner's settings: printable, no quote,
-# no space-only name. The runner's installer writes the same shape into its job's command line.
+# KIT-892. A path the review job's config may carry for the runner's settings: printable, with no
+# quote or backslash, the shape the runner's installer writes into its job's command line.
 _RUNNER_SETTINGS_RE = re.compile(r'^[^\x00-\x1f\x7f"\\]{1,300}$')
 RUNNER_ENTRY = "pipeline_runner.py"
 # The settings file in the runner's job: `… pipeline_runner.py" run --config "<file>" # kit …`, as
@@ -4254,9 +4254,9 @@ def step_configs(ctx, apply_it):
                                 "login": (conf.get("GITHUB_APP_LOGIN") or "").strip()}
     # KIT-892: where the runner's settings are, from RUNNER_SETTINGS or the runner's installed job,
     # and which repositories this conf names as runner projects (RUNNER_LANE_REPOS). For those, the
-    # review job says settings it cannot find or read, and pages, and never reads them as "lane
-    # off". Each is composed only when there is one, so a machine with no runner and no lane still
-    # composes, byte for byte, the config it always did.
+    # review job says so when it cannot find or read the settings, and pages: it never reads that
+    # as "lane off". Each is composed only when there is one, so a machine with no runner and no
+    # lane still composes, byte for byte, the config it always did.
     place = runner_settings_place(ctx)
     if place:
         poller["runner_settings"] = place
