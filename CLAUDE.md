@@ -225,7 +225,9 @@ npm run test:plan-executor   # idea-gate executor: tree validate, DoR-gate, forc
                              #   its prerequisite mode: the parent from the bridge's record, cap 15 (KIT-611)
 npm run test:plan-poller     # the planner job: the owner's move on a work team is the
                              #   trigger, the delegated ticket is a clean copy, its routing
-                             #   is checked (a miss stops planning), the plan read back
+                             #   is checked (a miss stops planning), the plan read back; every
+                             #   case on both lanes, the old dispatcher's and our own runner's,
+                             #   each lane-only case named (KIT-705)
 npm run test:sync-user-skills  # user-scope skill drift: check is read-only; --apply
                              #   refuses in an agent env (machine-local ~/.claude/skills)
 npm run test:emit       # generation-side gate: every producer REFUSES to write a malformed doc
@@ -416,7 +418,8 @@ npm run test:runner-guard    # the guards' launcher (KIT-704): no folder named o
 npm run test:runner-probe    # the live probe of each kind's walls (KIT-704), against a stand-in: walls
                              #   that hold pass, leaks fail, a model that declines is NOT MEASURED
 npm run test:runner-store    # the runner's store (KIT-642): requests and run records behind
-                             #   walls, each caller for its own kinds; unreadable runs are None
+                             #   walls, each caller for its own kinds; unreadable runs are None;
+                             #   a caller reads back and takes back its own requests (KIT-705)
 npm run test:runner          # the runner (KIT-642): start, resume, stop and a restart against a
                              #   stand-in; the owner's approval from the history; the pin; the one
                              #   command line; a run that died resumed once; a lane that is off for

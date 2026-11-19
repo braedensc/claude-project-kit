@@ -618,13 +618,18 @@ OPTIONAL_CONF_KEYS = {
     "AUTO_REPLAN_TRIES": "how many more runs one move may get, 1 to 5 (default 2)",
     "AUTO_REPLAN_PER_DAY": "how many re-runs may start in one UTC day, across every team: a "
                            "runaway's limit, not a normal day's (default 20)",
+    "RUNNER_SETTINGS": "where our own runner's settings file is (docs/RUNNER.md): an absolute "
+                       "path, or ~/ for the role account's home. It switches nothing: a "
+                       "repository plans on the runner only while the runner's own "
+                       "`lanes.plan` is on for its project. Empty (the default): every "
+                       "repository plans on the old dispatcher",
 }
 CONF_DEFAULTS = {"PLAN_IT_STATE": "Plan it", "POLL_INTERVAL_SECONDS": "300",
                  "GITHUB_TOKEN_ENV": "", "MAX_RUNS_PER_DAY": "10",
                  "ROUTING_WAIT_SECONDS": "120", "DISPATCHER_PORT": "3456",
                  "DISPATCHER_ROUTER_FILE": "", "LINEAR_KEY_FILE": ".stage-a/env",
                  "TICKET_MODEL": "", "HOLD_FILE": "", "AUTO_REPLAN": "no", "AUTO_REPLAN_TRIES": "2",
-                 "AUTO_REPLAN_PER_DAY": "20"}
+                 "AUTO_REPLAN_PER_DAY": "20", "RUNNER_SETTINGS": ""}
 # A path under the role account's home: relative, plain characters, no `..`. It travels
 # into a shell fragment run as that account, so its shape is the whole safety.
 KEY_FILE_RE = re.compile(r"^[A-Za-z0-9_.][A-Za-z0-9_.-]*(/[A-Za-z0-9_.][A-Za-z0-9_.-]*)*$")
@@ -766,6 +771,9 @@ def validate_conf(conf):
     hold = conf.get("HOLD_FILE", "")
     if hold and not (os.path.isabs(hold) or hold.startswith("~/")):
         errors.append("HOLD_FILE must be an absolute path, or start with ~/, or be empty")
+    runner = conf.get("RUNNER_SETTINGS", "")
+    if runner and not (os.path.isabs(runner) or runner.startswith("~/")):
+        errors.append("RUNNER_SETTINGS must be an absolute path, or start with ~/, or be empty")
     for key in conf:
         if key not in CONF_KEYS and key not in OPTIONAL_CONF_KEYS:
             errors.append("unknown key %s — a misspelled key is read as missing" % key)
@@ -2117,6 +2125,9 @@ def poller_config(ctx):
     # KIT-527: the watcher's hold file, composed only when HOLD_FILE is set, for the same reason.
     if conf_value(conf, "HOLD_FILE"):
         doc["hold"] = {"file": conf_value(conf, "HOLD_FILE")}
+    # KIT-705: where our own runner's settings are, composed only when set, for the same reason.
+    if conf_value(conf, "RUNNER_SETTINGS"):
+        doc["runner_settings"] = conf_value(conf, "RUNNER_SETTINGS")
     # KIT-375: composed only when AUTO_REPLAN is yes, for the same reason.
     if conf_value(conf, "AUTO_REPLAN") == "yes":
         doc["auto_replan"] = True
@@ -3164,7 +3175,7 @@ def notifier_behind_refusal(ctx):
 # The keys the planner job's config carries only when a conf key sets them, each with that
 # conf key and the value that leaves it out (KIT-379, KIT-375).
 NEWER_JOB_KEYS = (("ticket_model", "TICKET_MODEL", "empty"), ("auto_replan", "AUTO_REPLAN", "no"),
-                  ("hold", "HOLD_FILE", "empty"))
+                  ("hold", "HOLD_FILE", "empty"), ("runner_settings", "RUNNER_SETTINGS", "empty"))
 
 
 def newer_keys_refusal(ctx, want=None):
@@ -8955,6 +8966,40 @@ def selftest():
                   (validate_conf(dict(GOOD_CONF, HOLD_FILE="/srv/watcher/hold.json")),
                    validate_conf(dict(GOOD_CONF, HOLD_FILE="~/hold.json")),
                    any("HOLD_FILE" in e for e in validate_conf(dict(GOOD_CONF, HOLD_FILE="hold.json")))),
+                  ([], [], True))
+            # KIT-705: RUNNER_SETTINGS composes where our own runner's settings are, which the job's
+            # own validator accepts; empty (the default) composes nothing, so a config written
+            # before is unchanged; and a clone whose planner would refuse the key is refused first.
+            for runner_value in ("", "/srv/runner/runner.json"):
+                rc = _ctx(os.path.join(tmp, "runner-%s" % ("set" if runner_value else "unset")),
+                          conf=dict(GOOD_CONF, RUNNER_SETTINGS=runner_value),
+                          tracker=_ready_tracker())
+                doc_r = json.loads(poller_config(rc))
+                check("poller-config-runner-settings:%s (KIT-705)"
+                      % ("set" if runner_value else "unset"),
+                      (doc_r.get("runner_settings", "absent"), poller.validate_config(doc_r)),
+                      (runner_value or "absent", []))
+            for label, code in (("old-clone", "OPTIONAL_KEYS = (\"probe\",)\n"),
+                                ("new-clone", "OPTIONAL_KEYS = (\"probe\", \"runner_settings\")\n")):
+                rrc = _ctx(os.path.join(tmp, "runner-%s" % label),
+                           conf=dict(GOOD_CONF, RUNNER_SETTINGS="/srv/runner/runner.json"),
+                           tracker=_ready_tracker())
+                rrc.host.files[ROLE_KIT_DIR + "/scripts/pipeline_plan_poller.py"] = code
+                rrc.runner = Runner(apply_it=True)
+                try:
+                    step_poller_config(rrc, True)
+                    refused = None
+                except SetupError as exc:
+                    refused = str(exc)
+                check("poller-config-runner-settings-%s (KIT-705)" % label,
+                      (refused is not None and "leave RUNNER_SETTINGS empty" in refused,
+                       "runner_settings" in (rrc.host.files.get(ROLE_POLLER_CONFIG) or "")),
+                      (label == "old-clone", label == "new-clone"))
+            check("conf-runner-settings (KIT-705)",
+                  (validate_conf(dict(GOOD_CONF, RUNNER_SETTINGS="/srv/runner/runner.json")),
+                   validate_conf(dict(GOOD_CONF, RUNNER_SETTINGS="~/.pipeline-runner/runner.json")),
+                   any("RUNNER_SETTINGS" in e for e in validate_conf(dict(
+                       GOOD_CONF, RUNNER_SETTINGS="runner.json")))),
                   ([], [], True))
             # KIT-375: AUTO_REPLAN=yes composes the re-run keys, which the job's own validator
             # accepts; no (the default) composes none, so a config written before is unchanged.

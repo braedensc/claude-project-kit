@@ -15,6 +15,8 @@ The formats it reads and writes: `docs/PIPELINE-CONTRACT.md` section 28, and sec
 - **No real session goes through it yet.** Its selftest runs it against a stand-in program.
 - **The review lane is built (KIT-644).** The review job asks for a review run of a project whose
   `review` lane is on, and files no review ticket. No project's is on yet.
+- **The planning lane is built (KIT-705).** The planner job asks for a plan run on the idea itself
+  when a project's `lanes.plan` is on, and files no planning ticket ("The planning lane", below).
 
 A lane runs through the runner only when the runner's lane for that project is on, and the caller's
 own switch too where the caller keeps one. Either one off is the way back. The review job keeps
@@ -191,6 +193,8 @@ Not: the runner starts sessions behind the old walls until some script changes t
 
 - **Nothing from its workspace.** No settings, hooks, tool servers or `CLAUDE.md` load from it.
 - **The project's instructions,** read from its default branch by the runner, handed in as a file.
+- **A plan run's brief** comes before them, in the same file: how to plan, what one document to
+  answer with, and that the idea is its ticket (`scripts/pipeline_plan_brief.py`, KIT-705).
 - **The ticket,** as the runner read it, fenced as data. A resume's text is fenced the same way.
 - **A review: its facts and its instructions, and no ticket (KIT-644).** The review job resolved the
   basis it judges against, and the ticket may have been edited since, so no read of it is given.
@@ -390,6 +394,42 @@ through `file_finding`, where the cap of three holds.
 role account's, mode 0600, outside the work and home folders. The readers must trust that user. The
 finding filer's `agent_user_id` and the bridge's agent user must both name it.
 
+## The planning lane
+
+The planner job (`scripts/pipeline_plan_poller.py`) is the first caller (KIT-705). When the owner
+moves an idea to Plan it, the planner asks the runner for one `plan` start on the idea itself.
+
+- **The switch is the runner's.** A repository plans here when `lanes.plan` is on for the runner's
+  project whose committed `delivery.json` names it. The planner's `runner_settings`
+  (`RUNNER_SETTINGS` in `stage-a.conf`) only says where this file is. Empty, every repository plans
+  on the old dispatcher.
+- **No planning ticket, no routing label.** The request names the idea. Its text opens with three
+  lines, `Planning-run trigger:`, `Idea:` and `Repository:`, then any earlier attempts and the
+  owner's note. The session gets that text and the idea, each fenced as data.
+- **The owner's move still decides.** The runner checks the idea's own history for his newest move
+  into an approved plan state. So the team's Plan it state must be in the project's
+  `approval_states.plan`. Until it is, the planner starts nothing on this lane, and says why.
+- **The same plan document.** The session ends with the one fenced block it always did. The
+  planner reads the run's record and final message, then runs the plan executor unchanged, pinned
+  to the idea. The plan's receipt names the idea.
+- **Notes and pages land on the idea.** Nothing is moved, because no ticket was made.
+- **The caps count from the store.** A day's runs and re-runs are the planner's own requests here,
+  added to the old lane's. A store the planner cannot read starts nothing.
+- **Past the planner's time-out,** a request still waiting is taken back, and a run still going is
+  asked to stop, once. A request the runner refuses ends the attempt with the runner's reason.
+
+The old lane's probe sign-off, its version check and its routing stop do not hold this lane:
+nothing here is routed. Settings the planner cannot read start nothing on either lane.
+
+**The way back.** Turn `lanes.plan` off. A run already asked finishes on the runner, and the planner
+still reads it back. Empty `RUNNER_SETTINGS` only once no run there is in flight: the day's caps
+still count the runner's runs from the planner's own records, but a run whose record was lost is
+found again only through the store.
+
+Good: `"lanes": {"plan": true}` for the drill repository. Its next idea becomes one plan run, and
+the plan lands on the idea.
+Not: a planning ticket for that idea on the work team. On this lane none is made.
+
 ## Settings
 
 One JSON file, which the installer writes from `runner.conf` (see "Installing it"). Its own example is
@@ -557,3 +597,6 @@ The runner refuses to start from inside a Claude session, or as root.
 - How the owner's answer to a session's question reaches the work again on this lane. The
   notifier pages the question as today. Taking the answer back to the session by resume is
   KIT-707's.
+- That a plan run through the runner files a plan live. The planner's selftest runs every case on
+  both lanes against a stand-in runner over a real store. The first live run is its own ticket
+  (KIT-887), once the runner is installed.

@@ -57,7 +57,8 @@ from pipeline_bridge_transport import BridgeError  # noqa: E402
 from pipeline_bridge_config import (ASK_AGAIN_BIND, DONE, EXIT_USAGE, EXPIRED,  # noqa: E402
                                     OPEN, REFUSED, SLACK_USER_RE, _TICKET_WORD_RE,
                                     credit_terms, epoch, iso, key_of, label_names, plan_run,
-                                    run_idea, state_path, ticket_number, ts_float)
+                                    receipt_idea, run_idea, state_path, ticket_number,
+                                    ts_float)
 
 # KIT-305: how many passes a plan's close keeps trying to close its idea when the tracker would
 # not read or move it. A cause that retrying cannot mend is said once and never retried.
@@ -3314,16 +3315,17 @@ class PlansMixin(object):
     def plan_idea(self, rec):
         """(idea, why): the idea a plan was filed from, found as a re-plan finds it (RP-1): the
         plan's receipt `Plan id: <run>/...`, then the run's `Idea:` line, each on a ticket the
-        owner's key filed. `idea` is the tracker's ticket, or None with why, in words. The plan is
-        read again here, because the epic read carries no description. Raises BridgeError when
-        the tracker cannot be read."""
+        owner's key filed. On our own runner's lane the receipt names the idea itself
+        (receipt_idea, KIT-705). `idea` is the tracker's ticket, or None with why, in words. The
+        plan is read again here, because the epic read carries no description. Raises BridgeError
+        when the tracker cannot be read."""
         owner = self.cfg["owner_user_id"]
         plan = self.tracker.issue(rec["ticket"])
         run = plan_run(plan, owner) if plan else None
         if not run:
             return None, "it carries no receipt of the planning run it came from"
         node = self.tracker.issue(run)
-        ident = run_idea(node, owner) if node else None
+        ident = receipt_idea(node, owner)
         if not ident:
             return None, "its planning run %s names no idea I can trust" % run
         idea = self.tracker.issue(ident)
@@ -5795,6 +5797,19 @@ def cases_finish(kit):
               outcome(case_idea_closes),
               ((EXIT_OK, [("uuid-6", "st-done")], 1, []), True, [("uuid-6", "st-done")], 1,
                [("uuid-50", "st-done"), ("uuid-6", "st-done")]))
+
+        def case_idea_closes_on_the_runner_lane():
+            # KIT-705: no planning ticket on our own runner's lane. The executor is pinned to the
+            # idea, so the plan's receipt names the idea itself, and that idea closes the same way.
+            def setup(t):
+                t.issues["PROD-50"]["description"] += "\n\nPlan id: PROD-6/abc"
+                t.issues["PROD-6"]["state"] = {"id": "st-unstarted", "name": "Plan it",
+                                               "type": "unstarted"}
+                t.issues["PROD-6"]["team"] = {"key": "PROD"}
+            c, s, t, root, code = finished("fin-idea-runner", setup=setup)
+            return code, idea_moves(t), len(idea_comments(t))
+        check("a-plan-whose-receipt-names-the-idea-itself-closes-that-idea (KIT-705)",
+              outcome(case_idea_closes_on_the_runner_lane), (EXIT_OK, [("uuid-6", "st-done")], 1))
 
         def case_idea_elsewhere():
             c, s, t, root, code = finished("fin-idea-else", setup=with_idea("Backlog", "backlog"))

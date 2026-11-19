@@ -917,6 +917,25 @@ def plan_run(node, owner):
     return runs[0].upper()
 
 
+def receipt_idea(node, owner):
+    """The idea a plan's receipt leads to, or None (KIT-705). `node` is the ticket the receipt
+    names (plan_run). On the old dispatcher's lane that is one of the planner's planning
+    tickets, read as its idea (run_idea). On our own runner's lane the executor is pinned to the
+    idea itself, so the ticket the receipt names IS the idea: a ticket with no machine marks at
+    all. Any ticket with a planning or review ticket's marks that is not the planner's own run,
+    a planning ticket whose trigger line was edited away among them, names no idea: it fails
+    closed, never as an idea of the owner's. The receipt counts only on a plan the owner's key
+    filed (plan_run), so this too only chooses what is asked about."""
+    if not node or not node.get("identifier"):
+        return None
+    if poller.is_run_ticket(node):
+        return run_idea(node, owner)
+    if poller.machine.issue_is_machine_ticket(node):
+        return None
+    ident = str(node["identifier"])
+    return ident.upper() if re.match(r"^%s$" % TICKET_RE, ident) else None
+
+
 def ticket_number(identifier):
     try:
         return int((identifier or "").rsplit("-", 1)[1])
