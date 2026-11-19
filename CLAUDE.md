@@ -244,7 +244,8 @@ npm run test:gh-fallback     # GitHub REST fallback selftest (and that it cannot
 npm run test:review-local    # Stage E publisher: fork guard, secret scrub, 0/3/2 exits
 npm run test:review-poller   # Stage E poller: discovery, sanitizer, delegate-and-collect;
                              #   on the work teams, routing checked in the same pass and a
-                             #   misroute pauses one repository (KIT-597)
+                             #   misroute pauses one repository (KIT-597); every end-to-end
+                             #   case on both lanes, a ticket's and our own runner's (KIT-644)
 npm run test:bounce          # Stage E bounce driver: ledger, budget source, needs-human
 npm run test:criteria-snapshot  # the review basis's tier 2 (KIT-131): snapshot at a
                              #   person's delegation, lag recorded, one change notice
@@ -276,7 +277,9 @@ npm run test:settings        # the settings folder (KIT-853): one machine.conf u
                              #   value written to every part file the map names, shown first, --apply
                              #   refused under a model; no secret, no other reader, no link, no repo;
                              #   a file per project composed into the parts' lists, and a first-run
-                             #   gather that copies no secret and writes nothing before a yes (KIT-854)
+                             #   gather that copies no secret and writes nothing before a yes (KIT-854);
+                             #   a hand edit shown with both values for the person's choice, and a
+                             #   plain export (no secret, no record) and an import on a new Mac (KIT-855)
 npm run test:chat-lane-setup # chat-lane composer: owner's grant, fence keeps defaults, verify agent-refused
 npm run test:model-switch    # the dispatcher's chat-model switch (KIT-385): the pair alone or no
                              #   go, every open pipeline ticket on the default tagged first
@@ -312,7 +315,8 @@ npm run test:conflict-waker-setup  # the waker's installer: a user LaunchAgent, 
 npm run test:update          # review-and-update (KIT-238): UNKNOWN is never "current";
                              #   an update refuses under an agent and stops before any change
 npm run test:watch           # the health watch (KIT-236): alerts on change only, debounced,
-                             #   no page without internet, delivery checked
+                             #   no page without internet, delivery checked; its installer's
+                             #   `check` rows, `apply` answers through a pipe, the first-pass ceiling (KIT-869)
 npm run test:catchup         # the catch-up poller (KIT-47): a lost delegation re-prompted
                              #   once, past Linear's retries, never twice, gated on a live route
 npm run test:sweep           # the sweep (KIT-464): a finished run's worktree, ticket folder,
@@ -389,7 +393,8 @@ npm run test:window          # the working window (KIT-437): open or closed at a
 npm run test:queue-order     # the queue's order and limits (KIT-434): what starts next, in lanes,
                              #   within the day's load; each runaway stop holds every start
 npm run test:usage-runs      # the usage runs (KIT-422): the dispatcher's logs read into priced,
-                             #   classified, timed runs; a crash unpriced never zero, reads only
+                             #   classified, timed runs; a crash unpriced never zero, reads only;
+                             #   the runner's records too, a run both hold counted once (KIT-860)
 npm run test:usage           # the usage job (KIT-422): the runs counted into one file of spend;
                              #   the week unknown not guessed, a source it could not read said,
                              #   a file that does not conform never written
@@ -419,6 +424,9 @@ npm run test:runner          # the runner (KIT-642): start, resume, stop and a r
 npm run test:runner-limits   # the runner's limits (KIT-643): stand-ins that grow without bound
                              #   in memory (a child that left the group too) and on disk stopped
                              #   with their whole tree; the floor; each incident told once
+npm run test:runner-setup    # the runner's installer (KIT-859): every lane off for every project; on
+                             #   within its first-pass ceiling, else left off and never started at boot;
+                             #   one rows document; its answer piped, never typed; refused under a model
 npm run test:session-tools   # a session's own tracker tools (KIT-706): five tools tied to its run, no
                              #   ticket argument; hostile text refused or made inert; §8's caps; each
                              #   comment read by its job; only the fixed requests sent; real stdio

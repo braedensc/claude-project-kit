@@ -82,7 +82,7 @@ ALLOWED_ARGS = frozenset({
     "merge", "push", "--dry-run", "--apply", "--conf", "--json",
     "stage-e.conf", "stage-a.conf", "notifier.conf", "bridge.conf", "chat-lane.conf",
     "conflict-waker.conf", "queue.conf", "sweep.conf", "watcher.conf", "update.conf",
-    "acceptance.conf", "validator.conf",
+    "acceptance.conf", "runner.conf", "validator.conf",
 })
 
 # (earlier, later): the later part must need the earlier one, directly or through others.
@@ -436,7 +436,7 @@ def rule_docs(parts):
 
 
 # Placeholders a job row may hold that are no settings key: where the code itself decides.
-JOB_PLACEHOLDERS = frozenset({"role home", "owner home", "kit", "python", "claude", "conf file"})
+JOB_PLACEHOLDERS = frozenset({"role home", "owner home", "kit", "python", "claude", "conf file", "commit"})
 _PLACEHOLDER = re.compile(r"<([^<>]+)>")
 
 
@@ -995,6 +995,13 @@ def selftest():
            "loads its job (KIT-850)",
            [(isinstance(p.get("ceiling"), int) and not isinstance(p.get("ceiling"), bool),
              [j["loaded_by"] for j in p["jobs"]]) for p in notifier], [(True, ["installer"])])
+    # KIT-869: the health check's installer does the same, through its program-facing pair.
+    watch = [p for p in kit_parts if p.get("installer") == "scripts/pipeline_watch.py"]
+    expect("the kit's health-check part declares a whole-number first-pass ceiling, its installer "
+           "loads its job, and its check and apply are the program-facing pair (KIT-869)",
+           [(isinstance(p.get("ceiling"), int) and not isinstance(p.get("ceiling"), bool),
+             [j["loaded_by"] for j in p["jobs"]], p["check"]["args"][:1], p["apply"]["args"][:1])
+            for p in watch], [(True, ["installer"], ["check"], ["apply"])])
 
     print("%s: %d failure(s)" % ("FAIL" if failures else "OK", len(failures)))
     return 1 if failures else 0

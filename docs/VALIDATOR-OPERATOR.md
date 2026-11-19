@@ -887,7 +887,7 @@ on every pass.
 
 ### For a program: `check` and `apply`
 
-The one command (`scripts/pipeline_install.py`, step 3f) runs this when the Mac has a
+The one command (`scripts/pipeline_install.py`, step 3h) runs this when the Mac has a
 `validator.conf`. It asks for no Mac password for it.
 
 - **`check`** prints one JSON document of rows on stdout and its words on stderr. It changes,

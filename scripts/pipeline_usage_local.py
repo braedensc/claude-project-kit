@@ -20,12 +20,17 @@ like the status job. It reads files, and it writes one.
      never zero), classified, timed and signed in. Nothing a session can write decides what a
      run was. The same module reads each spend ledger the config names (contract §30): the
      model calls no dispatcher log records, made by the morning job, the stand-up, the tech
-     lead's turns and the conflict waker (KIT-844).
+     lead's turns and the conflict waker (KIT-844). And when the config names the runner's
+     store, its run records: each one run, of the record's own kind, priced as its share of
+     its session's running total or unpriced, and a run the logs hold too counted once
+     (KIT-860, contract §28).
   2. This job counts the runs: spend per local day, and since the plan's weekly reset by kind
      of work and by piece; how long sessions ran; Anthropic's newest word on each usage window;
      how each session signed in; the runs that never reached the model; and the runs the plan's
      limit cut off (a rejected window, then an error or no result), newest first. Each spend
-     ledger's calls count in its caller's kind, and `spend` says what was read of each.
+     ledger's calls count in its caller's kind, and `spend` says what was read of each. Each
+     day and the week say how much of them came from each source (`by_source`: the logs, the
+     runner, the spend ledgers and the judge), and each run listed by itself says its source.
   3. One document in the shape of contract §17, checked against
      schemas/pipeline-usage.schema.json, written atomically and world-readable (0644).
 
@@ -39,12 +44,13 @@ WHEN A SOURCE FAILS.  That source is written as `could-not-read` (or `partly-rea
 reason, and the file is still written. A source that is not read is unknown, never zero: a
 reader says "I couldn't check". The logs are the one source the figures cannot do without. A
 spend ledger that could not be read is named in `spend`, with no figure at all, and the pass is
-`partial`.
+`partial`. So is a runner store that could not be read: `sources.runner` says why, and none of
+its runs is counted, never as zero.
 
 EXIT CODES (contract §17, by §13's rule).
   0  every source was read, and the file was written
-  3  the file was written, and at least one source, the judge's record or a spend ledger was
-     not read whole: the file says which
+  3  the file was written, and at least one source (the runner's store among them), the judge's
+     record or a spend ledger was not read whole: the file says which
   1  the logs could not be read, no source could be, the pass crashed, or the file could not
      be written or did not conform (a document that does not conform is never written)
   2  usage or config: nothing was read, and nothing was written
@@ -73,8 +79,8 @@ import check_schemas  # noqa: E402  (the one definition of "conforms", contract 
 import pipeline_spend_ledger as spend_ledger  # noqa: E402  (the spend ledgers' rows, §30)
 import pipeline_usage_runs as usage_runs  # noqa: E402  (the reading half: the runs themselves)
 from pipeline_usage_runs import (  # noqa: E402
-    COULD_NOT, KINDS, OFF, PARTLY, READ, SOURCES, SPEND_KINDS, TICKET_RE, WORD_OTHER, _iso,
-    line, scan, unmatched_placeholders)
+    COULD_NOT, KINDS, LOGS, OFF, PARTLY, READ, RUNNER, SOURCES, SPEND_KINDS, TICKET_RE,
+    WORD_OTHER, _iso, line, scan, unmatched_placeholders)
 
 USAGE_SCHEMA = "pipeline-usage/1"
 SCHEMA_NAME = "pipeline-usage"
@@ -94,10 +100,12 @@ SPEND_LEDGER_PATHS = {
     "standup": "~/.stage-e/state/" + spend_ledger.FILE_NAMES["standup"],
     "tech_lead": "~/.stage-e/state/" + spend_ledger.FILE_NAMES["tech_lead"],
 }
-# No caller writes its ledger yet, so every one is off by default: a ledger nothing writes would read
-# as no calls, a zero nobody measured (Stage E on #622). KIT-687 adds the writers, and with them
-# makes SPEND_LEDGER_PATHS the defaults.
-DEFAULT_SPEND_LEDGERS = dict((caller, "") for caller in spend_ledger.CALLERS)
+# Each caller writes its ledger since KIT-687, so the three this account can read are on by default,
+# each where its writer puts it with its own defaults: the selftest pins every one to its writer's
+# own default, so none is a guess. A ledger nothing writes would read as no calls, a zero nobody
+# measured (Stage E on #622), so the waker's stays off: it is in a person's home.
+DEFAULT_SPEND_LEDGERS = dict((caller, SPEND_LEDGER_PATHS.get(caller, ""))
+                             for caller in spend_ledger.CALLERS)
 DEFAULT_LOOKBACK_DAYS = 8
 MAX_LOOKBACK_DAYS = 31
 
@@ -115,6 +123,11 @@ JUDGE_KIND = "judge"
 # run's kinds already, and two are kinds of their own, never a run the plan's limit cut off.
 LEDGER_KINDS = tuple(k for k in dict.fromkeys(SPEND_KINDS.values()) if k not in KINDS)
 COST_KINDS = KINDS + (JUDGE_KIND,) + LEDGER_KINDS
+# Where each counted run came from (KIT-860): the old dispatcher's logs, the runner's records, the
+# spend ledgers and the judge's record. Every run counts under exactly one, so each day's and the
+# week's `by_source` add up to their totals.
+SPEND_SOURCE, JUDGE_SOURCE = "spend", "judge"
+COUNT_SOURCES = (LOGS, RUNNER, SPEND_SOURCE, JUDGE_SOURCE)
 # The judge's calls file (scripts/pipeline_watcher_judge.py, contract §17): times and dollars only.
 JUDGE_SCHEMA = "pipeline-watcher-judge-calls/1"
 JUDGE_FILE_CAP = 4 * 1024 * 1024
@@ -153,9 +166,13 @@ CONFIG_KEYS = {
                          % DEFAULT_STAGE_A_STATE,
     "judge_file": "the watcher judge's judge-calls.json, whose calls the judge's cost is read "
                   "from (default: empty, which turns this source off)",
+    "runner_store": "the runner's store_dir (contract section 28), whose run records this job "
+                    "counts beside the logs (KIT-860); absolute or ~/. Default: empty, which "
+                    "turns this source off. Name it when a lane moves to the runner",
     "spend_ledgers": "for each caller (%s), its spend ledger's path, absolute or ~/ (contract "
-                     "section 30), where its job writes it: %s. \"\" or a caller left out turns "
-                     "its ledger off, and every one is off by default until its caller writes it"
+                     "section 30). A caller left out takes its default, where its job writes it: "
+                     "%s. The conflict waker's is off by default: it is in a person's home, which "
+                     "this account cannot read. \"\" turns a ledger off"
                      % (", ".join(spend_ledger.CALLERS),
                         ", ".join("%s %s" % kv for kv in sorted(SPEND_LEDGER_PATHS.items()))),
     "reviews_team_key": "optional: the KEY of an old Reviews team, e.g. \"REV\": a run in a folder "
@@ -172,6 +189,7 @@ EXAMPLE_CONFIG = {
     "stage_e_state_dir": DEFAULT_STAGE_E_STATE,
     "stage_a_state_dir": DEFAULT_STAGE_A_STATE,
     "judge_file": "",
+    "runner_store": "",
     "spend_ledgers": DEFAULT_SPEND_LEDGERS,
     "reviews_team_key": "REV",
     "out": DEFAULT_OUT,
@@ -276,6 +294,8 @@ def load_config(path):
         "stage_a_state_dir": resolve_path(raw.get("stage_a_state_dir", DEFAULT_STAGE_A_STATE),
                                           "stage_a_state_dir", off_when_empty=True),
         "judge_file": resolve_path(raw.get("judge_file", ""), "judge_file", off_when_empty=True),
+        "runner_store": resolve_path(raw.get("runner_store", ""), "runner_store",
+                                     off_when_empty=True),
         "spend_ledgers": ledgers,
         "reviews_team_key": team,
         "out": out,
@@ -321,31 +341,40 @@ def load_spend_ledgers(raw):
 # --------------------------------------------------------------------------- #
 def blank_totals():
     return {"usd": 0.0, "runs": 0, "unpriced": 0, "seconds": 0,
-            "by_kind": dict((k, {"runs": 0, "usd": 0.0}) for k in COST_KINDS)}
+            "by_kind": dict((k, {"runs": 0, "usd": 0.0}) for k in COST_KINDS),
+            "by_source": dict((s, {"runs": 0, "unpriced": 0, "usd": 0.0})
+                              for s in COUNT_SOURCES)}
 
 
 def add_run(totals, r):
+    """One run into a day's or the week's totals: by its kind, and by the source it was counted
+    from (KIT-860), so each split adds up to the totals."""
     totals["runs"] += 1
     totals["seconds"] += r["seconds"]
     kind = totals["by_kind"][r["kind"]]
+    source = totals["by_source"][r["source"]]
     kind["runs"] += 1
+    source["runs"] += 1
     if r["cost"] is None:
         totals["unpriced"] += 1
+        source["unpriced"] += 1
     else:
         totals["usd"] += r["cost"]
         kind["usd"] += r["cost"]
+        source["usd"] += r["cost"]
 
 
 def finish_totals(totals):
     totals["usd"] = round(totals["usd"], 6)
-    for kind in totals["by_kind"].values():
-        kind["usd"] = round(kind["usd"], 6)
+    for split in list(totals["by_kind"].values()) + list(totals["by_source"].values()):
+        split["usd"] = round(split["usd"], 6)
     return totals
 
 
 def unknown_week():
     return {"known": False, "starts_at": None, "resets_at": None, "usd": None, "runs": None,
-            "unpriced": None, "seconds": None, "by_kind": None, "by_model": None}
+            "unpriced": None, "seconds": None, "by_kind": None, "by_source": None,
+            "by_model": None}
 
 
 def judge_note(state, reason=None):
@@ -396,7 +425,7 @@ def read_judge(path):
             return judge_note(COULD_NOT, "the judge's record holds a call this job does not "
                                          "know, so its cost is not counted"), []
         calls.append({"last": float(at), "cost": float(usd) if priced else None,
-                      "seconds": 0, "kind": JUDGE_KIND})
+                      "seconds": 0, "kind": JUDGE_KIND, "source": JUDGE_SOURCE})
     return judge_note(READ), calls
 
 
@@ -493,7 +522,7 @@ def summarize(cfg, scanned, now, started):
     for caller in spend_ledger.CALLERS:
         got = ledgers.get(caller) or {"note": {"state": OFF, "reason": None}, "calls": None}
         for c in got["calls"] or []:
-            c["date"] = local_date(c["last"])
+            c["date"], c["source"] = local_date(c["last"]), SPEND_SOURCE
         spend[caller] = spend_entry(got["note"], got["calls"], listed_days)
         if spend[caller]["calls"] is not None:
             spent += [c for c in got["calls"] if c["date"] in listed_days]
@@ -504,6 +533,12 @@ def summarize(cfg, scanned, now, started):
     for r in runs:
         r["date"] = local_date(r["last"])
     inside = [r for r in runs if r["date"] in listed_days]
+    # The runner's runs (KIT-860): each one run, a run the logs hold too already counted from its
+    # log. A store that is off or could not be read gives none, and `sources.runner` says which.
+    for r in scanned.get("runner") or []:
+        r["date"] = local_date(r["last"])
+    ran = [r for r in scanned.get("runner") or [] if r["date"] in listed_days]
+    counted = inside + ran
     for c in judged:
         c["date"] = local_date(c["last"])
     judged = [c for c in judged if c["date"] in listed_days]
@@ -525,7 +560,7 @@ def summarize(cfg, scanned, now, started):
             why = ("the %d-day lookback does not reach the start of the plan's week: raise "
                    "lookback_days to at least 8" % cfg["lookback_days"])
         elif current:
-            week_runs = [r for r in inside if r["last"] >= begins]
+            week_runs = [r for r in counted if r["last"] >= begins]
             totals = blank_totals()
             by_model = {}
             for r in week_runs:
@@ -545,7 +580,7 @@ def summarize(cfg, scanned, now, started):
     days = []
     for name in names:
         totals = blank_totals()
-        for r in inside + judged + spent:
+        for r in counted + judged + spent:
             if r["date"] == name:
                 add_run(totals, r)
         days.append(dict(finish_totals(totals), date=name))
@@ -558,8 +593,14 @@ def summarize(cfg, scanned, now, started):
             p["usd"] += r["cost"] or 0.0
             p["last"] = max(p["last"], r["last"])
     listed = sorted(pieces.values(), key=lambda p: (-p["usd"], -p["last"], p["id"]))[:PIECES_CAP]
-    pieces = [{"id": p["id"], "kind": workspace_kind(p["id"], cfg, scanned["planners"],
-                                                     scanned.get("reviewers")),
+    # A ticket the runner reviewed or planned is a review's or a planning run's piece: its record
+    # says so, as the review poller's and the idea gate's records do for the logs (KIT-860).
+    by_runner = scanned.get("runner") or []
+    planners = set(scanned["planners"] or ()) | set(
+        r["workspace"] for r in by_runner if r["kind"] == "planner")
+    reviewers = set(scanned.get("reviewers") or ()) | set(
+        r["workspace"] for r in by_runner if r["kind"] == "review")
+    pieces = [{"id": p["id"], "kind": workspace_kind(p["id"], cfg, planners, reviewers),
                "usd": round(p["usd"], 6), "runs": p["runs"], "last_at": _iso(p["last"])}
               for p in listed]
     windows = {}
@@ -575,12 +616,12 @@ def summarize(cfg, scanned, now, started):
         word = r["key_source"] or KEY_UNSEEN
         counts[word] = counts.get(word, 0) + 1
         if word not in PLAN_SOURCES + (KEY_UNSEEN,) and TICKET_RE.match(r["workspace"]):
-            keyed.append({"id": r["workspace"], "at": _iso(r["start"])})
+            keyed.append({"id": r["workspace"], "at": _iso(r["start"]), "source": r["source"]})
     keyed.sort(key=lambda k: (k["at"], k["id"]), reverse=True)
     stopped = sorted((r for r in inside if r["limit_stop"]),
                      key=lambda r: (r["last"], r["workspace"]), reverse=True)
     stops = [{"ticket": r["workspace"] if TICKET_RE.match(r["workspace"]) else None,
-              "kind": r["kind"], "ended_at": _iso(r["last"]),
+              "kind": r["kind"], "source": r["source"], "ended_at": _iso(r["last"]),
               "window": r["limit_stop"]["window"],
               "resets_at": (_iso(r["limit_stop"]["resets_at"])
                             if r["limit_stop"]["resets_at"] is not None else None)}
@@ -618,7 +659,8 @@ def crashed(cfg, started, now, exc):
     sources = {}
     for name in SOURCES:
         off = (name == "ledger" and not cfg["stage_e_state_dir"]) or (
-            name == "planner" and not cfg["stage_a_state_dir"])
+            name == "planner" and not cfg["stage_a_state_dir"]) or (
+            name == "runner" and not cfg.get("runner_store"))
         sources[name] = ({"state": OFF, "asked": 0, "answered": 0, "reason": None,
                           "read_at": None} if off else
                          {"state": COULD_NOT, "asked": 0, "answered": 0, "reason": why,
@@ -666,6 +708,10 @@ def summary_lines(doc, dry_run):
                       week["seconds"] / 3600.0, week["starts_at"], week["resets_at"]))
         out.append("  by kind  " + ", ".join(
             "%s %s" % (LABELS[k], dollars(week["by_kind"][k]["usd"])) for k in COST_KINDS))
+        out.append("  by source " + ", ".join(
+            "%s %d run%s %s" % (s, week["by_source"][s]["runs"],
+                                "" if week["by_source"][s]["runs"] == 1 else "s",
+                                dollars(week["by_source"][s]["usd"])) for s in COUNT_SOURCES))
     elif doc["sources"]["logs"]["state"] != COULD_NOT:
         out.append("  week     unknown: no usable weekly event in the logs, or the lookback "
                    "does not reach it")
@@ -792,6 +838,7 @@ def selftest():
     time.tzset()
     try:
         _cases(check)
+        _selftest_writers(check)
     finally:
         if saved_zone is None:
             os.environ.pop("TZ", None)
@@ -846,6 +893,14 @@ def _cases(check):
             out[k] = {"runs": n, "usd": usd}
         return out
 
+    def sourced(**counted):
+        """A day's or the week's by_source (KIT-860): (runs, unpriced, usd) for each source
+        given, and zeros for the rest."""
+        out = dict((s, {"runs": 0, "unpriced": 0, "usd": 0.0}) for s in COUNT_SOURCES)
+        for s, (n, unpriced, usd) in counted.items():
+            out[s] = {"runs": n, "unpriced": unpriced, "usd": usd}
+        return out
+
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp = os.path.realpath(tmp)
@@ -871,10 +926,11 @@ def _cases(check):
                for s in SOURCES],
               [("logs", READ, 48, 48, "2026-11-03T12:00:00Z"),
                ("ledger", READ, 4, 4, "2026-11-03T12:00:00Z"),   # KIT-596: + the review record
-               ("planner", READ, 1, 1, "2026-11-03T12:00:00Z")])
+               ("planner", READ, 1, 1, "2026-11-03T12:00:00Z"),
+               ("runner", OFF, 0, 0, None)])                      # KIT-860: not named
         check("…and every pass says it, in the sources' own words",
-              ([l.split()[0] for l in said[1:4]], said[-2], said[-1].startswith("  written to ")),
-              (["logs", "ledger", "planner"], "  result: ok", True))
+              ([l.split()[0] for l in said[1:5]], said[-2], said[-1].startswith("  written to ")),
+              (["logs", "ledger", "planner", "runner"], "  result: ok", True))
 
         check("one entry for each local date in the lookback, oldest first, today last",
               [d["date"] for d in dig(doc, "days")],
@@ -886,20 +942,22 @@ def _cases(check):
             return dict((k, v) for k, v in by_date.get(date, {}).items() if k != "date")
         check("a quiet day is zeros, with every kind present",
               day("2026-10-29"), {"usd": 0.0, "runs": 0, "unpriced": 0, "seconds": 0,
-                                  "by_kind": kinds()})
+                                  "by_kind": kinds(), "by_source": sourced()})
         check("a run before the week began is still in its day", day("2026-10-28"),
               {"usd": 0.8, "runs": 1, "unpriced": 0, "seconds": 30,
-               "by_kind": kinds(coding=(1, 0.8))})
+               "by_kind": kinds(coding=(1, 0.8)), "by_source": sourced(logs=(1, 0, 0.8))})
         check("a day's spend, runs, unpriced runs, seconds and kinds", day("2026-11-02"),
               {"usd": 5.7, "runs": 12, "unpriced": 1, "seconds": 1180,
                "by_kind": kinds(review=(1, 0.4), planner=(1, 1.1), coding=(1, 2.0),
                                 bounce_fix=(2, 0.6), conflict_fix=(2, 0.5), catch_up=(1, 0.05),
-                                other_later=(4, 1.05))})
+                                other_later=(4, 1.05)),
+               "by_source": sourced(logs=(12, 1, 5.7))})
         check("a run counts on the local date of its last line: 22:30 UTC is the next day "
               "at UTC+3", day("2026-11-03"),
               {"usd": 1.9, "runs": 8, "unpriced": 1, "seconds": 320,
                "by_kind": kinds(tech_lead=(3, 0.5), review=(1, 0.3), coding=(3, 0.7),
-                                other_later=(1, 0.4))})
+                                other_later=(1, 0.4)),
+               "by_source": sourced(logs=(8, 1, 1.9))})
         week = dig(doc, "week")
         check("the week starts at the newest weekly event's reset, less seven days",
               (dig(week, "known"), dig(week, "starts_at"), dig(week, "resets_at")),
@@ -958,9 +1016,9 @@ def _cases(check):
               "the SDK's list lacks) is listed by ticket id and time, newest first; a chat "
               "run is counted and never listed",
               dig(doc, "sign_in", "api_key_runs"),
-              [{"id": "ENG-10", "at": "2026-11-02T20:00:00Z"},
-               {"id": "ENG-11", "at": "2026-11-02T11:30:00Z"},
-               {"id": "ENG-11", "at": "2026-11-02T09:00:00Z"}])
+              [{"id": "ENG-10", "at": "2026-11-02T20:00:00Z", "source": "logs"},
+               {"id": "ENG-11", "at": "2026-11-02T11:30:00Z", "source": "logs"},
+               {"id": "ENG-11", "at": "2026-11-02T09:00:00Z", "source": "logs"}])
         check("runs that never reached the model: only the placeholders no run follows, and "
               "only on a day in the lookback", dig(doc, "never_reached_model"), 2)
         text = text_of(cfg)
@@ -974,7 +1032,7 @@ def _cases(check):
         # -- the week unknown: never zero, never a guess -------------------------------------
         UNKNOWN_WEEK = {"known": False, "starts_at": None, "resets_at": None, "usd": None,
                         "runs": None, "unpriced": None, "seconds": None, "by_kind": None,
-                        "by_model": None}
+                        "by_source": None, "by_model": None}
         for label, weekly in (("no weekly event at all", "none"),
                               ("a weekly reset that has passed, so that week is over", "stale"),
                               ("a weekly reset more than a week ahead, so that week has not "
@@ -1056,7 +1114,9 @@ def _cases(check):
               "unpriced, and the day's dollars include them",
               dict((k, v) for k, v in days_j["2026-11-03"].items() if k != "by_kind"),
               dict((k, v) for k, v in dict(base_days["2026-11-03"], usd=1.94, runs=10,
-                                           unpriced=2).items() if k != "by_kind"))
+                                           unpriced=2, by_source=sourced(
+                                               logs=(8, 1, 1.9), judge=(2, 1, 0.04))
+                                           ).items() if k != "by_kind"))
         check("…and the day's kinds say it: two judge runs, four cents",
               days_j["2026-11-03"]["by_kind"]["judge"], {"runs": 2, "usd": 0.04})
         check("…a call on an earlier day counts there, a call before the lookback and one "
@@ -1241,6 +1301,113 @@ def _cases(check):
                dig(doc_q, "spend", "tech_lead", "calls"), dig(doc_q, "spend", "tech_lead", "usd")),
               (EXIT_PARTIAL, PARTIAL, PARTLY, 2, 0.3))
 
+        # -- the runner's runs count beside the logs, each under its source (KIT-860) ---------
+        real_add_run, real_scan_r, real_judge = add_run, scan, judge
+
+        def runner_pass(name, store=True, spend=False, **patched):
+            """One pass of the standard world with the runner's store (or, `store` False, one
+            the config names and that is not there), and with `spend` a spend ledger for each
+            caller too, module names patched for a mutant: (exit, what it said, the file)."""
+            root = os.path.join(tmp, name)
+            where = kit.runner_world(root) if store else os.path.join(root, "no-store")
+            more = {"spend_ledgers": spend_world(root)} if spend else {}
+            cfg_x, _ = std_world(root, runner_store=where, **more)
+            saved = dict((k, globals()[k]) for k in patched)
+            globals().update(patched)
+            try:
+                code_x, said_x = go(cfg_x)
+            finally:
+                globals().update(saved)
+            return code_x, said_x, written(cfg_x)
+
+        def adds_up(doc_x):
+            """Whether every day's and the week's by_source adds up to its runs, unpriced runs
+            and dollars."""
+            parts = list(dig(doc_x, "days") or []) + [dig(doc_x, "week")]
+            return all(sum(s["runs"] for s in p["by_source"].values()) == p["runs"]
+                       and sum(s["unpriced"] for s in p["by_source"].values()) == p["unpriced"]
+                       and round(sum(s["usd"] for s in p["by_source"].values()), 6) == p["usd"]
+                       for p in parts)
+
+        def runner_facts_local(doc_x):
+            """What a mutant of the runner's counting would change: each day's and the week's
+            by_source, and the runner source's state."""
+            return ([d["by_source"] for d in dig(doc_x, "days")], dig(doc_x, "week", "by_source"),
+                    dig(doc_x, "sources", "runner", "state"), dig(doc_x, "result"))
+        code_r, said_r, doc_r = runner_pass("runner-read")
+        days_r = dict((d["date"], d) for d in dig(doc_r, "days"))
+        check("KIT-860 the runner's store read: the pass is ok, the source says so, and the file "
+              "conforms",
+              (code_r, dig(doc_r, "result"),
+               [dig(doc_r, "sources", "runner", k) for k in ("state", "asked", "answered")],
+               check_schemas.document_problems(doc_r, SCHEMA_NAME)),
+              (EXIT_OK, OK, [READ, 1, 1], []))
+        check("…each day counts the runner's runs under `runner`, at their own cost or unpriced, "
+              "the logs' as they were",
+              [(d, days_r[d]["by_source"]) for d in ("2026-11-02", "2026-11-03")],
+              [("2026-11-02", sourced(logs=(12, 1, 5.7), runner=(2, 1, 0.0))),
+               ("2026-11-03", sourced(logs=(8, 1, 1.9), runner=(6, 3, 1.95)))])
+        check("…and the day's kinds take them: a run the logs hold too counted once, under the "
+              "kind its record gives",
+              days_r["2026-11-03"]["by_kind"],
+              kinds(tech_lead=(3, 0.5), review=(2, 0.3), coding=(4, 1.45), bounce_fix=(3, 1.2),
+                    other_later=(2, 0.4)))
+        check("…the week counts them too, and every by_source adds up to its totals",
+              ([dig(doc_r, "week", k) for k in ("runs", "unpriced", "usd")],
+               dig(doc_r, "week", "by_source"), adds_up(doc_r)),
+              ([29, 6, 12.55], sourced(logs=(21, 2, 10.6), runner=(8, 4, 1.95)), True))
+        code_b, _said_b, doc_b = runner_pass("runner-and-spend", spend=True)
+        check("…and with the spend ledgers' own-cost calls beside the runner's runs, every day and "
+              "the week still add up across all four sources, the calls under `spend`",
+              (code_b, adds_up(doc_b), dig(doc_b, "week", "by_source"),
+               [dig(doc_b, "week", k) for k in ("runs", "unpriced", "usd")]),
+              (EXIT_OK, True, sourced(logs=(21, 2, 10.6), runner=(8, 4, 1.95),
+                                      spend=(6, 2, 0.36)), [35, 8, 12.91]))
+        pieces_r = dict((p["id"], (p["kind"], p["usd"], p["runs"])) for p in dig(doc_r, "pieces"))
+        check("…its tickets are pieces, a ticket it reviewed or planned of that kind, and a run "
+              "both hold is one run of its piece",
+              [pieces_r.get(t) for t in ("ENG-30", "ENG-31", "ENG-32", "ENG-13", "ENG-14")],
+              [("coding", 1.65, 3), ("review", 0.0, 1), ("planner", 0.0, 1), ("coding", 0.7, 2),
+               ("coding", 0.5, 1)])
+        check("…a runner run names no sign-in and no usage event, so sign-in and the stops are "
+              "the logs' alone, and each listed run says it came from the logs",
+              (dig(doc_r, "sign_in", "counts") == dig(doc, "sign_in", "counts"),
+               sorted(set(r["source"] for r in dig(doc_r, "sign_in", "api_key_runs")
+                          + dig(doc_r, "limit_stops")))),
+              (True, ["logs"]))
+        check("…and the summary says the source and the week by source",
+              ([l.split()[:2] for l in said_r if l.startswith("  runner ")],
+               [l for l in said_r if l.startswith("  by source ")]),
+              ([["runner", "read"]],
+               ["  by source logs 21 runs $10.60, runner 8 runs $1.95, spend 0 runs $0.00, "
+                "judge 0 runs $0.00"]))
+        code_m, _said_m, doc_m = runner_pass("runner-missing", store=False)
+        check("a runner store that is not there: said, with no run of it counted, never zero, "
+              "and the pass is partial (exit 3)",
+              (code_m, dig(doc_m, "result"), dig(doc_m, "sources", "runner", "state"),
+               dig(doc_m, "sources", "runner", "reason"),
+               [d["by_source"]["runner"] for d in dig(doc_m, "days")],
+               [dig(doc_m, "week", k) for k in ("runs", "unpriced", "usd")],
+               check_schemas.document_problems(doc_m, SCHEMA_NAME)),
+              (EXIT_PARTIAL, PARTIAL, COULD_NOT,
+               "the runner's store could not be read (the store does not exist): is "
+               "runner_store right? Set it to \"\" to turn this source off",
+               [{"runs": 0, "unpriced": 0, "usd": 0.0}] * 8, [21, 2, 10.6], []))
+        want_r = runner_facts_local(doc_r)
+        for label, patched in (
+                ("every run counted from the logs",
+                 dict(add_run=lambda totals, r: real_add_run(totals, dict(r, source=LOGS)))),
+                ("the runner's runs left out of the counts",
+                 dict(scan=lambda cfg_s, now_s: dict(real_scan_r(cfg_s, now_s), runner=[]))),
+                ("a runner store that could not be read leaving the pass ok",
+                 dict(judge=lambda sources: real_judge(dict(
+                     (k, v) for k, v in sources.items() if k != "runner"))))):
+            store_on = label != "a runner store that could not be read leaving the pass ok"
+            got_x = runner_facts_local(runner_pass("runner-m-%d" % len(label), store=store_on,
+                                                   **patched)[2])
+            check("mutant: %s is caught" % label,
+                  got_x != (want_r if store_on else runner_facts_local(doc_m)), True)
+
         # -- sources that fail: said, and the exit code says it too ---------------------------
         cfg_f, _ = std_world(os.path.join(tmp, "nologs"),
                              dispatcher_home=os.path.join(tmp, "no-such-dispatcher"))
@@ -1266,7 +1433,7 @@ def _cases(check):
         doc_g = written(cfg_g)
         check("no source that is on can be read: failed, exit 1, each one named",
               (code, dig(doc_g, "result"), [dig(doc_g, "sources", s, "state") for s in SOURCES]),
-              (EXIT_ERROR, FAILED, [COULD_NOT] * 3))
+              (EXIT_ERROR, FAILED, [COULD_NOT] * 3 + [OFF]))
         cfg_h, _ = std_world(os.path.join(tmp, "nostate"),
                                  stage_e_state_dir=os.path.join(tmp, "no-e"),
                                  stage_a_state_dir=os.path.join(tmp, "no-a"))
@@ -1277,7 +1444,7 @@ def _cases(check):
               (code, dig(doc_h, "result"), [dig(doc_h, "sources", s, "state") for s in SOURCES],
                dig(doc_h, "sources", "ledger", "reason"),
                dig(doc_h, "sources", "planner", "reason")),
-              (EXIT_PARTIAL, PARTIAL, [READ, COULD_NOT, COULD_NOT],
+              (EXIT_PARTIAL, PARTIAL, [READ, COULD_NOT, COULD_NOT, OFF],
                "Stage E's state folder does not exist: is stage_e_state_dir right? Set it to "
                "\"\" to turn this source off",
                "the idea gate's state folder does not exist: is stage_a_state_dir right? Set "
@@ -1291,7 +1458,7 @@ def _cases(check):
               (code, dig(doc_o, "result"),
                [(dig(doc_o, "sources", s, "state"), dig(doc_o, "sources", s, "asked"),
                  dig(doc_o, "sources", s, "reason")) for s in SOURCES]),
-              (EXIT_OK, OK, [(READ, 48, None), (OFF, 0, None), (OFF, 0, None)]))
+              (EXIT_OK, OK, [(READ, 48, None), (OFF, 0, None), (OFF, 0, None), (OFF, 0, None)]))
         cfg_p, _ = std_world(os.path.join(tmp, "partly"))
         with open(os.path.join(cfg_p["stage_e_state_dir"], "outcomes", "broken.json"), "w") as fh:
             fh.write("{")
@@ -1401,14 +1568,16 @@ def _cases(check):
                  "stage_a_state_dir": "", "reviews_team_key": "REV",
                  "out": os.path.join(tmp, "limits", "out", "usage.json"), "lookback_days": 8}
         STOPS = [
-            {"ticket": None, "kind": "tech_lead", "ended_at": "2026-11-03T09:01:00Z",
-             "window": "five_hour", "resets_at": None},
-            {"ticket": "ENG-72", "kind": "coding", "ended_at": "2026-11-03T08:00:30Z",
-             "window": "seven_day", "resets_at": "2026-11-06T09:00:00Z"},
-            {"ticket": "ENG-71", "kind": "coding", "ended_at": "2026-11-03T06:01:00Z",
-             "window": "five_hour", "resets_at": "2026-11-03T14:00:00Z"},
-            {"ticket": "ENG-74", "kind": "coding", "ended_at": "2026-11-02T10:01:00Z",
-             "window": "overage", "resets_at": None}]
+            {"ticket": None, "kind": "tech_lead", "source": "logs",
+             "ended_at": "2026-11-03T09:01:00Z", "window": "five_hour", "resets_at": None},
+            {"ticket": "ENG-72", "kind": "coding", "source": "logs",
+             "ended_at": "2026-11-03T08:00:30Z", "window": "seven_day",
+             "resets_at": "2026-11-06T09:00:00Z"},
+            {"ticket": "ENG-71", "kind": "coding", "source": "logs",
+             "ended_at": "2026-11-03T06:01:00Z", "window": "five_hour",
+             "resets_at": "2026-11-03T14:00:00Z"},
+            {"ticket": "ENG-74", "kind": "coding", "source": "logs",
+             "ended_at": "2026-11-02T10:01:00Z", "window": "overage", "resets_at": None}]
 
         def stop_facts(**patched):
             """The file's limit_stops and the count past the cap for the limits world, with
@@ -1521,7 +1690,7 @@ def _cases(check):
                bool(re.match(r"^the pass stopped on an unexpected error: ValueError in boom "
                              r"\(line [0-9]+\)$", str(dig(doc_k, "error")))),
                dig(doc_k, "error") == dig(doc_k, "sources", "logs", "reason")),
-              (EXIT_ERROR, FAILED, [COULD_NOT] * 3, True, True))
+              (EXIT_ERROR, FAILED, [COULD_NOT] * 3 + [OFF], True, True))
         check("…and the exception's own words, which may be a log's, reach neither the file "
               "nor the output", (LEAK in text_of(cfg_k), any(LEAK in s for s in said)),
               (False, False))
@@ -1530,7 +1699,7 @@ def _cases(check):
         check("…a crash keeps a source the config turned off off, and the file still conforms",
               ([crash_doc["sources"][s]["state"] for s in SOURCES],
                check_schemas.document_problems(crash_doc, SCHEMA_NAME)),
-              ([COULD_NOT, OFF, OFF], []))
+              ([COULD_NOT, OFF, OFF, OFF], []))
         crash_spend = crashed(dict(cfg, spend_ledgers={"morning": "/m.jsonl", "standup": "",
                                                        "tech_lead": "/t.jsonl",
                                                        "conflict_waker": ""}),
@@ -1628,8 +1797,8 @@ def _cases(check):
         check("a relative path is refused, for the out file and for each source",
               ["absolute" in refused(dict(example, **{k: "some/where"}))
                for k in ("out", "dispatcher_home", "stage_e_state_dir", "stage_a_state_dir",
-                         "judge_file")],
-              [True] * 5)
+                         "judge_file", "runner_store")],
+              [True] * 6)
         worktree = os.path.join(tmp, "worktree")
         os.makedirs(os.path.join(worktree, ".git"))
         os.makedirs(os.path.join(tmp, "is-a-folder"))
@@ -1643,24 +1812,66 @@ def _cases(check):
                                           stage_a_state_dir="", judge_file="")))[k]
                for k in ("stage_e_state_dir", "stage_a_state_dir", "judge_file")]
               + ["absolute" in refused(dict(example, dispatcher_home=""))], ["", "", "", True])
-        # KIT-844: each caller's spend ledger, its default unless named, off when empty.
+        check("KIT-860 the runner's store is off unless named, and a ~/ path is under this "
+              "account's home",
+              (load_config(conf_file(dict((k, v) for k, v in example.items()
+                                          if k != "runner_store")))["runner_store"],
+               EXAMPLE_CONFIG["runner_store"],
+               load_config(conf_file(dict(example, runner_store="~/.pipeline-runner/store")))[
+                   "runner_store"]),
+              ("", "", os.path.realpath(os.path.join(
+                  pwd.getpwuid(os.getuid()).pw_dir, ".pipeline-runner", "store"))))
+        # KIT-844, KIT-687: each caller's spend ledger, its default unless named, off when empty.
         home_db = os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir)
         led = os.path.join(tmp, "ledgers")
-        check("spend_ledgers: a caller named is read from its path, \"\" or a caller left out "
-              "is off",
+        under_home = dict((c, os.path.join(os.path.realpath(os.path.join(
+            home_db, os.path.dirname(p[2:]))), os.path.basename(p)))
+            for c, p in SPEND_LEDGER_PATHS.items())
+        check("spend_ledgers: a caller named is read from its path, \"\" is off, and a caller "
+              "left out takes its default",
               load_config(conf_file(dict(example, spend_ledgers={
                   "morning": os.path.join(led, "m.jsonl"), "standup": ""})))["spend_ledgers"],
-              {"morning": os.path.join(led, "m.jsonl"), "standup": "", "tech_lead": "",
-               "conflict_waker": ""})
-        check("…every ledger is off by default until its caller writes it, never read as no calls "
-              "(Stage E on #622); a ~/ path is under this account's home",
+              {"morning": os.path.join(led, "m.jsonl"), "standup": "",
+               "tech_lead": under_home["tech_lead"], "conflict_waker": ""})
+        check("…the three ledgers this account can read are on by default, now that each caller "
+              "writes its own (KIT-687), under this account's home; the waker's, in a person's "
+              "home, is off, never read as no calls (Stage E on #622)",
               (load_config(conf_file(dict((k, v) for k, v in example.items()
                                           if k != "spend_ledgers")))["spend_ledgers"],
-               EXAMPLE_CONFIG["spend_ledgers"] == DEFAULT_SPEND_LEDGERS,
-               load_config(conf_file(dict(example, spend_ledgers={
-                   "morning": SPEND_LEDGER_PATHS["morning"]})))["spend_ledgers"]["morning"]),
-              (dict((c, "") for c in spend_ledger.CALLERS), True,
-               os.path.join(home_db, ".stage-e", "queue", "morning-spend.jsonl")))
+               EXAMPLE_CONFIG["spend_ledgers"] == DEFAULT_SPEND_LEDGERS),
+              (dict(under_home, conflict_waker=""), True))
+        # KIT-687: one call of each caller, its row added by the ledgers' one writer where that
+        # caller writes it by default, is in the file with its model and billing; an unread cost
+        # is unpriced. The account's home is stood in for, as the jobs' own `~` is theirs.
+        role_home = os.path.join(tmp, "kit-687-role-home")
+        made = {"morning": (0.04, "claude-sonnet-5-5"), "standup": (None, None),
+                "tech_lead": (0.2, "claude-opus-5-5")}
+        for caller, (usd, model) in sorted(made.items()):
+            path = os.path.join(role_home, SPEND_LEDGER_PATHS[caller][2:])
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            out_doc = None if usd is None else {"is_error": False, "subtype": "success",
+                                                "total_cost_usd": usd,
+                                                "modelUsage": {model: {"costUSD": usd}}}
+            spend_ledger.append(path, spend_ledger.row_from_result(caller, out_doc, "plan",
+                                                                   "sonnet"), now=T - 3600)
+        held_home = globals()["account_home"]
+        globals()["account_home"] = lambda: role_home
+        try:
+            defaults = load_spend_ledgers({})
+        finally:
+            globals()["account_home"] = held_home
+        cfg_d, _ = std_world(os.path.join(tmp, "kit-687-defaults"), spend_ledgers=defaults)
+        code_d, _said_d = go(cfg_d)
+        doc_d = written(cfg_d)
+        check("KIT-687 after one call of each caller, the file has a row for each read from its "
+              "default ledger, with its model and billing; the waker's is off, never zero",
+              (code_d, [(c, dig(doc_d, "spend", c, "state"), dig(doc_d, "spend", c, "calls"),
+                         dig(doc_d, "spend", c, "unpriced"), dig(doc_d, "spend", c, "models"),
+                         dig(doc_d, "spend", c, "billing")) for c in spend_ledger.CALLERS]),
+              (EXIT_OK, [("morning", READ, 1, 0, {"claude-sonnet-5-5": 1}, {"plan": 1}),
+                         ("standup", READ, 1, 1, {"sonnet": 1}, {"plan": 1}),
+                         ("tech_lead", READ, 1, 0, {"claude-opus-5-5": 1}, {"plan": 1}),
+                         ("conflict_waker", OFF, None, None, None, None)]))
         os.symlink(led, os.path.join(tmp, "ledgers-link"))
         check("…a ledger's folder is resolved and its file name kept, so a ledger that is a link "
               "is left for the reader to refuse",
@@ -1764,6 +1975,29 @@ def _cases(check):
                sorted(usage_runs.STATUS_WORDS + (WORD_OTHER,))
                == sorted(defs["window_event"]["properties"]["status"]["enum"])),
               (True, True, True, True))
+
+
+def _selftest_writers(check):
+    """KIT-687: a ledger this job reads by default is where its writer puts it with the writer's
+    own defaults, so no default is a guess: the morning job's beside its default day plan, the
+    stand-up's and the tech lead's in the bridge's default state folder. The waker's ledger, in
+    its own default state folder in a person's home, stays off. The writers are imported here
+    only, in the selftest: the job itself never loads them."""
+    import pipeline_bridge_config as bridge_config
+    import pipeline_morning as morning
+    import pr_conflict
+    writers = {
+        "morning": os.path.join(os.path.dirname(morning.DEFAULTS["day_plan_file"]),
+                                spend_ledger.FILE_NAMES["morning"]),
+        "standup": spend_ledger.path_in(bridge_config.DEFAULT_STATE_DIR, "standup"),
+        "tech_lead": spend_ledger.path_in(bridge_config.DEFAULT_STATE_DIR, "tech_lead"),
+    }
+    check("KIT-687 each ledger read by default is where its writer puts it by default; the "
+          "waker's, in its own state folder in a person's home, is off",
+          (DEFAULT_SPEND_LEDGERS, SPEND_LEDGER_PATHS,
+           spend_ledger.path_in(pr_conflict.DEFAULT_STATE_DIR, "conflict_waker")),
+          (dict(writers, conflict_waker=""), writers,
+           "~/.pr-conflict-waker/state/conflict-waker-spend.jsonl"))
 
 
 if __name__ == "__main__":

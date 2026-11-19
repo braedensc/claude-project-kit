@@ -16,6 +16,9 @@ move into it; until then this is the whole store.
     <store>/trees/<run>.json       the processes the runner remembered of a run, to kill what is
                                    left when it ends: the runner's alone, never in the run's own
                                    folder, which the run's processes write (KIT-739)
+    <store>/outputs/<run>.json     the session's final message, kept by the runner when the run
+                                   ends, for the caller that asked for it (KIT-858): the runner's
+                                   alone, for the same reason
 
 WHO MAY ASK.  Five jobs, each for its own kinds of session (CALLERS):
 
@@ -31,6 +34,22 @@ The runner checks every request against the tracker's history before it starts a
 (scripts/pipeline_runner.py). What keeps a session from writing a request at all is the walls below,
 and its sandbox. What this file checks is the shape, and that the named caller may ask for that kind.
 
+A REVIEW'S START (KIT-644).  The review job's start carries the review's facts as its text, up to
+REVIEW_TEXT_MAX characters since they hold the diff, and says its tier: `standard`, or `guarded` for
+a change to a guarded path, which gets the stronger model. The job chooses the request's id
+(new_request_id) and records it before ask() writes the request, so a crash between the two never
+asks twice; ask() refuses an id it has seen. A request still waiting can be withdrawn by its caller
+(withdraw). The runner holds a lock on a request's file while it judges and answers it (claimed), and
+a withdrawal takes the same lock without waiting: so it lands before the runner comes to the request,
+which is then skipped, or it is refused and the caller reads the run. A request is written without ASCII escapes, so the largest still fits DOC_MAX.
+
+TEXT AND THE FINAL MESSAGE (KIT-858).  A resume carries its text, and a start may carry one too: the
+facts its caller's own code wrote, which the runner hands the session fenced as data, after the
+ticket. A stop carries none. When a run ends, the runner keeps the session's final message, its last
+OUTPUT_MAX characters, in outputs/<run>.json. The caller reads it with run_output(): a document,
+None when the run left no result at all, or StoreError when one is there and cannot be read. The
+message is the session's own words, so it is data to its caller and never part of a run's record.
+
 THE WALLS.  A session must never write here: a request it wrote could start a session nobody
 approved. So the store must be an absolute path, outside every git working tree, a real folder
 (not a link), owned by this account, and writable by no one else. walls() says what is wrong, and
@@ -41,6 +60,8 @@ the runs folder cannot be listed, and names each record it could not read.
 
 Standard library only. It starts no process and opens no socket.
 """
+import contextlib
+import fcntl
 import json
 import os
 import re
@@ -64,6 +85,11 @@ CALLERS = {
     "acceptance": ("acceptance",),
 }
 STARTS = ("code", "review", "plan", "acceptance")        # fix and conflict are only resumes
+# The review job's name as a caller, which is also its one kind (KIT-644): one spelling, which the
+# review job's own code uses rather than writing the word out.
+REVIEW = "review"
+# What a review's start says of its change (KIT-644, KIT-418): `guarded` gets the stronger model.
+TIERS = ("standard", "guarded")
 # A run of kind K may be resumed as kind R when K is in RESUMES[R].
 RESUMES = {
     "code": ("code",),
@@ -90,8 +116,9 @@ STARTED_FOR = ("request", "interrupted", "session-gone")
 RUNNERS_OWN = ("interrupted", "session-gone")
 AUTO_RESUME = ("pending", "started", "refused")
 # How a run was let start: the owner's move or creation, a resume of a run of the same session,
-# or a fresh session in the workspace of a run whose session was gone.
-HOW = ("move", "creation", "resumed-run", "fresh-session")
+# a fresh session in the workspace of a run whose session was gone, or the approval its ticket's
+# code run recorded (KIT-644: a review follows the coding it judges).
+HOW = ("move", "creation", "resumed-run", "fresh-session", "code-run")
 FOLLOWS = ("resumed-run", "fresh-session")              # a run that carries on another run
 
 TICKET_RE = re.compile(r"^[A-Z][A-Z0-9]{0,15}-[0-9]{1,9}\Z")
@@ -102,11 +129,25 @@ UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]
 TIME_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\Z")
 ACTOR_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}\Z")
 BRANCH_RE = re.compile(r"^(feat|fix|chore|refactor|docs)/[a-z0-9][a-z0-9-]*\Z")
-TEXT_MAX = 20000          # a resume's text, written by the caller's own code
+TEXT_MAX = 20000          # a start's or a resume's text, written by the caller's own code
+# KIT-644: a review's start carries the review's facts, the diff among them, so it may be longer:
+# the review job's own cap is 120000 characters. Written without ASCII escapes, each character
+# takes at most 6 bytes, so the largest request still fits DOC_MAX.
+REVIEW_TEXT_MAX = 150000
 WHY_MAX = 300
 DOC_MAX = 1 << 20         # no request or record is larger than this
+# KIT-858: the session's final message, as the runner keeps it. Written without ASCII escapes, each
+# character takes at most 6 bytes (a control character's \u escape), so even the worst message
+# keeps its document under DOC_MAX.
+OUTPUT_SCHEMA = "pipeline-runner-output/1"
+OUTPUT_MAX = 150000
+OUTPUT_KEYS = ("schema", "run", "at", "is_error", "subtype", "text", "cut", "model", "tokens")
+# KIT-644: the model the run billed most, and its tokens, for the review comment's reviewer line.
+MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@\[\]-]{0,79}\Z")
+SUBTYPE_RE = re.compile(r"^[a-z_]{0,40}\Z")
 REQUEST_KEYS = ("schema", "id", "at", "caller", "action", "kind", "project", "ticket", "run",
                 "text")
+REQUEST_OPTIONAL = ("tier",)   # KIT-644: said by a review's start alone; absent is none
 RUN_KEYS = ("schema", "run", "request", "caller", "kind", "project", "ticket", "resumes",
             "started_for", "approved_by", "approved_at", "how", "session_id", "workspace",
             "branch", "pin", "pid", "state", "started_at", "ended_at", "seconds", "exit",
@@ -141,7 +182,7 @@ def request_problems(doc):
     if not isinstance(doc, dict):
         return ["the request is not an object"]
     bad = []
-    extra = sorted(k for k in doc if k not in REQUEST_KEYS)
+    extra = sorted(k for k in doc if k not in REQUEST_KEYS + REQUEST_OPTIONAL)
     if extra:
         bad.append("the request holds a field it may not hold")
     missing = [k for k in REQUEST_KEYS if k not in doc]
@@ -169,12 +210,25 @@ def request_problems(doc):
             bad.append("a start names no run")
     elif not (isinstance(doc["run"], str) and RUN_RE.match(doc["run"])):
         bad.append("a %s names the run it is for" % doc["action"])
+    review_start = doc["action"] == "start" and doc["kind"] == REVIEW
+    most = REVIEW_TEXT_MAX if review_start else TEXT_MAX
+    text_ok = (isinstance(doc["text"], str) and 0 < len(doc["text"]) <= most
+               and "\0" not in doc["text"])
     if doc["action"] == "resume":
-        if not (isinstance(doc["text"], str) and 0 < len(doc["text"]) <= TEXT_MAX
-                and "\0" not in doc["text"]):
+        if not text_ok:
             bad.append("a resume carries its text, at most %d characters" % TEXT_MAX)
+    elif doc["action"] == "start":
+        if review_start and not text_ok:                 # KIT-644: a review's facts are its review
+            bad.append("a review's start carries its facts, 1 to %d characters" % most)
+        elif doc["text"] is not None and not text_ok:    # KIT-858: a start's facts, when it has any
+            bad.append("a start's text, when it carries one, is 1 to %d characters" % most)
     elif doc["text"] is not None:
-        bad.append("only a resume carries text")
+        bad.append("a stop carries no text")
+    if review_start:                                     # KIT-644: which model judges it
+        if doc.get("tier") not in TIERS:
+            bad.append("a review's start says its tier: %s" % " or ".join(TIERS))
+    elif doc.get("tier") is not None:
+        bad.append("only a review's start says a tier")
     if not bad and not may(doc["caller"], doc["action"], doc["kind"]):
         bad.append("the %s job may not ask to %s a %s session"
                    % (doc["caller"], doc["action"], doc["kind"]))
@@ -280,11 +334,11 @@ def walls(path):
     return []
 
 
-FOLDERS = ("requests", "taken", "runs", "trees")
+FOLDERS = ("requests", "taken", "runs", "trees", "outputs")
 
 
 def prepare(store):
-    """Make the store and its four folders, mode 0700, and check every one. Returns problems."""
+    """Make the store and its five folders, mode 0700, and check every one. Returns problems."""
     for path in (store,) + tuple(os.path.join(store, name) for name in FOLDERS):
         if not os.path.lexists(path):
             try:
@@ -297,13 +351,14 @@ def prepare(store):
     return []
 
 
-def write_json(path, doc):
-    """One file, whole or not at all, mode 0600, never through a link."""
+def write_json(path, doc, ensure_ascii=True):
+    """One file, whole or not at all, mode 0600, never through a link. `ensure_ascii` False writes
+    text as UTF-8 rather than escapes, for a document whose size is bounded by its characters."""
     tmp = "%s.%s.tmp" % (path, uuid.uuid4().hex[:12])
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(doc, fh, indent=1, sort_keys=True)
+            json.dump(doc, fh, indent=1, sort_keys=True, ensure_ascii=ensure_ascii)
             fh.write("\n")
             fh.flush()
             os.fsync(fh.fileno())
@@ -338,13 +393,24 @@ def read_json(path):
 # --------------------------------------------------------------------------- #
 # Requests
 # --------------------------------------------------------------------------- #
-def ask(store, caller, action, kind, project, ticket, run=None, text=None, now=None):
+def new_request_id():
+    """A request id for a caller that records it before it asks (KIT-644)."""
+    return "rq-" + uuid.uuid4().hex
+
+
+def ask(store, caller, action, kind, project, ticket, run=None, text=None, now=None,
+        request_id=None, tier=None):
     """Write one request, and return its id. ValueError, in words, when it is not one this caller
     may write, or the store fails its walls. The caller's own code writes `text`; the runner hands
-    it to the session fenced as data."""
-    doc = {"schema": REQUEST_SCHEMA, "id": "rq-" + uuid.uuid4().hex,
+    it to the session fenced as data. `request_id` is one the caller recorded first (KIT-644): an
+    id already waiting or answered is refused, so one request is never asked twice. `tier` is a
+    review's start's alone."""
+    rid = new_request_id() if request_id is None else request_id
+    doc = {"schema": REQUEST_SCHEMA, "id": rid,
            "at": iso(time.time() if now is None else now), "caller": caller, "action": action,
            "kind": kind, "project": project, "ticket": ticket, "run": run, "text": text}
+    if tier is not None:
+        doc["tier"] = tier
     bad = request_problems(doc)
     if bad:
         raise ValueError(bad[0])
@@ -352,8 +418,61 @@ def ask(store, caller, action, kind, project, ticket, run=None, text=None, now=N
     bad = walls(store) or walls(folder)
     if bad:
         raise ValueError(bad[0])
-    write_json(os.path.join(folder, doc["id"] + ".json"), doc)
-    return doc["id"]
+    if any(os.path.lexists(os.path.join(store, f, rid + ".json")) for f in ("requests", "taken")):
+        raise ValueError("a request with this id was asked already")
+    write_json(os.path.join(folder, rid + ".json"), doc, ensure_ascii=False)
+    return rid
+
+
+def withdraw(store, request_id):
+    """Take back a request the runner has not taken (KIT-644): True when it was waiting and is now
+    gone, False when it was taken already, is being judged this moment, or was never there. It
+    takes the lock the runner holds while it judges and answers a request (claimed), without
+    waiting, so a withdrawal and a start can never both happen."""
+    if not (isinstance(request_id, str) and REQUEST_RE.match(request_id)):
+        raise ValueError("not a request id")
+    path = os.path.join(store, "requests", request_id + ".json")
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return False                    # the runner is judging it this moment
+        if os.path.lexists(os.path.join(store, "taken", request_id + ".json")):
+            return False
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            return False
+        return True
+    finally:
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def claimed(store, request_id):
+    """The runner's hold on one waiting request while it judges and answers it (KIT-644): True
+    while the request is still there, held so that its caller cannot withdraw it meanwhile; False
+    when it is gone, withdrawn before the runner came to it. A lock on the file itself, which a
+    runner that dies lets go of."""
+    path = os.path.join(store, "requests", request_id + ".json")
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        yield False
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            there = os.fstat(fd).st_ino == os.lstat(path).st_ino
+        except OSError:
+            there = False
+        yield there
+    finally:
+        os.close(fd)
 
 
 def pending(store):
@@ -388,7 +507,8 @@ def settle(store, request_id, doc, ok, run, why, now):
     """Record the runner's answer to a request, then remove it from the waiting ones."""
     write_json(os.path.join(store, "taken", request_id + ".json"),
                {"request": doc, "answer": {"at": iso(now), "ok": bool(ok), "run": run,
-                                           "why": why[:WHY_MAX] if why else ""}})
+                                           "why": why[:WHY_MAX] if why else ""}},
+               ensure_ascii=False)
     try:
         os.unlink(os.path.join(store, "requests", request_id + ".json"))
     except FileNotFoundError:
@@ -490,6 +610,81 @@ def read_runs(store):
 
 
 # --------------------------------------------------------------------------- #
+# The session's final message (KIT-858)
+# --------------------------------------------------------------------------- #
+def output_path(store, run_id):
+    """Where the runner keeps a run's final message: in its own folder, never the run's, whose
+    files the run's own processes write."""
+    if not (isinstance(run_id, str) and RUN_RE.match(run_id)):
+        raise ValueError("not a run id")
+    return os.path.join(store, "outputs", run_id + ".json")
+
+
+def output_problems(doc):
+    """Everything wrong with a kept final message's shape, in words. Empty when it is well formed."""
+    if not isinstance(doc, dict):
+        return ["the output is not an object"]
+    if sorted(doc) != sorted(OUTPUT_KEYS):
+        return ["the output's fields are not an output's"]
+    text = doc["text"]
+    checks = (
+        ("schema", doc["schema"] == OUTPUT_SCHEMA),
+        ("run", isinstance(doc["run"], str) and bool(RUN_RE.match(doc["run"]))),
+        ("at", isinstance(doc["at"], str) and bool(TIME_RE.match(doc["at"]))),
+        ("is_error", isinstance(doc["is_error"], bool)),
+        ("subtype", isinstance(doc["subtype"], str) and bool(SUBTYPE_RE.match(doc["subtype"]))),
+        ("text", text is None or (isinstance(text, str) and len(text) <= OUTPUT_MAX)),
+        ("cut", isinstance(doc["cut"], bool) and not (doc["cut"] and text is None)),
+        ("model", doc["model"] is None or (isinstance(doc["model"], str) and bool(MODEL_RE.match(doc["model"])))),
+        ("tokens", doc["tokens"] is None or (isinstance(doc["tokens"], int)
+                                             and not isinstance(doc["tokens"], bool) and doc["tokens"] >= 0)),
+    )
+    return ["the output's %s is not valid" % name for name, ok in checks if not ok]
+
+
+def write_output(store, run_id, is_error, subtype, text, now, model=None, tokens=None):
+    """Keep a run's final message: the runner's one way to write it, when the run ends. `text` is
+    the program's result text, or None when its result carried none. A longer one keeps its last
+    OUTPUT_MAX characters and says it was cut, since the block a caller reads ends the message. A
+    character UTF-8 cannot carry (a lone surrogate) becomes '?'. `model` and `tokens` are what the
+    run billed (KIT-644), each None when its result did not say. ValueError when the run id or a
+    field is not an output's."""
+    cut = isinstance(text, str) and len(text) > OUTPUT_MAX
+    if isinstance(text, str):
+        text = text[-OUTPUT_MAX:].encode("utf-8", "replace").decode("utf-8")
+    else:
+        text = None
+    doc = {"schema": OUTPUT_SCHEMA, "run": run_id, "at": iso(now), "is_error": bool(is_error),
+           "subtype": subtype if isinstance(subtype, str) and SUBTYPE_RE.match(subtype) else "",
+           "text": text, "cut": cut,
+           "model": model if isinstance(model, str) and MODEL_RE.match(model) else None,
+           "tokens": tokens if isinstance(tokens, int) and not isinstance(tokens, bool)
+           and tokens >= 0 else None}
+    bad = output_problems(doc)
+    if bad:
+        raise ValueError(bad[0])
+    write_json(output_path(store, run_id), doc, ensure_ascii=False)
+    return doc
+
+
+def run_output(store, run_id):
+    """A run's final message, as the runner kept it: the document, or None when there is none (the
+    run has not ended, or it left no result at all). StoreError when one is there and cannot be
+    read, or is not an output: "could not read it" is never "none" (contract section 13). Read it
+    once the run's record says it has ended."""
+    path = output_path(store, run_id)
+    if not os.path.lexists(path):
+        return None
+    doc = read_json(path)
+    bad = output_problems(doc)
+    if bad:
+        raise StoreError(bad[0])
+    if doc["run"] != run_id:
+        raise StoreError("the output is another run's")
+    return doc
+
+
+# --------------------------------------------------------------------------- #
 # Selftest
 # --------------------------------------------------------------------------- #
 def selftest():
@@ -558,6 +753,8 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
     expect("ask writes one waiting request", [i[0] for i in pending(store)], [rid])
     doc = pending(store)[0][1]
     expect("the request is well formed", request_problems(doc), [])
+    expect("a start may carry its caller's text, up to the limit (KIT-858)",
+           request_problems(dict(doc, caller="planner", kind="plan", text="x" * TEXT_MAX)), [])
     expect("the caller's own clock is not asked for: the time is the writer's", doc["at"],
            "2023-11-14T22:13:20Z")
     expect("a request file is mode 0600",
@@ -580,8 +777,15 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                                                  text="x"), "a resume names the run it is for"),
             ("a resume with no text", lambda: ask(store, "fix-driver", "resume", "fix", "app", "ENG-1",
                                                   run="run-" + "a" * 32), "a resume carries its text, at most 20000 characters"),
-            ("a start with text", lambda: ask(store, "queue", "start", "code", "app", "ENG-1", text="x"),
-             "only a resume carries text"),
+            ("a stop with text", lambda: ask(store, "queue", "stop", "code", "app", "ENG-1",
+                                             run="run-" + "a" * 32, text="x"),
+             "a stop carries no text"),
+            ("a start's text too long", lambda: ask(store, "planner", "start", "plan", "app", "ENG-1",
+                                                    text="x" * (TEXT_MAX + 1)),
+             "a start's text, when it carries one, is 1 to 20000 characters"),
+            ("a start's text that is empty", lambda: ask(store, "planner", "start", "plan", "app",
+                                                         "ENG-1", text=""),
+             "a start's text, when it carries one, is 1 to 20000 characters"),
             ("a text too long", lambda: ask(store, "fix-driver", "resume", "fix", "app", "ENG-1",
                                             run="run-" + "a" * 32, text="x" * (TEXT_MAX + 1)),
              "a resume carries its text, at most 20000 characters"),
@@ -691,6 +895,124 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
     expect("a runs folder that fails its walls gives None, never an empty list",
            (got["state"], got["runs"]), ("could-not-read", None))
     os.chmod(os.path.join(store, "runs"), 0o700)
+
+    # The session's final message, kept by the runner when a run ends (KIT-858).
+    one, two = "run-" + "5" * 32, "run-" + "6" * 32
+    expect("a final message is kept in the runner's own folder, never the run's",
+           (output_path(store, one), output_path(store, one).startswith(run_dir(store, one))),
+           (os.path.join(store, "outputs", one + ".json"), False))
+    expect("an output path is only ever a run's", refused(lambda: output_path(store, "../x")),
+           "not a run id")
+    expect("a run that left no result has none: None, never an empty message",
+           run_output(store, one), None)
+    message = "Here is the plan.\n```json\n{\"x\": \"é ✓ </untrusted-x>\"}\n```"
+    write_output(store, one, False, "success", message, 1700000100)
+    expect("the final message reads back exactly, whole and not cut", run_output(store, one),
+           {"schema": OUTPUT_SCHEMA, "run": one, "at": "2023-11-14T22:15:00Z", "is_error": False,
+            "subtype": "success", "text": message, "cut": False, "model": None, "tokens": None})
+    expect("an output file is mode 0600", stat.S_IMODE(os.stat(output_path(store, one)).st_mode), 0o600)
+    write_output(store, two, False, "success", "x" * OUTPUT_MAX + "the block at the end", 1700000100)
+    got = run_output(store, two)
+    expect("a longer message keeps its end, where its block is, and says it was cut",
+           (len(got["text"]), got["text"].endswith("the block at the end"), got["cut"]),
+           (OUTPUT_MAX, True, True))
+    for name, text in (("control characters", "\x01" * OUTPUT_MAX),
+                       ("characters past the first plane", "\U0001f600" * OUTPUT_MAX)):
+        write_output(store, two, False, "success", text, 1700000100)
+        expect("the largest message of %s still fits a document the store reads back" % name,
+               (os.path.getsize(output_path(store, two)) <= DOC_MAX, run_output(store, two)["text"] == text),
+               (True, True))
+    write_output(store, two, True, "error_max_turns", None, 1700000100)
+    got = run_output(store, two)
+    expect("a result that carried no message is kept as one with none, never an empty one",
+           (got["text"], got["is_error"], got["subtype"], got["cut"]), (None, True, "error_max_turns", False))
+    write_output(store, two, False, "success", "a\ud800b", 1700000100)
+    expect("a character UTF-8 cannot carry becomes '?', never a crash", run_output(store, two)["text"], "a?b")
+    write_output(store, two, False, "Not A Subtype", "x", 1700000100)
+    expect("a subtype that is not one is kept as none", run_output(store, two)["subtype"], "")
+    expect("an output for no run is refused", refused(lambda: write_output(store, "run-x", False, "", "x", 0)),
+           "the output's run is not valid")
+    with open(output_path(store, two), "w") as fh:
+        fh.write("{not json")
+    expect("an output that cannot be read is an error, never none",
+           refused(lambda: run_output(store, two)), "it could not be read (JSONDecodeError)")
+    write_json(output_path(store, two), run_output(store, one))
+    expect("an output filed under another run is an error", refused(lambda: run_output(store, two)),
+           "the output is another run's")
+    write_json(output_path(store, two), dict(run_output(store, one), run=two, extra=1))
+    expect("an output with a field it may not hold is an error",
+           refused(lambda: run_output(store, two)), "the output's fields are not an output's")
+    expect("an output cut with no text is not one",
+           output_problems(dict(run_output(store, one), text=None, cut=True)), ["the output's cut is not valid"])
+
+    # ---- a review's start (KIT-644) ------------------------------------------------------------ #
+    review = dict(doc, id="rq-" + "1" * 32, caller=REVIEW, kind=REVIEW, text="the facts", tier="guarded")
+    expect("a review's start carries its facts and says its tier", request_problems(review), [])
+    expect("...which it must say", (request_problems(dict(review, tier=None)),
+                                    request_problems(dict((k, v) for k, v in review.items() if k != "tier")),
+                                    request_problems(dict(review, tier="strong"))),
+           (["a review's start says its tier: standard or guarded"],) * 3)
+    expect("a review's start with no facts is refused: a run with none could only answer blocked",
+           request_problems(dict(review, text=None)),
+           ["a review's start carries its facts, 1 to %d characters" % REVIEW_TEXT_MAX])
+    expect("only a review's start says a tier",
+           request_problems(dict(doc, tier="standard")), ["only a review's start says a tier"])
+    expect("a request written before tiers holds none, and is still well formed",
+           ("tier" in doc, request_problems(doc)), (False, []))
+    expect("a review's facts may be longer than other text, up to their own limit",
+           (request_problems(dict(review, text="x" * REVIEW_TEXT_MAX)),
+            request_problems(dict(review, text="x" * (REVIEW_TEXT_MAX + 1))),
+            request_problems(dict(doc, caller="planner", kind="plan", text="x" * (TEXT_MAX + 1)))),
+           ([], ["a review's start carries its facts, 1 to %d characters" % REVIEW_TEXT_MAX],
+            ["a start's text, when it carries one, is 1 to %d characters" % TEXT_MAX]))
+    rid644 = new_request_id()
+    big = "\U0001f600\x01" * (REVIEW_TEXT_MAX // 2)
+    expect("a review's start is written under the id its caller recorded first",
+           ask(store, REVIEW, "start", REVIEW, "app", "ENG-6", text=big, request_id=rid644,
+               tier="standard"), rid644)
+    expect("...whole, and the largest still fits a document the store reads back",
+           (os.path.getsize(os.path.join(store, "requests", rid644 + ".json")) <= DOC_MAX,
+            [d for i, d, _ in pending(store) if i == rid644][0]["text"] == big), (True, True))
+    expect("an id that is waiting is never asked again",
+           refused(lambda: ask(store, REVIEW, "start", REVIEW, "app", "ENG-6", text="x",
+                               request_id=rid644, tier="standard")),
+           "a request with this id was asked already")
+    settle(store, rid644, [d for i, d, _ in pending(store) if i == rid644][0], True, "run-" + "4" * 32, "", 1700000000)
+    expect("...nor one that was answered, and the answer keeps the whole request",
+           (refused(lambda: ask(store, REVIEW, "start", REVIEW, "app", "ENG-6", text="x",
+                                request_id=rid644, tier="standard")),
+            (taken_request(store, rid644) or {}).get("text") == big),
+           ("a request with this id was asked already", True))
+    expect("an id that is not one is refused", refused(lambda: ask(store, REVIEW, "start", REVIEW, "app",
+                                                                   "ENG-6", text="x", request_id="rq-1",
+                                                                   tier="standard")),
+           "the request's id is not one")
+    waiting = ask(store, REVIEW, "start", REVIEW, "app", "ENG-7", text="x", tier="standard")
+    expect("a waiting request is withdrawn by its caller, once",
+           (withdraw(store, waiting), withdraw(store, waiting), waiting in [i for i, _, _ in pending(store)]),
+           (True, False, False))
+    expect("a request the runner took is never withdrawn", withdraw(store, rid644), False)
+    judged = ask(store, REVIEW, "start", REVIEW, "app", "ENG-8", text="x", tier="standard")
+    with claimed(store, judged) as there:
+        racing = withdraw(store, judged)
+    expect("a withdrawal while the runner judges the request is refused, and the request stays",
+           (there, racing, judged in [i for i, _, _ in pending(store)]), (True, False, True))
+    expect("...and once the runner lets go, it lands", withdraw(store, judged), True)
+    with claimed(store, judged) as there:
+        expect("the runner's hold on a withdrawn request finds it gone", there, False)
+    expect("withdraw names only a request", refused(lambda: withdraw(store, "../x")), "not a request id")
+    write_output(store, "run-" + "4" * 32, False, "success", "ok", 1700000100, model="claude-opus-test",
+                 tokens=4321)
+    got = run_output(store, "run-" + "4" * 32)
+    expect("the final message keeps the model the run billed and its tokens",
+           (got["model"], got["tokens"]), ("claude-opus-test", 4321))
+    write_output(store, "run-" + "4" * 32, False, "success", "ok", 1700000100, model="not a model!",
+                 tokens=-1)
+    got = run_output(store, "run-" + "4" * 32)
+    expect("...and a model or a count that is not one is kept as none", (got["model"], got["tokens"]),
+           (None, None))
+    expect("a run let start by its code run's approval is one the record holds",
+           "code-run" in HOW, True)
 
     if failures:
         print("FAIL: pipeline_runner_store selftest")

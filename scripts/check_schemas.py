@@ -640,6 +640,13 @@ def _usage_kinds(*pairs):
     return out
 
 
+def _usage_sources(*triples):
+    """§17's by_source split (KIT-860): runs, unpriced runs and dollars from the logs, the runner,
+    the spend ledgers and the judge, which add up to the totals beside them."""
+    return dict((n, {"runs": r, "unpriced": u, "usd": d})
+                for n, (r, u, d) in zip(("logs", "runner", "spend", "judge"), triples))
+
+
 # §17's spend ledgers (KIT-844): three read, every call inside the week, one stand-up call unpriced;
 # the waker's off.
 _SPEND_OFF = {"state": "off", "reason": None, "calls": None, "unpriced": None, "usd": None,
@@ -667,6 +674,7 @@ VALID_USAGE = {
                        reason="a review record could not be read",
                        read_at="2026-11-03T18:04:59Z"),
         "planner": dict(_USAGE_SOURCE, asked=1, answered=1, read_at="2026-11-03T18:04:59Z"),
+        "runner": dict(_USAGE_SOURCE, asked=1, answered=1, read_at="2026-11-03T18:04:59Z"),
     },
     "judge": {"state": "read", "reason": None},
     "spend": _USAGE_SPEND,
@@ -675,15 +683,18 @@ VALID_USAGE = {
         "usd": 42.337, "runs": 142, "unpriced": 3, "seconds": 51234,
         "by_kind": _usage_kinds((20, 3.1), (18, 6.5), (4, 2.4), (52, 21.3), (14, 4.2), (3, 0.9),
                                 (1, 0.15), (18, 2.787), (0, 0), (4, 0.6), (8, 0.4)),
-        "by_model": {"claude-opus-5-5": 30.2, "claude-sonnet-5-5": 12.137},
+        "by_source": _usage_sources((100, 2, 33.037), (10, 0, 5.2), (32, 1, 4.1), (0, 0, 0)),
+        "by_model": {"claude-opus-5-5": 25.0, "claude-sonnet-5-5": 12.137},
     },
     "days": [
         {"date": "2026-11-02", "usd": 9.75, "runs": 34, "unpriced": 1, "seconds": 11800,
          "by_kind": _usage_kinds((4, 0.8), (5, 1.9), (1, 0.6), (10, 4.1), (4, 1.2), (1, 0.3),
-                                 (0, 0), (6, 0.6), (0, 0), (1, 0.15), (2, 0.1))},
+                                 (0, 0), (6, 0.6), (0, 0), (1, 0.15), (2, 0.1)),
+         "by_source": _usage_sources((23, 0, 6.7), (4, 0, 2.0), (7, 1, 1.05), (0, 0, 0))},
         {"date": "2026-11-03", "usd": 7.45, "runs": 26, "unpriced": 2, "seconds": 9100,
          "by_kind": _usage_kinds((6, 0.9), (4, 1.4), (0, 0), (9, 3.55), (2, 0.5), (0, 0),
-                                 (1, 0.15), (2, 0.75), (0, 0), (1, 0.15), (1, 0.05))},
+                                 (1, 0.15), (2, 0.75), (0, 0), (1, 0.15), (1, 0.05)),
+         "by_source": _usage_sources((15, 2, 5.15), (3, 0, 1.2), (8, 0, 1.1), (0, 0, 0))},
     ],
     "pieces": [
         {"id": "ENG-301", "kind": "coding", "usd": 7.25, "runs": 6,
@@ -701,18 +712,20 @@ VALID_USAGE = {
         "events_per_day": 38.5,
     },
     "sign_in": {"counts": {"none": 150, "ANTHROPIC_API_KEY": 2},
-                "api_key_runs": [{"id": "ENG-307", "at": "2026-11-03T09:12:00Z"}]},
+                "api_key_runs": [{"id": "ENG-307", "at": "2026-11-03T09:12:00Z",
+                                  "source": "logs"}]},
     "never_reached_model": 1,
     "limit_stops": [
-        {"ticket": "ENG-312", "kind": "coding", "ended_at": "2026-11-03T17:41:09Z",
-         "window": "five_hour", "resets_at": "2026-11-03T19:00:00Z"},
+        {"ticket": "ENG-312", "kind": "coding", "source": "logs",
+         "ended_at": "2026-11-03T17:41:09Z", "window": "five_hour",
+         "resets_at": "2026-11-03T19:00:00Z"},
     ],
     "limit_stops_over_cap": 0,
 }
 # What a pass that could not read the logs writes: the week unknown, and no figure at all.
 _USAGE_UNKNOWN_WEEK = {"known": False, "starts_at": None, "resets_at": None, "usd": None,
                        "runs": None, "unpriced": None, "seconds": None, "by_kind": None,
-                       "by_model": None}
+                       "by_source": None, "by_model": None}
 
 # §18: a day plan file as the morning planner writes it (KIT-438), §18's own example: two lanes in
 # one repository, a piece held behind another, and a plan and a merge waiting on the owner.
@@ -1288,6 +1301,27 @@ FIXTURES = [
      _without(VALID_USAGE, "days", 0, "by_kind", "morning"), False, "required"),
     ("pipeline-usage", "the-standup-kind-left-out-of-the-week",
      _without(VALID_USAGE, "week", "by_kind", "standup"), False, None),
+    # The runner's runs (KIT-860): its store is a source like the others, every counted run is
+    # under one source in each day and the week, and each run listed by itself names its source.
+    ("pipeline-usage", "the-runner-source-left-out",
+     _without(VALID_USAGE, "sources", "runner"), False, "required"),
+    ("pipeline-usage", "a-runner-store-that-could-not-be-read",
+     _with(VALID_USAGE, "sources.runner", dict(_USAGE_SOURCE, state="could-not-read", answered=0,
+                                               reason="the store does not exist", read_at=None)),
+     True, None),
+    ("pipeline-usage", "the-by-source-split-left-out-of-a-day",
+     _without(VALID_USAGE, "days", 0, "by_source"), False, "required"),
+    ("pipeline-usage", "a-source-left-out-of-the-weeks-split",
+     _without(VALID_USAGE, "week", "by_source", "runner"), False, None),
+    ("pipeline-usage", "a-split-source-nobody-defined",
+     _with(VALID_USAGE, "days.0.by_source.cyrus", {"runs": 1, "unpriced": 0, "usd": 0.1}),
+     False, "additionalProperties"),
+    ("pipeline-usage", "an-unknown-week-whose-split-is-null",
+     _with(VALID_USAGE, "week", _USAGE_UNKNOWN_WEEK), True, None),
+    ("pipeline-usage", "a-stopped-run-with-no-source",
+     _without(VALID_USAGE, "limit_stops", 0, "source"), False, "required"),
+    ("pipeline-usage", "a-key-run-from-a-source-nobody-defined",
+     _with(VALID_USAGE, "sign_in.api_key_runs.0.source", "spend"), False, "enum"),
 
     # §30: one row per call. Fields only, and an unknown figure is null, never zero (KIT-844).
     ("pipeline-spend-ledger", "valid", VALID_SPEND_ROW, True, None),
@@ -1341,7 +1375,7 @@ FIXTURES = [
      _with(VALID_USAGE, "limit_stops.0.reason", "you have hit your limit"), False,
      "additionalProperties"),
     ("pipeline-usage", "a-limit-stop-for-a-chat-thread-and-no-reset",
-     _with(VALID_USAGE, "limit_stops", [{"ticket": None, "kind": "tech_lead",
+     _with(VALID_USAGE, "limit_stops", [{"ticket": None, "kind": "tech_lead", "source": "logs",
                                          "ended_at": "2026-11-03T17:41:09Z", "window": "other",
                                          "resets_at": None}]), True, None),
     ("pipeline-usage", "more-limit-stops-than-the-cap",

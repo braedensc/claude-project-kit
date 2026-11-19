@@ -94,7 +94,7 @@
             "files": {
               "type": "array",
               "maxItems": 10,
-              "items": {"type": "string", "pattern": "^(scripts|schemas)/[A-Za-z0-9._-]{1,100}$"}
+              "items": {"type": "string", "pattern": "^(scripts|schemas|session-kinds)/[A-Za-z0-9._-]{1,100}$"}
             },
             "files_total": {"type": ["integer", "null"], "minimum": 0},
             "checked_at": {"$ref": "#/$defs/time_or_null"},
@@ -102,7 +102,7 @@
           }
         }
       ],
-      "description": "KIT-581. Whether the checkout these jobs run from, the role account's copy of the kit, is behind the repository's branch. null: the job is not told a repository (`kit_repo`). `behind`: a file the jobs run, or a schema they read, changed between the checkout's head (`head`, twelve characters) and the branch; `merges_behind` counts the commits, and `files` names up to ten of the files, out of `files_total`. `current`: no file the jobs run changed (a doc or a test only may have). `unknown`: the question could not be answered, with `reason` in fixed words; never read as current. Optional: a file from before KIT-581 has none."
+      "description": "KIT-581. Whether the checkout these jobs run from, the role account's copy of the kit, is behind the repository's branch. null: the job is not told a repository (`kit_repo`). `behind`: a file the jobs run, or data they read (a schema, or a session kind the runner starts, KIT-880), changed between the checkout's head (`head`, twelve characters) and the branch; `merges_behind` counts the commits, and `files` names up to ten of the files, out of `files_total`. `current`: no file the jobs run changed (a doc or a test only may have). `unknown`: the question could not be answered, with `reason` in fixed words; never read as current. Optional: a file from before KIT-581 has none."
     },
     "queue_room": {
       "oneOf": [

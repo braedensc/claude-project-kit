@@ -56,8 +56,13 @@ QUEUE_CONFIG=~/.stage-e/queue/queue.json
 USAGE_CONFIG=~/.stage-e/usage/usage-config.json
 USAGE_FILE=~/.stage-e/usage/usage.json
 # The bridge's config, and the bridge's and finding job's records the queue reads (empty: that record is off).
+# The usage job reads the tech lead's and the stand-up's spend ledgers beside the bridge's record, so an empty
+# BRIDGE_STATE_FILE leaves their calls uncounted, and the usage file says so.
 BRIDGE_CONFIG=~/.stage-e/bridge.json
 BRIDGE_STATE_FILE=~/.stage-e/state/bridge-state.json
 FINDINGS_FILE=~/.stage-e/finding/seen.json
+# The runner's store_dir (runner.json), once a lane moves to the runner: the usage job counts its runs beside the
+# old dispatcher's, so they count against the day and the week. Empty: off, and the usage file says `off`.
+RUNNER_STORE=
 USAGE_INTERVAL_SECONDS=900
 MORNING_INTERVAL_SECONDS=600

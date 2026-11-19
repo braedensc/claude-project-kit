@@ -868,6 +868,7 @@ jobs:
           python3 scripts/pipeline_runner_store.py --selftest
           python3 scripts/pipeline_runner.py --selftest
           python3 scripts/pipeline_runner_limits.py --selftest
+          python3 scripts/pipeline_runner_setup.py --selftest
 
       # KIT-620. Every package.json test:* script needs a step above, or an entry with a reason
       # in the check's allow list. The leak sweeps do not count.
