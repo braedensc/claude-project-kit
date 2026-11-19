@@ -31,6 +31,7 @@ if HERE not in sys.path:
 
 import pipeline_notify_local as notify  # noqa: E402
 import pipeline_plan_poller as poller  # noqa: E402
+import pipeline_runner_store as runner_store  # noqa: E402  (KIT-908: runner-lane plan runs)
 from pipeline_bridge_transport import BridgeError  # noqa: E402
 from pipeline_bridge_config import (ASK_AGAIN_BIND, DECLINED, DONE,  # noqa: E402
                                     EXIT_USAGE, EXPIRED, OPEN, PLANNING_HEARD, REFUSED,
@@ -305,6 +306,15 @@ class ReplanMixin(object):
         if going:
             return ("%s is still being planned, in %s." % (ident, ", ".join(going)),
                     RUN_OPEN_BIND, "run open"), runs
+        # KIT-908: on our own runner's lane a planning run is no ticket, so it is read from the
+        # runner's store. A store that cannot be read is said, and never read as "no run open".
+        open_here, unread = self.runner_plan_runs(ident)
+        if unread:
+            return ("I can't tell whether %s is still being planned on our runner: %s."
+                    % (ident, unread), "", "runner unread"), runs
+        if open_here:
+            return ("%s is still being planned, in %s." % (ident, ", ".join(open_here)),
+                    RUN_OPEN_BIND, "run open"), runs
         standing = [p for p in self.standing_plans(issue, team, runs)
                     if p.get("id") not in ignore]
         if standing:
@@ -313,6 +323,44 @@ class ReplanMixin(object):
                              or "?") for p in standing)),
                     PLAN_FILED_BIND, "plan filed"), runs
         return None, runs
+
+    def runner_plan_runs(self, ident):
+        """([names of the idea's plan runs still going on our own runner], "") or ([], why) when
+        they cannot be told (KIT-908). Read from the stores of the projects `runner_lane` wires
+        whose own plan lane is on: the planner's plan starts for this idea, each followed to its
+        run the planner's own way (runner_phase). With no `runner_lane` nothing is read and the
+        ticket lane alone decides. A lane that cannot be read, a store that cannot be listed, a
+        request file that cannot be read (it may be this idea's) or a run record that cannot be
+        read gives `why` in words (contract section 13)."""
+        lane = self.cfg.get("runner_lane") or {}
+        stores = set()
+        for project in sorted(set((lane.get("repos") or {}).values())):
+            state, where, why = runner_store.caller_lane(lane["settings_file"], project, "plan")
+            if state == "held":
+                return [], why
+            if state == "on":
+                stores.add(where)
+        names = []
+        for store in sorted(stores):
+            try:
+                got = runner_store.asked(store, "planner", "plan")
+            except (runner_store.StoreError, ValueError) as exc:
+                return [], "the runner's store could not be read (%s)" % self.clean(str(exc))[:160]
+            if got["unread"]:
+                return [], ("%d request file(s) in the runner's store could not be read, and one "
+                            "may be this idea's" % got["unread"])
+            for row in got["asked"]:
+                if row["request"]["action"] != "start" or row["request"]["ticket"] != ident.upper():
+                    continue
+                try:
+                    phase = poller.runner_phase(store, row["id"])
+                except poller.PollerError as exc:
+                    return [], self.clean(str(exc))[:200]
+                if phase["phase"] == "waiting":
+                    names.append("our runner (request %s)" % row["id"])
+                elif phase["phase"] == "running":
+                    names.append(phase["run"]["run"])
+        return names, ""
 
     def settle_replan(self, q):
         """True when a re-plan under way may have its idea outside Plan it: its first move
@@ -1072,6 +1120,104 @@ def cases_replan(kit):
                  "PROD-6 is on OPS, and I plan only on PROD.")):
             check("replan-refused-before-asking: " + name,
                   outcome(lambda: rp_refused("rp-" + name, setup)), (want, {}, []))
+
+        # KIT-908: on our own runner's lane a planning run is no ticket. The bridge reads the
+        # runner's store for the idea's plan starts, and refuses a replan while one is open.
+        import uuid
+        import pipeline_runner_store as rstore_mod
+
+        def runner_idea(name, setup=None, settings=None, ident="PROD-6"):
+            folder = os.path.join(tmp, "rl-" + name)
+            os.makedirs(folder)
+            store = os.path.join(folder, "store")
+            rstore_mod.prepare(store)
+            path = os.path.join(folder, "runner.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(settings if settings is not None else json.dumps({
+                    "enabled": True, "store_dir": store,
+                    "projects": {"app": {"lanes": {"plan": True}}}}))
+            lane = {"settings_file": path, "repos": {"acme/app": "app"}}
+            c, s, t = world("rp-rl-" + name, act=True, runner_lane=lane,
+                            queue_config=os.path.join(folder, "queue.json"))
+            run(c, s, t)
+            t.in_plan_it("PROD-6", trigger="T1")
+            rid = rstore_mod.ask(store, "planner", "start", "plan", "app", ident, now=now)
+            if setup:
+                setup(store, rid)
+            s.add(ALICE, "replan PROD-6")
+            run(c, s, t)
+            qs = json.load(open(state_path(c)))["questions"].values()
+            return (posted(s)[-1], [q["kind"] for q in qs], t.moves), rid
+
+        def answered(state):
+            def setup(store, rid):
+                doc = rstore_mod.pending(store)[0][1]
+                run_id = "run-" + uuid.uuid4().hex
+                rec = dict((k, None) for k in rstore_mod.RUN_KEYS)
+                rec.update(schema=rstore_mod.RUN_SCHEMA, run=run_id, request=rid, caller="planner",
+                           kind="plan", project="app", ticket=doc["ticket"], started_for="request",
+                           approved_by=OWNER, how="move", session_id=str(uuid.uuid4()),
+                           workspace="/runner/work/plan/PROD-6", branch="chore/prod-6-plan",
+                           state=state, started_at="2025-10-09T08:00:00Z")
+                if state == "ended":
+                    rec.update(reason="ended", ended_at="2025-10-09T08:30:00Z")
+                rstore_mod.write_run(store, rec)
+                rstore_mod.settle(store, rid, doc, True, run_id, "", now)
+                setup.run = run_id
+            return setup
+
+        asked_again = "*Plan this again?*"
+
+        def waiting_case():
+            (text, kinds, moves), rid = runner_idea("waiting")
+            return text == ("PROD-6 is still being planned, in our runner (request %s). Ask again "
+                            "once that run has finished." % rid), kinds, moves
+        check("replan-refused-while-a-run-waits-on-our-runner (KIT-908)", outcome(waiting_case),
+              (True, [], []))
+
+        def running_case():
+            setup = answered("running")
+            (text, kinds, moves), _rid = runner_idea("running", setup)
+            return text == ("PROD-6 is still being planned, in %s. Ask again once that run has "
+                            "finished." % setup.run), kinds, moves
+        check("replan-refused-while-a-run-goes-on-our-runner (KIT-908)", outcome(running_case),
+              (True, [], []))
+
+        def ended_case():
+            (text, kinds, _m), _rid = runner_idea("ended", answered("ended"))
+            return text.startswith(asked_again), kinds
+        check("replan-asks-when-its-runner-run-has-ended (KIT-908)", outcome(ended_case),
+              (True, ["replan"]))
+
+        def none_case():
+            (text, kinds, _m), _rid = runner_idea(
+                "none", lambda store, rid: rstore_mod.withdraw(store, rid))
+            return text.startswith(asked_again), kinds
+        check("replan-asks-when-no-run-is-open-on-our-runner (KIT-908)", outcome(none_case),
+              (True, ["replan"]))
+
+        def other_case():
+            (text, kinds, _m), _rid = runner_idea("other", ident="PROD-7")
+            return text.startswith(asked_again), kinds
+        check("replan-ignores-another-ideas-run-on-our-runner (KIT-908)", outcome(other_case),
+              (True, ["replan"]))
+
+        cannot = "I can't tell whether PROD-6 is still being planned on our runner: "
+
+        def unreadable_case():
+            (text, kinds, moves), _rid = runner_idea("nosettings", settings="{not json")
+            return text.startswith(cannot), kinds, moves
+        check("replan-refused-in-words-when-the-runner-settings-cannot-be-read (KIT-908)",
+              outcome(unreadable_case), (True, [], []))
+
+        def corrupt_case():
+            def setup(store, rid):
+                with open(os.path.join(store, "requests", "rq-" + "b" * 32 + ".json"), "w") as fh:
+                    fh.write("{")
+            (text, kinds, moves), _rid = runner_idea("corrupt", setup)
+            return text.startswith(cannot + "1 request file(s)"), kinds, moves
+        check("replan-refused-in-words-when-a-request-file-cannot-be-read (KIT-908)",
+              outcome(corrupt_case), (True, [], []))
 
         # KIT-444: a plan that still stands is offered for cancelling, in the re-plan's own
         # question; the yes cancels it alone, then plans the idea again.
