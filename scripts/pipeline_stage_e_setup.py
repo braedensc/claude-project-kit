@@ -1247,13 +1247,13 @@ def role_path(path, home):
     return path
 
 
-def runner_job_settings(ctx):
+def runner_job_settings(ctx, listed):
     """The settings file the runner's installed job reads, as the role account names it, or None
-    when no runner job is installed here (KIT-892). The runner's job is found the way `verify`
-    finds every job that runs from the clone (`clone_jobs_sh`), and its own file says which
-    settings it reads. Raises Unknown when the jobs, or that file, could not be read: where the
-    runner's settings are is a fact to measure, and "could not tell" is never "no runner"."""
-    found = [plist for entry, plist in _clone_job_files(ctx) if entry == RUNNER_ENTRY]
+    when no runner job is installed here (KIT-892). `listed` is every job that runs from the
+    clone, as `verify` finds them (`_clone_job_files`), and the runner's own file says which
+    settings it reads. Raises Unknown when that file could not be read: where the runner's
+    settings are is a fact to measure, and "could not tell" is never "no runner"."""
+    found = [plist for entry, plist in listed if entry == RUNNER_ENTRY]
     if not found:
         return None
     if len(found) > 1:
@@ -1277,18 +1277,32 @@ def runner_job_settings(ctx):
 
 
 def runner_settings_place(ctx):
-    """Where the review job reads the runner's settings (KIT-892): RUNNER_SETTINGS when it is set,
-    else the file the runner's installed job reads, else None: no runner here, so nothing is
-    written and the review job keeps its own default. A key that names another file than the
-    installed job reads is refused, both named: the review job would read settings the runner
-    does not, and a lane switched on there would quietly do nothing."""
+    """(where the review job reads the runner's settings, a note or None): KIT-892. RUNNER_SETTINGS
+    when it is set, else the file the runner's installed job reads, else None: no runner here, so
+    nothing is written and the review job keeps its own default. A key that names another file
+    than the installed job reads is refused, both named: the review job would read settings the
+    runner does not, and a lane switched on there would quietly do nothing.
+
+    A jobs listing it could not read stops the step where this conf names the runner (either key
+    set): where its settings are is then a fact the step must have. With neither key, the machine
+    is not wired to a runner, and such a listing is said in a note instead, with nothing written,
+    as before this key: one unreadable LaunchDaemon file never blocks a machine with no runner. A
+    runner job it found and could not read stops the step either way: a runner is there."""
     said = (ctx.conf.get("RUNNER_SETTINGS") or "").strip()
-    installed = runner_job_settings(ctx)
+    try:
+        listed = _clone_job_files(ctx)
+    except Unknown as exc:
+        if said or runner_lane(ctx.conf):
+            raise
+        return None, ("where a runner job is installed could not be read (%s), so no runner_settings "
+                      "was written and the review job keeps its default, %s. Set RUNNER_SETTINGS in "
+                      "stage-e.conf if a runner runs here" % (exc.what[:200], "~/.pipeline-runner/runner.json"))
+    installed = runner_job_settings(ctx, listed)
     if said and installed and os.path.normpath(role_path(said, ctx.role_home)) != os.path.normpath(installed):
         raise SetupError("RUNNER_SETTINGS names %s, but the runner's installed job reads %s. The review "
                          "job would read settings the runner does not. Nothing was written. Set "
                          "RUNNER_SETTINGS to %s, or empty it, then run this again" % (said, installed, installed))
-    return role_path(said, ctx.role_home) if said else installed
+    return (role_path(said, ctx.role_home) if said else installed), None
 
 
 def catchup_teams(conf):
@@ -2201,7 +2215,9 @@ CARDS = {
         "why": ("Its first real pass replies once to every delegation from the past week that "
                 "the dispatcher never answered, and each reply starts a paid session. Some "
                 "were dropped on purpose, and some you may not want any more. The dry-run "
-                "lines above name every one. Only you know which you want started."),
+                "lines above name every one. Only you know which you want started. A team "
+                "whose fixes our own runner takes, its `fix` lane on there, is left out of "
+                "every pass, so of the count too (KIT-707): that team is not this job's."),
         "do": ["Nothing else waits on this: until you sign, the catch-up poller is simply",
                "not installed, and every run says so. To decline it for good, set",
                "CATCHUP_INTERVAL_SECONDS=off in stage-e.conf.",
@@ -4259,9 +4275,11 @@ def step_configs(ctx, apply_it):
     # review job says so when it cannot find or read the settings, and pages: it never reads that
     # as "lane off". Each is composed only when there is one, so a machine with no runner and no
     # lane still composes, byte for byte, the config it always did.
-    place = runner_settings_place(ctx)
+    place, place_note = runner_settings_place(ctx)
     if place:
         poller["runner_settings"] = place
+    if place_note:
+        notes = list(notes) + [place_note]
     if runner_lane(conf):
         poller["runner_projects"] = dict((repo, project) for repo, _team, project in runner_lane(conf))
     bounce = {
@@ -13425,14 +13443,17 @@ def _selftest_body():
                ("cat $HOME/.stage-e/kit/scripts/pipeline_bounce_local.py", 0, 'cfg["runner_lane"] = 1\n'),
                ("cat $HOME/.stage-e/kit/scripts/pipeline_catchup_poller.py", 0, '"runner_lane"\n')] \
             + list(fake892.answers)
+        notes892[:] = []
         try:
-            _quiet(lambda: step_configs(ctx892, apply_it=True))
+            (_ok892, _d892, got_notes), _p892 = _quiet(lambda: step_configs(ctx892, apply_it=True))
+            notes892.extend(got_notes)
             raised = None
         except (SetupError, Unknown) as exc:
             raised = "%s: %s" % (type(exc).__name__, exc)
         wrote = [json.loads(w["stdin"]) for w in fake892.writes
                  if "cat >" in _fmt(w["argv"]) and ".stage-e/poller.json" in _fmt(w["argv"])]
         return raised, (wrote[0] if wrote else None), fake892.writes
+    notes892 = []                                   # the last _configs_892 step's notes
 
     runner_listed = (0, "pipeline_runner.py %s\nEND\n" % rplist)
     r892, p892, _w = _configs_892(conf, runner_listed, _runner_body("~/.pipeline-runner"))
@@ -13464,7 +13485,6 @@ def _selftest_body():
            r892 is None and p892 is not None and "runner_settings" not in p892 and "runner_projects" not in p892,
            "no runner and no key gave %r, %r" % (r892, p892))
     for label, listing, body in (
-            ("a jobs listing that could not be read", (9, ""), None),
             ("a runner's file that could not be read", runner_listed, "not a plist"),
             ("a runner's file with no settings in its command", runner_listed,
              _runner_body("~/.pipeline-runner").replace(" run --config ", " run ")),
@@ -13475,6 +13495,20 @@ def _selftest_body():
                r892 and r892.startswith("Unknown") and not [w for w in w892 if "cat >" in _fmt(w["argv"])],
                "%s gave %r, %r" % (label, r892, p892))
     store892 = "~/.pipeline-runner/store"
+    # A jobs listing it could not read: where this conf names the runner, the step cannot be judged;
+    # with neither key, the machine is not wired to a runner, and it is a note, with nothing written.
+    for label, conf892 in (("RUNNER_SETTINGS set", dict(conf, RUNNER_SETTINGS="/srv/runner/runner.json")),
+                           ("RUNNER_LANE_REPOS set", dict(conf, RUNNER_LANE_REPOS="example-org/kit:KIT:kit",
+                                                          RUNNER_STORE_DIR=store892))):
+        r892, p892, w892 = _configs_892(conf892, (9, ""))
+        expect("KIT-892 a jobs listing that could not be read, with %s, is not known" % label,
+               r892 and r892.startswith("Unknown") and not [w for w in w892 if "cat >" in _fmt(w["argv"])],
+               "%s and an unread listing gave %r" % (label, r892))
+    r892, p892, _w = _configs_892(conf, (9, ""))
+    expect("KIT-892 with neither key, a jobs listing that could not be read is a note, and nothing is written for it",
+           r892 is None and p892 is not None and "runner_settings" not in p892
+           and any("no runner_settings was written" in n for n in notes892),
+           "no keys and an unread listing gave %r, %r, notes %r" % (r892, p892, notes892))
     r892, p892, _w = _configs_892(dict(conf, RUNNER_LANE_REPOS="example-org/kit:KIT:kit",
                                        RUNNER_STORE_DIR=store892), runner_listed, _runner_body("~/.pipeline-runner"))
     expect("KIT-892 the repositories named as runner projects are written beside it",
