@@ -27,7 +27,9 @@ none: the runner's `lanes.review` is the review lane's one switch.
 **The runner says which lanes it takes** (KIT-708). It writes them into its store, and the acceptance
 job and the fix driver read them there. Each sends a kind to the runner only while the runner says that
 lane is on for the project, and takes its old road otherwise. Their own `runner_lane` only says where the
-runner's store is and which project a repository is: it switches nothing.
+runner's store is and which project a repository is: it switches nothing. The catch-up job reads the
+`fix` lane there too (KIT-707): it leaves a team out of each pass while that lane is on for every one of
+its projects, so the one switch moves a project's fixes and its catch-up together.
 
 **Its runs count against the day and the week** once `RUNNER_STORE` in `queue.conf` names its
 `store_dir` (KIT-860). The usage job reads every run record through the store's one reader, beside
@@ -556,9 +558,10 @@ off for project app".
 
 **It says which lanes it takes** (KIT-708). Each pass writes `<store_dir>/lanes.json` from its own
 checked settings, when they change: whether it is on, each project's lanes that are on, its work
-folder and `look_config_dir`. The acceptance job and the fix driver read it. A lane it does not take,
-or a runner that has written nothing yet, is the job's old road. A file that cannot be read is "could
-not tell": the job sends nothing and says so, and never reads it as off.
+folder and `look_config_dir`. The acceptance job, the fix driver and the catch-up job read it. A lane it
+does not take, or a runner that has written nothing yet, is the job's old road. A file that cannot be
+read is "could not tell": the job sends nothing and says so, and never reads it as off. The catch-up
+job then leaves no team out, and fires, so a lost delegation is still re-sent.
 
 Good: the owner sets `"acceptance": true` for project app. The next acceptance check of app's
 repository is asked of the runner. He sets it back to false, and the next check files its ticket.

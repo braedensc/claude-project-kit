@@ -2613,16 +2613,16 @@ RUNNER_STORE_DIR=~/.pipeline-runner/store
 ```
 
 Each entry is `OWNER/NAME:TEAM:PROJECT`. The repository is one you review, the team is its
-tracker team, and the project is its key in the runner's settings. Remove the entry and run
-the installer again to switch it back.
+tracker team, and the project is its key in the runner's settings. The entry is wiring: it
+switches nothing by itself (KIT-707).
 
 **The runner's own lanes switch each kind** (KIT-708). The runner writes the lanes it takes into
 its store, and the driver reads them each pass. A fix goes to the runner only while the runner's
 `fix` lane is on for the project, and a conflict only while its `conflict` lane is on. Off, that
 kind goes by the session's thread, as before. Lanes the driver cannot read are said on the pull
 request, and nothing is sent. So the entry here names the repository once, and the runner's
-`lanes` setting moves each kind and moves it back. The catch-up poller still leaves the team out
-while the entry is here: to move a team back to the thread for good, remove its entry too.
+`lanes` setting moves each kind and moves it back. The catch-up poller reads the same lanes each
+pass (KIT-707), so the `fix` lane moves its cover too: no installer run either way.
 
 - **What stays the same.** The ledger rows, the fix budget, the re-review request, exhaustion
   and the page when a fix is never pushed. The visible record line goes on the ticket as one
@@ -2632,10 +2632,11 @@ while the entry is here: to move a team back to the thread for good, remove its 
   request says a person is needed. While that run is still going, the fix waits for it to end
   and spends nothing. Past `blocked_after_seconds` that wait is said on the pull request
   instead, since the runner may be down.
-- **The catch-up poller** leaves that repository's team out. With every team on this lane it
-  is not installed, as with `CATCHUP_INTERVAL_SECONDS=off`. It works by team, so a team leaves
-  it as a whole: name every repository of that team, or none. A repository of it still on the
-  thread would no longer have its lost delegations re-sent.
+- **The catch-up poller** leaves that repository's team out of each pass while the runner's
+  `fix` lane is on for every repository named for the team, and covers it again once the lane is
+  off. A pass with no team left reads nothing and says so; lanes it cannot read leave no team
+  out, and page. It works by team, so name every repository of a team: one not named would lose
+  the re-sending of its lost delegations while the team is left out.
 - **A conflict** goes to the runner too, while the runner's `conflict` lane is on (KIT-708): a
   `conflict` resume of the same coding run, with the same ledger rows and ack (step 6).
 - **Name a repository only once its coding sessions run through the runner too.** Until then
