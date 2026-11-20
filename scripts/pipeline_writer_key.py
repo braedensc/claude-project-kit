@@ -476,14 +476,14 @@ def renew(st, post=None):
     access, fresh, life = doc.get("access_token"), doc.get("refresh_token"), doc.get("expires_in")
     if fresh is not None and not (isinstance(fresh, str) and RENEWAL_RE.match(fresh)):
         return "renewal-failed", None
+    whole = (isinstance(access, str) and tl.KEY_RE.match(access) and isinstance(life, int)
+             and not isinstance(life, bool) and EXPIRES_MIN <= life <= EXPIRES_MAX)
     try:
-        write_secret(src["renewal_file"], fresh or token)        # the chain first
-        if not (isinstance(access, str) and tl.KEY_RE.match(access)):
-            return "renewal-failed", None
+        write_secret(src["renewal_file"], fresh or token)        # the chain first, whatever else the answer holds
+        if not whole:
+            return "renewal-failed", None                        # the key is written only from a whole answer
         write_secret(st["key_file"], access)
     except OSError:
-        return "renewal-failed", None
-    if not (isinstance(life, int) and not isinstance(life, bool) and EXPIRES_MIN <= life <= EXPIRES_MAX):
         return "renewal-failed", None
     return "renewed", life
 
@@ -529,12 +529,17 @@ def _since(stamp, now):
 
 
 def _state(doc):
-    renewal = (doc.get("renewal") or {}).get("result")
-    if doc["source"] == "renew" and renewal not in (None, "renewed"):
+    """(state, reason). A renewal a person must mend (a refused renewal token or client, or none to renew with) is
+    failed at once. One that did not complete (Linear out of reach, an answer that was not whole) is unknown: it is
+    tried again every five minutes, and judge() says so once the key's end is six hours off."""
+    renewal = (doc.get("renewal") or {}).get("result") if doc["source"] == "renew" else None
+    if renewal not in (None, "renewed", "renewal-failed"):
         return "failed", renewal
     result = (doc.get("check") or {}).get("result")
     if result in ("other-user", "refused", "unreadable"):
         return "failed", result
+    if renewal == "renewal-failed":
+        return "unknown", renewal
     if result == "unreachable":
         return "unknown", "unreachable"
     if result is None:
@@ -689,6 +694,8 @@ def judge(doc, now):
                                           "ended " + _ago(now - ends) + " ago")
         if doc["renewed_at"]:
             words += ", renewed at %s" % doc["renewed_at"]
+        if doc["reason"] == "renewal-failed":
+            words += "; its last renewal did not complete, and is tried again every %d minutes" % (RETRY_EVERY // 60)
     elif doc["source"] == "other-program":
         words += "; its end is that program's to keep, so the runner asks it who it is every %d minutes" % (
             CHECK_EVERY // 60)
@@ -922,6 +929,8 @@ def cases(expect, tmp):  # noqa: C901  (one battery, read top to bottom)
         expect("refused: %s" % name, got, ("renewal-failed", None))
     expect("…a renewal token that came back is kept even when the rest is wrong: the chain is never lost",
            open(renewal).read().strip(), "renew8" + "r" * 30)
+    expect("…but the key is written only from a whole answer: the last good key stays", open(keyf).read().strip(),
+           PREFIX + "%064x" % 2)
 
     # ---- the runner's pass ------------------------------------------------------------ #
     lin = StandInLinear()
@@ -972,6 +981,26 @@ def cases(expect, tmp):  # noqa: C901  (one battery, read top to bottom)
     doc = keep(st_renew, sdir, ["owner-1"], t2 + RETRY_EVERY, lin.gql, lin.post)
     expect("a new renewal token put in: renewed, and OK again", (doc["state"], judge(doc, t2 + RETRY_EVERY)[0]),
            ("ok", []))
+
+    sdir5 = os.path.join(tmp, "store5")
+    os.makedirs(sdir5, mode=0o700)
+    lin = StandInLinear()
+    write_secret(renewal, RENEWAL_0)
+    doc = keep(st_renew, sdir5, ["owner-1"], T0, lin.gql, lin.post)
+    t = epoch(doc["ends_at"]) - RENEW_BEFORE
+
+    def down(url, form):
+        raise OSError("Linear out of reach")
+    doc = keep(st_renew, sdir5, ["owner-1"], t, lin.gql, down)
+    problems, words = judge(doc, t)
+    expect("a renewal that did not complete (Linear out of reach) is unknown, not failed, while the key answers and "
+           "its end is 12 hours off; the words say it is tried again",
+           (doc["state"], doc["reason"], problems, "its last renewal did not complete" in words),
+           ("unknown", "renewal-failed", [], True))
+    t2 = epoch(doc["ends_at"]) - WARN_BEFORE + 1
+    doc = keep(st_renew, sdir5, ["owner-1"], t2, lin.gql, down)
+    expect("…and once its end is six hours off, that is said", any("has not been renewed" in p for p in judge(doc, t2)[0]),
+           True)
 
     lin = StandInLinear()
     _put(other, json.dumps({"linearToken": KEY_A}), 0o644)

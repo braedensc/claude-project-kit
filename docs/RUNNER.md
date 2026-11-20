@@ -544,7 +544,10 @@ differs. The bridge's name is compared with the name the key answered with, once
 
 **Removing the previous dispatcher.** Switch to `renew` first, and wait until `check` says the runner
 renewed the key. Then remove the program. Nothing reads its file any more, so the key keeps working. Take
-`runner-writer-key` out of CREDENTIAL_EXPIRIES: that date was for a key a person wrote.
+`runner-writer-key` out of CREDENTIAL_EXPIRIES: that date was for a key a person wrote. The parts list still
+says a writer's key ends on a date set when it is made, which is true of the `file` source. So the one
+command asks for that date on each run, and `dates` lists it as missing: press Enter, since a key that is
+renewed has no date to give.
 
 Good: `check` says the writer's key is renewed by the runner itself, answered 4 minutes ago, and ends tomorrow at 03:12.
 Not: a person copying the key into `writer-key` each morning. It ends within a day, and nobody is warned before it does.

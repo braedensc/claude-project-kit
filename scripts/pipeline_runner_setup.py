@@ -1249,6 +1249,10 @@ def step_writer_key(ctx, apply_it):
         ok, words = step_key("writer-key", ctx, apply_it)
         if "yet: run `writer-key`" in words:
             return ok, words            # no file yet, and no lane needs one: no fault, whatever the runner saw
+        when = recorded_end(ctx.watch_conf, WRITER_CLOCK)[0]
+        if when is not None and (when - (ctx.today or _today())).days <= 1:     # KIT-933: within a day is said
+            raise SetupError("the session writer's key ends on %s, within a day: make a new one and run `writer-key` "
+                             "before it does, or let the runner keep it working (WRITER_KEY_SOURCE)" % when.isoformat())
         try:
             doc = writer_status(ctx)[0]
         except Unknown:
@@ -1279,8 +1283,10 @@ def step_writer_key(ctx, apply_it):
                                  ("renewal token", src["renewal_file"], "writer-renewal")):
             word = token_file_state(lambda script: ctx.as_role(script, "reading the %s file's kind" % label), path)
             if word == "absent" and cmd == "writer-renewal" and src.get("adopt_file"):
-                found.append("its first renewal takes the renewal token from %s, under %s" % (
-                    src["adopt_file"], src["adopt_field"]))
+                found.append("its first renewal takes the renewal token from %s, under %s. Stop that program for "
+                             "good first: each renewal hands back a new renewal token, so if both renew, the one that "
+                             "goes second is refused, and it may be that program, which says nothing here" % (
+                                 src["adopt_file"], src["adopt_field"]))
                 continue
             if word == "absent":
                 raise SetupError("WRITER_KEY_SOURCE is renew, and there is no %s file at %s: run `%s`" % (label, path, cmd))
@@ -1332,7 +1338,8 @@ else:
 '''
 SETTINGS_STATE_WORDS = dict(TOKEN_STATE_WORDS, writable="can be changed by group or others, so nothing in it is "
                             "trusted", **{"too-large": "is larger than any settings file the runner reads"})
-STATUS_LOOKS = 15                      # an apply waits this many two-second looks for the runner's first word
+STATUS_LOOKS = 30   # an apply waits this many two-second looks (a minute) for the runner's first word: its first pass,
+                    # with a renewal and a question to the tracker, each held to 30 and 20 seconds
 
 
 def settings_file_state(ctx, path):
@@ -2699,6 +2706,7 @@ def _cases(check, tmp, unsafe):  # noqa: C901  (one battery, read top to bottom)
 
     # 12d. KIT-933: where the session writer's key comes from, how the runner says it stands, and the one user every
     #      reader trusts. The runner's status of the key is planted in the role home; the key files hold stand-ins.
+    #      Each case runs its one row alone on one machine, never a whole install: Kit checks runs near its limit.
     OTHER = "~/.other-program/config.json"
     tools = {"SESSION_TOOLS_KEY_FILE": "~/.pipeline-runner/writer-key", "SESSION_TOOLS_WRITER_USER_ID": "writer-1"}
     borrowed = dict(tools, WRITER_KEY_SOURCE="other-program", WRITER_KEY_FROM=OTHER, WRITER_KEY_FROM_FIELD="linearToken")
@@ -2715,15 +2723,42 @@ def _cases(check, tmp, unsafe):  # noqa: C901  (one battery, read top to bottom)
                 "ends_at": wkey.iso(now + ends_in) if ends_in is not None else None}
 
     def plant(fake, status=None, other_mode=0o644, files=()):
-        if status is not None:
-            _put(fake.home + "/.pipeline-runner/store/" + wkey.STATUS_FILE, json.dumps(status))
-            os.chmod(fake.home + "/.pipeline-runner/store/" + wkey.STATUS_FILE, 0o600)
-        if other_mode is not None:
-            _put(fake.home + "/" + OTHER[2:], json.dumps({"linearToken": KEY}))
-            os.chmod(fake.home + "/" + OTHER[2:], other_mode)
-        for leaf in files:
-            _put(fake.home + "/.pipeline-runner/" + leaf, KEY + "\n")
-            os.chmod(fake.home + "/.pipeline-runner/" + leaf, 0o600)
+        """The runner's status, the other program's file and the renewed key's files, each there or gone."""
+        spath, opath = fake.home + "/.pipeline-runner/store/" + wkey.STATUS_FILE, fake.home + "/" + OTHER[2:]
+        for path, there, body, mode in ((spath, status is not None, json.dumps(status), 0o600),
+                                        (opath, other_mode is not None, json.dumps({"linearToken": KEY}), other_mode)):
+            if there:
+                _put(path, body)
+                os.chmod(path, mode)
+            elif os.path.lexists(path):
+                os.unlink(path)
+        for leaf in ("writer-client", "writer-renewal-key"):
+            path = fake.home + "/.pipeline-runner/" + leaf
+            if leaf in files:
+                _put(path, KEY + "\n")
+                os.chmod(path, 0o600)
+            elif os.path.lexists(path):
+                os.unlink(path)
+
+    def one_row(fake, step_id, **over):
+        """(outcome, detail) of one step run alone, as run_steps runs it, from the machine's runner.conf (`over` writes
+        it first): no install, and no other row."""
+        if over:
+            _put(fake.root + "/runner.conf", text(ENGINE_DIR=fake.root + "/engine/kit", **over))
+        conf, errors = load_conf(fake.root + "/runner.conf", "selftest-person")
+        if errors:
+            return "conf", errors
+        ctx = Ctx(conf, fake, {}, True, None, fake.scripts)
+        ctx.home, ctx.watch_conf, ctx.conf_dir = fake.home, fake.root + "/update.conf", fake.root
+        fake.dry_run, fake.writes = True, []
+        try:
+            ok, detail = dict(STEPS)[step_id](ctx, False)
+            outcome = ALREADY_DONE if ok else WOULD_CHANGE
+        except Unknown as exc:
+            outcome, detail = UNKNOWN, "NOT MEASURED: %s (%s)" % (exc.what, exc.remedy)
+        except (SetupError, Refusal) as exc:
+            outcome, detail = FAILED, str(exc)
+        return outcome, _s(detail)
 
     def source_faults():
         got = []
@@ -2742,39 +2777,60 @@ def _cases(check, tmp, unsafe):  # noqa: C901  (one battery, read top to bottom)
          ("the source rules dropped", [(me, "source_problems", lambda c: [])]),
          ("the path rules dropped", [(me, "path_problems", lambda c, home, skip=(): [])]))
 
-    def installed_doc(fake):
-        with open(fake.home + "/.pipeline-runner/runner.json") as fh:
-            return json.load(fh)
+    def writer_dates():
+        import pipeline_parts
+        doc = pipeline_parts.load(KIT)[0]
+        mine = [s for p in pipeline_parts.parts_of(doc) if p["id"] == "runner" for s in p["secrets"]
+                if s.get("clock") == WRITER_CLOCK]
+        kit = tempfile.mkdtemp(dir=tmp)
+        for name, source in (("pipeline-parts.json", "pipeline-parts.json"), ("runner.conf", "runner.conf.example")):
+            with open(os.path.join(KIT, source), encoding="utf-8") as fh:
+                _put(kit + "/" + name, fh.read())
+        keys = [k for k in watch.listed_keys(kit) if k["clock"] == WRITER_CLOCK]
+        return len(mine), mine and mine[0]["ends"], watch.date_rows(keys, [], today, 30)[1]
+    case("the parts list keeps the session writer's key one that ends when it is made: a person-written key (the file "
+         "source, the default) with no date on record still makes `dates` fail", writer_dates, (1, "set-when-made", 10),
+         ("another clock name", [(me, "WRITER_CLOCK", "other-name")]))
+
+    def written_key_ending():
+        fake, out = world(**tools), []
+        _put(fake.home + "/.pipeline-runner/writer-key", KEY + "\n")
+        os.chmod(fake.home + "/.pipeline-runner/writer-key", 0o600)
+        for days in (200, 1):
+            watch_conf(fake, "%s:%s" % (WRITER_CLOCK, ON(days)))
+            out.append(one_row(fake, "writer-key"))
+        return out[0][0], out[1][0], "within a day" in out[1][1]
+    case("check: a person-written session writer's key that ends within a day FAILS, in words", written_key_ending,
+         (ALREADY_DONE, FAILED, True),
+         ("the day not judged", [(me, "recorded_end", lambda wc, clock=None, real=recorded_end: (
+             None, "", 30) if clock == WRITER_CLOCK else real(wc, clock))]))
 
     def source_carried():
-        fake = world(**borrowed)
-        go(fake, "apply")
-        first = installed_doc(fake)["session_tools"]
-        _put(fake.root + "/runner.conf", text(ENGINE_DIR=fake.root + "/engine/kit", **tools))
-        go(fake, "apply")
-        kept = installed_doc(fake)["session_tools"].get("key_source")
-        _put(fake.root + "/runner.conf", text(ENGINE_DIR=fake.root + "/engine/kit", WRITER_KEY_SOURCE="file", **tools))
-        go(fake, "apply")
-        return (first, kept, "key_source" in installed_doc(fake)["session_tools"],
-                runner_job.load_config(qs.with_home(dict(installed_doc(fake), session_tools=first), fake.home))[1])
-    case("apply: the source goes into session_tools; left out it is kept, even when the conf writes the rest of "
-         "session_tools; `file` is no source at all; the runner's own loader takes it",
+        conf_of = lambda **over: validate_conf(parse_conf(text(**over))[0], "p")[0]      # noqa: E731
+        installed = compose(conf_of(**borrowed), True, None)
+        kept = compose(conf_of(**tools), True, installed)["session_tools"].get("key_source")
+        gone = "key_source" in compose(conf_of(WRITER_KEY_SOURCE="file", **tools), True, installed)["session_tools"]
+        try:
+            settings_body(conf_of(**borrowed), True, tempfile.mkdtemp(dir=tmp), None)
+            loader = "taken"
+        except SetupError as exc:
+            loader = str(exc)
+        return installed["session_tools"], kept, gone, loader
+    case("apply's settings: the source goes into session_tools; left out it is kept, even when the conf writes the rest "
+         "of session_tools; `file` is no source at all; the runner's own loader takes it",
          source_carried, ({"key_file": "~/.pipeline-runner/writer-key", "writer_user_id": "writer-1",
                            "key_source": {"kind": "other-program", "file": OTHER, "field": "linearToken"}},
-                          {"kind": "other-program", "file": OTHER, "field": "linearToken"}, False, []),
+                          {"kind": "other-program", "file": OTHER, "field": "linearToken"}, False, "taken"),
          ("the installed source dropped", [(me, "writer_source", lambda c, real=writer_source: real(c) or {"kind": "file"})]))
 
     def borrowed_rows():
-        out = []
+        fake, out = world(**borrowed), []
         for status, mode in ((status_doc("other-program"), 0o644),
                              (status_doc("other-program", "failed", "refused", answered_ago=4 * 3600), 0o644),
                              (None, 0o644), (status_doc("other-program"), 0o664), (status_doc("other-program"), None),
                              (status_doc("file"), 0o644)):
-            fake = world(**borrowed)
-            go(fake, "apply")
             plant(fake, status, mode)
-            r = [x for x in go(fake)[1]["rows"] if x["step"] == "writer-key"][0]
-            out.append((r["outcome"], r["detail"]))
+            out.append(one_row(fake, "writer-key"))
         return ([o for o, _d in out], "read from %s, under linearToken" % OTHER in out[0][1],
                 "the runner asks it who it is every 30 minutes" in out[0][1],
                 wkey.REASONS["refused"] in out[1][1], "has not said" in out[2][1], "changed by group or others" in
@@ -2789,7 +2845,8 @@ def _cases(check, tmp, unsafe):  # noqa: C901  (one battery, read top to bottom)
          ("an old source believed", [(me, "status_for", lambda ctx, kind, apply_it: writer_status(ctx))]))
 
     def renewed_rows():
-        out = []
+        fake, out = world(**renewing), []
+        watch_conf(fake, "%s:%s" % (WRITER_CLOCK, ON(1)))
         for status, files, over in ((status_doc("renew", ends_in=20 * 3600 + 900), ("writer-client", "writer-renewal-key"), {}),
                                     (status_doc("renew", ends_in=5 * 3600), ("writer-client", "writer-renewal-key"), {}),
                                     (status_doc("renew", "failed", "renewal-refused", ends_in=10 * 3600),
@@ -2798,15 +2855,12 @@ def _cases(check, tmp, unsafe):  # noqa: C901  (one battery, read top to bottom)
                                     (status_doc("renew", ends_in=20 * 3600 + 900), ("writer-client",),
                                      dict(WRITER_KEY_FROM=OTHER, WRITER_RENEWAL_FROM_FIELD="linearRefreshToken")),
                                     (status_doc("renew", ends_in=20 * 3600 + 900), ("writer-client",), {})):
-            fake = world(**dict(renewing, **over))
-            go(fake, "apply")
             plant(fake, status, None, files)
-            watch_conf(fake, "%s:%s" % (WRITER_CLOCK, ON(1)))
-            r = [x for x in go(fake)[1]["rows"] if x["step"] == "writer-key"][0]
-            out.append((r["outcome"], r["detail"]))
+            out.append(one_row(fake, "writer-key", **dict(renewing, **over)))
         return ([o for o, _d in out], "renewed by the runner itself" in out[0][1], "(in 20 hours)" in out[0][1],
                 "has not been renewed" in out[1][1], wkey.REASONS["renewal-refused"] in out[2][1],
-                "run `writer-client`" in out[3][1], "takes the renewal token from %s" % OTHER in out[4][1],
+                "run `writer-client`" in out[3][1],
+                "takes the renewal token from %s" % OTHER in out[4][1] and "Stop that program for good first" in out[4][1],
                 "run `writer-renewal`" in out[5][1], "take it out of update.conf" in out[0][1])
     case("check: a renewed key says when it ends; one that ends within six hours or could not be renewed FAILS in "
          "words; no client details, or no renewal token and none to adopt, FAILS naming the step; a person's old "
@@ -2817,7 +2871,7 @@ def _cases(check, tmp, unsafe):  # noqa: C901  (one battery, read top to bottom)
              real(c), adopt_file=None) if (real(c) or {}).get("kind") == "renew" else real(c))]))
 
     def user_rows():
-        out = []
+        fake, out = world(**borrowed), []
         for confs, finding, status in (
                 ({"notifier.conf": "DISPATCHER_AGENT_USER_ID=writer-1\n", "acceptance.conf": "AGENT_USER_ID=writer-1\n",
                   "bridge.conf": "AGENT_USER_NAME=dispatcher-agent\n"}, {"agent_user_id": "writer-1"},
@@ -2827,15 +2881,18 @@ def _cases(check, tmp, unsafe):  # noqa: C901  (one battery, read top to bottom)
                 ({"bridge.conf": "AGENT_USER_NAME=Old Agent\n"}, None, status_doc("other-program")),
                 ({"bridge.conf": "AGENT_USER_NAME=dispatcher-agent\n"}, None, None),
                 ({"notifier.conf": "DISPATCHER_AGENT_USER_ID=\n"}, None, None)):
-            fake = world(**borrowed)
-            for leaf, body in confs.items():
-                _put(fake.root + "/" + leaf, body)
-            go(fake, "apply")
+            for leaf in ("notifier.conf", "acceptance.conf", "bridge.conf"):
+                if leaf in confs:
+                    _put(fake.root + "/" + leaf, confs[leaf])
+                elif os.path.exists(fake.root + "/" + leaf):
+                    os.unlink(fake.root + "/" + leaf)
             plant(fake, status, 0o644)
+            finding_path = fake.home + "/.stage-e/finding/poller.json"
             if finding is not None:
-                _put(fake.home + "/.stage-e/finding/poller.json", json.dumps(finding))
-            r = [x for x in go(fake)[1]["rows"] if x["step"] == "writer-user"][0]
-            out.append((r["outcome"], r["detail"]))
+                _put(finding_path, json.dumps(finding))
+            elif os.path.exists(finding_path):
+                os.unlink(finding_path)
+            out.append(one_row(fake, "writer-user"))
         return ([o for o, _d in out], "the notifier (DISPATCHER_AGENT_USER_ID)" in out[0][1] and "the finding filer" in
                 out[0][1] and "the bridge (AGENT_USER_NAME)" in out[0][1], "is someone-else" in out[1][1],
                 "is old-agent" in out[2][1], "answers as dispatcher-agent" in out[3][1],
@@ -2848,7 +2905,6 @@ def _cases(check, tmp, unsafe):  # noqa: C901  (one battery, read top to bottom)
 
     def client_and_renewal_steps():
         fake = world(**renewing)
-        go(fake, "apply")
         client = "client0id01234:secret0abcdef0123"
         code_c, words_c, asked_c, _s1 = step(fake, token=client, date=ON(300), cmd="writer-client")
         cpath = fake.home + "/.pipeline-runner/writer-client"

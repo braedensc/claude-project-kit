@@ -745,7 +745,9 @@ def row_queue_store(ctx):
 
 def key_files(ctx):
     """[(what, path, needed, rule)]: every key file the settings name, and the ones this lane cannot run without.
-    The rule is `key` (the runner's own: mode 0600, one key's size) or `settings` (KIT-933: another program's
+    The rule is `key` (the runner's own: mode 0600, one key's size), `later` (KIT-933: the same, but a file the
+    runner makes itself and may not have made yet: a renewed key's file before its first renewal, or its renewal
+    token while it is still to be taken from the other program's file) or `settings` (KIT-933: another program's
     settings file the writer's key is read from, which that program keeps: no one else may write it)."""
     cfg = ctx.cfg or {}
     st = cfg.get("session_tools") or {}
@@ -756,10 +758,10 @@ def key_files(ctx):
         out.append(("the other program's settings file the writer's key is read from", src.get("file"), needs_writer,
                     "settings"))
     elif src["kind"] == "renew":
-        out += [("the session writer's key", st.get("key_file"), False, "key"),
+        out += [("the session writer's key", st.get("key_file"), False, "later"),
                 ("the app's client details", src.get("client_file"), needs_writer, "key"),
                 ("the session writer's renewal token", src.get("renewal_file"),
-                 needs_writer and not src.get("adopt_file"), "key")]
+                 needs_writer and not src.get("adopt_file"), "later" if src.get("adopt_file") else "key")]
     elif st.get("key_file") or needs_writer:
         out.append(("the session writer's key", st.get("key_file"), needs_writer, "key"))
     if cfg.get("push_token_file") or ctx.lane in PUSH_LANES:
@@ -770,8 +772,8 @@ def key_files(ctx):
 def row_keys(ctx):
     """Each key file: there, a file, the role account's, mode 0600, and of a key's size; another program's
     settings file there, the role account's, and closed to writes by others. Looked at with `stat`, never opened.
-    A file not needed yet may be absent: a renewed key's file before its first renewal, or its renewal token
-    before the runner takes it over."""
+    Only a `later` file may be absent: a renewed key's file before its first renewal, or its renewal token
+    before the runner takes it over. Any other file the settings name and that is not there is MISSING."""
     said = []
     for what, path, needed, rule in key_files(ctx):
         if not path:
@@ -781,7 +783,7 @@ def row_keys(ctx):
             continue
         res = as_role(ctx, KEY_SH.replace("@F@", shlex.quote(path)))
         word = res.out.strip() if res.ok else ""
-        if word == "absent" and not needed:
+        if word == "absent" and rule == "later":
             continue
         if word in ("absent", "not-a-file"):
             raise Missing("%s's file %s is %s" % (what, path, "not there" if word == "absent" else
@@ -2184,7 +2186,7 @@ FLAGS = {
     "no_review": False, "interrupt_at": None, "lose_sudo_at": None, "ledger_ref": "same", "review_ticket": None,
     "mark_word": "passed", "gh_down": False, "no_old_review": False, "no_push": False, "no_role": False,
     "gh_after_on": False, "term_in_off": False, "settings_list": False,
-    "key_source": None, "writer_status": None, "other_mode": 0o644,        # KIT-933
+    "key_source": None, "writer_status": None, "other_mode": 0o644, "absent_keys": (),      # KIT-933
 }
 
 
@@ -2237,7 +2239,8 @@ class World(object):
                 _put(os.path.join(self.home, src["file"][2:]), json.dumps({"linearToken": PLANTED}),
                      self.f["other_mode"])
             for leaf in [src[k] for k in ("renewal_file", "client_file") if src.get(k)]:
-                _put(os.path.join(self.home, leaf[2:]), PLANTED + "\n")
+                if os.path.basename(leaf) not in self.f["absent_keys"]:
+                    _put(os.path.join(self.home, leaf[2:]), PLANTED + "\n")
         _put(self.settings, json.dumps(doc, indent=2, sort_keys=True) + "\n")
         with open(self.settings) as fh:
             self.installed = fh.read()
@@ -2826,8 +2829,26 @@ def _cases(check_, tmp):  # noqa: C901  (one battery, read top to bottom)
                                                          "answered as the session writer 3 minutes ago; it ends at "
                                                          "2026-11-21T08:00:00Z (in 23 hours)"}
 
+    def checked(lane="code", **flags):
+        """(io, the rows that are neither OK nor NOT NEEDED) of `check` alone: it never goes on to run the lane."""
+        _rc, io = go(world(lane, **flags), command="check")
+        return io, dict((k, v) for k, v in rows(io).items() if v not in (OK, NOT_NEEDED))
+
+    def keys_state(lane="code", **flags):
+        return checked(lane, **flags)[1].get("keys", OK)
+    case("the keys row: only a file the runner makes itself may be missing, a renewed key's own file before its first "
+         "renewal and its renewal token while it is still to be taken from the other program; any other file the "
+         "settings name that is missing is MISSING, whether this lane needs it or not",
+         lambda: (keys_state(key_source=dict(renewed, adopt_file=other["file"], adopt_field="linearRefreshToken"),
+                             writer_status=fine, keys={"writer-key": "absent"}, absent_keys=("writer-renewal-key",)),
+                  keys_state(key_source=renewed, writer_status=fine, absent_keys=("writer-renewal-key",)),
+                  keys_state("plan", keys={"push-token": "absent"})),
+         (OK, MISSING, MISSING),
+         ("any missing file passed over", [(me, "key_files", lambda ctx, real=key_files: [
+             (w, p_, n, "later" if r == "key" else r) for w, p_, n, r in real(ctx)])]))
+
     def writer_said(**flags):
-        io, bad = broken_io(**flags)
+        io, bad = checked(**flags)
         line = [ln for ln in io.said if ln[2:16].strip() == "writer key"]
         return bad.get("writer key", OK), (line[0][27:].strip() if line else ""), bad.get("keys", OK)
     case("a key from another program's settings file: the writer row says where it comes from, as the runner "
