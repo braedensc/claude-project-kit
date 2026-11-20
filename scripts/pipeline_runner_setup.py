@@ -579,7 +579,7 @@ try:
         os.lchown(top, uid, gid)
     st = os.lstat(top)
     if not stat.S_ISDIR(st.st_mode) or st.st_uid != uid or st.st_mode & 0o022:
-        refuse("%s is not a folder of root's alone" % top)
+        refuse("the folder above the copy is not root's alone: %s" % top)
     data = sys.stdin.buffer.read()
     for path in (new, old):
         gone(path)
@@ -595,7 +595,7 @@ try:
                 os.makedirs(path, 0o755, exist_ok=True)
                 continue
             if not m.isreg():
-                refuse("%s is not a plain file" % m.name)
+                refuse("not a plain file: %s" % m.name)
             os.makedirs(os.path.dirname(path), 0o755, exist_ok=True)
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o755 if m.mode & 0o100 else 0o644)
             with os.fdopen(fd, "wb") as fh:
@@ -765,14 +765,16 @@ def engine_state(ctx):
             raise Unknown("the role account %s has no user id" % ctx.account, "install Stage E first")
         problems += ["for %s: %s" % (who, p) for p in runner_guard.engine_problems(dest, uid=uid)]
     differ, missing, extra = copy_diff(tree, files)
+    # The reason first and the copy's place last: a row's words are cut at a length, and a long path must
+    # never push the reason past it.
     if not (differ or missing or extra or problems or mark != commit):
-        return True, "the copy at %s is kit %s, the commit Stage E's clone is at: %d files, each root's, and none " \
-                     "of it or above it the role account or you can change" % (dest, commit[:12], len(tree)), tree
+        return True, "the copy is kit %s, the commit Stage E's clone is at: %d files, each root's, and none of it " \
+                     "or above it the role account or you can change; it is at %s" % (commit[:12], len(tree), dest), tree
     said = ["%d %s" % (len(v), w) for v, w in ((differ, "differ"), (missing, "missing"), (extra, "extra")) if v]
-    return False, "the copy at %s holds kit %s, and Stage E's clone is at kit %s%s%s" % (
-        dest, (mark or "unknown")[:12], commit[:12], ": " + ", ".join(said) + " file(s)" if said else "",
+    return False, "the copy holds kit %s, and Stage E's clone is at kit %s%s%s; it is at %s" % (
+        (mark or "unknown")[:12], commit[:12], ": " + ", ".join(said) + " file(s)" if said else "",
         "; " + "; ".join(problems[:3]) + (" and %d more" % (len(problems) - 3) if len(problems) > 3 else "")
-        if problems else ""), tree
+        if problems else "", dest), tree
 
 
 def step_engine(ctx, apply_it):
@@ -793,12 +795,12 @@ def step_engine(ctx, apply_it):
                           % (ctx.commit[:12], dest), stdin=body, timeout=ENGINE_TIMEOUT)
         last = ((res.out or "").strip().splitlines() or [""])[-1]
         if not res.ok or last != "copied %s %d" % (ctx.commit, len(tree)):
-            raise SetupError("could not copy kit %s to %s as root (exit %d): %s" % (
-                ctx.commit[:12], dest, res.rc, _s(last or (res.err or "").strip())[:200] or "it said nothing"))
+            raise SetupError("the root program did not copy kit %s (exit %d): %s; the copy's place is %s" % (
+                ctx.commit[:12], res.rc, _s(last or (res.err or "").strip())[:200] or "it said nothing", dest))
         again, words, _tree = engine_state(ctx)
         if not again:
-            raise SetupError("copied kit %s to %s, and reading it back does not match: %s"
-                             % (ctx.commit[:12], dest, words))
+            raise SetupError("kit %s was copied, and reading the copy back does not match: %s"
+                             % (ctx.commit[:12], words))
     except SetupError as exc:           # never leave the runner stopped for a refresh that did not happen
         if stopped:
             raise SetupError("%s; %s" % (load_again(ctx), exc))       # the job's state first, then why
@@ -2290,7 +2292,8 @@ def _cases(check, tmp, unsafe):  # noqa: C901  (one battery, read top to bottom)
             code, doc, _err, _left = go(fake, "apply")
         finally:
             os.chmod(fake.root + "/engine", 0o755)
-        return code, rows(doc)["engine"], "is not a folder of root's alone" in said(doc), os.path.lexists(fake.engine)
+        return (code, rows(doc)["engine"], "the folder above the copy is not root's alone" in said(doc),
+                os.path.lexists(fake.engine))
     case("a folder above the copy that others can write: the root program refuses in its words, and makes no copy",
          open_above, (1, FAILED, True, False),
          ("the refusal dropped", [(me, "ENGINE_PY", ENGINE_PY.replace("st.st_mode & 0o022", "False"))]))
