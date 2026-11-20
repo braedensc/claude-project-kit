@@ -37,10 +37,9 @@ the old dispatcher's logs (docs/QUEUE-OPERATOR.md, "The runner's runs"). Set it 
 lane moves.
 
 Each kind of session is data now, behind walls the probe proved live for every kind, as the role
-account, on 18 Nov 2026: 95 of 95 (KIT-704). One thing still comes before any lane moves: a
-root-owned copy of the kit for the runner to run from. Its installer does not make that copy yet: it
-runs the runner from Stage E's clone, which this account can change. So a start on a lane that is on
-is held until the copy exists.
+account, on 18 Nov 2026: 95 of 95 (KIT-704). The runner runs from a root-owned copy of the kit. Its
+installer makes that copy and refreshes it (KIT-919): see "Installing it". Until the copy is in place, a
+start on a lane that is on is held.
 
 ## What it does
 
@@ -302,6 +301,7 @@ today. Taking the token out of sessions, with the runner pushing for them, is KI
   never current. An ended token, a file others can read and a link are FAILED. No file yet is no fault
   while no code, fix or conflict lane is on, and FAILED once one is. A path you installed by hand stays:
   with `PUSH_TOKEN_FILE` unset in `runner.conf`, `apply` keeps it. Set it to replace the path.
+  `PUSH_TOKEN_FILE=off` writes the setting off, and a rerun that leaves the key out keeps it off (KIT-919).
 - **Who reads it.** The runner, at each start or resume of a code, fix or conflict run, and never
   for another kind. A file it cannot read, or one that holds anything but one GitHub token, holds the
   request. The answer says why, never what the file holds.
@@ -562,6 +562,23 @@ One JSON file, which the installer writes from `runner.conf` (see "Installing it
 
 The four folders must not sit inside one another.
 
+**From runner.conf** (KIT-919). You never edit `runner.json` for these. The installer writes them from
+`runner.conf`:
+
+- `SESSION_TOOLS_KEY_FILE` and `SESSION_TOOLS_WRITER_USER_ID` become `session_tools`.
+- `QUEUE_CONFIG` becomes `queue_config`, and `LOOK_CONFIG_DIR` becomes `look_config_dir`.
+- `PUSH_TOKEN_FILE` becomes `push_token_file` (see "The push token"). Left out, it keeps what is
+  installed, and else is `push-token` in `RUNNER_DIR`.
+- `APPROVAL_STATES_<KEY>` (`code:<state id>, plan:<state id>`) and `ALLOWED_HOSTS_<KEY>` become each
+  project's `approval_states` and `allowed_hosts`. `<KEY>` is the project's key in capitals, with `-`
+  written as `_`.
+
+A key you set decides, and `off` writes the off itself. A key you leave out keeps what is installed:
+your own value, or an off you set.
+
+Good: `ALLOWED_HOSTS_APP=github.com, api.github.com, registry.npmjs.org`. App's sessions may reach npm too.
+Not: editing `allowed_hosts` in `runner.json`. Use runner.conf, so a rerun writes the same thing.
+
 **Each project's lanes.** `lanes` holds `true` or `false` for each kind of session: `code`, `fix`,
 `conflict`, `review`, `plan` and `acceptance`. A kind left out is off, and so is a project with no
 `lanes`. The runner refuses a start or resume for a lane that is off, before it makes or reads
@@ -604,25 +621,39 @@ and every word for a person on standard error, as the notifier's installer does.
   project every lane off. Switching one on is the owner's yes, per project, and this installer never
   does it. So it writes only the keys it owns, from `runner.conf`. A lane you switched on, its approved
   states and every other key you set are kept as installed. A file that is not JSON is never written
-  over.
+  over. The keys it carries for you are in "From runner.conf" under Settings.
+- **Its copy of the kit** (KIT-919). The runner runs from `ENGINE_DIR` (default
+  `/usr/local/pipeline-runner/kit`). That is a copy of the kit at the commit Stage E's clone is at, and
+  every file and folder in it is root's, closed to group and others. `check` compares the copy file by
+  file with that commit. It also runs the runner's own check of the copy, for the role account and for
+  you. When the clone moves, `check` says the copy is behind, and the same `apply` refreshes it. Nothing
+  else writes the copy: not the role account, and not a session.
+  - The files come from this checkout's own git objects at that commit, never from the role's clone.
+    Run the installer from a checkout that has fetched it.
+  - Only a commit on `origin/main` is copied, and the copy never moves back to an older commit.
+  - A small root program writes the files beside the old copy and swaps the two. Then the copy is read
+    back. A copy that cannot be read is NOT MEASURED, never current.
+  - A job that runs from the copy is stopped before the swap, so no session's guard comes from a copy
+    half moved. The `job` row loads it again. A refresh that fails loads it again at once, and says so.
+- **Its job.** One LaunchDaemon as the role account, kept alive, running the runner from its copy of the
+  kit. Stage E's `run` finds it there, stops it around a move of the clone and loads it again, still
+  on the old copy. The copy moves only with this installer's `apply`, which then loads the job again.
+  The job file says `Disabled`, so it starts at boot only after `launchctl enable`, which only an
+  install that switches it on runs.
 - **Its switch and its ceiling.** `enabled` is the part's own switch. Once installed it is kept: on
   stays on, and off is never switched back on by the installer. To switch it on, set `enabled` to true
   in `runner.json`. A first install counts its first pass: the requests waiting in its store and its
   unfinished runs. At or below its ceiling in `pipeline-parts.json` (0), it is switched on and loaded.
   Above it, or with a ceiling it cannot read, it is installed and left off. The document's `left_off`
   says why.
-- **Its job.** One LaunchDaemon as the role account, kept alive, running the runner from Stage E's
-  clone. Stage E's `run` stops it around a move of the clone and loads it again. The job file says
-  `Disabled`, so it starts at boot only after `launchctl enable`, which only an install that switches
-  it on runs.
 - **It asks nothing.** `apply` takes its answers through a pipe from the program that runs it, never a
   terminal, a file or an argument. Every sudo call is `sudo -n`. With no live sudo session, `check`
   says NOT MEASURED and `apply` exits 5. The one command holds that session. Inside a Claude session,
   `apply` is refused before it reads anything.
 
 `check` reports the job: its file, whether it starts at boot, and the kit commit launchd runs. It
-reports the clone's commit, whether its runner scripts are this checkout's, and each project's lanes
-as installed.
+reports the clone's commit, whether its runner scripts are this checkout's, whether the copy matches
+that commit, and each project's lanes as installed.
 
 Good: a fresh Mac. `apply` writes every lane off, switches the runner on and loads it. It starts nothing.
 Not: a store with requests left from before. The runner is left off, and the line says how many wait.
@@ -679,7 +710,7 @@ Each refusal says why, in the request's answer (`<store_dir>/taken/<id>.json`).
 | the push token file could not be read, can be read by others, or does not hold one GitHub token | Fix the file `push_token_file` names: this account's, mode 0600, one GitHub token. The request waits and starts on a later pass. |
 | the machine is below its floor | Free disk or memory. The request waits; it starts when there is room. |
 | the workspace's `.env` names a variable the program reads | Take the variable out of that file, or out of the project's committed copy. |
-| the engine's folder could be changed by this account | The runner runs from its own copy of the kit, owned by root. The request waits until it does. |
+| the engine's folder could be changed by this account | The runner must run from its root-owned copy of the kit. Run the installer's `check`: its `engine` row says what is wrong, and `apply` makes the copy again. The request waits until then. |
 | the session kinds could not be loaded | A kind's data file is missing or wrong: `python3 scripts/pipeline_session_kinds.py --check` says which. |
 | the kit's session kinds changed after this runner loaded them | The kit moved after the runner started. Restart the runner: it loads them, and the request starts. |
 | the kit's session kinds could not be read to compare | The folder, or a kind's file in it, cannot be read (a link, say). `python3 scripts/pipeline_session_kinds.py --check` says which. The request waits. |
