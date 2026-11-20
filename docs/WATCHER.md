@@ -296,6 +296,10 @@ The copies are `queue-heartbeat.json`, `morning-heartbeat.json` and `sweep-heart
 watch reads them; the one command sets the matching lines in `update.conf` (docs/UPDATE-OPERATOR.md). With only heartbeats and no
 `USAGE_FILE`, the copier still runs and the watcher's rules name no usage file.
 
+**The runner's word on the writer's key (KIT-933).** The same copier copies `writer-key.json` from the runner's store when
+`WRITER_KEY_STATUS` in `watcher.conf` names it, as `writer-key-status.json`. It is refused for the same reasons, and its old copy
+removed. The health watch's `writer-key` kind reads the copy, and the one command sets `WRITER_KEY_STATUS_FILE` to it.
+
 Two more limits: the copier has a plain-file check but does not read the content (the watcher judges that), and clearing
 `USAGE_FILE` later does not remove the copier's job. Remove it by hand.
 

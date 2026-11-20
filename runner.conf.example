@@ -31,6 +31,23 @@ PUSH_TOKEN_FILE=~/.pipeline-runner/push-token
 # in the runner's work, home or store folder, nor be the push token's or the tracker key's file.
 WRITER_KEY_FILE=~/.pipeline-runner/writer-key
 
+# Where the session writer's key comes from (KIT-933; docs/RUNNER.md, "The writer's key"). Unset keeps what is installed.
+#   file           the default: the file above, which a person writes with `writer-key` before it ends.
+#   other-program  another program on this account keeps the key in its own JSON settings file and renews it there.
+#                  The runner reads it from WRITER_KEY_FROM, under the JSON key WRITER_KEY_FROM_FIELD, each time it is
+#                  needed. It only reads: it never renews that key, so the two programs never clash.
+#   renew          the runner renews the key itself, through the tracker's OAuth token endpoint, with the renewal token in
+#                  WRITER_RENEWAL_FILE and the app's client details in WRITER_CLIENT_FILE (`writer-client` writes them,
+#                  as id:secret). Set it once that other program is stopped for good: with WRITER_KEY_FROM and
+#                  WRITER_RENEWAL_FROM_FIELD set, its first renewal takes the renewal token from that program's file.
+# Paths and JSON key names only: no line here holds a key.
+#WRITER_KEY_SOURCE=other-program
+#WRITER_KEY_FROM=~/.other-program/settings.json
+#WRITER_KEY_FROM_FIELD=accessTokenKeyName
+#WRITER_RENEWAL_FROM_FIELD=renewalTokenKeyName
+WRITER_RENEWAL_FILE=~/.pipeline-runner/writer-renewal-key
+WRITER_CLIENT_FILE=~/.pipeline-runner/writer-client
+
 # Tracker user ids: the owner's, and the old dispatcher's own users (which never approve).
 OWNER_USER_IDS=owner-user-id-1
 DISPATCHER_USER_IDS=dispatcher-user-id-1

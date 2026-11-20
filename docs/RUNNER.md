@@ -452,26 +452,128 @@ backlog and replies on the ticket.
 Not: a session puts a finding block in a `comment`. The comment is refused, because a finding goes
 through `file_finding`, where the cap of three holds.
 
-**The writer's key.** A Linear API key for the user named in `writer_user_id`, in a file of the
-role account's, mode 0600, outside the work and home folders. The readers must trust that user. The
-finding filer's `agent_user_id` and the bridge's agent user must both name it. Make it with
-`writer-key` ("The key files", below).
+## The writer's key
+
+The session writer's key lets a coding session's ticket tools write as the session writer. It also lets
+the runner move a coding ticket into its working state. It belongs to the tracker user in
+`session_tools.writer_user_id`. Every reader that trusts a session's words trusts that user (KIT-933).
+
+**Where it comes from.** `WRITER_KEY_SOURCE` in runner.conf picks one of three. The installer writes it
+into `session_tools.key_source`. Left out, the source you installed stays.
+
+| Source | Who keeps it working | What the runner does |
+|---|---|---|
+| `file` (the default) | A person, with `writer-key`, before its end date. | Reads the key file at each use. |
+| `other-program` | Another program on the role account. It renews the key in its own JSON settings file. | Reads the key from that file at each use. It never renews it. |
+| `renew` | The runner itself. | Renews the key 12 hours before it ends. |
+
+**From another program's settings.** While the previous dispatcher is installed, it holds the app user's
+key and renews it about once a day. Point the runner at its settings file:
+
+    WRITER_KEY_SOURCE=other-program
+    WRITER_KEY_FROM=~/<that program's folder>/<its settings file>.json
+    WRITER_KEY_FROM_FIELD=<the JSON key that holds the access token>
+
+- The runner finds that JSON key at any depth of the file. Every place that holds it must hold the same
+  key. Two different keys are refused, never guessed between.
+- The runner only reads the file. Each renewal hands back a new renewal token, so two renewers would
+  clash, and the runner never renews this key.
+- The file must be the role account's, and nobody else may change it. Its program's own mode, such as
+  0644, is left as it is.
+- The file is walled from every session, like each key file.
+
+**Renewed by the runner.** Once that program is stopped for good:
+
+1. Run `python3 scripts/pipeline_runner_setup.py writer-client` at a terminal. Give the app's client id and
+   secret at the hidden prompt, as `id:secret`. It asks for the day you will review the secret.
+2. In runner.conf, set `WRITER_KEY_SOURCE=renew`. Keep `WRITER_KEY_FROM`, and set
+   `WRITER_RENEWAL_FROM_FIELD` to the JSON key that holds that program's renewal token.
+3. Run the installer's `apply`. Its `writer-key` row waits for the runner's first word.
+
+The runner's next pass takes the renewal token from that file, once, and renews at once. From then on it
+uses its own files, mode 0600, beside the writer's key: `WRITER_RENEWAL_FILE` (default
+`writer-renewal-key`) and `WRITER_CLIENT_FILE` (default `writer-client`). No person copies a key.
+
+How Linear renews a key (its OAuth 2.0 guide, "Refresh an access token"):
+
+- One form POST to `https://api.linear.app/oauth/token`: `grant_type=refresh_token`, the renewal token,
+  and the app's client id and secret.
+- The answer holds a new key, a new renewal token and `expires_in`. A key lives 24 hours.
+- A renewal token ends 30 days after it was issued. Each renewal issues a new one.
+- An answer that was lost can be fetched again with the same renewal token for 30 minutes.
+
+The runner writes the new renewal token first, then the key, then the key's end. A stop between two of
+them never leaves a used renewal token behind. After a failure it tries again every five minutes, inside
+that 30-minute window.
+
+**What it says.** Each pass may update `<store>/writer-key.json`. It holds the source, the state, when the
+key last answered as the session writer, the name it answered with, and for a renewed key when it ends.
+It never holds a key. The runner asks the key who it is every 30 minutes.
+
+- The runner's `check`, in its `writer-key` row, says the source and when the key ends.
+- The live tool's writer row says the same.
+- The health watch's `writer-key` kind reads a copy of that file, made by the watcher's copier
+  (`WRITER_KEY_STATUS` in watcher.conf; the one command sets `WRITER_KEY_STATUS_FILE`). It reaches Slack
+  when the key could not be read or renewed, or answers as another user. It also does when the key has
+  not answered for three hours, ends within six hours, or the runner has said nothing for three hours.
+- A key that cannot be used is told once in the runner's log, and cleared when it answers again.
+
+A renewed key always ends within a day: that is Linear's 24 hours. So for a renewed key, "close to its
+end" means within six hours, which is two missed renewal windows.
+
+**When it fails.**
+
+| It says | What a person does |
+|---|---|
+| Linear refused the renewal token | It ended, was revoked, or another program used it first. Authorize the app again, as the app, then run `writer-renewal` with the new renewal token. Meanwhile, `WRITER_KEY_SOURCE=file` and `writer-key` keep sessions writing. |
+| Linear refused the app's client details | The secret was changed. Run `writer-client` with the current ones. |
+| the key could not be read from where it is kept | `check` names the file and why. For `other-program`, start that program again, or fix `WRITER_KEY_FROM_FIELD`. |
+| the tracker refused the key | For `other-program`, that program stopped renewing. Start it again, or move to `renew`. For `file`, write a new key. |
+| the key answers as another user | The source holds another user's key. Fix the file, or the key name. |
+| the runner has not said how the key stands | The runner's job is not running. Its installer's `check` says why. |
+
+**One writer user.** Each reader that trusts a session's words must name the session writer:
+
+- the notifier's `DISPATCHER_AGENT_USER_ID`;
+- the acceptance check's `AGENT_USER_ID`;
+- the finding filer's `agent_user_id`;
+- the bridge's `AGENT_USER_NAME`, by display name.
+
+The `writer-user` row of `check` compares each with `writer_user_id`. It fails, naming the one that
+differs. The bridge's name is compared with the name the key answered with, once the runner has one.
+
+**Removing the previous dispatcher.** Switch to `renew` first, and wait until `check` says the runner
+renewed the key. Then remove the program. Nothing reads its file any more, so the key keeps working. Take
+`runner-writer-key` out of CREDENTIAL_EXPIRIES: that date was for a key a person wrote. The parts list still
+says a writer's key ends on a date set when it is made, which is true of the `file` source. So the one
+command asks for that date on each run, and `dates` lists it as missing: press Enter, since a key that is
+renewed has no date to give.
+
+Good: `check` says the writer's key is renewed by the runner itself, answered 4 minutes ago, and ends tomorrow at 03:12.
+Not: a person copying the key into `writer-key` each morning. It ends within a day, and nobody is warned before it does.
 
 ## The key files
 
-The runner holds three key files, each the role account's own, mode 0600, one key and nothing else.
-One installer step writes each, the way it writes the push token (KIT-907, KIT-928):
+The runner holds three key files, and two more for a renewed writer's key (KIT-933). Each is the role
+account's own, mode 0600, one key and nothing else. One installer step writes each, the way it writes the
+push token (KIT-907, KIT-928):
 
 | Step | File | Who reads it | Its end date is filed as |
 |---|---|---|---|
 | `push-token` | `PUSH_TOKEN_FILE` | The code, fix and conflict sessions, through git's helper | `runner-push-token` |
 | `tracker-key` | `tracker-key` in `RUNNER_DIR` | The runner, for its own tracker reads | `runner-tracker-key` |
 | `writer-key` | `WRITER_KEY_FILE` (unset: the `session_tools.key_file` you installed, else `writer-key` in `RUNNER_DIR`) | The runner, to move a ticket, and the session's own tracker tools | `runner-writer-key` |
+| `writer-client` | `WRITER_CLIENT_FILE` (unset: `writer-client` in `RUNNER_DIR`) | The runner, to renew the writer's key (`renew` only) | `runner-writer-client`, the day you review it |
+| `writer-renewal` | `WRITER_RENEWAL_FILE` (unset: `writer-renewal-key` in `RUNNER_DIR`) | The runner, to renew the writer's key (`renew` only) | nothing: the runner renews it |
 
 Run each one at a terminal, never in a Claude session (it is refused there, and blocked with no terminal):
 
     python3 scripts/pipeline_runner_setup.py tracker-key
     python3 scripts/pipeline_runner_setup.py writer-key
+
+`writer-key` is refused while `WRITER_KEY_SOURCE` is `other-program` or `renew`: a key written then would
+never be the one used. `writer-renewal` asks no end date. You need it only when Linear refused the
+runner's renewal token ("The writer's key", above).
 
 Make the key first. The step asks for it at a hidden prompt, then for the day it ends. A key that never
 ends gets the day you will review it, so the warning still comes. It judges both before it asks for
@@ -590,7 +692,7 @@ One JSON file, which the installer writes from `runner.conf` (see "Installing it
 | `max_review_starts_per_ticket` | The same limit for reviews: above a full loop of parts and re-reviews (KIT-644). | `100` |
 | `hold` | The watcher's hold file (contract section 20). Set, nothing starts. | none |
 | `limits` | `wall_minutes`, `memory_mb`, `disk_mb`, `check_seconds` (how often trees and folders are measured) and `room` (the floor). See "Its limits". | above |
-| `session_tools` | `key_file`, the session writer's tracker key, and `writer_user_id`, the user it must belong to, never an owner. See "The session's own tracker tools". Absent, no session gets tracker tools, and no code, fix or conflict lane may be on. | none |
+| `session_tools` | `key_file`, the session writer's tracker key, and `writer_user_id`, the user it must belong to, never an owner. `key_source`, where the key comes from: see "The writer's key". See "The session's own tracker tools". Absent, no session gets tracker tools, and no code, fix or conflict lane may be on. | none |
 | `queue_config` | The queue's settings file, whose reader and judge approve each code start. No code lane may be on without it. | none |
 | `look_config_dir` | The folder the acceptance job writes each check's look config into: its own `look_config_dir`. The acceptance kind's look tool is started on it. Needed while any project's acceptance lane is on. Never inside the other three folders, nor in a git working tree. | none |
 | `projects` | Each project: `repo` (the runner's own clone), `base`, `lanes`, `approval_states` per kind, `allowed_hosts`. | required |
@@ -601,6 +703,9 @@ The four folders must not sit inside one another.
 `runner.conf`:
 
 - `SESSION_TOOLS_KEY_FILE` and `SESSION_TOOLS_WRITER_USER_ID` become `session_tools`.
+- `WRITER_KEY_SOURCE`, with `WRITER_KEY_FROM`, `WRITER_KEY_FROM_FIELD`, `WRITER_RENEWAL_FROM_FIELD`,
+  `WRITER_RENEWAL_FILE` and `WRITER_CLIENT_FILE`, becomes `session_tools.key_source` ("The writer's key").
+  `file` is no source at all, and left out, the installed source stays.
 - `QUEUE_CONFIG` becomes `queue_config`, and `LOOK_CONFIG_DIR` becomes `look_config_dir`.
 - `PUSH_TOKEN_FILE` becomes `push_token_file` (see "The push token"). Left out, it keeps what is
   installed, and else is `push-token` in `RUNNER_DIR`.
@@ -724,6 +829,15 @@ The session tools' selftest checks every refusal and every cap. It checks that o
 requests reach the tracker, and that no answer, log line or file holds the key. It holds each
 comment against the job that reads it, then runs the real server over stdio.
 
+```bash
+npm run test:writer-key
+```
+
+The writer key's selftest (KIT-933) reads the key from another program's settings file in three
+shapes, and refuses every bad one in words. It renews against a stand-in of Linear's token endpoint
+that takes each renewal token once, three days running, with the other program removed. It checks the
+order the files are written in, and that no status or word holds a key.
+
 ## Proving a lane live
 
 One script proves one lane on one test project, from off to on and back to off (KIT-916). You run
@@ -746,7 +860,9 @@ review, the idea to plan, or the piece to check.
    account cannot change (its root-owned copy, KIT-919); its job running main's head (the commit its job
    file names);
    the project's clone, HTTPS, reached; `RUNNER_STORE` for the queue; each key file the role account's,
-   mode 0600; a dry-run push with the push token; the writer key answering as its user; the probe passing
+   mode 0600 (another program's settings file the writer's key comes from: closed to writes by others);
+   a dry-run push with the push token; the writer key answering as its user, with where it comes from
+   and when it ends, as the runner's own word on it says (KIT-933); the probe passing
    at a commit with main's session kinds; `delivery.json` on main passing the kit's validator; the
    project's `docs/SESSION-BRIEF.md` naming the ticket tools; now inside the working window; the lane
    off; the settings with it on taken by the runner's own loader; no other approved ticket waiting; and
@@ -839,3 +955,8 @@ The runner refuses to start from inside a Claude session, or as root.
 - That a plan run through the runner files a plan live. The planner's selftest runs every case on
   both lanes against a stand-in runner over a real store. The first live run is its own ticket
   (KIT-887), once the runner is installed.
+- That the runner's own renewal of the writer's key works against Linear's real token endpoint
+  (KIT-933). The selftest renews against a stand-in that keeps the rules Linear documents. The first
+  real renewal is the one after `WRITER_KEY_SOURCE=renew`, and `check` says how it went.
+- That the key read from another program's settings file keeps answering for two days running, with no
+  person writing a key (KIT-933's second criterion). The owner runs the live check on two days in a row.

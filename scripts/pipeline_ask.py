@@ -20,7 +20,9 @@ WHAT IT ASKS, AND WHEN
   The health check's three job heartbeats (KIT-782) are not asked: when watcher.conf names a heartbeat
   file for the queue, the morning job or the sweep, the one command points the matching *_HEARTBEAT_FILE
   line of update.conf at the copier's copy of it, and lists that line on the consent page like the rest.
-  A job watcher.conf leaves out is written as off, and only if the line holds its own copy path.
+  A job watcher.conf leaves out is written as off, and only if the line holds its own copy path. The
+  runner's word on the session writer's key (KIT-933: WRITER_KEY_STATUS, WRITER_KEY_STATUS_FILE) is set
+  the same way.
   A settings file that is not there asks nothing and is said in one plain line, before the first
   question: `Not asked: no bridge.conf in the kit folder, so the tech lead's name was not asked.`
   (and the same for update.conf and the key end dates). It says where it looked. A file that is
@@ -523,7 +525,8 @@ def _watcher():
 def level_settings(update_conf, watcher_conf):
     """The changes that bring the health check's settings level with the watcher's: for each of the queue, the
     morning job and the sweep that watcher.conf gives a heartbeat file, the health check's *_HEARTBEAT_FILE names
-    the copier's copy of it. A job watcher.conf leaves out is written as off, and only when the line holds that job's
+    the copier's copy of it, and likewise WRITER_KEY_STATUS_FILE for the runner's word on the writer's key (KIT-933,
+    one more entry of the watcher's BEATS). A job watcher.conf leaves out is written as off, and only when the line holds that job's
     own copy path: a path a person typed is never touched. Nothing is asked and nothing is written here. A file
     that is not there, or is not usable, gives no change. Rerun, it gives none, because each line already matches."""
     if not (os.path.isfile(update_conf) and os.path.isfile(watcher_conf)):

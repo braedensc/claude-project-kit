@@ -196,6 +196,7 @@ try:
     import pipeline_harness_claude as harness
     import pipeline_runner_guard as guard_launcher
     import pipeline_session_tools as session_tools
+    import pipeline_writer_key as wkey
     import pipeline_plan_brief as plan_brief
     import pipeline_review_brief as review_brief
     from pipeline_agent_env import AGENT_ENV_MARKERS
@@ -546,8 +547,8 @@ class LinearTracker(object):
             raise TrackerError("no session writer is set (session_tools), so the ticket cannot be moved")
         send = self._writer_gql
         if send is None:
-            try:
-                key = tl_tools.read_key(writer["key_file"])
+            try:            # KIT-933: from where its source says, read at each move
+                key = wkey.read_key(writer)
             except tl_tools.ToolError as exc:
                 raise TrackerError(str(exc))
             send = lambda q, v: status_job.linear_graphql(q, v, key)   # noqa: E731
@@ -1273,8 +1274,10 @@ def session_main(rdir, fd):
 # --------------------------------------------------------------------------- #
 class Runner(object):
     def __init__(self, cfg, tracker, environ=None, git_env=None, clock=time.time, say=None,
-                 room=None, engine=None, judge=None, kinds=None):
+                 room=None, engine=None, judge=None, kinds=None, writer_io=None):
         self.cfg, self.tracker = cfg, tracker
+        # KIT-933: how the writer's key is asked who it is and renewed; the selftest stands both in
+        self.writer_io = writer_io or {}
         self.room, self.measured, self._floor = room, {}, None    # room: the floor's reader
         self.budget_minutes = {}                  # KIT-645: each live run's own minutes, from its pin
         self.budget_misses = {}                   # …and how many reads of its pin failed in a row
@@ -1339,6 +1342,7 @@ class Runner(object):
             out.update(state="could-not", why=bad[0])
             return out
         self.say_lanes()
+        self.keep_writer()
         self.reap()
         self._floor = None                       # the machine's floor is read once a pass
         runs = self.runs()
@@ -1384,6 +1388,29 @@ class Runner(object):
                       "that asks it may take the wrong road until they are." % type(exc).__name__)
             return
         self.clear("lanes")
+
+    def keep_writer(self):
+        """KIT-933: keep the session writer's key working, and say how it stands. A renewed key is renewed
+        before it ends; every key is asked who it is every half hour. How it stands goes into
+        <store>/writer-key.json, for `check`, the live tool and the health watch, and a key that cannot be
+        used is told once, in plain words, and cleared when it answers again. Never silent. Only this
+        process renews: it holds the store's lock, so two renewals never clash."""
+        st = self.cfg.get("session_tools")
+        if not st:
+            return
+        try:
+            doc = wkey.keep(st, self.store_dir(), self.cfg["owner_user_ids"], self.clock(),
+                            gql=self.writer_io.get("gql"), post=self.writer_io.get("post"))
+        except Exception as exc:                                  # noqa: BLE001  (it never stops the runner)
+            self.tell("writer-key", "How the session writer's key stands could not be kept in its store "
+                      "(%s), so the health watch reads an older word, and says so once it is three hours "
+                      "old." % type(exc).__name__)
+            return
+        if doc["state"] == "failed":
+            self.tell("writer-key", "The session writer's key could not be used: %s%s." % (
+                wkey.REASONS.get(doc["reason"], doc["reason"]), " (%s)" % doc["detail"] if doc["detail"] else ""))
+        elif doc["state"] == "ok":
+            self.clear("writer-key")
 
     # -- a live run ------------------------------------------------------- #
     def check(self, rec):
@@ -2366,6 +2393,15 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
     import tempfile
     failures, cleanup, counted, victims = [], [], [0], []
 
+    # KIT-933: no pass here reaches Linear. The writer's key is asked who it is, and renewed, by
+    # stand-ins alone: a runner given none finds the tracker out of reach.
+    def offline(*_args, **_kw):
+        raise wkey.Unreachable("the selftest never reaches the tracker")
+
+    def no_renewal(*_args, **_kw):
+        raise OSError("the selftest never reaches the token endpoint")
+    wkey.ask_tracker, wkey.post_form = offline, no_renewal
+
     def expect(name, got, want):
         counted[0] += 1
         if got != want:
@@ -3182,6 +3218,85 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
         expect("the move is the runner's only write: its one mutation", [
             q for q in (v for k, v in sorted(globals().items()) if k.startswith(("Q_", "M_")))
             if isinstance(q, str) and q.lstrip().startswith("mutation")], [M_WORKING])
+
+        # ---- KIT-933: the writer's key, from where its source says ------------ #
+        other_cfg = os.path.join(tmp, "other-program", "config.json")
+        os.makedirs(os.path.dirname(other_cfg))
+        okey = "lin" + "_oauth_" + "OtherProgramKey0123456789"
+
+        def other_program(value):
+            with open(other_cfg, "w") as fh:
+                json.dump({"repositories": [{"id": "r1", "linearToken": value}]}, fh)
+            os.chmod(other_cfg, 0o644)        # that program's own mode: others may read it, never write it
+        other_program(okey)
+        borrowed = {"key_file": writer_key, "writer_user_id": "writer-1",
+                    "key_source": {"kind": "other-program", "file": other_cfg, "field": "linearToken"}}
+        cfg_o, bad_o = load_config(dict(raw, session_tools=borrowed))
+        expect("KIT-933: a writer's key read from another program's settings file loads", bad_o, [])
+        sent_keys = []
+
+        def fake_graphql(query, variables, key, timeout=60):
+            sent_keys.append(key)
+            return {"viewer": {"id": "writer-1"}} if query == Q_VIEWER else {"issueUpdate": {"success": True}}
+        real_graphql, status_job.linear_graphql = status_job.linear_graphql, fake_graphql
+        try:
+            try:
+                LinearTracker(os.path.join(tmp, "key")).move("uuid-x", "st-working",
+                                                             (cfg_o or {}).get("session_tools"), ["owner-1"])
+                moved_o = "moved"
+            except TrackerError as exc:
+                moved_o = str(exc)
+            other_program(okey + "R")         # that program renews its key and rewrites its file
+            try:
+                LinearTracker(os.path.join(tmp, "key")).move("uuid-x", "st-working",
+                                                             (cfg_o or {}).get("session_tools"), ["owner-1"])
+            except TrackerError:
+                pass
+        finally:
+            status_job.linear_graphql = real_graphql
+        expect("…the move reads the key from that file at each move, so a renewed key is the one used",
+               (moved_o, sent_keys), ("moved", [okey, okey, okey + "R", okey + "R"]))
+        if cfg_o and not bad_o:
+            probe = {"asked": []}
+
+            def viewer(key):
+                probe["asked"].append(key)
+                return {"viewer": {"id": "writer-1", "displayName": "dispatcher-agent"}}
+            kept = R(cfg_o, tracker, environ=environ, git_env=genv, say=said.append, room=roomy, engine=safe,
+                     writer_io={"gql": viewer, "post": None}, clock=lambda: 1_800_000_000.0)
+            kept.pass_once()
+            got = wkey.read_status(wkey.status_path(sdir))[0] or {}
+            expect("…the runner's pass asks it who it is, and writes how it stands into its store",
+                   (probe["asked"], got.get("source"), got.get("state"), got.get("writer_name")),
+                   ([okey + "R"], "other-program", "ok", "dispatcher-agent"))
+            kept.pass_once()
+            expect("…a pass soon after asks nothing more", len(probe["asked"]), 1)
+            os.unlink(other_cfg)
+            gone = R(cfg_o, tracker, environ=environ, git_env=genv, say=said.append, room=roomy, engine=safe,
+                     writer_io={"gql": viewer, "post": None}, clock=lambda: 1_800_000_000.0 + wkey.CHECK_EVERY)
+            gone.pass_once()
+            got = wkey.read_status(wkey.status_path(sdir))[0] or {}
+            told = _load(os.path.join(sdir, "incidents.json"))
+            expect("…its file gone: FAILED in the store, and told once in plain words, never silently",
+                   (got.get("state"), got.get("reason"), "writer-key" in told["open"],
+                    [t["words"] for t in told["told"] if t["key"] == "writer-key"][-1:]),
+                   ("failed", "unreadable", True, ["The session writer's key could not be used: %s (%s)."
+                                                   % (wkey.REASONS["unreadable"], got.get("detail"))]))
+            other_program(okey + "R")
+            gone.clock = lambda: 1_800_000_000.0 + wkey.CHECK_EVERY + wkey.RETRY_EVERY
+            gone.pass_once()
+            expect("…and cleared once it answers again", "writer-key" in _load(os.path.join(sdir, "incidents.json"))[
+                "open"], False)
+            real_keep, wkey.keep = wkey.keep, lambda *_a, **_k: {}["a fault"]
+            try:
+                faulted = gone.pass_once()
+            finally:
+                wkey.keep = real_keep
+            told = _load(os.path.join(sdir, "incidents.json"))
+            expect("…a fault while keeping it never stops the runner's pass: it is told once, in words",
+                   (faulted["state"], [t["words"] for t in told["told"] if t["key"] == "writer-key"][-1].startswith(
+                       "How the session writer's key stands could not be kept in its store (KeyError)")),
+                   ("ran", True))
 
         # ---- a resume ------------------------------------------------------ #
         rq = store.ask(sdir, "review", "resume", "review", "app", "ENG-1", run=run1, text="look again")

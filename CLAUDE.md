@@ -448,6 +448,9 @@ npm run test:runner-live     # the owner's live run of one lane (KIT-916): every
 npm run test:session-tools   # a session's own tracker tools (KIT-706): five tools tied to its run, no
                              #   ticket argument; hostile text refused or made inert; §8's caps; each
                              #   comment read by its job; only the fixed requests sent; real stdio
+npm run test:writer-key      # the session writer's key (KIT-933): read from another program's settings at
+                             #   each use, never renewed; or renewed by the runner, new renewal token first,
+                             #   three days against a stand-in token endpoint; its status holds no key
 npm run test:queue-setup     # the queue's installer (KIT-456): configs pass the jobs' own loaders; no plist
                              #   overwritten, no job loaded; refused under a model
 npm run test:day-plan        # the day plan file (KIT-438): the queue's decision as fields only, each

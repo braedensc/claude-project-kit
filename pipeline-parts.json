@@ -2450,7 +2450,23 @@
           "what": "The session writer's tracker key, in a file of the pipeline's account, by the setting that names the file.",
           "ends": "set-when-made",
           "clock": "runner-writer-key",
-          "date_from": "The expiry date you chose when you made the key (the day you will review it, if it never ends); the writer-key step asks for it and records it."
+          "date_from": "The expiry date you chose when you made the key (the day you will review it, if it never ends); the writer-key step asks for it and records it. With WRITER_KEY_SOURCE other-program or renew there is no date to give, since the key is renewed every day: leave it unset, and the health check's writer-key kind watches the key instead."
+        },
+        {
+          "key": "WRITER_CLIENT_FILE",
+          "default_name": "WRITER_CLIENT_FILE",
+          "what": "The tracker app's client id and secret, which the runner renews the session writer's key with, in a file of the pipeline's account, by the setting that names the file.",
+          "ends": "unknown",
+          "clock": "runner-writer-client",
+          "date_from": "Only while the runner renews the key (WRITER_KEY_SOURCE=renew): the day you will review the app's client secret, which does not end by itself. The writer-client step asks for it and records it."
+        },
+        {
+          "key": "WRITER_RENEWAL_FILE",
+          "default_name": "WRITER_RENEWAL_FILE",
+          "what": "The renewal token the runner renews the session writer's key with, in a file of the pipeline's account, by the setting that names the file.",
+          "ends": "unknown",
+          "clock": "runner-writer-renewal",
+          "date_from": "No date to record: each renewal replaces it, and one ends 30 days after it was issued. The health check's writer-key kind says when a renewal fails."
         }
       ],
       "jobs": [
@@ -2489,6 +2505,12 @@
           "card_in": null,
           "kind": "only-a-person",
           "words": "Make the runner's tracker key and the session writer's key, then run `python3 scripts/pipeline_runner_setup.py tracker-key` and `python3 scripts/pipeline_runner_setup.py writer-key` in a terminal, each time giving the key and its end date at the prompts."
+        },
+        {
+          "card": null,
+          "card_in": null,
+          "kind": "only-a-person",
+          "words": "Before the runner renews the session writer's key itself (WRITER_KEY_SOURCE=renew), run `python3 scripts/pipeline_runner_setup.py writer-client` in a terminal and give the tracker app's client id and secret, as id:secret, and the day you will review them."
         }
       ],
       "ceiling": 0,

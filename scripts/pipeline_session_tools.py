@@ -24,6 +24,9 @@ ITS RUN.  Its one argument, --run, names a file the runner wrote in the run's ow
 store: outside the workspace, behind the session's walls, mode 0600 in a folder of mode 0700.
 It names the run, the ticket, the key file and the user that key must belong to. No argument a
 tool is given can change any of it. The run's counts are kept beside it, in the same folder.
+The key is read at each tracker call: from the key file, or, with `key_field` set, from under that
+key name in another program's JSON settings file, which renews it there (KIT-933,
+scripts/pipeline_writer_key.py).
 
 WHO IT WRITES AS.  The session writer: the tracker user the pipeline's readers already trust as
 a session's author (the finding filer's and the bridge's agent user). Never an owner: a
@@ -81,6 +84,7 @@ import pipeline_tech_lead_tools as tl  # noqa: E402
 import pipeline_routing_tags as routing  # noqa: E402
 import pipeline_review_local as publisher  # noqa: E402
 import pipeline_runner_store as store  # noqa: E402
+import pipeline_writer_key as writer_key  # noqa: E402  (where the writer's key comes from, KIT-933)
 import telemetry_block  # noqa: E402
 from pipeline_bridge_transport import _http_json  # noqa: E402
 from pipeline_status_local import clean_title, _hidden  # noqa: E402
@@ -104,8 +108,8 @@ STATE_FILE = "session-tools-state.json"
 # plan and an acceptance check each return one checked block instead, and get none.
 STAGES = {"code": "dev", "fix": "bounce", "conflict": "bounce"}
 RUN_KEYS = ("schema", "run", "kind", "ticket", "team_key", "auth_mode", "model", "started_at",
-            "key_file", "writer_user_id", "owner_user_ids")
-SETTING_KEYS = ("key_file", "writer_user_id")
+            "key_file", "key_field", "writer_user_id", "owner_user_ids")
+SETTING_KEYS = ("key_file", "writer_user_id", "key_source")
 
 # Contract section 8's caps.
 WRITES_MAX = 20            # comments a run posts; the last is kept for report_done
@@ -232,7 +236,8 @@ def setting(raw, owner_ids, folders=()):
     """(setting, problems): the runner's `session_tools` setting. Absent (None) is off. On, it is
     {"key_file", "writer_user_id"}: the session writer's key file, and the tracker user that key
     must belong to, which is never an owner. `folders` are where a session can write; the key
-    file is never inside one."""
+    file is never inside one. `key_source` (KIT-933), when set, says where the key comes from:
+    judged by scripts/pipeline_writer_key.py, and kept only when it is set."""
     if raw is None:
         return None, []
     if not isinstance(raw, dict):
@@ -253,18 +258,22 @@ def setting(raw, owner_ids, folders=()):
     elif isinstance(owner_ids, list) and writer in owner_ids:
         bad.append("session_tools.writer_user_id: is an owner's id. A session must never write "
                    "as the owner")
+    source = None
+    if "key_source" in raw:
+        source, problems = writer_key.source_setting(raw["key_source"], key_file, folders)
+        bad += problems
     if bad:
         return None, bad
-    return {"key_file": key_file, "writer_user_id": writer}, []
+    out = {"key_file": key_file, "writer_user_id": writer}
+    if source is not None:
+        out["key_source"] = source
+    return out, []
 
 
 def key_files(st):
-    """The session writer's key file, as written and as resolved, for the session's walls."""
-    if not st:
-        return []
-    out = [st["key_file"]]
-    real = os.path.realpath(st["key_file"])
-    return out + ([real] if real != st["key_file"] else [])
+    """Every file that holds a part of the session writer's key, as written and as resolved, for the
+    session's walls: its key file, and for a key from elsewhere (KIT-933) the files it comes from."""
+    return writer_key.files(st)
 
 
 def gets_tools(st, kind):
@@ -272,11 +281,14 @@ def gets_tools(st, kind):
 
 
 def run_doc(st, kind, pin, model, owner_ids):
-    """The run file's document, from the run's pin: its ticket, run and auth mode."""
+    """The run file's document, from the run's pin: its ticket, run and auth mode. `key_file` and
+    `key_field` say where the server reads the key at each call (KIT-933): a key file, or the value
+    under `key_field` in another program's settings file."""
     tk = pin["ticket"]
+    path, field = writer_key.key_at(st)
     return {"schema": RUN_SCHEMA, "run": pin["dispatch_id"], "kind": kind, "ticket": tk["id"],
             "team_key": tk["team_key"], "auth_mode": pin["auth_mode"], "model": model,
-            "started_at": pin["pinned_at"], "key_file": st["key_file"],
+            "started_at": pin["pinned_at"], "key_file": path, "key_field": field,
             "writer_user_id": st["writer_user_id"], "owner_user_ids": list(owner_ids)}
 
 
@@ -324,6 +336,9 @@ def run_problems(doc):
     if not (isinstance(doc["key_file"], str) and os.path.isabs(doc["key_file"])
             and "\0" not in doc["key_file"]):
         bad.append("key_file: not an absolute path")
+    if doc["key_field"] is not None and not (isinstance(doc["key_field"], str)
+                                             and writer_key.FIELD_RE.match(doc["key_field"])):
+        bad.append("key_field: not the name of a JSON key")
     owners = doc["owner_user_ids"]
     if not (isinstance(owners, list) and owners
             and all(isinstance(o, str) and ID_RE.match(o) for o in owners)):
@@ -613,7 +628,7 @@ class Server(object):
     def send(self, document, variables):
         if document not in DOCUMENTS:
             raise ToolError("only this server's own requests are sent to the tracker")
-        key = tl.read_key(self.run["key_file"])
+        key = writer_key.read_key_at(self.run["key_file"], self.run["key_field"])
         try:
             doc = _http_json(TRACKER_API, {"Authorization": key, "Content-Type": "application/json"},
                              {"query": document, "variables": variables})
@@ -1120,6 +1135,24 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
            os.path.join(account_home(), "k"))
     expect("the writer's key file is walled from the session", key_files(st), [keyf])
     expect("off, no key file is walled", key_files(None), [])
+    # KIT-933: the key read from another program's JSON settings file, each time it is needed.
+    other_cfg = os.path.join(root, "other-program", "config.json")
+    os.makedirs(os.path.dirname(other_cfg))
+    key2, key3 = key[:-4] + "OTH2", key[:-4] + "OTH3"
+
+    def other_program(value):
+        with open(other_cfg, "w") as fh:
+            json.dump({"repositories": [{"id": "r1", "linearToken": value}]}, fh)
+        os.chmod(other_cfg, 0o644)          # that program's own mode: others may read it, never write it
+    other_program(key2)
+    src = {"kind": "other-program", "file": other_cfg, "field": "linearToken"}
+    st_o, bad = setting({"key_file": keyf, "writer_user_id": "writer-1", "key_source": src}, ["owner-1"], (work,))
+    expect("setting: a key read from another program's settings file loads (KIT-933)",
+           (bad, (st_o or {}).get("key_source")), ([], src))
+    expect("…that file is walled from the session too", key_files(st_o) if st_o else None, [keyf, other_cfg])
+    expect("setting: a key source of an unknown kind is refused",
+           setting({"key_file": keyf, "writer_user_id": "w", "key_source": {"kind": "vault"}}, ["owner-1"])[1],
+           ["session_tools.key_source: must be an object whose kind is file, other-program or renew"])
 
     rdir = run_folder(1)
     expect("a code run gets the five tools, each by its exact name",
@@ -1130,7 +1163,7 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
     expect("the run file names the run, its ticket, the key file and the writer",
            rdoc, {"schema": RUN_SCHEMA, "run": "run-%032x" % 1, "kind": "code", "ticket": "ENG-12",
                   "team_key": "ENG", "auth_mode": "subscription", "model": "sonnet",
-                  "started_at": "2026-11-17T09:00:00Z", "key_file": keyf,
+                  "started_at": "2026-11-17T09:00:00Z", "key_file": keyf, "key_field": None,
                   "writer_user_id": "writer-1", "owner_user_ids": ["owner-1"]})
     expect("the run file is this account's alone", stat.S_IMODE(os.stat(run_file).st_mode), 0o600)
     with open(os.path.join(rdir, "mcp.json")) as fh:
@@ -1799,6 +1832,33 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
         for sample in ("sonnet", "claude-opus-5-5", "opus[1m]", "", "-x", "a" * 80, "a" * 81):
             expect("a model %r is judged as the runner judges it" % sample[:12],
                    bool(MODEL_RE.match(sample)), bool(voice._MODEL_RE.match(sample)))
+
+        # ── KIT-933: the key from another program's settings file, read at each use ──────────
+        if st_o:
+            d = run_folder(95)
+            prepare(st_o, d, "code", pin_for(95), "sonnet", ["owner-1"])
+            with open(os.path.join(d, RUN_FILE)) as fh:
+                odoc = json.load(fh)
+            expect("the run file names the other program's file and the key's name in it",
+                   (odoc.get("key_file"), odoc.get("key_field")), (other_cfg, "linearToken"))
+            orun, of = load_run(os.path.join(d, RUN_FILE))
+            fds.append(of)
+            osrv = Server(orun, of, clock=lambda: now)
+            osrv.folder = d
+            reset()
+            mark = len(sent)
+            call(osrv, "read_ticket")
+            expect("the server reads the key from the other program's file",
+                   sorted(set(h.get("Authorization") for _u, h, _p in sent[mark:])), [key2])
+            other_program(key3)             # that program renews its key and rewrites its file
+            mark = len(sent)
+            call(osrv, "read_ticket")
+            expect("…and reads it again at each use, so a renewed key is the one sent",
+                   sorted(set(h.get("Authorization") for _u, h, _p in sent[mark:])), [key3])
+            os.unlink(other_cfg)
+            text, err = call(osrv, "read_ticket")
+            expect("…a file that is gone is refused in words, without a key",
+                   (err, "is not there" in text, key2 in text or key3 in text), (True, True, False))
     finally:
         globals()["_http_json"] = real_http
         for f in fds:

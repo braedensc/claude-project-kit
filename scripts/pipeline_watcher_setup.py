@@ -91,12 +91,16 @@ CONF_DEFAULTS = {
     # KIT-782: the queue's, the morning job's and the sweep's heartbeats, the workers' files the copier also copies
     # so the health watch can read them. Empty: that job is off here.
     "QUEUE_HEARTBEAT": "", "MORNING_HEARTBEAT": "", "SWEEP_HEARTBEAT": "",
+    # KIT-933: the runner's word on the session writer's key (writer-key.json in the runner's store), copied the same
+    # way, so the health watch's writer-key kind can read it. Empty: not watched.
+    "WRITER_KEY_STATUS": "",
 }
-# The three heartbeat sources: conf key -> (the copy's name in root's copy folder, the health check's update.conf key).
-# The one command writes that update.conf key with the copy's path.
+# The three heartbeat sources, and the runner's word on the writer's key (KIT-933): conf key -> (the copy's name in
+# root's copy folder, the health check's update.conf key). The one command writes that update.conf key with the copy's path.
 BEATS = {"QUEUE_HEARTBEAT": ("queue-heartbeat.json", "QUEUE_HEARTBEAT_FILE"),
          "MORNING_HEARTBEAT": ("morning-heartbeat.json", "MORNING_HEARTBEAT_FILE"),
-         "SWEEP_HEARTBEAT": ("sweep-heartbeat.json", "SWEEP_HEARTBEAT_FILE")}
+         "SWEEP_HEARTBEAT": ("sweep-heartbeat.json", "SWEEP_HEARTBEAT_FILE"),
+         "WRITER_KEY_STATUS": ("writer-key-status.json", "WRITER_KEY_STATUS_FILE")}
 BEAT_MAX_BYTES = 65536          # a heartbeat is a few lines; a bigger file is refused
 
 
@@ -927,6 +931,12 @@ QUEUE_HEARTBEAT=
 MORNING_HEARTBEAT=
 SWEEP_HEARTBEAT=
 
+# Optional (KIT-933): the runner's word on the session writer's key, writer-key.json in the runner's store (its
+# RUNNER_DIR's store/ folder), as the runner writes it.  The same copier copies it, and the one command points the
+# health check's WRITER_KEY_STATUS_FILE at the copy, so the health watch says when the key could not be read or
+# renewed, is near its end, or the runner went quiet.  Empty = not watched.
+WRITER_KEY_STATUS=
+
 # Optional: the validator's ledger (docs/WATCHER.md, approval-rate).  With it, every merge into a watched
 # repository is checked against the validator's approvals.  This account must be able to read the file.
 # OWNER_LOGINS: your own GitHub logins, comma-separated: your own merges need no approval.  Leave yours out,
@@ -1591,7 +1601,8 @@ def selftest():
         beat_dir = os.path.join(tmp, "beats")
         beat_src = dict((k, os.path.join(beat_dir, n)) for k, n in (("QUEUE_HEARTBEAT", "q.json"),
                                                                     ("MORNING_HEARTBEAT", "m.json"),
-                                                                    ("SWEEP_HEARTBEAT", "s.json")))
+                                                                    ("SWEEP_HEARTBEAT", "s.json"),
+                                                                    ("WRITER_KEY_STATUS", "w.json")))
 
         def put_beats(links=()):
             shutil.rmtree(beat_dir, ignore_errors=True)
@@ -1617,12 +1628,12 @@ def selftest():
         check("heartbeats alone give a copier whose rules name each source, the role account and its copy, small",
               [(c_["source"], c_["owner"], c_["dest"], c_["max_bytes"]) for c_ in crb["copies"]],
               [(beat_src[k], "_clawdispatch", "%s/copy/%s" % (inst, BEATS[k][0]), BEAT_MAX_BYTES)
-               for k in ("MORNING_HEARTBEAT", "QUEUE_HEARTBEAT", "SWEEP_HEARTBEAT")])
-        check("...a full run ends fine and says the copier made three copies",
-              (rc, hb.copier_rc, "made its 3 copies" in outb), (EX_OK, EX_OK, True))
+               for k in ("MORNING_HEARTBEAT", "QUEUE_HEARTBEAT", "SWEEP_HEARTBEAT", "WRITER_KEY_STATUS")])
+        check("...a full run ends fine and says the copier made four copies (KIT-933: the writer key's status too)",
+              (rc, hb.copier_rc, "made its 4 copies" in outb), (EX_OK, EX_OK, True))
         check("...each copy is the source, whole",
               [open(hb._real("%s/copy/%s" % (inst, BEATS[k][0])), "rb").read() == open(beat_src[k], "rb").read()
-               for k in sorted(BEATS)], [True, True, True])
+               for k in sorted(BEATS)], [True, True, True, True])
         check("...and the watcher's rules name no usage file",
               "usage_file" in json.loads(hb.read(inst + "/" + RULES_NAME)), False)
         hl = machine()
