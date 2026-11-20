@@ -861,6 +861,7 @@ jobs:
       - name: Batteries with no step of their own (kept required after the leak sweeps moved)
         run: |
           python3 scripts/pipeline_ws_client.py --selftest
+          python3 scripts/pipeline_chat_cap.py --selftest
           python3 scripts/pipeline_bridge_handover.py --selftest
           python3 scripts/pipeline_tech_lead_tools.py --selftest
           python3 scripts/pipeline_session_tools.py --selftest

@@ -528,6 +528,15 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
             raise BridgeError("the Slack token answers to %s, not the bridge app's bot "
                               "(bot_user_id). Nothing was read. Put the bridge app's own "
                               "token in place" % self.me["user_id"], EXIT_USAGE)
+        # Held messages whose time has come go out as one digest (KIT-936). A real pass only, and
+        # only with a client that has a limit: a stand-in has none. What it could not do is said.
+        flush = getattr(self.slack, "flush_held", None)
+        if flush is not None and not self.dry:
+            digests, flush_problems = flush()
+            for line in flush_problems:
+                self.say("  chat limit: " + line)
+            if digests:
+                self.say("  chat limit: sent %d digest(s) of held messages" % digests)
         try:
             # Before the pings file and the tracker: a pass either one stops must not
             # silence the one thing that says the notifier is down (KIT-285).

@@ -111,6 +111,17 @@ INTERVAL_SECONDS=300
 # Flood guard: above this many new events, a pass declines the rest.
 MAX_EVENTS_PER_PASS=25
 
+# After an outage (or with no record of a good pass and pages older than this), the pages a
+# pass owes go out as ONE catch-up message, not one by one (KIT-935). Minutes since the last
+# good pass.
+CATCHUP_GAP_MINUTES=60
+
+# The runaway stop on messages to one chat (KIT-936): at most CHAT_CAP_MAX in
+# CHAT_CAP_WINDOW_MINUTES; past it the rest are held and sent as one message. Normal use never
+# reaches it. Set the bridge's the same.
+CHAT_CAP_MAX=20
+CHAT_CAP_WINDOW_MINUTES=10
+
 # How many recent comments per ticket one pass reads.
 LOOKBACK_COMMENTS=20
 

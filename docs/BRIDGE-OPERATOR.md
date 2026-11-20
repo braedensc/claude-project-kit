@@ -1750,6 +1750,22 @@ bridge stops at 10 an hour.
 
 ---
 
+## The chat limit (KIT-936)
+
+Every message the bridge sends to a chat passes one shared check: the tech lead's replies and
+reach-outs, the stand-up, the status replies, the sprint message and the push job's answers
+(a streamed answer counts as one message). Past `CHAT_CAP_MAX` (default 20) in
+`CHAT_CAP_WINDOW_MINUTES` (default 10) it sends one notice and holds the rest. After the window the
+held messages go out as one digest, at the start of the next pass. A held message is sent once and
+never lost, and a record the check cannot read holds the message instead of sending it. Reaching it
+writes `chat-cap-trips.json` in `STATE_DIR` and is a defect to look at, not normal use.
+
+Set `CHAT_CAP_MAX` and `CHAT_CAP_WINDOW_MINUTES` in `bridge.conf`, the same as in `notifier.conf`,
+and keep both `STATE_DIR`s the same folder. The notifier's section, *The chat limit*, has the
+rest, and how the default was chosen.
+
+---
+
 ## After a merge that changes the tech lead
 
 Run the one command, `python3 scripts/pipeline_install.py`. Its Stage E check counts the

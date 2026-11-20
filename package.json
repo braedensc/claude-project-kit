@@ -50,6 +50,7 @@
     "test:bridge": "python3 scripts/pipeline_bridge.py --selftest",
     "test:bridge-transport": "python3 scripts/pipeline_bridge_transport.py --selftest",
     "test:ws-client": "python3 scripts/pipeline_ws_client.py --selftest",
+    "test:chat-cap": "python3 scripts/pipeline_chat_cap.py --selftest",
     "test:bridge-push": "python3 scripts/pipeline_bridge_push.py --selftest",
     "test:bridge-push-setup": "python3 scripts/pipeline_bridge_push_setup.py --selftest",
     "test:bridge-modules": "for m in tracker config requests answers replan plans pings tech_lead watch direct bind handover push; do python3 scripts/pipeline_bridge_$m.py --selftest || exit 1; done",

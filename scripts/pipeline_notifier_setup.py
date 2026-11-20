@@ -460,6 +460,9 @@ CONF_DEFAULTS = {
     "STATE_DIR": "~/.stage-e/state",
     "INTERVAL_SECONDS": "300",
     "MAX_EVENTS_PER_PASS": "25",
+    "CATCHUP_GAP_MINUTES": "60",          # KIT-935: an older last good pass makes ONE catch-up message
+    "CHAT_CAP_MAX": "20",                 # KIT-936: the runaway stop on messages to one chat
+    "CHAT_CAP_WINDOW_MINUTES": "10",
     "LOOKBACK_COMMENTS": "20",
     "RUN_TIMEOUT_SECONDS": "240",
     "CHAT_API_BASE": "https://slack.com/api",
@@ -540,7 +543,8 @@ ENV_NAME_KEYS = ("CHAT_TOKEN_ENV", "LINEAR_KEY_ENV", "WRITER_TOKEN_ENV")
 PATH_KEYS = ("ROLE_KIT_CLONE", "ENV_FILE", "NOTIFIER_CONFIG", "STATE_DIR")
 OPTIONAL_PATH_KEYS = ("DISPATCHER_ENV_FILE", "DISPATCHER_STATE_ROOT")
 NUMERIC_KEYS = ("INTERVAL_SECONDS", "MAX_EVENTS_PER_PASS", "LOOKBACK_COMMENTS",
-                "RUN_TIMEOUT_SECONDS")
+                "RUN_TIMEOUT_SECONDS", "CATCHUP_GAP_MINUTES", "CHAT_CAP_MAX",
+                "CHAT_CAP_WINDOW_MINUTES")
 
 _CONF_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 _UPPER_SNAKE = re.compile(r"^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*$")
@@ -1066,6 +1070,9 @@ def compose_config(conf, label_ids, actor_ids, monitor_ids=(), bounce_ids=(),
         "label_ids": dict((k, label_ids[k]) for k in LABEL_KEYS if label_ids.get(k)),
         "executor_actor_ids": list(actor_ids),
         "max_events_per_pass": int(conf["MAX_EVENTS_PER_PASS"]),
+        "catchup_gap_minutes": int(conf["CATCHUP_GAP_MINUTES"]),
+        "chat_cap_max": int(conf["CHAT_CAP_MAX"]),
+        "chat_cap_window_minutes": int(conf["CHAT_CAP_WINDOW_MINUTES"]),
         "lookback_comments": int(conf["LOOKBACK_COMMENTS"]),
         "run_timeout_seconds": int(conf["RUN_TIMEOUT_SECONDS"]),
     }

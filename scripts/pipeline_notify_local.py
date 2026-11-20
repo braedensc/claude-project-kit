@@ -424,6 +424,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 import pipeline_pass_lock as pass_lock  # noqa: E402  (one pass at a time — KIT-681)
+import pipeline_chat_cap as chat_cap  # noqa: E402  (the runaway stop on messages to a chat — KIT-936)
 
 # ── Exit vocabulary — the same five names and numbers every sibling job uses. ──────────
 # Redeclared rather than imported so this file stands alone; the selftest asserts they
@@ -969,6 +970,14 @@ CONFIG_KEYS = {
                        "page_images on (KIT-555). Optional: empty or absent, no page carries "
                        "one, and each says so. Never inside a git worktree",
     "max_events_per_pass": "flood guard; above it the pass sends one summary and declines",
+    "catchup_gap_minutes": "when the last good pass is older than this, or there is no record "
+                           "of one, the pages the pass owes go out as ONE catch-up message "
+                           "(KIT-935). Default 60",
+    "chat_cap_max": "the runaway stop on messages to one chat (KIT-936): at most this many in "
+                    "chat_cap_window_minutes (default %d). Past it, the rest are held and sent "
+                    "as one message. Set the bridge's the same" % chat_cap.DEFAULT_MAX,
+    "chat_cap_window_minutes": "the window for chat_cap_max, in minutes (default %d)"
+                               % chat_cap.DEFAULT_WINDOW_MINUTES,
     "lookback_comments": "how many recent comments per ticket to examine",
     "run_timeout_seconds": "wall clock for one pass; exceeding it is exit 4, not exit 1",
     "reply_relay": "true relays the owner's threaded replies to agent:blocked pings into the "
@@ -1070,6 +1079,9 @@ EXAMPLE_CONFIG = {
     "acceptance_ledger": "",
     "look_record_dir": "",
     "max_events_per_pass": 25,
+    "catchup_gap_minutes": 60,
+    "chat_cap_max": chat_cap.DEFAULT_MAX,
+    "chat_cap_window_minutes": chat_cap.DEFAULT_WINDOW_MINUTES,
     "lookback_comments": 20,
     "run_timeout_seconds": 240,
     "reply_relay": False,
@@ -1148,6 +1160,7 @@ def load_config(path):
         "acceptance_ledger": raw.get("acceptance_ledger", ""),
         "look_record_dir": raw.get("look_record_dir", ""),
         "max_events_per_pass": raw.get("max_events_per_pass") or 25,
+        "catchup_gap_minutes": raw.get("catchup_gap_minutes", 60),
         "lookback_comments": raw.get("lookback_comments") or 20,
         "run_timeout_seconds": raw.get("run_timeout_seconds") or 240,
         # The relay keys take `raw.get(key, default)`, not `or`: a 0 cap or a "false" string
@@ -1220,8 +1233,9 @@ def load_config(path):
 
     # Numeric keys are validated here, in the same all-at-once pass, so a string value is a
     # named config error rather than a traceback at alarm-arming time with no heartbeat.
+    cfg.update(chat_cap.validate(raw, errors))
     for key in ("lookback_comments", "run_timeout_seconds", "max_events_per_pass",
-                "relay_max_chars", "relay_max_per_hour"):
+                "relay_max_chars", "relay_max_per_hour", "catchup_gap_minutes"):
         value = cfg[key]
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             errors.append("config %r must be a positive integer, got %r" % (key, value))
@@ -2565,6 +2579,7 @@ def select_events(tickets, sent_keys, cfg, labelled_keys=None):
     """
     events, settle, skipped = [], [], []
     emitted = set()
+    incident_of = {}           # ticket id -> its health-incident event still in `events` (KIT-935)
     cap = cfg.get("max_events_per_pass") or 25
     capped = 0
     labelled_keys = set(sent_keys) if labelled_keys is None else set(labelled_keys)
@@ -2668,7 +2683,15 @@ def select_events(tickets, sent_keys, cfg, labelled_keys=None):
             if key in sent_keys and not owed:
                 skipped.append((tid, cid, "already sent"))
                 continue
-            if not owed and len(events) >= cap:
+            # KIT-935: the monitor writes an incident comment each time the set of failing jobs
+            # changes, so a long outage leaves a pile of them on one ticket, each saying the
+            # same thing about a state that is gone. Comments come oldest first, so a later
+            # incident on the same ticket TAKES THE PLACE of the one before: that one is never
+            # paged, its key is carried on the newer event (`folded_keys`) and marked seen when
+            # that page lands, and it does not count against the cap, so the newest of thirty
+            # is not left for a later pass to page alone.
+            folds = incident_of.get(tid) if (mark == ESC_HEALTH_INCIDENT and not owed) else None
+            if not owed and folds is None and len(events) >= cap:
                 capped += 1
                 continue
 
@@ -2703,7 +2726,15 @@ def select_events(tickets, sent_keys, cfg, labelled_keys=None):
                 "author_id": comment.get("author_id") or "",
                 "label": label_for(mark),
                 "existing_labels": ticket.get("label_ids") or [],
+                # KIT-935: when the mark was written, as the tracker said it. A page delivered
+                # late says so, and a catch-up names the newest of each kind by it.
+                "at": comment.get("created_at") or "",
             }
+            if folds is not None:
+                event["folded_keys"] = list(folds.get("folded_keys") or []) + [folds["key"]]
+                events.remove(folds)
+            if mark == ESC_HEALTH_INCIDENT and not owed:
+                incident_of[tid] = event
             (settle if owed else events).append(event)
 
     # Owed labels go FIRST: a debt from an earlier pass is discharged before new work, so a
@@ -2727,6 +2758,119 @@ def _moment(text):
         return None
     return (whole.replace(tzinfo=datetime.timezone.utc).timestamp()
             + float(match.group(2) or 0))
+
+
+# ── KIT-935: after an outage, one catch-up message, not every page that piled up ─────────────
+# On 20 Nov 2026 the notifier came back after a day down and sent the owner about thirty
+# pages in a row, oldest first, mostly one alert about the notifier itself being down. A pass
+# whose last good pass is older than `catchup_gap_minutes` (or with no record of one) now
+# says what it owes in ONE message: how many of each kind, the newest of each with the time it
+# was raised, and the tickets. No page is dropped. Each is either in that message or counted in
+# it, its key is marked seen when the message lands, and a label a page carries is still owed
+# and still applied. A page paged on its own and more than an hour late says so.
+CATCHUP_MARK = "catch-up"
+LATE_SECONDS = 3600
+CATCHUP_MAX_TICKETS = 10
+
+
+def last_good_moment(cfg):
+    """When the last good pass ended, in seconds, or None: no record, or one that cannot be read
+    or makes no sense (KIT-931's file)."""
+    try:
+        with open(last_good_path(cfg), encoding="utf-8") as fh:
+            return _moment((json.load(fh) or {}).get("at"))
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def _utc_words(moment):
+    return time.strftime("%d %b %H:%M UTC", time.gmtime(moment))
+
+
+def late_words(event, now):
+    """The line a page more than an hour late starts with, naming when it was raised; "" for
+    one that is not late or has no time."""
+    at = _moment(event.get("at"))
+    if at is None or now - at <= LATE_SECONDS:
+        return ""
+    return "This page is late: it was raised at %s. " % _utc_words(at)
+
+
+def folded_words(event):
+    n = len(event.get("folded_keys") or [])
+    if not n:
+        return ""
+    return ("%d earlier health-check comment%s on this ticket said the same, so %s not sent "
+            "one by one." % (n, "" if n == 1 else "s", "it is" if n == 1 else "they are"))
+
+
+def _first_sentence(words):
+    head = (words or "").strip().split(". ")[0].strip()
+    return head if head.endswith(".") else head + "."
+
+
+def plan_catchup(cfg, events, now, last_good):
+    """(events, note). When the pass owes two or more pages and its last good pass is older than
+    the gap (or unknown, with a page older than the gap), every page it would send becomes ONE synthetic event, `catchup`,
+    carrying the pages it stands for in `covers`; the settle events (a label owed, no page) stay
+    as they are. Otherwise the events come back unchanged, and `note` is "".
+
+    Pure. The key is made from the keys it covers, so a retry after a page that reached only
+    some people is the same page, and the DM ledger never sends it twice to one person."""
+    import hashlib
+    pageable = [e for e in events if not e.get("settle")]
+    gap = (cfg.get("catchup_gap_minutes") or 60) * 60
+    if last_good is not None:
+        stale = now - last_good > gap
+    else:
+        # No record of a good pass (a first run, or a file that cannot be read): the pages
+        # themselves say whether they piled up, by being older than the gap.
+        stale = any(_moment(e.get("at")) is not None and now - _moment(e.get("at")) > gap
+                    for e in pageable)
+    if len(pageable) < 2 or not stale:
+        return events, ""
+    groups = {}
+    for e in pageable:
+        groups.setdefault(e["mark"], []).append(e)
+    covered_keys = sorted(k for e in pageable for k in [e["key"]] + list(e.get("folded_keys") or []))
+    total = len(covered_keys)
+    since = ("since %s" % _utc_words(last_good)) if last_good is not None else (
+        "for a while (there is no record of my last good pass)")
+    lines = ["I could not page you %s, so %d page%s piled up. They are in this one message "
+             "instead of %d." % (since, total, "" if total == 1 else "s", total)]
+    newest_all = None
+    for mark in sorted(groups, key=lambda m: -len(groups[m])):
+        evs = groups[mark]
+        count = len(evs) + sum(len(e.get("folded_keys") or []) for e in evs)
+        newest = max(enumerate(evs), key=lambda p: (_moment(p[1].get("at")) or 0, p[0]))[1]
+        if newest_all is None or ((_moment(newest.get("at")) or 0)
+                                  >= (_moment(newest_all.get("at")) or 0)):
+            newest_all = newest
+        ids = []
+        for e in evs:
+            if e["ticket_id"] not in ids:
+                ids.append(e["ticket_id"])
+        shown = ", ".join(ids[:CATCHUP_MAX_TICKETS])
+        if len(ids) > CATCHUP_MAX_TICKETS:
+            shown += " and %d more" % (len(ids) - CATCHUP_MAX_TICKETS)
+        raised = _moment(newest.get("at"))
+        lines.append("- %d: %s Newest: %s%s %s. Tickets: %s."
+                     % (count, _first_sentence(MARKS.get(mark, {}).get("page") or mark),
+                        newest["ticket_id"],
+                        " (raised %s)" % _utc_words(raised) if raised is not None else "",
+                        newest["url"], shown))
+    lines.append("Open the tickets for the detail. Each page's label is still applied.")
+    synthetic = {
+        "key": "catchup:" + hashlib.sha256("|".join(covered_keys).encode("utf-8")).hexdigest()[:16],
+        "mark": CATCHUP_MARK, "settle": False, "comment_id": None, "thread_id": None,
+        "ticket_id": newest_all["ticket_id"], "ticket_uuid": None, "ticket_title": "",
+        "url": newest_all["url"], "detail": {}, "general": "", "author_id": "", "label": None,
+        "existing_labels": [], "at": "", "catchup": "\n".join(lines), "covers": pageable,
+    }
+    note = ("catch-up: %d page%s in ONE message (last good pass %s)"
+            % (total, "" if total == 1 else "s",
+               _utc_words(last_good) if last_good is not None else "not on record"))
+    return [e for e in events if e.get("settle")] + [synthetic], note
 
 
 def make_asked(tickets):
@@ -3271,6 +3415,8 @@ class ChatClient:
         self.channel = cfg["chat_channel_id"]
         self.token = token
         self._dms = {}
+        # The runaway stop on messages to a chat (KIT-936). A config naming no state folder has none.
+        self.cap = chat_cap.settings(cfg)
 
     def open_dm(self, user_id):
         """The direct-message channel, a `D…` id, between the app's bot and `user_id` (KIT-296).
@@ -3350,8 +3496,44 @@ class ChatClient:
                             code=EXIT_ERROR)
 
     def post_message(self, text, channel=None, thread_ts=None):
-        """One post: to `channel` when given (a DM, KIT-296), else the config's; top-level unless
-        `thread_ts` names a thread (KIT-568, a page's note about its screenshots)."""
+        """One post, through the runaway stop (KIT-936): to `channel` when given (a DM, KIT-296),
+        else the config's; top-level unless `thread_ts` names a thread (KIT-568, a page's note
+        about its screenshots).
+
+        Past the chat's limit the post is HELD, not sent, and the answer says so the way Slack
+        says a post landed: ok, with a timestamp-shaped token and `held`, so the page counts as
+        handed over (the limit keeps it whole and sends it in one digest, once). A limit that
+        cannot read its record answers ok false, so the page is owed again next pass."""
+        if self.cap is None:
+            return self._post_raw(text, channel, thread_ts)
+        target = channel or self.channel
+        try:
+            outcome, got = chat_cap.guarded_send(
+                self.cap, target, text, lambda: self._post_raw(text, channel, thread_ts),
+                self._plain_to(target), thread=thread_ts, via="notifier")
+        except chat_cap.CannotCheck as exc:
+            return {"ok": False, "error": "the chat limit could not be checked, so nothing was "
+                                          "sent: %s" % str(exc)[:160]}
+        if outcome == "held":
+            return {"ok": True, "channel": target, "ts": got, "held": True}
+        return got
+
+    def _plain_to(self, target):
+        def plain(body):
+            doc = self._post_raw(body, target, None)
+            if not isinstance(doc, dict) or not doc.get("ok"):
+                raise NotifierError("chat refused a notice or digest (%s)"
+                                    % (doc.get("error") if isinstance(doc, dict) else "no JSON"))
+            return doc
+        return plain
+
+    def flush_held(self):
+        """The digests whose time has come, at the start of a pass: (sent, problems)."""
+        if self.cap is None:
+            return 0, []
+        return chat_cap.flush_due(self.cap, "notifier", self._plain_to)
+
+    def _post_raw(self, text, channel=None, thread_ts=None):
         payload = {"channel": channel or self.channel, "text": text, "unfurl_links": False,
                    "unfurl_media": False}
         if thread_ts:
@@ -4016,6 +4198,12 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None, 
                 writer_notes.append("I could not load the writer (%s), so every page went out "
                                     "as its plain text" % type(exc).__name__)
     bridge_failures, dm_failures = [], []
+    # KIT-936: messages the chat limit held, whose time has come, go out first as one digest. A
+    # client with no limit (a stand-in) has none to send; what could not be done is said below.
+    cap_problems = []
+    flush = getattr(chat, "flush_held", None)
+    if flush is not None and not dry_run:
+        _digests, cap_problems = flush()
     image_notes = []                    # KIT-555: screenshots a page could not carry, and why
     tickets, read_failures = [], []
     for team in cfg["team_keys"]:
@@ -4049,8 +4237,8 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None, 
     events += filed
     capped += held
     sent = labelled = settled = 0
-    declined = len(file_problems)
-    problems = list(file_problems)
+    declined = len(file_problems) + len(cap_problems)
+    problems = list(file_problems) + ["chat limit: " + c for c in cap_problems]
     relay_failures = []
 
     # A ping that went out but has no live relay target — sent while the switch was off, or
@@ -4132,6 +4320,24 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None, 
     spent_off = [e for e in general if e["general"] == ESC_FIXES_SPENT
                  and not cfg.get("bounce_actor_ids")]
 
+    # KIT-935: what this pass owes, said in one message when the last good pass is old, and the
+    # health-check comments that piled up on one ticket folded into the newest (select_events).
+    folded_total = sum(len(e.get("folded_keys") or []) for e in events)
+    events, catchup_note = plan_catchup(cfg, events, now, last_good_moment(cfg))
+
+    def absorb(page):
+        """A page has landed: the pages it stands for (a catch-up's, a health incident's
+        folded ones) are seen, so none is sent again, and the label one of them carries is owed
+        as a settle event, the label alone, applied later in this same pass."""
+        if dry_run:
+            return
+        for covered in page.get("covers") or []:
+            sent_keys.add(covered["key"])
+            sent_keys.update(covered.get("folded_keys") or [])
+            if covered.get("label"):
+                events.append(dict(covered, settle=True))
+        sent_keys.update(page.get("folded_keys") or [])
+
     for event in events:
         try:
             if event.get("settle"):
@@ -4170,15 +4376,27 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None, 
                 problems.append("%s: title withheld, paged with the ticket id alone — its title "
                                 "carries a credential shape; edit it in the tracker"
                                 % event["ticket_id"])
-            plain = build_message(event["mark"], event["ticket_id"], event["ticket_title"],
-                                  event["url"], event.get("detail"))
-            # KIT-297: with the writer on, a page to direct messages carries no @mention, since
-            # a DM notifies by itself. With it off, every page keeps the mentions it always had.
-            prefix = "" if writer_on and dm_on else mention_prefix(event["mark"], cfg)
-            # KIT-338: the line a reply binds to ends the page, after a blank line, on every
-            # path: the fixed text, the writer's words, and a retry's held words alike.
-            bind = page_bind(event)
-            bind_tail = "\n\n" + bind if bind else ""
+            catching = bool(event.get("catchup"))
+            if catching:
+                # KIT-935: the one message that stands for a pile of pages, built by plan_catchup
+                # from ids, marks and links alone. No mention, no bound reply line, no writer.
+                plain, prefix, bind_tail = event["catchup"], "", ""
+            else:
+                plain = build_message(event["mark"], event["ticket_id"], event["ticket_title"],
+                                      event["url"], event.get("detail"))
+                # KIT-935: a page more than an hour late says so, with when it was raised, and
+                # the newest health incident says how many it stands for.
+                plain = late_words(event, now) + plain
+                if event.get("folded_keys"):
+                    plain += "\n" + folded_words(event)
+                # KIT-297: with the writer on, a page to direct messages carries no @mention,
+                # since a DM notifies by itself. With it off, every page keeps the mentions it
+                # always had.
+                prefix = "" if writer_on and dm_on else mention_prefix(event["mark"], cfg)
+                # KIT-338: the line a reply binds to ends the page, after a blank line, on every
+                # path: the fixed text, the writer's words, and a retry's held words alike.
+                bind = page_bind(event)
+                bind_tail = "\n\n" + bind if bind else ""
             text = prefix + plain + bind_tail
             leaked = secret_hits(text)
             if leaked:
@@ -4196,7 +4414,7 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None, 
             # outside the model's words, and the scan runs again on the final text. A page
             # the writer could not write is the fixed text, with no note about the writer:
             # the summary says why (KIT-482).
-            if write_it and not (dm_on and dm_failures):
+            if write_it and not catching and not (dm_on and dm_failures):
                 first = held_words(dm_state, event["key"]) if dm_on else None
                 if first is not None:
                     # KIT-297 review: this page reached someone on an earlier pass, so the rest
@@ -4262,6 +4480,7 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None, 
                     sent += 1
                     if not unrecorded:
                         sent_keys.add(event["key"])
+                        absorb(event)
                 else:
                     declined += 1
                     problems.extend(dm_problems)
@@ -4292,6 +4511,7 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None, 
                     continue
                 sent += 1
                 sent_keys.add(event["key"])
+                absorb(event)
 
             # Only with the switch on, and only for the agent:blocked mark: remember which
             # chat message this ping is, and which thread its mark sits in, so a reply under
@@ -4559,6 +4779,11 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None, 
     if image_notes:
         summary += " | screenshots not all sent: " + "; ".join(redact(n, secrets)
                                                              for n in image_notes)
+    if catchup_note:
+        summary += " | " + catchup_note
+    if folded_total:
+        summary += (" | %d earlier health-check comment(s) folded into the newest on their "
+                    "ticket, not sent one by one" % folded_total)
     if declined and code == EXIT_OK:
         code = EXIT_DECLINED
     if problems:
@@ -5504,7 +5729,9 @@ def selftest():
            "2 seen, not paged yet" in res_p_off["summary"]
            and "none paged" not in res_p_off["summary"], res_p_off["summary"])
         chat_p_on = _FakeChat()
-        res_p_on = run_once(cfg_on, _FakeTracker(pair), chat_p_on, False, out=buf)
+        # (a catch-up would fold these two, 12 September's, into one message: its own cases say so)
+        res_p_on = run_once(dict(cfg_on, catchup_gap_minutes=10 ** 9), _FakeTracker(pair), chat_p_on,
+                            False, out=buf)
         ok("…and the first pass with the key set pages both, the incident BEFORE its recovery",
            len(chat_p_on.posts) == 2 and "need a look" in chat_p_on.posts[0]
            and "checking in again" in chat_p_on.posts[1] and res_p_on["exit"] == EXIT_OK,
@@ -6298,6 +6525,9 @@ def selftest():
 
         # ── §14. A page's screenshots in its thread (KIT-568) — off by default ────────
         _page_images_selftest(ok, tmp, good)
+
+        # ── §15. After an outage one catch-up message; the chat limit (KIT-935, KIT-936) ──
+        _catchup_selftest(ok, tmp, good)
 
         # ── §15. The acceptance check's page, from the acceptance poller's ledger (KIT-555)
         _selftest_acceptance_page(ok, tmp, good)
@@ -9125,6 +9355,207 @@ def _writer_selftest(ok, tmp, good):
          "the fixed text, with nothing about the writer (KIT-482)", held_reach_says_no_line)
 
 
+def _catchup_selftest(ok, tmp, good):
+    """§15 — KIT-935 and KIT-936: after an outage, one catch-up message; health-check comments
+    on one ticket folded into the newest; and the real chat client's runaway stop. Lives in the
+    span §10's own-source scan skips, like the other helpers."""
+    import datetime
+    import io
+    G = globals()
+
+    def at(day, hour):
+        return "2026-11-%02dT%02d:00:00.000Z" % (day, hour)
+
+    NOW = G["_moment"]("2026-11-20T12:00:00Z")
+    MON, SESS = "monitor-author", "session-author"
+    n = [0]
+
+    def fresh(**over):
+        n[0] += 1
+        return G["load_config_from"](
+            dict(good, state_dir=os.path.join(tmp, "cu-state-%d" % n[0]),
+                 monitor_actor_ids=[MON], chat_cap_max=100000, **over), tmp)
+
+    def incident(i, when, ticket="KIT-133"):
+        return {"id": "inc-%s-%d" % (ticket, i),
+                "body": "<!-- pipeline-escalation: daemon-health-incident -->\nneeds a look",
+                "author_id": MON, "created_at": G["_iso_at"](when)}
+
+    def blocked(i, day=19, hour=9):
+        return {"id": "blk-%d" % i, "body": "<!-- pipeline-escalation: agent:blocked -->\nasks",
+                "author_id": SESS, "created_at": at(day, hour)}
+
+    def ticket(tid, comments):
+        return {"id": tid, "uuid": "u-" + tid, "title": "Title of " + tid, "label_ids": [],
+                "comments": list(reversed(comments))}      # the tracker answers newest first
+
+    def last_good(cfg, moment):
+        os.makedirs(cfg["state_dir"], exist_ok=True)
+        with open(G["last_good_path"](cfg), "w", encoding="utf-8") as fh:
+            json.dump({"at": G["_iso_at"](moment)}, fh)
+
+    def go(cfg, tickets, chat=None, tracker=None):
+        chat = chat or G["_FakeChat"]()
+        tracker = tracker or G["_FakeTracker"](tickets)
+        res = G["run_once"](cfg, tracker, chat, False, out=io.StringIO(), now=NOW)
+        return res, chat, tracker
+
+    def seen(cfg):
+        return set(G["load_seen"](cfg)["sent"])
+
+    # 30 incident comments over two days on one ticket: ONE message, 29 folded, none lost.
+    cfg = fresh()
+    last_good(cfg, NOW - 2 * 86400)
+    comments = [incident(i, NOW - 47 * 3600 + i * 5400) for i in range(30)]
+    res, chat, _ = go(cfg, [ticket("KIT-133", comments)])
+    ok("KIT-935: 30 incident comments over two days give exactly one message",
+       len(chat.posts) == 1 and res["sent"] == 1 and res["exit"] == EXIT_OK, (chat.posts, res))
+    ok("KIT-935: …that says how many it stands for, and that it is late, and when it was raised",
+       "29 earlier health-check comments" in chat.posts[0] and "This page is late" in chat.posts[0]
+       and "raised at 2" in chat.posts[0], chat.posts)
+    ok("KIT-935: …and the newest of the thirty is the one sent",
+       "raised at 20 Nov 08:30 UTC" in chat.posts[0], chat.posts[0])
+    ok("KIT-935: no incident is lost: all thirty are marked seen, so none pages again",
+       {G["event_id"]("inc-KIT-133-%d" % i) for i in range(30)} <= seen(cfg), len(seen(cfg)))
+    res2, chat2, _ = go(cfg, [ticket("KIT-133", comments)])
+    ok("KIT-935: a second pass sends nothing and says it is nothing to do",
+       chat2.posts == [] and res2["summary"].startswith("nothing to do"), res2["summary"])
+    ok("KIT-935: the folded count is in the pass summary", "29 earlier health-check" in res["summary"],
+       res["summary"])
+
+    # The cap does not leave the newest incidents behind: 40 comments, the default cap of 25.
+    cfg = fresh()
+    last_good(cfg, NOW - 60)
+    many = [incident(i, NOW - 2000 + i * 10) for i in range(40)]
+    res, chat, _ = go(cfg, [ticket("KIT-133", many)])
+    ok("KIT-935: 40 incident comments are not cut by the per-pass cap: one message, none capped",
+       len(chat.posts) == 1 and res["capped"] == 0, (len(chat.posts), res["capped"]))
+
+    # A pile of several kinds after an outage: ONE catch-up message; every page counted in it.
+    cfg = fresh()
+    last_good(cfg, NOW - 36 * 3600)
+    tickets = [ticket("KIT-133", [incident(i, G["_moment"]("2026-11-19T00:00:00Z") + i * 3600) for i in range(1, 11)]),
+               ticket("KIT-201", [blocked(1)]), ticket("KIT-202", [blocked(2, hour=10)]),
+               ticket("KIT-203", [dict(blocked(3), body="<!-- pipeline-escalation: agent:needs-human -->\nx")])]
+    res, chat, tracker = go(cfg, tickets)
+    text = chat.posts[0] if chat.posts else ""
+    ok("KIT-935: after an outage the pages owed go out as ONE catch-up message",
+       len(chat.posts) == 1 and "piled up" in text and res["sent"] == 1, (chat.posts, res))
+    ok("KIT-935: …how many of each kind, the newest of each, and their tickets",
+       "- 10:" in text and "- 2:" in text and "- 1:" in text
+       and "Newest: KIT-133" in text and "KIT-201, KIT-202" in text and "(raised 19 Nov" in text, text)
+    ok("KIT-935: …each page is in it or counted in it (13 pages, 13 keys seen)",
+       "13 pages" in text
+       and {G["event_id"](c["id"]) for t in tickets for c in t["comments"]} <= seen(cfg), len(seen(cfg)))
+    ok("KIT-935: …and the labels the pages carry are still applied, once each",
+       sorted(l for _u, l in tracker.labels) == ["L1", "L1", "L2"] and res["labelled"] == 3,
+       (tracker.labels, res["labelled"]))
+    ok("KIT-935: …and the summary says it was a catch-up", "catch-up: 13 pages in ONE message" in res["summary"],
+       res["summary"])
+    res2, chat2, _ = go(cfg, tickets)
+    ok("KIT-935: the next pass owes nothing and sends nothing", chat2.posts == [], chat2.posts)
+
+    # A catch-up that did not land loses nothing: the pass says so and the next one sends it.
+    cfg = fresh()
+    last_good(cfg, NOW - 36 * 3600)
+    tickets = [ticket("KIT-201", [blocked(1)]), ticket("KIT-202", [blocked(2)])]
+    res, chat, tracker = go(cfg, tickets, chat=G["_FakeChat"](ok=False, error="ratelimited"))
+    ok("KIT-935: a catch-up Slack refused marks nothing seen and applies no label",
+       res["exit"] == EXIT_DECLINED and not seen(cfg) and tracker.labels == [], (res, seen(cfg)))
+    res, chat, _ = go(cfg, tickets)
+    ok("KIT-935: …and the next pass sends it, once", len(chat.posts) == 1 and "piled up" in chat.posts[0],
+       chat.posts)
+
+    # Not after an outage: a recent good pass pages each one, as it always did.
+    cfg = fresh()
+    last_good(cfg, NOW - 5 * 60)
+    res, chat, _ = go(cfg, [ticket("KIT-201", [blocked(1, day=20, hour=11)]),
+                            ticket("KIT-202", [blocked(2, day=20, hour=11)]),
+                            ticket("KIT-203", [blocked(3, day=20, hour=11)])])
+    ok("KIT-935: with a recent good pass the pages go one by one, with no late line",
+       len(chat.posts) == 3 and not any("piled up" in p or "late" in p for p in chat.posts), chat.posts)
+
+    # No record of a good pass: pages older than the gap are a catch-up; fresh ones are not.
+    cfg = fresh()
+    res, chat, _ = go(cfg, [ticket("KIT-201", [blocked(1)]), ticket("KIT-202", [blocked(2)])])
+    ok("KIT-935: with no record of a good pass, old pages are one catch-up that says so",
+       len(chat.posts) == 1 and "no record of my last good pass" in chat.posts[0], chat.posts)
+    cfg = fresh()
+    res, chat, _ = go(cfg, [ticket("KIT-201", [blocked(1, day=20, hour=11)]),
+                            ticket("KIT-202", [blocked(2, day=20, hour=11)])])
+    ok("KIT-935: …and with no record but fresh pages, each goes on its own", len(chat.posts) == 2, chat.posts)
+
+    # One page more than an hour late says so; one a few minutes old does not.
+    cfg = fresh()
+    last_good(cfg, NOW - 60)
+    res, chat, _ = go(cfg, [ticket("KIT-201", [blocked(1, day=19, hour=9)]),
+                            ticket("KIT-202", [blocked(2, day=20, hour=11)])])
+    late = [p for p in chat.posts if "KIT-201" in p]
+    soon = [p for p in chat.posts if "KIT-202" in p]
+    ok("KIT-935: a page more than an hour late says so, with when it was raised; a fresh one does not",
+       len(late) == 1 and "This page is late: it was raised at 19 Nov 09:00 UTC" in late[0]
+       and len(soon) == 1 and "late" not in soon[0], chat.posts)
+
+    # The gap is a setting.
+    bad = None
+    try:
+        G["load_config_from"](dict(good, state_dir=os.path.join(tmp, "cu-bad"), catchup_gap_minutes=0), tmp)
+    except NotifierError as exc:
+        bad = str(exc)
+    ok("KIT-935: catchup_gap_minutes must be a positive whole number",
+       bad is not None and "catchup_gap_minutes" in bad, bad)
+
+    # ── KIT-936: the REAL chat client's runaway stop, the network swapped for a recorder ──────
+    calls = []
+    answers = {"ok": True}
+
+    def rec_json(url, payload, headers, timeout=20):
+        calls.append((url.rsplit("/", 1)[-1], payload.get("channel"), payload.get("text")))
+        return {"ok": answers["ok"], "channel": payload.get("channel"), "ts": "1700000000.%06d" % len(calls)}
+
+    real = G["_post_json"]
+    G["_post_json"] = rec_json
+    try:
+        capped = G["load_config_from"](dict(good, state_dir=os.path.join(tmp, "cu-cap"), chat_cap_max=3,
+                                            chat_cap_window_minutes=10), tmp)
+        client = G["ChatClient"](capped, "test-token")
+        _quiet, sys.stderr = sys.stderr, io.StringIO()
+        try:
+            replies = [client.post_message("page %d" % i, channel="D0123456789") for i in range(8)]
+        finally:
+            sys.stderr = _quiet
+        sent_texts = [c[2] for c in calls]
+        ok("KIT-936: the notifier's client sends the limit, then ONE notice, and holds the rest",
+           len(calls) == 4 and sent_texts[:3] == ["page 0", "page 1", "page 2"]
+           and sent_texts[3].startswith("I have sent 3 messages") and all(r["ok"] for r in replies),
+           sent_texts)
+        ok("KIT-936: a held post answers ok with a token and says held, so the page counts as handed over",
+           [bool(r.get("held")) for r in replies] == [False] * 3 + [True] * 5
+           and all(r["ts"] for r in replies), replies)
+        ok("KIT-936: the trip is recorded for the health watch",
+           os.path.exists(os.path.join(capped["state_dir"], chat_cap.TRIPS_NAME)), os.listdir(capped["state_dir"]))
+        rec = os.path.join(capped["state_dir"], chat_cap.RECORD_NAME)
+        doc = json.load(open(rec))
+        for entry in doc["chats"].values():
+            entry["release_at"] = 1.0
+        json.dump(doc, open(rec, "w"))
+        before = len(calls)
+        sent_n, problems = client.flush_held()
+        ok("KIT-936: a pass flushes the held ones as ONE digest, which carries all five",
+           (sent_n, problems, len(calls) - before) == (1, [], 1)
+           and all(("page %d" % i) in calls[-1][2] for i in range(3, 8)), (sent_n, problems, calls[-1:]))
+        ok("KIT-936: …and a second flush sends nothing", client.flush_held() == (0, []) and len(calls) == before + 1,
+           calls[-1:])
+        with open(rec, "w") as fh:
+            fh.write("[")
+        calls_before = len(calls)
+        stuck = client.post_message("page x", channel="D0123456789")
+        ok("KIT-936: a record the limit cannot read sends nothing and answers not ok",
+           not stuck["ok"] and len(calls) == calls_before, stuck)
+    finally:
+        G["_post_json"] = real
+
+
 def _page_images_selftest(ok, tmp, good):
     """§14 — KIT-568: a page's screenshots, sent into its thread by Slack's external upload. The
     REAL chat client runs every case with the network swapped for recorders, and one real local
@@ -9154,7 +9585,8 @@ def _page_images_selftest(ok, tmp, good):
 
     def run(paths, on=True, upload_url="https://files.slack.com/upload/v1/abc", get_error=None,
             upload_raises=None, form_raises=None, page_ok=True, complete_ok=True):
-        cfg = load_config_from(dict(good, state_dir=os.path.join(tmp, "pi-state"), page_images=on), tmp)
+        cfg = load_config_from(dict(good, state_dir=os.path.join(tmp, "pi-state"), page_images=on,
+                                       chat_cap_max=100000), tmp)
         calls = []
 
         def rec_json(url, payload, headers, timeout=20):

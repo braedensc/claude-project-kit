@@ -294,6 +294,10 @@ npm run test:bridge          # Slack bridge (KIT-221): Slack-verified sender, it
                              #   made only with act on
 npm run test:bridge-transport  # the bridge's transport (KIT-388): its Slack client against a
                              #   stubbed HTTP call, a redirect refused, no tracker call
+npm run test:chat-cap        # the runaway stop on messages to a chat (KIT-936): one shared check, a record
+                             #   under a lock, a burst from two processes = the cap plus one notice, a held
+                             #   message sent once in one digest, an unreadable record holds; and no third
+                             #   file may build a chat.postMessage address
 npm run test:ws-client       # the standard-library WebSocket client (KIT-559, a slice of KIT-557):
                              #   handshake, masking, fragments, ping/pong, close, and every frame
                              #   a server may not send, against a server it starts itself
