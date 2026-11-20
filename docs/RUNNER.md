@@ -414,7 +414,8 @@ A row the session never tried is NOT MEASURED, never PASS. A refusal counts as t
 when its own words are seen. Exit 0 means every wall held; 1 a wall failed; 2 some wall was not
 measured; 3 it could not run.
 
-Its results name the kit commit it ran at (KIT-916). Run it from the copy the runner runs from, with
+Its results name the kit commit it ran at (KIT-916): the root-owned copy's own marker, `.engine-commit`, or
+git's answer in a checkout. Run it from the copy the runner runs from (`ENGINE_DIR`), with
 `--out <RUNNER_DIR>/probe`: the live-run tool reads its last result there ("Proving a lane live").
 
 ## The session's own tracker tools
@@ -711,7 +712,8 @@ review, the idea to plan, or the piece to check.
 1. **Check.** Sixteen rows, each OK, MISSING with what to do, or NOT NEEDED for this lane. Anything it
    cannot read is UNKNOWN, never OK, and stops the run. The rows: the runner installed and on (its
    installer's own `check`, the push token's end date among its rows); its job running from a copy the role
-   account cannot change (KIT-919 builds it); its job running main's head (the commit its job file names);
+   account cannot change (its root-owned copy, KIT-919); its job running main's head (the commit its job
+   file names);
    the project's clone, HTTPS, reached; `RUNNER_STORE` for the queue; each key file the role account's,
    mode 0600; a dry-run push with the push token; the writer key answering as its user; the probe passing
    at a commit with main's session kinds; `delivery.json` on main passing the kit's validator; the

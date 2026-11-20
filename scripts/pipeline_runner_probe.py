@@ -821,13 +821,24 @@ def _account():
 
 
 def engine_commit(engine, run=subprocess.run):
-    """The commit of the kit copy the probe ran from, or None when it is not a git checkout or git cannot
-    say. The owner's live-run tool (scripts/pipeline_runner_live.py, KIT-916) passes a result only at a
-    commit that holds main's last change to the session kinds, and None never passes. The copy the runner
-    runs from belongs to another account (root's, KIT-919), and git refuses a checkout another user owns
-    ("dubious ownership") unless `safe.directory` names it in protected configuration, which a `-c` on
-    the command line is. So this one read names it there, and trusts no other folder. `run` stands in for
-    subprocess.run in the selftest."""
+    """The commit of the kit copy the probe ran from, or None when neither the copy nor git can say. The
+    owner's live-run tool (scripts/pipeline_runner_live.py, KIT-916) passes a result only at a commit that
+    holds main's last change to the session kinds, and None never passes.
+
+    The runner's own copy (KIT-919) is no git checkout: root unpacks the kit's files there and writes the
+    commit they are beside them, in the installer's marker file. That file is read first. A git checkout
+    another account owns is refused by git ("dubious ownership") unless `safe.directory` names it in
+    protected configuration, which a `-c` on the command line is: so the git read names this one folder
+    there, and trusts no other. `run` stands in for subprocess.run in the selftest."""
+    from pipeline_runner_setup import ENGINE_MARK       # the one name of the copy's marker
+    try:
+        with open(os.path.join(engine, ENGINE_MARK), encoding="ascii") as fh:
+            mark = fh.read(100).strip()
+        return mark if re.match(r"^[0-9a-f]{40}\Z", mark) else None
+    except FileNotFoundError:
+        pass                                            # not the runner's copy: a checkout, perhaps
+    except (OSError, UnicodeDecodeError):
+        return None
     try:
         r = run(["git", "-c", "safe.directory=%s" % engine, "-C", engine, "rev-parse", "--verify", "HEAD"],
                 capture_output=True, universal_newlines=True, timeout=30)
@@ -1103,6 +1114,21 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                 engine_commit("/opt/kit-copy", run=lambda argv, **kw: owned_by_another(
                     [a for a in argv if not a.startswith("safe.directory") and a != "-c"], **kw))),
                ("f" * 40, None))
+        # The runner's own copy (KIT-919) is no checkout: its commit is the installer's marker beside its files.
+        from pipeline_runner_setup import ENGINE_MARK
+        copy = os.path.join(tmp, "engine-copy")
+        os.makedirs(copy)
+        with open(os.path.join(copy, ENGINE_MARK), "w") as fh:
+            fh.write("e" * 40 + "\n")
+        no_git = lambda argv, **kw: subprocess.CompletedProcess(argv, 128, "", "fatal: not a git repository")  # noqa: E731
+        bad = os.path.join(tmp, "engine-copy-bad")
+        os.makedirs(bad)
+        with open(os.path.join(bad, ENGINE_MARK), "w") as fh:
+            fh.write("not a commit\n")
+        expect("KIT-916: the runner's root-owned copy names its commit by the installer's marker; a marker that "
+               "is not a commit names none, and git is not asked",
+               (engine_commit(copy, run=no_git), engine_commit(bad, run=lambda argv, **kw: subprocess.CompletedProcess(
+                   argv, 0, "f" * 40 + "\n", ""))), ("e" * 40, None))
         pushed = dict((r["row"], (r["verdict"], r["note"])) for r in json.loads(kept)["rows"]
                       if r["row"].endswith(":push-token") or r["row"].endswith(":git-credential"))
         expect("KIT-886: a push-token row per kind, by name: present for code, absent for review and acceptance; "

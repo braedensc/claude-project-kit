@@ -826,8 +826,8 @@ def row_engine(ctx):
     if got.get("state") != "read":
         raise Unknown("whether %s could change %s %s" % (ctx.role, engine, got.get("state")))
     if got.get("problems"):
-        raise Missing("the runner runs from %s, which %s could change (%s): the root-owned copy of the kit (KIT-919) "
-                      "is not in place, and the runner holds every start until it is" % (
+        raise Missing("the runner runs from %s, which %s could change (%s), so it holds every start: run the "
+                      "runner's installer, whose `engine` row makes its root-owned copy (KIT-919)" % (
                           engine, ctx.role, short(str(got["problems"][0]), 160)))
     return "%s: the role account can change none of it" % engine
 
@@ -2737,7 +2737,7 @@ def _cases(check_, tmp):  # noqa: C901  (one battery, read top to bottom)
          {"writer key": MISSING},
          ("the writer's answer not compared", [(me, "row_writer_key", lambda ctx: "ok")]))
     case("the runner runs from a folder the role account could change: MISSING, naming the root-owned copy",
-         lambda: (lambda r: (r[1], "root-owned copy of the kit (KIT-919)" in "\n".join(r[0].said)))(
+         lambda: (lambda r: (r[1], "makes its root-owned copy (KIT-919)" in "\n".join(r[0].said)))(
              broken_io(engine_problems=["/opt/kit-engine is writable by this account"])),
          ({"engine": MISSING}, True),
          ("the engine not judged", [(me, "row_engine", lambda ctx: "ok")]))
