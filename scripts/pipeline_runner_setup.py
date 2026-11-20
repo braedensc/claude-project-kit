@@ -2740,6 +2740,16 @@ def _cases(check, tmp, unsafe):  # noqa: C901  (one battery, read top to bottom)
             elif os.path.lexists(path):
                 os.unlink(path)
 
+    shared = []
+
+    def machine(**over):
+        """The one stand-in machine these cases share, its runner.conf written from `over`. A new machine costs a git
+        repository and a clone, and each case here needs only the role home and the folder of confs."""
+        if not shared:
+            shared.append(world())
+        _put(shared[0].root + "/runner.conf", text(ENGINE_DIR=shared[0].root + "/engine/kit", **over))
+        return shared[0]
+
     def one_row(fake, step_id, **over):
         """(outcome, detail) of one step run alone, as run_steps runs it, from the machine's runner.conf (`over` writes
         it first): no install, and no other row."""
@@ -2793,7 +2803,7 @@ def _cases(check, tmp, unsafe):  # noqa: C901  (one battery, read top to bottom)
          ("another clock name", [(me, "WRITER_CLOCK", "other-name")]))
 
     def written_key_ending():
-        fake, out = world(**tools), []
+        fake, out = machine(**tools), []
         _put(fake.home + "/.pipeline-runner/writer-key", KEY + "\n")
         os.chmod(fake.home + "/.pipeline-runner/writer-key", 0o600)
         for days in (200, 1):
@@ -2824,7 +2834,8 @@ def _cases(check, tmp, unsafe):  # noqa: C901  (one battery, read top to bottom)
          ("the installed source dropped", [(me, "writer_source", lambda c, real=writer_source: real(c) or {"kind": "file"})]))
 
     def borrowed_rows():
-        fake, out = world(**borrowed), []
+        fake, out = machine(**borrowed), []
+        watch_conf(fake)
         for status, mode in ((status_doc("other-program"), 0o644),
                              (status_doc("other-program", "failed", "refused", answered_ago=4 * 3600), 0o644),
                              (None, 0o644), (status_doc("other-program"), 0o664), (status_doc("other-program"), None),
@@ -2845,7 +2856,7 @@ def _cases(check, tmp, unsafe):  # noqa: C901  (one battery, read top to bottom)
          ("an old source believed", [(me, "status_for", lambda ctx, kind, apply_it: writer_status(ctx))]))
 
     def renewed_rows():
-        fake, out = world(**renewing), []
+        fake, out = machine(**renewing), []
         watch_conf(fake, "%s:%s" % (WRITER_CLOCK, ON(1)))
         for status, files, over in ((status_doc("renew", ends_in=20 * 3600 + 900), ("writer-client", "writer-renewal-key"), {}),
                                     (status_doc("renew", ends_in=5 * 3600), ("writer-client", "writer-renewal-key"), {}),
@@ -2871,7 +2882,7 @@ def _cases(check, tmp, unsafe):  # noqa: C901  (one battery, read top to bottom)
              real(c), adopt_file=None) if (real(c) or {}).get("kind") == "renew" else real(c))]))
 
     def user_rows():
-        fake, out = world(**borrowed), []
+        fake, out = machine(**borrowed), []
         for confs, finding, status in (
                 ({"notifier.conf": "DISPATCHER_AGENT_USER_ID=writer-1\n", "acceptance.conf": "AGENT_USER_ID=writer-1\n",
                   "bridge.conf": "AGENT_USER_NAME=dispatcher-agent\n"}, {"agent_user_id": "writer-1"},
@@ -2904,7 +2915,9 @@ def _cases(check, tmp, unsafe):  # noqa: C901  (one battery, read top to bottom)
          ("the finding filer not read", [(me, "FINDING_CONFIG", "~/.nowhere/poller.json")]))
 
     def client_and_renewal_steps():
-        fake = world(**renewing)
+        fake = machine(**renewing)
+        if os.path.exists(fake.home + "/.pipeline-runner/writer-key"):
+            os.unlink(fake.home + "/.pipeline-runner/writer-key")       # an earlier case's, on the shared machine
         client = "client0id01234:secret0abcdef0123"
         code_c, words_c, asked_c, _s1 = step(fake, token=client, date=ON(300), cmd="writer-client")
         cpath = fake.home + "/.pipeline-runner/writer-client"
