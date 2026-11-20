@@ -3589,6 +3589,9 @@ def send_page_with_images(chat, cfg, channel, text, paths):
     answer = chat.post_message(text, channel=channel)
     if not paths:
         return answer, None
+    if isinstance(answer, dict) and answer.get("held"):
+        # KIT-936: the chat limit holds this page, so there is no message to thread under.
+        return answer, "the screenshots were not sent, because the chat limit is holding this page"
     ts = answer.get("ts") if isinstance(answer, dict) and answer.get("ok") else None
     if not ts:
         return answer, None                  # no page landed, so there is no thread to explain in
@@ -4050,6 +4053,7 @@ def page_dms(cfg, chat, dm_state, bridge_state, event, text, now, paged, secrets
         held = [r for r in dm_state["posts"].values()
                 if (r or {}).get("channel") == channel
                 and (r or {}).get("event_key") == event["key"]]
+        page_held = False                  # KIT-936: the chat limit holds it: no real message yet
         if held:
             # Posted on an earlier pass whose page did not reach everyone. Never again.
             posted, ts = channel, held[0].get("ts")
@@ -4077,6 +4081,7 @@ def page_dms(cfg, chat, dm_state, bridge_state, event, text, now, paged, secrets
                                 % (tid, user_id, redact(str(reply.get("error")), secrets)))
                 continue
             reached = True              # this person has it, whatever happens to its record
+            page_held = bool(reply.get("held"))
             posted, ts = reply.get("channel") or channel, reply.get("ts")
             if not ts:
                 landed = False
@@ -4109,7 +4114,7 @@ def page_dms(cfg, chat, dm_state, bridge_state, event, text, now, paged, secrets
                 continue
         # KIT-224's record for the bridge, once per DM post, in today's shape. A post the
         # ledger held is checked too: a record whose save failed on an earlier pass is made now.
-        if (bridge_state is not None and is_relayable_mark(event["mark"])
+        if (bridge_state is not None and is_relayable_mark(event["mark"]) and not page_held
                 and chat_message_key(posted, ts) not in bridge_state["messages"]):
             recorded = record_relayable(bridge_state, posted, ts, event, _iso_at(now))
             try:
@@ -4381,14 +4386,16 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None, 
                 # KIT-935: the one message that stands for a pile of pages, built by plan_catchup
                 # from ids, marks and links alone. No mention, no bound reply line, no writer.
                 plain, prefix, bind_tail = event["catchup"], "", ""
+                plain_core, late_line, fold_line = plain, "", ""
             else:
                 plain = build_message(event["mark"], event["ticket_id"], event["ticket_title"],
                                       event["url"], event.get("detail"))
                 # KIT-935: a page more than an hour late says so, with when it was raised, and
                 # the newest health incident says how many it stands for.
-                plain = late_words(event, now) + plain
-                if event.get("folded_keys"):
-                    plain += "\n" + folded_words(event)
+                plain_core = plain
+                late_line = late_words(event, now)
+                fold_line = ("\n" + folded_words(event)) if event.get("folded_keys") else ""
+                plain = late_line + plain_core + fold_line
                 # KIT-297: with the writer on, a page to direct messages carries no @mention,
                 # since a DM notifies by itself. With it off, every page keeps the mentions it
                 # always had.
@@ -4423,8 +4430,10 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None, 
                     text = first or text
                     retried += 1
                 else:
-                    words, by, why = write_page(cfg, writer, event, plain, deadline)
-                    text = prefix + words
+                    words, by, why = write_page(cfg, writer, event, plain_core, deadline)
+                    # KIT-935 review: the late line and the folded count are not the model's to
+                    # keep or drop, so they go round its words, as the mention and bind line do.
+                    text = prefix + late_line + words + fold_line
                     if by == "model":
                         written += 1
                     else:
@@ -4518,7 +4527,7 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None, 
             # it has a recorded target. SAVED IMMEDIATELY — the target is worthless if the
             # pass ends between the post and a save at the end of the loop, and nothing ever
             # re-records it: the key is in the seen-set, so the ping is never sent again.
-            if relay_on and is_relayable_mark(event["mark"]):
+            if relay_on and is_relayable_mark(event["mark"]) and not (reply or {}).get("held"):
                 recorded = record_relayable(
                     relay_state,
                     (reply or {}).get("channel") or cfg["chat_channel_id"],
@@ -4546,7 +4555,8 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None, 
             # KIT-224: the same record, kept for the Slack bridge instead, which answers in
             # the relay's place. Saved at once, and a failed save keeps the key out of the
             # seen-set, exactly as the relay's own record does. In DM mode page_dms records it.
-            if bridge_on and not dm_on and is_relayable_mark(event["mark"]):
+            if (bridge_on and not dm_on and is_relayable_mark(event["mark"])
+                    and not (reply or {}).get("held")):
                 recorded = record_relayable(
                     bridge_state,
                     (reply or {}).get("channel") or cfg["chat_channel_id"],
@@ -9504,6 +9514,31 @@ def _catchup_selftest(ok, tmp, good):
         bad = str(exc)
     ok("KIT-935: catchup_gap_minutes must be a positive whole number",
        bad is not None and "catchup_gap_minutes" in bad, bad)
+
+    # With the writer on, its words never carry the late line or the folded count away (review).
+    cfg = fresh()
+    cfg["writer"] = True
+    last_good(cfg, NOW - 60)
+
+    def dropping_writer(_cfg, mark, facts, fallback=None, keep=()):
+        return {"by": "model", "text": " ".join(keep) + " reworded, nothing else"}
+    folded = [incident(i, NOW - 47 * 3600 + i * 5400) for i in range(5)]
+    chat = G["_FakeChat"]()
+    res = G["run_once"](cfg, G["_FakeTracker"]([ticket("KIT-133", folded)]), chat, False,
+                        out=io.StringIO(), now=NOW, writer=dropping_writer)
+    ok("KIT-935 review: with the writer on, the late line and the folded count are kept round its words",
+       len(chat.posts) == 1 and "reworded" in chat.posts[0] and "This page is late" in chat.posts[0]
+       and "4 earlier health-check comments" in chat.posts[0], (chat.posts, res["summary"][:200]))
+
+    # A page the chat limit holds has no message to thread screenshots under.
+    held_answer = {"ok": True, "channel": "D1", "ts": "1.000000", "held": True}
+
+    class _HeldChat(object):
+        def post_message(self, text, channel=None, thread_ts=None):
+            return held_answer
+    answer, note = G["send_page_with_images"](_HeldChat(), {"page_images": True}, "D1", "t", ["/x.png"])
+    ok("KIT-936 review: a held page sends no screenshots and says why",
+       answer is held_answer and "chat limit is holding this page" in (note or ""), note)
 
     # ── KIT-936: the REAL chat client's runaway stop, the network swapped for a recorder ──────
     calls = []

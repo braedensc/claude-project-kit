@@ -221,6 +221,7 @@ def digest_text(st, entry, now):
              "Here they are together, oldest first."
              % (total, "" if total == 1 else "s", _clock_words(held[0]["at"]) if held else "?",
                 st["max"], int(st["window"] // 60))]
+    lines.append("These were held, so a reply under one of them is not tied to it: reply here.")
     lines.append("About: " + "; ".join(h["subject"] for h in held[:8])
                  + ("; and %d more" % (len(held) - 8) if len(held) > 8 else "") + ".")
     if entry.get("dropped"):
@@ -292,6 +293,11 @@ def guarded_send(st, key, text, send, plain, thread=None, via="", keep=True, now
         _prune(entry, now, st["window"])
         if via and not entry["held"]:
             entry["via"] = via
+        if (not entry["held"] and entry["release_at"] is not None
+                and now >= entry["release_at"]):
+            # An episode of holds that kept nothing (a stream start, an "on it" line) has no
+            # digest to end it. Its time has come, so the next trip is a trip (review of KIT-937).
+            entry["release_at"], entry["noticed"] = None, False
         if entry["held"] and entry["release_at"] is not None and now >= entry["release_at"]:
             _send_digest(st, doc, key, entry, plain, now)
             _write(st["state_dir"], doc)
@@ -587,6 +593,24 @@ def _selftest_body():
     for name in ("pipeline_bridge_transport.py", "pipeline_notify_local.py"):
         src = open(os.path.join(here, name), encoding="utf-8").read()
         check("%s calls the check" % name, "guarded_send(" in src, True)
+
+    # 14b. Every place a SlackClient is built hands it a loaded config (a hand-built one has no state
+    #      folder, and a client with none has no limit).
+    for name in ("pipeline_bridge.py", "pipeline_bridge_push.py", "pipeline_standup.py"):
+        src = open(os.path.join(here, name), encoding="utf-8").read()
+        args = set(re.findall(r"SlackClient\((\w+)", src)) - {"object"}
+        check("%s builds its SlackClient from a loaded config" % name,
+              args <= {"cfg", "bridge_cfg", "cfg_for"}, True)
+
+    # 14c. An episode of holds that kept nothing does not leave the next trip unrecorded.
+    st12, s12 = fresh(max=1), Sink()
+    guarded_send(st12, "D1", "a", s12.one("a"), s12.post, now=1.0)
+    guarded_send(st12, "D1", "stream", s12.one("s"), s12.post, keep=False, now=2.0)
+    guarded_send(st12, "D1", "b", s12.one("b"), s12.post, now=700.0)      # a new window opens
+    guarded_send(st12, "D1", "c", s12.one("c"), s12.post, now=701.0)      # a second trip
+    trips = json.load(open(_paths(st12["state_dir"])[2]))["trips"]
+    check("a second trip after a keep-off episode is recorded and noticed",
+          (len(trips), len([x for x in s12.sent if x.startswith("I have sent")])), (2, 2))
 
     # 15. Settings: defaults, and a bad value is named.
     errs = []
