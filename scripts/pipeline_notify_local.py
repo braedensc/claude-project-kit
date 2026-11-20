@@ -1728,6 +1728,25 @@ def _awake_clock():
         return None
 
 
+def last_good_path(cfg):
+    return os.path.join(cfg["state_dir"], "notifier-last-good.json")
+
+
+def ticket_window_days(cfg, now):
+    """How many days of ticket updates this pass reads (KIT-931): the time since the last good
+    pass plus a margin, held between the floor and the ceiling. No record, or one that cannot
+    be read or makes no sense, is the ceiling: reading more is always safe, reading less is not."""
+    try:
+        with open(last_good_path(cfg), encoding="utf-8") as fh:
+            at = _moment((json.load(fh) or {}).get("at"))
+    except (OSError, ValueError, AttributeError):
+        at = None
+    if at is None or at > now:
+        return TICKET_WINDOW_DAYS
+    days = (now - at) / 86400.0 + TICKET_MARGIN_DAYS
+    return min(TICKET_WINDOW_DAYS, max(TICKET_FLOOR_DAYS, days))
+
+
 def write_heartbeat(cfg, result, now):
     """Record what the last one-shot pass did, atomically.
 
@@ -1779,6 +1798,13 @@ def write_heartbeat(cfg, result, now):
     except OSError as exc:
         sys.stderr.write("NOTE: could not write the heartbeat %s: %s\n"
                          % (heartbeat_path(cfg), exc))
+    # KIT-931: a pass that read every team (exit 0 or 3) and was no rehearsal is the point the
+    # next pass reads back to. A failed or dry pass leaves the old point where it was.
+    if not dry and result.get("exit") in (EXIT_OK, EXIT_DECLINED):
+        try:
+            _atomic_write_json(last_good_path(cfg), {"at": now})
+        except OSError as exc:
+            sys.stderr.write("NOTE: could not write %s: %s\n" % (last_good_path(cfg), exc))
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════
@@ -2386,9 +2412,17 @@ SATURATED_SKIP = "comment window saturated"
 # KIT-680: the ticket list is read in pages of TICKET_PAGE_SIZE, newest update first, until one
 # older than TICKET_WINDOW_DAYS days; more than TICKET_MAX_PAGES pages inside that window is a
 # failed read that says so.
+#
+# KIT-931: a busy team passes 500 updates in 14 days in normal use, so the normal read is small:
+# only tickets updated since the last GOOD pass, less TICKET_MARGIN_DAYS, and never less than
+# TICKET_FLOOR_DAYS (a notifier that was down reads back to where it stopped). TICKET_WINDOW_DAYS
+# is now the CEILING, used when no good pass is on record. The page cap stays as a runaway stop,
+# far above normal use, and still fails loudly.
 TICKET_PAGE_SIZE = 50
 TICKET_WINDOW_DAYS = 14
-TICKET_MAX_PAGES = 10
+TICKET_FLOOR_DAYS = 2
+TICKET_MARGIN_DAYS = 1
+TICKET_MAX_PAGES = 40
 # The two ways a daemon-health mark goes unpaged. The first is named in the pass summary
 # with its ticket, comment and author, because something other than the configured monitor
 # wrote the monitor's mark; the second is counted in the summary's OFF clause.
@@ -3433,7 +3467,7 @@ class TrackerClient:
                                 code=EXIT_ERROR)
         return doc
 
-    def recent_tickets(self, team_key, limit):
+    def recent_tickets(self, team_key, limit, window_days=None):
         """Tickets, with the UUID a mutation needs, the labels a union needs, the comment
         author the mark gate needs, and each comment's PARENT.
 
@@ -3449,7 +3483,8 @@ class TrackerClient:
         is a live-test assumption and not a guarantee, a ticket whose window came back FULL
         is flagged, and the pass reports the truncation instead of going quiet about it.
         """
-        query = ("query($t:String!,$n:Int!,$c:Int!,$a:String){issues(filter:{team:{key:{eq:$t}}},"
+        query = ("query($t:String!,$n:Int!,$c:Int!,$a:String,$s:DateTimeOrDuration!){"
+                 "issues(filter:{team:{key:{eq:$t}},updatedAt:{gt:$s}},"
                  "first:$n,after:$a,orderBy:updatedAt){pageInfo{hasNextPage endCursor} "
                  "nodes{id identifier title updatedAt state{type} "
                  "labels{nodes{id}} "
@@ -3460,10 +3495,12 @@ class TrackerClient:
         # the pages run out. A team whose window holds more than the page limit is a failed
         # read, said as one, never a quiet cut at the 50th ticket.
         nodes, cursor, pages = [], None, 0
-        horizon = time.time() - TICKET_WINDOW_DAYS * 86400
+        days = TICKET_WINDOW_DAYS if window_days is None else window_days
+        horizon = time.time() - days * 86400
+        since = _iso_at(horizon)
         while True:
             doc = self._gql(query, {"t": team_key, "n": TICKET_PAGE_SIZE, "c": int(limit),
-                                    "a": cursor})
+                                    "a": cursor, "s": since})
             conn = ((doc.get("data") or {}).get("issues")) or {}
             page = conn.get("nodes") or []
             nodes.extend(page)
@@ -3479,7 +3516,7 @@ class TrackerClient:
                     "team %s has more than %d tickets updated in the last %d days (%d pages "
                     "of %d were read): the notifier could not see all of them, so this read "
                     "is a FAILURE, not a quiet week" % (
-                        team_key, TICKET_MAX_PAGES * TICKET_PAGE_SIZE, TICKET_WINDOW_DAYS,
+                        team_key, TICKET_MAX_PAGES * TICKET_PAGE_SIZE, int(math.ceil(days)),
                         pages, TICKET_PAGE_SIZE), code=EXIT_ERROR)
             cursor = info["endCursor"]
         out = []
@@ -3982,7 +4019,8 @@ def run_once(cfg, tracker, chat, dry_run, out=sys.stdout, secrets=(), now=None, 
     tickets, read_failures = [], []
     for team in cfg["team_keys"]:
         try:
-            tickets.extend(tracker.recent_tickets(team, cfg["lookback_comments"]))
+            tickets.extend(tracker.recent_tickets(
+                team, cfg["lookback_comments"], window_days=ticket_window_days(cfg, now)))
         except (NotifierError, Exception) as exc:                 # noqa: BLE001
             if isinstance(exc, Deadline):
                 raise
@@ -4647,7 +4685,8 @@ class _FakeTracker:
             raise self.reply_raises
         return "rc-%d" % len(self.replies)
 
-    def recent_tickets(self, team_key, limit):
+    def recent_tickets(self, team_key, limit, window_days=None):
+        self.window_asked = window_days
         if self.fail:
             raise RuntimeError("tracker unreachable")
         return list(self.tickets)
@@ -5925,7 +5964,99 @@ def selftest():
         except NotifierError as exc:
             said = str(exc)
         ok("KIT-680: more tickets in the window than the page limit is a FAILED read, named",
-           "more than 500 tickets" in said and len(busy.calls) == 10, (said, len(busy.calls)))
+           "more than 2000 tickets" in said and len(busy.calls) == TICKET_MAX_PAGES == 40,
+           (said, len(busy.calls)))
+
+        # KIT-931: the normal read is small. The stub honours the `since` the read sends, as the
+        # tracker does, so a busy team's older updates are never asked for.
+        class _SinceStub(_PagedStub):
+            def _gql(self, query, variables):
+                self.sent.append(variables.get("s"))
+                self.calls.append(variables.get("a"))
+                want = _moment(variables["s"])
+                keep = [i for i in range(self.total) if _moment(self.stamp(i)) > want]
+                start = int(variables.get("a") or 0)
+                part = keep[start:start + variables["n"]]
+                nodes = [{"id": "u-%d" % i, "identifier": "KIT-%d" % i, "title": "t",
+                          "labels": {"nodes": []}, "state": {"type": "started"},
+                          "updatedAt": self.stamp(i), "comments": {"nodes": []}}
+                         for i in part]
+                end = start + len(part)
+                return {"data": {"issues": {"nodes": nodes, "pageInfo": {
+                    "hasNextPage": end < len(keep), "endCursor": str(end)}}}}
+
+        def _since_stub(total, stamp):
+            stub = _SinceStub(cfg, "not-a-real-key", total=total, stamp=stamp)
+            stub.sent = []
+            return stub
+        # 700 updates spread over 14 days (50 a day); the newest two days hold 100 of them.
+        spread = lambda i: _ago(i * 86400 * 14 // 700 + 60)
+        win_none = ticket_window_days(dict(cfg, state_dir=os.path.join(tmp, "lg")), time.time())
+        ok("KIT-931: with no good pass on record the read goes back the full ceiling",
+           win_none == TICKET_WINDOW_DAYS, win_none)
+        sd = _since_stub(700, spread)
+        got = sd.recent_tickets("KIT", 20, window_days=TICKET_FLOOR_DAYS)
+        ok("KIT-931: a busy team (700 updates in 14 days) is read in the floor window, not failed",
+           90 <= len(got) <= 110 and len(sd.calls) <= 3, (len(got), sd.calls))
+        sd_gap = _since_stub(700, spread)
+        got_gap = sd_gap.recent_tickets("KIT", 20, window_days=11)
+        ok("KIT-931: a notifier back after a long gap reads back to where it stopped",
+           540 <= len(got_gap) <= 580 and len(sd_gap.calls) <= 12, (len(got_gap), sd_gap.calls))
+        sd_run = _since_stub(5000, lambda i: _ago(60))
+        try:
+            sd_run.recent_tickets("KIT", 20, window_days=TICKET_FLOOR_DAYS)
+            said2 = ""
+        except NotifierError as exc:
+            said2 = str(exc)
+        ok("KIT-931: a read past the cap is still a loud FAILURE, never a quiet week",
+           "FAILURE" in said2 and len(sd_run.calls) == TICKET_MAX_PAGES, (said2, len(sd_run.calls)))
+        ok("KIT-931: the read sends its window to the tracker as a since filter",
+           "updatedAt:{gt:$s}" in _GqlStub.asked[0] and abs(
+               _moment(sd.sent[0]) - (time.time() - TICKET_FLOOR_DAYS * 86400)) < 5, sd.sent[:1])
+
+        # The window itself, from the last good pass.
+        lg_cfg = dict(cfg, state_dir=os.path.join(tmp, "lg2"))
+        t_now = time.time()
+
+        def _lg(ago, raw=None):
+            os.makedirs(lg_cfg["state_dir"], exist_ok=True)
+            with open(last_good_path(lg_cfg), "w", encoding="utf-8") as fh:
+                fh.write(raw if raw is not None else json.dumps({"at": _ago(ago)}))
+            return ticket_window_days(lg_cfg, t_now)
+        ok("KIT-931: a pass an hour ago reads the floor, not a day or more",
+           _lg(3600) == TICKET_FLOOR_DAYS, _lg(3600))
+        ok("KIT-931: a pass 5 days ago reads 5 days plus the margin",
+           abs(_lg(5 * 86400) - (5 + TICKET_MARGIN_DAYS)) < 0.01, _lg(5 * 86400))
+        ok("KIT-931: a pass 40 days ago reads no more than the ceiling",
+           _lg(40 * 86400) == TICKET_WINDOW_DAYS, _lg(40 * 86400))
+        ok("KIT-931: a damaged or future record reads the ceiling",
+           _lg(0, raw="{nope") == TICKET_WINDOW_DAYS and _lg(0, raw="[]") == TICKET_WINDOW_DAYS
+           and _lg(-3600) == TICKET_WINDOW_DAYS)
+
+        # Only a real, finished pass moves the point.
+        hb_cfg = dict(cfg, state_dir=os.path.join(tmp, "lg3"))
+
+        def _beat(exit_code, dry=False):
+            write_heartbeat(hb_cfg, {"exit": exit_code, "dry": dry}, "2026-11-19T10:00:00Z")
+            return os.path.exists(last_good_path(hb_cfg))
+        ok("KIT-931: a failed pass and a dry pass leave no good point",
+           not _beat(EXIT_ERROR) and not _beat(EXIT_OK, dry=True))
+        ok("KIT-931: a finished pass (exit 3 here) records the good point",
+           _beat(EXIT_DECLINED) and json.load(open(last_good_path(hb_cfg)))["at"]
+           == "2026-11-19T10:00:00Z")
+        write_heartbeat(hb_cfg, {"exit": EXIT_ERROR}, "2026-11-19T12:00:00Z")
+        ok("KIT-931: a later failed pass leaves the earlier good point where it was",
+           json.load(open(last_good_path(hb_cfg)))["at"] == "2026-11-19T10:00:00Z")
+
+        # run_once hands the read its window, from the good point on record.
+        os.makedirs(lg_cfg["state_dir"], exist_ok=True)
+        with open(last_good_path(lg_cfg), "w", encoding="utf-8") as fh:
+            json.dump({"at": _ago(5 * 86400)}, fh)
+        ft_win = _FakeTracker([])
+        run_once(dict(cfg, state_dir=lg_cfg["state_dir"]), ft_win, _FakeChat(), True,
+                 out=io.StringIO())
+        ok("KIT-931: a pass asks the tracker for its own window, not the ceiling",
+           abs(ft_win.window_asked - (5 + TICKET_MARGIN_DAYS)) < 0.05, ft_win.window_asked)
 
         # ── §7d. A hostile ticket title cannot control the chat client ───────────
         nasty = [tkt("KIT-5", ESC_BLOCKED, "c5", title="<!channel> <http://x|click>",
