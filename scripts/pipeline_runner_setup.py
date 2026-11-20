@@ -5,6 +5,7 @@ always-on job, checked or applied with its answers given (KIT-655). Guide: docs/
     python3 scripts/pipeline_runner_setup.py check [--conf runner.conf]
     echo '{"schema": "runner-answers/1", "consent": "yes"}' | python3 scripts/pipeline_runner_setup.py apply
     python3 scripts/pipeline_runner_setup.py push-token|tracker-key|writer-key [--conf runner.conf] [--watch-conf update.conf]
+    python3 scripts/pipeline_runner_setup.py writer-client|writer-renewal [--conf runner.conf] [--watch-conf update.conf]
     python3 scripts/pipeline_runner_setup.py --selftest
 
 Both print one JSON document of rows on stdout, on every exit, and every human word on stderr, as the
@@ -66,6 +67,16 @@ TRACKER-KEY and WRITER-KEY (KIT-928).  The same step, file and end date for the 
 the installed `session_tools.key_file`, filed as `runner-writer-key`). Each has its own `check` row, which says
 the file's owner, mode and presence in words and never its text.
 
+WHERE THE WRITER'S KEY COMES FROM (KIT-933).  WRITER_KEY_SOURCE becomes `session_tools.key_source`
+(scripts/pipeline_writer_key.py): `file` (the step above), `other-program` (read from another program's JSON
+settings file, WRITER_KEY_FROM, under the key WRITER_KEY_FROM_FIELD, each time it is needed, never renewed) or
+`renew` (the runner renews it itself, with the renewal token in WRITER_RENEWAL_FILE and the app's client details
+in WRITER_CLIENT_FILE; its first renewal may take the renewal token from WRITER_KEY_FROM under
+WRITER_RENEWAL_FROM_FIELD). Unset, the installed source is kept. `writer-client` and `writer-renewal` are the owner's
+steps for those two files, as for the keys above; a renewal token has no end date to record, since the runner
+renews it. The `writer-key` row says which source is in use and when the key ends, from the runner's own status
+of it; the `writer-user` row says whether every reader that trusts the session writer names the same user.
+
 Exits: 0 done or current · 1 failed · 2 settings · 3 refused · 4 not measured · 5 no live sudo
 (apply) · 10 work to do (check), or not agreed, or left off.
 """
@@ -80,6 +91,7 @@ import stat
 import subprocess
 import sys
 import tarfile
+import time
 from xml.sax.saxutils import escape as _esc
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -98,6 +110,7 @@ import pipeline_bridge_push_setup as push  # noqa: E402  (the kept-alive plist, 
 import pipeline_runner as runner_job  # noqa: E402  (its own loader judges what this composes)
 import pipeline_session_tools as session_tools  # noqa: E402  (which lanes hold the session writer's key)
 import pipeline_tech_lead_tools as tl_tools  # noqa: E402  (the tracker key's one shape)
+import pipeline_writer_key as wkey  # noqa: E402  (where the writer's key comes from, and its status, KIT-933)
 import pipeline_runner_guard as runner_guard  # noqa: E402  (its own check of the folder it runs from)
 import pipeline_runner_store as store  # noqa: E402
 import pipeline_queue_pool as pool  # noqa: E402
@@ -114,10 +127,15 @@ ANSWERS_MAX_BYTES = 64 * 1024
 CONF_REQUIRED = ("ROLE_ACCOUNT", "CLAUDE_BIN", "OWNER_USER_IDS", "DISPATCHER_USER_IDS", "PROJECTS")
 CONF_DEFAULTS = {"ROLE_KIT_CLONE": se.ROLE_KIT_CLONE_PATH, "ENV_FILE": "~/.stage-e/env",
                  "JOB_LABEL": "local.pipeline-runner", "RUNNER_DIR": "~/.pipeline-runner",
-                 "TOKEN_ENV": "CLAUDE_WRITER_OAUTH_TOKEN", "PUSH_TOKEN_FILE": "", "WRITER_KEY_FILE": ""}
+                 "TOKEN_ENV": "CLAUDE_WRITER_OAUTH_TOKEN", "PUSH_TOKEN_FILE": "", "WRITER_KEY_FILE": "",
+                 # KIT-933: where the session writer's key comes from (empty keeps what is installed)
+                 "WRITER_KEY_SOURCE": "", "WRITER_KEY_FROM": "", "WRITER_KEY_FROM_FIELD": "",
+                 "WRITER_RENEWAL_FROM_FIELD": "", "WRITER_RENEWAL_FILE": "", "WRITER_CLIENT_FILE": ""}
 PUSH_CLOCK = "runner-push-token"       # the name its end date is filed under in CREDENTIAL_EXPIRIES
 TRACKER_CLOCK, WRITER_CLOCK = "runner-tracker-key", "runner-writer-key"
-KEY_COMMANDS = ("push-token", "tracker-key", "writer-key")      # the owner's steps, one per key file (KIT-928)
+CLIENT_CLOCK = "runner-writer-client"  # the app's client details: the day they are reviewed (KIT-933)
+# The owner's steps, one per key file (KIT-928), and the renewed key's two files (KIT-933).
+KEY_COMMANDS = ("push-token", "tracker-key", "writer-key", "writer-client", "writer-renewal")
 PUSH_DATE_YEARS = 5                    # a date further off than this is a typo, not a token's end
 # Left invalid on purpose, so an unedited copy of the example cannot run.
 CONF_UNEDITED = {"OWNER_USER_IDS": "owner-user-id-1", "DISPATCHER_USER_IDS": "dispatcher-user-id-1"}
@@ -173,6 +191,8 @@ def validate_conf(values, user=None):
     c["WRITER_KEY_UNSET"] = not c["WRITER_KEY_FILE"]       # then the session writer's installed path is the owner's
     if not c["WRITER_KEY_FILE"]:
         c["WRITER_KEY_FILE"] = c["RUNNER_DIR"].rstrip("/") + "/writer-key"
+    for k, leaf in (("WRITER_RENEWAL_FILE", "writer-renewal-key"), ("WRITER_CLIENT_FILE", "writer-client")):
+        c[k] = c[k] or c["RUNNER_DIR"].rstrip("/") + "/" + leaf      # KIT-933: beside the writer's key
 
     def need(ok, why):
         if not ok:
@@ -192,9 +212,12 @@ def validate_conf(values, user=None):
          "OWNER_USER_IDS lists the dispatcher's own user, which never approves")
     need(not c.get("CLAUDE_BIN") or c["CLAUDE_BIN"].startswith("/") and path_ok(c["CLAUDE_BIN"]),
          "CLAUDE_BIN must be an absolute path")
-    bad = [k for k in ("ROLE_KIT_CLONE", "ENV_FILE", "RUNNER_DIR", "PUSH_TOKEN_FILE", "WRITER_KEY_FILE")
-           if not path_ok(c[k]) and not (k == "PUSH_TOKEN_FILE" and c[k] == OFF)]      # KIT-919: `off` is the off
+    bad = [k for k in ("ROLE_KIT_CLONE", "ENV_FILE", "RUNNER_DIR", "PUSH_TOKEN_FILE", "WRITER_KEY_FILE",
+                       "WRITER_RENEWAL_FILE", "WRITER_CLIENT_FILE", "WRITER_KEY_FROM")
+           if not path_ok(c[k]) and not (k == "PUSH_TOKEN_FILE" and c[k] == OFF)      # KIT-919: `off` is the off
+           and not (k == "WRITER_KEY_FROM" and not c[k])]
     e.extend("%s must be `~/…` (the role account's home) or an absolute path, with no `..`" % k for k in bad)
+    e.extend(source_problems(c))                                                    # KIT-933
     need("ROLE_KIT_CLONE" in bad or c["ROLE_KIT_CLONE"].rstrip("/") == se.ROLE_KIT_CLONE_PATH,
          "ROLE_KIT_CLONE is not Stage E's clone, %s" % se.ROLE_KIT_CLONE_PATH)
     items = projects(c.get("PROJECTS"))[1]
@@ -207,23 +230,55 @@ def validate_conf(values, user=None):
 
 def path_problems(c, home, skip=()):
     """RUNNER_DIR inside the clone, a git working tree a session can write, or holding the env file."""
+    files = ("PUSH_TOKEN_FILE", "WRITER_KEY_FILE", "WRITER_RENEWAL_FILE", "WRITER_CLIENT_FILE")
     p = dict((k, ns.resolve_path(c[k], home))
-             for k in ("ROLE_KIT_CLONE", "ENV_FILE", "RUNNER_DIR", "PUSH_TOKEN_FILE", "WRITER_KEY_FILE") if k not in skip)
+             for k in ("ROLE_KIT_CLONE", "ENV_FILE", "RUNNER_DIR") + files + ("WRITER_KEY_FROM",)
+             if k not in skip and c.get(k))
     under = lambda a, b: a in p and b in p and ns._under(p[a], p[b])      # noqa: E731
     found = ["RUNNER_DIR %s" % why for bad, why in (
         (under("RUNNER_DIR", "ROLE_KIT_CLONE"), "is inside ROLE_KIT_CLONE, a git working tree"),
         (under("ENV_FILE", "RUNNER_DIR"), "holds ENV_FILE")) if bad]
-    for key, other in (("PUSH_TOKEN_FILE", "WRITER_KEY_FILE"), ("WRITER_KEY_FILE", "PUSH_TOKEN_FILE")):
+    for key in files + ("WRITER_KEY_FROM",):
         if key in p and "RUNNER_DIR" in p:
             d = p["RUNNER_DIR"].rstrip("/")
+            others = [p.get(o) for o in files if o != key]
             found += ["%s %s" % (key, why) for bad, why in (
                 (under(key, "ROLE_KIT_CLONE"), "is inside ROLE_KIT_CLONE, a git working tree"),
-                (p[key] in (p.get("ENV_FILE"), p.get(other), d + "/tracker-key", d + "/runner.json"),
+                (p[key] in [p.get("ENV_FILE"), d + "/tracker-key", d + "/runner.json"] + others,
                  "is the env file, the tracker key's file, the settings file or the other key file: it holds "
-                 "one key alone"),
+                 "one key alone" if key != "WRITER_KEY_FROM" else "is one of the runner's own files, not "
+                 "another program's settings file"),
                 (any(ns._under(p[key], d + "/" + sub) for sub in ("work", "home", "store")),
                  "is in the runner's work, home or store folder, where a session can write")) if bad]
     return found
+
+
+def source_problems(c):
+    """KIT-933: WRITER_KEY_SOURCE and the keys it needs, every fault by key."""
+    kind, out = c.get("WRITER_KEY_SOURCE") or "", []
+    if kind and kind not in wkey.SOURCES:
+        out.append("WRITER_KEY_SOURCE must be file, other-program or renew (unset keeps what is installed)")
+    for k in ("WRITER_KEY_FROM_FIELD", "WRITER_RENEWAL_FROM_FIELD"):
+        if c.get(k) and not wkey.FIELD_RE.match(c[k]):
+            out.append("%s must be the name of one JSON key (letters, digits, _ and -)" % k)
+    if kind == "other-program" and not (c.get("WRITER_KEY_FROM") and c.get("WRITER_KEY_FROM_FIELD")):
+        out.append("WRITER_KEY_SOURCE=other-program needs WRITER_KEY_FROM (that program's JSON settings file) and "
+                   "WRITER_KEY_FROM_FIELD (the JSON key that holds the session writer's key)")
+    if kind == "renew" and bool(c.get("WRITER_KEY_FROM")) != bool(c.get("WRITER_RENEWAL_FROM_FIELD")):
+        out.append("WRITER_KEY_SOURCE=renew takes its first renewal token from WRITER_KEY_FROM, under "
+                   "WRITER_RENEWAL_FROM_FIELD: set both, or neither")
+    return out
+
+
+def writer_source(c):
+    """The `session_tools.key_source` the conf's WRITER_KEY_SOURCE names, or None when it names none."""
+    kind = c.get("WRITER_KEY_SOURCE") or ""
+    if kind == "other-program":
+        return {"kind": kind, "file": c["WRITER_KEY_FROM"], "field": c["WRITER_KEY_FROM_FIELD"]}
+    if kind == "renew":
+        return {"kind": kind, "renewal_file": c["WRITER_RENEWAL_FILE"], "client_file": c["WRITER_CLIENT_FILE"],
+                "adopt_file": c.get("WRITER_KEY_FROM") or None, "adopt_field": c.get("WRITER_RENEWAL_FROM_FIELD") or None}
+    return {"kind": "file"} if kind == "file" else None
 
 
 def load_conf(path, user=None):
@@ -403,9 +458,21 @@ def compose(c, on, was=None):
 
 def carry(c, doc):
     """`doc` with what the conf names of the carried keys: its value, or `off` as the off itself (KIT-919). A key it
-    leaves out is not touched, so a rerun keeps the owner's own value and an off he set."""
+    leaves out is not touched, so a rerun keeps the owner's own value and an off he set. The writer's key source
+    (KIT-933) goes inside `session_tools`, and survives the conf replacing the rest of it: WRITER_KEY_SOURCE left
+    out keeps the installed source, and `file` is the absence of one."""
     top, per, _bad = carried(c)
+    st = doc.get("session_tools")
+    kept = st.get("key_source") if isinstance(st, dict) else None
     doc.update(top)
+    st = doc.get("session_tools")
+    if isinstance(st, dict):
+        want = writer_source(c)
+        want = kept if want is None else want
+        st = dict((k, v) for k, v in st.items() if k != "key_source")
+        if want is not None and want != {"kind": "file"}:
+            st["key_source"] = want
+        doc["session_tools"] = st
     for key, settings in per.items():
         doc["projects"][key].update(settings)
     return doc
@@ -499,6 +566,7 @@ class Ctx(object):
         self.home = self.commit = self.on = self.left_off = self.first = None
         self.was = None
         self.watch_conf, self.today = os.path.join(KIT, "update.conf"), None      # the push token's end date
+        self.now, self.conf_dir = None, KIT      # KIT-933: the writer key's clock, and where the readers' confs are
 
     account = property(lambda self: self.conf["ROLE_ACCOUNT"])
 
@@ -1030,6 +1098,21 @@ def key_spec(name):
                 "make": "Make a tracker API key for the runner's own tracker user first (it reads tickets and the "
                         "queue's records), with an end date if the tracker lets you set one.",
                 "kinds": []}
+    if name == "writer-client":             # KIT-933: a renewed key's client details, `id:secret` on one line
+        return {"label": "app's client details", "clock": CLIENT_CLOCK, "pattern": wkey.CLIENT_RE,
+                "path": lambda c, was: c["WRITER_CLIENT_FILE"], "shape": "the app's client id and secret, as id:secret",
+                "prompt": "The app's client id and client secret, as id:secret (hidden): ",
+                "make": "Open the tracker app's own page in the tracker's settings (the app the session writer is) and "
+                        "copy its client id and client secret. A secret does not end by itself: give the day you "
+                        "will review it.",
+                "kinds": []}
+    if name == "writer-renewal":            # KIT-933: only when the runner says its renewal token was refused
+        return {"label": "session writer's renewal token", "clock": None, "pattern": wkey.RENEWAL_RE,
+                "path": lambda c, was: c["WRITER_RENEWAL_FILE"], "shape": "one renewal token",
+                "prompt": "The renewal token (hidden): ",
+                "make": "Authorize the tracker app again, as the app, and take the renewal token from that answer. The "
+                        "runner renews the key from it, and keeps the key's end itself: no date is asked.",
+                "kinds": []}
     return {"label": "session writer's key", "clock": WRITER_CLOCK, "pattern": tl_tools.KEY_RE, "path": writer_path,
             "shape": "one tracker key", "prompt": "The session writer's key (hidden): ",
             "make": "Make a tracker API key for the user named in `session_tools.writer_user_id` first (never an "
@@ -1156,7 +1239,228 @@ def step_tracker_key(ctx, apply_it):
 
 
 def step_writer_key(ctx, apply_it):
-    return step_key("writer-key", ctx, apply_it)
+    """The session writer's key (KIT-928, KIT-933): which source is in use and how the key stands. The file source is
+    its key file and end date, as for the other keys, with the runner's own word on it when there is one. A key from
+    another program, or one the runner renews, is judged from the runner's status of it: when it last answered as
+    the session writer and, renewed, when it ends. One that could not be read or renewed, or that ends within six
+    hours, FAILS in words; a runner that has said nothing yet is NOT MEASURED, never current."""
+    src = installed_source(ctx)
+    if src["kind"] == "file":
+        ok, words = step_key("writer-key", ctx, apply_it)
+        if "yet: run `writer-key`" in words:
+            return ok, words            # no file yet, and no lane needs one: no fault, whatever the runner saw
+        try:
+            doc = writer_status(ctx)[0]
+        except Unknown:
+            doc = None
+        if doc is not None and doc["source"] == "file":
+            problems, said = wkey.judge(doc, ctx.now or time.time())
+            if problems:
+                raise SetupError("%s; but the runner says: %s" % (words, "; ".join(problems)))
+            words += "; the runner says %s" % said.split("; ", 1)[-1]
+        return ok, words
+    if not ctx.home:
+        raise Unknown("waits on `home`", "clear that row first")
+    found = []
+    if src["kind"] == "other-program":
+        word = settings_file_state(ctx, src["file"])
+        if word == "absent":
+            raise SetupError("WRITER_KEY_SOURCE is other-program, and there is no settings file at %s: start that "
+                             "program again, or, once it is gone for good, set WRITER_KEY_SOURCE=renew" % src["file"])
+        if word == "unread":
+            raise Unknown("the other program's settings file %s could not be looked at" % src["file"],
+                          "check the account's folder, then run this again")
+        if word != "ok":
+            raise SetupError("the other program's settings file %s %s" % (src["file"], SETTINGS_STATE_WORDS[word]))
+        found.append("read from %s, under %s, each time it is needed; that program renews it and the runner never "
+                     "does" % (src["file"], src["field"]))
+    else:
+        for label, path, cmd in (("app's client details", src["client_file"], "writer-client"),
+                                 ("renewal token", src["renewal_file"], "writer-renewal")):
+            word = token_file_state(lambda script: ctx.as_role(script, "reading the %s file's kind" % label), path)
+            if word == "absent" and cmd == "writer-renewal" and src.get("adopt_file"):
+                found.append("its first renewal takes the renewal token from %s, under %s" % (
+                    src["adopt_file"], src["adopt_field"]))
+                continue
+            if word == "absent":
+                raise SetupError("WRITER_KEY_SOURCE is renew, and there is no %s file at %s: run `%s`" % (label, path, cmd))
+            if word == "unread":
+                raise Unknown("the %s file's kind could not be read" % label, "check the account's folder, then run "
+                              "this again")
+            if word != "ok":
+                raise SetupError("the %s file %s %s" % (label, path, TOKEN_STATE_WORDS[word]))
+        found.insert(0, "renewed by the runner itself, before it ends")
+    doc, why = status_for(ctx, src["kind"], apply_it)
+    if doc is None:
+        raise Unknown("the runner has not said how the session writer's key stands (%s)" % why,
+                      "it says so within a minute of starting with these settings: run `check` again, and if it "
+                      "still says this, the runner is not running")
+    problems, said = wkey.judge(doc, ctx.now or time.time())
+    if problems:
+        raise SetupError("the session writer's key is %s; the runner says: %s" % ("; ".join(found), "; ".join(problems)))
+    held, _why, _warn = recorded_end(ctx.watch_conf, WRITER_CLOCK)
+    stale = ("; CREDENTIAL_EXPIRIES still holds %s:%s, the date of a key a person wrote: take it out of update.conf, "
+             "or the health watch keeps warning about a date that is no longer this key's" % (WRITER_CLOCK, held)) if held else ""
+    return True, "the session writer's key is %s; the runner says %s%s" % ("; ".join(found), said.split("; ", 1)[-1], stale)
+
+
+# ── KIT-933: the writer's key source after this install, the runner's word on it, and the one writer user ─────────
+# Another program's settings file, looked at as the role account: what kind of file it is, never what it holds. Its
+# own program chose its mode, so group and others may read it; a file they could change is never trusted.
+SETTINGS_STATE_PY = r'''
+import os, stat, sys
+try:
+    st = os.lstat(os.path.expanduser(sys.argv[1]))
+except FileNotFoundError:
+    print("absent")
+    sys.exit(0)
+except OSError:
+    print("unread")
+    sys.exit(0)
+if stat.S_ISLNK(st.st_mode):
+    print("link")
+elif not stat.S_ISREG(st.st_mode):
+    print("not-file")
+elif st.st_uid != os.getuid():
+    print("other-owner")
+elif st.st_mode & 0o022:
+    print("writable")
+elif st.st_size > int(sys.argv[2]):
+    print("too-large")
+else:
+    print("ok")
+'''
+SETTINGS_STATE_WORDS = dict(TOKEN_STATE_WORDS, writable="can be changed by group or others, so nothing in it is "
+                            "trusted", **{"too-large": "is larger than any settings file the runner reads"})
+STATUS_LOOKS = 15                      # an apply waits this many two-second looks for the runner's first word
+
+
+def settings_file_state(ctx, path):
+    """absent, ok, link, not-file, other-owner, writable, too-large, or unread: the role account's own program's word."""
+    res = ctx.as_role(py(SETTINGS_STATE_PY, path, str(wkey.SETTINGS_MAX)), "looking at the other program's settings file")
+    word = (res.out or "").strip()
+    return word if res.ok and (word in ("absent", "ok", "unread") or word in SETTINGS_STATE_WORDS) else "unread"
+
+
+def installed_source(ctx):
+    """The writer's key source in effect after this install: the conf's WRITER_KEY_SOURCE, else the installed one,
+    else the file."""
+    want = writer_source(ctx.conf)
+    if want is None:
+        st = ctx.was.get("session_tools") if isinstance(ctx.was, dict) else None
+        held = st.get("key_source") if isinstance(st, dict) else None
+        want = held if isinstance(held, dict) and held.get("kind") in wkey.SOURCES else {"kind": "file"}
+    return want
+
+
+def writer_status(ctx):
+    """(status, "") or (None, why): the runner's own word on the writer's key, read as the role account. A file that is
+    not in its shape is never believed. It holds names, times and fixed words: never a key."""
+    path = ctx.conf["RUNNER_DIR"].rstrip("/") + "/store/" + wkey.STATUS_FILE
+    text, _mode = qs.read_role_file(ctx, path)
+    if text is None:
+        return None, "it has written no status yet"
+    try:
+        doc = json.loads(text)
+    except ValueError:
+        return None, "its status is not JSON"
+    bad = wkey.status_problems(doc)
+    return (None, "its status is not in its shape: %s" % bad[0]) if bad else (doc, "")
+
+
+def status_for(ctx, kind, apply_it):
+    """The runner's status of the `kind` source. An apply that just moved the job waits a little for its first word."""
+    for look in range(STATUS_LOOKS if apply_it else 1):
+        doc, why = writer_status(ctx)
+        if doc is not None and doc["source"] != kind:
+            doc, why = None, "it still reports the %s source: it has not loaded these settings yet" % doc["source"]
+        if doc is not None or look + 1 >= (STATUS_LOOKS if apply_it else 1):
+            return doc, why
+        se._pause(2)
+    return None, "no look was made"
+
+
+# Every reader that trusts the session writer as a session's author, and how it names that user (ticket KIT-933):
+# (who, its conf beside runner.conf, the key, by id or by display name). The finding filer's is installed by Stage E.
+WRITER_READERS = (("the notifier", "notifier.conf", "DISPATCHER_AGENT_USER_ID", "id"),
+                  ("the acceptance check", "acceptance.conf", "AGENT_USER_ID", "id"),
+                  ("the bridge", "bridge.conf", "AGENT_USER_NAME", "name"))
+FINDING_CONFIG = "~/.stage-e/finding/poller.json"
+
+
+def conf_value(path, key):
+    """The value of `key` in a KEY=value conf (its last active line), "" when it has none, None when the file cannot
+    be read. Each of these keys holds a user's id or name, never a credential."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except (OSError, UnicodeDecodeError):
+        return None
+    value = ""
+    for raw in text.splitlines():
+        k, eq, v = raw.strip().partition("=")
+        if eq and not k.startswith("#") and k.strip() == key:
+            value = v.strip()
+    return value
+
+
+def step_writer_user(ctx, apply_it):
+    """KIT-933: every reader that trusts the session writer names the runner's `writer_user_id`. One that names
+    another user FAILS, in words: that reader would read a session's comments, questions or findings as no
+    session's. A reader that is not set up here is left out, and a name not yet comparable is said."""
+    if not ctx.home:
+        raise Unknown("waits on `home`", "clear that row first")
+    was = ctx.was if isinstance(ctx.was, dict) else {}
+    st = was.get("session_tools") if isinstance(was.get("session_tools"), dict) else {}
+    named = ctx.conf.get(SESSION_WRITER)
+    writer = named if named and named != OFF else st.get("writer_user_id")
+    if not writer:
+        return True, "no session writer is set (session_tools is off), so there is no reader to compare"
+    same, differ, unread, notes, name = ["the runner"], [], [], [], None
+    for who, leaf, key, by in WRITER_READERS:
+        path = os.path.join(ctx.conf_dir, leaf)
+        if not os.path.exists(path):
+            continue
+        value = conf_value(path, key)
+        if value is None:
+            unread.append("%s in %s could not be read" % (key, leaf))
+        elif not value:
+            continue
+        elif by == "id":
+            (same if value == writer else differ).append(
+                "%s (%s)" % (who, key) if value == writer else "%s's %s in %s is %s" % (who, key, leaf, value))
+        else:
+            if name is None:
+                doc = writer_status(ctx)[0]
+                name = (doc or {}).get("writer_name") or ""
+            if not name:
+                notes.append("%s names the writer by display name (%s), and the runner has not recorded the "
+                             "writer's display name yet: it is compared once the runner has" % (who, key))
+            elif value == name:
+                same.append("%s (%s)" % (who, key))
+            else:
+                differ.append("%s's %s in %s is %s, but the session writer's key answers as %s" % (
+                    who, key, leaf, value, name))
+    text, _mode = qs.read_role_file(ctx, FINDING_CONFIG)
+    if text is not None:
+        try:
+            agent = json.loads(text).get("agent_user_id")
+        except (ValueError, AttributeError):
+            agent = None
+        if not (isinstance(agent, str) and agent):
+            unread.append("the finding filer's agent_user_id in %s could not be read" % FINDING_CONFIG)
+        elif agent == writer:
+            same.append("the finding filer (agent_user_id)")
+        else:
+            differ.append("the finding filer's agent_user_id in %s is %s" % (FINDING_CONFIG, agent))
+    if differ:
+        raise SetupError("not every reader that trusts the session writer names %s: %s. Each must name the same "
+                         "user, or that reader takes a session's comments, questions and findings for no session's"
+                         % (writer, "; ".join(differ)))
+    if unread:
+        raise Unknown("; ".join(unread), "fix that file, then run this again")
+    return True, "every reader that trusts the session writer names %s: %s%s" % (
+        writer, ", ".join(same), "".join("; " + n for n in notes))
 
 
 def _today():
@@ -1245,7 +1549,7 @@ def step_job(ctx, apply_it):
 # The copy comes right before the job: a refresh stops a job that runs from it, and the `job` row loads it again.
 STEPS = (("home", step_home), ("kit", step_kit), ("settings", step_settings), ("engine", step_engine),
          ("job", step_job), ("push-token", step_push_token), ("tracker-key", step_tracker_key),
-         ("writer-key", step_writer_key))
+         ("writer-key", step_writer_key), ("writer-user", step_writer_user))
 _SEVERITY = (FAILED, UNKNOWN, WOULD_CHANGE)
 
 
@@ -1321,6 +1625,18 @@ def parse_end_date(text, today):
     return when, ""
 
 
+def writer_key_refusal(conf):
+    """KIT-933: why `writer-key` writes nothing, or None. A key a person writes is the one used only while the
+    source is the file: from another program's settings, or renewed by the runner, it would never be read."""
+    kind = conf.get("WRITER_KEY_SOURCE")
+    if kind not in ("other-program", "renew"):
+        return None
+    return ("REFUSED: WRITER_KEY_SOURCE is %s in your conf, so the session writer's key is %s. A key written here "
+            "would not be the one used. Nothing was written." % (kind, {
+                "other-program": "read from the other program's settings file",
+                "renew": "renewed by the runner itself"}[kind]))
+
+
 def cmd_key(name, args, env, machine=None, reader=None, date_reader=None, tty=None, today=None):
     """The owner's one step for a key file (KIT-907 for the push token, KIT-928 for the other two): a hidden
     prompt for the key, a question for its end date, the role account writing a 0600 file, the date recorded for
@@ -1350,22 +1666,30 @@ def cmd_key(name, args, env, machine=None, reader=None, date_reader=None, tty=No
     if name == "push-token" and conf["PUSH_TOKEN_FILE"] == OFF:
         say("REFUSED: PUSH_TOKEN_FILE is off in your conf. Set it to the file's path first. Nothing was written.")
         return EX_USAGE
+    refused = writer_key_refusal(conf) if name == "writer-key" else None          # KIT-933
+    if refused:
+        say(refused)
+        return EX_USAGE
     spec, today = key_spec(name), today or _today()
-    label, path = spec["label"], spec["path"](conf, {})
-    say("The %s: written to %s as %s, mode 0600, and its end date recorded for the health watch."
+    label, path, dated = spec["label"], spec["path"](conf, {}), spec["clock"] is not None
+    say("The %s: written to %s as %s, mode 0600, %s."
         % (label, path + (" (or the key file your installed settings name)" if name == "writer-key" and
-                          conf.get("WRITER_KEY_UNSET") else ""), conf["ROLE_ACCOUNT"]))
+                          conf.get("WRITER_KEY_UNSET") else ""), conf["ROLE_ACCOUNT"],
+           "and its end date recorded for the health watch" if dated else
+           "with no end date to record: the runner renews it, and the health watch says when it cannot"))
     say(spec["make"])
     value = ((reader or getpass.getpass)(spec["prompt"]) or "").strip()
     if not spec["pattern"].match(value):
         say("REFUSED: that is not %s. Nothing was written." % spec["shape"])
         return EX_USAGE
-    when, why = parse_end_date((date_reader or input)("The day it ends, as YYYY-MM-DD (the expiry you chose "
-                                                       "when you made it): "), today)
-    if when is None:
-        say("REFUSED: %s. Nothing was written: a key with no end date on record is one nobody is warned about."
-            % why)
-        return EX_USAGE
+    when = None
+    if dated:
+        when, why = parse_end_date((date_reader or input)("The day it ends, as YYYY-MM-DD (the expiry you chose "
+                                                           "when you made it): "), today)
+        if when is None:
+            say("REFUSED: %s. Nothing was written: a key with no end date on record is one nobody is warned "
+                "about." % why)
+            return EX_USAGE
     run, sudo = machine or (Runner(), se.SudoSession())
     try:
         sudo.acquire("`%s` writes the %s as %s." % (name, label, conf["ROLE_ACCOUNT"]), name)
@@ -1387,6 +1711,10 @@ def cmd_key(name, args, env, machine=None, reader=None, date_reader=None, tty=No
         say("FAILED: the %s could not be written into %s as %s, or reading it back does not match (%s). "
             "No end date was recorded." % (label, path, conf["ROLE_ACCOUNT"], _s((res.err or "").strip())[:200] or state))
         return EX_FAILED
+    if not dated:
+        say("DONE: %s holds it (mode 0600, the role account's own). The runner renews the key from it on its next "
+            "pass, and `check` says how that went." % path)
+        return EX_OK
     failed = record_end(args.watch_conf, when, spec["clock"])
     if failed:
         say("FAILED: the key is in %s, but its end date is NOT on record: %s. Put `%s:%s` into CREDENTIAL_EXPIRIES "
@@ -1483,6 +1811,7 @@ def _main(args, env, stdin, machine, box):
         return EX_NOPRIV
     ctx = box["ctx"] = Ctx(conf, run, env, live, part_ceiling(root), scripts)
     ctx.watch_conf = args.watch_conf
+    ctx.conf_dir = os.path.dirname(os.path.abspath(args.conf))        # the other parts' confs sit beside this one
     say("The runner's installer: %s, role account %s" % (
         "CHECK, nothing is changed" if args.command == "check" else "APPLY", ctx.account))
     box["rows"] = run_steps(ctx, args.command == "apply")
@@ -1743,7 +2072,8 @@ def _cases(check, tmp, unsafe):  # noqa: C901  (one battery, read top to bottom)
     case("check on a fresh machine: exit 10 in one document, settings and job would change, nothing written",
          fresh_check, (10, 10, {"home": ALREADY_DONE, "kit": ALREADY_DONE, "engine": WOULD_CHANGE,
                                 "settings": WOULD_CHANGE, "job": WOULD_CHANGE, "push-token": ALREADY_DONE,
-                                "tracker-key": ALREADY_DONE, "writer-key": ALREADY_DONE}, True, [], None, []),
+                                "tracker-key": ALREADY_DONE, "writer-key": ALREADY_DONE,
+                                "writer-user": ALREADY_DONE}, True, [], None, []),
          ("a check that applies", [(me, "run_steps", lambda ctx, apply_it, real=run_steps: real(ctx, True))]))
 
     # 3. Apply on a fresh machine: within the ceiling, so on; every lane off; the job enabled and loaded.
@@ -2366,6 +2696,178 @@ def _cases(check, tmp, unsafe):  # noqa: C901  (one battery, read top to bottom)
     case("the health watch warns before the tracker key's and the session writer's end dates, naming each",
          keys_warn, (watch.OK, watch.FIRING, True),
          ("the dates filed under another name", [(me, "TRACKER_CLOCK", "other-name"), (me, "WRITER_CLOCK", "other-two")]))
+
+    # 12d. KIT-933: where the session writer's key comes from, how the runner says it stands, and the one user every
+    #      reader trusts. The runner's status of the key is planted in the role home; the key files hold stand-ins.
+    OTHER = "~/.other-program/config.json"
+    tools = {"SESSION_TOOLS_KEY_FILE": "~/.pipeline-runner/writer-key", "SESSION_TOOLS_WRITER_USER_ID": "writer-1"}
+    borrowed = dict(tools, WRITER_KEY_SOURCE="other-program", WRITER_KEY_FROM=OTHER, WRITER_KEY_FROM_FIELD="linearToken")
+    renewing = dict(tools, WRITER_KEY_SOURCE="renew")
+
+    def status_doc(source, state="ok", reason=None, ends_in=None, answered_ago=60, name="dispatcher-agent"):
+        now = time.time()
+        return {"schema": wkey.STATUS_SCHEMA, "at": wkey.iso(now - 30), "source": source, "writer_user_id": "writer-1",
+                "state": state, "reason": reason, "detail": None,
+                "check": {"at": wkey.iso(now - answered_ago), "result": "writer"},
+                "answered_at": wkey.iso(now - answered_ago), "writer_name": name,
+                "renewal": {"at": wkey.iso(now - 3600), "result": "renewed"} if source == "renew" else None,
+                "renewed_at": wkey.iso(now - 3600) if source == "renew" else None,
+                "ends_at": wkey.iso(now + ends_in) if ends_in is not None else None}
+
+    def plant(fake, status=None, other_mode=0o644, files=()):
+        if status is not None:
+            _put(fake.home + "/.pipeline-runner/store/" + wkey.STATUS_FILE, json.dumps(status))
+            os.chmod(fake.home + "/.pipeline-runner/store/" + wkey.STATUS_FILE, 0o600)
+        if other_mode is not None:
+            _put(fake.home + "/" + OTHER[2:], json.dumps({"linearToken": KEY}))
+            os.chmod(fake.home + "/" + OTHER[2:], other_mode)
+        for leaf in files:
+            _put(fake.home + "/.pipeline-runner/" + leaf, KEY + "\n")
+            os.chmod(fake.home + "/.pipeline-runner/" + leaf, 0o600)
+
+    def source_faults():
+        got = []
+        for over, want in ((dict(WRITER_KEY_SOURCE="vault"), "WRITER_KEY_SOURCE must be"),
+                           (dict(WRITER_KEY_SOURCE="other-program"), "needs WRITER_KEY_FROM"),
+                           (dict(WRITER_KEY_SOURCE="renew", WRITER_KEY_FROM=OTHER), "set both, or neither"),
+                           (dict(borrowed, WRITER_KEY_FROM_FIELD="a.b"), "WRITER_KEY_FROM_FIELD must be"),
+                           (dict(WRITER_RENEWAL_FILE="~/.pipeline-runner/tracker-key"), "WRITER_RENEWAL_FILE is the env"),
+                           (dict(WRITER_CLIENT_FILE="~/.pipeline-runner/work/c"), "WRITER_CLIENT_FILE is in the runner's"),
+                           (dict(borrowed, WRITER_KEY_FROM="~/.pipeline-runner/runner.json"), "WRITER_KEY_FROM is one of")):
+            errors = validate_conf(parse_conf(text(**over))[0], "selftest-person")[1]
+            got.append(any(e.startswith(want) or want in e for e in errors))
+        return got, validate_conf(parse_conf(text(**borrowed))[0], "p")[1]
+    case("conf: a writer's key source names what it needs, by key; a good one has no fault", source_faults,
+         ([True] * 7, []),
+         ("the source rules dropped", [(me, "source_problems", lambda c: [])]),
+         ("the path rules dropped", [(me, "path_problems", lambda c, home, skip=(): [])]))
+
+    def installed_doc(fake):
+        with open(fake.home + "/.pipeline-runner/runner.json") as fh:
+            return json.load(fh)
+
+    def source_carried():
+        fake = world(**borrowed)
+        go(fake, "apply")
+        first = installed_doc(fake)["session_tools"]
+        _put(fake.root + "/runner.conf", text(ENGINE_DIR=fake.root + "/engine/kit", **tools))
+        go(fake, "apply")
+        kept = installed_doc(fake)["session_tools"].get("key_source")
+        _put(fake.root + "/runner.conf", text(ENGINE_DIR=fake.root + "/engine/kit", WRITER_KEY_SOURCE="file", **tools))
+        go(fake, "apply")
+        return (first, kept, "key_source" in installed_doc(fake)["session_tools"],
+                runner_job.load_config(qs.with_home(dict(installed_doc(fake), session_tools=first), fake.home))[1])
+    case("apply: the source goes into session_tools; left out it is kept, even when the conf writes the rest of "
+         "session_tools; `file` is no source at all; the runner's own loader takes it",
+         source_carried, ({"key_file": "~/.pipeline-runner/writer-key", "writer_user_id": "writer-1",
+                           "key_source": {"kind": "other-program", "file": OTHER, "field": "linearToken"}},
+                          {"kind": "other-program", "file": OTHER, "field": "linearToken"}, False, []),
+         ("the installed source dropped", [(me, "writer_source", lambda c, real=writer_source: real(c) or {"kind": "file"})]))
+
+    def borrowed_rows():
+        out = []
+        for status, mode in ((status_doc("other-program"), 0o644),
+                             (status_doc("other-program", "failed", "refused", answered_ago=4 * 3600), 0o644),
+                             (None, 0o644), (status_doc("other-program"), 0o664), (status_doc("other-program"), None),
+                             (status_doc("file"), 0o644)):
+            fake = world(**borrowed)
+            go(fake, "apply")
+            plant(fake, status, mode)
+            r = [x for x in go(fake)[1]["rows"] if x["step"] == "writer-key"][0]
+            out.append((r["outcome"], r["detail"]))
+        return ([o for o, _d in out], "read from %s, under linearToken" % OTHER in out[0][1],
+                "the runner asks it who it is every 30 minutes" in out[0][1],
+                wkey.REASONS["refused"] in out[1][1], "has not said" in out[2][1], "changed by group or others" in
+                out[3][1], "start that program again" in out[4][1], "still reports the file source" in out[5][1],
+                KEY in repr(out))
+    case("check: a key from another program's settings file says so, and what the runner last saw; a key the runner "
+         "found refused FAILS in its words; no word from the runner is NOT MEASURED; a file others can change, or no "
+         "file, FAILS; the key is in no row", borrowed_rows,
+         ([ALREADY_DONE, FAILED, UNKNOWN, FAILED, FAILED, UNKNOWN], True, True, True, True, True, True, True, False),
+         ("the runner's problems ignored", [(wkey, "judge", lambda doc, now: ([], "fine"))]),
+         ("another program's file judged as a key file", [(me, "settings_file_state", lambda ctx, path: "ok")]),
+         ("an old source believed", [(me, "status_for", lambda ctx, kind, apply_it: writer_status(ctx))]))
+
+    def renewed_rows():
+        out = []
+        for status, files, over in ((status_doc("renew", ends_in=20 * 3600 + 900), ("writer-client", "writer-renewal-key"), {}),
+                                    (status_doc("renew", ends_in=5 * 3600), ("writer-client", "writer-renewal-key"), {}),
+                                    (status_doc("renew", "failed", "renewal-refused", ends_in=10 * 3600),
+                                     ("writer-client", "writer-renewal-key"), {}),
+                                    (status_doc("renew", ends_in=20 * 3600 + 900), ("writer-renewal-key",), {}),
+                                    (status_doc("renew", ends_in=20 * 3600 + 900), ("writer-client",),
+                                     dict(WRITER_KEY_FROM=OTHER, WRITER_RENEWAL_FROM_FIELD="linearRefreshToken")),
+                                    (status_doc("renew", ends_in=20 * 3600 + 900), ("writer-client",), {})):
+            fake = world(**dict(renewing, **over))
+            go(fake, "apply")
+            plant(fake, status, None, files)
+            watch_conf(fake, "%s:%s" % (WRITER_CLOCK, ON(1)))
+            r = [x for x in go(fake)[1]["rows"] if x["step"] == "writer-key"][0]
+            out.append((r["outcome"], r["detail"]))
+        return ([o for o, _d in out], "renewed by the runner itself" in out[0][1], "(in 20 hours)" in out[0][1],
+                "has not been renewed" in out[1][1], wkey.REASONS["renewal-refused"] in out[2][1],
+                "run `writer-client`" in out[3][1], "takes the renewal token from %s" % OTHER in out[4][1],
+                "run `writer-renewal`" in out[5][1], "take it out of update.conf" in out[0][1])
+    case("check: a renewed key says when it ends; one that ends within six hours or could not be renewed FAILS in "
+         "words; no client details, or no renewal token and none to adopt, FAILS naming the step; a person's old "
+         "end date still on record is said", renewed_rows,
+         ([ALREADY_DONE, FAILED, FAILED, FAILED, ALREADY_DONE, FAILED], True, True, True, True, True, True, True, True),
+         ("the end not judged", [(wkey, "WARN_BEFORE", 0)]),
+         ("adoption not offered", [(me, "writer_source", lambda c, real=writer_source: dict(
+             real(c), adopt_file=None) if (real(c) or {}).get("kind") == "renew" else real(c))]))
+
+    def user_rows():
+        out = []
+        for confs, finding, status in (
+                ({"notifier.conf": "DISPATCHER_AGENT_USER_ID=writer-1\n", "acceptance.conf": "AGENT_USER_ID=writer-1\n",
+                  "bridge.conf": "AGENT_USER_NAME=dispatcher-agent\n"}, {"agent_user_id": "writer-1"},
+                 status_doc("other-program")),
+                ({"notifier.conf": "DISPATCHER_AGENT_USER_ID=someone-else\n"}, None, None),
+                ({"acceptance.conf": "AGENT_USER_ID=writer-1\n"}, {"agent_user_id": "old-agent"}, None),
+                ({"bridge.conf": "AGENT_USER_NAME=Old Agent\n"}, None, status_doc("other-program")),
+                ({"bridge.conf": "AGENT_USER_NAME=dispatcher-agent\n"}, None, None),
+                ({"notifier.conf": "DISPATCHER_AGENT_USER_ID=\n"}, None, None)):
+            fake = world(**borrowed)
+            for leaf, body in confs.items():
+                _put(fake.root + "/" + leaf, body)
+            go(fake, "apply")
+            plant(fake, status, 0o644)
+            if finding is not None:
+                _put(fake.home + "/.stage-e/finding/poller.json", json.dumps(finding))
+            r = [x for x in go(fake)[1]["rows"] if x["step"] == "writer-user"][0]
+            out.append((r["outcome"], r["detail"]))
+        return ([o for o, _d in out], "the notifier (DISPATCHER_AGENT_USER_ID)" in out[0][1] and "the finding filer" in
+                out[0][1] and "the bridge (AGENT_USER_NAME)" in out[0][1], "is someone-else" in out[1][1],
+                "is old-agent" in out[2][1], "answers as dispatcher-agent" in out[3][1],
+                "not recorded the writer's display name yet" in out[4][1])
+    case("check: every reader that trusts the session writer names the runner's writer, or the row FAILS naming the "
+         "one that does not; a display name is compared with the one the key answers with, once the runner has it",
+         user_rows, ([ALREADY_DONE, FAILED, FAILED, FAILED, ALREADY_DONE, ALREADY_DONE], True, True, True, True, True),
+         ("the readers' confs not read", [(me, "WRITER_READERS", ())]),
+         ("the finding filer not read", [(me, "FINDING_CONFIG", "~/.nowhere/poller.json")]))
+
+    def client_and_renewal_steps():
+        fake = world(**renewing)
+        go(fake, "apply")
+        client = "client0id01234:secret0abcdef0123"
+        code_c, words_c, asked_c, _s1 = step(fake, token=client, date=ON(300), cmd="writer-client")
+        cpath = fake.home + "/.pipeline-runner/writer-client"
+        code_r, words_r, asked_r, _s2 = step(fake, token="renewal0" + "r" * 30, cmd="writer-renewal", put_watch=False)
+        rpath = fake.home + "/.pipeline-runner/writer-renewal-key"
+        code_k, words_k, _a, sudo_k = step(fake, token=KEY, date=ON(300), cmd="writer-key", put_watch=False)
+        return ((code_c, oct(os.stat(cpath).st_mode & 0o777), open(cpath).read(), asked_c,
+                 "%s:%s" % (CLIENT_CLOCK, ON(300)) in (watch_text(fake) or ""), client in words_c),
+                (code_r, oct(os.stat(rpath).st_mode & 0o777), asked_r, "runner-writer-renewal" in (watch_text(fake) or "")),
+                (code_k, "renewed by the runner itself" in words_k, sudo_k,
+                 os.path.exists(fake.home + "/.pipeline-runner/writer-key")))
+    case("writer-client writes `id:secret` alone, mode 0600, and files its review date; writer-renewal writes the "
+         "renewal token with no date asked or filed; writer-key is refused while the runner renews the key",
+         client_and_renewal_steps,
+         ((0, "0o600", "client0id01234:secret0abcdef0123\n", ["token", "date"], True, False),
+          (0, "0o600", ["token"], False), (2, True, 0, False)),
+         ("the renewal token asked for a date", [(me, "key_spec", lambda name, real=key_spec: dict(
+             real(name), clock="runner-writer-renewal") if name == "writer-renewal" else real(name))]),
+         ("writer-key not refused", [(me, "writer_key_refusal", lambda conf: None)]))
 
     # 13. The parts list's own ceiling and commands.
     import pipeline_parts

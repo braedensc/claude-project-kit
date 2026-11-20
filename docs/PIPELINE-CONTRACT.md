@@ -3609,9 +3609,16 @@ one that is a link, another account's, changeable by others, or not this shape.
 | `kind` | `code` \| `fix` \| `conflict` | The kinds that get the tools. |
 | `ticket`, `team_key` | ticket id; its team's key | The only ticket any tool reads or writes. No tool takes a ticket. |
 | `auth_mode`, `model`, `started_at` | from the pin and the settings | For the telemetry block. |
-| `key_file` | absolute path | The session writer's tracker key. Walled from the session. |
+| `key_file` | absolute path | Where the session writer's tracker key is read, at each call. Walled from the session. |
+| `key_field` | `null` \| JSON key name | `null`: `key_file` holds the key alone. A name (KIT-933): `key_file` is another program's JSON settings file, and the key is the one value under that name, at any depth. |
 | `writer_user_id` | user id | The user the key must belong to. Checked with the tracker before the first call. |
 | `owner_user_ids` | user ids | The writer is never one of them. |
+
+The runner's own word on the writer's key is `<store>/writer-key.json` (`pipeline-writer-key/1`, KIT-933):
+`at`, `source` (`file`, `other-program` or `renew`), `writer_user_id`, `state` (`ok`, `failed`, `unknown`),
+`reason` (a code with fixed words), `detail`, `check` and `renewal` (each `{"at", "result"}` or `null`),
+`answered_at`, `writer_name`, `renewed_at` and `ends_at`. It never holds a key. Its readers judge it with one
+function, `pipeline_writer_key.judge`, and believe nothing that fails `status_problems`.
 
 `runs/<run>/session-tools-state.json` holds the run's counts. Only the server writes it, whole,
 mode 0600: `{"schema": "pipeline-session-tools-state/1", "run", "writes": [{"tool", "at",

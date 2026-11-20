@@ -89,6 +89,7 @@ import pipeline_runner as runner_job  # noqa: E402  (its own loader judges the s
 import pipeline_runner_setup as setup  # noqa: E402  (runner.conf, and where the settings live)
 import pipeline_runner_store as store  # noqa: E402  (the kinds, callers and shapes of the store)
 import pipeline_session_tools as session_tools  # noqa: E402  (the five ticket tools' names)
+import pipeline_writer_key as wkey  # noqa: E402  (where the writer's key comes from, and the runner's word on it)
 import pipeline_window as window  # noqa: E402  (the working window, as the queue judges it)
 from pipeline_stage_e_setup import SetupError, _dispatcher_plist  # noqa: E402
 
@@ -452,14 +453,23 @@ for epic in a.get("marks_of") or []:
             marks.append(dict(m, at=n.get("createdAt"), author=dig(n, "user", "id")))
     out["marks"][epic] = {"state": "read" if isinstance(nodes, list) else "could not read", "marks": marks}
 if a.get("writer"):
+    import time
     st, key = cfg.get("session_tools") or {}, None
     try:
-        key = r.tl_tools.read_key(st["key_file"])
+        key = r.wkey.read_key(st)
         who = dig(r.status_job.linear_graphql(r.Q_VIEWER, {}, key), "viewer", "id")
         out["writer"] = {"state": "read", "id": who if isinstance(who, str) else None}
+    except r.tl_tools.ToolError as exc:
+        out["writer"] = {"state": "could not read: %s" % str(exc)[:200]}
     except Exception as exc:
         out["writer"] = {"state": "could not read (%s)" % type(exc).__name__}
     key = None
+    doc, why = r.wkey.read_status(r.wkey.status_path(cfg["store_dir"]))
+    if doc is None:
+        out["writer"]["status"] = {"state": "none", "why": why[:200]}
+    else:
+        problems, words = r.wkey.judge(doc, time.time())
+        out["writer"]["status"] = {"state": "read", "source": doc["source"], "problems": problems, "words": words}
 W = ("query LiveRunWaiting($team: String!, $states: [ID!]) { issues(first: 50, filter: "
      "{ team: { key: { eq: $team } }, state: { id: { in: $states } } }) { nodes { identifier } } }")
 if a.get("waiting"):
@@ -734,22 +744,36 @@ def row_queue_store(ctx):
 
 
 def key_files(ctx):
-    """[(what, path, needed)]: every key file the settings name, and the ones this lane cannot run without."""
+    """[(what, path, needed, rule)]: every key file the settings name, and the ones this lane cannot run without.
+    The rule is `key` (the runner's own: mode 0600, one key's size) or `settings` (KIT-933: another program's
+    settings file the writer's key is read from, which that program keeps: no one else may write it)."""
     cfg = ctx.cfg or {}
     st = cfg.get("session_tools") or {}
-    out = [("the runner's tracker key", cfg.get("linear_key_file"), True)]
-    if st.get("key_file") or ctx.lane in WRITER_LANES:
-        out.append(("the session writer's key", st.get("key_file"), ctx.lane in WRITER_LANES))
+    src = st.get("key_source") or {"kind": "file"}
+    needs_writer = ctx.lane in WRITER_LANES
+    out = [("the runner's tracker key", cfg.get("linear_key_file"), True, "key")]
+    if src["kind"] == "other-program":
+        out.append(("the other program's settings file the writer's key is read from", src.get("file"), needs_writer,
+                    "settings"))
+    elif src["kind"] == "renew":
+        out += [("the session writer's key", st.get("key_file"), False, "key"),
+                ("the app's client details", src.get("client_file"), needs_writer, "key"),
+                ("the session writer's renewal token", src.get("renewal_file"),
+                 needs_writer and not src.get("adopt_file"), "key")]
+    elif st.get("key_file") or needs_writer:
+        out.append(("the session writer's key", st.get("key_file"), needs_writer, "key"))
     if cfg.get("push_token_file") or ctx.lane in PUSH_LANES:
-        out.append(("the push token", cfg.get("push_token_file"), ctx.lane in PUSH_LANES))
+        out.append(("the push token", cfg.get("push_token_file"), ctx.lane in PUSH_LANES, "key"))
     return out
 
 
 def row_keys(ctx):
-    """Each key file: there, a file, the role account's, mode 0600, and of a key's size. Looked at with `stat`,
-    never opened."""
+    """Each key file: there, a file, the role account's, mode 0600, and of a key's size; another program's
+    settings file there, the role account's, and closed to writes by others. Looked at with `stat`, never opened.
+    A file not needed yet may be absent: a renewed key's file before its first renewal, or its renewal token
+    before the runner takes it over."""
     said = []
-    for what, path, needed in key_files(ctx):
+    for what, path, needed, rule in key_files(ctx):
         if not path:
             if needed:
                 raise Missing("%s's file is not set in %s: a %s session cannot run without it" % (
@@ -757,6 +781,8 @@ def row_keys(ctx):
             continue
         res = as_role(ctx, KEY_SH.replace("@F@", shlex.quote(path)))
         word = res.out.strip() if res.ok else ""
+        if word == "absent" and not needed:
+            continue
         if word in ("absent", "not-a-file"):
             raise Missing("%s's file %s is %s" % (what, path, "not there" if word == "absent" else
                                                    "a link or not a file"))
@@ -766,11 +792,20 @@ def row_keys(ctx):
         mode, owner, size = m.group(1)[-3:], m.group(2), int(m.group(3))
         if owner != ctx.role:
             raise Missing("%s's file %s belongs to %s, not %s" % (what, path, owner, ctx.role))
-        if mode != "600":
+        if rule == "settings":
+            if int(mode, 8) & 0o022:
+                raise Missing("%s %s is mode %s: others could change it, so the runner trusts nothing in it" % (
+                    what, path, mode))
+            if not 0 < size <= wkey.SETTINGS_MAX:
+                raise Missing("%s %s is %s" % (what, path, "empty" if not size else "larger than the runner reads"))
+        elif mode != "600":
             raise Missing("%s's file %s is mode %s: chmod 600 it, as %s" % (what, path, mode, ctx.role))
-        if not 0 < size <= runner_job.PUSH_TOKEN_MAX:
+        elif not 0 < size <= (wkey.SECRET_MAX if "renewal" in what or "client" in what else runner_job.PUSH_TOKEN_MAX):
             raise Missing("%s's file %s is %s" % (what, path, "empty" if not size else "too large to hold one key"))
         said.append(what)
+    if any(rule == "settings" for _w, _p, _n, rule in key_files(ctx)):
+        return "%s: each the role account's, mode 0600, and the other program's settings file closed to writes by " \
+               "others (none read)" % ", ".join(said)
     return "%s: each the role account's, mode 0600 (none read)" % ", ".join(said)
 
 
@@ -813,7 +848,20 @@ def row_writer_key(ctx):
     if got.get("id") != st["writer_user_id"]:
         raise Missing("the session writer's key answers as %s, not as writer_user_id %s" % (
             got.get("id") or "nobody", st["writer_user_id"]))
-    return "it answers as %s, the session writer" % got["id"]
+    # KIT-933: where the key comes from and when it ends, as the runner itself says on each pass.
+    status, where = got.get("status") or {}, wkey.where(st)
+    kind = (st.get("key_source") or {}).get("kind", "file")
+    if status.get("state") == "read" and status.get("source") != kind:
+        raise Unknown("the session writer's key is %s, and the runner still reports the %s source: it has not "
+                      "loaded these settings yet" % (where, status.get("source")))
+    if status.get("state") != "read":
+        if kind != "file":
+            raise Unknown("the session writer's key is %s, and the runner has not said how it stands (%s)" % (
+                where, status.get("why") or "no word"))
+        return "it answers as %s, the session writer; its key is %s" % (got["id"], where)
+    if status.get("problems"):
+        raise Missing("the session writer's key is %s; the runner says: %s" % (where, "; ".join(status["problems"])))
+    return "it answers as %s, the session writer; %s" % (got["id"], status.get("words"))
 
 
 def row_engine(ctx):
@@ -2056,7 +2104,8 @@ def _data():
 
 def load_file(path):
     return (None, ["bad"]) if _data().get("settings_bad") else (
-        {"linear_key_file": "/nowhere", "session_tools": {"key_file": "/nowhere-either", "writer_user_id": "w"}}, [])
+        {"linear_key_file": "/nowhere", "store_dir": "/nowhere-store",
+         "session_tools": {"key_file": "/nowhere-either", "writer_user_id": "w"}}, [])
 
 
 class LinearTracker(object):
@@ -2090,9 +2139,32 @@ Q_VIEWER = "query RunnerViewer { viewer { id } }"
 
 
 class tl_tools(object):
+    class ToolError(Exception):
+        pass
+
     @staticmethod
     def read_key(path):
         return "not-a-key"
+
+
+class wkey(object):
+    """KIT-933: the writer key's source and the runner's status of it, as data."""
+    @staticmethod
+    def read_key(st):
+        return "not-a-key"
+
+    @staticmethod
+    def status_path(store_dir):
+        return store_dir + "/writer-key.json"
+
+    @staticmethod
+    def read_status(path):
+        doc = _data().get("writer_status")
+        return (None, "it has written no status yet") if doc is None else (doc, "")
+
+    @staticmethod
+    def judge(doc, now):
+        return doc.get("problems") or [], doc.get("words") or ""
 
 
 class status_job(object):
@@ -2112,6 +2184,7 @@ FLAGS = {
     "no_review": False, "interrupt_at": None, "lose_sudo_at": None, "ledger_ref": "same", "review_ticket": None,
     "mark_word": "passed", "gh_down": False, "no_old_review": False, "no_push": False, "no_role": False,
     "gh_after_on": False, "term_in_off": False, "settings_list": False,
+    "key_source": None, "writer_status": None, "other_mode": 0o644,        # KIT-933
 }
 
 
@@ -2158,6 +2231,13 @@ class World(object):
                    "code": ["st-todo"], "plan": ["st-planit"], "acceptance": ["st-acc"]}}}}
         if self.f["session_tools"]:
             doc["session_tools"] = {"key_file": "~/.pipeline-runner/writer-key", "writer_user_id": WRITER}
+        if self.f["key_source"] and self.f["session_tools"]:          # KIT-933: the key from elsewhere
+            src = doc["session_tools"]["key_source"] = dict(self.f["key_source"])
+            if src.get("file"):
+                _put(os.path.join(self.home, src["file"][2:]), json.dumps({"linearToken": PLANTED}),
+                     self.f["other_mode"])
+            for leaf in [src[k] for k in ("renewal_file", "client_file") if src.get(k)]:
+                _put(os.path.join(self.home, leaf[2:]), PLANTED + "\n")
         _put(self.settings, json.dumps(doc, indent=2, sort_keys=True) + "\n")
         with open(self.settings) as fh:
             self.installed = fh.read()
@@ -2181,7 +2261,8 @@ class World(object):
                     for d in ("mon", "tue", "wed", "thu", "fri", "sat", "sun"))
         _put(os.path.join(self.se, "queue", "queue.json"), json.dumps(
             {"window": {"time_zone": "UTC", "days": days, "grace_minutes": 0}}))
-        self.tracker.update(writer_viewer=self.f["writer_viewer"], todo=self.f["todo"])
+        self.tracker.update(writer_viewer=self.f["writer_viewer"], todo=self.f["todo"],
+                            writer_status=self.f["writer_status"])
         os.makedirs(self.stub, exist_ok=True)
         _put(os.path.join(self.stub, "pipeline_runner.py"), STUB_RUNNER % self.tracker_file)
         self.node(self.ticket, self.f["ticket_state"])
@@ -2736,6 +2817,43 @@ def _cases(check_, tmp):  # noqa: C901  (one battery, read top to bottom)
     case("the session writer's key answers as another user: MISSING", lambda: broken(writer_viewer="someone")[1],
          {"writer key": MISSING},
          ("the writer's answer not compared", [(me, "row_writer_key", lambda ctx: "ok")]))
+
+    # KIT-933: where the writer's key comes from, and when it ends, as the runner's own status says.
+    other = {"kind": "other-program", "file": "~/.other-program/config.json", "field": "linearToken"}
+    renewed = {"kind": "renew", "renewal_file": "~/.pipeline-runner/writer-renewal-key",
+               "client_file": "~/.pipeline-runner/writer-client", "adopt_file": None, "adopt_field": None}
+    fine = {"source": "renew", "problems": [], "words": "the session writer's key is renewed by the runner; it "
+                                                         "answered as the session writer 3 minutes ago; it ends at "
+                                                         "2026-11-21T08:00:00Z (in 23 hours)"}
+
+    def writer_said(**flags):
+        io, bad = broken_io(**flags)
+        line = [ln for ln in io.said if ln[2:16].strip() == "writer key"]
+        return bad.get("writer key", OK), (line[0][27:].strip() if line else ""), bad.get("keys", OK)
+    case("a key from another program's settings file: the writer row says where it comes from, as the runner "
+         "says it; that file may be its own program's mode 0644, never writable by others",
+         lambda: (writer_said(key_source=other, writer_status=dict(fine, source="other-program", words="the "
+                              "session writer's key is read from another program's settings, which renews it")),
+                  writer_said(key_source=other, other_mode=0o664,
+                              writer_status=dict(fine, source="other-program"))[2]),
+         ((OK, "it answers as writer-1, the session writer; the session writer's key is read from another "
+               "program's settings, which renews it", OK), MISSING),
+         ("the source's file not looked at", [(me, "key_files", lambda ctx, real=key_files: [
+             k for k in real(ctx) if k[3] != "settings"])]),
+         ("the runner's word not given", [(me, "row_writer_key", lambda ctx: "it answers as writer-1, the session "
+                                                                            "writer")]))
+    case("a renewed key: the row says when it ends; a key the runner could not renew is MISSING, in its words; "
+         "a runner that has said nothing is UNKNOWN, never OK",
+         lambda: (writer_said(key_source=renewed, writer_status=fine)[:2],
+                  (lambda r: (r[0], r[1].startswith("the session writer's key is renewed by the runner itself, in "),
+                              r[1].endswith("/.pipeline-runner/writer-renewal-key; the runner says: Linear refused "
+                                            "the renewal token")))(
+                      writer_said(key_source=renewed, writer_status=dict(fine, problems=["Linear refused the renewal "
+                                                                                        "token"]))),
+                  writer_said(key_source=renewed)[0]),
+         ((OK, "it answers as writer-1, the session writer; " + fine["words"]), (MISSING, True, True), UNKNOWN),
+         ("the runner's problems ignored", [(wkey, "where", lambda st: "x"), (me, "row_writer_key", lambda ctx: "ok")]),
+         ("no word taken as fine", [(me, "WRITER_LANES", ())]))
     case("the runner runs from a folder the role account could change: MISSING, naming the root-owned copy",
          lambda: (lambda r: (r[1], "makes its root-owned copy (KIT-919)" in "\n".join(r[0].said)))(
              broken_io(engine_problems=["/opt/kit-engine is writable by this account"])),

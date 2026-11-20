@@ -47,6 +47,12 @@ QUEUE_HEARTBEAT=
 MORNING_HEARTBEAT=
 SWEEP_HEARTBEAT=
 
+# Optional (KIT-933): the runner's word on the session writer's key, writer-key.json in the runner's store (its
+# RUNNER_DIR's store/ folder), as the runner writes it.  The same copier copies it, and the one command points the
+# health check's WRITER_KEY_STATUS_FILE at the copy, so the health watch says when the key could not be read or
+# renewed, is near its end, or the runner went quiet.  Empty = not watched.
+WRITER_KEY_STATUS=
+
 # Optional: the validator's ledger (docs/WATCHER.md, approval-rate).  With it, every merge into a watched
 # repository is checked against the validator's approvals.  This account must be able to read the file.
 # OWNER_LOGINS: your own GitHub logins, comma-separated: your own merges need no approval.  Leave yours out,

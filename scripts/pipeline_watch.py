@@ -77,6 +77,12 @@ WHAT IT CHECKS, one KIND each (a kind is what an alert is about):
               file each writes after a pass: older than the limit in <KIND>_HEARTBEAT_MAX_AGE_MINUTES, unreadable, in
               another shape or missing, two passes running. Empty: that job is off here, not
               watched, and every pass says so. Slack only, through the status file.
+  writer-key  the session writer's key (KIT-933), where WRITER_KEY_STATUS_FILE names the copy of the
+              runner's word on it (the watcher's copier makes it): a key that could not be read or
+              renewed, that answers as another user, that has not answered as the writer for three
+              hours, a renewed key within six hours of its end, or a runner silent for three hours,
+              two passes running. Fixed words from the runner's own judge: nothing the file says is
+              repeated but its times. Empty: not watched. Slack only, through the status file.
 A last kind, `watch-job` — this job itself stopped — cannot be reported by the job. The
 heartbeat monitor watches the status file this job writes and pages when it goes stale.
 
@@ -165,13 +171,13 @@ STATUS_SCHEMA = "pipeline-health-status/1"
 STATE_SCHEMA = "pipeline-health-watch-state/1"
 KINDS = ("hooks", "updates", "release", "dispatcher", "front-door", "disk", "temp",
          "conflict-waker", "waker-sandbox", "watcher-page", "push-connection", "notifier", "monitor",
-         "credentials", "memory", "burn", "queue", "morning", "sweep")
+         "credentials", "memory", "burn", "queue", "morning", "sweep", "writer-key")
 # Read here for the heartbeat monitor, which cannot (KIT-339): the conflict waker is the
 # owner's LaunchAgent, and its heartbeat sits in the owner's home. It reaches Slack through
 # the status file alone. It opens no GitHub issue: the alert workflow knows a fixed list of
 # kinds, and a deployed copy that does not know this one would fail every send.
 SLACK_ONLY_KINDS = ("conflict-waker", "waker-sandbox", "watcher-page", "push-connection", "memory", "burn",
-                    "queue", "morning", "sweep")
+                    "queue", "morning", "sweep", "writer-key")
 WAKER_SCHEMA = "pr-conflict-waker-heartbeat/1"
 # The watcher's page job (KIT-519) writes this beat. A page that could not be sent shows in it as
 # `could-not-page` and the routes that failed, and nothing else reads it (KIT-549). The route names
@@ -1005,6 +1011,40 @@ def check_job_beat(env, conf, state, kind):
     return finding(kind, UNKNOWN, "%s this pass; one more and it fires" % problem)
 
 
+def check_writer_key(env, conf, state):
+    """The session writer's key (KIT-933), where WRITER_KEY_STATUS_FILE names the copy of the runner's word on it,
+    and said off where it is not. Judged by the runner's own judge (scripts/pipeline_writer_key.py), so this watch,
+    the runner's `check` and the live tool say one thing. A file that cannot be read, or is not in its shape, is a
+    problem, never fine. Debounced like the job heartbeats: on a wake from sleep this pass can run before the
+    copier's."""
+    import pipeline_writer_key as wkey
+    kind, path = "writer-key", conf.get("WRITER_KEY_STATUS_FILE")
+    if not path:
+        return finding(kind, OK, "WRITER_KEY_STATUS_FILE is not set: the session writer's key is not watched here")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except FileNotFoundError:
+        problems, words = ["the runner's word on it has never been copied to %s" % path], ""
+    except (OSError, ValueError) as exc:
+        problems, words = ["the runner's word on it, %s, cannot be read (%s)" % (path, type(exc).__name__)], ""
+    else:
+        if wkey.status_problems(doc):
+            problems, words = ["the runner's word on it, %s, is not in a shape this watch knows" % path], ""
+        else:
+            problems, words = wkey.judge(doc, _now(env))
+    if not problems:
+        _debounced(state, kind, False)
+        return finding(kind, OK, words)
+    said = "; ".join(problems)
+    if _debounced(state, kind, True):
+        return finding(kind, FIRING, (
+            "The session writer's key: %s, for %d passes running. Coding sessions write their ticket comments with "
+            "it, and the runner moves a coding ticket with it. What a person does: docs/RUNNER.md, \"The writer's "
+            "key\"." % (said, DEBOUNCE)))
+    return finding(kind, UNKNOWN, "the session writer's key: %s, this pass; one more and it fires" % said)
+
+
 def check_clerk(env, conf, state, kind):
     """The notifier or the heartbeat monitor (KIT-286), where its heartbeat file is named, and
     said off where it is not. Debounced like the waker: on a wake from sleep this hourly pass
@@ -1151,6 +1191,7 @@ def run_pass(env, conf, dry_run=False, tally=None):
                 check_memory(env, conf, state), check_burn(env, conf)]
     findings += [check_clerk(env, conf, state, kind) for kind in CLERKS]
     findings += [check_job_beat(env, conf, state, kind) for kind in JOB_BEATS]
+    findings.append(check_writer_key(env, conf, state))         # KIT-933
     failed, notes, claimed = [], [], set()
     github_on = bool(conf.get("ALERT_REPO"))
     for f in findings:
@@ -2934,6 +2975,70 @@ def selftest():
         check("a relative heartbeat file for any of the three is refused by name",
               [bool([e for e in pu.validate_conf(dict(base_c, **{JOB_BEATS[k][0]: "x.json"}))[1]
                      if JOB_BEATS[k][0] in e]) for k in sorted(JOB_BEATS)], [True] * 3)
+
+        # -- the session writer's key (KIT-933): the runner's word on it, copied for this account; off unless
+        #    named; a key that could not be read or renewed, ends within six hours, has not answered, or a
+        #    runner gone quiet is unknown once and fires on the second pass, in the runner's own fixed words
+        #    and Slack only. Nothing the file says is repeated but its times. -----------------------------
+        import pipeline_writer_key as wkey
+        wk_path = os.path.join(home, "writer-key-status.json")
+
+        def wk_status(**over):
+            doc = {"schema": wkey.STATUS_SCHEMA, "at": _iso(T - 600), "source": "renew", "writer_user_id": "writer-1",
+                   "state": "ok", "reason": None, "detail": None, "check": {"at": _iso(T - 600), "result": "writer"},
+                   "answered_at": _iso(T - 600), "writer_name": "dispatcher-agent",
+                   "renewal": {"at": _iso(T - 3600), "result": "renewed"}, "renewed_at": _iso(T - 3600),
+                   "ends_at": _iso(T + 20 * 3600 + 900)}
+            doc.update(over)
+            with open(wk_path, "w") as fh:
+                json.dump(doc, fh)
+        env = make_env(home)
+        wc = conf(WRITER_KEY_STATUS_FILE=wk_path)
+        off = check_writer_key(env, conf(), {})
+        check("writer-key is said off where WRITER_KEY_STATUS_FILE is not set",
+              (off["state"], "not watched here" in off["summary"]), (OK, True))
+        wk_status()
+        fine = check_writer_key(env, wc, {})
+        check("a renewed key that answers and ends in 20 hours is ok, and says when it ends",
+              (fine["state"], "it ends at %s (in 20 hours)" % _iso(T + 20 * 3600 + 900) in fine["summary"]), (OK, True))
+        seen = []
+        for name, over in (("not renewed", dict(state="failed", reason="renewal-refused",
+                                                renewal={"at": _iso(T - 60), "result": "renewal-refused"})),
+                           ("ends within six hours", dict(ends_at=_iso(T + 5 * 3600))),
+                           ("a runner gone quiet", dict(at=_iso(T - 4 * 3600))),
+                           ("refused by the tracker", dict(source="other-program", renewal=None, renewed_at=None,
+                                                           ends_at=None, state="failed", reason="refused")),
+                           ("not answered for hours", dict(answered_at=_iso(T - 4 * 3600))),
+                           ("another shape", dict(schema="x/1")),
+                           ("never copied", None)):
+            if over is None:
+                os.remove(wk_path)
+            else:
+                wk_status(**over)
+            st_w = {}
+            two = [check_writer_key(env, wc, st_w)["state"] for _ in range(2)]
+            seen.append((name, two[0], two[1]))
+        check("a key in trouble is unknown on one pass and fires on two, each way it can be", seen,
+              [(n, UNKNOWN, FIRING) for n in ("not renewed", "ends within six hours", "a runner gone quiet",
+                                              "refused by the tracker", "not answered for hours", "another shape",
+                                              "never copied")])
+        wk_status(state="failed", reason="renewal-refused", detail="planted words the watch never says",
+                  renewal={"at": _iso(T - 60), "result": "renewal-refused"})
+        st_w = {}
+        fired = [check_writer_key(env, wc, st_w) for _ in range(2)][1]
+        check("...in the runner's own fixed words, never the file's",
+              (wkey.REASONS["renewal-refused"] in fired["summary"], "planted words" in fired["summary"]), (True, False))
+        jw_home = os.path.join(home, "writer-key-pass")
+        os.makedirs(jw_home)
+        jw_status = os.path.join(home, "writer-key-health.json")
+        env = make_env(jw_home, gh=gh_ok(T))
+        for _ in range(2):
+            run_pass(env, conf(HEALTH_STATUS_FILE=jw_status, KIT_CHECKOUT=kit, WRITER_KEY_STATUS_FILE=wk_path))
+        check("...it reaches the status file the monitor reads, and no GitHub issue",
+              (sorted(json.load(open(jw_status))["firing"]), env.runner.writes), (["writer-key"], []))
+        check("a relative WRITER_KEY_STATUS_FILE is refused by name",
+              bool([e for e in pu.validate_conf(dict(base_c, WRITER_KEY_STATUS_FILE="x.json"))[1]
+                    if "WRITER_KEY_STATUS_FILE" in e]), True)
 
         # -- the yearly credentials (KIT-579): the owner writes each date down; the kind
         #    warns CREDENTIAL_WARN_DAYS ahead and after, names only, and is upkeep -------------

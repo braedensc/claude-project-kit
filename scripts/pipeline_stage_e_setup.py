@@ -588,7 +588,8 @@ SIBLING_JOBS = (
                             "pipeline_session_kinds.py", "pipeline_session_tools.py", "pipeline_sprint.py",
                             "pipeline_sprint_changes.py", "pipeline_sprint_plan.py", "pipeline_sprint_review.py",
                             "pipeline_standup.py", "pipeline_tech_lead_tools.py", "pipeline_tech_lead_turn.py",
-                            "pipeline_validator_settings.py", "pipeline_voice.py", "pipeline_window.py"),
+                            "pipeline_validator_settings.py", "pipeline_voice.py", "pipeline_window.py",
+                            "pipeline_writer_key.py"),
      # Its data (KIT-889): the kit's guards, which the runner's guard launcher runs on every tool call of every
      # session it starts (scripts/pipeline_runner_guard.py), from the runner's copy of this clone's commit.
      (".claude/hooks",)),

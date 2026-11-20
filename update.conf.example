@@ -167,6 +167,13 @@ QUEUE_HEARTBEAT_MAX_AGE_MINUTES=60
 MORNING_HEARTBEAT_MAX_AGE_MINUTES=60
 SWEEP_HEARTBEAT_MAX_AGE_MINUTES=180
 
+# The session writer's key (KIT-933): the COPY of the runner's word on it (writer-key.json in the runner's store), made
+# by the watcher's copier (watcher.conf's WRITER_KEY_STATUS). You do not write this line: the one command sets it to the
+# copy. The `writer-key` kind reaches Slack when the key could not be read or renewed, answers as another user, has not
+# answered for three hours, or (a key the runner renews) ends within six hours; or when the runner has said nothing for
+# three hours. Two passes running, Slack only. Empty: not watched, and every pass says so. docs/RUNNER.md, "The writer's key".
+WRITER_KEY_STATUS_FILE=
+
 # The yearly credentials' end dates (KIT-579): name:YYYY-MM-DD, comma separated. Names and
 # dates ONLY, never a token. The `credentials` kind opens a GitHub issue once a date is within
 # CREDENTIAL_WARN_DAYS (14 to 365) of today, or past; it never pages Slack. Empty: not watched.

@@ -201,6 +201,7 @@ Each step is marked: *only a person* can do it, or it is *a sign-off a machine c
 - **Approves and merges in your place, inside hard limits**: Turn on each switch by hand, one at a time, in the settings file. *only a person.*
 - **Starts, resumes and stops the pipeline's sessions**: Make the sessions' push token on the code host with an end date, then run `python3 scripts/pipeline_runner_setup.py push-token` in a terminal and give it the token and the end date at its prompts. *only a person.*
 - **Starts, resumes and stops the pipeline's sessions**: Make the runner's tracker key and the session writer's key, then run `python3 scripts/pipeline_runner_setup.py tracker-key` and `python3 scripts/pipeline_runner_setup.py writer-key` in a terminal, each time giving the key and its end date at the prompts. *only a person.*
+- **Starts, resumes and stops the pipeline's sessions**: Before the runner renews the session writer's key itself (WRITER_KEY_SOURCE=renew), run `python3 scripts/pipeline_runner_setup.py writer-client` in a terminal and give the tracker app's client id and secret, as id:secret, and the day you will review them. *only a person.*
 - **Runs the pipeline on hosted runners instead of this machine**: Move the pipeline workflow templates into the project, and make the app or token they use. *only a person.*
 - **An hourly check of what nothing else watches**: Make a private alert repository and copy the alert workflow into it. *only a person.*
 
