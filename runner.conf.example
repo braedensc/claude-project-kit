@@ -20,7 +20,7 @@ TOKEN_ENV=CLAUDE_WRITER_OAUTH_TOKEN
 # The sessions' push token: a file of the role account's (mode 0600) that holds one GitHub token. It is NOT
 # in this file. `python3 scripts/pipeline_runner_setup.py push-token` asks for the token at a hidden prompt and
 # for the day it ends, writes the file, and records the date where the health watch warns from it. Unset, it is
-# `push-token` inside RUNNER_DIR. It may not sit in the runner's work, home or store folder.
+# `push-token` inside RUNNER_DIR. It may not sit in the runner's work, home or store folder. `off` keeps it off.
 PUSH_TOKEN_FILE=~/.pipeline-runner/push-token
 
 # Tracker user ids: the owner's, and the old dispatcher's own users (which never approve).
@@ -29,3 +29,23 @@ DISPATCHER_USER_IDS=dispatcher-user-id-1
 
 # Each project: KEY=PATH@BASE. A lower-case key, the runner's own clone of it, and its base branch.
 PROJECTS=app=~/repos/app@main
+
+# The copy of the kit the runner runs from (KIT-919): root's, at the commit Stage E's clone is at. `apply`
+# makes it and refreshes it when the clone moves; nothing else writes it. An absolute path, outside every
+# home and temp folder.
+ENGINE_DIR=/usr/local/pipeline-runner/kit
+
+# The runner keys this file carries, so you never edit runner.json by hand (KIT-919). A key you set decides,
+# and `off` writes the off itself. A key you leave out keeps what is installed: your own value, or an off
+# you set. Paths: `~/` is the role account's home. Uncomment and fill in the ones you need.
+# The session tools: the session writer's key file, and the tracker user it belongs to (never an owner).
+#SESSION_TOOLS_KEY_FILE=~/.pipeline-runner/session-writer-key
+#SESSION_TOOLS_WRITER_USER_ID=writer-user-id-1
+# The queue's settings file, whose judge approves each code start; the look tool's folder for acceptance.
+#QUEUE_CONFIG=~/.pipeline-queue/queue.json
+#LOOK_CONFIG_DIR=~/.pipeline-acceptance/look-configs
+# Per project, by its key in capitals (`-` written `_`): the approved states per kind, as KIND:STATE_ID.
+# code and acceptance take the board's ready state; plan takes the idea gate's Plan-it state.
+#APPROVAL_STATES_APP=code:ready-state-id, acceptance:ready-state-id, plan:plan-it-state-id
+# The hosts its sessions may reach. Left out, the runner allows github.com and api.github.com.
+#ALLOWED_HOSTS_APP=github.com, api.github.com, registry.npmjs.org
