@@ -178,6 +178,11 @@ LINEAR_API = "https://api.linear.app/graphql"
 # resolved to a UUID through `delivery.json` — §1: states are compared by ID,
 # never by display name, so a rename in the tracker UI cannot silently stop this.
 STATE_EVENTS = {"ready": "approved", "working": "dispatched"}
+# KIT-934. Linear groups one user's nearby changes into one history entry, whose `createdAt` is
+# its first change and `updatedAt` its last. An entry whose two times are further apart than this
+# may hold its move anywhere between them, so its move's own time cannot be read from it. This
+# job reads no state history (the one place that dates such a move), so it leaves that event out.
+GROUPED_SECONDS = 2
 
 HISTORY_QUERY = """
 query($filter: IssueFilter, $after: String) {
@@ -186,7 +191,7 @@ query($filter: IssueFilter, $after: String) {
     nodes {
       identifier
       history(first: 50) {
-        nodes { createdAt toState { id } actor { id } botActor { id } }
+        nodes { createdAt updatedAt toState { id } actor { id } botActor { id } }
       }
     }
   }
@@ -247,6 +252,11 @@ def tracker_events(linear, state_ids, notes):
     `ready`, and the dispatcher owns the move to `working`. Reading the
     transitions back is stronger than either side reporting them, because the
     tracker recorded them as a side effect of the move actually happening.
+
+    A row's `at` is its entry's `createdAt`, read only from an entry that holds
+    its change alone (`updatedAt` within GROUPED_SECONDS of it). A grouped
+    entry's `createdAt` is an earlier change, so its move is left out and
+    counted in a note, never recorded early (KIT-934).
     """
     wanted = {}
     for key, event in STATE_EVENTS.items():
@@ -258,7 +268,7 @@ def tracker_events(linear, state_ids, notes):
                      % ", ".join(sorted(STATE_EVENTS)))
         return []
 
-    rows = []
+    rows, grouped = [], 0
     for issue in linear:
         ticket = issue.get("identifier")
         if not ticket:
@@ -270,9 +280,24 @@ def tracker_events(linear, state_ids, notes):
             at = node.get("createdAt")
             if not event or not scrape.ISO_RE.match(str(at or "")):
                 continue
+            span = seconds_between(at, node.get("updatedAt"))
+            if span is None or abs(span) > GROUPED_SECONDS:
+                grouped += 1             # KIT-934: never recorded at the entry's first change
+                continue
             rows.append({"ticket_id": ticket, "event": event, "at": at,
                          "actor": history_actor(node)})
+    if grouped:
+        notes.append("%d tracker move(s) left out: each shares its history entry with another "
+                     "change, so its own time cannot be read (KIT-934)" % grouped)
     return rows
+
+
+def seconds_between(first, last):
+    """`last` minus `first`, two tracker times, in seconds; None when either cannot be read."""
+    if not (scrape.ISO_RE.match(str(first or "")) and scrape.ISO_RE.match(str(last or ""))):
+        return None
+    parse = lambda text: datetime.strptime(text[:19], "%Y-%m-%dT%H:%M:%S")  # noqa: E731
+    return (parse(last) - parse(first)).total_seconds()
 
 
 # --------------------------------------------------------------------------- #
@@ -497,23 +522,23 @@ STATE_IDS = {"raw": "s-raw", "ready": "s-ready", "working": "s-working",
 ISSUES = [{
     "identifier": "ENG-123",
     "history": {"nodes": [
-        {"createdAt": "2026-08-18T14:00:00Z", "toState": {"id": "s-ready"},
+        {"createdAt": "2026-08-18T14:00:00Z", "updatedAt": "2026-08-18T14:00:00Z", "toState": {"id": "s-ready"},
          "actor": None, "botActor": {"id": "bot-1"}},
-        {"createdAt": "2026-08-18T15:00:00Z", "toState": {"id": "s-working"},
+        {"createdAt": "2026-08-18T15:00:00Z", "updatedAt": "2026-08-18T15:00:00Z", "toState": {"id": "s-working"},
          "actor": None, "botActor": {"id": "bot-1"}},
-        {"createdAt": "2026-08-19T09:05:00Z", "toState": {"id": "s-review"},
+        {"createdAt": "2026-08-19T09:05:00Z", "updatedAt": "2026-08-19T09:05:00Z", "toState": {"id": "s-review"},
          "actor": None, "botActor": {"id": "bot-1"}},
-        {"createdAt": "2026-08-20T18:00:00Z", "toState": {"id": "s-done"},
+        {"createdAt": "2026-08-20T18:00:00Z", "updatedAt": "2026-08-20T18:00:00Z", "toState": {"id": "s-done"},
          "actor": {"id": "u-1"}, "botActor": None},
     ]},
 }, {
     "identifier": "ENG-124",
     "history": {"nodes": [
-        {"createdAt": "2026-08-19T08:00:00Z", "toState": {"id": "s-ready"},
+        {"createdAt": "2026-08-19T08:00:00Z", "updatedAt": "2026-08-19T08:00:00Z", "toState": {"id": "s-ready"},
          "actor": {"id": "u-1"}, "botActor": None},
-        {"createdAt": "2026-08-19T08:30:00Z", "toState": None,
+        {"createdAt": "2026-08-19T08:30:00Z", "updatedAt": "2026-08-19T08:30:00Z", "toState": None,
          "actor": {"id": "u-1"}, "botActor": None},
-        {"createdAt": "not a timestamp", "toState": {"id": "s-working"},
+        {"createdAt": "not a timestamp", "updatedAt": "not a timestamp", "toState": {"id": "s-working"},
          "actor": {"id": "u-1"}, "botActor": None},
     ]},
 }]
@@ -668,6 +693,25 @@ def selftest():
     check("placeholder stateIds yield nothing",
           tracker_events(ISSUES, {"ready": "{{LINEAR_STATE_ID_READY}}"}, notes) == [])
     check("...and say so", notes, "no note emitted")
+
+    # KIT-934: a label at 08:03 and the move into `ready` at 08:21, kept in one entry as Linear
+    # groups them. Its createdAt is the label's; the move's own time is not in the entry.
+    grouped = [{"identifier": "ENG-125", "history": {"nodes": [
+        {"createdAt": "2026-08-19T08:03:04Z", "updatedAt": "2026-08-19T08:21:31.849Z",
+         "toState": {"id": "s-ready"}, "actor": {"id": "u-1"}, "botActor": None},
+        {"createdAt": "2026-08-19T09:00:00Z", "updatedAt": None,
+         "toState": {"id": "s-working"}, "actor": {"id": "u-1"}, "botActor": None},
+        {"createdAt": "2026-08-19T10:00:00.900Z", "updatedAt": "2026-08-19T10:00:00.850Z",
+         "toState": {"id": "s-working"}, "actor": None, "botActor": {"id": "bot-1"}}]}}]
+    notes = []
+    rows = tracker_events(grouped, STATE_IDS, notes)
+    check("KIT-934: a move sharing its entry with an earlier change is left out, never dated "
+          "by that change; one whose entry has no last change too",
+          [(r["event"], r["at"]) for r in rows] == [("dispatched", "2026-08-19T10:00:00.900Z")],
+          json.dumps(rows))
+    check("KIT-934: ...and the moves left out are counted in words",
+          notes == ["2 tracker move(s) left out: each shares its history entry with another "
+                    "change, so its own time cannot be read (KIT-934)"], json.dumps(notes))
 
     result, sink6 = run(linear=FakeLinear(fail=True), state_ids=STATE_IDS)
     check("an unreachable tracker loses only the tracker rows",

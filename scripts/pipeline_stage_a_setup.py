@@ -5937,12 +5937,18 @@ class FakeLinear(object):
             self._hidden[v["id"]] = still
             reads = self._creator_reads[v["id"]] = self._creator_reads.get(v["id"], 0) + 1
             rec = self.issues.get(v["id"]) or {}
+            # KIT-934: an entry's last change is its first, and each move begins a state span then.
+            seen = [dict(n, updatedAt=n["createdAt"]) for n in self.histories.get(v["id"], [])]
             return {"issue": {"createdAt": rec.get("createdAt"),
                               "creator": ({"id": self.viewer} if rec and reads > self.creator_lag
                                           else None),
-                              "history": {"nodes": list(self.histories.get(v["id"], [])),
+                              "history": {"nodes": seen,
                                           "pageInfo": {"hasNextPage": False,
-                                                       "endCursor": None}}}}
+                                                       "endCursor": None}},
+                              "stateHistory": {"nodes": [{"stateId": n["toStateId"],
+                                                          "startedAt": n["createdAt"]}
+                                                         for n in seen if n.get("toStateId")],
+                                               "pageInfo": {"hasNextPage": False}}}}
         if "StageADrillIdea" in query:
             return {"issue": {"comments": {"nodes": list(self.comments.get(v["id"], []))}}}
         if "StageADrillRuns" in query:

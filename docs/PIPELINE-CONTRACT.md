@@ -180,6 +180,30 @@ the reader happens to run.
 > - `unstarted` removes the lane from that contest entirely, and matches how the kit
 >   already models `ready` — its other "waiting on a human" state.
 
+> **A move's time comes from the state history, never from a history entry's `createdAt`
+> (KIT-934).** Linear groups one user's nearby changes into one history entry. The entry's
+> `createdAt` is its first change, and its `updatedAt` is its last ("last meaningfully
+> updated"). So neither one dates a move inside the entry. On 20 Nov the owner added a label at
+> 16:03 and moved the ticket to Todo at 16:21:31. Both changes landed in one entry, so the move
+> was read as 16:03:04. The issue's state history does date the move: each span's `startedAt` is
+> "the time the issue entered the status". The source is Linear's public GraphQL schema
+> (`IssueHistory`, `Issue.stateHistory`, `IssueStateSpan`, in `packages/sdk/src/schema.graphql`
+> of `github.com/linear/linear`).
+>
+> - **The rule.** A move's time is the start of the latest span of the state it moved into that
+>   begins inside its entry's window: from `createdAt` to `updatedAt`, with 2 seconds' slack on
+>   each side. One function computes it: `move_times` in `scripts/pipeline_queue_pool.py`.
+> - **Who reads it.** The queue's reader stores it on each entry as `movedAt`. The pool and the
+>   runner order moves by it, and the runner records it as the approval's time. The planner
+>   dates its trigger the same way. The live-run tool checks a run's approval time against the
+>   state history itself, and disagrees past its slack.
+> - **When it cannot be read.** A move whose span cannot be found has no time. The approval it
+>   carries is not read, and the reader says so in words. It is never given the earlier time.
+>   Telemetry reads no state history, so it leaves out a move whose entry spans more than
+>   2 seconds, and counts the moves left out in a note.
+> - **Not covered.** Only moves are dated this way. An edit (a title, a label) is still placed
+>   at its entry's `createdAt`, or with the move that shares its entry.
+
 ### `github`
 
 | Field | Type | Notes |
@@ -3430,6 +3454,8 @@ the tracker and judges it.
   of the owner's took the ticket back out of the approved states.
 
 The old dispatcher's own user never approves. A history that cannot be read whole approves nothing.
+Every move counts at its own time, from the state history (§1, KIT-934). A move with no time of its
+own approves nothing, and its request waits.
 
 **The runner's one tracker write (KIT-645).** A `code` start's ticket is moved into its project's
 working state (`delivery.json`'s `linear.stateIds.working`) just before the program starts, so its

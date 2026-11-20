@@ -58,7 +58,9 @@ ticket from the tracker and judges it:
     itself recorded for the start of the work it carries on, while no later move of the owner's
     took the ticket back out of its approved states.
 The owner is `owner_user_ids`, never the old dispatcher's own user. A history that cannot be read
-whole approves nothing, and the request waits.
+whole approves nothing, and the request waits. A move counts at its own time, from the ticket's state
+history, never at its history entry's `createdAt` (KIT-934): Linear groups one user's nearby changes
+into one entry that starts at the first. A move with no time of its own approves nothing, said so.
 
 THE CODE LANE (KIT-645).  A code start's ticket is moved into its project's working state
 (delivery.json's `linear.stateIds.working`) just before the program starts: the runner's one
@@ -593,6 +595,16 @@ def _dig(obj, *path):
     return obj
 
 
+def unread_history(raw_history):
+    """Why a history approves nothing, in words. KIT-934: a move is read only at its own time, which the
+    state history gives; a grouped entry's createdAt is an earlier change, so it never stands in."""
+    n = pool.undated_moves(raw_history)
+    if n:
+        return ("%d move(s) in the ticket's history have no time of their own in its state history, so no "
+                "approval is read from it" % n)
+    return "the ticket's history could not be read whole"
+
+
 def approval(cfg, kind, node, raw_history, states, ignore=()):
     """({"by", "at", "how"}, "") when the owner approved this ticket for this kind, else (None,
     why). `raw_history` is the tracker's list; a history that is not whole approves nothing. The
@@ -607,7 +619,7 @@ def approval(cfg, kind, node, raw_history, states, ignore=()):
         return None, "the runner's settings name no approved state for a %s session" % kind
     hist = pool.read_history(raw_history)
     if hist is None:
-        return None, "the ticket's history could not be read whole"
+        return None, unread_history(raw_history)
     owners = {"owner_user_ids": cfg["owner_user_ids"],
               "dispatcher_user_ids": cfg["dispatcher_user_ids"]}
     moves = [(at, e) for at, e in hist
@@ -1651,7 +1663,8 @@ class Runner(object):
         no move of the owner's in its history, and its fix and its resumes still follow his approval.
         It stands only while the ticket's history shows no later move of the owner's out of the
         approved states: that is him taking it back. (None, "") when a run on the way cannot be read,
-        or that start was not one a named approver let through."""
+        or that start was not one a named approver let through. A history it cannot read whole stands
+        for nothing (KIT-934): its later moves are unknown, so the approval is not read."""
         steps = 0
         while rec is not None and rec["resumes"] and steps < limit:
             rec, steps = store.read_run(self.store_dir(), rec["resumes"]), steps + 1
@@ -1660,7 +1673,10 @@ class Runner(object):
         owners = {"owner_user_ids": self.cfg["owner_user_ids"],
                   "dispatcher_user_ids": self.cfg["dispatcher_user_ids"]}
         since = pool.epoch(rec["approved_at"]) or 0
-        his = [e for at, e in pool.read_history(raw_history) or [] if at > since
+        hist = pool.read_history(raw_history)
+        if hist is None:
+            return None, unread_history(raw_history)
+        his = [e for at, e in hist if at > since
                and (e["toStateId"] or e["fromStateId"]) and pool.is_owner(owners, e["actorId"])]
         if his and his[-1]["toStateId"] not in states:
             return None, ("the owner moved the ticket out of its approved states since it was approved, "
@@ -1929,6 +1945,8 @@ class Runner(object):
             return "held", None, "the tracker could not be read: %s" % exc
         if hist is None and not code_start:
             return "held", None, "the ticket's history could not be read whole"
+        if not code_start and pool.undated_moves(hist):      # KIT-934: unread, so it waits, never dated early
+            return "held", None, unread_history(hist)
         if node.get("identifier") != ticket:
             return "refused", None, "the tracker answered for another ticket"
         if code_start:
@@ -2431,9 +2449,11 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
     environ = {"RUNNER_TEST_TOKEN": "a-test-token"}
     keys = pool.HISTORY_KEYS
 
-    def move(actor, to, at="2026-11-01T10:00:00Z", frm="st-backlog"):
+    def move(actor, to, at="2026-11-01T10:00:00Z", frm="st-backlog", created=None):
+        """A move as the queue's reader hands it on, dated by the state history (KIT-934). `created`: the
+        entry's first change, when the move shares it with an earlier one."""
         e = dict((k, None) for k in keys)
-        e.update(createdAt=at, actorId=actor, fromStateId=frm, toStateId=to)
+        e.update(createdAt=created or at, movedAt=at, actorId=actor, fromStateId=frm, toStateId=to)
         return e
 
     def node(ident, title, state="st-ready", creator="owner-1", team="ENG", effort="lab-s"):
@@ -2861,6 +2881,16 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
         expect("a history the tracker cannot give whole: the request waits",
                (store.answer(sdir, rq), rq in [i[0] for i in store.pending(sdir)]), (None, True))
         os.unlink(os.path.join(sdir, "requests", rq + ".json"))
+        # KIT-934: a move the state history does not date is unread, so its request waits, and says why.
+        ticket("ENG-45", "Its move has no time of its own",
+               [dict(move("owner-1", "st-ready", created="2026-11-01T09:00:00Z"), movedAt=None)])
+        rq = store.ask(sdir, "acceptance", "start", "acceptance", "app", "ENG-45")
+        out45 = runner.pass_once()
+        expect("KIT-934: a move with no time of its own: the request waits, and says why",
+               (store.answer(sdir, rq), rq in out45["waiting"], "runner: request %s waits: 1 move(s) in the ticket's "
+                "history have no time of their own in its state history, so no approval is read from it" % rq in said),
+               (None, True, True))
+        os.unlink(os.path.join(sdir, "requests", rq + ".json"))
         forged = {"schema": store.REQUEST_SCHEMA, "id": "rq-" + "9" * 32, "at": iso(time.time()),
                   "caller": "review", "action": "start", "kind": "code", "project": "app",
                   "ticket": "ENG-8", "run": None, "text": None}
@@ -2914,9 +2944,10 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
             t.update(more)
             return t
 
-        def hmove(actor, to="st-ready", at=t1):
+        def hmove(actor, to="st-ready", at=t1, created=None):
+            """A history entry as the tracker holds one: `created` its first change when the move shares it."""
             e = dict((k, None) for k in keys)
-            e.update(createdAt=at, actorId=actor, fromStateId="st-backlog", toStateId=to)
+            e.update(createdAt=created or at, updatedAt=at, actorId=actor, fromStateId="st-backlog", toStateId=to)
             return e
 
         class Board(object):
@@ -2944,7 +2975,9 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                 if op == "QueueHistory":
                     if ident in self.unread:
                         raise status_job.SourceError("the history was refused", whole=False)
-                    return {"issue": {"history": page(self.hist.get(ident, []))}}
+                    rows = self.hist.get(ident, [])     # KIT-934: each move begins a span at its last change
+                    return {"issue": {"history": page(rows), "stateHistory": page([
+                        {"stateId": e["toStateId"], "startedAt": e["updatedAt"]} for e in rows if e["toStateId"]])}}
                 if op == "QueueBusy":
                     return {"issue": {"comments": page([])}}
                 if op == "QueueEpic":
@@ -2956,10 +2989,12 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
             bnode(51), bnode(52, "Backlog", ("effort:S", "provenance:agent", "track:platform")),
             bnode(53), bnode(54), bnode(50, labels=("provenance:agent",),
                                         children={"nodes": [{"id": "uuid-eng-55"}]}),
-            piece, bnode(56)]
+            piece, bnode(56), bnode(57)]
         tracker.board = Board(board_issues, {
             "uuid-eng-51": [hmove("owner-1")], "uuid-eng-53": [hmove("someone")],
-            "uuid-eng-54": [hmove("owner-1")], "uuid-eng-56": [hmove("owner-1")]}, unread=["uuid-eng-54"])
+            "uuid-eng-54": [hmove("owner-1")], "uuid-eng-56": [hmove("owner-1")],
+            # KIT-934: the owner's label at t0 and his move at t1, in one entry, as Linear groups them.
+            "uuid-eng-57": [dict(hmove("owner-1", created=t0), addedLabelIds=["lab-x"])]}, unread=["uuid-eng-54"])
         qdir = os.path.dirname(queue_conf)
         os.makedirs(qdir)
         seen_file, bridge_file = os.path.join(qdir, "seen.json"), os.path.join(qdir, "bridge-state.json")
@@ -2979,7 +3014,7 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                                   "inputs_file": os.path.join(qdir, "inputs.json")}}, fh)
         for n, title in ((51, "Judged by the queue"), (52, "An agent-filed finding"), (53, "Moved by another"),
                          (54, "Its history is refused"), (55, "A piece approved in Slack"),
-                         (56, "Its move is refused at first")):
+                         (56, "Its move is refused at first"), (57, "Its move shares an entry with a label")):
             ticket("ENG-%d" % n, title, [move("owner-1", "st-ready")])
         nodes["ENG-55"].update(state={"id": "st-backlog"}, parent={"identifier": "ENG-50"},
                                labels={"nodes": [{"id": "lab-s", "name": "effort:S"},
@@ -3001,6 +3036,8 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                                         True))
         expect("…a piece of a plan the owner approved in Slack is his approval, by the bridge's record",
                judged.judge("ENG-55"), ({"by": "U0OWNER001", "at": t1, "how": "slack"}, "", False))
+        expect("KIT-934: …a move sharing one entry with his label at t0 is his approval at t1, the move's own time",
+               judged.judge("ENG-57"), ({"by": "owner-1", "at": t1, "how": "move"}, "", False))
         expect("…a ticket the queue does not read at all has no verdict, and is refused",
                judged.judge("ENG-1")[::2], (None, False))
         tracker.board.down = True
@@ -3090,6 +3127,19 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
         lone = dict(rfix or {}, resumes="run-" + "e" * 32)
         expect("a carried approval whose start cannot be read approves nothing",
                judged.carried_approval(lone, [], ["st-ready"]) if rfix else None, (None, ""))
+        # KIT-934: a move's time is its own, from the state history; a grouped entry's createdAt never stands in.
+        grouped = [move("owner-1", "st-ready", created="2026-11-01T09:00:00Z")]
+        undated = [dict(move("owner-1", "st-backlog", "2026-11-02T10:00:00Z", "st-working"), movedAt=None)]
+        no_time = ("1 move(s) in the ticket's history have no time of their own in its state history, so no "
+                   "approval is read from it")
+        expect("KIT-934: a move sharing one entry with an earlier change approves at the move's own time",
+               approval(cfg, "fix", nodes["ENG-1"], grouped, ["st-ready"])[0],
+               {"by": "owner-1", "at": "2026-11-01T10:00:00Z", "how": "move"})
+        expect("KIT-934: …a move with no time of its own approves nothing, and says why",
+               approval(cfg, "fix", nodes["ENG-1"], [dict(grouped[0], movedAt=None)], ["st-ready"]),
+               (None, no_time))
+        expect("KIT-934: …nor does a carried approval stand over a history it cannot place, unread",
+               judged.carried_approval(rfix, undated, ["st-ready"]) if rfix else None, (None, no_time))
 
         # ---- the runner's one tracker write, as the session writer (KIT-645) ---------- #
         sent = []

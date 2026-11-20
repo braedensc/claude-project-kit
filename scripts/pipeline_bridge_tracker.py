@@ -845,16 +845,24 @@ def cases_searches(kit):
                          "position": 1},
                         {"id": "st-plan-it", "name": "Plan it", "type": "unstarted",
                          "position": 3}]}, "labels": {"nodes": []}}]}}}
-                if "PlanHistory" in q:
+                if "PlanHistory" in q:      # KIT-934: each move dated by its state span
+                    spans = [("st-backlog", "2025-10-01T00:00:00.000Z"),
+                             ("st-plan-it", "2025-10-02T00:00:00.000Z"),
+                             ("st-backlog", "2025-10-02T12:00:00.000Z"),
+                             ("st-plan-it", "2025-10-03T00:00:00.000Z")]
                     return {"data": {"issue": {"createdAt": "2025-10-01T00:00:00.000Z",
                                                "creator": {"id": OWNER}, "history": {
                         "nodes": [{"id": "h1", "createdAt": "2025-10-02T00:00:00.000Z",
+                                   "updatedAt": "2025-10-02T00:00:00.000Z",
                                    "actorId": OWNER, "fromStateId": "st-backlog",
                                    "toStateId": "st-plan-it"},
                                   {"id": "h2", "createdAt": "2025-10-03T00:00:00.000Z",
+                                   "updatedAt": "2025-10-03T00:00:00.000Z",
                                    "actorId": OWNER, "fromStateId": "st-backlog",
                                    "toStateId": "st-plan-it"}],
-                        "pageInfo": {"hasNextPage": False}}}}}
+                        "pageInfo": {"hasNextPage": False}},
+                        "stateHistory": {"nodes": [{"stateId": s, "startedAt": at} for s, at in spans],
+                                         "pageInfo": {"hasNextPage": False}}}}}
                 raise AssertionError("unexpected query: %s" % q[:60])
             real_http = globals()["_http_json"]
             globals()["_http_json"] = transport
