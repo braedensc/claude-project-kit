@@ -2463,7 +2463,7 @@
             "program": "/bin/sh",
             "args": [
               "-c",
-              "set -a; . <ENV_FILE>; set +a; exec /usr/bin/python3 <ROLE_KIT_CLONE>/scripts/pipeline_runner.py run --config <RUNNER_DIR>/runner.json # kit <commit>"
+              "set -a; . <ENV_FILE>; set +a; exec /usr/bin/python3 <ENGINE_DIR>/scripts/pipeline_runner.py run --config <RUNNER_DIR>/runner.json # kit <commit>"
             ]
           },
           "schedule": "always-on",
