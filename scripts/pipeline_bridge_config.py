@@ -32,6 +32,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
+import pipeline_chat_cap as chat_cap  # noqa: E402  (KIT-936: the chat limit's two settings)
 import pipeline_notify_local as notify  # noqa: E402
 import pipeline_plan_poller as poller  # noqa: E402
 import pipeline_runner_store as runner_store  # noqa: E402  (KIT-645: a project key's shape)
@@ -161,6 +162,11 @@ CONFIG_KEYS = {
     "relay_max_chars": "a longer answer is refused, never cut (default the relay's, 1000)",
     "relay_max_per_hour": "answers passed on in an hour (default %d, a runaway's limit)"
                           % DEFAULT_RELAY_MAX_PER_HOUR,
+    "chat_cap_max": "the runaway stop on messages to one chat (KIT-936): at most this many in "
+                    "chat_cap_window_minutes (default %d). Past it, the rest are held and sent "
+                    "as one message. Set the notifier's the same" % chat_cap.DEFAULT_MAX,
+    "chat_cap_window_minutes": "the window for chat_cap_max, in minutes (default %d)"
+                               % chat_cap.DEFAULT_WINDOW_MINUTES,
     "notifier_bot_user_id": "optional: the notifier app's own Slack bot user id. A member's "
                             "reply under one of its posts that the pings file does not hold "
                             "is then refused aloud, never ignored",
@@ -330,8 +336,11 @@ def validate_config(raw):
     unknown = sorted(set(raw) - set(CONFIG_KEYS) - set(RETIRED_KEYS))
     if unknown:
         errors.append("unknown config key(s): %s" % ", ".join(unknown))
+    cap_values = chat_cap.validate(raw, errors)
     cfg = {
         "schema": raw.get("schema"),
+        "chat_cap_max": cap_values["chat_cap_max"],
+        "chat_cap_window_minutes": cap_values["chat_cap_window_minutes"],
         "state_dir": os.path.realpath(os.path.expanduser(raw.get("state_dir")
                                                          or DEFAULT_STATE_DIR)),
         "chat_api_base": (raw.get("chat_api_base") or "https://slack.com/api").rstrip("/"),
@@ -1049,6 +1058,16 @@ def cases_config(kit):
                                    back_room_channel_id="C0123456789", writer=True,
                                    writer_bin="/opt/claude/bin/claude", tech_lead_wake=True,
                                    wake_quiet_hours="21:00-08:00", forward_answer_minutes=10))
+        # KIT-936: the chat limit's two settings default, load, and a bad value is named.
+        capped = validate_config(dict(EXAMPLE_CONFIG, state_dir=os.path.join(tmp, "cap1"),
+                                      chat_cap_max=5, chat_cap_window_minutes=3))
+        plain = validate_config(dict(EXAMPLE_CONFIG, state_dir=os.path.join(tmp, "cap2")))
+        check("config-chat-cap-defaults-loads-and-a-bad-value-is-named",
+              (plain["chat_cap_max"], plain["chat_cap_window_minutes"], capped["chat_cap_max"],
+               capped["chat_cap_window_minutes"],
+               "chat_cap_max" in _config_error(dict(EXAMPLE_CONFIG, state_dir=os.path.join(tmp, "cap3"),
+                                                    chat_cap_max=0))),
+              (20, 10, 5, 3, True))
         turn_keys = dict(tech_lead_turn=True, turn_bin="/opt/claude/bin/claude",
                          turn_tools_config="/etc/tech-lead/tools.json")
         check("config-a-retired-key-loads-as-nothing-is-named-and-an-unknown-one-is-refused",

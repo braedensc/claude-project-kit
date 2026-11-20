@@ -47,6 +47,7 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 # The notifier's exit codes, as the bridge's are (pipeline_bridge.py imports both).
+import pipeline_chat_cap as chat_cap  # noqa: E402  (the runaway stop on messages to a chat, KIT-936)
 import pipeline_notify_local as notify  # noqa: E402
 
 EXIT_ERROR = notify.EXIT_ERROR
@@ -90,6 +91,9 @@ class SlackClient(object):
     def __init__(self, cfg, token):
         self.base = cfg["chat_api_base"]
         self.token = token
+        # The runaway stop on messages to a chat (KIT-936): every message this client sends passes
+        # it. A config that names no state folder (a stand-in in a selftest) has no record to keep.
+        self.cap = chat_cap.settings(cfg)
 
     def _get(self, method, params):
         try:
@@ -208,13 +212,20 @@ class SlackClient(object):
 
     def start_stream(self, channel, thread_ts, text, user_id, team_id):
         """Open a streamed message in a thread with its first text (KIT-565); its `ts`. The
-        recipient is the member whose DM it is. Slack's own refusal word is the error."""
-        doc = self._call("chat.startStream", {
-            "channel": channel, "thread_ts": thread_ts, "markdown_text": text,
-            "recipient_user_id": user_id, "recipient_team_id": team_id})
-        if not isinstance(doc.get("ts"), str) or not doc["ts"]:
-            raise BridgeError("Slack chat.startStream gave no message")
-        return doc["ts"]
+        recipient is the member whose DM it is. Slack's own refusal word is the error. A stream is
+        a message, so it passes the chat limit (KIT-936): held, it raises, which the stream reads
+        as Slack's refusal, and the caller's whole-answer post (which the limit holds and keeps)
+        stands in its place."""
+        def open_stream():
+            doc = self._call("chat.startStream", {
+                "channel": channel, "thread_ts": thread_ts, "markdown_text": text,
+                "recipient_user_id": user_id, "recipient_team_id": team_id})
+            if not isinstance(doc.get("ts"), str) or not doc["ts"]:
+                raise BridgeError("Slack chat.startStream gave no message")
+            return doc["ts"]
+        if self.cap is None:
+            return open_stream()
+        return self._through_cap(channel, text, open_stream, thread_ts, keep=False, raises=True)
 
     def append_stream(self, channel, ts, text):
         self._call("chat.appendStream", {"channel": channel, "ts": ts, "markdown_text": text})
@@ -227,6 +238,45 @@ class SlackClient(object):
         self._call("chat.update", {"channel": channel, "ts": ts, "text": text})
 
     def post(self, channel, thread_ts, text):
+        """One message, through the runaway stop (KIT-936). Past the limit it is HELD, not sent:
+        what comes back is a timestamp-shaped token the caller records as it would a message's,
+        and the held message goes out in one digest. A record the check cannot read raises
+        BridgeError, with nothing sent."""
+        if self.cap is None:
+            return self._post_raw(channel, thread_ts, text)
+        return self._through_cap(channel, text, lambda: self._post_raw(channel, thread_ts, text),
+                                 thread_ts)
+
+    def post_transient(self, channel, thread_ts, text):
+        """A line the answer replaces (the push job's "on it"): counted like any message, but never
+        kept when held, since it is deleted anyway. A held one raises BridgeError."""
+        if self.cap is None:
+            return self._post_raw(channel, thread_ts, text)
+        return self._through_cap(channel, text, lambda: self._post_raw(channel, thread_ts, text),
+                                 thread_ts, keep=False, raises=True)
+
+    def _plain_to(self, channel):
+        return lambda body: self._post_raw(channel, None, body)
+
+    def _through_cap(self, channel, text, send, thread_ts, keep=True, raises=False):
+        try:
+            outcome, got = chat_cap.guarded_send(self.cap, channel, text, send,
+                                                 self._plain_to(channel), thread=thread_ts,
+                                                 via="bridge", keep=keep)
+        except chat_cap.CannotCheck as exc:
+            raise BridgeError("the chat limit could not be checked, so nothing was sent: %s"
+                              % str(exc)[:160])
+        if outcome == "held" and raises:
+            raise BridgeError("held by the chat limit, not sent")
+        return got
+
+    def flush_held(self):
+        """The digests whose time has come, for a pass that runs on a timer. (sent, problems)."""
+        if self.cap is None:
+            return 0, []
+        return chat_cap.flush_due(self.cap, "bridge", self._plain_to)
+
+    def _post_raw(self, channel, thread_ts, text):
         payload = {"channel": channel, "text": text, "unfurl_links": False,
                    "unfurl_media": False}
         if thread_ts:
@@ -926,6 +976,61 @@ def selftest():
     check("stream:a-fault-in-the-judge-never-raises-and-sends-nothing",
           (rec.calls, st.broken, st.why), ([], True, "the stream failed (ValueError)"))
 
+    # 3b. THE CHAT LIMIT (KIT-936): every message this client sends passes it. The real client, with
+    #     only the HTTP call stubbed, a state folder of its own, a limit of two.
+    import tempfile
+    with tempfile.TemporaryDirectory() as cap_dir:
+        cfg = {"chat_api_base": "https://slack.example.invalid/api", "state_dir": cap_dir,
+               "chat_cap_max": 2, "chat_cap_window_minutes": 10}
+        limited = SlackClient(cfg, "xoxb-test")
+        counter = [0]
+
+        def landed(_url, _payload):
+            counter[0] += 1
+            return {"ok": True, "ts": "1700000000.%06d" % counter[0]}
+        _err, sys.stderr = sys.stderr, open(os.devnull, "w")
+        try:
+            got, sent = through(landed, lambda: [limited.post("D1", None, "page %d" % i)
+                                                 for i in range(6)])
+        finally:
+            sys.stderr.close()
+            sys.stderr = _err
+        texts = [p_["text"] for _u, _h, p_ in sent]
+        check("limit:a-burst-sends-the-limit-then-one-notice-and-holds-the-rest",
+              (texts[:2], len(texts), texts[2].startswith("I have sent 2 messages")),
+              (["page 0", "page 1"], 3, True))
+        check("limit:a-held-post-answers-with-a-timestamp-shaped-token-so-the-caller-records-it",
+              (got[:2], all(re.match(r"^\d+\.\d{6}$", t) for t in got)),
+              (["1700000000.000001", "1700000000.000002"], True))
+        got, sent = through(landed, lambda: limited.start_stream("D1", "1.0", "hello", "U1", "T1"))
+        check("limit:a-stream-is-a-message-held-it-raises-and-sends-nothing",
+              (str(got).startswith("BridgeError: held by the chat limit"), sent), (True, []))
+        got, sent = through(landed, lambda: limited.post_transient("D1", "1.0", "On it."))
+        check("limit:a-transient-line-held-raises-and-is-not-kept",
+              (str(got).startswith("BridgeError: held by the chat limit"), sent), (True, []))
+        record = os.path.join(cap_dir, chat_cap.RECORD_NAME)
+        doc = json.load(open(record))
+        check("limit:only-the-posts-are-kept-whole-no-stream-text-no-on-it",
+              sorted(h["text"] for h in doc["chats"]["D1"]["held"]),
+              ["page 2", "page 3", "page 4", "page 5"])
+        for entry in doc["chats"].values():
+            entry["release_at"] = 1.0
+        json.dump(doc, open(record, "w"))
+        got, sent = through(landed, lambda: limited.flush_held())
+        check("limit:a-timer-flushes-the-held-ones-as-one-digest",
+              (got, len(sent), all(("page %d" % i) in sent[0][2]["text"] for i in range(2, 6))),
+              ((1, []), 1, True))
+        with open(record, "w") as fh:
+            fh.write("{")
+        got, sent = through(landed, lambda: limited.post("D1", None, "never"))
+        check("limit:a-record-it-cannot-read-sends-nothing-and-says-so",
+              (str(got).startswith("BridgeError: the chat limit could not be checked"), sent),
+              (True, []))
+        check("limit:a-config-with-no-state-folder-has-no-limit-and-posts-as-before",
+              through(landed, lambda: SlackClient({"chat_api_base": "https://x.invalid/api"},
+                                                  "t").post("D1", None, "plain"))[0].startswith("1700000000."),
+              True)
+
     # 4. THE ERROR carries its exit code: the bridge's error code unless one is given.
     check("bridge-error-codes", (BridgeError("x").code, BridgeError("x", 2).code,
                                  str(BridgeError("said"))), (EXIT_ERROR, 2, "said"))
@@ -953,6 +1058,7 @@ def selftest():
 
 if __name__ == "__main__":
     if sys.argv[1:] == ["--selftest"]:
-        sys.exit(selftest())
+        from scratch_run import contained
+        sys.exit(contained(selftest, "bridge-transport-selftest-"))
     print("usage: pipeline_bridge_transport.py --selftest (the bridge imports this module)")
     sys.exit(notify.EXIT_USAGE)
