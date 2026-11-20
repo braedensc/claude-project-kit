@@ -1049,7 +1049,7 @@ The notifier reads each team's tickets 50 at a time, newest update first, and as
 tracker only for tickets updated since its last good pass, less one day. It never reads fewer
 than 2 days or more than 14. A mark lands on a ticket that was just updated, so older tickets
 need no read. The last good pass is the time in `notifier-last-good.json` in the state folder:
-a real pass that read every team (exit 0 or 3). A failed or dry pass leaves it alone, so a
+a real pass that ended clean (exit 0). A failed, dry or declined (exit 3) pass leaves it alone, so a
 notifier that was down reads back to where it stopped. With no such file it reads 14 days.
 
 A busy team passes 500 updates in 14 days in normal use (KIT-931), so that is no longer a limit.
@@ -1059,6 +1059,10 @@ The runaway stop is 2000 tickets in the window. Past it the read is a FAILURE: t
 Good: `FAIL: could not read 1 of 2 team(s): PROD: team PROD has more than 2000 tickets updated
 in the last 2 days`.
 Not that: a pass that says `nothing to do` while ticket 51 held a mark.
+
+No other job reads tickets newest-first by a day window (KIT-931 checked): the queue, status,
+sweep, finding, plan and review jobs filter by state, label or a watermark, or already send a
+time filter, so none meets this cap.
 
 Other fixed list sizes found in the readers (nothing was changed for these; each is a ceiling
 that a very busy ticket or team could pass without a word):

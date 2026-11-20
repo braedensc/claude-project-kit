@@ -1798,9 +1798,10 @@ def write_heartbeat(cfg, result, now):
     except OSError as exc:
         sys.stderr.write("NOTE: could not write the heartbeat %s: %s\n"
                          % (heartbeat_path(cfg), exc))
-    # KIT-931: a pass that read every team (exit 0 or 3) and was no rehearsal is the point the
-    # next pass reads back to. A failed or dry pass leaves the old point where it was.
-    if not dry and result.get("exit") in (EXIT_OK, EXIT_DECLINED):
+    # KIT-931: a clean pass (exit 0) that was no rehearsal is the point the next pass reads back
+    # to. A failed, dry or declined (exit 3) pass leaves the old point: a refused send or a
+    # label that will retry is owed again only by reading the ticket again.
+    if not dry and result.get("exit") == EXIT_OK:
         try:
             _atomic_write_json(last_good_path(cfg), {"at": now})
         except OSError as exc:
@@ -6041,10 +6042,13 @@ def selftest():
             return os.path.exists(last_good_path(hb_cfg))
         ok("KIT-931: a failed pass and a dry pass leave no good point",
            not _beat(EXIT_ERROR) and not _beat(EXIT_OK, dry=True))
-        ok("KIT-931: a finished pass (exit 3 here) records the good point",
-           _beat(EXIT_DECLINED) and json.load(open(last_good_path(hb_cfg)))["at"]
+        ok("KIT-931: a declined pass (exit 3) leaves no good point, its events are still owed",
+           not _beat(EXIT_DECLINED))
+        ok("KIT-931: a clean pass (exit 0) records the good point",
+           _beat(EXIT_OK) and json.load(open(last_good_path(hb_cfg)))["at"]
            == "2026-11-19T10:00:00Z")
         write_heartbeat(hb_cfg, {"exit": EXIT_ERROR}, "2026-11-19T12:00:00Z")
+        write_heartbeat(hb_cfg, {"exit": EXIT_DECLINED}, "2026-11-19T13:00:00Z")
         ok("KIT-931: a later failed pass leaves the earlier good point where it was",
            json.load(open(last_good_path(hb_cfg)))["at"] == "2026-11-19T10:00:00Z")
 
