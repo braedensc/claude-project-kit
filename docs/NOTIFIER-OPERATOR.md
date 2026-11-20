@@ -1043,6 +1043,62 @@ share. It stops there, before it changes anything: run the two again in the orde
 
 ---
 
+## After an outage: one catch-up message (KIT-935)
+
+On 20 Nov 2026 the notifier came back after a day of failed passes and sent about thirty pages in
+a row. They were days old and nearly all one alert, about the notifier itself being down.
+
+Now a pass whose last good pass is older than `CATCHUP_GAP_MINUTES` (default 60) says what it owes
+in **one** message:
+
+- how many pages of each kind, the newest of each with the time it was raised, and their tickets;
+- no page dropped: each is in the message or counted in it, its key is marked seen when the
+  message lands, and a label a page carries is still applied;
+- no record of a good pass at all counts as an outage only when two or more owed pages are older
+  than the gap, so a new install does not summarise fresh pages.
+
+The heartbeat monitor posts an incident comment each time the set of failing jobs changes.
+Several on one ticket are folded into the newest, with or without an outage: the older ones are
+counted in its words ("29 earlier health-check comments ... said the same") and never sent one by
+one. They do not count against `MAX_EVENTS_PER_PASS`.
+
+A page sent on its own more than an hour after it was raised starts "This page is late: it was
+raised at <time> UTC."
+
+- **Good:** change the gap with `CATCHUP_GAP_MINUTES=120` in `notifier.conf`, then `run`.
+- **Not:** a gap shorter than `INTERVAL_SECONDS`. Every pass would then count as an outage.
+- A catch-up page has no reply line: a reply under it is not tied to one ticket. Open the tickets
+  it names.
+- A catch-up that Slack refuses marks nothing seen. The next pass sends it again.
+
+## The chat limit (KIT-936)
+
+Every message to your chat passes one check, `scripts/pipeline_chat_cap.py`: the notifier's pages,
+and the tech lead's replies, reach-outs, stand-up and status replies. Past `CHAT_CAP_MAX`
+messages (default 20) in `CHAT_CAP_WINDOW_MINUTES` (default 10) to one chat, nothing more goes
+one by one.
+
+What you see when it is reached: one notice ("I have sent 20 messages in 10 minutes ... holding
+the next ones ... together at about 14:20 UTC"), then, after the window, one digest holding every
+held message whole, oldest first. A held message is sent once and never lost. If the check cannot
+read or lock its record it sends nothing: a notifier page is then owed again next pass, and the
+pass summary says why.
+
+It is a runaway stop. Normal use must never reach it, so reaching it is a defect to look at. Each
+time it is reached the check writes `chat-cap-trips.json` in `STATE_DIR` (the last twenty trips)
+and a line on stderr. The default is above what normal chat reaches: the repo holds no traffic
+log, so it is worked out from the fastest normal traffic, a conversation with the tech lead
+(one reply a turn, a turn takes tens of seconds), plus a handful of pages.
+
+- Set both `CHAT_CAP_MAX` and `CHAT_CAP_WINDOW_MINUTES` in `notifier.conf` and in `bridge.conf`
+  to the same values, and keep both `STATE_DIR`s the same folder (the default), so one record
+  counts both jobs.
+- The count is per chat: your direct message with each app is one chat.
+- The watcher's urgent page is the one sender outside it: it runs as its own account, which
+  cannot read this record, and it already pages once per change.
+
+---
+
 ## How many tickets it reads (KIT-680)
 
 The notifier reads each team's tickets 50 at a time, newest update first, and asks the

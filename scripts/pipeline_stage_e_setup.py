@@ -490,12 +490,12 @@ SIBLING_JOBS = (
     # The notifier, and the module its pages from the review poller's records come from
     # (KIT-336). Every job that loads the writer loads the runner's one command-line builder with it
     # (pipeline_harness_claude.py, KIT-708).
-    ("pipeline_notify_local.py", ("pipeline_harness_claude.py", "pipeline_notify_local.py",
+    ("pipeline_notify_local.py", ("pipeline_chat_cap.py", "pipeline_harness_claude.py", "pipeline_notify_local.py",
                                   "pipeline_notify_events.py", "pipeline_voice.py"), ()),
     # The bridge and the modules split out of it (KIT-312: KIT-388, KIT-407, part 3), the
     # daily stand-up it posts (KIT-349), the queue it asks what may start (KIT-454), and the
     # tech lead's turn with the tool server it starts (KIT-489).
-    ("pipeline_bridge.py", ("pipeline_bridge.py", "pipeline_bridge_answers.py",
+    ("pipeline_bridge.py", ("pipeline_chat_cap.py", "pipeline_bridge.py", "pipeline_bridge_answers.py",
                             "pipeline_bridge_bind.py", "pipeline_bridge_config.py",
                             "pipeline_bridge_direct.py", "pipeline_bridge_handover.py",
                             "pipeline_bridge_pings.py",
@@ -514,7 +514,7 @@ SIBLING_JOBS = (
                             "pipeline_voice.py", "pipeline_window.py"), ()),
     # The bridge's always-on job (KIT-561): Slack's push connection, run by its own LaunchDaemon from
     # the same clone. It loads the bridge, and the standard-library WebSocket client it reads Slack with.
-    ("pipeline_bridge_push.py", ("pipeline_bridge.py", "pipeline_bridge_answers.py",
+    ("pipeline_bridge_push.py", ("pipeline_chat_cap.py", "pipeline_bridge.py", "pipeline_bridge_answers.py",
                                 "pipeline_bridge_bind.py", "pipeline_bridge_config.py",
                                 "pipeline_bridge_direct.py", "pipeline_bridge_handover.py",
                                 "pipeline_bridge_pings.py", "pipeline_bridge_plans.py",
@@ -534,7 +534,7 @@ SIBLING_JOBS = (
                                 "pipeline_ws_client.py"), ()),
     # The queue's two jobs (KIT-456): the usage job, and the morning job.
     ("pipeline_usage_local.py", ("pipeline_usage_local.py",), ()),
-    ("pipeline_morning.py", ("pipeline_bridge.py", "pipeline_bridge_answers.py",
+    ("pipeline_morning.py", ("pipeline_chat_cap.py", "pipeline_bridge.py", "pipeline_bridge_answers.py",
                              "pipeline_bridge_bind.py", "pipeline_bridge_config.py",
                              "pipeline_bridge_direct.py", "pipeline_bridge_handover.py",
                              "pipeline_bridge_pings.py", "pipeline_bridge_plans.py",
@@ -554,14 +554,14 @@ SIBLING_JOBS = (
                              "pipeline_validator_settings.py", "pipeline_voice.py",
                              "pipeline_window.py"), ()),
     # The bridge installer's verify runs the writer's probe from the clone (KIT-297).
-    ("pipeline_voice.py", ("pipeline_harness_claude.py", "pipeline_voice.py", "pipeline_notify_events.py",
+    ("pipeline_voice.py", ("pipeline_chat_cap.py", "pipeline_harness_claude.py", "pipeline_voice.py", "pipeline_notify_events.py",
                            "pipeline_notify_local.py"), ()),
     # The bridge installer's verify runs the tech lead's turn's probe, and checks the tool server
     # it starts, from the clone (KIT-498).
-    ("pipeline_tech_lead_tools.py", ("pipeline_bridge_transport.py", "pipeline_harness_claude.py",
+    ("pipeline_tech_lead_tools.py", ("pipeline_chat_cap.py", "pipeline_bridge_transport.py", "pipeline_harness_claude.py",
                                      "pipeline_notify_events.py", "pipeline_notify_local.py",
                                      "pipeline_tech_lead_tools.py", "pipeline_voice.py"), ()),
-    ("pipeline_tech_lead_turn.py", ("pipeline_bridge_transport.py", "pipeline_harness_claude.py",
+    ("pipeline_tech_lead_turn.py", ("pipeline_chat_cap.py", "pipeline_bridge_transport.py", "pipeline_harness_claude.py",
                                     "pipeline_notify_events.py", "pipeline_notify_local.py",
                                     "pipeline_tech_lead_tools.py", "pipeline_tech_lead_turn.py",
                                     "pipeline_voice.py"), ()),
@@ -575,7 +575,7 @@ SIBLING_JOBS = (
     # The runner (KIT-859), our own dispatcher's always-on job. Its installer runs it from a root-owned copy of this
     # clone's commit (KIT-919) and refreshes the copy after the clone moves. `run` finds its job there
     # (clone_jobs_sh), stops it around the clone's move and loads it again.
-    ("pipeline_runner.py", ("pipeline_bridge.py", "pipeline_bridge_answers.py", "pipeline_bridge_bind.py",
+    ("pipeline_runner.py", ("pipeline_chat_cap.py", "pipeline_bridge.py", "pipeline_bridge_answers.py", "pipeline_bridge_bind.py",
                             "pipeline_bridge_config.py", "pipeline_bridge_direct.py", "pipeline_bridge_handover.py",
                             "pipeline_bridge_pings.py", "pipeline_bridge_plans.py", "pipeline_bridge_replan.py",
                             "pipeline_bridge_requests.py", "pipeline_bridge_tech_lead.py", "pipeline_bridge_tracker.py",

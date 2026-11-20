@@ -797,9 +797,10 @@ def _cases(verify, hits, tmp):
                 "labels": {"nodes": [{"name": x} for x in (
                     "track:platform", "effort:" + effort, "provenance:" + prov)]}}
 
-    def move(actor):
+    def move(actor):      # dated by the state history, as the queue's reader hands it on (KIT-934)
         return dict(dict.fromkeys(pool.HISTORY_KEYS), createdAt="2026-11-03T10:00:00Z",
-                    actorId=actor, fromStateId="st-backlog", toStateId="st-todo")
+                    movedAt="2026-11-03T10:00:00Z", actorId=actor, fromStateId="st-backlog",
+                    toStateId="st-todo")
 
     def extra(n, repo, effort="S", priority=0, blockers=(), **more):
         return dict({"repo": repo, "priority": priority, "plan_priority": 0, "effort": effort,

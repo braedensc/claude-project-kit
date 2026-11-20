@@ -105,6 +105,7 @@ from pipeline_dispatch_local import AGENT_ENV_MARKERS  # noqa: E402
 import pipeline_stage_e_setup as se  # noqa: E402
 import pipeline_bridge as bridge  # noqa: E402
 import pipeline_bridge_config as bridge_config  # noqa: E402
+import pipeline_chat_cap as chat_cap  # noqa: E402  (KIT-936: the chat limit's defaults)
 import pipeline_bridge_push_setup as push_setup  # noqa: E402  (KIT-561: Socket Mode's pieces)
 import pipeline_heartbeat_monitor as hbm  # noqa: E402  (KIT-330: a beat aged in awake time)
 import pipeline_tech_lead_turn as turn  # noqa: E402  (KIT-498: its keys and its probe)
@@ -205,6 +206,12 @@ CONF_KEYS = {
                          "window, and starts it; empty: the tech lead's own hand-over of plans"),
     "QUEUE_EVERY_SECONDS": (str(bridge_config.DEFAULT_QUEUE_EVERY_SECONDS),
                             "how often the queue is asked, 60 to 86400 seconds"),
+    "CHAT_CAP_MAX": (str(chat_cap.DEFAULT_MAX),
+                     "the runaway stop on messages to one chat (KIT-936): at most this many in "
+                     "CHAT_CAP_WINDOW_MINUTES, then the rest are held and sent as one message. "
+                     "Set the notifier's the same"),
+    "CHAT_CAP_WINDOW_MINUTES": (str(chat_cap.DEFAULT_WINDOW_MINUTES),
+                                "the window for CHAT_CAP_MAX, in minutes"),
     "RUNNER_SETTINGS": ("", "our own runner's settings file, as the role account sees it "
                             "(KIT-645): with RUNNER_REPOS, a queued start on a listed repository "
                             "goes to the runner while its project's lanes.code there is on"),
@@ -433,6 +440,9 @@ def validate_conf(values):
     every = conf["QUEUE_EVERY_SECONDS"]
     if not WHOLE_RE.match(every) or not 60 <= int(every) <= 86400:
         errors.append("QUEUE_EVERY_SECONDS must be a whole number from 60 to 86400")
+    for key in ("CHAT_CAP_MAX", "CHAT_CAP_WINDOW_MINUTES"):
+        if not WHOLE_RE.match(conf[key]) or not 1 <= int(conf[key]) <= 100000:
+            errors.append("%s must be a whole number from 1 to 100000" % key)
     # KIT-645: the wiring to our own runner. Its switch is the runner's own lanes.code.
     rsettings, rpairs = conf["RUNNER_SETTINGS"], split_list(conf["RUNNER_REPOS"])
     if rsettings and not (rsettings.startswith("/") or rsettings.startswith("~/")):
@@ -745,6 +755,7 @@ COMPOSED_AS = {"CHANNEL_IDS": "channel_ids", "OWNER_USER_ID": "owner_user_id",
                "ACCEPTANCE_REPOS": "acceptance_repos", "ACCEPTANCE_LEDGER": "acceptance_ledger",
                "QUESTION_REMINDER_HOURS": "question_reminder_hours",
                "QUEUE_CONFIG": "queue_config", "QUEUE_EVERY_SECONDS": "queue_every_seconds",
+               "CHAT_CAP_MAX": "chat_cap_max", "CHAT_CAP_WINDOW_MINUTES": "chat_cap_window_minutes",
                "RUNNER_SETTINGS": "runner_lane", "RUNNER_REPOS": "runner_lane"}
 # KIT-298: the tech lead's keys, each checked above by its conf name.
 COMPOSED_AS.update({"TECH_LEAD_TURN": "tech_lead_turn", "TURN_BIN": "turn_bin",
@@ -784,6 +795,7 @@ JOB_KEY_FROM = {
     "direct_max_age_minutes": "DIRECT_MAX_AGE_MINUTES",
     "question_reminder_hours": "QUESTION_REMINDER_HOURS",
     "queue_config": "QUEUE_CONFIG", "queue_every_seconds": "QUEUE_EVERY_SECONDS",
+    "chat_cap_max": "CHAT_CAP_MAX", "chat_cap_window_minutes": "CHAT_CAP_WINDOW_MINUTES",
     "runner_lane": "RUNNER_REPOS",
     "push_mode": "PUSH_MODE", "push_token_env": "PUSH_TOKEN_ENV",
 }
@@ -1006,6 +1018,15 @@ def compose_config(conf):
     if conf["QUEUE_EVERY_SECONDS"] != str(bridge_config.DEFAULT_QUEUE_EVERY_SECONDS):
         every = conf["QUEUE_EVERY_SECONDS"]
         doc["queue_every_seconds"] = int(every) if WHOLE_RE.match(every) else every
+    # KIT-936: the chat limit, composed only when not the default, so a default install is the
+    # same bytes as before.
+    cap_max = int(conf["CHAT_CAP_MAX"]) if WHOLE_RE.match(conf["CHAT_CAP_MAX"]) else conf["CHAT_CAP_MAX"]
+    if cap_max != chat_cap.DEFAULT_MAX:
+        doc["chat_cap_max"] = cap_max
+    cap_window = (int(conf["CHAT_CAP_WINDOW_MINUTES"]) if WHOLE_RE.match(conf["CHAT_CAP_WINDOW_MINUTES"])
+                  else conf["CHAT_CAP_WINDOW_MINUTES"])
+    if cap_window != chat_cap.DEFAULT_WINDOW_MINUTES:
+        doc["chat_cap_window_minutes"] = cap_window
     # KIT-299: the same, so a config written before the key existed stays the same.
     if conf["DONE_STATE"] != bridge.DEFAULT_DONE_STATE:
         doc["done_state"] = conf["DONE_STATE"]

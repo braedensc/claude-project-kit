@@ -405,8 +405,9 @@ print(json.dumps(out, sort_keys=True))
 
 # The tracker, read by the runner's own reader, as the role account, with the runner's own key file. Only
 # fields come back: the ticket's ids, state, creator, labels (names) and whole history (who moved it, from
-# and to which state, which labels were added), and from an epic's comments the acceptance verdict marks, read
-# by the acceptance poller's own reader, with each one's author.
+# and to which state, which labels were added, and each move's own time as the reader dated it), its state
+# history (when it entered each state, KIT-934), and from an epic's comments the acceptance verdict marks,
+# read by the acceptance poller's own reader, with each one's author.
 TRACKER_PY = r'''
 import json, sys
 a = json.loads(sys.argv[1])
@@ -420,6 +421,8 @@ if bad:
     raise SystemExit(0)
 tr = r.LinearTracker(cfg["linear_key_file"])
 dig = lambda o, *p: o if not p else dig(o.get(p[0]) if isinstance(o, dict) else None, *p[1:])
+QS = ("query LiveRunStates($id: String!) { issue(id: $id) { stateHistory(first: 100) { nodes { stateId startedAt }"
+      " pageInfo { hasNextPage } } } }")
 for t in a["tickets"]:
     try:
         node, raw = tr.issue(t), tr.history(t)
@@ -428,8 +431,17 @@ for t in a["tickets"]:
         continue
     hist = None
     if isinstance(raw, list) and all(isinstance(e, dict) for e in raw):
-        hist = [{"at": e.get("createdAt"), "actor": e.get("actorId"), "from": e.get("fromStateId"),
-                 "to": e.get("toStateId"), "added": e.get("addedLabelIds") or []} for e in raw]
+        hist = [{"at": e.get("createdAt"), "moved_at": e.get("movedAt"), "actor": e.get("actorId"),
+                 "from": e.get("fromStateId"), "to": e.get("toStateId"), "added": e.get("addedLabelIds") or []}
+                for e in raw]
+    # KIT-934: the state history itself, read apart from the reader's dating of each move, to check it by.
+    try:
+        sh = dig(tr.gql(QS, {"id": t}), "issue", "stateHistory")
+    except Exception as exc:
+        sh = {"error": type(exc).__name__}
+    spans = dig(sh, "nodes")
+    states = [{"state": dig(n, "stateId"), "at": dig(n, "startedAt")} for n in spans] if isinstance(spans, list) \
+        and dig(sh, "pageInfo", "hasNextPage") is False else None
     out["tickets"][t] = {"state": "read", "identifier": node.get("identifier"), "id": node.get("id"),
                          "state_id": dig(node, "state", "id"), "creator": dig(node, "creator", "id"),
                          "created_at": node.get("createdAt"), "parent": dig(node, "parent", "identifier"),
@@ -437,7 +449,9 @@ for t in a["tickets"]:
                                           if isinstance(n, dict)),
                          "label_ids": sorted(str(n.get("id")) for n in (dig(node, "labels", "nodes") or [])
                                              if isinstance(n, dict)),
-                         "history": hist}
+                         "history": hist, "states": states,
+                         "states_state": "read" if states is not None else "could not read (%s)" % (
+                             dig(sh, "error") or "not whole")}
 Q = "query LiveRunMarks($id: String!) { issue(id: $id) { comments(first: 100) { nodes { createdAt body user { id } } } } }"
 for epic in a.get("marks_of") or []:
     import pipeline_acceptance_poller as poller
@@ -1680,36 +1694,66 @@ def agreed(ctx, name, ok, words):
 
 
 def history_of(ctx, ticket):
+    """(history, node, why): the ticket's history oldest first, or None and why in words. A move is placed at its
+    own time, as the runner's reader dated it from the state history (KIT-934): its entry's `at` is the entry's
+    first change, which can be minutes earlier. A move with no time of its own leaves the history unplaced."""
     node = (ctx.tracker_doc or {}).get("tickets", {}).get(ticket) or {}
     if node.get("state") != "read" or node.get("history") is None:
-        return None, node
-    return sorted(((epoch(e["at"]), e) for e in node["history"] if epoch(e.get("at")) is not None),
-                  key=lambda p: p[0]), node
+        return None, node, "the ticket's history could not be read whole: %s" % (node.get("state") or "not read")
+    placed = [(epoch(e.get("moved_at") if e.get("from") or e.get("to") else e.get("at")), e) for e in node["history"]]
+    if any(t is None and (e.get("from") or e.get("to")) for t, e in placed):
+        return None, node, "a move in the ticket's history has no time of its own in its state history"
+    return sorted((p for p in placed if p[0] is not None), key=lambda p: p[0]), node, ""
+
+
+def entered(node, states):
+    """KIT-934: when the ticket's state history has it enter one of `states`, in seconds, oldest first; None when
+    the state history could not be read whole."""
+    spans = node.get("states")
+    times = [(epoch(s.get("at")) if isinstance(s, dict) else None, s) for s in spans or ()]
+    if not isinstance(spans, list) or any(t is None for t, _s in times):
+        return None
+    return sorted(t for t, s in times if s.get("state") in states)
+
+
+def entered_words(times, at):
+    """The state history's word on an approval time: the entry into an approved state nearest to it."""
+    if not times:
+        return "has it enter no approved state"
+    near = min(times, key=lambda t: abs(t - at) if at is not None else 0)
+    return "has it enter an approved state at %s%s" % (hms(near), "" if at is not None and abs(near - at) <= TIME_SLACK
+                                                       else ", %s from the run's time" % span(abs(near - (at or 0))))
 
 
 def agree_code(ctx):
     run, pr = ctx.run, ctx.pr
     owners = (ctx.cfg or {}).get("owner_user_ids") or []
     writer = ((ctx.cfg or {}).get("session_tools") or {}).get("writer_user_id")
-    hist, node = history_of(ctx, ctx.ticket)
+    hist, node, unread = history_of(ctx, ctx.ticket)
     states = (ctx.proj.get("approval_states") or {}).get("code") or []
     at = epoch(run["approved_at"])
+    # KIT-934: the approval's time is checked against the state history itself, apart from the reader's dating.
+    into = entered(node, states)
+    near = [t for t in into or () if at is not None and abs(t - at) <= TIME_SLACK]
     if hist is None:
-        agreed(ctx, "who approved", None, "the ticket's history could not be read whole: %s" % (
-            node.get("state") or "not read"))
+        agreed(ctx, "who approved", None, unread)
+    elif run["how"] in ("move", "creation") and into is None:
+        agreed(ctx, "who approved", None, "the ticket's state history could not be read whole: %s" % (
+            node.get("states_state") or "not read"))
     elif run["how"] == "move":
         moves = [e for t, e in hist if e["actor"] == run["approved_by"] and e["to"] in states
                  and at is not None and abs(t - at) <= TIME_SLACK]
-        agreed(ctx, "who approved", bool(moves) and run["approved_by"] in owners,
-               "run: %s, by a move at %s; the tracker %s" % (run["approved_by"], run["approved_at"],
-                                                              "holds that move into an approved state" if moves else
-                                                              "holds no such move by that user at that time"))
+        agreed(ctx, "who approved", bool(moves) and bool(near) and run["approved_by"] in owners,
+               "run: %s, by a move at %s; the tracker %s; its state history %s" % (
+                   run["approved_by"], run["approved_at"], "holds that move into an approved state" if moves else
+                   "holds no such move by that user at that time", entered_words(into, at)))
     elif run["how"] == "creation":
         same = node.get("creator") == run["approved_by"] and at is not None and \
             abs((epoch(node.get("created_at")) or 0) - at) <= TIME_SLACK
-        agreed(ctx, "who approved", same and run["approved_by"] in owners,
-               "run: %s, by creating it at %s; the tracker says %s made it at %s" % (
-                   run["approved_by"], run["approved_at"], node.get("creator"), node.get("created_at")))
+        agreed(ctx, "who approved", same and bool(near) and run["approved_by"] in owners,
+               "run: %s, by creating it at %s; the tracker says %s made it at %s; its state history %s" % (
+                   run["approved_by"], run["approved_at"], node.get("creator"), node.get("created_at"),
+                   entered_words(into, at)))
     else:
         agreed(ctx, "who approved", BY_HAND, "approved %s, which the tracker's history does not hold: compare "
                "with that record" % ("in Slack" if run["how"] == "slack" else "by the validator"))
@@ -1726,7 +1770,7 @@ def agree_code(ctx):
                    "into its working state %ds before the start" % (started - right[0][0]) if right else
                    "into no working state just before the start"))
     else:
-        agreed(ctx, "what ran", None, "the ticket's history could not be read whole")
+        agreed(ctx, "what ran", None, unread)
     ended, opened = epoch(run["ended_at"]), epoch(pr.get("createdAt"))
     length = (ended - started) if ended is not None and started is not None else None
     ok = length is not None and run["seconds"] is not None and abs(run["seconds"] - length) <= TIME_SLACK \
@@ -1806,7 +1850,7 @@ def agree_plan(ctx):
            run["ticket"] == ctx.ticket and ctx.request["ticket"] == ctx.ticket and ctx.request["caller"] == "planner",
            "the planner's request and the run's record name the idea %s itself, so no planning ticket was made to "
            "carry a routing label" % run["ticket"])
-    hist, node = history_of(ctx, ctx.ticket)
+    hist, node, _why = history_of(ctx, ctx.ticket)
     before, after_ = sorted(ctx.before.get("labels") or []), sorted(node.get("labels") or [])
     if before != after_:
         ctx.notes.append("the idea's labels changed during the run: before %s; after %s" % (
@@ -2134,6 +2178,11 @@ class LinearTracker(object):
             raise TrackerError("the tracker did not answer")
         if "issues(" in query:
             return {"issues": {"nodes": [{"identifier": t} for t in d.get("todo") or []]}}
+        if "stateHistory" in query:
+            if d.get("states_down"):
+                raise TrackerError("the state history was refused")
+            return {"issue": {"stateHistory": {"nodes": self._one(variables["id"]).get("states") or [],
+                                               "pageInfo": {"hasNextPage": False}}}}
         return {"issue": {"comments": {"nodes": d["comments"].get(variables["id"], [])}}}
 
 
@@ -2187,6 +2236,9 @@ FLAGS = {
     "mark_word": "passed", "gh_down": False, "no_old_review": False, "no_push": False, "no_role": False,
     "gh_after_on": False, "term_in_off": False, "settings_list": False,
     "key_source": None, "writer_status": None, "other_mode": 0o644, "absent_keys": (),      # KIT-933
+    # KIT-934: the owner's move shares one history entry with his label 18m 27s before it (as on 20 Nov), and
+    # the reader dated it by that entry's first change, as before KIT-934, and the run recorded that time.
+    "grouped": False, "reader_early": False, "states_down": False,
 }
 
 
@@ -2265,7 +2317,7 @@ class World(object):
         _put(os.path.join(self.se, "queue", "queue.json"), json.dumps(
             {"window": {"time_zone": "UTC", "days": days, "grace_minutes": 0}}))
         self.tracker.update(writer_viewer=self.f["writer_viewer"], todo=self.f["todo"],
-                            writer_status=self.f["writer_status"])
+                            writer_status=self.f["writer_status"], states_down=self.f["states_down"])
         os.makedirs(self.stub, exist_ok=True)
         _put(os.path.join(self.stub, "pipeline_runner.py"), STUB_RUNNER % self.tracker_file)
         self.node(self.ticket, self.f["ticket_state"])
@@ -2295,15 +2347,21 @@ class World(object):
 
     # -- the tracker and GitHub, as data ----------------------------------- #
     def node(self, t, state):
-        self.tracker["tickets"].setdefault(t, {"history": []})["node"] = {
+        one = self.tracker["tickets"].setdefault(t, {"history": [], "states": []})
+        one["node"] = {
             "id": "uuid-" + t, "identifier": t, "state": {"id": state}, "creator": {"id": OWNER},
             "createdAt": store.iso(T0 - 86400), "parent": None, "title": "add the thing",
             "labels": {"nodes": [{"id": "lb-1", "name": "effort:M"}]}}
+        if not one["states"]:
+            one["states"].append({"stateId": state, "startedAt": store.iso(T0 - 86400).replace("Z", ".100Z")})
 
-    def history(self, t, actor, frm, to, at):
+    def history(self, t, actor, frm, to, at, first=None):
+        """A move at `at`, as the runner's reader hands it on: dated by the state history, whose span it begins
+        (KIT-934). `first`: the entry's first change, when Linear grouped the move with an earlier one."""
         self.tracker["tickets"][t]["history"].append({
-            "createdAt": store.iso(at).replace("Z", ".250Z"), "actorId": actor, "fromStateId": frm, "toStateId": to,
-            "addedLabelIds": [], "removedLabelIds": []})
+            "createdAt": store.iso(first or at).replace("Z", ".250Z"), "movedAt": store.iso(at), "actorId": actor,
+            "fromStateId": frm, "toStateId": to, "addedLabelIds": ["lb-1"] if first else [], "removedLabelIds": []})
+        self.tracker["tickets"][t]["states"].append({"stateId": to, "startedAt": store.iso(at).replace("Z", ".300Z")})
         self.tracker["tickets"][t]["node"]["state"] = {"id": to}
 
     def save(self):
@@ -2476,9 +2534,12 @@ class World(object):
     def ask(self, ticket, stray=False):
         t = self.now
         if self.lane == "code":
+            first = t - 3 - 1107 if self.f["grouped"] or self.f["reader_early"] else None
             if not stray and self.f["move_in_history"]:
-                self.history(ticket, OWNER, "st-backlog", "st-todo", t - 3)
-            self.move_at = self.move_at or t - 3
+                self.history(ticket, OWNER, "st-backlog", "st-todo", t - 3, first=first)
+                if self.f["reader_early"]:
+                    self.tracker["tickets"][ticket]["history"][-1]["movedAt"] = store.iso(first)
+            self.move_at = self.move_at or (first if self.f["reader_early"] else t - 3)
             return store.ask(self.store, "queue", "start", "code", "app", ticket, now=t)
         if self.lane == "plan":
             if not stray:
@@ -2980,6 +3041,32 @@ def _cases(check_, tmp):  # noqa: C901  (one battery, read top to bottom)
          lambda: (lambda r: (r[1], "| who approved | DISAGREE |" in r[3]))(code_run(move_in_history=False)),
          (EXIT_FAILED, True),
          ("the approval not compared", [(me, "agree_code", lambda ctx: agreed(ctx, "who approved", True, "x"))]))
+
+    # KIT-934: a move's time is its own, from the state history; a grouped entry's first change never stands in.
+    def first_change(ctx, ticket, real=history_of):
+        hist, node, why = real(ctx, ticket)
+        return (hist if hist is None else sorted(((epoch(e["at"]), e) for _t, e in hist), key=lambda p: p[0]),
+                node, why)
+
+    def reader_says(node, states):
+        return sorted(epoch(e.get("moved_at")) for e in node.get("history") or [] if e.get("to") in states)
+    case("KIT-934: the owner's move shares an entry with his label 18m 27s earlier: approved at the move's own "
+         "time, and the state history agrees",
+         lambda: (lambda r: (r[1], "| who approved | AGREE |" in r[3]))(code_run(grouped=True)), (EXIT_OK, True),
+         ("the move placed at its entry's first change", [(me, "history_of", first_change)]))
+    case("KIT-934: an approval time from that entry's first change: DISAGREE, by the state history itself",
+         lambda: (lambda r: (r[1], "| who approved | DISAGREE |" in r[3],
+                             "its state history has it enter an approved state at %s, 18m 27s from the run's time"
+                             % hms(r[0].move_at + 1107) in r[3]))(code_run(reader_early=True)),
+         (EXIT_FAILED, True, True),
+         ("the state history not compared, only the reader's dating", [(me, "entered", reader_says)]))
+    case("KIT-934: a state history it cannot read: who approved is NOT CHECKED, never a pass",
+         lambda: (lambda r: (r[1], "| who approved | NOT CHECKED |" in r[3],
+                             "the ticket's state history could not be read whole: could not read (TrackerError)"
+                             in r[3]))(code_run(states_down=True)),
+         (EXIT_FAILED, True, True),
+         ("an unread state history taken to agree", [(me, "entered", lambda node, states: [
+             epoch(e.get("moved_at")) for e in node.get("history") or []])]))
     case("a stop (SIGTERM) while the lane is being switched off is ignored: the switch off finishes, confirmed",
          lambda: (lambda r: (r[1], lane_now(r[0]), r[0].off_seen is not None))(code_run(term_in_off=True)),
          (EXIT_OK, False, True),

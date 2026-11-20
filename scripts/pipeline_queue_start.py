@@ -659,9 +659,10 @@ def _cases(check, tmp, home):
     os.makedirs(os.path.join(GIT, ".git"))
     calls = []
 
-    def move(actor):
+    def move(actor):      # dated by the state history, as the queue's reader hands it on (KIT-934)
         return dict(dict.fromkeys(pool.HISTORY_KEYS), createdAt="2026-11-03T10:00:00Z",
-                    actorId=actor, fromStateId="st-backlog", toStateId="st-todo")
+                    movedAt="2026-11-03T10:00:00Z", actorId=actor, fromStateId="st-backlog",
+                    toStateId="st-todo")
 
     def issue(n):
         return {"id": "id-%d" % n, "identifier": "ENG-%d" % n, "title": "Title %s" % LEAK,

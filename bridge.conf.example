@@ -76,6 +76,11 @@ TURN_BIN=/opt/homebrew/bin/claude
 # hand-over of approved plans. How often it asks, in seconds.
 #QUEUE_CONFIG=
 #QUEUE_EVERY_SECONDS=900
+# The runaway stop on messages to one chat (KIT-936): at most CHAT_CAP_MAX in
+# CHAT_CAP_WINDOW_MINUTES, then the rest are held and sent as one message. Normal use never
+# reaches it. Set the notifier's the same, and keep both STATE_DIRs the same folder.
+#CHAT_CAP_MAX=20
+#CHAT_CAP_WINDOW_MINUTES=10
 # Our own runner (KIT-645). With both set, a queued start on a listed repository is a code
 # request to the runner, and nothing is handed over, while the runner's own lanes.code for
 # that project is on: that one setting switches a project, and back. The runner's settings

@@ -514,7 +514,8 @@ class PushJob(object):
 
     def on_it_line(self, channel, root):
         try:
-            return self.slack.post(channel, root, ON_IT)
+            # A line the answer replaces: through the chat limit, but never kept when held (KIT-936).
+            return getattr(self.slack, "post_transient", self.slack.post)(channel, root, ON_IT)
         except BridgeError:
             return None
 

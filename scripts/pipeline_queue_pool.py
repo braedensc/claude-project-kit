@@ -48,6 +48,9 @@ WHAT IT IS GIVEN (all of it data; nothing is fetched).
   histories  ticket id -> the ticket's whole IssueHistory, or None when it could not be read
              whole. Every entry must carry every key in HISTORY_KEYS, even as null: an entry
              without them cannot say who edited what, so the ticket is held, never guessed.
+             An entry that moved the ticket carries the move's own time in `movedAt`, which
+             the queue's reader dates from the state history (`move_times`, KIT-934). A move
+             with no time of its own leaves the history unread, and the ticket is held.
   busy       ids of tickets that ever had an agent session.
   findings   the finding poller's seen-set map, or None. Names each filed finding and its source.
   plans      the bridge's record of plans approved in Slack (`state["epics"]`), or None.
@@ -130,7 +133,11 @@ MODE_LABELS = ("orchestrator", "graphite")      # the bridge's: the agent would 
 FINISHED = ("completed", "canceled")
 EDIT_FIELDS = ("fromTitle", "toTitle", "updatedDescription", "addedLabelIds", "removedLabelIds",
                "fromParentId", "toParentId", "relationChanges")
-HISTORY_KEYS = ("createdAt", "actorId", "fromStateId", "toStateId") + EDIT_FIELDS
+# `movedAt` is the reader's, not the tracker's: a move's own time, from the state history (KIT-934).
+HISTORY_KEYS = ("createdAt", "actorId", "fromStateId", "toStateId", "movedAt") + EDIT_FIELDS
+# KIT-934. How far a state span's start may sit outside its history entry's window. The two are
+# separate records, written milliseconds apart, and read here in whole seconds.
+MOVE_SLACK = 2
 # Fields every ticket (and every epic) must be read with, even as null: a rule that reads a field
 # nobody asked for would pass whatever it should have held.
 TICKET_KEYS = ("title", "description", "createdAt", "state", "team", "labels", "children",
@@ -276,16 +283,58 @@ def config(raw):
 # --------------------------------------------------------------------------- #
 # History: who did what, and when
 # --------------------------------------------------------------------------- #
+def is_move(e):
+    """True for a history entry that changed the ticket's state."""
+    return bool(e.get("fromStateId") or e.get("toStateId"))
+
+
+def move_times(entries, states):
+    """For each history entry, in order: the move's own time in seconds, or None. None for an
+    entry that moved nothing, and for a move whose own time cannot be read (KIT-934).
+
+    Linear groups one user's nearby changes into one history entry ("Nearby changes can be grouped
+    into one entry", its schema). The entry's `createdAt` is its first change and its `updatedAt`
+    its last, so neither dates a move inside it: on 20 Nov a label added at 16:03 and a move at
+    16:21 shared one entry whose `createdAt` was 16:03. The issue's state history does date it:
+    each span's `startedAt` is "the time the issue entered the status". So a move's own time is
+    the start of the latest span of the state it moved into that begins inside its entry's window,
+    `createdAt` to `updatedAt`, widened by MOVE_SLACK. None when no span begins there, when a time
+    cannot be read, or when two entries would take the same span. `states` is the state history's
+    nodes, `{"stateId", "startedAt"}`, read whole."""
+    spans = [(dig(s, "stateId"), epoch(dig(s, "startedAt"))) for s in states or ()]
+    picked = []
+    for e in entries:
+        e = e if isinstance(e, dict) else {}
+        lo, hi, to = epoch(e.get("createdAt")), epoch(e.get("updatedAt")), e.get("toStateId")
+        fits = [(at, i) for i, (sid, at) in enumerate(spans) if to and sid == to and None not in (
+            at, lo, hi) and lo - MOVE_SLACK <= at <= hi + MOVE_SLACK]
+        picked.append(max(fits) if fits else None)
+    return [p[0] if p is not None and picked.count(p) == 1 else None for p in picked]
+
+
+def undated_moves(raw):
+    """How many entries moved the ticket with no time of their own (`movedAt`), so that a reader
+    can say why a history was not read. 0 for a history that is not a list."""
+    return sum(1 for e in raw if isinstance(e, dict) and is_move(e) and epoch(e.get("movedAt")) is None
+               ) if isinstance(raw, list) else 0
+
+
 def read_history(raw):
     """[(seconds, entry)] oldest first, or None when the history cannot be read whole: not a
-    list, an entry without every field this pool reads, or a time it cannot place."""
+    list, an entry without every field this pool reads, or a time it cannot place. An entry that
+    moved the ticket is placed at the move's own time, `movedAt` (KIT-934), never at its
+    `createdAt`, which in a grouped entry is an earlier change. A move with none is a time it
+    cannot place. An edit in the same entry goes with the move, so never before that entry's
+    `createdAt`."""
     if not isinstance(raw, list):
         return None
     out = []
     for e in raw:
-        at = epoch(e.get("createdAt")) if isinstance(e, dict) else None
-        if at is None or any(k not in e for k in HISTORY_KEYS) or not (
+        if not isinstance(e, dict) or any(k not in e for k in HISTORY_KEYS) or not (
                 e["actorId"] is None or isinstance(e["actorId"], str)):
+            return None
+        at = epoch(e["movedAt"] if is_move(e) else e["createdAt"])
+        if at is None:
             return None
         out.append((at, e))
     return sorted(out, key=lambda p: p[0])
@@ -811,12 +860,18 @@ def _cases(check):
         return t
 
     def ev(at, actor, **kw):
-        return dict(dict.fromkeys(HISTORY_KEYS), createdAt=at, actorId=actor, **kw)
+        e = dict(dict.fromkeys(HISTORY_KEYS), createdAt=at, actorId=actor, **kw)
+        if (e["fromStateId"] or e["toStateId"]) and "movedAt" not in kw:
+            e["movedAt"] = at          # a move alone in its entry: the state history dates it then
+        return e
 
     def to_todo(at, actor):
         return ev(at, actor, fromStateId="st-backlog", toStateId="st-todo")
 
     MOVE = to_todo(T1, OWNER)
+    # KIT-934: one entry holding the owner's label at T0 and his move at T1, as Linear groups them.
+    GROUPED = ev(T0, OWNER, addedLabelIds=["l1"], fromStateId="st-backlog", toStateId="st-todo",
+                 movedAt=T1)
 
     def run(ts, hists, cfg=None, epics=(), busy=(), findings={}, plans={}, ledger=LEDGER,
             validator=None):
@@ -859,6 +914,11 @@ def _cases(check):
     sc("an entry without every field cannot say who edited what",
        ("todo", "history-unreadable", None),
        h=[{"createdAt": T1, "actorId": OWNER, "toStateId": "st-todo"}])
+    sc("KIT-934: a move grouped with the owner's earlier label is still his approval", ok, h=[GROUPED])
+    sc("KIT-934: a move the state history does not date is no approval, never the earlier time",
+       ("todo", "history-unreadable", None), h=[dict(GROUPED, movedAt=None)])
+    sc("KIT-934: …nor is a move dated by a time that cannot be read",
+       ("todo", "history-unreadable", None), h=[dict(GROUPED, movedAt="16:21")])
     # -- anyone else's change since, until the owner touches it again --------------------------
     for field, val in (("fromTitle", "a"), ("toTitle", "b"), ("updatedDescription", True),
                        ("addedLabelIds", ["l1"]), ("removedLabelIds", ["l2"]),
@@ -1180,6 +1240,35 @@ def _cases(check):
     check("the plan's own ticket is never a piece", [sig(v) for v in plan_ticket][0],
           ("todo", "plan-ticket", None))
 
+    # -- KIT-934: a move's own time is the state history's, never a grouped entry's first change ----
+    v = run([issue()], {"id-1": [GROUPED]})[0]
+    check("KIT-934: one entry holding a label at T0 and the owner's move at T1 approves at T1",
+          (v["reason"], v["by"], v["at"], v["via"]), ("admitted", OWNER, T1, "move"))
+    v = run([issue()], {"id-1": [GROUPED, ev("2026-11-02T09:30:00Z", OTHER, toTitle="x")]})[0]
+    check("KIT-934: …so someone else's edit before the move's own time came before his approval",
+          (v["reason"], v["at"]), ("admitted", T1))
+    late = "2026-11-02T10:00:00.900Z"                 # the entry's updatedAt: its last change, the move
+    spans = [{"stateId": "st-backlog", "startedAt": "2026-11-02T08:00:00.123Z"},
+             {"stateId": "st-todo", "startedAt": "2026-11-02T10:00:00.849Z"}]
+    raw = dict(GROUPED, updatedAt=late, movedAt=None)
+    check("KIT-934: the matcher dates that move by the span it began, and dates no edit",
+          move_times([raw, ev(T0, OTHER, toTitle="x", updatedAt=T0)], spans), [epoch(T1), None])
+    check("KIT-934: …no span of its state inside its window, no state history, or no updatedAt: none",
+          [move_times([dict(raw, updatedAt=T0)], spans), move_times([raw], None),
+           move_times([dict(raw, updatedAt=None)], spans)], [[None], [None], [None]])
+    check("KIT-934: …a span the slack's seconds outside the window still fits, one further does not",
+          [move_times([dict(raw, updatedAt="2026-11-02T09:59:5%dZ" % s)], spans)[0] for s in (8, 7)],
+          [epoch(T1), None])
+    again = spans + [{"stateId": "st-backlog", "startedAt": "2026-11-02T10:05:00Z"},
+                     {"stateId": "st-todo", "startedAt": "2026-11-02T10:09:00Z"}]
+    check("KIT-934: …moved in, out and in again inside one entry: the last time it went in",
+          move_times([dict(raw, updatedAt="2026-11-02T10:09:00Z")], again), [epoch("2026-11-02T10:09:00Z")])
+    check("KIT-934: …two entries that would take one span: neither is dated",
+          move_times([raw, dict(raw, createdAt=T1, updatedAt=late)], spans), [None, None])
+    check("KIT-934: a reader can count the moves it could not date, and only those",
+          [undated_moves([dict(GROUPED, movedAt=None), MOVE, ev(T0, OTHER, toTitle="x")]),
+           undated_moves(None)], [1, 0])
+
     # -- the shape of what comes out -------------------------------------------------------------
     check("every reason is on the closed list, and every one on it is reached",
           sorted(set(v["reason"] for v in verdicts)), sorted(REASONS))
@@ -1418,6 +1507,10 @@ def _cases(check):
             ("a history that cannot be read taken for an empty one", dict(
                 read_history=lambda raw: [] if not isinstance(raw, list) else o["read_history"](
                     raw))),
+            ("KIT-934: a move with no time of its own placed at its entry's createdAt", dict(
+                read_history=lambda raw: o["read_history"]([dict(e, movedAt=e.get("movedAt") or e.get(
+                    "createdAt")) if isinstance(e, dict) else e for e in raw]) if isinstance(raw, list)
+                else None)),
             ("the readiness gate skipped", dict(ready_problems=lambda t, parent=None: [])),
             ("a finding taken for the owner's backlog", dict(lane_of=lambda cfg, t, c, e: (
                 "backlog" if o["lane_of"](cfg, t, c, e) == "agent_filed" else o["lane_of"](
