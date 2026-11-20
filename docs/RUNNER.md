@@ -448,9 +448,40 @@ backlog and replies on the ticket.
 Not: a session puts a finding block in a `comment`. The comment is refused, because a finding goes
 through `file_finding`, where the cap of three holds.
 
-**The writer's key.** Put a Linear API key for the user named in `writer_user_id` in a file of the
+**The writer's key.** A Linear API key for the user named in `writer_user_id`, in a file of the
 role account's, mode 0600, outside the work and home folders. The readers must trust that user. The
-finding filer's `agent_user_id` and the bridge's agent user must both name it.
+finding filer's `agent_user_id` and the bridge's agent user must both name it. Make it with
+`writer-key` ("The key files", below).
+
+## The key files
+
+The runner holds three key files, each the role account's own, mode 0600, one key and nothing else.
+One installer step writes each, the way it writes the push token (KIT-907, KIT-928):
+
+| Step | File | Who reads it | Its end date is filed as |
+|---|---|---|---|
+| `push-token` | `PUSH_TOKEN_FILE` | The code, fix and conflict sessions, through git's helper | `runner-push-token` |
+| `tracker-key` | `tracker-key` in `RUNNER_DIR` | The runner, for its own tracker reads | `runner-tracker-key` |
+| `writer-key` | `WRITER_KEY_FILE` (unset: the `session_tools.key_file` you installed, else `writer-key` in `RUNNER_DIR`) | The runner, to move a ticket, and the session's own tracker tools | `runner-writer-key` |
+
+Run each one at a terminal, never in a Claude session (it is refused there, and blocked with no terminal):
+
+    python3 scripts/pipeline_runner_setup.py tracker-key
+    python3 scripts/pipeline_runner_setup.py writer-key
+
+Make the key first. The step asks for it at a hidden prompt, then for the day it ends. A key that never
+ends gets the day you will review it, so the warning still comes. It judges both before it asks for
+your password, writes the file as the role account, and files the date for the health watch. The key
+is in no command line, no output and no log. Run it again to replace a key.
+
+`check` has a row for each step. It says the file's owner, mode and presence in words, never its
+text. A file with no end date on record, or one it cannot read, is NOT MEASURED. An ended key, a file
+others can read and a link are FAILED. No file yet is no fault, except the writer's key when a code,
+fix or conflict lane is on. The installer does not choose which tracker user the writer is: that is
+`session_tools.writer_user_id`, yours.
+
+Good: `check` says `writer-key` is present, the role account's own and closed to group and others, and ends in 200 days.
+Not: a key file that others can read. The row fails and says the mode, and the runner will not read it.
 
 ## The coding lane
 
