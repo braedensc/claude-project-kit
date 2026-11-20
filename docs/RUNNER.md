@@ -759,7 +759,9 @@ review, the idea to plan, or the piece to check.
 5. **Switch off.** The same setting, back to false, confirmed by the runner. It watches three minutes
    that nothing of the lane starts after. A failure, Ctrl-C or a closed terminal switches it off first.
 6. **Compare and print.** The run record, the tracker's history, the pull request and the ledger, where
-   the lane's proof asks. Then one result block to post on the proof's ticket, with what did not work.
+   the lane's proof asks. The approval's time is checked against the ticket's state history itself, so
+   an approval dated by an earlier change in the same history entry disagrees (KIT-934). Then one result
+   block to post on the proof's ticket, with what did not work.
 
 No key reaches the script, its output or a command line. Each key file is looked at with `stat`. The
 dry run hands the push token to git as a session's git gets it, and the writer key is asked who it is by
@@ -790,6 +792,7 @@ Each refusal says why, in the request's answer (`<store_dir>/taken/<id>.json`).
 | the project has no committed delivery.json | The project is not set up for the pipeline. |
 | `<name>` is not set | The sign-in token's variable is missing from the job's environment. |
 | the tracker could not be read | Nothing to do: the request waits, and the next pass tries again. |
+| `<n>` move(s) in the ticket's history have no time of their own in its state history | The request waits, and each pass reads it again. A move counts only at the time its state history gives it (contract §1), never at an earlier change Linear kept in the same history entry. If it stays, start the work from a fresh ticket. |
 | the push token file could not be read, can be read by others, or does not hold one GitHub token | Fix the file `push_token_file` names: this account's, mode 0600, one GitHub token. The request waits and starts on a later pass. |
 | the machine is below its floor | Free disk or memory. The request waits; it starts when there is room. |
 | the workspace's `.env` names a variable the program reads | Take the variable out of that file, or out of the project's committed copy. |

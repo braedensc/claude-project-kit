@@ -189,6 +189,9 @@ LIVE-TEST ITEMS (coded defensively; verify on the first real run and amend here)
   - `IssueHistory.actorId` / `toStateId` are read as the @linear/sdk typings name them. If a
     live answer carries neither, no move is attributable to the owner and every idea is
     refused with a note that says so — loud, never a silent start.
+  - KIT-934: the move into Plan it is dated by the idea's state history, by the span that
+    begins inside its entry's window (`createdAt` to `updatedAt`). A move it cannot date
+    plans nothing, and the idea gets the no-move note.
   - Sessions are found the way the review poller finds them: a workspace listing of agent
     sessions filtered client-side on the issue id. Linear's current public schema also has
     `Issue.agentSessions`, unused here until it is measured live.
@@ -235,6 +238,7 @@ import pipeline_hold as watcher_hold  # noqa: E402  the watcher's hold, which st
 import pipeline_routing_tags as routing  # noqa: E402  the one definition of a routing directive
 import pipeline_heartbeat_monitor as hbm  # noqa: E402  the one definition of awake time (KIT-211)
 import pipeline_runner_store as runner_store  # noqa: E402  the runner's store, its one module (KIT-705)
+import pipeline_queue_pool as pool  # noqa: E402  the one dating of a move by the state history (KIT-934)
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -646,8 +650,12 @@ query PlanHistory($id: String!, $after: String) {
     createdAt
     creator { id }
     history(first: 50, after: $after) {
-      nodes { id createdAt actorId fromStateId toStateId }
+      nodes { id createdAt updatedAt actorId fromStateId toStateId }
       pageInfo { hasNextPage endCursor }
+    }
+    stateHistory(first: 100) {
+      nodes { stateId startedAt }
+      pageInfo { hasNextPage }
     }
   }
 }"""
@@ -1462,7 +1470,7 @@ CREATION_TRIGGER_PREFIX = "created-"
 
 
 def read_history(linear, idea_id):
-    """(issue, nodes): the idea's creation facts and its WHOLE history.
+    """(issue, nodes): the idea's creation facts and state history, and its WHOLE history.
 
     The history is read page by page; the newest entry is picked by the caller, by
     createdAt. Linear's history takes an order field but no direction, and the direction
@@ -1484,13 +1492,23 @@ def read_history(linear, idea_id):
 
 
 def trigger_from(issue, nodes, plan_it_id, idea_id):
-    """The newest history entry that moved this idea INTO Plan it. Failing that, when the
-    history holds no state change at all and the creator can be read, the creation, as
-    `{"id": "created-<idea id>", "createdAt", "actorId": <creator>, "creation": True}`.
-    Otherwise None."""
+    """The newest history entry that moved this idea INTO Plan it, with its `createdAt` the
+    move's own time: the start of the state span it began, from the idea's state history
+    (KIT-934, the queue pool's `move_times`). Linear groups one user's nearby changes into
+    one entry whose own `createdAt` is its first change, minutes before the move at times.
+    None when the move has no time of its own: the move is not read, never dated earlier.
+    Failing a move, when the history holds no state change at all and the creator can be
+    read, the creation, as `{"id": "created-<idea id>", "createdAt", "actorId": <creator>,
+    "creation": True}`. Otherwise None."""
     hits = [n for n in nodes if n.get("toStateId") == plan_it_id and n.get("id")]
     if hits:
-        return max(hits, key=lambda n: n.get("createdAt") or "")
+        hit = max(hits, key=lambda n: n.get("createdAt") or "")
+        states = issue.get("stateHistory") or {}
+        spans = states.get("nodes") if (states.get("pageInfo") or {}).get("hasNextPage") is False else None
+        at = pool.move_times(nodes, spans)[nodes.index(hit)] if isinstance(spans, list) else None
+        began = [s["startedAt"] for s in spans or () if isinstance(s, dict) and s.get("stateId") == plan_it_id
+                 and pool.epoch(s.get("startedAt")) == at] if at is not None else []
+        return dict(hit, createdAt=max(began)) if began else None
     if any(n.get("fromStateId") or n.get("toStateId") for n in nodes):
         return None                  # a recorded change, none into Plan it: no trigger
     creator = (issue.get("creator") or {}).get("id")
@@ -4633,16 +4651,24 @@ class FakeLinear(object):
 
     def _PlanHistory(self, v):
         self.history_reads += 1
-        hist = list(self.ideas[v["id"]]["history"])
+        # KIT-934: an entry's last change is its first unless a case says (`updatedAt`), and its
+        # move begins a state span then, unless the idea carries a state history of its own.
+        hist = [dict(h, updatedAt=h.get("updatedAt") or h["createdAt"])
+                for h in self.ideas[v["id"]]["history"]]
         hist.sort(key=lambda h: h["createdAt"], reverse=self.history_desc)
         start = int(v.get("after") or 0)
         page = hist[start:start + HISTORY_PAGE]
         more = start + HISTORY_PAGE < len(hist)
         idea = self.ideas[v["id"]]
+        spans = idea.get("states")
+        if spans is None:
+            spans = [{"stateId": h["toStateId"], "startedAt": h["updatedAt"]}
+                     for h in hist if h.get("toStateId")]
         return {"issue": {"createdAt": idea.get("createdAt"),
                           "creator": {"id": idea["creator"]} if idea.get("creator") else None,
                           "history": {"nodes": page, "pageInfo": {
-                              "hasNextPage": more, "endCursor": str(start + HISTORY_PAGE)}}}}
+                              "hasNextPage": more, "endCursor": str(start + HISTORY_PAGE)}},
+                          "stateHistory": {"nodes": spans, "pageInfo": {"hasNextPage": False}}}}
 
     def _PlanIdea(self, v):
         i = self.ideas[v["id"]]
@@ -5027,6 +5053,21 @@ def selftest():
         check("title-collapsed-before-the-scrub",
               routing_directives_in(run_title({"identifier": "PROD-1",
                                                "title": "Dark [\nagent=evil] mode"})), [])
+        # KIT-934: the owner's label at 16:03 and his move into Plan it at 16:21, in one entry, as
+        # Linear groups them. The move is dated by the state history; undated, it is not read.
+        grouped = {"id": "h1", "createdAt": "2026-11-20T16:03:04.120Z", "actorId": "u-owner",
+                   "updatedAt": "2026-11-20T16:21:31.900Z", "fromStateId": "st-bl", "toStateId": "st-pi"}
+        spans = {"nodes": [{"stateId": "st-bl", "startedAt": "2026-11-20T02:25:10.234Z"},
+                           {"stateId": "st-pi", "startedAt": "2026-11-20T16:21:31.849Z"}],
+                 "pageInfo": {"hasNextPage": False}}
+        dated = lambda states: trigger_from({"stateHistory": states}, [grouped], "st-pi", "i1")  # noqa: E731
+        check("KIT-934-a-grouped-move-into-plan-it-is-dated-by-the-state-history",
+              [(dated(spans) or {}).get("createdAt"), dated(dict(spans, nodes=spans["nodes"][:1])),
+               dated(dict(spans, pageInfo={"hasNextPage": True})), dated(None)],
+              ["2026-11-20T16:21:31.849Z", None, None, None])
+        check("KIT-934-its-planning-run-says-the-move-time",
+              started_by({"plan_it_state": "Plan it"}, dated(spans)),
+              "started when the owner moved it to Plan it at 2026-11-20T16:21:31.849Z")
 
         def runner_settings_for(name, plan=True, **over):
             """KIT-705: our own runner's settings for one case, read with its own loader: a

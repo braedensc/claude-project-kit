@@ -26,8 +26,8 @@ user by its session); the plans, and only plans (a candidate's parent the idea g
 `provenance:agent`, a candidate that is such a plan, the epics in the bridge's record: the pool
 reads every epic as a plan, so a sub-issue of an ordinary parent stays an ordinary ticket; a plan
 past `max_pages` is left out, and its pieces among the candidates held); each issue's whole
-history and whether a dispatcher's agent session commented on it (whole or null, never a part);
-the three records.
+history and whether a dispatcher's agent session commented on it (whole or null, never a part),
+each move in it dated by the issue's state history (`movedAt`, KIT-934); the three records.
 
 WHAT IT RETURNS.  One document, schema SCHEMA: `read_at`, `date` (the machine-local day, as the
 usage job names one), `result`, `sources` (`tracker`, `findings`, `plans`, `ledger`: `state` and
@@ -46,6 +46,9 @@ planner: private to the account, never printed.
 
 LIVE-TEST ITEMS (coded defensively; verify on the first real run and amend here).
   - The history's edit fields (HISTORY_FIELDS) are the pool's; without them every ticket is held.
+  - KIT-934: a move is dated by the state span that begins inside its entry's window, `createdAt`
+    to `updatedAt`. That a grouped entry's `updatedAt` reaches the move it took in is Linear's
+    "last meaningfully updated"; a move it does not reach is held and said, never dated early.
   - Linear refuses a query over 10,000 complexity points, and nested lists multiply it. The
     selftest estimates each query by the published rule, counting generously, and holds them
     under COMPLEXITY_CAP. If a live read is still refused as too complex (the cause is on
@@ -69,7 +72,7 @@ try:
     from pipeline_queue_order import config as order_config
     from pipeline_queue_pool import (GATE_EPIC_LABEL, HISTORY_KEYS, TEAM_RE, config as pool_config,
                                      dig, epoch as pool_epoch, has_children, iso, label_names,
-                                     local_date, pointer_lines)
+                                     local_date, move_times, pointer_lines, undated_moves)
     from pipeline_status_local import (ENV_NAME_RE, PR_URL_RE, REPO_RE, SourceError, credential,
                                        inside_git_worktree, linear_graphql)
     import pipeline_validator_ledger as vledger      # KIT-543: the validator's piece approvals
@@ -136,10 +139,14 @@ ISSUE_FIELDS = """id identifier title description createdAt priority
       nodes { type issue { id identifier state { name type } labels(first: 10) { nodes { name } } } }
       pageInfo { hasNextPage }
     }"""
-# The history entry's fields: the pool's HISTORY_KEYS. The edit fields are a live-test item.
-HISTORY_FIELDS = ("createdAt actorId fromStateId toStateId fromTitle toTitle updatedDescription "
+# The history entry's fields: the pool's HISTORY_KEYS, but `movedAt`, which this reader adds, and with
+# `updatedAt`, the end of the entry's window (KIT-934). The edit fields are a live-test item.
+HISTORY_FIELDS = ("createdAt updatedAt actorId fromStateId toStateId fromTitle toTitle updatedDescription "
                   "addedLabelIds removedLabelIds fromParentId toParentId "
                   "relationChanges { identifier type }")
+ENTRY_KEYS = tuple(k for k in HISTORY_KEYS if k != "movedAt") + ("updatedAt",)
+# KIT-934: the state history dates each move. Read with the history's first page, whole or not at all.
+STATE_SPANS = 100
 Q_CANDIDATES = """query QueueCandidates($filter: IssueFilter!, $after: String) {
   issues(filter: $filter, first: %d, after: $after) {
     nodes { %s }
@@ -168,8 +175,12 @@ Q_HISTORY = """query QueueHistory($id: String!, $after: String) {
       nodes { %s }
       pageInfo { hasNextPage endCursor }
     }
+    stateHistory(first: %d) {
+      nodes { stateId startedAt }
+      pageInfo { hasNextPage }
+    }
   }
-}""" % (LIST_PAGE, HISTORY_FIELDS)
+}""" % (LIST_PAGE, HISTORY_FIELDS, STATE_SPANS)
 # The bounce driver's own live-proven read of who ran a session in a comment.
 Q_BUSY = """query QueueBusy($id: String!, $after: String) {
   issue(id: $id) {
@@ -525,12 +536,24 @@ def read_epics(budget, cfg, tickets, record, problems):
 
 
 def read_history(budget, ident, limit):
-    """The issue's whole history, or None: past `limit` pages, a question that failed, or an entry
-    short of a field the pool reads is not the whole."""
-    nodes, status, _ = paged(budget, Q_HISTORY, {"id": ident}, ("issue", "history"), limit)
-    whole = status == "whole" and all(isinstance(e, dict) and all(k in e for k in HISTORY_KEYS)
-                                      for e in nodes)
-    return nodes if whole else None
+    """The issue's whole history, each move dated by its own time, or None: past `limit` pages, a
+    question that failed, an entry short of a field the pool reads, or a state history not read
+    whole is not the whole. KIT-934: each entry gets `movedAt`, the time the state history says the
+    ticket entered the state that entry moved it into (the pool's `move_times`). A grouped entry's
+    `createdAt` is its first change, which can be minutes before the move. A move the state history
+    does not date keeps `movedAt` null, and the pool holds the ticket for it."""
+    nodes, status, first = paged(budget, Q_HISTORY, {"id": ident}, ("issue", "history"), limit)
+    states = dig(first, "issue", "stateHistory")
+    spans = dig(states, "nodes")
+    whole = (status == "whole" and all(isinstance(e, dict) and all(k in e for k in ENTRY_KEYS) for e in nodes)
+             and isinstance(spans, list) and dig(states, "pageInfo", "hasNextPage") is False
+             and all(isinstance(dig(s, "stateId"), str) and pool_epoch(dig(s, "startedAt")) is not None
+                     for s in spans))
+    if not whole:
+        return None
+    for e, at in zip(nodes, move_times(nodes, spans)):
+        e["movedAt"] = iso(at) if at is not None else None
+    return nodes
 
 
 def read_busy(budget, ident, limit, dispatchers):
@@ -556,6 +579,9 @@ def read_histories(budget, cfg, nodes, problems):
     unread = sum(1 for h in histories.values() if h is None)
     if unread:
         problems.append("histories not read: %d" % unread)
+    undated = sum(1 for h in histories.values() if undated_moves(h))
+    if undated:          # KIT-934: held by the pool, never dated by an earlier change
+        problems.append("histories with a move the state history does not date: %d" % undated)
     return histories, sorted(busy)
 
 
@@ -986,9 +1012,20 @@ def _cases(check, tmp, blocked):
                 and ("or" not in f or any(matches(g, i) for g in f["or"])))
 
     class Linear(object):
-        def __init__(self, issues, hist=None, comments=None, size=2, fail=None, clock=None, cursor=True):
+        def __init__(self, issues, hist=None, comments=None, size=2, fail=None, clock=None, cursor=True,
+                     states=None):
             self.issues, self.hist, self.comments, self.size = issues, hist or {}, comments or {}, size
             self.fail, self.clock, self.cursor, self.calls = fail, clock, cursor, []
+            self.states = states or {}
+
+        def spans(self, ident):
+            """KIT-934: the issue's state history, as given, or one span for each move in its history,
+            begun at that entry's updatedAt."""
+            if ident in self.states:
+                return self.states[ident]
+            return {"nodes": [{"stateId": e["toStateId"], "startedAt": e["updatedAt"]}
+                              for e in self.hist.get(ident, []) if e.get("toStateId")],
+                    "pageInfo": {"hasNextPage": False}}
 
         def kids(self, i):
             return [k for k in self.issues if dig(k, "parent", "id") == i["id"]]
@@ -1020,7 +1057,8 @@ def _cases(check, tmp, blocked):
             else:
                 one = next((i for i in self.issues if i["id"] == ident), None)
                 data = {"issue": {
-                    "QueueHistory": lambda: {"history": self.page(self.hist.get(ident, []), after)},
+                    "QueueHistory": lambda: {"history": self.page(self.hist.get(ident, []), after),
+                                             "stateHistory": self.spans(ident)},
                     "QueueBusy": lambda: {"comments": self.page(self.comments.get(ident, []), after)},
                     "QueueEpic": lambda: one and dict(self.shape(one), children=self.page(
                         [self.shape(k) for k in self.kids(one)], after))}[op]()}
@@ -1048,8 +1086,14 @@ def _cases(check, tmp, blocked):
 
     def piece(n, st="Backlog", **kw):
         return issue(n, st, ("effort:S", "provenance:epic"), parent={"id": "id-10", "identifier": "ENG-10"}, **kw)
-    MOVE = dict(dict.fromkeys(HISTORY_KEYS), createdAt=T1, actorId=OWNER, fromStateId="st-backlog",
+    MOVE = dict(dict.fromkeys(HISTORY_KEYS), createdAt=T1, updatedAt=T1, actorId=OWNER, fromStateId="st-backlog",
                 toStateId="st-todo")
+    DATED = dict(MOVE, movedAt=T1)          # as the reader hands it on: dated by the state history (KIT-934)
+    # KIT-934: the owner's label at T0 and his move at T1, in one entry, as Linear groups them.
+    GROUPED = dict(MOVE, createdAt=T0, updatedAt="2026-11-02T10:00:00.900Z", addedLabelIds=["l1"])
+    SPANS = lambda *pairs, more=False: {"nodes": [{"stateId": s, "startedAt": at} for s, at in pairs],
+                                        "pageInfo": {"hasNextPage": more}}
+    TOD177 = SPANS(("st-backlog", "2026-11-01T02:25:10.234Z"), ("st-todo", "2026-11-02T10:00:00.849Z"))
     PIECES = [piece(11), piece(12, inverseRelations=rels(rel(11, "blocks", "Backlog", "backlog"))), piece(13)]
     ISSUES = [
         issue(1, labels=("effort:S", "provenance:human", "repo:web"), priority=2,
@@ -1142,8 +1186,16 @@ def _cases(check, tmp, blocked):
         return types.SimpleNamespace(kept=json.load(open(path)), left=os.listdir(folder), doc=None)
     SCENES = {
         "W": lambda: read(ISSUES, FILESET, fail=failing(boom, "QueueBusy", "id-6")),
-        "H": lambda: read(ISSUES[:3], {"max_pages": 2}, {"id-1": [MOVE] * 5, "id-2": [MOVE] * 4,
+        "H": lambda: read(ISSUES[:3], {"max_pages": 2}, {"id-1": [MOVE] * 5, "id-2": [dict(
+            MOVE, createdAt="2026-11-02T10:0%d:00Z" % k, updatedAt="2026-11-02T10:0%d:00Z" % k) for k in range(4)],
                                                           "id-3": [dict(MOVE, toParentId=MISSING)]}),
+        # KIT-934: one entry holding a label at T0 and the move at T1; a move the state history does not date;
+        # a state history that runs past one page.
+        "G": lambda: read(ISSUES[:1], hist={"id-1": [GROUPED]}, states={"id-1": TOD177}),
+        "U": lambda: read(ISSUES[:1], hist={"id-1": [GROUPED]}, states={"id-1": SPANS(
+            ("st-backlog", "2026-11-01T02:25:10.234Z"))}),
+        "SH": lambda: read(ISSUES[:1], hist={"id-1": [GROUPED]}, states={"id-1": dict(TOD177, pageInfo={
+            "hasNextPage": True})}),
         "CAP": lambda: read(ISSUES[:2], {"max_requests": 4}),
         "TIME": lambda: read(ISSUES[:2], {"run_timeout_seconds": 30}, clock=[0.0]),
         "TK": lambda: read(ISSUES[:6], {"max_tickets": 2}),
@@ -1194,7 +1246,7 @@ def _cases(check, tmp, blocked):
          lambda d: (sorted(W(d)), W(d)["schema"], W(d)["read_at"], W(d)["date"], d["OK"].doc["result"]))
     case("paging; plans from tickets and the record; a history for each",
          ([5, 3, 3], ["ENG-%d" % n for n in (1, 2, 3, 4, 5, 6, 10, 11, 12, 13)],
-          [["ENG-11", "ENG-12", "ENG-13"], ["ENG-41"]], [False] * 2, 12, [MOVE]),
+          [["ENG-11", "ENG-12", "ENG-13"], ["ENG-41"]], [False] * 2, 12, [DATED]),
          lambda d: ([d["W"].calls.count(q) for q in ("QueueCandidates", "QueueRunning", "QueueEpic")],
                     [t["identifier"] for t in W(d)["tickets"]],
                     [[k["identifier"] for k in e["children"]["nodes"]] for e in W(d)["epics"]],
@@ -1212,6 +1264,18 @@ def _cases(check, tmp, blocked):
          lambda d: (W(d)["busy"], W(d)["histories"]["id-6"], tr(W(d)), d["H"].doc["sources"]["tracker"],
                     [d["H"].doc["histories"]["id-1"], len(d["H"].doc["histories"]["id-2"]),
                      d["H"].doc["histories"]["id-3"]]))
+    # -- KIT-934: a move's own time is the state history's, never a grouped entry's first change
+    case("KIT-934: one entry with a label at T0 and the move at T1: the move is dated T1, and approves at T1",
+         (T1, ("admitted", OWNER, T1), "ok"),
+         lambda d: (d["G"].doc["histories"]["id-1"][0]["movedAt"], (lambda v: (v["reason"], v["by"], v["at"]))(
+             judged(d["G"].doc)["ENG-1"]), d["G"].doc["result"]))
+    case("KIT-934: a move the state history does not date is kept undated, held and said, never dated earlier",
+         (None, "history-unreadable", ("partial", why("histories with a move the state history does not date: 1"))),
+         lambda d: (d["U"].doc["histories"]["id-1"][0]["movedAt"], judged(d["U"].doc)["ENG-1"]["reason"],
+                    tr(d["U"].doc)))
+    case("KIT-934: a state history past its one page is no history at all: held, and said",
+         (None, "history-unreadable", ("partial", why("histories not read: 1"))),
+         lambda d: (d["SH"].doc["histories"]["id-1"], judged(d["SH"].doc)["ENG-1"]["reason"], tr(d["SH"].doc)))
     # -- what the order adds
     case("repo, effort, priorities, blockers, title, Pointers",
          ([("acme/web", "S", 2, 0), ("acme/app", "M", 0, 0), (None, None, 0, 0), (None, "L", 0, 0),
@@ -1365,7 +1429,21 @@ def _cases(check, tmp, blocked):
     mutant("started beats hand-off", running_entry=lambda cfg, n: o["running_entry"](
         cfg if dig(n, "state", "type") != "started" else dict(cfg, order={"handoff_states": []}), n))
     mutant("history cap ignored", read_history=lambda b, i, limit: o["read_history"](b, i, 10 ** 6))
-    mutant("short history entry accepted", HISTORY_KEYS=())
+    mutant("short history entry accepted", ENTRY_KEYS=())
+
+    def by_created(b, i, limit):
+        h = o["read_history"](b, i, limit)
+        return h if h is None else [dict(e, movedAt=e["createdAt"]) for e in h]
+
+    def any_page(budget, query, variables, path, limit):
+        nodes, status, first = o["paged"](budget, query, variables, path, limit)
+        more = dig(first, "issue", "stateHistory", "pageInfo")
+        if isinstance(more, dict):
+            more["hasNextPage"] = False
+        return nodes, status, first
+    mutant("KIT-934: a move dated by its entry's createdAt", read_history=by_created)
+    mutant("KIT-934: a state history past its page taken as whole", paged=any_page)
+    mutant("KIT-934: the window's end not queried", Q_HISTORY=Q_HISTORY.replace(" updatedAt", ""))
     mutant("any app user is busy", read_busy=lambda b, i, limit, disp: o["read_busy"](b, i, limit, [DISP, OTHER]))
     mutant("unread comments = idle", read_busy=lambda *a: bool(o["read_busy"](*a)))
     mutant("first page only", paged=lambda b, q, v, path, limit: o["paged"](
