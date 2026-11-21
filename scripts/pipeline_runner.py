@@ -4160,7 +4160,9 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
         # 3.13 (measured 20 Nov, in the guard's MB). The line sits well above that and well below
         # the grower's peak, 200 MB higher, so it stops growth and never a run at rest.
         tight_mb = 192
-        rest = limits.resident_kb(limits.tree(store.read_run(sdir, rec7["run"])["pid"]) or [])
+        pids7 = limits.tree(store.read_run(sdir, rec7["run"])["pid"])
+        # Nothing measured is never under: a tree it could not read, an empty one, or 0 KB.
+        rest = (limits.resident_kb(pids7) if pids7 else None) or None
         expect("a session at rest, the runner's own wrapper with it, is under the line the runaway "
                "case sets, under this Python too (KIT-946)",
                "under" if rest is not None and rest < tight_mb * 1024 else "%s at rest" % (
