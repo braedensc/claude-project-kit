@@ -14,7 +14,7 @@ arguments, is run by a step of a job in `.github/workflows/ci.yml` other than th
 same words, then the end of the line, `&&`, `;` or `||`), or when the workflow writes the script as
 `npm run <script>`. A path in `git show` or `cp`, or the same script with other arguments, is not a
 run of it. A `for m in a b; do python3 x_$m.py; done` loop is read once per word. The leak sweeps
-do not count: that job runs every battery, which is what hid the gap.
+do not count (the sweeps job and each of its shard jobs): they run every battery, which is what hid the gap.
 
 THE ALLOW LIST is data: a script left out on purpose, with its reason. An entry for a script
 that is covered anyway, or that is not in package.json, fails too, so the list cannot go stale.
@@ -40,20 +40,30 @@ LOOP = re.compile(r"for\s+(\w+)\s+in\s+([^;]+);\s*do\s+(.*?);\s*done")
 JOB = re.compile(r"^  ([A-Za-z0-9_-]+):\s*$")
 
 
-def ci_text_without_sweeps(text):
-    """The workflow's text minus the leak-sweep job (lines from its header to the next job)."""
-    out, skipping, in_jobs = [], False, False
+def ci_job_texts(text):
+    """{job id: its text, comment lines dropped} for each job except the leak sweeps (the sweeps job and
+    every shard of it: an id that starts with SWEEP_JOB). A comment naming a script is not a step running it.
+    Lines before `jobs:` belong to no job."""
+    out, current, in_jobs = {}, None, False
     for line in text.splitlines():
         if line.lstrip().startswith("#"):
-            continue                    # a comment naming a script is not a step running it
+            continue
         if line.startswith("jobs:"):
             in_jobs = True
+            continue
         m = JOB.match(line) if in_jobs else None
         if m:
-            skipping = m.group(1) == SWEEP_JOB
-        if not skipping:
-            out.append(line)
-    return "\n".join(out)
+            current = None if m.group(1).startswith(SWEEP_JOB) else m.group(1)
+            if current is not None:
+                out[current] = []
+        elif in_jobs and current is not None:
+            out[current].append(line)
+    return {job: "\n".join(lines) for job, lines in out.items()}
+
+
+def ci_text_without_sweeps(text):
+    """The workflow's text minus the leak-sweep jobs: every other job's lines, joined."""
+    return "\n".join(ci_job_texts(text).values())
 
 
 def needed_commands(command):
@@ -89,23 +99,33 @@ def runs(command, text):
 
 
 def uncovered(scripts, ci_text, allowed=None):
-    """[(script, why)] for each test:* script with no step, plus stale allow-list entries."""
+    """[(script, why)] for each test:* script with no step, one run by more than one job, plus stale
+    allow-list entries. Kit checks is split into parallel shard jobs (KIT-945): the shards' union must
+    be exactly the full test:* list, so a battery in no shard is silently untested and one in two is
+    run twice (a CI minute spent on nothing, and a shard that can no longer be balanced)."""
     allowed = ALLOWED if allowed is None else allowed
-    text = ci_text_without_sweeps(ci_text)
+    jobs = ci_job_texts(ci_text)
     problems = []
     names = sorted(k for k in scripts if k.startswith("test:"))
     for name in names:
         command = scripts[name]
-        if re.search(r"npm run (?:--silent )?%s(?![\w:-])" % re.escape(name), text):
-            covered = True
+        npm = re.compile(r"npm run (?:--silent )?%s(?![\w:-])" % re.escape(name))
+        needed = needed_commands(command)
+        npm_jobs = [j for j, text in jobs.items() if npm.search(text)]
+        if npm_jobs:
+            run_by = [npm_jobs]
         else:
-            needed = needed_commands(command)
-            covered = bool(needed) and all(runs(c, text) for c in needed)
+            run_by = [[j for j, text in jobs.items() if runs(c, text)] for c in needed]
+        covered = bool(npm_jobs) or (bool(needed) and all(run_by))
+        doubled = sorted({j for sets in run_by for j in sets}) if any(len(s) > 1 for s in run_by) else []
         if name in allowed:
             if covered:
                 problems.append((name, "is in the allow list but has a CI step: remove the entry"))
         elif not covered:
             problems.append((name, "has no CI step: add one to %s, or list it in ALLOWED with a reason" % CI))
+        elif doubled:
+            problems.append((name, "runs in more than one job (%s): each battery runs in exactly one"
+                             % ", ".join(doubled)))
     for name in sorted(allowed):
         if name not in scripts:
             problems.append((name, "is in the allow list but not in package.json: remove the entry"))
@@ -184,6 +204,26 @@ def selftest():
            uncovered(both, ci + "      - run: python3 scripts/t.py --selftest\n      - run: python3 scripts/t.py\n", {}), [])
     expect("a command followed by && or || still counts",
            uncovered(sec, ci + "      - run: python3 scripts/sec.py --selftest && echo ok\n", {}), [])
+    # KIT-945: Kit checks is parallel shard jobs, and each battery belongs to exactly one of them
+    sharded = ("jobs:\n  kit-checks-1:\n    steps:\n      - run: python3 scripts/a.py --selftest\n"
+               "  kit-checks-2:\n    steps:\n      - run: python3 scripts/b.py --selftest\n"
+               "  temp-leak-sweeps-shards:\n    steps:\n      - run: python3 scripts/a.py --selftest\n"
+               "  temp-leak-sweeps:\n    steps:\n      - run: python3 scripts/c.py --selftest\n")
+    ab = {"test:a": "python3 scripts/a.py --selftest", "test:b": "python3 scripts/b.py --selftest"}
+    expect("each battery in exactly one shard job passes (the sweeps' shard jobs are not shards)",
+           uncovered(ab, sharded, {}), [])
+    twice = sharded.replace("scripts/b.py --selftest", "scripts/a.py --selftest")
+    expect("a battery run by two shard jobs fails and is named",
+           [(n, "kit-checks-1, kit-checks-2" in w) for n, w in uncovered({"test:a": ab["test:a"]}, twice, {})],
+           [("test:a", True)])
+    expect("a battery in no shard job fails even when a sweeps shard runs it",
+           [n for n, _ in uncovered({"test:c": "python3 scripts/c.py --selftest", "test:d": "python3 scripts/a.py --selftest"},
+                                    sharded.replace("kit-checks-1:\n    steps:\n      - run: python3 scripts/a.py",
+                                                    "kit-checks-1:\n    steps:\n      - run: python3 scripts/z.py"), {})],
+           ["test:c", "test:d"])
+    npm_twice = ("jobs:\n  kit-checks-1:\n    steps:\n      - run: npm run test:n\n"
+                 "  kit-checks-2:\n    steps:\n      - run: npm run --silent test:n\n")
+    expect("an npm run in two shard jobs fails", [n for n, _ in uncovered({"test:n": "node x.mjs"}, npm_twice, {})], ["test:n"])
     expect("the allow list holds only reasons", all(isinstance(v, str) and v for v in ALLOWED.values()), True)
     if failures:
         print("%d FAILED" % len(failures))

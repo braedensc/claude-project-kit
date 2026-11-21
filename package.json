@@ -145,6 +145,7 @@
     "test:direct-checks": "python3 scripts/check_direct_checks.py --selftest && python3 scripts/check_direct_checks.py --verify",
     "test:ci-covers": "python3 scripts/check_ci_covers_tests.py --selftest",
     "lint:ci-covers": "python3 scripts/check_ci_covers_tests.py",
+    "test:ci-shards": "python3 scripts/check_ci_shards.py --selftest && python3 scripts/check_ci_shards.py --verify",
     "test:alert-pages": "python3 scripts/check_alert_pages.py",
     "test:secret-scan": "python3 scripts/check_secret_scan.py --selftest",
     "lint:secrets": "python3 scripts/check_secret_scan.py --scan",
