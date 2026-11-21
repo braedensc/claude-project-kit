@@ -201,8 +201,24 @@ the reader happens to run.
 >   carries is not read, and the reader says so in words. It is never given the earlier time.
 >   Telemetry reads no state history, so it leaves out a move whose entry spans more than
 >   2 seconds, and counts the moves left out in a note.
-> - **Not covered.** Only moves are dated this way. An edit (a title, a label) is still placed
->   at its entry's `createdAt`, or with the move that shares its entry.
+> - **Not covered here.** Edits are dated by the next rule.
+
+> **An edit is dated by the end of its entry's window, against an approval (KIT-940).** The same
+> grouping dates an edit early: another user's entry can open before an approval, on a first
+> change, and hold a title, description, label or parent edit made after it. The entry's
+> `createdAt` would call that edit older than the approval.
+>
+> - **The rule.** An edit counts as after an approval whenever its entry's window, `createdAt` to
+>   `updatedAt`, reaches the approval. This is conservative: an edit made before the approval in
+>   such an entry also voids it. One function gives the time: `edit_reach` in
+>   `scripts/pipeline_queue_pool.py`. The pool uses it for every rule that orders an edit against
+>   an approval: a change by anyone but the owner since the approval, a piece moved under its
+>   plan after the approval, and the validator's approval, which must follow the last change.
+> - **When it cannot be placed.** An entry that edited the ticket and has no readable
+>   `updatedAt` makes the history unreadable. The approval is not given, and the pool says
+>   `history-unreadable`, "its history could not be read". It is never given the `createdAt`.
+> - **The owner's touch.** It clears someone else's edit only when it is strictly later than that
+>   edit's window end.
 
 ### `github`
 
