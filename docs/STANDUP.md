@@ -104,6 +104,12 @@ Not that: a quiet stand-up when the record could not be read, or the agent's rea
 stand-up's own words. With the setting empty, or no ledger yet, the messages are what they were.
 The account the bridge runs as must be able to read the ledger (`docs/VALIDATOR-OPERATOR.md`).
 
+**The points (KIT-923).** In both stand-ups, when `STANDUP_DAY_PLAN_FILE` is set and the day plan has a `points` block: "Points today: 4 of 10
+done (started), 6 left." and "Points this sprint: 12 of 40 done (started), 28 left." (or "not known, because the usage file can't place the
+sprint's week"). A piece counts as done when the queue starts it. It also says, each in words, when new starts are paused at the weekly share
+you set, when they are holding because the usage file gives no figure for the week, and which pieces have no effort label and so are not started.
+A day plan from before points says nothing about them.
+
 **The spend (KIT-471).** Only in the afternoon, and only when `STANDUP_DAY_PLAN_FILE` or
 `STANDUP_USAGE_FILE` is set (below). One line from today's day plan, which is written once each
 morning and is used all day if it is for today: "Spend today: $14.50 of the $40 planned (hard stop

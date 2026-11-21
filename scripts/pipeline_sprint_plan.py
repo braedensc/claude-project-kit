@@ -5,8 +5,8 @@
 
 A sprint is the plan's week (scripts/pipeline_sprint.py). On the first morning after the weekly reset,
 the morning job (scripts/pipeline_morning.py) builds ONE proposal from what it already read for the
-day: the pieces the pool admitted, in the queue's own order, as many as fit the week's budget, and
-what does not fit and why. The stand-up posts it once, in the owner's DM. A reply that names the
+day: the pieces the pool admitted, in the queue's own order, as many as fit the sprint's story points
+(KIT-923), and what does not fit and why. The stand-up posts it once, in the owner's DM. A reply that names the
 sprint, `plan sprint 2026-11-11`, records the plan. Nothing else does.
 
 THE FILE.  One JSON file (`pipeline-sprint-plan/1`), written whole by a rename. It holds the sprint
@@ -21,8 +21,8 @@ before an unplanned one of the same admission. It admits nothing, and no reply c
 BUILT BY CODE.  Every sentence is fixed text with ids, numbers and dates put into it. A title is cleaned
 as the status file cleans one. No model writes any of it.
 
-NEVER GUESSED.  A budget that is not set, a usage file that cannot place the week, or an input the
-morning job could not read gives no proposal and a line saying why. A sprint already proposed is not
+NEVER GUESSED.  A usage file that cannot place the week, or an input the morning job could not read,
+gives no proposal and a line saying why. A sprint already proposed is not
 proposed again.
 """
 import argparse
@@ -70,6 +70,35 @@ WHY = {
 NOT_PLANNED = ("over-budget", "no-size")
 
 
+def _settings(cfg):
+    """The queue's order config with its defaults filled in (the morning job hands it over as written)."""
+    full, bad = order.config(cfg)
+    if bad:
+        raise SprintPlanError("the queue's config is not usable: " + "; ".join(bad))
+    return full
+
+
+def capacity(cfg, view):
+    """The sprint's story points: `sprint_points` when the owner set it, else the day's points times the
+    sprint's working days. The owner sets one number and the other follows from the working days (KIT-923)."""
+    cfg = _settings(cfg)
+    return cfg["sprint_points"] if cfg["sprint_points"] else cfg["points_per_day"] * view["days_total"]
+
+
+def points_block(cfg, decision, view, ledger):
+    """The day plan's `points` block: the day's points from the queue's decision, the sprint's from the
+    ledger (the points started in the usage file's current week) against `capacity`; sprint is None when the
+    sprint is not known. `started` counts a piece when the queue starts it."""
+    day = dict((k, decision["points"][k]) for k in ("planned", "started", "left"))
+    if not (isinstance(view, dict) and view.get("known")):
+        return {"day": day, "sprint": None}
+    mine = ledger.get("sprint") if isinstance(ledger, dict) else None
+    week = view["resets_at"].astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    done = mine["points"] if isinstance(mine, dict) and mine.get("week") == week else 0
+    total = capacity(cfg, view)
+    return {"day": day, "sprint": {"planned": total, "started": done, "left": max(0, total - done)}}
+
+
 class SprintPlanError(Exception):
     """A proposal that cannot be made or a file that cannot be used, in words."""
 
@@ -99,24 +128,18 @@ def propose(view, pieces, cfg, usage, now):
     """The proposal document, or raises SprintPlanError saying why there is none.
       view     scripts/pipeline_sprint.py's sprint_view, already known
       pieces   the pool's verdicts with the reader's extras merged in (title, effort, priority, ...)
-      cfg      the queue's order config: `weekly_budget_usd` and `estimates`
-      usage    the usage file (its `week.usd` is what the week has spent already)
+      cfg      the queue's order config: `points` (a piece's points by effort), `points_per_day`, `sprint_points`
+      usage    the usage file (unused here: the sprint is sized in points, not dollars)
       now      seconds since 1970"""
     if not view.get("known"):
         raise SprintPlanError("the sprint is not known: %s" % view.get("why"))
-    budget = cfg.get("weekly_budget_usd")
-    if not order.amount(budget) or budget <= 0:
-        raise SprintPlanError("no weekly budget is set (weekly_budget_usd), so the week cannot be sized")
-    week = usage.get("week") if isinstance(usage, dict) and isinstance(usage.get("week"), dict) else {}
-    spent = week.get("usd")
-    if not order.amount(spent) or spent < 0:
-        raise SprintPlanError("what the week has spent so far could not be read from the usage file")
-    estimates = cfg["estimates"]
+    budget = capacity(cfg, view)
+    estimates = _settings(cfg)["points"]
     cleaned = [x for x in (order.clean(p) for p in pieces) if x]
     titles = dict((p.get("ticket"), p.get("title")) for p in pieces if isinstance(p, dict))
     dep = order.dependency_index(cleaned)
     ranked = sorted((p for p in cleaned if p["admitted"]), key=lambda p: order.sort_key(p, dep))
-    left = budget - spent
+    left = budget
     planned, other = [], []
     for p in ranked:
         usd = estimates.get(p["effort"]) if p["effort"] else None
@@ -126,15 +149,15 @@ def propose(view, pieces, cfg, usage, now):
             other.append({"ticket": p["ticket"], "why": "over-budget", "reply": None})
         else:
             left -= usd
-            planned.append({"ticket": p["ticket"], "effort": p["effort"], "usd": usd,
+            planned.append({"ticket": p["ticket"], "effort": p["effort"], "points": usd,
                             "title": _title(titles.get(p["ticket"]))})
     for p in sorted((p for p in cleaned if not p["admitted"]), key=lambda p: order.sort_key(p, dep)):
         if p["reason"] in WHY:
             other.append({"ticket": p["ticket"], "why": p["reason"], "reply": p["reply"]})
     doc = {"schema": SCHEMA, "sprint": sprint_id(view), "first_day": view["first_day"].isoformat(),
            "resets_at": view["resets_at"].astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-           "proposed_at": _iso(now), "announced_at": None, "budget_usd": budget, "spent_usd": spent,
-           "planned_usd": sum(x["usd"] for x in planned), "planned": planned, "not_planned": other,
+           "proposed_at": _iso(now), "announced_at": None, "budget_points": budget,
+           "planned_points": sum(x["points"] for x in planned), "planned": planned, "not_planned": other,
            "plan": None}
     problems = check(doc)
     if problems:
@@ -154,9 +177,12 @@ def check(doc):
     p = []
     if not isinstance(doc, dict):
         return ["the file holds no object"]
-    keys = {"schema", "sprint", "first_day", "resets_at", "proposed_at", "announced_at", "budget_usd",
-            "spent_usd", "planned_usd", "planned", "not_planned", "plan"}
-    if set(doc) != keys:
+    keys = {"schema", "sprint", "first_day", "resets_at", "proposed_at", "announced_at", "budget_points",
+            "planned_points", "planned", "not_planned", "plan"}
+    # A proposal written before KIT-923 counted dollars: it still loads, so a recorded plan is not lost.
+    legacy = (keys - {"budget_points", "planned_points"}) | {"budget_usd", "spent_usd", "planned_usd"}
+    old = set(doc) == legacy
+    if set(doc) != keys and not old:
         p.append("its keys are not the ones this version writes")
     if doc.get("schema") != SCHEMA:
         p.append("its schema is not %s" % SCHEMA)
@@ -168,14 +194,15 @@ def check(doc):
     if doc.get("announced_at") is not None and not (isinstance(doc["announced_at"], str)
                                                     and TIME_RE.match(doc["announced_at"])):
         p.append("announced_at is not a time or null")
-    for k in ("budget_usd", "spent_usd", "planned_usd"):
+    unit = "usd" if old else "points"
+    for k in ("budget_usd", "spent_usd", "planned_usd") if old else ("budget_points", "planned_points"):
         if not order.amount(doc.get(k)) or doc[k] < 0:
             p.append("%s is not a number" % k)
     planned = doc.get("planned")
     if not isinstance(planned, list) or len(planned) > MAX_PLANNED or not all(
-            isinstance(x, dict) and set(x) == {"ticket", "effort", "usd", "title"}
+            isinstance(x, dict) and set(x) == {"ticket", "effort", unit, "title"}
             and isinstance(x["ticket"], str) and order.TICKET_RE.match(x["ticket"])
-            and x["effort"] in order.EFFORTS and order.amount(x["usd"]) and isinstance(x["title"], str)
+            and x["effort"] in order.EFFORTS and order.amount(x[unit]) and isinstance(x["title"], str)
             for x in planned):
         p.append("planned is not a list of pieces")
     other = doc.get("not_planned")
@@ -256,15 +283,21 @@ def reply_for(doc):
 
 def text_of(doc):
     first = datetime.date.fromisoformat(doc["first_day"])
-    lines = ["*The sprint plan for the week starting %s*" % first.strftime("%a %d %b"),
-             "The week's budget is $%s and $%s is spent, so there is room for $%s. The plan holds %d piece%s, $%s of "
-             "estimates." % (_money(doc["budget_usd"]), _money(doc["spent_usd"]),
-                             _money(max(doc["budget_usd"] - doc["spent_usd"], 0)), len(doc["planned"]),
-                             "" if len(doc["planned"]) == 1 else "s", _money(doc["planned_usd"]))]
+    lines = ["*The sprint plan for the week starting %s*" % first.strftime("%a %d %b")]
+    if "budget_points" in doc:
+        lines.append("The sprint has room for %s point%s. The plan holds %d piece%s, %s point%s." % (
+            doc["budget_points"], "" if doc["budget_points"] == 1 else "s", len(doc["planned"]),
+            "" if len(doc["planned"]) == 1 else "s", doc["planned_points"], "" if doc["planned_points"] == 1 else "s"))
+    else:                                         # a proposal from before KIT-923, in dollars
+        lines.append("The week's budget is $%s and $%s is spent, so there is room for $%s. The plan holds %d piece%s, $%s of "
+                     "estimates." % (_money(doc["budget_usd"]), _money(doc["spent_usd"]),
+                                     _money(max(doc["budget_usd"] - doc["spent_usd"], 0)), len(doc["planned"]),
+                                     "" if len(doc["planned"]) == 1 else "s", _money(doc["planned_usd"])))
     if doc["planned"]:
         lines.append("In the plan, in order:")
         for x in doc["planned"][:MAX_SHOWN]:
-            lines.append("• %s (%s, $%s)%s" % (x["ticket"], x["effort"], _money(x["usd"]),
+            size = "%s point%s" % (x["points"], "" if x["points"] == 1 else "s") if "points" in x else "$" + _money(x["usd"])
+            lines.append("• %s (%s, %s)%s" % (x["ticket"], x["effort"], size,
                                               ": " + _safe(x["title"]) if x["title"] else ""))
         if len(doc["planned"]) > MAX_SHOWN:
             lines.append("and %d more." % (len(doc["planned"]) - MAX_SHOWN))
@@ -273,8 +306,8 @@ def text_of(doc):
     if doc["not_planned"]:
         lines.append("Not in the plan:")
         for x in doc["not_planned"][:MAX_SHOWN]:
-            why = {"over-budget": "it does not fit the week's budget",
-                   "no-size": "it has no size yet, so it has no estimate"}.get(x["why"]) or WHY[x["why"]]
+            why = {"over-budget": "it does not fit the sprint's points",
+                   "no-size": "it has no effort label, so it is not started"}.get(x["why"]) or WHY[x["why"]]
             lines.append("• %s: %s%s" % (x["ticket"], why, " (reply `%s` to start it)" % x["reply"] if x["reply"] else ""))
         if len(doc["not_planned"]) > MAX_SHOWN:
             lines.append("and %d more." % (len(doc["not_planned"]) - MAX_SHOWN))
@@ -402,7 +435,7 @@ def _selftest():
     view = sprint.sprint_view(usage, at(11, 8), days, tz=tz)
     check_("the sprint reader places the test week", (view["known"], view["first_day"].isoformat()), (True, "2026-11-11"))
     now = at(11, 8).timestamp()
-    cfg = {"weekly_budget_usd": 28, "estimates": {"S": 2.0, "M": 4.0, "L": 8.0}}
+    cfg = order.config({"sprint_points": 7})[0]               # S 1, M 2, L 3: 7 points for the sprint
 
     def piece(n, effort="M", admitted=True, reason="admitted", prio=3, reply=None, title=None):
         return {"ticket": "KIT-%d" % n, "id": "id%d" % n, "admitted": admitted, "reason": reason, "reply": reply,
@@ -412,13 +445,14 @@ def _selftest():
               piece(4, "L", prio=4), piece(5, None, prio=4), piece(6, "S", admitted=False, reason="not-ready", reply="start KIT-6"),
               piece(7, "S", admitted=False, reason="delegated")]
     doc = propose(view, pieces, cfg, usage, now)
-    check_("the proposal fits the pieces by the queue's order inside the room left (28 - 10 spent)",
-           ([x["ticket"] for x in doc["planned"]], doc["planned_usd"]), (["KIT-1", "KIT-2", "KIT-3"], 14.0))
+    check_("the proposal fits the pieces by the queue's order inside the sprint's points (1 + 2 + 3 of 7)",
+           ([x["ticket"] for x in doc["planned"]], doc["planned_points"], doc["budget_points"]),
+           (["KIT-1", "KIT-2", "KIT-3"], 6, 7))
     check_("what does not fit says why, and a held piece keeps its exact reply",
            [(x["ticket"], x["why"], x["reply"]) for x in doc["not_planned"]],
            [("KIT-4", "over-budget", None), ("KIT-5", "no-size", None),
             ("KIT-6", "not-ready", "start KIT-6"), ("KIT-7", "delegated", None)])
-    big = propose(view, pieces, dict(cfg, weekly_budget_usd=16), usage, now)
+    big = propose(view, pieces, dict(cfg, sprint_points=3), usage, now)
     check_("a smaller week plans fewer pieces and says the rest do not fit",
            ([x["ticket"] for x in big["planned"]], [x["why"] for x in big["not_planned"] if x["ticket"] in ("KIT-3", "KIT-4")]),
            (["KIT-1", "KIT-2"], ["over-budget", "over-budget"]))
@@ -427,26 +461,41 @@ def _selftest():
     check_("a piece the pool did not admit is never planned, however high its priority",
            all(t not in [x["ticket"] for x in doc["planned"]] for t in ("KIT-6", "KIT-7")), True)
     text = text_of(doc)
-    check_("the message names the budget, the room, the plan, what is out, the one reply and that nothing starts alone",
-           ("$28" in text, "$10" in text, "$18" in text, "KIT-1 (S, $2)" in text, "KIT-4: it does not fit" in text,
+    check_("the message names the points, the plan, what is out, the one reply and that nothing starts alone",
+           ("room for 7 points" in text, "6 points" in text, "KIT-1 (S, 1 point)" in text, "KIT-3 (L, 3 points)" in text,
+            "KIT-4: it does not fit the sprint's points" in text, "KIT-5: it has no effort label, so it is not started" in text,
             "KIT-6: it is not ready to start (reply `start KIT-6` to start it)" in text, "`plan sprint 2026-11-11`" in text,
-            "Nothing starts from this message alone" in text), (True,) * 8)
+            "Nothing starts from this message alone" in text, "$" in text), (True,) * 9 + (False,))
     check_("a title with angle brackets and an ampersand is cleaned as the status file cleans one, and shows safe",
            ("A b big /b bold one" in text and "<b>" not in text and "&lt;b" not in text and _safe("a<b>&") == "a&lt;b&gt;&amp;"), True)
     banned = sorted(set(w.lower() for w in bridge.BANNED_WORDS_RE.findall(text + text_of(big) + unknown_text("x") + " ".join(WHY.values()))))
     check_("no word the owner's DM keeps out", banned, [])
     check_("every reason the pool can give has a plain phrase, and no other", sorted(WHY), sorted(r for r in pool.REASONS if r != "admitted"))
-    for label, over, needle in (("no budget", {"weekly_budget_usd": None}, "no weekly budget"),
-                                ("a budget of zero", {"weekly_budget_usd": 0}, "no weekly budget")):
-        try:
-            propose(view, pieces, dict(cfg, **over), usage, now)
-            got = "proposed"
-        except SprintPlanError as exc:
-            got = str(exc)
-        check_("%s: no proposal, and it says so" % label, needle in got, True)
-    for label, u in (("a week the file cannot place", {"result": "ok", "week": {"known": False}}),
-                     ("a usage file with no week spend", {"result": "ok", "week": dict(usage["week"], usd=None)}),
-                     ("a spend that is a string", {"result": "ok", "week": dict(usage["week"], usd="9")})):
+    own = propose(view, pieces, order.config({"points_per_day": 1})[0], usage, now)
+    check_("with no sprint figure, the day's points times the sprint's working days (6 days of 1 point)",
+           (own["budget_points"], view["days_total"]), (6, 6))
+    check_("a sprint figure of the owner's wins over the day's points",
+           capacity(order.config({"points_per_day": 1, "sprint_points": 40})[0], view), 40)
+    check_("a piece with no effort label is not planned, and the message says it is not started",
+           ("KIT-5" in [x["ticket"] for x in own["not_planned"]]), True)
+    legacy = {"schema": SCHEMA, "sprint": doc["sprint"], "first_day": doc["first_day"], "resets_at": doc["resets_at"],
+              "proposed_at": doc["proposed_at"], "announced_at": None, "budget_usd": 28, "spent_usd": 10, "planned_usd": 2.0,
+              "planned": [{"ticket": "KIT-1", "effort": "S", "usd": 2.0, "title": ""}], "not_planned": [], "plan": None}
+    check_("a proposal written in dollars, before points, still loads and reads", (check(legacy), "$28" in text_of(legacy)), ([], True))
+    check_("…but one mixing the two is refused", bool(check(dict(legacy, budget_points=3))), True)
+    blk = points_block(cfg, {"points": {"planned": 10, "started": 4, "left": 6}}, view,
+                       {"sprint": {"week": doc["resets_at"], "points": 5}})
+    check_("the day plan's points: the day's from the queue, the sprint's from the ledger against its room",
+           blk, {"day": {"planned": 10, "started": 4, "left": 6}, "sprint": {"planned": 7, "started": 5, "left": 2}})
+    check_("…another week's count is not this sprint's, and a sprint it cannot place is none",
+           (points_block(cfg, {"points": {"planned": 10, "started": 4, "left": 6}}, view,
+                         {"sprint": {"week": "2026-11-03T18:00:00Z", "points": 5}})["sprint"]["started"],
+            points_block(cfg, {"points": {"planned": 10, "started": 4, "left": 6}}, {"known": False}, None)["sprint"]),
+           (0, None))
+    check_("…and the sprint's points left never go below none",
+           points_block(cfg, {"points": {"planned": 1, "started": 0, "left": 1}}, view,
+                        {"sprint": {"week": doc["resets_at"], "points": 99}})["sprint"]["left"], 0)
+    for label, u in (("a week the file cannot place", {"result": "ok", "week": {"known": False}}),):
         v = sprint.sprint_view(u, at(11, 8), days, tz=tz)
         try:
             propose(v, pieces, cfg, u, now)

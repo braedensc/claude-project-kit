@@ -26,18 +26,33 @@ REPO_BY_LABEL=
 BACKLOG=no
 AGENT_FILED=off
 
-# The day's planned work and hard stop, in dollars at API prices; lanes per repository (1 to 3).
-# The tech lead changes these three when you ask in your DM: "lower the planned load to 30" (KIT-700).
+# The day is sized in story points (KIT-923), the way a team sizes a sprint. A piece's effort label (S, M or L) gives
+# it points; a piece with no effort label is not started, and the stand-up says so. The queue takes on up to
+# POINTS_PER_DAY points in a working day, and sprint planning proposes up to the sprint's points.
+# Set ONE of POINTS_PER_DAY and SPRINT_POINTS (to use the sprint's, delete the POINTS_PER_DAY line and write, say, SPRINT_POINTS=60): the other follows from the working days in WINDOW_DAYS. Setting both is
+# refused. A piece bigger than the whole day may still take an empty day.
+EFFORT_POINTS=S=1,M=2,L=3
+POINTS_PER_DAY=10
+SPRINT_POINTS=
+# Pause new starts when the subscription's weekly usage reaches this percent (empty: off), for example 85. A week the
+# usage file gives no figure for holds new starts too, and the stand-up says it could not read it. Work already running
+# goes on; new starts go on when the week resets, or when you raise the share.
+USAGE_PAUSE_SHARE=
+# Lanes per repository (1 to 3): a day's points can run side by side in them.
+# The tech lead changes lanes (and the dollar stops below) when you ask in your DM: "make it two lanes" (KIT-700).
 # Your next queue install writes its change here, unless you changed that line yourself since.
-PLANNED_LOAD=40
-DAY_STOP=60
 LANES_PER_REPO=1
-# yes: pace each day's load to the plan's weekly reset, from the week's budget in dollars at API prices
-# (WEEKLY_BUDGET_USD). Pacing only ever lowers a day. Off by default.
+# Dollars at API prices, as RUNAWAY STOPS only: they are not how the day is sized, so they are set high, and a day that
+# reaches one is a day something ran away. The day's estimated dollars (PLANNED_LOAD) hold a piece, and today's spend at
+# DAY_STOP holds every start. Lower them only if you want a harder safety net.
+PLANNED_LOAD=400
+DAY_STOP=600
+# yes: also lower those two dollar stops each day to the plan's weekly reset, from the week's budget in dollars at API
+# prices (WEEKLY_BUDGET_USD). Pacing only ever lowers a stop. Off by default.
 PACE_TO_RESET=no
 WEEKLY_BUDGET_USD=
 # Sprint planning (KIT-575): a file name turns it on (empty: off). On the first morning of each new sprint (the plan's
-# week), the morning job writes ONE proposal of the week's work into it, sized to WEEKLY_BUDGET_USD (required). Your
+# week), the morning job writes ONE proposal of the week's work into it, sized to the sprint's points. Your
 # yes, in your DM, records the plan in it; nothing starts from the proposal alone. Name the same file in bridge.conf
 # (STANDUP_SPRINT_PLAN_FILE) so the stand-up can send the proposal. It must be outside every git working tree.
 SPRINT_PLAN_FILE=

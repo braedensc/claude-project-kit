@@ -307,10 +307,14 @@ def stop_words(decision):
     """KIT-695: the runaway stops a decision names, as fixed words and numbers only, sorted: the
     stop's code, the ref (a window name, a ticket id or a repository) and its value against its
     limit. [] for a decision with none, or no decision. The bridge ends its pass loud for as long as
-    this list is not empty, so a stop that holds every start reaches the owner as a page."""
+    this list is not empty, so a stop that holds every start reaches the owner as a page. The weekly share's
+    pause (KIT-923) is the owner's own setting working, said in the stand-up and the day plan, so it is no
+    page; a week the usage file gives no figure for is one."""
     out = []
     for item in (decision or {}).get("stops") or []:
         if not isinstance(item, dict) or not isinstance(item.get("stop"), str):
+            continue
+        if item["stop"] == "weekly-share" and item.get("ref") == "paused":
             continue
         words = item["stop"]
         if isinstance(item.get("ref"), str):
@@ -366,6 +370,10 @@ def decide(raw_config, gql, now, clock=time.time, say=None, room=None):
     paced = dict(paced, sprint_planned=sprint_plan.planned_for_usage(cfg["sprint_plan_file"], usage))
     decision = order.order(paced, now, with_extras(verdicts, inputs["extras"]),
                            inputs["running"], usage, inputs["ledger"])
+    # KIT-923: each start carries the usage file's week it falls in, so the ledger can count the sprint's points.
+    week = order.dig(usage, "week", "resets_at") if order.dig(usage, "week", "known") is True else None
+    for entry in decision["start"]:
+        entry["week"] = week if isinstance(week, str) and order.TIME_RE.match(week) else None
     return dict(out, state="decided", decision=decision, verdicts=verdicts,
                 why="partial" if inputs["result"] == "partial" else None)
 
@@ -376,7 +384,7 @@ def decide(raw_config, gql, now, clock=time.time, say=None, room=None):
 def read_ledger(path, today):
     """Today's ledger as written, or a new day's at zero. Raises ValueError for one that cannot
     be counted on, OSError for a file that cannot be read."""
-    zero = {"date": today, "starts": 0, "agent_filed_starts": 0, "rows": []}
+    zero = {"date": today, "starts": 0, "agent_filed_starts": 0, "points_started": 0, "sprint": None, "rows": []}
     try:
         with open(path, encoding="utf-8") as fh:
             doc = json.load(fh)
@@ -390,19 +398,28 @@ def read_ledger(path, today):
             and reader.whole_count(doc.get("agent_filed_starts"))
             and isinstance(rows, list) and all(isinstance(r, dict) for r in rows)):
         raise ValueError("the ledger is not a ledger of starts")
+    points, sprint = doc.get("points_started", 0), doc.get("sprint")
+    if not (reader.whole_count(points) and (sprint is None or (
+            isinstance(sprint, dict) and set(sprint) == {"week", "points"} and isinstance(sprint["week"], str)
+            and reader.whole_count(sprint["points"])))):
+        raise ValueError("the ledger's points are not counts")
     if doc["date"] > today:
         raise ValueError("the ledger is dated after today")
     if doc["date"] < today:
-        return zero
-    return {"date": today, "starts": doc["starts"],
-            "agent_filed_starts": doc["agent_filed_starts"], "rows": list(rows)}
+        return dict(zero, sprint=sprint)       # the sprint's points go on across days; the day's start again
+    return {"date": today, "starts": doc["starts"], "agent_filed_starts": doc["agent_filed_starts"],
+            "points_started": points, "sprint": sprint, "rows": list(rows)}
 
 
-def counted(led, ticket, source, now):
-    """The ledger with one more start of `source`."""
-    return dict(led, starts=led["starts"] + 1,
+def counted(led, ticket, source, now, points=0, week=None):
+    """The ledger with one more start of `source`, and the story points it takes on (KIT-923): the day's, and
+    the sprint's, which are counted per week of the usage file and start again when that week changes."""
+    sprint = led.get("sprint")
+    if week is not None:
+        sprint = {"week": week, "points": (sprint["points"] if sprint and sprint["week"] == week else 0) + points}
+    return dict(led, starts=led["starts"] + 1, points_started=led.get("points_started", 0) + points, sprint=sprint,
                 agent_filed_starts=led["agent_filed_starts"] + (source == "agent_filed"),
-                rows=led["rows"] + [{"ticket": ticket, "source": source, "at": pool.iso(now)}])
+                rows=led["rows"] + [{"ticket": ticket, "source": source, "at": pool.iso(now), "points": points}])
 
 
 class QueueBusy(OSError):
@@ -410,13 +427,15 @@ class QueueBusy(OSError):
     not a failure, so a caller that can tell it apart says so and ends its step quietly."""
 
 
-def record_start(path, now, ticket, source):
+def record_start(path, now, ticket, source, points=0, week=None):
     """Write today's row for a start about to be made, and return the ledger as written. Raises
     ValueError (a ledger that cannot be counted on, a ticket or source of the wrong shape, a
     folder inside a git working tree) or OSError (the disk would not take it): either way,
     nothing may start."""
     if not (isinstance(ticket, str) and TICKET_RE.match(ticket)) or source not in LEDGER_SOURCES:
         raise ValueError("a start names a ticket id and one of %s" % ", ".join(LEDGER_SOURCES))
+    if not (reader.whole_count(points) and (week is None or (isinstance(week, str) and order.TIME_RE.match(week)))):
+        raise ValueError("a start's points are a count, and its week a time or none")
     # KIT-681: one pass writes the ledger at a time. A second one finds it held, writes nothing and
     # raises, so nothing starts on its say (it is the same "nothing may start" as a bad ledger).
     folder = os.path.dirname(path)
@@ -427,7 +446,7 @@ def record_start(path, now, ticket, source):
     if handle is None:
         raise QueueBusy(pass_lock.BUSY_SAYS % "the queue's starter")
     try:
-        led = counted(read_ledger(path, pool.local_date(now)), ticket, source, now)
+        led = counted(read_ledger(path, pool.local_date(now)), ticket, source, now, points, week)
         write(led, path)
         return led
     finally:
@@ -724,15 +743,17 @@ def _cases(check, tmp, home):
                 fh.write(seed if isinstance(seed, str) else json.dumps(seed))
         before, got = open(path).read() if seed is not None else None, None
         try:
-            for ticket, source in starts:
-                got = record_start(path, NOW, ticket, source)
+            for ticket, source, *more in starts:
+                got = record_start(path, NOW, ticket, source, *more)
         except ValueError as exc:
             return ("refused", str(exc), open(path).read() == before if seed is not None
                     else not os.path.exists(path))
         mode = oct(os.stat(path).st_mode & 0o777)
         return (got["starts"], got["agent_filed_starts"],
                 [(r["ticket"], r["source"], r["at"]) for r in got["rows"]], mode,
-                reader.read_ledger(path, TODAY, lambda line: None)[0]["starts"])
+                reader.read_ledger(path, TODAY, lambda line: None)[0]["starts"],
+                got["points_started"], got["sprint"])
+    WK = "2026-11-10T18:00:00Z"
     counter = [0]
 
     def tempfile_dir():
@@ -948,13 +969,27 @@ def _cases(check, tmp, home):
             ("ledger: none yet, then the same day, then an agent-filed start",
              ledger_case(None, ("ENG-1", "todo"), ("ENG-2", "plan"), ("ENG-3", "agent_filed")),
              (3, 1, [("ENG-1", "todo", AT), ("ENG-2", "plan", AT), ("ENG-3", "agent_filed", AT)],
-              "0o600", 3)),
+              "0o600", 3, 0, None)),
             ("ledger: a day gone by starts again at zero",
              ledger_case({"date": "2026-11-03", "starts": 9, "agent_filed_starts": 4, "rows": []},
                          ("ENG-1", "todo"))[:3], (1, 0, [("ENG-1", "todo", AT)])),
             ("ledger: today's counts go on",
              ledger_case({"date": TODAY, "starts": 2, "agent_filed_starts": 1},
                          ("ENG-1", "backlog"))[:2], (3, 1)),
+            ("ledger points (KIT-923): the day's and the sprint's add up; a new day starts the day again and keeps the "
+             "sprint; a new week starts the sprint again; a start with no points adds none",
+             [(lambda g: (g[5], g[6]))(ledger_case(s, *st)) for s, st in (
+                 (None, [("ENG-1", "todo", 2, WK), ("ENG-2", "todo", 3, WK)]),
+                 ({"date": "2026-11-03", "starts": 9, "agent_filed_starts": 0, "points_started": 8,
+                   "sprint": {"week": WK, "points": 8}, "rows": []}, [("ENG-1", "todo", 1, WK)]),
+                 ({"date": TODAY, "starts": 1, "agent_filed_starts": 0, "points_started": 4,
+                   "sprint": {"week": "2026-11-03T18:00:00Z", "points": 9}, "rows": []}, [("ENG-1", "todo", 2, WK)]),
+                 ({"date": TODAY, "starts": 1, "agent_filed_starts": 0}, [("ENG-1", "resume")]))],
+             [(5, {"week": WK, "points": 5}), (1, {"week": WK, "points": 9}), (6, {"week": WK, "points": 2}),
+              (0, None)]),
+            ("ledger: points that are not a count, or a week that is not a time, refuse",
+             [ledger_case(None, ("ENG-1", "todo", p, w)) for p, w in ((1.5, None), (-1, None), (1, "monday"))],
+             [("refused", "a start's points are a count, and its week a time or none", True)] * 3),
             ("ledger: dated ahead, not JSON, or not whole counts refuses, and leaves it",
              [ledger_case(s, ("ENG-1", "todo")) for s in (
                  {"date": "2026-11-05", "starts": 0, "agent_filed_starts": 0}, "{not json",
@@ -981,6 +1016,10 @@ def _cases(check, tmp, home):
                                     {"stop": "day-hard-stop", "ref": None, "value": 61.5,
                                      "limit": 60}, "junk", {"stop": 5}]})],
              [[], [], ["day-hard-stop (61.5 against 60)", "plan-near-limit five_hour"]]),
+            ("stop_words: the weekly share's pause is no page, a week it cannot read is one",
+             [stop_words({"stops": [{"stop": "weekly-share", "ref": "paused", "value": 85.0, "limit": 85}]}),
+              stop_words({"stops": [{"stop": "weekly-share", "ref": "unreadable", "value": None, "limit": None}]})],
+             [[], ["weekly-share unreadable"]]),
             ("attribution: a fixed sentence for each source, ids and a time only",
              [say(), say(at=None), say(source="plan", plan="ENG-10"),
               say(source="backlog"), say(source="agent_filed"), say(source="plan", plan="x")],
@@ -1069,10 +1108,10 @@ def _cases(check, tmp, home):
              "days left; unreadable, the configured figures and a line saying why",
              [pace_view(), pace_view(order=dict(pace_to_reset=True, weekly_budget_usd=100)),
               pace_view(order=dict(pace_to_reset=True, weekly_budget_usd=100), known=False)],
-             [(40, []),
+             [(400, []),
               (17.5, ["queue: paced to the weekly reset: 70.0 left of 100 at the start of today, "
                               "over 4 working windows, so today plans 17.5 and stops at 26.25"]),
-              (40, ["queue: pacing is on, but the usage file cannot place the plan's "
+              (400, ["queue: pacing is on, but the usage file cannot place the plan's "
                           "week, so the day stays at its configured figures"])]),
             ("room: the readings, parsed from the fixed commands",
              (machine(), machine(pressure="4\n", volume=False, swap="used = 512.00K"),

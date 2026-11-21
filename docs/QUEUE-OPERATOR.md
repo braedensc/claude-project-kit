@@ -116,6 +116,9 @@ after the stop lifts. The page does not carry the stop's name: the bridge's log 
 Good: one page when `day-hard-stop` trips, one when it clears.
 Not that: starts held for hours with no page. Look at the stop the page names.
 
+The weekly share's pause (`weekly-share`, KIT-923) holds every new start too, but it is your own setting working, so a pause at the share
+sends no page: the stand-up says it. A week the usage file gives no figure for (`weekly-share unreadable`) is a stop that pages.
+
 ## When the plan's limit stops a piece
 
 If the 5-hour or weekly window cuts a session off, the usage file lists it (`limit_stops`). After that window resets, and
@@ -146,6 +149,38 @@ the limits admit (`agent_filed: limits`) is refused there, and the bridge's pass
 Todo yourself to start it, or keep `agent_filed` off while a project codes on the runner. The runner reads this queue's
 config file (`queue_config` in its own settings), so both must name the same file.
 
+## Sizing the day in story points
+
+On a subscription, dollars at API prices are not how a team sizes its work (KIT-923). The queue sizes a day the way a team
+sizes a sprint, in **story points**.
+
+- **Points per piece.** A piece's effort label gives it points: `EFFORT_POINTS=S=1,M=2,L=3` by default. A piece with **no effort
+  label is not started**, and the stand-up says so (`No effort label, so not started: ...`). Give it a label and it starts.
+- **Points per day and per sprint.** The queue takes on up to `POINTS_PER_DAY` points in a working day (default 10). Sprint
+  planning proposes up to the sprint's points. Set **one** of `POINTS_PER_DAY` and `SPRINT_POINTS`; the other follows from the
+  working days in `WINDOW_DAYS` (the sprint's points are the day's times the sprint's working days, and a `SPRINT_POINTS` of 52
+  over five working days is 11 a day, rounded up). Setting both is refused. A piece bigger than the whole day may still take an
+  empty day, so none is stuck. A day's points count when the queue starts a piece, and what runs now counts if that is more.
+- **Lanes.** `LANES_PER_REPO` stays the number of side-by-side lanes in a repository (1 to 3). A day's points can run in them in parallel.
+- **A pause at the weekly usage share.** Set `USAGE_PAUSE_SHARE` (a percent, for example 85) and new starts pause when the
+  subscription's weekly window has filled that far. Work already running goes on, and new starts go on when the week resets or you
+  raise the share. Empty is off. A usage file that gives no figure for the week holds new starts too, and says so: that is never
+  read as being under the share.
+- **Dollars are runaway stops only.** `PLANNED_LOAD` and `DAY_STOP` (and the piece stop) stay, set high on purpose (400 and 600). A day
+  that reaches one is a day something ran away, not a normal day.
+
+The stand-up says each state in words: `Points today: 4 of 10 done (started), 6 left.`, `Points this sprint: 12 of 40 done (started),
+28 left.`, `New starts are paused at the weekly share: the week's usage is at 87.5%, and the share you set is 85%. ...` and `New starts are
+holding: the usage file gives no figure for how full the week is, ...`. The same numbers are in the day plan file (`points`, contract §18)
+and the status file (`queue_points`). A piece counts as done when the queue starts it; a finished-and-merged count is not kept.
+
+**An existing `queue.conf`** that lacks these keys still loads, with the defaults. But if it still says `PLANNED_LOAD=40` and `DAY_STOP=60`
+(the old dollar day), those are now runaway stops, and a normal day will reach them: raise them (`PLANNED_LOAD=400`, `DAY_STOP=600`) or delete the two
+lines, then add `POINTS_PER_DAY` (or `SPRINT_POINTS`) and, if you want the pause, `USAGE_PAUSE_SHARE`.
+
+Good: `Points today: 4 of 10 done (started), 6 left.` Not that: no points line at all. The day plan has no `points` block until the morning job
+has run the new version once, and the stand-up says nothing about points until then.
+
 ## Pacing each day to the plan's weekly reset
 
 The plan's usage limit resets once a week, and a busy Monday can spend what Friday needed. Set `PACE_TO_RESET=yes` and
@@ -154,7 +189,7 @@ as the day began (the week's spend less today's), divided by the working windows
 load. Today's own spend does not shrink the day, so a pass late in the day plans what the morning did. Both the morning job and the queue's pass do this, so the plan and the starts agree.
 
 The reset is the usage file's own `seven_day` reset time, never a fixed day, so pacing moves when the plan's reset moves.
-Pacing only ever lowers a day: the figures never go above `PLANNED_LOAD` and `DAY_STOP`. A week with nothing left plans a
+Pacing lowers the two dollar runaway stops, never the day's points, and never above `PLANNED_LOAD` and `DAY_STOP`. A week with nothing left plans a
 cent, so any spend holds every start. It is off by default, and off changes nothing.
 
 Good: `paced to the weekly reset: 54.0 left of 90 at the start of today, over 3 working windows, so today plans 18.0 and stops at 27.0`. Not that:
@@ -164,10 +199,11 @@ than eight days off, no spend for today in the usage file, and no working window
 
 ## Sprint planning at the reset
 
-A sprint is the plan's week (`scripts/pipeline_sprint.py`). Set `SPRINT_PLAN_FILE` and `WEEKLY_BUDGET_USD` in `queue.conf`
+A sprint is the plan's week (`scripts/pipeline_sprint.py`). Set `SPRINT_PLAN_FILE` in `queue.conf`
 and, on the first morning of each new sprint, the morning job also writes **one proposal** of the week's work into that
-file: the pieces the pool admitted, in the queue's own order, as many as fit the week's budget less what the week has
-spent, each at its effort's estimate. What does not fit says why: over the budget, no size yet, or the pool's reason in plain words.
+file: the pieces the pool admitted, in the queue's own order, as many as fit the sprint's story points, each at its effort's points.
+What does not fit says why: over the sprint's points, no effort label (so not started), or the pool's reason in plain words. No dollar
+budget is needed. A proposal written before points (in dollars) still loads and reads as it was.
 
 A held piece that one reply would start keeps that reply in the list. The proposal offers nothing the pool did not
 admit, so it never offers work the pipeline cannot land. It is not proposed again for the same sprint. The stand-up
@@ -177,12 +213,12 @@ What the queue does with a recorded plan: **its pieces go first** among the piec
 morning job's day plan and in the starter that actually starts them (it reads the same `morning.sprint_plan_file`). That is all.
 It admits nothing, raises no budget and changes no stop. With no plan recorded, the order is what it was.
 
-Settings (`queue.conf` key, then the morning job's key): `SPRINT_PLAN_FILE` is `morning.sprint_plan_file`; `WEEKLY_BUDGET_USD` is
-`order.weekly_budget_usd`. The working days a sprint counts are `morning.sprint_days` (default `mon` to `sat`). A plan file
+Settings (`queue.conf` key, then the morning job's key): `SPRINT_PLAN_FILE` is `morning.sprint_plan_file`; `SPRINT_POINTS` is
+`order.sprint_points`, and `POINTS_PER_DAY` is `order.points_per_day`. The working days a sprint counts are `morning.sprint_days` (default `mon` to `sat`). A plan file
 must be outside every git working tree: it holds your yes. Name the same path in `bridge.conf` (`STANDUP_SPRINT_PLAN_FILE`).
 
-Good: `proposed a sprint plan for the week starting 2026-11-11: 4 piece(s), $18.00 of estimates`. Not that:
-`no sprint plan was proposed: the sprint is not known (...)`, or `... what the week has spent so far could not be read ...`.
+Good: `proposed a sprint plan for the week starting 2026-11-11: 4 piece(s), 12 of 60 point(s)`. Not that:
+`no sprint plan was proposed: the sprint is not known (...)`.
 The morning job then exits 3. A plan file it cannot read is never planned over, since your yes may be in it.
 
 ## When the tech lead changes a setting

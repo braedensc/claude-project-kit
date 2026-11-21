@@ -3351,7 +3351,7 @@ class PlansMixin(object):
             self.say("  [dry-run] the queue would %s %s" % (
                 "ask our runner to start" if runner else "hand to the agent", ident))
             return
-        starter.record_start(ledger, self.now, ident, entry["source"])
+        starter.record_start(ledger, self.now, ident, entry["source"], entry.get("points", 0), entry.get("week"))
         if piece:
             self.start_child(piece[0], piece[1], piece[2], agent_id, runner=runner)
             return
@@ -5173,9 +5173,9 @@ def cases_approve(kit):
             asks.append(now)
             return answer["v"]
 
-        def spy_record(path, now_, ticket, source):
+        def spy_record(path, now_, ticket, source, *more):
             order_seen.append((ticket, len(active[0].delegations)))
-            return real[1](path, now_, ticket, source)
+            return real[1](path, now_, ticket, source, *more)
         active = [None]
         starter.decide, starter.record_start = fake_decide, spy_record
         try:
@@ -5222,6 +5222,15 @@ def cases_approve(kit):
             run(c, s, t, at=now + 1100)
             check("the-queue-is-asked-at-most-every-queue-every-seconds",
                   (len(asks), delegated(t)), (0, ["uuid-51", "uuid-7"]))
+
+            # -- KIT-923: each start's story points and week go into the ledger row, the day's and the sprint's
+            WK = "2025-10-06T00:00:00Z"
+            c, s, t, out, ledger = queued("q-points", decided(
+                dict(start("PROD-51"), points=3, week=WK), dict(start("PROD-7", "todo", "acme/app:2"), points=2, week=WK)))
+            led_doc = json.load(open(ledger))
+            check("the-queue-records-each-starts-points-for-the-day-and-the-sprint",
+                  (led_doc["points_started"], led_doc["sprint"], [r["points"] for r in led_doc["rows"]], out[0]),
+                  (5, {"week": WK, "points": 5}, [3, 2], EXIT_OK))
 
             # -- KIT-645: our own runner. On a switched project the queue's start is a code
             #    request to the runner, and nothing is delegated; each later pass reads its answer.
@@ -5700,7 +5709,8 @@ def cases_approve(kit):
                     else:
                         self.hand_over(entry["id"], entry["ticket"], agent_id,
                                        starter.attribution(entry))
-                    starter.record_start(ledger, self.now, entry["ticket"], entry["source"])
+                    starter.record_start(ledger, self.now, entry["ticket"], entry["source"],
+                                         entry.get("points", 0), entry.get("week"))
                 return start_queued
 
             def ungated(saved):

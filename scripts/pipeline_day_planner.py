@@ -40,13 +40,16 @@ the result. No block, or two, is unusable. Each pick that fails is dropped with 
   bad-footprint    not a clean repository-relative pattern: no `..`, no absolute path, no
                    backslash or control character, at most 50 patterns of at most 200 characters,
                    from a strict character set
-  over-load        the batch's estimates are over the planned load: dropped from the end
+  over-load        the batch's estimates are over the planned load, or its story points over the day's
+                   points (KIT-923): dropped from the end
 It returns `{"planned_by", "why", "lanes", "dropped"}`: "agent" and why None, or "queue" with a
 reason (WHY) when the answer was unusable or nothing in it was valid, and the plain queue plans
 the day. The agent's `deferred` list is its own note and is not read.
 
 THE CONFIG.  Names and defaults are pipeline_queue_order's where they overlap: `lanes_per_repo`
-(never above 3), `lanes_by_repo`, `merge_gate_ready`, `estimates` and `planned_load`. Two more are
+(never above 3), `lanes_by_repo`, `merge_gate_ready`, `estimates` and `planned_load`. `points` and
+`points_per_day` (KIT-923) are the queue's too, but `points_per_day` is None here until the installer sets
+it, and None sets no points limit. Two more are
 this file's, sized for a runaway: `max_answer_chars` and `max_pieces`.
 """
 import argparse
@@ -96,8 +99,10 @@ DEFAULTS = {
     "lanes_per_repo": 1,                 # lanes in a repository: the queue's name and default
     "lanes_by_repo": {},                 # {"owner/name": n}: a repository's own, never above 3
     "merge_gate_ready": [],              # repositories whose gate tests open PRs together
-    "planned_load": 40,                  # the day's estimated work, in dollars at API prices
+    "planned_load": 400,                 # runaway stop: the day's estimated dollars at API prices (the queue's)
     "estimates": {"S": 2.0, "M": 4.0, "L": 8.0},    # a piece's estimate, by effort
+    "points": {"S": 1, "M": 2, "L": 3},  # a piece's story points, by effort (the queue's own)
+    "points_per_day": None,              # the day's story points; None: no points limit
     "max_answer_chars": 100000,          # an answer longer than this is not read
     "max_pieces": 300,                   # more admitted pieces than this are not briefed
 }
@@ -139,6 +144,11 @@ def config(raw):
              "must be a whole number from %d%s" % (low, "" if high is None else " to %d" % high))
     need("planned_load", amount(cfg["planned_load"]) and cfg["planned_load"] > 0,
          "must be a number above 0")
+    need("points", isinstance(cfg["points"], dict) and set(cfg["points"]) == set(EFFORTS)
+         and all(whole(v) and v >= 1 for v in cfg["points"].values()),
+         "must give S, M and L each a whole number, 1 or more")
+    need("points_per_day", cfg["points_per_day"] is None or (
+        whole(cfg["points_per_day"]) and cfg["points_per_day"] >= 1), "must be a whole number, 1 or more, or null")
     need("lanes_by_repo", isinstance(cfg["lanes_by_repo"], dict) and all(
         isinstance(k, str) and REPO_RE.match(k) and whole(v) and 1 <= v <= MAX_LANES
         for k, v in cfg["lanes_by_repo"].items()), "must map repositories to 1 to %d" % MAX_LANES)
@@ -259,6 +269,9 @@ def brief(pieces, cfg):
         "5. Fit the day: the batch's estimates (S %g, M %g, L %g dollars) stay within %g."
         % (cfg["estimates"]["S"], cfg["estimates"]["M"], cfg["estimates"]["L"],
            cfg["planned_load"]),
+        ] + (["6. The batch's story points (S %d, M %d, L %d) stay within %d, and a piece with no effort label is not "
+              "started." % (cfg["points"]["S"], cfg["points"]["M"], cfg["points"]["L"], cfg["points_per_day"])]
+             if cfg["points_per_day"] is not None else []) + [
         "Limits: %s." % (caps or "none, there are no pieces"), "",
         "Answer with exactly one fenced json block, and no other fenced block. Its shape is %s. "
         "Only ids, repositories and path patterns are read: any other words in your answer are "
@@ -384,10 +397,12 @@ def over_load(cfg, pool, flat):
     """The pieces, from the end, that do not fit the planned load: the first one whose running
     estimate passes it, and everything after. A piece with no effort counts at the largest."""
     worst, total = max(cfg["estimates"].values()), 0
+    worst_pts, points, per_day = max(cfg["points"].values()), 0, cfg["points_per_day"]
     for i, t in enumerate(flat):
         total += cfg["estimates"].get(pool[t]["effort"], worst)
-        if round(total, 6) > round(cfg["planned_load"], 6):
-            return flat[i:]
+        points += cfg["points"].get(pool[t]["effort"], worst_pts)
+        if round(total, 6) > round(cfg["planned_load"], 6) or (per_day is not None and i and points > per_day):
+            return flat[i:]               # a piece alone may take a day smaller than it, so none is stuck
     return []
 
 
@@ -649,6 +664,15 @@ def _cases(verify):
         ("…the estimates are the config's", ans(lane(A, [1, 7])), {"estimates": {
             "S": 3, "M": 4, "L": 8}, "planned_load": 5}, only((A, ["ENG-1"], L1), drops=[
                 ("ENG-7", "over-load")])),
+        ("a batch over the day's story points is cut from the end (KIT-923)", ans(lane(A, [1, 7, 3])),
+         {"points_per_day": 2}, only((A, ["ENG-1", "ENG-7"], L1), drops=[("ENG-3", "over-load")])),
+        ("…a piece alone bigger than the day takes an empty day", ans(lane(W, [4], ["w"])),
+         {"points_per_day": 2}, only((W, ["ENG-4"], ["w"]))),
+        ("…points are the config's: L is 4", ans(lane(A, [1, 7]), lane(W, [4], ["web/**"])),
+         dict(READY, points_per_day=5, points={"S": 1, "M": 2, "L": 4}),
+         only((A, ["ENG-1", "ENG-7"], L1), drops=[("ENG-4", "over-load")])),
+        ("…no points limit set is none", ans(lane(A, [1, 7, 3])), {"planned_load": 100},
+         only((A, ["ENG-1", "ENG-7", "ENG-3"], L1))),
         ("…a piece with no effort counts at the largest", ans(lane(A, [1, 10])),
          {"planned_load": 9}, only((A, ["ENG-1"], L1), drops=[("ENG-10", "over-load")])),
         ("the deferred list is the agent's own note: not read", ans(
@@ -792,7 +816,7 @@ def _cases(verify):
     good, why = config({})
     verify("the defaults are a sound config, and config is idempotent", (why, config(good)),
            ([], (good, [])))
-    shared = ("lanes_per_repo", "lanes_by_repo", "merge_gate_ready", "planned_load", "estimates")
+    shared = ("lanes_per_repo", "lanes_by_repo", "merge_gate_ready", "planned_load", "estimates", "points")
     verify("the names and defaults it shares with the queue are the queue's",
            ([DEFAULTS[k] for k in shared], MAX_LANES, EFFORTS, TICKET_RE.pattern, REPO_RE.pattern),
            ([queue.DEFAULTS[k] for k in shared], queue.MAX_LANES, queue.EFFORTS,
@@ -802,6 +826,10 @@ def _cases(verify):
            ("estimates for two efforts", {"estimates": {"S": 1, "M": 2}}),
            ("a negative estimate", {"estimates": {"S": -1, "M": 2, "L": 3}}),
            ("a load of nothing", {"planned_load": 0}),
+           ("points for two efforts", {"points": {"S": 1, "M": 2}}),
+           ("a fraction of a point", {"points": {"S": 0.5, "M": 2, "L": 3}}),
+           ("no points a day", {"points_per_day": 0}),
+           ("points a day that are text", {"points_per_day": "9"}),
            ("a load that is text", {"planned_load": "9"}),
            ("a gate list that is text", {"merge_gate_ready": "a/b"}),
            ("an answer cap of nothing", {"max_answer_chars": 0}),

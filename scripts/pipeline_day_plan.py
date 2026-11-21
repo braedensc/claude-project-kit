@@ -73,11 +73,11 @@ DROPS = ("not-in-pool", "duplicate", "wrong-repo", "blocker-order", "lane-cap", 
 WINDOW_STATES = ("open", "closed", "unknown")
 # The queue's closed lists (scripts/pipeline_queue_order.py): the selftest pins these equal.
 HELD = ("malformed", "no-repo", "no-estimate", "blockers-unreadable", "blocked", "stopped",
-        "no-lane", "running-cap", "starts-cap", "agent-filed-cap", "over-load")
+        "no-lane", "running-cap", "starts-cap", "agent-filed-cap", "over-load", "over-points")
 KINDS = ("plan", "agent_filed", "changed", "approval", "merge", "question")
 STOPS = ("usage-missing", "usage-failed", "usage-stale", "ledger-unknown", "plan-near-limit",
          "plan-at-limit", "day-hard-stop", "piece-cost", "too-many-running", "too-many-starts",
-         "api-key")
+         "api-key", "weekly-share")
 # The two fixed replies, and the verb each kind takes. A merge is done on GitHub, and a question
 # is answered in its thread: neither has a reply.
 REPLY = {"approve": "approve %s", "start": "start %s"}
@@ -178,7 +178,7 @@ def reply_for(kind, ref, said):
 # The document
 # --------------------------------------------------------------------------- #
 def build(date, window, decision, verdicts, spent, planned_load, hard_stop, planned_by, why, now,
-          titles=None, estimates=None, filed_from=None, progress=None, dropped=None):
+          titles=None, estimates=None, filed_from=None, progress=None, dropped=None, points=None):
     """The day plan, from what the queue and the pool said. See the module's docstring. Raises
     ValueError when what it is given cannot make a document: a bad date, number or window, or a
     record or a word it cannot read."""
@@ -311,7 +311,18 @@ def build(date, window, decision, verdicts, spent, planned_load, hard_stop, plan
             refuse("a dropped pick has a reason this writer does not know")
         cut.append({"id": pick(d.get("id"), TICKET_RE), "reason": d["reason"]})
     n_of = lambda state: sum(1 for p in flat if p["state"] == state)       # noqa: E731
-    return {
+    shown = None
+    if points is not None:                  # KIT-923: story points, the day's and the sprint's
+        def count(block):
+            ok = isinstance(block, dict) and set(block) == {"planned", "started", "left"} and all(
+                whole(block[k]) and block[k] >= 0 for k in block)
+            if not ok:
+                refuse("points are whole numbers of 0 or more: planned, started and left")
+            return dict((k, block[k]) for k in ("planned", "started", "left"))
+        if not (isinstance(points, dict) and set(points) == {"day", "sprint"}):
+            refuse("points name a day and a sprint")
+        shown = {"day": count(points["day"]), "sprint": None if points["sprint"] is None else count(points["sprint"])}
+    doc = {
         "schema": SCHEMA, "written_at": written, "date": date,
         "planned_by": {"who": planned_by, "why": why},
         "window": {"state": window["state"], "opens_at": opens, "closes_at": closes},
@@ -324,6 +335,9 @@ def build(date, window, decision, verdicts, spent, planned_load, hard_stop, plan
                    "started": n_of("started"), "done": n_of("done"), "held": n_of("held"),
                    "unplaced": len(lost - set(slots)) + nameless, "needs_ok": len(asks),
                    "agent_filed": len(filed), "stops": len(halted), "dropped": len(cut)}}
+    if shown is not None:
+        doc["points"] = shown
+    return doc
 
 
 # --------------------------------------------------------------------------- #
@@ -557,7 +571,11 @@ def _cases(check):
         ("a window time that is not one", dict(window=dict(WINDOW, opens_at="at nine"))),
         ("a date that is not a day", dict(date="2026-02-30")), ("a negative spend", dict(spent=-1)),
         ("a load of nothing", dict(planned_load=0)),
-        ("estimates for two efforts", dict(estimates={"S": 1, "M": 2})))
+        ("estimates for two efforts", dict(estimates={"S": 1, "M": 2})),
+        ("points that are not a day and a sprint", dict(points={"day": {"planned": 1, "started": 0, "left": 1}})),
+        ("points with a fraction", dict(points={"day": {"planned": 1.5, "started": 0, "left": 1}, "sprint": None})),
+        ("points below none", dict(points={"day": {"planned": 1, "started": -1, "left": 1}, "sprint": None})),
+        ("points with a missing count", dict(points={"day": {"planned": 1, "started": 0}, "sprint": None})))
     check("refused, each by name", [n for n, over in TABLE if attempt(**over) != REFUSED], [])
     check("a queue's reason; a spend nobody could read; a window nobody could read; seconds or Z",
           (make(planned_by="queue", why="several-blocks")["planned_by"],
@@ -569,6 +587,12 @@ def _cases(check):
            {"state": "unknown", "opens_at": None, "closes_at": None},
            {"state": "closed", "opens_at": "2026-11-04T15:05:00Z",
             "closes_at": "2026-11-04T20:00:00Z"}))
+    PTS = {"day": {"planned": 10, "started": 4, "left": 6}, "sprint": {"planned": 40, "started": 12, "left": 28}}
+    with_pts, no_pts = only(points=PTS), only()
+    check("points (KIT-923): carried through when given, valid by the schema, a sprint of none allowed; none given, none written",
+          (with_pts["points"], problems(with_pts), "points" in no_pts,
+           only(points=dict(PTS, sprint=None))["points"]["sprint"], problems(only(points=dict(PTS, sprint=None)))),
+          (PTS, [], False, None, []))
     empty = only(decision=dec(), planned_by="queue", why="no-answer")
     check("nothing planned is a document too", (problems(empty), empty["counts"]["lanes"]), ([], 0))
     check("a piece's estimate: the queue's own, else its effort's (or the caller's), else none",
