@@ -174,6 +174,11 @@ SWEEP_HEARTBEAT_MAX_AGE_MINUTES=180
 # three hours. Two passes running, Slack only. Empty: not watched, and every pass says so. docs/RUNNER.md, "The writer's key".
 WRITER_KEY_STATUS_FILE=
 
+# The chat limit's trips (KIT-941): a COPY of chat-cap-trips.json from the bridge's state folder, readable by this account.
+# The `chat-cap` kind raises each trip once, naming the chat and how many messages were held, to Slack only. An unreadable
+# copy is said after two passes, never read as no trips. Empty: not watched, and every pass says so.
+CHAT_CAP_TRIPS_FILE=
+
 # The yearly credentials' end dates (KIT-579): name:YYYY-MM-DD, comma separated. Names and
 # dates ONLY, never a token. The `credentials` kind opens a GitHub issue once a date is within
 # CREDENTIAL_WARN_DAYS (14 to 365) of today, or past; it never pages Slack. Empty: not watched.

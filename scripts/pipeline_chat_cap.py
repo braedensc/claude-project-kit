@@ -78,6 +78,13 @@ TRIPS_KEPT = 20
 SETTING_KEYS = ("chat_cap_max", "chat_cap_window_minutes")
 
 
+class HeldToken(str):
+    """The stand-in a held message answers with (KIT-941): timestamp-shaped, so a caller has
+    something to record, but never a message anywhere. A caller that keeps a record of what it
+    posted tests for this type and records the message as held instead; nothing may look a held
+    token up as a real message."""
+
+
 class CannotCheck(Exception):
     """The record cannot be read or locked. Nothing was sent, and nothing was kept."""
 
@@ -245,7 +252,7 @@ def _trip(st, key, entry, now, sent_in_window):
     """Reaching the limit, recorded where the health watch can read it."""
     line = {"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)), "chat": key,
             "max": st["max"], "window_minutes": int(st["window"] // 60),
-            "sent_in_window": sent_in_window}
+            "sent_in_window": sent_in_window, "held": 0}
     return line
 
 
@@ -273,6 +280,7 @@ def _send_digest(st, doc, key, entry, plain, now):
     plain(digest_text(st, entry, now))
     entry["held"], entry["dropped"] = [], 0
     entry["release_at"], entry["noticed"] = None, False
+    entry["held_total"] = 0
     entry["sent"].append(now)
 
 
@@ -298,6 +306,7 @@ def guarded_send(st, key, text, send, plain, thread=None, via="", keep=True, now
             # An episode of holds that kept nothing (a stream start, an "on it" line) has no
             # digest to end it. Its time has come, so the next trip is a trip (review of KIT-937).
             entry["release_at"], entry["noticed"] = None, False
+            entry["held_total"] = 0
         if entry["held"] and entry["release_at"] is not None and now >= entry["release_at"]:
             _send_digest(st, doc, key, entry, plain, now)
             _write(st["state_dir"], doc)
@@ -313,7 +322,8 @@ def _hold(st, doc, key, entry, text, thread, now, keep, plain):
     first = not entry["held"] and entry["release_at"] is None
     if first:
         entry["release_at"] = now + st["window"]
-    token = "%.6f" % (now + 0.000001 * (len(entry["held"]) + entry.get("dropped", 0)))
+    token = HeldToken("%.6f" % (now + 0.000001 * (len(entry["held"]) + entry.get("dropped", 0))))
+    entry["held_total"] = entry.get("held_total", 0) + 1
     if keep:
         h = _hash(key, thread, text)
         same = [x for x in entry["held"] if x.get("h") == h]
@@ -330,6 +340,11 @@ def _hold(st, doc, key, entry, text, thread, now, keep, plain):
         sys.stderr.write("CHAT LIMIT REACHED: %s got %d messages in %d minutes; holding the "
                          "rest. This is a runaway stop: look at what is sending.\n"
                          % (key, st["max"], int(st["window"] // 60)))
+    # The trip says how many messages this episode has held so far (KIT-941): every hold of the
+    # episode, kept or not, updates the newest trip of this chat.
+    mine = [t for t in doc["trips"] if t.get("chat") == key]
+    if mine:
+        mine[-1]["held"] = entry["held_total"]
     if not entry["noticed"]:
         try:
             plain(notice_text(st, entry, text, now))
@@ -339,8 +354,7 @@ def _hold(st, doc, key, entry, text, thread, now, keep, plain):
             sys.stderr.write("NOTE: the chat limit's notice could not be sent (%s)\n"
                              % type(exc).__name__)
     _write(st["state_dir"], doc)
-    if first:
-        _write_trips(st, doc)
+    _write_trips(st, doc)
     return token
 
 
@@ -371,6 +385,29 @@ def flush_due(st, via, send_for, now=None):
     except CannotCheck as exc:
         problems.append(str(exc))
     return sent, problems
+
+
+def read_trips(path):
+    """(trips, problem) from a trip record at `path` (the file itself or a copy of it): the
+    trips as a list of dicts, or None and a short plain reason. The reason is "absent" for a
+    file that does not exist, because the cap writes the file only at its first trip, so absent
+    can mean none yet; every other reason is a record that could not be read (KIT-941)."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except FileNotFoundError:
+        return None, "absent"
+    except (OSError, ValueError) as exc:
+        return None, "cannot be read (%s)" % type(exc).__name__
+    if (not isinstance(doc, dict) or doc.get("schema") != TRIPS_SCHEMA
+            or not isinstance(doc.get("trips"), list)):
+        return None, "is not in the shape %s" % TRIPS_SCHEMA
+    for t in doc["trips"]:
+        if (not isinstance(t, dict) or not isinstance(t.get("at"), str)
+                or not isinstance(t.get("chat"), str) or not isinstance(t.get("max"), int)
+                or not isinstance(t.get("window_minutes"), int)):
+            return None, "has a trip in no known shape"
+    return doc["trips"], None
 
 
 def status(st):
@@ -617,6 +654,39 @@ def _selftest_body():
     check("defaults", validate({}, errs), {"chat_cap_max": DEFAULT_MAX, "chat_cap_window_minutes": DEFAULT_WINDOW_MINUTES})
     validate({"chat_cap_max": 0, "chat_cap_window_minutes": "10"}, errs)
     check("a bad value is named, twice", len(errs), 2)
+    # KIT-941: a trip says how many messages the episode held; a held token is its own type.
+    st9 = fresh()
+    sink9 = Sink()
+    for i in range(3):
+        guarded_send(st9, "D9", "m%d" % i, sink9.one("m%d" % i), sink9.post, now=100.0 + i)
+    toks = [guarded_send(st9, "D9", "h%d" % i, sink9.one("h"), sink9.post, now=110.0 + i)[1]
+            for i in range(4)]
+    trips9, why9 = read_trips(_paths(st9["state_dir"])[2])
+    check("a held message answers with a HeldToken, never a plain string",
+          [type(t) is HeldToken for t in toks], [True] * 4)
+    check("the trip counts every message the episode held, and there is one trip",
+          (why9, len(trips9), trips9[0]["held"], trips9[0]["chat"]), (None, 1, 4, "D9"))
+    guarded_send(st9, "D9", "t", lambda: None, sink9.post, via="x", keep=False, now=115.0)
+    check("a hold that keeps nothing still counts",
+          read_trips(_paths(st9["state_dir"])[2])[0][0]["held"], 5)
+    guarded_send(st9, "D9", "after", sink9.one("after"), sink9.post, now=900.0)
+    guarded_send(st9, "D9", "n1", sink9.one("n1"), sink9.post, now=901.0)
+    for i in range(3):
+        guarded_send(st9, "D9", "again", sink9.one("a"), sink9.post, now=902.0 + i)
+    again = read_trips(_paths(st9["state_dir"])[2])[0]
+    check("a second episode is a second trip with its own count",
+          (len(again), again[0]["held"], again[1]["held"]), (2, 5, 3))
+    bad = os.path.join(st9["state_dir"], "bad.json")
+    check("a missing trip record is absent",
+          read_trips(os.path.join(st9["state_dir"], "none.json")), (None, "absent"))
+    with open(bad, "w") as fh:
+        fh.write("{")
+    check("an unreadable trip record is a problem, not none",
+          read_trips(bad)[0:1] + (read_trips(bad)[1].startswith("cannot be read"),), (None, True))
+    with open(bad, "w") as fh:
+        json.dump({"schema": TRIPS_SCHEMA, "trips": [{"at": 1}]}, fh)
+    check("a trip in no known shape is a problem", read_trips(bad)[0], None)
+
     check("a config with no state folder has no check", settings({}), None)
     check("a loaded config's settings", settings({"state_dir": "/x", "chat_cap_max": 5, "chat_cap_window_minutes": 2}),
           {"state_dir": "/x", "max": 5, "window": 120.0})
