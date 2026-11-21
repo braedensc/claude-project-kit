@@ -112,9 +112,14 @@ can be *proven* upstream-newer and everything differing degrades to bucket 2.
 python3 .claude/skills/sync-kit/compare.py --kit <kit-path> --project "$(git rev-parse --show-toplevel)"
 ```
 
-Surfaces compared: `.claude/hooks/`, `.claude/skills/`, `.github/workflows/`,
-`templates/workflows/`, `scripts/`, and top-level `docs/*.md`. Everything else —
+Surfaces compared: `.claude/hooks/`, `.husky/`, `.claude/skills/`, `.github/workflows/`,
+`templates/workflows/`, `schemas/`, `scripts/`, and top-level `docs/*.md`. Everything else —
 app code, `docs/adr/`, `docs/examples/` — is the project's own and is never examined.
+A kit template the project runs live as `.github/workflows/<same name>` counts as
+adopted and is compared against that live copy; it is never listed as new. A file or
+folder it could not read is listed under COULD NOT READ and was not compared: that is
+not "no differences". Each row carries `proposable`, true only for a copyable
+bucket-1 row; `.husky/` and `.claude/hooks/` rows are never proposable.
 Add `--json` if you want to drive the next steps programmatically.
 
 The classifier manufactures the merge base the two repos never shared: the kit
@@ -129,7 +134,7 @@ Verify the classifier itself whenever you touch it: `python3 .claude/skills/sync
 
 Bucket 1 is *candidates*, not a work order. Filter it:
 
-- **Hook files and `.claude/settings*.json` — report-only, always.** Never copy them,
+- **Hook files (`.claude/hooks/`, `.husky/`) and `.claude/settings*.json` — report-only, always.** Never copy them,
   in dry run or apply. Two reasons and either is sufficient: hook self-protection
   blocks the write in every kit-derived project anyway, and porting a guard needs
   judgement about how it composes with the guards that project already has. Emit a

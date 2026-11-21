@@ -48,6 +48,8 @@ import sys
 # own business and is never even looked at.
 SURFACES = (
     (".claude/hooks/",       "hook",     "report-only"),
+    (".husky/",              "hook",     "report-only"),
+    ("schemas/",             "schema",   "copyable"),
     (".claude/skills/",      "skill",    "informational"),
     (".github/workflows/",   "workflow", "copyable-flagged"),
     ("templates/workflows/", "template", "copyable"),
@@ -121,13 +123,25 @@ def matches(rel, globs):
     return any(fnmatch.fnmatch(rel, g) for g in globs)
 
 
-def walk(root):
-    """Every file under root that falls in a synced surface, repo-relative."""
+def walk(root, unreadable=None):
+    """Every file under root that falls in a synced surface, repo-relative.
+
+    A folder that exists but cannot be listed is appended to `unreadable` (when
+    given) instead of reading as empty: an empty answer would look like "no
+    differences" for a surface that was never compared (contract section 13).
+    """
     out = set()
+
+    def failed(err):
+        if unreadable is not None and os.path.exists(err.filename):
+            unreadable.append(os.path.relpath(err.filename, root) + "/")
+
     for prefix, _kind, _tier in SURFACES:
         base = os.path.join(root, prefix)
-        for dirpath, dirnames, filenames in os.walk(base):
-            dirnames[:] = [d for d in dirnames if d not in (".git", "__pycache__")]
+        for dirpath, dirnames, filenames in os.walk(base, onerror=failed):
+            # .husky/_ is husky's generated runtime, not a project file.
+            dirnames[:] = [d for d in dirnames
+                           if d not in (".git", "__pycache__", "_")]
             for fn in filenames:
                 rel = os.path.relpath(os.path.join(dirpath, fn), root)
                 if in_surface(rel) and not matches(rel, ALWAYS_INTENTIONAL):
@@ -199,21 +213,50 @@ def kit_state(kit, want_ref):
 
 def classify(kit, project, config):
     extra_intentional = tuple(config.get("intentional", ()))
-    kit_files, proj_files = walk(kit), walk(project)
+    bad_dirs = []
+    kit_files, proj_files = walk(kit, bad_dirs), walk(project, bad_dirs)
     has_templates = os.path.isdir(os.path.join(project, "templates"))
     has_pipeline = os.path.exists(os.path.join(project, "delivery.json"))
     rows = []
 
     for rel in sorted(kit_files | proj_files):
+        if any(rel.startswith(d) for d in bad_dirs):
+            continue  # inside a folder we could not list: reported once, below
         kind, tier = in_surface(rel)
         kb = read(os.path.join(kit, rel))
         pb = read(os.path.join(project, rel))
+        live = None  # the live .github/workflows/ copy of an adopted template
 
         def row(bucket, status, note="", **kw):
             entry = dict(path=rel, kind=kind, tier=tier, bucket=bucket,
                          status=status, note=note)
             entry.update(kw)  # callers may downgrade the action tier
+            # Only a bucket-1 copy tier may go into the proposed PR. A hook
+            # (.claude/hooks/, .husky/) is report-only whatever else is true.
+            entry["proposable"] = (entry["bucket"] == 1 and entry["kind"] != "hook"
+                                   and entry["tier"] in ("copyable", "copyable-flagged"))
             rows.append(entry)
+
+        # A path that exists but cannot be read is not "absent": say so.
+        if kb is None and os.path.lexists(os.path.join(kit, rel)):
+            row(4, "unreadable", "the kit's copy could not be read — not compared")
+            continue
+        if pb is None and os.path.lexists(os.path.join(project, rel)):
+            row(4, "unreadable", "the project's copy could not be read — not compared")
+            continue
+
+        if pb is None and kind == "template" and not matches(rel, extra_intentional):
+            # A template the project runs live as .github/workflows/<name> is
+            # adopted: compare it against that copy, never call it new.
+            live_rel = ".github/workflows/" + rel[len("templates/workflows/"):]
+            live_path = os.path.join(project, live_rel)
+            pb = read(live_path)
+            if pb is not None:
+                live = live_rel
+            elif os.path.lexists(live_path):
+                row(4, "unreadable", f"the project's live copy {live_rel} could not "
+                                     f"be read — not compared")
+                continue
 
         if matches(rel, extra_intentional):
             row(2, "configured", "listed under `intentional` in the sync config")
@@ -241,7 +284,7 @@ def classify(kit, project, config):
         elif kb is None:
             row(2, "project-only", "the project's own file")
         elif blob_sha(kb) == blob_sha(pb):
-            row(0, "in-sync")
+            row(0, "in-sync", f"adopted: live as {live}" if live else "")
         else:
             hist = history(kit, rel)
             if hist is None:
@@ -257,7 +300,8 @@ def classify(kit, project, config):
                 behind = [s for s, _ in hist].index(psha)
                 row(1, "behind-upstream",
                     f"project bytes == kit {match[:8]}; never edited locally "
-                    f"({behind} upstream revision(s) since)")
+                    f"({behind} upstream revision(s) since)"
+                    + (f"; adopted, live as {live}" if live else ""))
             else:
                 near = min(hist, key=lambda sc: distance(kit, sc[0], pb))
                 if near[0] == head:
@@ -268,6 +312,10 @@ def classify(kit, project, config):
                     row(3, "drifted",
                         f"nearest upstream base {near[1][:8]} is behind kit HEAD — "
                         f"both sides moved")
+    for d in sorted(set(bad_dirs)):
+        rows.append(dict(path=d, kind="dir", tier="informational", bucket=4,
+                         status="unreadable", proposable=False,
+                         note="folder could not be listed — nothing in it was compared"))
     return rows
 
 
@@ -284,12 +332,13 @@ BUCKETS = {
     1: "1 · UPSTREAM-NEWER — candidates for a PR",
     2: "2 · PROJECT-SPECIFIC — intentional, never drift",
     3: "3 · DRIFTED — both sides changed; human judgement only",
+    4: "COULD NOT READ — not compared; this is NOT 'no differences'",
 }
 
 
 def render(rows):
     out = []
-    for b in (1, 3, 2, 0):
+    for b in (4, 1, 3, 2, 0):
         group = [r for r in rows if r["bucket"] == b]
         if not group:
             continue
@@ -336,11 +385,19 @@ def _selftest():
     wf(kit, "docs/TESTING.md", "old testing doc\n")
     wf(kit, "scripts/stable.py", "never changes\n")
     wf(kit, "templates/workflows/backup-cron.yml", "on: schedule\n")
+    wf(kit, ".husky/pre-commit", "scan v1\n")
+    wf(kit, "schemas/alpha.schema.json", "{}\n")
+    wf(kit, "schemas/beta.schema.json", "{}\n")
+    wf(kit, "templates/workflows/ship-it.yml", "on: push\n")
+    wf(kit, "templates/workflows/same-flow.yml", "on: pull_request\n")
     commit("v1")
     # v2 — the kit moves on
     wf(kit, "docs/TESTING.md", "new testing doc\nwith more\n")
     wf(kit, "scripts/shared.py", "one\ntwo\nthree-upstream\n")
     wf(kit, "scripts/brand-new.py", "added upstream\n")
+    wf(kit, ".husky/pre-commit", "scan v2\n")
+    wf(kit, "schemas/alpha.schema.json", "{\"v\": 2}\n")
+    wf(kit, "templates/workflows/ship-it.yml", "on: [push, pull_request]\n")
     commit("v2")
 
     os.makedirs(proj)
@@ -352,11 +409,17 @@ def _selftest():
     wf(proj, "scripts/stable.py", "never changes\nplus a project guard\n")
     # bucket 2, project-only
     wf(proj, "scripts/only-here.mjs", "project code\n")
+    # KIT-959: .husky/ and schemas/ are compared; the hook is report-only
+    wf(proj, ".husky/pre-commit", "scan v1\n")
+    wf(proj, "schemas/alpha.schema.json", "{}\n")  # behind; beta.schema.json absent
+    # KIT-959: templates run live under .github/workflows/ are adopted
+    wf(proj, ".github/workflows/ship-it.yml", "on: push\n")           # behind
+    wf(proj, ".github/workflows/same-flow.yml", "on: pull_request\n")  # in sync
     # bucket 1, new upstream: scripts/brand-new.py simply absent
     # bucket 2, unadopted: no templates/ dir downstream
 
-    got = {r["path"]: (r["bucket"], r["status"])
-           for r in classify(kit, proj, {})}
+    rows1 = classify(kit, proj, {})
+    got = {r["path"]: (r["bucket"], r["status"]) for r in rows1}
     expect = {
         "docs/TESTING.md":                    (1, "behind-upstream"),
         "scripts/brand-new.py":               (1, "new-upstream"),
@@ -364,6 +427,11 @@ def _selftest():
         "scripts/stable.py":                  (2, "local-edits"),
         "scripts/only-here.mjs":              (2, "project-only"),
         "templates/workflows/backup-cron.yml": (2, "unadopted"),
+        ".husky/pre-commit":                  (1, "behind-upstream"),
+        "schemas/alpha.schema.json":          (1, "behind-upstream"),
+        "schemas/beta.schema.json":           (1, "new-upstream"),
+        "templates/workflows/ship-it.yml":    (1, "behind-upstream"),
+        "templates/workflows/same-flow.yml":  (0, "in-sync"),
     }
     fails = [f"  {p}: expected {v}, got {got.get(p)}"
              for p, v in expect.items() if got.get(p) != v]
@@ -382,11 +450,50 @@ def _selftest():
     if got3.get("docs/TESTING.md") != (2, "unclassified"):
         fails.append(f"  no-history degrade: got {got3.get('docs/TESTING.md')}")
 
+    # A hook row is never proposable; a copyable schema row is.
+    prop = {r["path"]: r["proposable"] for r in rows1}
+    if prop.get(".husky/pre-commit") is not False:
+        fails.append("  .husky/pre-commit must be report-only, never proposable")
+    if prop.get("schemas/beta.schema.json") is not True:
+        fails.append("  schemas/beta.schema.json should be proposable")
+    # A project with its own templates/ folder still does not see an adopted
+    # template as new.
+    proj2 = os.path.join(tmp, "proj2")
+    shutil.copytree(proj, proj2)
+    wf(proj2, "templates/workflows/mine.yml", "on: workflow_dispatch\n")
+    got4 = {r["path"]: (r["bucket"], r["status"]) for r in classify(kit, proj2, {})}
+    if got4.get("templates/workflows/ship-it.yml") != (1, "behind-upstream"):
+        fails.append(f"  adopted template, project has templates/: "
+                     f"{got4.get('templates/workflows/ship-it.yml')}")
+    # Unreadable surfaces are named, never read as absent or as no differences.
+    n_unreadable = 0
+    if hasattr(os, "geteuid") and os.geteuid() != 0:
+        n_unreadable = 2
+        proj3 = os.path.join(tmp, "proj3")
+        shutil.copytree(proj, proj3)
+        locked_file = os.path.join(proj3, "schemas", "alpha.schema.json")
+        locked_dir = os.path.join(proj3, ".husky")
+        os.chmod(locked_file, 0)
+        os.chmod(locked_dir, 0)
+        try:
+            rows3 = classify(kit, proj3, {})
+        finally:
+            os.chmod(locked_file, 0o644)
+            os.chmod(locked_dir, 0o755)
+        got5 = {r["path"]: (r["bucket"], r["status"]) for r in rows3}
+        if got5.get("schemas/alpha.schema.json") != (4, "unreadable"):
+            fails.append(f"  unreadable file: {got5.get('schemas/alpha.schema.json')}")
+        if got5.get(".husky/") != (4, "unreadable") or ".husky/pre-commit" in got5:
+            fails.append(f"  unreadable folder: {got5.get('.husky/')}, "
+                         f"file inside: {got5.get('.husky/pre-commit')}")
+        if "COULD NOT READ" not in render(rows3):
+            fails.append("  the report does not name what it could not read")
+
     shutil.rmtree(tmp, ignore_errors=True)
     if fails:
         print("FAIL: sync-kit classifier\n" + "\n".join(fails))
         return 1
-    print(f"OK: sync-kit classifier ({len(expect) + 2} cases)")
+    print(f"OK: sync-kit classifier ({len(expect) + 6 + n_unreadable} cases)")
     return 0
 
 
