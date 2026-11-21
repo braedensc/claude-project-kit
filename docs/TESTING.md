@@ -239,13 +239,13 @@ fan-in job that keeps the old name (next section).
 
 | Job | Limit | Required to merge | Before (20 Nov) | Measured now |
 | --- | --- | --- | --- | --- |
-| Kit checks (fan-in) | 5 minutes | yes | one job, 14m25s of 15 | pending: the three runs of KIT-945 |
-| Kit checks shard 1/3, 2/3, 3/3 | 15 minutes | through the fan-in | | pending: the three runs of KIT-945 |
-| Temp-leak sweeps (fan-in) | 5 minutes | yes, since 12 Nov 2026 | one job, 15m32s of 20 | pending: the three runs of KIT-945 |
-| Temp-leak sweeps shard 1/2, 2/2 | 20 minutes | through the fan-in | | pending: the three runs of KIT-945 |
+| Kit checks (fan-in) | 5 minutes | yes | one job, 14m25s of 15 | under 10 seconds |
+| Kit checks shard 1/3, 2/3, 3/3 | 15 minutes | through the fan-in | | 3.4 to 4.9 minutes (three runs, slowest 4.9) |
+| Temp-leak sweeps (fan-in) | 5 minutes | yes, since 12 Nov 2026 | one job, 15m32s of 20 | under 15 seconds |
+| Temp-leak sweeps shard 1/2, 2/2 | 20 minutes | through the fan-in | | 5.5 minutes (shard 1) and 7.8 to 8.0 minutes (shard 2), three runs |
 | Provenance scan | 10 minutes | yes | under a minute | under a minute |
-| Kit checks (Python 3.9, the Mac's) (fan-in) | 5 minutes | no | one job, 28m31s and 29m38s of 30, then cancelled | pending: the three runs of KIT-945 |
-| Kit checks (Python 3.9, the Mac's) shard 1/5 to 5/5 | 20 minutes | no | | pending: the three runs of KIT-945 |
+| Kit checks (Python 3.9, the Mac's) (fan-in) | 5 minutes | no | one job, 28m31s and 29m38s of 30, then cancelled | under 15 seconds |
+| Kit checks (Python 3.9, the Mac's) shard 1/5 to 5/5 | 20 minutes | no | | 4.3 to 6.7 minutes for shards 1, 3, 4 and 5; 11.1 to 12.9 minutes for shard 2 (test:runner-setup alone is about 9.5 minutes on macOS), three runs |
 
 ## How the batteries are split (KIT-945)
 
