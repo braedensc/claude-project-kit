@@ -1002,6 +1002,8 @@ def selftest():
         check("limit:a-held-post-answers-with-a-timestamp-shaped-token-so-the-caller-records-it",
               (got[:2], all(re.match(r"^\d+\.\d{6}$", t) for t in got)),
               (["1700000000.000001", "1700000000.000002"], True))
+        check("limit:a-held-post-answers-with-the-HeldToken-type-itself-not-a-copy-of-it",
+              [type(t) is chat_cap.HeldToken for t in got], [False, False, True, True, True, True])
         got, sent = through(landed, lambda: limited.start_stream("D1", "1.0", "hello", "U1", "T1"))
         check("limit:a-stream-is-a-message-held-it-raises-and-sends-nothing",
               (str(got).startswith("BridgeError: held by the chat limit"), sent), (True, []))

@@ -1053,7 +1053,7 @@ def check_writer_key(env, conf, state):
 def _trip_words(trip):
     held = trip.get("held")
     held = held if isinstance(held, int) and not isinstance(held, bool) and held >= 0 else 0
-    return "chat %s reached its limit of %d messages in %d minutes at %s, and %d message%s held" % (
+    return "chat %s reached its limit of %d messages in %d minutes at %s, and %d message%s held so far (the count is as of this pass and may grow until the digest goes out)" % (
         trip["chat"][:40], trip["max"], trip["window_minutes"], trip["at"][:25], held,
         " was" if held == 1 else "s were")
 
@@ -3114,7 +3114,7 @@ def selftest():
         cc_write([cc_trip("2026-11-20T10:00:00Z", "D123", 7)])
         first = check_chat_cap(env, ccc, st_c)
         check("a trip fires once, naming the chat and how many messages were held",
-              (first["state"], "D123" in first["summary"], "7 messages were held" in first["summary"]),
+              (first["state"], "D123" in first["summary"], "7 messages were held so far" in first["summary"]),
               (FIRING, True, True))
         again = check_chat_cap(env, ccc, st_c)
         check("the same trip on the next pass is not raised again",
@@ -3122,7 +3122,7 @@ def selftest():
         cc_write([cc_trip("2026-11-20T10:00:00Z", "D123", 9), cc_trip("2026-11-20T12:00:00Z", "D456", 1)])
         third = check_chat_cap(env, ccc, st_c)
         check("a later trip is raised on its own, and the earlier one is not repeated",
-              (third["state"], "D456" in third["summary"], "1 message was held" in third["summary"],
+              (third["state"], "D456" in third["summary"], "1 message was held so far" in third["summary"],
                "D123" in third["summary"]), (FIRING, True, True, False))
         seen_c = []
         for name, writer in (("unreadable", lambda: open(cc_path, "w").write("{")),
