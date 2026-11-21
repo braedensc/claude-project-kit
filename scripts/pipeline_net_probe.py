@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Measure the pipeline account's network path to GitHub and Linear (KIT-948). Read-only.
 
-    python3 scripts/pipeline_net_probe.py [--account _clawdispatch] [--attempts 3] [--timeout 5]
+    python3 scripts/pipeline_net_probe.py [--account NAME | --conf runner.conf] [--attempts 3] [--timeout 5]
+
+The role account is `--account`, or the `ROLE_ACCOUNT` line of the runner's conf (`--conf`, default
+runner.conf beside this script's repo). With neither, it stops and says so.
 
 WHY. The role account's calls to GitHub and Linear sometimes end in "[Errno 60] Operation timed
 out" while the owner's own calls work. Three causes are possible and none was measured: a firewall
@@ -27,7 +30,8 @@ import re
 import subprocess
 import sys
 
-DEFAULT_ACCOUNT = "_clawdispatch"
+KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+MAX_ANCHORS, MAX_DEPTH = 200, 6          # a walk past these is said, never read as done
 HOSTS = ("api.github.com", "api.linear.app")
 
 # Runs as the role account, with `-I`: argv is (attempts, timeout, host...). Prints one JSON document.
@@ -92,6 +96,21 @@ def parse_probe(text):
     return doc if ok else None
 
 
+def conf_account(path):
+    """The ROLE_ACCOUNT line of a KEY=value conf (its last active one), or None."""
+    try:
+        with open(path) as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return None
+    found = None
+    for line in lines:
+        m = re.match(r"\s*ROLE_ACCOUNT\s*=\s*(.*?)\s*$", line)
+        if m:
+            found = m.group(1).strip("'\"") or None
+    return found
+
+
 def uid_of(account, runner=run):
     code, out, _err = runner(["id", "-u", account])
     return out.strip() if code == 0 and out.strip().isdigit() else None
@@ -107,15 +126,45 @@ def applies_to(rule, account, uid):
     return account in names or (uid is not None and uid in names)
 
 
+def list_anchors(runner):
+    """(anchors, problems): every anchor under the main ruleset, walked one level at a time. `pfctl -s
+    Anchors` shows only the anchors directly below the one named by -a (pfctl(8)), so each is asked in
+    turn. A walk that fails, or goes past MAX_DEPTH or MAX_ANCHORS, names what it did not read."""
+    problems, found, queue = [], [], [(None, 0)]
+    while queue:
+        parent, depth = queue.pop(0)
+        argv = ["sudo", "pfctl", "-s", "Anchors"] + (["-a", parent] if parent else [])
+        code, out, err = runner(argv)
+        if code != 0:
+            problems.append("could not list the anchors below %s (exit %d): %s"
+                            % (parent or "the main ruleset", code, err.strip()[-160:]))
+            continue
+        for raw in out.splitlines():
+            name = raw.strip()
+            if name.endswith("/*"):
+                name = name[:-2]
+            if not name:
+                continue
+            if parent and not name.startswith(parent + "/"):
+                name = parent + "/" + name
+            if name in found:
+                continue
+            if depth + 1 > MAX_DEPTH or len(found) >= MAX_ANCHORS:
+                problems.append("did not read the anchors below %s: the walk stops at depth %d and %d "
+                                "anchors" % (name, MAX_DEPTH, MAX_ANCHORS))
+                continue
+            found.append(name)
+            queue.append((name, depth + 1))
+    return found, problems
+
+
 def filter_rules(account, uid, runner=run):
     """(anchors, rules, problems): every anchor the filter names, and each rule line, from the main
     ruleset and from each anchor, that applies to the account and blocks or redirects. `pfctl -s`
-    only lists."""
-    problems, rules = [], []
-    code, out, err = runner(["sudo", "pfctl", "-s", "Anchors"])
-    if code != 0:
-        problems.append("could not list the filter's anchors (exit %d): %s" % (code, err.strip()[-160:]))
-    anchors = [a.strip() for a in out.splitlines() if a.strip()]
+    only lists. Anything it could not list or read is a problem, so "none" is said only of rules it
+    read."""
+    rules = []
+    anchors, problems = list_anchors(runner)
     for anchor in [None] + anchors:
         argv = ["sudo", "pfctl", "-s", "rules"] + (["-a", anchor] if anchor else [])
         code, out, err = runner(argv)
@@ -153,13 +202,19 @@ def summarize(label, doc):
 
 def main(argv=None, runner=run, say=print):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--account", default=DEFAULT_ACCOUNT)
+    ap.add_argument("--account", default=None)
+    ap.add_argument("--conf", default=os.path.join(KIT, "runner.conf"))
     ap.add_argument("--attempts", type=int, default=3)
     ap.add_argument("--timeout", type=float, default=5.0)
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args(argv)
     if args.selftest:
         return selftest()
+    if args.account is None:
+        args.account = conf_account(args.conf)
+    if not args.account:
+        say("No role account: name it with --account, or give --conf a runner.conf with a ROLE_ACCOUNT line.")
+        return 2
     if not 1 <= args.attempts <= 10 or not 1 <= args.timeout <= 30:
         say("--attempts is 1 to 10 and --timeout is 1 to 30 seconds.")
         return 2
@@ -187,14 +242,16 @@ def main(argv=None, runner=run, say=print):
                                            % (c.get("error", ""), c["ms"])))
     say("")
     say("Packet filter anchors: %s" % (", ".join(anchors) or "none listed"))
-    say("Packet filter rules that apply to %s (block, drop, redirect, route): %s"
-        % (args.account, "none" if not rules else ""))
+    say("Packet filter rules that apply to %s (block, drop, redirect, route), from the main ruleset and "
+        "%d anchor(s): %s" % (args.account, len(anchors),
+                              "" if rules else ("none" if not problems else
+                                                "none seen, but not all of it was read (NOT MEASURED below)")))
     for rule in rules:
         say("  " + rule)
     for problem in problems:
         say("NOT MEASURED: " + problem)
     say("")
-    say("Paste everything above on KIT-948. If IPv6 resolves but its connects fail while IPv4 works, "
+    say("Paste everything above to the coordinator chat. If IPv6 resolves but its connects fail while IPv4 works, "
         "or a rule above drops an address, that is the cause. If both families connect, the "
         "timeouts are network loss, and the retry in the installer's dry run is the answer.")
     return 4 if failed or problems else 0
@@ -228,26 +285,49 @@ def selftest():
 
     seen = []
 
-    def fake(argv):
-        seen.append(argv)
-        if argv[:3] == ["id", "-u", "_r"]:
-            return 0, "300\n", ""
-        if "-I" in argv:
-            return 0, json.dumps(good), ""
-        if argv[-2:] == ["-s", "Anchors"] or argv[-1] == "Anchors":
-            return 0, "com.apple/*\nmine\n", ""
-        if argv[-1] == "rules":
-            return 0, "pass in all\nblock drop out proto tcp user 501\nblock drop out inet6 user _r\n", ""
-        if argv[-1] == "mine" or "-a" in argv:
-            return 0, "block return out all\n", ""
-        return 1, "", "no"
+    tree = {None: ["com.apple/*", "mine"], "com.apple": ["com.apple/250.ApplicationFirewall"],
+            "com.apple/250.ApplicationFirewall": [], "mine": ["deep"], "mine/deep": []}
+    rules_of = {None: "pass in all\nblock drop out proto tcp user 501\n", "com.apple": "pass all\n",
+                "com.apple/250.ApplicationFirewall": "", "mine": "pass out all\n",
+                "mine/deep": "block drop out inet6 user _r\n"}
+
+    def make_fake(unreadable=()):
+        def fake(argv):
+            seen.append(argv)
+            if argv[:3] == ["id", "-u", "_r"]:
+                return 0, "300\n", ""
+            if "-I" in argv:
+                return 0, json.dumps(good), ""
+            anchor = argv[argv.index("-a") + 1] if "-a" in argv else None
+            if anchor in unreadable:
+                return 1, "", "pfctl: anchor unreadable"
+            if argv[-1] == "Anchors" or argv[3:5] == ["Anchors", "-a"]:
+                return 0, "".join(x + "\n" for x in tree[anchor]), ""
+            if argv[3] == "rules":
+                return 0, rules_of[anchor], ""
+            return 1, "", "no"
+        return fake
+    fake = make_fake()
     out = []
     code = main(["--account", "_r"], runner=fake, say=out.append)
     text = "\n".join(out)
     check("report-exit-ok", code, 0)
-    check("report-lists-the-rule-for-the-account-and-skips-the-other-users",
-          ("block drop out inet6 user _r" in text, "user 501" in text), (True, False))
-    check("report-names-anchors", "com.apple/*, mine" in text, True)
+    check("report-reads-a-rule-in-a-nested-anchor-and-skips-the-other-users",
+          ("mine/deep: block drop out inet6 user _r" in text, "user 501" in text), (True, False))
+    check("report-names-every-anchor-nested-too",
+          "com.apple, mine, com.apple/250.ApplicationFirewall, mine/deep" in text, True)
+    out = []
+    code = main(["--account", "_r"], runner=make_fake(unreadable=("mine",)), say=out.append)
+    text_u = "\n".join(out)
+    check("a-nested-anchor-it-could-not-list-or-read-is-not-measured-never-none",
+          (code, "NOT MEASURED: could not list the anchors below mine" in text_u,
+           "NOT MEASURED: could not read the rules of mine" in text_u, "rules that apply to _r" in text_u
+           and "none seen, but not all of it was read" in text_u), (4, True, True, True))
+    out = []
+    main(["--account", "_r"], runner=make_fake(unreadable=("mine/deep",)), say=out.append)
+    check("a-clean-walk-never-says-none-when-it-read-something-less",
+          "NOT MEASURED: could not read the rules of mine/deep" in "\n".join(out), True)
+    check("closing-line-points-at-the-coordinator-chat", "Paste everything above to the coordinator chat" in text, True)
     check("report-says-both-logins", ("role account api.github.com IPv6" in text, "you api.github.com IPv6" in text),
           (True, True))
     check("only-lists-never-loads",
@@ -259,6 +339,23 @@ def selftest():
     code = main(["--account", "_r"], runner=broken, say=out.append)
     check("a-probe-that-did-not-run-is-said-and-never-a-clean-pass",
           (code, "the probe did not run" in "\n".join(out), "NOT MEASURED" in "\n".join(out)), (4, True, True))
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="net-probe-") as tmp:
+        good_conf, empty_conf = os.path.join(tmp, "runner.conf"), os.path.join(tmp, "empty.conf")
+        with open(good_conf, "w") as fh:
+            fh.write("# comment\nROLE_ACCOUNT=_r\nOTHER=x\n")
+        with open(empty_conf, "w") as fh:
+            fh.write("OTHER=x\n")
+        check("conf-account-is-read", (conf_account(good_conf), conf_account(empty_conf),
+                                       conf_account(os.path.join(tmp, "absent"))), ("_r", None, None))
+        before = len(seen)
+        said = []
+        check("no-account-and-no-conf-is-refused-before-anything-runs",
+              (main(["--conf", empty_conf], runner=fake, say=said.append), len(seen) == before,
+               "--account" in "\n".join(said)), (2, True, True))
+        out = []
+        check("the-conf-names-the-account", (main(["--conf", good_conf], runner=make_fake(), say=out.append),
+                                             "Measuring as _r" in out[0]), (0, True))
     check("bad-attempts-refused", main(["--attempts", "99"], runner=fake, say=lambda _l: None), 2)
     if cases:
         print("FAILED net probe selftest:\n  " + "\n  ".join(cases))
