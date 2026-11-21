@@ -118,12 +118,24 @@ def uid_of(account, runner=run):
 
 def applies_to(rule, account, uid):
     """True for a packet-filter rule line that applies to the account: one with no `user` clause
-    (it covers everyone) or one whose `user` clause names the account or its number."""
-    found = re.search(r"\buser\s+(\{[^}]*\}|\S+)", rule)
+    (it covers everyone) or one whose `user` clause covers the account. pfctl prints the clause with
+    an operator (`user = 300`, `user != 501`, `user >= 300`) or a list (`user { 501 300 }`); a
+    comparison it cannot settle from the account's number counts as applying, never as not."""
+    found = re.search(r"\buser\s*(!=|<=|>=|=|<|>)?\s*(\{[^}]*\}|\S+)", rule)
     if not found:
         return True
-    names = set(re.findall(r"[\w.\-]+", found.group(1)))
-    return account in names or (uid is not None and uid in names)
+    op = found.group(1) or "="
+    names = set(re.findall(r"[\w.\-]+", found.group(2)))
+    member = account in names or (uid is not None and uid in names)
+    if op == "=":
+        return member
+    if op == "!=":
+        return not member
+    nums = [int(n) for n in names if n.isdigit()]
+    if uid is None or not uid.isdigit() or len(nums) != 1:
+        return True
+    u, n = int(uid), nums[0]
+    return {"<": u < n, ">": u > n, "<=": u <= n, ">=": u >= n}[op]
 
 
 def list_anchors(runner):
@@ -278,6 +290,12 @@ def selftest():
     check("applies-user-by-name", applies_to("block drop out proto tcp user _r", "_r", "300"), True)
     check("applies-user-by-number-in-braces", applies_to("block out user { 501 300 }", "_r", "300"), True)
     check("other-user-is-not-ours", applies_to("block out user 501", "_r", "300"), False)
+    for line, want in (("block drop out proto tcp all user = 300", True), ("block drop out all user = 501", False),
+                       ("block out user != 501", True), ("block out user != 300", False),
+                       ("block out user >= 300", True), ("block out user < 300", False),
+                       ("block out user = _r", True), ("block out user = { 501 300 }", True)):
+        check("pfctl-prints-user-with-an-operator: " + line, applies_to(line, "_r", "300"), want)
+    check("a-comparison-with-no-uid-known-applies", applies_to("block out user < 300", "_r", None), True)
     check("probe-argv-as-role", probe_argv("_r", 3, 5.0, HOSTS)[:5], ["sudo", "-u", "_r", "-H", "/usr/bin/python3"])
     check("probe-argv-as-caller", probe_argv(None, 3, 5.0, HOSTS)[:2], ["/usr/bin/python3", "-I"])
     check("probe-argv-never-writes", any(w in " ".join(probe_argv("_r", 3, 5.0, HOSTS)[:5]) for w in ("tee", "rm ")),

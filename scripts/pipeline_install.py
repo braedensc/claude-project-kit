@@ -1059,15 +1059,20 @@ def cards_of(doc):
                      for r in rows_with(doc, "BLOCKED-ON-HUMAN") if r.get("card"))
 
 
-def only_self_unmeasured(doc, spec):
-    """KIT-951: True when a check's rows hold something this part's own apply would change, no
-    FAILED row, and no UNKNOWN row except the ones the apply itself makes measurable (the spec's
-    `self_measured`). A part with none named is never this: an unmeasured row stops the run."""
+def only_own_unknown(doc, spec):
+    """KIT-951: True when a document has an UNKNOWN row, no FAILED row, and no UNKNOWN row except the
+    ones the part's own apply makes measurable (the spec's `self_measured`). A part with none named
+    is never this: an unmeasured row stops the run. An apply's document has no WOULD-CHANGE row, so
+    this is the test for it."""
     own = spec.get("self_measured") or ()
-    rows = doc["rows"]
     unknown = rows_with(doc, "UNKNOWN")
-    return bool(own and unknown and rows_with(doc, "WOULD-CHANGE") and not rows_with(doc, "FAILED")
+    return bool(own and unknown and not rows_with(doc, "FAILED")
                 and all(r.get("step") in own for r in unknown))
+
+
+def only_self_unmeasured(doc, spec):
+    """KIT-951: a check's rows hold something the apply would change AND only_own_unknown."""
+    return bool(rows_with(doc, "WOULD-CHANGE")) and only_own_unknown(doc, spec)
 
 
 def step_job_auto(io, spec, base, conf, rep):
@@ -1138,7 +1143,7 @@ def step_job_auto(io, spec, base, conf, rep):
                     else EX_UNMEASURED)
     rep.seen[seen] = (code, cards_of(doc))
     if first_pass and code in (0, EX_BLOCKED, EX_UNMEASURED) and (
-            code != EX_UNMEASURED or only_self_unmeasured(doc, spec)):
+            code != EX_UNMEASURED or only_own_unknown(doc, spec)):
         return recheck_after_apply(io, spec, base, conf, rep, seen)
     if code == 0:
         io.say("%s is up to date." % noun)
@@ -1178,9 +1183,8 @@ def recheck_after_apply(io, spec, base, conf, rep, seen):
                             "The lines above say why." % (noun, code),
                         code if code not in (None, 0, EX_BLOCKED) else EX_UNMEASURED)
         rep.seen[seen] = (code, cards_of(doc))
-        waiting = code == EX_UNMEASURED and not rows_with(doc, "WOULD-CHANGE") and \
-            bool(rows_with(doc, "UNKNOWN")) and all(
-                r.get("step") in spec["self_measured"] for r in rows_with(doc, "UNKNOWN"))
+        waiting = (code == EX_UNMEASURED and not rows_with(doc, "WOULD-CHANGE")
+                   and only_own_unknown(doc, spec))
         if not waiting or waited >= limit:
             break
         io.say("%s has not written its status yet. Waiting %d seconds (%d of up to %d)."
@@ -3703,6 +3707,17 @@ def selftest():
     check("runner-first-run-with-a-new-key-source-is-asked-applied-and-checked-again",
           (code, io.asked, [k for k in io.ran if "runner_setup" in k], io.waits, rout(io)),
           (EX_OK, ["Update the runner now?"], [look, apply_, look], (), [(OUT_UPDATED, "")]))
+    # Stage E's review: the apply itself can exit 4 with only that row unmeasured (the runner's own
+    # apply waits for its status and says UNKNOWN when it has not come). It has no WOULD-CHANGE row.
+    apply_4 = rdoc("apply", 4, ("settings", runner_setup.DONE), ("job", runner_setup.DONE),
+                   ("writer-key", runner_setup.UNKNOWN))
+    code, io = runner({look: [4, 0], apply_: 4}, {look: [first, clean], apply_: apply_4}, answers=[True])
+    check("runner-an-apply-that-exits-4-with-only-its-own-row-unmeasured-is-checked-again",
+          (code, [k for k in io.ran if "runner_setup" in k], rout(io)), (EX_OK, [look, apply_, look], [(OUT_UPDATED, "")]))
+    apply_other = rdoc("apply", 4, ("settings", runner_setup.UNKNOWN), ("writer-key", runner_setup.UNKNOWN))
+    code, io = runner({look: [4, 0], apply_: 4}, {look: [first, clean], apply_: apply_other}, answers=[True])
+    check("runner-an-apply-that-exits-4-with-another-row-unmeasured-still-stops",
+          (code, io.ran.count(look), [o for o, _d in rout(io)]), (EX_UNMEASURED, 1, [OUT_UNMEASURED]))
     code, io = runner({look: [4, 4, 4, 0], apply_: 0}, {look: [first, waiting_doc, waiting_doc, clean],
                                                         apply_: applied}, answers=[True])
     check("runner-waits-for-its-status-and-looks-again-while-only-that-row-is-unmeasured",
