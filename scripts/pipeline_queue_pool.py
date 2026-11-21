@@ -1562,7 +1562,7 @@ def _cases(check):
                 read_history=lambda raw: o["read_history"]([dict(e, updatedAt=e.get("updatedAt") or e.get(
                     "createdAt")) if isinstance(e, dict) else e for e in raw]) if isinstance(raw, list)
                 else None)),
-            ("the readiness gate skipped",dict(ready_problems=lambda t, parent=None: [])),
+            ("the readiness gate skipped", dict(ready_problems=lambda t, parent=None: [])),
             ("a finding taken for the owner's backlog", dict(lane_of=lambda cfg, t, c, e: (
                 "backlog" if o["lane_of"](cfg, t, c, e) == "agent_filed" else o["lane_of"](
                     cfg, t, c, e)))),
