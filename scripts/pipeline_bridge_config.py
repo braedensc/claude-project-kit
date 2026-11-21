@@ -749,7 +749,7 @@ def new_state():
     # named (ACT-1, KIT-364). plan_changes: each change made to an approved plan without the
     # owner, as fields (KIT-320), kept for the stand-up and for anyone to read.
     return {"schema": STATE_SCHEMA, "handled": {}, "threads": {}, "questions": {},
-            "asked_at": [], "posted": {}, "attempts": {}, "limit_said": {}, "owed": [],
+            "asked_at": [], "posted": {}, "held_posts": {}, "attempts": {}, "limit_said": {}, "owed": [],
             "epics": {}, "relays": [], "relay_pending": {}, "dms": {}, "stray_said": {},
             "forwarded_at": [], "relayed_posts": {}, "set_up_posts": {},
             "direct": {}, "turn_sessions": {}, "turn_threads": {}, "plan_changes": []}
@@ -784,6 +784,7 @@ def load_state(cfg):
         raise BridgeError("the bridge's state %s is not a %s document. Nothing was done"
                           % (path, STATE_SCHEMA))
     doc.setdefault("posted", {})
+    doc.setdefault("held_posts", {})
     doc.setdefault("attempts", {})
     doc.setdefault("limit_said", {})
     doc.setdefault("owed", [])

@@ -295,6 +295,7 @@ if HERE not in sys.path:
 # scrub for the chat provider, its secret scan and redaction, its atomic JSON write and its
 # worktree test. One copy of each means one place to fix it.
 import pipeline_notify_local as notify  # noqa: E402
+import pipeline_chat_cap as chat_cap  # noqa: E402  (its HeldToken: what a held message answers with)
 # The planner job's own rules for what is live work, and its own team query: the bridge
 # refuses exactly what the planner would, so it never moves a ticket the planner refuses.
 import pipeline_plan_poller as poller  # noqa: E402
@@ -463,6 +464,11 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
                      % (channel, thread_ts, len(text)))
             return "%.6f" % self.now
         ts = self.slack.post(channel, thread_ts, text)
+        if isinstance(ts, chat_cap.HeldToken):
+            # The chat limit held it (KIT-941): nothing was posted, so the stand-in is no message
+            # of the bridge's. Recorded as held, and never in `posted`, which vouches for real ones.
+            self.state.setdefault("held_posts", {})[key_of(channel, ts)] = self.now
+            return ts
         self.state["posted"][key_of(channel, ts)] = self.now
         return ts
 
@@ -480,6 +486,8 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
 
     # -- reading -------------------------------------------------------------------
     def read_thread(self, channel, root):
+        if key_of(channel, root) in self.state.get("held_posts", {}):
+            return []                  # a held stand-in is no thread in Slack (KIT-941)
         msgs = self.slack.replies(channel, root)
         self.threads[(channel, root)] = msgs
         return [r for r in msgs if r.get("ts") != root]
@@ -800,8 +808,9 @@ class Pass(RequestsMixin, AnswersMixin, ReplanMixin, PlansMixin, PingsMixin, Tec
 
         def fresh(k):
             return ts_float(k.rsplit(":", 1)[-1]) >= horizon
-        for name in ("handled", "threads", "posted", "attempts"):
-            self.state[name] = dict((k, v) for k, v in self.state[name].items() if fresh(k))
+        for name in ("handled", "threads", "posted", "attempts", "held_posts"):
+            self.state[name] = dict((k, v) for k, v in self.state.get(name, {}).items()
+                                    if fresh(k))
         self.state["questions"] = dict(
             (k, q) for k, q in self.state["questions"].items()
             if q.get("status") == OPEN or q.get("asked_at", 0) >= horizon)
@@ -3998,6 +4007,36 @@ def _selftest(identity=(True,) * 5, reached=()):
     # KIT-224: the one borrowed write is the bounce driver's thread reply, from one place.
     check("the thread reply is borrowed from one place only",
           body.count("linear_reply_in_thread("), 1)
+    # KIT-941: a message the chat limit held is recorded as held, never as posted, and nothing
+    # reads its stand-in token as a real message.
+    import pipeline_chat_cap as chat_cap_mod
+
+    class _CapSlack(object):
+        def __init__(self):
+            self.n = 0
+
+        def post(self, channel, thread_ts, text):
+            self.n += 1
+            if self.n == 1:
+                return "1700000000.000001"
+            return chat_cap_mod.HeldToken("1700000000.000002")
+
+        def replies(self, channel, root):
+            raise AssertionError("a held stand-in was read as a real thread")
+    held_pass = Pass.__new__(Pass)
+    held_pass.slack, held_pass.dry, held_pass.now = _CapSlack(), False, 1700000100.0
+    held_pass.dm_channels, held_pass.secrets, held_pass.threads = (), (), {}
+    held_pass.state = new_state()
+    sent_ts = held_pass.post("C1", None, "one")
+    held_ts = held_pass.post("C1", None, "two")
+    check("a-held-message-is-recorded-as-held-not-as-posted",
+          (sorted(held_pass.state["posted"]), sorted(held_pass.state["held_posts"]),
+           held_ts == "1700000000.000002"),
+          (["C1:1700000000.000001"], ["C1:1700000000.000002"], True))
+    check("a-sent-message-is-still-recorded-as-posted", sent_ts, "1700000000.000001")
+    check("a-held-stand-in-is-never-read-as-a-thread",
+          held_pass.read_thread("C1", held_ts), [])
+    check("a-fresh-state-has-the-held-record", "held_posts" in new_state(), True)
     # Last: every call the guard refused, whatever the case made of the refusal.
     check("no-case-reached-real-http", list(reached), [])
 

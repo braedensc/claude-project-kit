@@ -1758,7 +1758,9 @@ reach-outs, the stand-up, the status replies, the sprint message and the push jo
 `CHAT_CAP_WINDOW_MINUTES` (default 10) it sends one notice and holds the rest. After the window the
 held messages go out as one digest, at the start of the next pass. A held message is sent once and
 never lost, and a record the check cannot read holds the message instead of sending it. Reaching it
-writes `chat-cap-trips.json` in `STATE_DIR` and is a defect to look at, not normal use.
+writes `chat-cap-trips.json` in `STATE_DIR` and is a defect to look at, not normal use. Each trip
+says how many messages were held, and the health watch's `chat-cap` kind raises each one once
+(`CHAT_CAP_TRIPS_FILE` in `update.conf`, docs/UPDATE-OPERATOR.md).
 
 Set `CHAT_CAP_MAX` and `CHAT_CAP_WINDOW_MINUTES` in `bridge.conf`, the same as in `notifier.conf`,
 and keep both `STATE_DIR`s the same folder. The notifier's section, *The chat limit*, has the
