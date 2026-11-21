@@ -219,7 +219,7 @@ slowest battery (the Stage E installer's) ends in 0.1 to 0.2 s on a Mac at five 
 and in 0.1 s in each of five runs with ten busy loops running beside it (17 Nov 2026). That does
 not reproduce the runner; on 13 Nov 2026 a busy hosted runner once took 15.1 s against the old limit of 15 (KIT-755),
 so the limit is twice that worst case.
-The **Temp-leak sweeps** job runs both passes, beside **Kit checks** (KIT-617).
+The **Temp-leak sweeps** job runs both passes, beside **Kit checks** (KIT-617), each in two shards: `check_temp_leaks.py --shard sweeps/N` runs one shard's share (KIT-945).
 
 **A new selftest needs a `test:*` script in package.json.** The check runs only what
 package.json lists.
@@ -228,18 +228,54 @@ package.json lists.
 
 ## Job limits and what to do near one
 
-CI's jobs in `.github/workflows/ci.yml` each have their own `timeout-minutes`. A run that hits
-the limit is cancelled, and a cancelled run reads as red CI although nothing failed.
+CI's jobs each have their own `timeout-minutes`. A run that hits the limit is cancelled, and a
+cancelled run reads as red CI although nothing failed. Each job should finish with at least five
+minutes to spare.
 
-| Job | Limit | Required to merge | Measured |
+On 20 Nov 2026 three jobs were at their limits: Kit checks took 14m25s of 15, Temp-leak sweeps
+took 15m32s of 20, and the Python 3.9 job took 28m31s and 29m38s of 30, then was cancelled at the
+limit on two PRs. Every new battery added time. KIT-945 split each into parallel shard jobs and a
+fan-in job that keeps the old name (next section).
+
+| Job | Limit | Required to merge | Before (20 Nov) | Measured now |
+| --- | --- | --- | --- | --- |
+| Kit checks (fan-in) | 5 minutes | yes | one job, 14m25s of 15 | under 10 seconds |
+| Kit checks shard 1/3, 2/3, 3/3 | 15 minutes | through the fan-in | | 3.4 to 4.9 minutes (three runs, slowest 4.9) |
+| Temp-leak sweeps (fan-in) | 5 minutes | yes, since 12 Nov 2026 | one job, 15m32s of 20 | under 15 seconds |
+| Temp-leak sweeps shard 1/2, 2/2 | 20 minutes | through the fan-in | | 5.5 minutes (shard 1) and 7.8 to 8.0 minutes (shard 2), three runs |
+| Provenance scan | 10 minutes | yes | under a minute | under a minute |
+| Kit checks (Python 3.9, the Mac's) (fan-in) | 5 minutes | no | one job, 28m31s and 29m38s of 30, then cancelled | under 15 seconds |
+| Kit checks (Python 3.9, the Mac's) shard 1/5 to 5/5 | 20 minutes | no | | 4.3 to 6.7 minutes for shards 1, 3, 4 and 5; 11.1 to 12.9 minutes for shard 2 (test:runner-setup alone is about 9.5 minutes on macOS), three runs |
+
+## How the batteries are split (KIT-945)
+
+Each of the three long jobs is several parallel shard jobs plus one **fan-in job** that keeps the
+old name. Branch protection requires "Kit checks", "Provenance scan", "Hooks change guard" and
+"Temp-leak sweeps" by name, so those names are the fan-in jobs. The shards are named
+"... shard N/M" and are never required themselves.
+
+| Family | Shards | Who owns the list | What fails when a battery is missing or doubled |
 | --- | --- | --- | --- |
-| Kit checks | 15 minutes | yes | 5.8 and 6.5 minutes (was 12 to 14) |
-| Temp-leak sweeps | 20 minutes | yes, since 12 Nov 2026 | 7.7 and 7.6 minutes |
-| Provenance scan | 10 minutes | yes | under a minute |
+| Kit checks | `kit-checks-1` to `-3` in `ci.yml`: their steps are the list | the workflow | `scripts/check_ci_covers_tests.py`: a `test:*` battery run by no shard job, or by two, fails |
+| Temp-leak sweeps | `temp-leak-sweeps-shards`, a matrix of 2 | `scripts/check_ci_shards.py` (`SWEEPS`) | `check_ci_shards.py --verify` |
+| Kit checks (Python 3.9, the Mac's) | `mac-python-shards`, a matrix of 5 | `scripts/check_ci_shards.py` (`MAC`) | `check_ci_shards.py --verify` |
+
+**A new battery** needs its `test:*` script, a step in exactly one `kit-checks-N` job (the shortest
+one), and a name in exactly one list of `SWEEPS` and of `MAC` in `scripts/check_ci_shards.py`. A battery
+that is in no list is a red check (`npm run test:ci-shards`), not a silent skip. The lists were
+balanced on measured times; rebalance them when a shard's measured time drifts from the others.
+
+**A fan-in job runs `if: always()` and fails unless every shard's result is `success`.** When a
+needed job fails, GitHub skips the jobs that depend on it, and a skipped required check can read as
+a pass. `python3 scripts/check_ci_shards.py fan-in --expect <ids>` fails on a failed, skipped, cancelled
+or missing shard, and on a shard nobody listed. `check_ci_shards.py --verify` fails when a workflow's
+fan-in loses its name, its `if: always()`, a shard in `needs` or in `--expect`, or when a matrix's
+shard list differs from the lists. A new shard job needs a line in all of those, so it cannot be
+forgotten.
 
 **Why the sweeps have their own job (KIT-617).** They ran as the last steps of Kit checks and
 took about 7.5 minutes together (6.5 and 1), which put Kit checks at 12.6 to 14.4 minutes against 15. Now they
-run beside the selftests.
+run beside the selftests, and since KIT-945 in two shards.
 
 **The job is a required check.** The owner added it on 12 Nov 2026 (KIT-699), so a leak blocks
 the merge. A job that is not required only turns the PR red. A copy of the kit adds it the same
@@ -282,8 +318,9 @@ Code that is fine on a newer Python can break there, so one job runs on it.
 
 The Python 3.9 job (`.github/workflows/ci-mac-python.yml`) puts a `python3` link to
 `/usr/bin/python3` first on the PATH, then fails unless `python3 -V` says 3.9 and matches
-`/usr/bin/python3 -V`. It byte-compiles every tracked `.py`, then runs `npm run check:temp-leaks`
-(the hook battery and every other battery, one at a time). It also runs the **direct checks**:
+`/usr/bin/python3 -V`. It is five shard jobs. Shard 1 byte-compiles every tracked `.py`; every shard then
+runs its share of the batteries with `check_temp_leaks.py --shard mac/N` (the hook battery and the others,
+one at a time in each shard). Shard 1 also runs the **direct checks**:
 the scripts Kit checks runs bare over the real tree (runner pin, agent trigger, standard-library,
 workflow calls, placeholders, session brief, schemas, delivery config, alert pages, the parts list) and the
 JSON/YAML parse, through `python3 scripts/check_direct_checks.py --run`. That script holds the list.
@@ -292,7 +329,8 @@ the list differ (`npm run test:direct-checks`). A failure turns the PR red.
 
 It is **not a required context**, so a failure turns the PR red without blocking the merge. The
 owner can add it with the same command as Temp-leak sweeps above, using the context name
-`Kit checks (Python 3.9, the Mac's)`. If it nears its limit, split the job; do not trim batteries.
+`Kit checks (Python 3.9, the Mac's)` (the fan-in job). If a shard nears its limit, add a shard or rebalance
+the lists in `scripts/check_ci_shards.py`; do not trim batteries.
 
 macOS minutes are free on a public repository. A private copy of the kit is billed for them at
 a high rate (a multiple of the Linux rate), so check the plan before copying this workflow there.

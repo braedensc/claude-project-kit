@@ -83,7 +83,7 @@ import tempfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCAN_STEP = "Secret scan (every tracked file, as git stores it)"
 # (workflow, job): the job whose first step after Node runs the scan.
-WORKFLOWS = ((".github/workflows/ci.yml", "kit-checks"),
+WORKFLOWS = ((".github/workflows/ci.yml", "kit-checks-1"),
              ("templates/workflows/ci.yml", "secrets-and-paths"))
 LINT_SECRETS = "python3 scripts/check_secret_scan.py --scan"
 BLOB_MODES = (b"100644", b"100755", b"120000")  # files and links; a submodule has no blob here

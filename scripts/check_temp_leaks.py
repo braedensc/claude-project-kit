@@ -4,6 +4,7 @@
     python3 scripts/check_temp_leaks.py               # run every `test:*` battery, one at a time
     python3 scripts/check_temp_leaks.py --sigterm 1   # …and stop each with SIGTERM 1 s in
     python3 scripts/check_temp_leaks.py --only hooks,stage-e-setup
+    python3 scripts/check_temp_leaks.py --shard sweeps/1   # one CI shard (scripts/check_ci_shards.py owns the lists)
     python3 scripts/check_temp_leaks.py --list        # the batteries it would run
     python3 scripts/check_temp_leaks.py --selftest    # this check's own battery
 
@@ -574,6 +575,19 @@ def selftest():
                       "hook-battery-pl-k3j4h5g6", "tmpk3j4h5g6", "README"]),
                {"stage-e-selftest.*": 2, "hook-battery-pl-*": 1, "tmp*": 1, "README": 1})
 
+        # KIT-945: --shard picks one CI shard's batteries, and a bad one is exit 2, never a quiet skip.
+        shard_runs = {spec: subprocess.run([py, os.path.abspath(__file__), "--shard", spec, "--list"],
+                                           capture_output=True, text=True)
+                      for spec in ("sweeps/1", "sweeps/2", "sweeps/99", "nonsense")}
+        expect("--shard sweeps/1 and sweeps/2 list disjoint, non-empty halves of the batteries",
+               (shard_runs["sweeps/1"].returncode, shard_runs["sweeps/2"].returncode,
+                bool(shard_runs["sweeps/1"].stdout.strip()), bool(shard_runs["sweeps/2"].stdout.strip()),
+                not (set(l.split()[0] for l in shard_runs["sweeps/1"].stdout.splitlines())
+                     & set(l.split()[0] for l in shard_runs["sweeps/2"].stdout.splitlines()))),
+               (0, 0, True, True, True))
+        expect("--shard with a shard number out of range, or no FAMILY/N, is exit 2",
+               (shard_runs["sweeps/99"].returncode, shard_runs["nonsense"].returncode), (2, 2))
+
     expect("the selftest's own folder is gone", os.path.exists(outer), False)
     if failures:
         print(f"\n{len(failures)} check(s) failed: {', '.join(failures)}")
@@ -601,6 +615,24 @@ def main(argv):
         unknown = sorted(wanted - {n for n, _ in batteries})
         if unknown:
             print(f"check_temp_leaks: no such battery: {', '.join(unknown)}")
+            return 2
+        batteries = [(n, c) for n, c in batteries if n in wanted]
+    if "--shard" in argv:
+        # KIT-945: a CI shard runs a share of the batteries. scripts/check_ci_shards.py owns the lists and
+        # fails CI when they miss or double a battery; a name here that package.json lacks is a
+        # broken list, so it is could-not-check, never a quiet skip.
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import check_ci_shards
+        try:
+            family, number = check_ci_shards.parse_spec(argv[argv.index("--shard") + 1])
+            wanted = set(check_ci_shards.shard_names(family, number))
+        except (IndexError, ValueError) as exc:
+            print(f"check_temp_leaks: --shard: {exc}")
+            return 2
+        unknown = sorted(wanted - {n for n, _ in batteries})
+        if unknown:
+            print(f"check_temp_leaks: shard {family}/{number} names batteries package.json lacks: "
+                  f"{', '.join(unknown)}")
             return 2
         batteries = [(n, c) for n, c in batteries if n in wanted]
     if "--list" in argv:
