@@ -112,6 +112,10 @@ WHAT IT DOES, IN ORDER
      its `check` read as one JSON document, and on a WOULD-CHANGE row, asked in Manual, its `apply`
      with the consent piped in. A part its installer left off above its first-pass ceiling is
      "waiting on you", with the document's `left_off` line as the reason, and the run carries on.
+     A `check` that stops on UNKNOWN is not final for one row: the runner's `writer-key` row is
+     UNKNOWN until the new runner has written its status, which only its own `apply` starts. When
+     that is the only UNKNOWN row and something would change (KIT-951), the run asks, applies, waits
+     up to a minute for the status, and checks again. Any other UNKNOWN row still stops it.
   3h. The validator's job (`scripts/pipeline_validator_setup.py`, KIT-547), optional, when this Mac
      has a `validator.conf` (`--validator-conf` names another). It runs under your own login: no
      account, and no Mac password is held for it. In Manual it runs the installer's own
@@ -219,6 +223,7 @@ import re
 import stat
 import subprocess
 import sys
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 KIT = os.path.dirname(HERE)
@@ -422,6 +427,10 @@ class Io(object):
             end_it()
             self.interrupted = True
             return None, "interrupted"
+
+    def wait(self, seconds):
+        """Wait, with nothing to do meanwhile (KIT-951: the runner writing its own status)."""
+        time.sleep(seconds)
 
     def exists(self, path):
         return os.path.exists(path)
@@ -972,7 +981,14 @@ RUNNER_STEP = {
     "answers": {"schema": "runner-answers/1", "consent": "yes"},
     "auto_note": "It writes the runner's settings with every lane off for every project, and installs "
                  "its job as the role account. It switches the job on itself only when its first pass "
-                 "would act on nothing; otherwise the job stays off, and the end says why."}
+                 "would act on nothing; otherwise the job stays off, and the end says why.",
+    # KIT-951: the rows only the runner's own apply can make measurable. After a copy or a settings
+    # change the runner has said nothing yet about the session writer's key: its status is written
+    # on its first pass, which an apply starts. UNKNOWN on one of these rows must not stop the
+    # update that would clear it. The wait is the time the runner needs for that first pass (the
+    # installer's own STATUS_LOOKS two-second looks, checked against it by the selftest).
+    "self_measured": ("writer-key",), "settle_seconds": 60}
+SETTLE_LOOK_SECONDS = 10
 
 # KIT-547: optional, run after the runner (3g). The validator's job, under your own login: no role
 # account, so no Mac password is held for it (`sudo`: False). Its program-facing pair is the
@@ -1043,6 +1059,17 @@ def cards_of(doc):
                      for r in rows_with(doc, "BLOCKED-ON-HUMAN") if r.get("card"))
 
 
+def only_self_unmeasured(doc, spec):
+    """KIT-951: True when a check's rows hold something this part's own apply would change, no
+    FAILED row, and no UNKNOWN row except the ones the apply itself makes measurable (the spec's
+    `self_measured`). A part with none named is never this: an unmeasured row stops the run."""
+    own = spec.get("self_measured") or ()
+    rows = doc["rows"]
+    unknown = rows_with(doc, "UNKNOWN")
+    return bool(own and unknown and rows_with(doc, "WOULD-CHANGE") and not rows_with(doc, "FAILED")
+                and all(r.get("step") in own for r in unknown))
+
+
 def step_job_auto(io, spec, base, conf, rep):
     """Automatic (KIT-850): the installer's own `check`, then its `apply` with the consent piped
     in, when a row is work. Neither asks anything: the Mac password is held here first, once for
@@ -1073,7 +1100,10 @@ def step_job_auto(io, spec, base, conf, rep):
         io.say("%s's settings are up to date. Nothing to change." % noun)
         rep.note(key, OUT_OK)
         return None
-    if code != EX_BLOCKED:
+    # KIT-951: an unmeasured row that only this part's own apply can make measurable does not stop
+    # the run. The update is asked for and applied, and the check is made again after it.
+    first_pass = code == EX_UNMEASURED and only_self_unmeasured(doc, spec)
+    if code != EX_BLOCKED and not first_pass:
         rep.note_code(key, code, "its check")
         return stop(io, "%s's check stopped with exit %d. The lines above say why." % (noun, code),
                     code)
@@ -1085,6 +1115,11 @@ def step_job_auto(io, spec, base, conf, rep):
         return None
     io.say("")
     io.say("%s is not up to date: the rows above name what would change." % noun)
+    if first_pass:
+        io.say("One row, %s, cannot be measured until the update has run: %s has said nothing "
+               "about it yet. That is expected, so the update is not held back for it."
+               % (" and ".join(sorted(r.get("step") for r in rows_with(doc, "UNKNOWN"))),
+                  noun.lower()))
     io.say(spec["auto_note"])
     if not io.ask("Update %s now?" % noun.lower()):
         rep.note(key, OUT_WAITING, "behind; you did not update it")
@@ -1102,6 +1137,9 @@ def step_job_auto(io, spec, base, conf, rep):
                         "above say why." % (noun, code), code if code not in (None, 0, EX_BLOCKED)
                     else EX_UNMEASURED)
     rep.seen[seen] = (code, cards_of(doc))
+    if first_pass and code in (0, EX_BLOCKED, EX_UNMEASURED) and (
+            code != EX_UNMEASURED or only_self_unmeasured(doc, spec)):
+        return recheck_after_apply(io, spec, base, conf, rep, seen)
     if code == 0:
         io.say("%s is up to date." % noun)
         rep.note(key, OUT_UPDATED)
@@ -1117,6 +1155,52 @@ def step_job_auto(io, spec, base, conf, rep):
     rep.note_code(key, code, "its apply")
     return stop(io, "%s's apply stopped with exit %d. The lines above say why; do what they say, "
                     "then run this command again." % (noun, code), code)
+
+
+def recheck_after_apply(io, spec, base, conf, rep, seen):
+    """KIT-951: the check again, after an apply that made an unmeasured row measurable. The part
+    needs time to write its own status, so a check that still shows only those rows waits and
+    looks again, for up to `settle_seconds`, said in words. The last check decides, as the first
+    one did. None to carry on, or an exit code."""
+    key, noun = spec["key"], spec["noun"]
+    limit, waited = spec.get("settle_seconds", 0), 0
+    io.say("%s needs up to %d seconds after an update to write its own status. Checking again "
+           "when it has." % (noun, limit))
+    while True:
+        code, out = io.run_rows(base + spec["auto_check"] + ["--conf", conf])
+        if io.interrupted:
+            rep.note(key, OUT_UNMEASURED, "interrupted during its check")
+            return stop(io, INTERRUPTED % (noun + "'s check"), code or EX_BLOCKED)
+        doc = rows_doc(out, spec["rows_schema"])
+        if doc is None:
+            rep.note(key, OUT_UNMEASURED, "its second check printed no rows (exit %s)" % code)
+            return stop(io, "%s's second check printed no rows this command could read (exit %s). "
+                            "The lines above say why." % (noun, code),
+                        code if code not in (None, 0, EX_BLOCKED) else EX_UNMEASURED)
+        rep.seen[seen] = (code, cards_of(doc))
+        waiting = code == EX_UNMEASURED and not rows_with(doc, "WOULD-CHANGE") and \
+            bool(rows_with(doc, "UNKNOWN")) and all(
+                r.get("step") in spec["self_measured"] for r in rows_with(doc, "UNKNOWN"))
+        if not waiting or waited >= limit:
+            break
+        io.say("%s has not written its status yet. Waiting %d seconds (%d of up to %d)."
+               % (noun, SETTLE_LOOK_SECONDS, waited + SETTLE_LOOK_SECONDS, limit))
+        io.wait(SETTLE_LOOK_SECONDS)
+        waited += SETTLE_LOOK_SECONDS
+    io.say("")
+    if code == 0:
+        io.say("%s is up to date." % noun)
+        rep.note(key, OUT_UPDATED)
+        return None
+    if code == EX_BLOCKED:
+        detail = doc.get("left_off") or "updated; a card is still yours"
+        io.say("%s waits for you: %s. Carrying on; it is on the list at the end." % (noun, detail))
+        rep.note(key, OUT_WAITING, detail)
+        return None
+    rep.note_code(key, code, "its second check")
+    return stop(io, "%s was updated, but its check after the update stopped with exit %d. The "
+                    "lines above say why; do what they say, then run this command again."
+                % (noun, code), code)
 
 
 def step_job(io, spec, files, rep):
@@ -2435,7 +2519,15 @@ class FakeIo(Io):
         kept in `piped` (KIT-850)."""
         code, _out = self.run(argv)
         self.piped = tuple(self.piped) + ((self.ran[-1], stdin_text),)
-        return code, self.rows_out.get(self.ran[-1], "")
+        got = self.rows_out.get(self.ran[-1], "")
+        if isinstance(got, list):              # one document per call, the last repeating (KIT-951)
+            got = got.pop(0) if len(got) > 1 else got[0]
+        return code, got
+
+    waits = ()                             # the seconds it was asked to wait, in order
+
+    def wait(self, seconds):
+        self.waits = tuple(self.waits) + (seconds,)
 
     def run(self, argv, capture=False):
         k = self.key(argv)
@@ -3595,6 +3687,48 @@ def selftest():
         code, io = runner({look: 10, apply_: rc}, {look: work, apply_: rdoc("apply", rc)}, answers=[True])
         check("runner-installer-exit-%d-is-never-up-to-date" % rc,
               (code, [o for o, _d in rout(io)]), (rc, [OUT_UNMEASURED]))
+
+    # KIT-951. A part whose only unmeasured row is one its own apply produces (the runner's
+    # `writer-key` status, which only the new runner writes) is updated, then checked again after a
+    # wait said in words. An unmeasured row the apply cannot produce still stops the run.
+    check("runner-the-wait-is-the-time-the-runner-needs-for-its-first-status",
+          RUNNER_STEP["settle_seconds"], runner_setup.STATUS_LOOKS * 2)
+    first = rdoc("check", 4, ("settings", runner_setup.ALREADY_DONE), ("job", runner_setup.WOULD_CHANGE),
+                 ("writer-key", runner_setup.UNKNOWN))
+    waiting_doc = rdoc("check", 4, ("settings", runner_setup.ALREADY_DONE), ("job", runner_setup.ALREADY_DONE),
+                       ("writer-key", runner_setup.UNKNOWN))
+    clean = rdoc("check", 0, ("settings", runner_setup.ALREADY_DONE), ("job", runner_setup.ALREADY_DONE),
+                 ("writer-key", runner_setup.ALREADY_DONE))
+    code, io = runner({look: [4, 0], apply_: 0}, {look: [first, clean], apply_: applied}, answers=[True])
+    check("runner-first-run-with-a-new-key-source-is-asked-applied-and-checked-again",
+          (code, io.asked, [k for k in io.ran if "runner_setup" in k], io.waits, rout(io)),
+          (EX_OK, ["Update the runner now?"], [look, apply_, look], (), [(OUT_UPDATED, "")]))
+    code, io = runner({look: [4, 4, 4, 0], apply_: 0}, {look: [first, waiting_doc, waiting_doc, clean],
+                                                        apply_: applied}, answers=[True])
+    check("runner-waits-for-its-status-and-looks-again-while-only-that-row-is-unmeasured",
+          (code, io.waits, io.ran.count(look), rout(io)), (EX_OK, (SETTLE_LOOK_SECONDS,) * 2, 4, [(OUT_UPDATED, "")]))
+    code, io = runner({look: [4] * 12, apply_: 0}, {look: [first, waiting_doc], apply_: applied}, answers=[True])
+    check("runner-a-status-that-never-comes-stops-after-the-wait-and-is-never-up-to-date",
+          (code, io.waits, [o for o, _d in rout(io)]),
+          (EX_UNMEASURED, (SETTLE_LOOK_SECONDS,) * (RUNNER_STEP["settle_seconds"] // SETTLE_LOOK_SECONDS),
+           [OUT_UNMEASURED]))
+    other = rdoc("check", 4, ("settings", runner_setup.UNKNOWN), ("job", runner_setup.WOULD_CHANGE))
+    code, io = runner({look: 4}, {look: other}, answers=[True])
+    check("runner-an-unmeasured-row-its-apply-cannot-make-still-stops-before-any-apply",
+          (code, io.asked, io.ran.count(apply_), [o for o, _d in rout(io)]), (EX_UNMEASURED, [], 0, [OUT_UNMEASURED]))
+    both = rdoc("check", 4, ("job", runner_setup.WOULD_CHANGE), ("writer-key", runner_setup.UNKNOWN),
+                ("settings", runner_setup.UNKNOWN))
+    code, io = runner({look: 4}, {look: both}, answers=[True])
+    check("runner-its-own-row-beside-an-unrelated-unmeasured-one-still-stops",
+          (code, io.ran.count(apply_)), (EX_UNMEASURED, 0))
+    only_key = rdoc("check", 4, ("job", runner_setup.ALREADY_DONE), ("writer-key", runner_setup.UNKNOWN))
+    code, io = runner({look: 4}, {look: only_key}, answers=[True])
+    check("runner-an-unmeasured-key-row-with-nothing-to-update-still-stops",
+          (code, io.ran.count(apply_)), (EX_UNMEASURED, 0))
+    import pipeline_net_probe                       # KIT-948: the owner's read-only network measurement
+    check("net-probe-its-own-selftest", pipeline_net_probe.selftest(), 0)
+    check("runner-no-other-part-names-a-row-its-apply-makes-measurable",
+          [s_["key"] for s_ in list(JOB_STEPS) + [RUNNER_STEP] if s_.get("self_measured")], ["runner"])
     os.unlink(runner_conf)
 
     # 6f. THE HOURLY HEALTH CHECK (KIT-585): read whether its job is level, ask, install, look again.

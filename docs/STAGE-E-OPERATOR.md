@@ -261,6 +261,8 @@ checks your work and carries on. It never asks you to type `y`.
 | `card CK-4` | print any checkpoint card in full, at any time |
 | `attest A-DRY-RUN --initials YOUR-INITIALS` | record something no computer can check. `YOUR-INITIALS` is a placeholder and is refused as typed — sign with your own 2–4 letters |
 
+**A dry-run read that times out is tried once more** (KIT-948). The role account's calls to GitHub or Linear sometimes get no answer ("Errno 60, Operation timed out"). The install's dry run reads, so it waits 20 seconds and runs that one component again, and says so. A second timeout fails the step. To measure the cause, run `python3 scripts/pipeline_net_probe.py`: read-only, it prints the DNS answers, IPv4 and IPv6 connect times and the packet-filter rules for the role account.
+
 **`status` and `verify` answer different questions, and only one of them looks.** `status`
 prints the recorded outcome of each step from the installer's own state file; it is fast,
 needs no password, and is exactly as true as the last run that wrote it. Anything that

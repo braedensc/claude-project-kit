@@ -276,7 +276,9 @@ npm run test:stage-a-setup   # Stage A (idea-gate) installer: planning built int
                              #   the fence, the probe run and read back, the entry written after
                              #   a typed yes, the delivery PR opened, the drill, agent-refused
 npm run test:install         # the one command (scripts/pipeline_install.py): skills, then
-                             #   Stage E after a yes, then Stage A; refused under a model
+                             #   Stage E after a yes, then Stage A; refused under a model; a timed-out
+                             #   dry-run read retried once (KIT-948); the runner's own unmeasured status
+                             #   row no longer stops it (KIT-951); runs pipeline_net_probe.py's selftest
 npm run test:parts           # every part listed once (pipeline-parts.json): owners, needs, cards, docs/PARTS.md
 npm run test:settings        # the settings folder (KIT-853): one machine.conf under ~/Library, a shared
                              #   value written to every part file the map names, shown first, --apply
