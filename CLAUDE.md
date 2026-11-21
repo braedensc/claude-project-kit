@@ -469,7 +469,9 @@ npm run test:union           # union check: green alone + red together, bisected
 npm run test:hooks-path      # core.hooksPath pinned absolute: a worktree runs the pre-commit hook (KIT-420)
 npm run test:runner-pin       # no workflow on a moving -latest runner image (KIT-429)
 npm run test:direct-checks  # the 3.9 job's list of direct checks matches Kit checks' direct steps (KIT-659)
-npm run test:ci-covers      # every package.json test:* script has a CI step outside the leak sweeps (KIT-620)
+npm run test:ci-covers      # every package.json test:* script has a CI step outside the leak sweeps, in exactly one job (KIT-620, KIT-945)
+npm run test:ci-shards      # the sweeps' and the Python 3.9 job's shard lists hold every battery once; each fan-in job keeps
+                             #   its name, `if: always()` and every shard, and fails on a skipped one (KIT-945)
 npm run lint:ci-covers      # …and the same check over this repo
 npm run test:stdlib-only    # the kit's Python imports only the standard library, bar a named list (KIT-652)
 npm run lint:stdlib-only    # …and the same check over this repo's tracked .py files
@@ -525,17 +527,25 @@ selftests above are the whole of what runs in this repo. Nothing is scheduled he
 deployment steps are `docs/STAGE-E-OPERATOR.md` and the design is
 `docs/adr/2026-09-05-stage-e-under-a-delegation-bound-dispatcher.md`.
 
-CI (`.github/workflows/ci.yml`, job **Kit checks**) runs the battery, JSON/YAML
+CI (`.github/workflows/ci.yml`) runs the battery, JSON/YAML
 validation, the reusable-workflow call-contract check, the PR-base selftest, the alert-page check, the forbidden-paths gate,
 placeholder integrity, the DoR, delivery-config, generation-gate, auto-approve,
 auto-merge, grader-path, safe-outputs, conflict-loop, union-check, telemetry, dashboard
-and weekly-review selftests, the secret-scan selftest, and, as its first step, the secret
+and weekly-review selftests, the secret-scan selftest, and, as the first step of shard 1, the secret
 scan on every PR. A separate job, **Temp-leak sweeps**, runs every battery again, each in
 its own empty TMPDIR, once to the end and once stopped by a SIGTERM, and fails on anything
-one leaves behind (KIT-450, KIT-617). `main` is protected: **four** contexts are required —
+one leaves behind (KIT-450, KIT-617). **Each long job is parallel shard jobs and one fan-in job
+that keeps the old name (KIT-945):** `kit-checks-1` to `-3` (their steps are the list; each battery
+is in exactly one, which `check_ci_covers_tests.py` enforces), the sweeps in 2 shards and the Python 3.9
+job in 5 (the lists are in `scripts/ci_shards.py`, and `--verify` fails on a battery in none or in two).
+A fan-in job runs `if: always()` and fails unless every shard's result is `success`, because a job whose
+`needs` failed is skipped and a skipped required check can read as a pass. A new battery needs a step in
+one `kit-checks-N` job and a name in one list of each family in `scripts/ci_shards.py`. `main` is protected: **four** contexts are required —
 **Kit checks**, **Provenance scan**, **Hooks change guard** and **Temp-leak sweeps** (since
-12 Nov 2026, KIT-699) — with admins enforced, so a leak blocks the merge. Each job's limit,
-and what to do near one, is in `docs/TESTING.md` ("Job limits and what to do near one").
+12 Nov 2026, KIT-699), each by that exact name, which is the fan-in job where a job is sharded, with admins enforced, so a
+leak blocks the merge. The shard jobs ("Kit checks shard 1/3" and so on) are never required themselves: no new
+required job is added. Each job's limit and measured time, and what to do near a limit, is in `docs/TESTING.md`
+("Job limits and what to do near one").
 A fourth workflow, **PR base** (`.github/workflows/pr-base.yml`), fails any PR not
 based on a base branch and re-runs on a retarget. It is deliberately not required:
 every PR into `main` passes it, and branch protection never covers a PR based on a

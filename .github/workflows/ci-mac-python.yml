@@ -10,6 +10,13 @@ name: CI on the Mac's Python
 # context, and renaming or matrixing it would leave every PR waiting forever. This job is NOT
 # required until the owner adds it (docs/TESTING.md, "Which Python each job runs"); a failure
 # turns the PR red. No `continue-on-error`: a failure that succeeds tells nobody.
+#
+# KIT-945. One job ran every battery one after another and took 28m31s and 29m38s of its 30
+# minutes, then was cancelled at the limit on two PRs while running test:acceptance-setup, so the
+# batteries after it got no run on the Python the Mac runs. It is five parallel shard jobs now,
+# from the lists in scripts/ci_shards.py, and a fan-in job that keeps the old name. The fan-in
+# fails unless every shard succeeded: a job whose needs failed is skipped, and a skip can read
+# as a pass.
 
 on:
   push:
@@ -21,12 +28,16 @@ permissions:
   contents: read
 
 jobs:
-  mac-python:
-    name: Kit checks (Python 3.9, the Mac's)
+  mac-python-shards:
+    name: Kit checks (Python 3.9, the Mac's) shard ${{ matrix.shard }}/5
     runs-on: macos-15
-    # 30: not yet measured on this image. The same batteries take 5.8 to 7.7 minutes on Ubuntu;
-    # macOS runners are slower. Set the limit from three measured runs (docs/TESTING.md).
-    timeout-minutes: 30
+    # 20: five shards of the batteries, each a fifth of the work. Set from the measured runs in
+    # docs/TESTING.md, "Job limits and what to do near one".
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5]
     steps:
       - uses: actions/checkout@v4
 
@@ -57,8 +68,10 @@ jobs:
           python3 -m pip install --quiet --user pyyaml
           npm ci
 
-      # The compiled files go to a folder under RUNNER_TEMP, so the checkout stays clean.
+      # The compiled files go to a folder under RUNNER_TEMP, so the checkout stays clean. Shard 1
+      # only: it is one pass over the whole tree.
       - name: Byte-compile every tracked Python file
+        if: matrix.shard == 1
         run: |
           set -euo pipefail
           python3 -V
@@ -69,13 +82,30 @@ jobs:
       # KIT-659. The scripts Kit checks runs bare over the real tree (runner pin, workflow calls,
       # schemas, placeholders, delivery config and the others) and the JSON and YAML parse. The
       # list is scripts/check_direct_checks.py; Kit checks fails when its own steps and that list differ.
+      # Shard 1 only: they read the whole tree, not a battery.
       - name: Direct checks over the real tree
+        if: matrix.shard == 1
         run: |
           python3 -V
           python3 scripts/check_direct_checks.py --run
 
-      # Includes the hook battery (test:hooks), then every other test:* battery, one at a time.
-      - name: Every selftest battery, one at a time
+      # This shard's share of the test:* batteries, one at a time, each with its own TMPDIR. The lists
+      # are scripts/ci_shards.py, which fails CI when one is missing or in two shards.
+      - name: This shard's selftest batteries, one at a time
         run: |
           python3 -V
-          npm run check:temp-leaks
+          python3 scripts/check_temp_leaks.py --shard mac/${{ matrix.shard }}
+
+  mac-python:
+    name: Kit checks (Python 3.9, the Mac's)
+    needs: [mac-python-shards]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Every Mac shard succeeded (a skipped or cancelled one is not a pass)
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: python3 scripts/ci_shards.py fan-in --expect mac-python-shards

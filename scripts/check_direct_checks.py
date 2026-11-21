@@ -42,6 +42,7 @@ DIRECT = (
     "scripts/check_label_gate.py",
     "scripts/check_template_label_gate.py",
     "scripts/check_ci_covers_tests.py",
+    "scripts/ci_shards.py --verify",
     "scripts/pipeline_session_kinds.py --check",
 )
 
@@ -68,7 +69,9 @@ def kit_checks_direct_steps(ci_text):
             in_jobs = True
         m = HEADER.match(line) if in_jobs else None
         if m:
-            inside = m.group(1) == JOB
+            # Kit checks is split into parallel shard jobs `kit-checks-1..N` (KIT-945), and the job
+            # named plain `kit-checks` is the fan-in: a direct step is in the shards.
+            inside = m.group(1).startswith(JOB + "-")
         if not inside or line.lstrip().startswith("#"):
             continue
         for part in re.split(r"\s*&&\s*", line.split("run:", 1)[-1].strip()):
@@ -176,10 +179,11 @@ def selftest():
         if not ok:
             failures.append(name)
 
-    ci = ("jobs:\n  kit-checks:\n    steps:\n      - name: a\n        run: python3 scripts/a.py\n"
+    ci = ("jobs:\n  kit-checks-1:\n    steps:\n      - name: a\n        run: python3 scripts/a.py\n"
           "      - run: |\n          python3 scripts/b.py --selftest\n          python3 scripts/c.py\n"
           "      # python3 scripts/ghost.py\n      - run: python3 scripts/d.py --selftest\n"
-          "      - run: python3 .claude/hooks/t.py\n"
+          "  kit-checks-2:\n    steps:\n      - run: python3 .claude/hooks/t.py\n"
+          "  kit-checks:\n    steps:\n      - run: python3 scripts/fan.py\n"
           "  other:\n    steps:\n      - run: python3 scripts/z.py\n")
     expect("direct steps: no-argument runs in Kit checks only, comments skipped",
            kit_checks_direct_steps(ci), ["scripts/a.py", "scripts/c.py", ".claude/hooks/t.py"])
