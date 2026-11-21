@@ -184,6 +184,11 @@ def config(raw):
         return None, ["the config is not an object"]
     cfg = copy.deepcopy(dict((k, raw.get(k, d)) for k, d in DEFAULTS.items()))
     bad = ["%s: not a setting" % repr(k)[:40] for k in sorted(raw, key=repr) if k not in DEFAULTS]
+    # A file from before KIT-923 may set only `day_stop` (say 60): its load was the default 40, so the new default
+    # load never rises above a stop the owner set, and such a file still loads.
+    if "planned_load" not in raw and amount(cfg["day_stop"]) and amount(cfg["planned_load"]) \
+            and 0 < cfg["day_stop"] < cfg["planned_load"]:
+        cfg["planned_load"] = cfg["day_stop"]
 
     def need(key, ok, why):
         if not ok:
@@ -1079,6 +1084,14 @@ def _cases(check):
            DEFAULTS["usage_pause_share"], DEFAULTS["sprint_points"], DEFAULTS["planned_load"],
            DEFAULTS["day_stop"], DEFAULTS["piece_stop"], DEFAULTS["starts_cap"]),
           (1, 5, 10, {"S": 1, "M": 2, "L": 3}, None, None, 400, 600, 150, 20))
+    check("a config from before points that sets only a day stop of 60 still loads, its load held under the stop",
+          (config({"day_stop": 60})[1], config({"day_stop": 60})[0]["planned_load"], config({"day_stop": 900})[0]["planned_load"]),
+          ([], 60, 400))
+    on_defaults = order({}, NOW, [P(n, effort="L") for n in range(1, 6)], [], usage(NOW), ledger(NOW, starts=0, agent=0))
+    check("the shipped defaults, with none of the old dollar figures, let a normal day start: five large pieces, three "
+          "of 3 points in a day of 10, the rest over the day's points",
+          (len(on_defaults["start"]), [h["reason"] for h in on_defaults["held"]], SP(on_defaults)),
+          (3, ["over-points"] * 2, []))
     check("the usage fixtures are documents the usage file's own schema accepts",
           check_schemas.document_problems(usage(), "pipeline-usage"), [])
     # -- the shape of what comes out --------------------------------------------------------------

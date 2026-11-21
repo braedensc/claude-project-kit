@@ -1360,8 +1360,8 @@ def points_text(settings, now):
                   if isinstance(p, dict) and p.get("held") == "no-estimate" and isinstance(p.get("id"), str)
                   and _SAID_TICKET_RE.fullmatch(p["id"]))
     if bare:
-        lines.append("No effort label, so not started: %s." % ", ".join(bare[:10]) + (
-            " and %d more" % (len(bare) - 10) if len(bare) > 10 else ""))
+        lines.append("No effort label, so not started: %s%s." % (", ".join(bare[:10]), (
+            " and %d more" % (len(bare) - 10)) if len(bare) > 10 else ""))
     return "\n".join(lines)
 
 
@@ -4264,6 +4264,9 @@ def _selftest():
     put_json(plan_path, plan_doc(points=pts, stops=share(ref="unreadable", value=None, limit=None)))
     pt_blind = points_text(s_on, pm).split("\n")
     put_json(plan_path, plan_doc())
+    many = [{"id": "KIT-%d" % n, "held": "no-estimate"} for n in range(1, 14)]
+    put_json(plan_path, plan_doc(points=pts, lanes=[{"id": "acme/app:1", "pieces": many}]))
+    pt_many = points_text(s_on, pm).split("\n")[-1]
     pt_old = points_text(s_on, pm)
     put_json(plan_path, plan_doc(points={"day": {"planned": "x", "started": 1, "left": 1}, "sprint": {"planned": 1.5}}))
     pt_junk = points_text(s_on, pm)
@@ -4278,6 +4281,8 @@ def _selftest():
     check("points: a week the usage file gives no figure for says new starts are holding",
           pt_blind[2], "New starts are holding: the usage file gives no figure for how full the week is, so I can't tell "
                        "whether it is under the share you set.")
+    check("points: more than ten pieces with no effort label end in one sentence, the count before the full stop",
+          pt_many, "No effort label, so not started: KIT-1, KIT-10, KIT-11, KIT-12, KIT-13, KIT-2, KIT-3, KIT-4, KIT-5, KIT-6 and 3 more.")
     check("points: a plan from before points, or one with points that are not counts, says nothing it cannot back",
           (pt_old, pt_junk), ("", ""))
     # A missing or unreadable file, on the day, is one line each; a file of another schema too.
