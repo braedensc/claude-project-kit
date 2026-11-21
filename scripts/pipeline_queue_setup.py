@@ -82,7 +82,9 @@ CONF_DEFAULTS = {
     # KIT-596: optional. Review tickets on the work teams are told by their marks; this names
     # only an old Reviews team, whose tickets stay never work.
     "REVIEWS_TEAM_KEY": "",
-    "REPO_BY_LABEL": "", "BACKLOG": "no", "AGENT_FILED": "off", "PLANNED_LOAD": "40", "DAY_STOP": "60",
+    "REPO_BY_LABEL": "", "BACKLOG": "no", "AGENT_FILED": "off", "PLANNED_LOAD": "400", "DAY_STOP": "600",
+    # KIT-923: the day is sized in story points. The dollar figures above are runaway stops only.
+    "POINTS_PER_DAY": "10", "SPRINT_POINTS": "", "EFFORT_POINTS": "S=1,M=2,L=3", "USAGE_PAUSE_SHARE": "",
     "PACE_TO_RESET": "no", "WEEKLY_BUDGET_USD": "", "SPRINT_PLAN_FILE": "",
     "LANES_PER_REPO": "1", "WINDOW_TIME_ZONE": "", "WINDOW_DAYS": "mon-sat 09:00 6, sun off", "GRACE_MINUTES": "60",
     "PLANNER": "yes", "PLANNER_BIN": "", "PLANNER_TOKEN_ENV": morning.DEFAULTS["planner_token_env"],
@@ -110,6 +112,18 @@ def num(text):
     if not re.match(r"^[0-9]+(\.[0-9]+)?$", text or "") or float(text) <= 0:
         return None
     return int(float(text)) if float(text) == int(float(text)) else float(text)
+
+
+def pairs_of_points(text):
+    """({effort: points}, [numbers of the items that are not `S=1`, or repeat an effort]) from `S=1,M=2,L=3`."""
+    out, bad = {}, []
+    for n, item in enumerate(split_list(text), 1):
+        name, _eq, count = (p.strip() for p in item.partition("="))
+        if name not in ("S", "M", "L") or name in out or not whole(count) or whole(count) < 1:
+            bad.append(n)
+        else:
+            out[name] = whole(count)
+    return out, bad
 
 
 def pairs(text):
@@ -195,12 +209,20 @@ def validate_conf(values, invoking_user=None):
     for k in ("PLANNED_LOAD", "DAY_STOP"):
         need(num(c.get(k)), "%s must be a number above 0" % k)
     need(c.get("PACE_TO_RESET") in ("yes", "no"), "PACE_TO_RESET must be yes or no")
+    need((whole(c.get("POINTS_PER_DAY")) or 0) >= 1, "POINTS_PER_DAY must be a whole number, 1 or more")
+    need(not c.get("SPRINT_POINTS") or (whole(c["SPRINT_POINTS"]) or 0) >= 1, "SPRINT_POINTS must be empty or a whole number, 1 or more")
+    need(not (c.get("SPRINT_POINTS") and "POINTS_PER_DAY" in values),
+         "set SPRINT_POINTS or POINTS_PER_DAY, not both: the other follows from the working days")
+    points, bad_points = pairs_of_points(c.get("EFFORT_POINTS"))
+    need(not bad_points and set(points) == {"S", "M", "L"}, "EFFORT_POINTS must give S, M and L each a whole number, 1 or more, "
+                                                            "as `S=1,M=2,L=3`")
+    share = c.get("USAGE_PAUSE_SHARE")
+    need(not share or (num(share) is not None and num(share) <= 100), "USAGE_PAUSE_SHARE must be empty (off) or a percent above 0 "
+                                                                       "and up to 100")
     need(not c.get("WEEKLY_BUDGET_USD") or num(c.get("WEEKLY_BUDGET_USD")), "WEEKLY_BUDGET_USD must be empty or a number above 0")
     need(c.get("PACE_TO_RESET") != "yes" or c.get("WEEKLY_BUDGET_USD"), "WEEKLY_BUDGET_USD is required with PACE_TO_RESET=yes")
     need(not c.get("SPRINT_PLAN_FILE") or re.match(r"^[~/][A-Za-z0-9_./~-]{1,200}\Z", c["SPRINT_PLAN_FILE"]),
          "SPRINT_PLAN_FILE must be a path, or empty")
-    need(not c.get("SPRINT_PLAN_FILE") or c.get("WEEKLY_BUDGET_USD"),
-         "WEEKLY_BUDGET_USD is required with SPRINT_PLAN_FILE: a week cannot be sized without a budget")
     for k in ("LANES_PER_REPO", "GRACE_MINUTES"):
         need(whole(c.get(k)) is not None, "%s must be a whole number" % k)
     days, bad_days = parse_window_days(c.get("WINDOW_DAYS"))
@@ -250,15 +272,21 @@ def compose(c):
     """(the queue's config, the usage job's config); `~` stays literal. The planner and the order get the same numbers,
     and the usage job's `out` is the file the queue reads."""
     load, lanes = num(c["PLANNED_LOAD"]), whole(c["LANES_PER_REPO"])
+    points, per_day = pairs_of_points(c["EFFORT_POINTS"])[0], whole(c["POINTS_PER_DAY"])
+    if c["SPRINT_POINTS"]:       # the owner set the sprint: the day's points follow from the working days
+        days = sum(1 for d in parse_window_days(c["WINDOW_DAYS"])[0].values() if d)
+        per_day = max(1, -(-whole(c["SPRINT_POINTS"]) // days))
     queue = {
         "pool": {"owner_user_ids": split_list(c["OWNER_USER_IDS"]), "dispatcher_user_ids": split_list(c["DISPATCHER_USER_IDS"]),
                  "owner_slack_user_ids": split_list(c["OWNER_SLACK_USER_IDS"]), "team_keys": split_list(c["TEAM_KEYS"]),
                  "reviews_team_key": c["REVIEWS_TEAM_KEY"], "backlog": c["BACKLOG"] == "yes", "agent_filed": c["AGENT_FILED"]},
-        "order": dict({"lanes_per_repo": lanes, "planned_load": load, "day_stop": num(c["DAY_STOP"])},
+        "order": dict({"lanes_per_repo": lanes, "planned_load": load, "day_stop": num(c["DAY_STOP"]),
+                       "points": points, "points_per_day": per_day},
+                      **({"sprint_points": whole(c["SPRINT_POINTS"])} if c["SPRINT_POINTS"] else {}),
+                      **({"usage_pause_share": num(c["USAGE_PAUSE_SHARE"])} if c["USAGE_PAUSE_SHARE"] else {}),
                       **({"pace_to_reset": True, "weekly_budget_usd": num(c["WEEKLY_BUDGET_USD"])}
-                         if c["PACE_TO_RESET"] == "yes" else
-                         {"weekly_budget_usd": num(c["WEEKLY_BUDGET_USD"])} if c["SPRINT_PLAN_FILE"] else {})),
-        "planner": {"lanes_per_repo": lanes, "planned_load": load},
+                         if c["PACE_TO_RESET"] == "yes" else {})),
+        "planner": {"lanes_per_repo": lanes, "planned_load": load, "points": points, "points_per_day": per_day},
         "window": {"time_zone": c["WINDOW_TIME_ZONE"] or None, "days": parse_window_days(c["WINDOW_DAYS"])[0],
                    "grace_minutes": whole(c["GRACE_MINUTES"])},
         "reader": {"linear_key_env": c["LINEAR_KEY_ENV"], "repo_by_team": pairs(c["REPO_BY_TEAM"])[0],
@@ -844,7 +872,7 @@ FAKE_JOB = (
 BASE_CONF = {"ROLE_ACCOUNT": "_exqueue", "OWNER_USER_IDS": "owner-1", "DISPATCHER_USER_IDS": "disp-1",
              "TEAM_KEYS": "ENG,OPS", "REVIEWS_TEAM_KEY": "REV", "REPO_BY_TEAM": "ENG=acme/app,OPS=acme/ops",
              "USAGE_JOB_LABEL": "com.example.queue-usage", "MORNING_JOB_LABEL": "com.example.queue-morning",
-             "PLANNER_BIN": "/opt/claude/bin/claude"}
+             "PLANNER_BIN": "/opt/claude/bin/claude", "PLANNED_LOAD": "40", "DAY_STOP": "60"}
 
 
 def _put(path, body, mode=0o644):
@@ -1043,7 +1071,7 @@ def _cases(check, tmp):
         conf = parse(text(WINDOW_DAYS="mon-fri 08:30 7.5, sat 10:00 4"))[0]
         queue, usage = compose(conf)
         validate_composed(queue, usage, None)
-        return (sorted(queue), queue["planner"] == {k: queue["order"][k] for k in ("lanes_per_repo", "planned_load")},
+        return (sorted(queue), queue["planner"] == {k: queue["order"][k] for k in ("lanes_per_repo", "planned_load", "points", "points_per_day")},
                 usage["out"] == queue["morning"]["usage_file"] == conf["USAGE_FILE"],
                 [d for d, v in queue["window"]["days"].items() if v], queue["window"]["days"]["sat"])
     case("compose: both configs pass the jobs' own loaders; two files share a value; a day not named has no window",
@@ -1106,7 +1134,7 @@ def _cases(check, tmp):
         conf, bad_ = parse(text(**over))
         return (bad_, compose(conf)[0]["order"]) if not bad_ else (bad_, None)
     check("pacing: off by default leaves the order's keys as they were; on adds the two, and the jobs' own loaders accept it",
-          (paced_conf()[1].keys() == {"lanes_per_repo", "planned_load", "day_stop"},
+          (paced_conf()[1].keys() == {"lanes_per_repo", "planned_load", "day_stop", "points", "points_per_day"},
            paced_conf(PACE_TO_RESET="yes", WEEKLY_BUDGET_USD="90")[1].get("weekly_budget_usd"),
            validate_composed(compose(parse(text(PACE_TO_RESET="yes", WEEKLY_BUDGET_USD="90"))[0])[0],
                              compose(parse(text())[0])[1], None)),
@@ -1122,18 +1150,44 @@ def _cases(check, tmp):
         conf, bad_ = parse(text(**over))
         return (bad_, compose(conf)[0]) if not bad_ else (bad_, None)
     ok_s = sprint_conf(WEEKLY_BUDGET_USD="90", SPRINT_PLAN_FILE="~/.stage-e/queue/sprint-plan.json")
-    check("sprint planning (KIT-575): off by default adds nothing; on writes the file name and the budget, and the jobs' own loaders accept it",
+    check("sprint planning (KIT-575): off by default adds nothing; on writes the file name, needs no dollar budget (KIT-923), and the jobs' own loaders accept it",
           (sprint_conf()[1]["morning"].get("sprint_plan_file"), "weekly_budget_usd" in sprint_conf()[1]["order"],
-           ok_s[0], ok_s[1]["morning"]["sprint_plan_file"], ok_s[1]["order"]["weekly_budget_usd"],
-           ok_s[1]["order"].get("pace_to_reset"),
+           ok_s[0], ok_s[1]["morning"]["sprint_plan_file"], "weekly_budget_usd" in ok_s[1]["order"],
+           sprint_conf(SPRINT_PLAN_FILE="~/p.json")[0],
            validate_composed(ok_s[1], compose(parse(text())[0])[1], None)),
-          (None, False, [], "~/.stage-e/queue/sprint-plan.json", 90, None,
+          (None, False, [], "~/.stage-e/queue/sprint-plan.json", False, [],
            validate_composed(ok_s[1], compose(parse(text())[0])[1], None)))
-    check("sprint planning: a plan file with no budget, and a file name that is not a path, are each refused by key",
-          [sprint_conf(**kw)[0] for kw in (dict(SPRINT_PLAN_FILE="~/p.json"),
-                                          dict(WEEKLY_BUDGET_USD="90", SPRINT_PLAN_FILE="bad name; echo hi"))],
-          [["WEEKLY_BUDGET_USD is required with SPRINT_PLAN_FILE: a week cannot be sized without a budget"],
-           ["SPRINT_PLAN_FILE must be a path, or empty"]])
+    check("sprint planning: a file name that is not a path is refused by key",
+          sprint_conf(SPRINT_PLAN_FILE="bad name; echo hi")[0], ["SPRINT_PLAN_FILE must be a path, or empty"])
+
+    # -- story points (KIT-923): the conf's keys, what they compose, and each refusal by key
+    def pts_conf(**over):
+        conf, bad_ = parse(text(**over))
+        return (bad_, compose(conf)[0]) if not bad_ else (bad_, None)
+    dflt, custom = pts_conf()[1], pts_conf(POINTS_PER_DAY="12", EFFORT_POINTS="S=1,M=3,L=5", USAGE_PAUSE_SHARE="85")[1]
+    sprint_set = pts_conf(WINDOW_DAYS="mon-fri 09:00 6, sat off, sun off", SPRINT_POINTS="52", POINTS_PER_DAY=None)
+    check("points: the defaults compose S 1, M 2, L 3 and 10 a day with no pause; the owner's figures and pause carry to the "
+          "order and the planner, and the jobs' own loaders accept each",
+          (dflt["order"]["points"], dflt["order"]["points_per_day"], "usage_pause_share" in dflt["order"],
+           "sprint_points" in dflt["order"], dflt["planner"]["points_per_day"],
+           custom["order"]["points"], custom["order"]["points_per_day"], custom["order"]["usage_pause_share"],
+           custom["planner"]["points"], validate_composed(custom, compose(parse(text())[0])[1], None)),
+          ({"S": 1, "M": 2, "L": 3}, 10, False, False, 10, {"S": 1, "M": 3, "L": 5}, 12, 85, {"S": 1, "M": 3, "L": 5},
+           validate_composed(custom, compose(parse(text())[0])[1], None)))
+    check("points: the sprint's figure sets the day's, from the working days (52 over 5 days is 11 a day, rounded up)",
+          (sprint_set[0], sprint_set[1]["order"]["sprint_points"], sprint_set[1]["order"]["points_per_day"]),
+          ([], 52, 11))
+    check("points: each bad figure is refused by key, and both the sprint's and the day's figure together is refused",
+          [pts_conf(**kw)[0] for kw in (dict(POINTS_PER_DAY="0"), dict(POINTS_PER_DAY="ten"), dict(SPRINT_POINTS="0"),
+                                       dict(SPRINT_POINTS="60", POINTS_PER_DAY="10"), dict(EFFORT_POINTS="S=1,M=2"),
+                                       dict(EFFORT_POINTS="S=1,M=2,L=0"), dict(EFFORT_POINTS="S=1,M=2,L=3,S=4"),
+                                       dict(USAGE_PAUSE_SHARE="0"), dict(USAGE_PAUSE_SHARE="101"),
+                                       dict(USAGE_PAUSE_SHARE="85%"))],
+          [["POINTS_PER_DAY must be a whole number, 1 or more"]] * 2
+          + [["SPRINT_POINTS must be empty or a whole number, 1 or more"],
+             ["set SPRINT_POINTS or POINTS_PER_DAY, not both: the other follows from the working days"]]
+          + [["EFFORT_POINTS must give S, M and L each a whole number, 1 or more, as `S=1,M=2,L=3`"]] * 3
+          + [["USAGE_PAUSE_SHARE must be empty (off) or a percent above 0 and up to 100"]] * 3)
 
     def loaders_refuse():
         fake, conf = world()

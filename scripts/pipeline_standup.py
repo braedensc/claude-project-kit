@@ -1317,6 +1317,58 @@ def sprint_text(settings, now):
     return sprint.sprint_line(view, now)
 
 
+def _points_part(block):
+    """(started, planned, left) from one of the day plan's points blocks, or None when it is not three counts."""
+    if isinstance(block, dict) and all(isinstance(block.get(k), int) and not isinstance(block.get(k), bool)
+                                       and block[k] >= 0 for k in ("planned", "started", "left")):
+        return block["started"], block["planned"], block["left"]
+    return None
+
+
+def points_text(settings, now):
+    """KIT-923: the day's story points and the sprint's, and each way new starts are not going on, in fixed words,
+    from the day plan. "" when the day plan is off, unreadable (the spend lines already say so) or has no points
+    (a plan from before points). Built by code: the only words in it are numbers, ticket ids and these sentences."""
+    if not settings.get("day_plan_file"):
+        return ""
+    doc, _problem = read_dated(settings, "day_plan_file", now, DAY_PLAN_SCHEMA, "day plan", True)
+    if doc is None or not isinstance(doc.get("points"), dict):
+        return ""
+    lines, pts = [], doc["points"]
+    day = _points_part(pts.get("day"))
+    if day:
+        lines.append("Points today: %d of %d done (started), %d left." % day)
+    if pts.get("sprint") is None:
+        lines.append("Points this sprint: not known, because the usage file can't place the sprint's week.")
+    else:
+        week = _points_part(pts["sprint"])
+        if week:
+            lines.append("Points this sprint: %d of %d done (started), %d left." % week)
+    for stop in doc.get("stops") if isinstance(doc.get("stops"), list) else []:
+        if not (isinstance(stop, dict) and stop.get("stop") == "weekly-share"):
+            continue
+        if stop.get("ref") == "paused" and _num(stop.get("value")) and _num(stop.get("limit")):
+            lines.append("New starts are paused at the weekly share: the week's usage is at %s%%, and the share you "
+                         "set is %s%%. They go on when the week resets, or when you raise the share."
+                         % (_pct(stop["value"]), _pct(stop["limit"])))
+        else:
+            lines.append("New starts are holding: the usage file gives no figure for how full the week is, so I "
+                         "can't tell whether it is under the share you set.")
+    lanes = doc.get("lanes") if isinstance(doc.get("lanes"), list) else []
+    bare = sorted(p["id"] for lane in lanes if isinstance(lane, dict)
+                  for p in (lane.get("pieces") if isinstance(lane.get("pieces"), list) else [])
+                  if isinstance(p, dict) and p.get("held") == "no-estimate" and isinstance(p.get("id"), str)
+                  and _SAID_TICKET_RE.fullmatch(p["id"]))
+    if bare:
+        lines.append("No effort label, so not started: %s%s." % (", ".join(bare[:10]), (
+            " and %d more" % (len(bare) - 10)) if len(bare) > 10 else ""))
+    return "\n".join(lines)
+
+
+def _pct(value):
+    return ("%.1f" % value).rstrip("0").rstrip(".")
+
+
 HEALTH_SCHEMA = "pipeline-health-status/1"
 HEALTH_MAX_AGE = timedelta(hours=3)          # the watch runs hourly; an older file is the heartbeat monitor's to page
 MACHINE_KINDS = ("memory", "burn")
@@ -2042,6 +2094,9 @@ def compose(kind, now, settings, record=None, teams=None):
     notes = notes + unread
     lead.extend(notes)
     sprint_line = sprint_text(settings, now) if settings.get("sprint") else None
+    points_line = points_text(settings, now)
+    if points_line:
+        sprint_line = (sprint_line + "\n" if sprint_line else "") + points_line
     if sprint_line:
         lead.append(sprint_line)
     if unknown:
@@ -4195,6 +4250,41 @@ def _selftest():
         "Spend this week: $87.50 so far, measured as plan use at API prices, not a bill.",
         "0 pieces had runs this week, 40 runs in all."], base[8])
     check("the-morning-has-no-spend", base[9] == "", base[9])
+    # --- story points (KIT-923): the day's and the sprint's, and each way starts are not going on ---
+    pts = {"day": {"planned": 10, "started": 4, "left": 6}, "sprint": {"planned": 40, "started": 12, "left": 28}}
+    held_lane = [{"id": "acme/app:1", "pieces": [{"id": "KIT-8", "held": "no-estimate"}, {"id": "KIT-7", "held": "no-estimate"},
+                                                 {"id": "KIT-6", "held": "blocked"}]}]
+    share = lambda **kw: [dict({"stop": "weekly-share", "ref": "paused", "value": 87.5, "limit": 85}, **kw)]    # noqa: E731
+    put_json(plan_path, plan_doc(points=pts))
+    pt_ok = points_text(s_on, pm).split("\n")
+    put_json(plan_path, plan_doc(points=dict(pts, sprint=None)))
+    pt_nosprint = points_text(s_on, pm).split("\n")
+    put_json(plan_path, plan_doc(points=pts, stops=share(), lanes=held_lane))
+    pt_paused = points_text(s_on, pm).split("\n")
+    put_json(plan_path, plan_doc(points=pts, stops=share(ref="unreadable", value=None, limit=None)))
+    pt_blind = points_text(s_on, pm).split("\n")
+    put_json(plan_path, plan_doc())
+    many = [{"id": "KIT-%d" % n, "held": "no-estimate"} for n in range(1, 14)]
+    put_json(plan_path, plan_doc(points=pts, lanes=[{"id": "acme/app:1", "pieces": many}]))
+    pt_many = points_text(s_on, pm).split("\n")[-1]
+    pt_old = points_text(s_on, pm)
+    put_json(plan_path, plan_doc(points={"day": {"planned": "x", "started": 1, "left": 1}, "sprint": {"planned": 1.5}}))
+    pt_junk = points_text(s_on, pm)
+    check("points: the day's and the sprint's, done (started) and left",
+          pt_ok, ["Points today: 4 of 10 done (started), 6 left.", "Points this sprint: 12 of 40 done (started), 28 left."])
+    check("points: a sprint the usage file cannot place is said, never a number",
+          pt_nosprint[1], "Points this sprint: not known, because the usage file can't place the sprint's week.")
+    check("points: a pause at the weekly share is said in words, and a piece with no effort label is named",
+          pt_paused[2:], ["New starts are paused at the weekly share: the week's usage is at 87.5%, and the share you set is "
+                          "85%. They go on when the week resets, or when you raise the share.",
+                          "No effort label, so not started: KIT-7, KIT-8."])
+    check("points: a week the usage file gives no figure for says new starts are holding",
+          pt_blind[2], "New starts are holding: the usage file gives no figure for how full the week is, so I can't tell "
+                       "whether it is under the share you set.")
+    check("points: more than ten pieces with no effort label end in one sentence, the count before the full stop",
+          pt_many, "No effort label, so not started: KIT-1, KIT-10, KIT-11, KIT-12, KIT-13, KIT-2, KIT-3, KIT-4, KIT-5, KIT-6 and 3 more.")
+    check("points: a plan from before points, or one with points that are not counts, says nothing it cannot back",
+          (pt_old, pt_junk), ("", ""))
     # A missing or unreadable file, on the day, is one line each; a file of another schema too.
     os.unlink(plan_path)
     os.unlink(usage_path)

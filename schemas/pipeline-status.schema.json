@@ -104,6 +104,25 @@
       ],
       "description": "KIT-581. Whether the checkout these jobs run from, the role account's copy of the kit, is behind the repository's branch. null: the job is not told a repository (`kit_repo`). `behind`: a file the jobs run, or data they read (a schema, or a session kind the runner starts, KIT-880; and a job's own data where that job is installed: the kit's guards for the runner, the look tool's profile for the acceptance job, KIT-889), changed between the checkout's head (`head`, twelve characters) and the branch; `merges_behind` counts the commits, and `files` names up to ten of the files, out of `files_total`. `current`: no file the jobs run changed (a doc or a test only may have). `unknown`: the question could not be answered, with `reason` in fixed words; never read as current. Optional: a file from before KIT-581 has none."
     },
+    "queue_points": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["state", "date", "written_at", "day", "sprint", "reason"],
+          "properties": {
+            "state": {"enum": ["read", "unread"]},
+            "date": {"type": ["string", "null"], "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"},
+            "written_at": {"$ref": "#/$defs/time_or_null"},
+            "day": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/points"}]},
+            "sprint": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/points"}]},
+            "reason": {"type": ["string", "null"], "maxLength": 120}
+          }
+        }
+      ],
+      "description": "KIT-923. The day plan's story points, copied as numbers and a date only: the day's, and the sprint's (null when the plan could not place the sprint). null: the job is told not to look, or no plan has been written yet. `unread`: the plan is there and cannot be read or holds no points, said with a `reason`, never taken as none left."
+    },
     "queue_room": {
       "oneOf": [
         {"type": "null"},
@@ -153,6 +172,16 @@
   },
 
   "$defs": {
+    "points": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["planned", "started", "left"],
+      "properties": {
+        "planned": {"type": "integer", "minimum": 0},
+        "started": {"type": "integer", "minimum": 0},
+        "left": {"type": "integer", "minimum": 0}
+      }
+    },
     "time": {
       "type": "string",
       "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",

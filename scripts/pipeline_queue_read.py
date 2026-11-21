@@ -642,7 +642,7 @@ def read_ledger(path, today, say):
     zero; a day that has not come, or a file that is not a ledger, is not read."""
     if not path:
         return None, OFF, None
-    zero = {"date": today, "starts": 0, "agent_filed_starts": 0}
+    zero = {"date": today, "starts": 0, "agent_filed_starts": 0, "points_started": 0, "sprint": None}
     try:
         doc = read_json(path)
     except FileNotFoundError:
@@ -650,16 +650,21 @@ def read_ledger(path, today, say):
     except (OSError, ValueError) as exc:
         say("ledger: %s could not be read (%s)" % (path, type(exc).__name__))
         return None, COULD_NOT, UNREADABLE
+    sprint = doc.get("sprint") if isinstance(doc, dict) else None
     if not (isinstance(doc, dict) and is_day(doc.get("date")) and whole_count(doc.get("starts"))
-            and whole_count(doc.get("agent_filed_starts"))):
+            and whole_count(doc.get("agent_filed_starts")) and whole_count(doc.get("points_started", 0))
+            and (sprint is None or (isinstance(sprint, dict) and set(sprint) == {"week", "points"}
+                                    and isinstance(sprint["week"], str) and whole_count(sprint["points"])))):
         say("ledger: %s is not a ledger of starts" % path)
         return None, COULD_NOT, UNREADABLE
     if doc["date"] > today:
         say("ledger: %s is dated after today" % path)
         return None, COULD_NOT, "the record is dated ahead"
     if doc["date"] < today:
-        return zero, READ, "a new day"
-    return dict((k, doc[k]) for k in ("date", "starts", "agent_filed_starts")), READ, None
+        return dict(zero, sprint=sprint), READ, "a new day"
+    return dict(
+        dict((k, doc[k]) for k in ("date", "starts", "agent_filed_starts")),
+        points_started=doc.get("points_started", 0), sprint=sprint), READ, None
 
 
 def read_validator(settings_path, ledger_path, say):
@@ -1124,7 +1129,11 @@ def _cases(check, tmp, blocked):
     F = dict((k, put(FILES, k + ".json", v if isinstance(v, str) else dump(v))) for k, v in dict(
         {"seen": {"schema": SEEN_SCHEMA, "seen": SEEN}, "bridge": {"epics": RECORD}, "bad": "{not json",
          "list": [], "ledger": dict(LEDGER, rows=[]), "old": dict(LEDGER, date="1999-01-01"),
-         "ahead": dict(LEDGER, date="2999-01-01"), "epicslist": {"epics": []}},
+         "ahead": dict(LEDGER, date="2999-01-01"), "epicslist": {"epics": []},
+         "pts": dict(LEDGER, points_started=4, sprint={"week": "2026-11-10T18:00:00Z", "points": 7}),
+         "pts_old": dict(LEDGER, date="1999-01-01", points_started=4, sprint={"week": "2026-11-10T18:00:00Z", "points": 7}),
+         "pts_bad": dict(LEDGER, points_started=-1), "sprint_bad": dict(LEDGER, sprint={"week": "w", "points": 1.5}),
+         "sprint_key": dict(LEDGER, sprint={"week": "w", "points": 1, "x": 1})},
         **dict(("junk%d" % i, v) for i, v in enumerate(JUNK))).items())
     F["none"] = os.path.join(FILES, "none.json")
     FILESET = {"findings_file": F["seen"], "bridge_state_file": F["bridge"], "ledger_file": F["ledger"]}
@@ -1298,7 +1307,10 @@ def _cases(check, tmp, blocked):
          lambda d: (lambda p: (p["repo"], p["priority"], p["effort"], [b["ticket"] for b in p["blockers"]]))(
              order.clean(dict(judged(W(d))["ENG-1"], **W(d)["extras"]["ENG-1"]))))
     # -- the records
-    UN, ZERO = (None, COULD_NOT, UNREADABLE), {"date": TODAY, "starts": 0, "agent_filed_starts": 0}
+    UN, ZERO = (None, COULD_NOT, UNREADABLE), {"date": TODAY, "starts": 0, "agent_filed_starts": 0,
+                                               "points_started": 0, "sprint": None}
+    WEEK = {"week": "2026-11-10T18:00:00Z", "points": 7}
+    LEDGER_READ = dict(LEDGER, points_started=0, sprint=None)
     case("finding and plan records: read, missing, refused, off",
          ([(SEEN, READ, None), ({}, READ, NO_RECORD), UN, (None, OFF, None)],
           [(RECORD, READ, None), ({}, READ, NO_RECORD), UN, UN, UN, (None, OFF, None)]),
@@ -1306,13 +1318,17 @@ def _cases(check, tmp, blocked):
                     [read_plans(F[k], quiet) for k in ("bridge", "none", "bad", "list", "epicslist")]
                     + [read_plans("", quiet)]))
     case("ledger: today, a new day, missing, ahead or malformed, off",
-         ([(LEDGER, READ, None), (ZERO, READ, "a new day"), (ZERO, READ, "no start recorded yet"),
+         ([(LEDGER_READ, READ, None), (ZERO, READ, "a new day"), (ZERO, READ, "no start recorded yet"),
            (None, COULD_NOT, "the record is dated ahead"), (None, OFF, None)], [UN] * 5),
          lambda d: ([read_ledger(F[k], TODAY, quiet) for k in ("ledger", "old", "none", "ahead")]
                     + [read_ledger("", TODAY, quiet)],
                     [read_ledger(F["junk%d" % i], TODAY, quiet) for i in range(5)]))
+    case("ledger points (KIT-923): today's, the sprint's across a day, and none when absent; a count that is not one is unreadable",
+         [(4, WEEK), (0, WEEK), (0, None), UN, UN, UN],
+         lambda d: [(lambda r: (r[0]["points_started"], r[0]["sprint"]))(read_ledger(F[k], TODAY, quiet))
+                    for k in ("pts", "pts_old", "ledger")] + [read_ledger(F[k], TODAY, quiet) for k in ("pts_bad", "sprint_bad", "sprint_key")])
     case("records ride along; an unreadable one makes it partial",
-         ((SEEN, RECORD, LEDGER), ("partial", None, UNREADABLE)),
+         ((SEEN, RECORD, LEDGER_READ), ("partial", None, UNREADABLE)),
          lambda d: ((W(d)["findings"], W(d)["plans"], W(d)["ledger"]),
                     (d["RB"].doc["result"], d["RB"].doc["findings"], d["RB"].doc["sources"]["findings"]["reason"])))
     # -- the caps, and a tracker that fails
