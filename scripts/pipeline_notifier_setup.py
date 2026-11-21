@@ -502,6 +502,12 @@ CONF_DEFAULTS = {
     # default, and then no relay key is composed. On, it needs the owner's Slack member id and
     # the dispatcher's agent user id, and the Slack app needs the groups:history scope.
     "REPLY_RELAY": "no",
+    # KIT-920: where the relay sends an answer for a team whose runner lane is on. The runner's
+    # store, and each team key's project key in the runner's settings, as `KIT=app,TOD=todo`. Both
+    # empty composes no key, and every answer goes to the session's thread as before. Whether a
+    # project's answers go to the runner is the runner's own `lanes.fix` for it, never set here.
+    "RUNNER_STORE_DIR": "",
+    "RUNNER_PROJECTS": "",
     "OWNER_CHAT_USER_ID": "",
     "DISPATCHER_AGENT_USER_ID": "",
     # KIT-281: the Slack member ids @mentioned on every page that asks a person to do
@@ -559,6 +565,25 @@ ROLE_HOME_SENTINEL = "/__role_home__"
 
 def split_list(value):
     return se.split_list(value)
+
+
+def runner_lane_from_conf(conf):
+    """({} or the notifier's `runner_lane` object, problems) from RUNNER_STORE_DIR and
+    RUNNER_PROJECTS (KIT-920), judged by the notifier's own rule so the two can never disagree.
+    Both empty is {} and no problem; one without the other is a problem."""
+    store = (conf.get("RUNNER_STORE_DIR") or "").strip()
+    pairs = split_list(conf.get("RUNNER_PROJECTS"))
+    if not store and not pairs:
+        return {}, []
+    projects = {}
+    for pair in pairs:
+        team, sep, project = pair.partition("=")
+        if not sep or team in projects:
+            return {}, ["RUNNER_PROJECTS entries are TEAM=project, each team once, got %r" % pair]
+        projects[team] = project
+    if not store or not projects:
+        return {}, ["RUNNER_STORE_DIR and RUNNER_PROJECTS go together: set both or neither"]
+    return notify.runner_lane_setting({"store_dir": store, "projects": projects})
 
 
 def credential_shape(value):
@@ -813,6 +838,13 @@ def validate_conf(values, invoking_user=None):
             errors.append("REPLY_RELAY=yes and DM_USER_IDS are both set: the relay reads a "
                           "channel's threads, and pages in direct messages have none. Turn "
                           "REPLY_RELAY off")
+    lane_doc, lane_bad = runner_lane_from_conf(conf)
+    if lane_bad:
+        errors.append("RUNNER_STORE_DIR and RUNNER_PROJECTS are not usable: %s (KIT-920)"
+                      % "; ".join(lane_bad))
+    elif lane_doc and conf.get("REPLY_RELAY") != "yes":
+        errors.append("RUNNER_STORE_DIR and RUNNER_PROJECTS need REPLY_RELAY=yes: they only "
+                      "change where a relayed answer goes (KIT-920)")
     if conf.get("PAGE_IMAGES", "no") not in ("yes", "no"):
         errors.append("PAGE_IMAGES must be yes or no, got %r" % conf.get("PAGE_IMAGES"))
     if conf.get("REPLAN_IN_DM", "no") not in ("yes", "no"):
@@ -1102,6 +1134,10 @@ def compose_config(conf, label_ids, actor_ids, monitor_ids=(), bounce_ids=(),
     if conf.get("REPLY_RELAY") == "yes":
         doc.update(reply_relay=True, owner_chat_user_id=conf["OWNER_CHAT_USER_ID"].strip(),
                    dispatcher_agent_user_id=conf["DISPATCHER_AGENT_USER_ID"].strip())
+    # …and where a runner-lane project's answers go (KIT-920), only when both keys are set.
+    lane_doc, _lane_bad = runner_lane_from_conf(conf)
+    if lane_doc and conf.get("REPLY_RELAY") == "yes":
+        doc["runner_lane"] = {"store_dir": lane_doc["store_dir"], "projects": lane_doc["projects"]}
     # The same rule for the @mentions (KIT-281): composed only when someone is named.
     mentions = split_list(conf.get("MENTION_CHAT_USER_IDS"))
     if mentions:
@@ -4747,6 +4783,22 @@ def _selftest_body():
        refused("REPLY_RELAY=yes\nDISPATCHER_AGENT_USER_ID=a\n", "OWNER_CHAT_USER_ID")
        and refused("REPLY_RELAY=yes\nOWNER_CHAT_USER_ID=U0SYNTH0001\n",
                    "DISPATCHER_AGENT_USER_ID"))
+    # KIT-920: the runner lane's two keys, composed only together, only with the relay on.
+    _rn = _relay + "RUNNER_STORE_DIR=/var/runner/store\nRUNNER_PROJECTS=KIT=app,TOD=todo\n"
+    _rn_json = json.loads(validate_composed(compose_config(
+        good_conf(_rn), {"agent:blocked": "lbl-1", "agent:needs-human": "lbl-2"}, ["a-1"]), None))
+    ok("conf: RUNNER_STORE_DIR and RUNNER_PROJECTS compose the notifier's runner_lane, and its own "
+       "loader accepts it; the default composes none (KIT-920)",
+       _rn_json.get("runner_lane", {}).get("projects") == {"KIT": "app", "TOD": "todo"}
+       and _rn_json["runner_lane"]["store_dir"].endswith("/var/runner/store")
+       and "runner_lane" not in _rl_json, _rn_json.get("runner_lane"))
+    ok("refuse: the runner lane's keys without the relay, one without the other, a bad pair or "
+       "a relative store (KIT-920)",
+       refused("RUNNER_STORE_DIR=/s\nRUNNER_PROJECTS=KIT=app\n", "need REPLY_RELAY=yes")
+       and refused(_relay + "RUNNER_STORE_DIR=/s\n", "go together")
+       and refused(_relay + "RUNNER_PROJECTS=KIT=app\n", "go together")
+       and refused(_relay + "RUNNER_STORE_DIR=/s\nRUNNER_PROJECTS=KIT\n", "TEAM=project")
+       and refused(_relay + "RUNNER_STORE_DIR=s\nRUNNER_PROJECTS=KIT=app\n", "store_dir"))
     ok("refuse: an OWNER_CHAT_USER_ID that is not a chat user id (KIT-177)",
        refused(_relay.replace("U0SYNTH0001", "bob"), "OWNER_CHAT_USER_ID"))
     ok("refuse: REPLY_RELAY beside BRIDGE_PINGS or DM_USER_IDS, which the notifier refuses "

@@ -26,7 +26,9 @@ none: the runner's `lanes.review` is the review lane's one switch.
 
 **The runner says which lanes it takes** (KIT-708). It writes them into its store, and the acceptance
 job and the fix driver read them there. Each sends a kind to the runner only while the runner says that
-lane is on for the project, and takes its old road otherwise. Their own `runner_lane` only says where the
+lane is on for the project, and takes its old road otherwise. The notifier's reply relay is a sixth caller
+(KIT-920): while the `fix` lane is on for a project, the owner's answer to a stopped session goes to the
+runner as a fix-kind resume of the run that asked, and the thread is used while it is off. Their own `runner_lane` only says where the
 runner's store is and which project a repository is: it switches nothing. The catch-up job reads the
 `fix` lane there too (KIT-707): it leaves a team out of each pass while that lane is on for every one of
 its projects, so the one switch moves a project's fixes and its catch-up together.
