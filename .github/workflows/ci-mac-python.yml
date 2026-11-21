@@ -14,7 +14,7 @@ name: CI on the Mac's Python
 # KIT-945. One job ran every battery one after another and took 28m31s and 29m38s of its 30
 # minutes, then was cancelled at the limit on two PRs while running test:acceptance-setup, so the
 # batteries after it got no run on the Python the Mac runs. It is five parallel shard jobs now,
-# from the lists in scripts/ci_shards.py, and a fan-in job that keeps the old name. The fan-in
+# from the lists in scripts/check_ci_shards.py, and a fan-in job that keeps the old name. The fan-in
 # fails unless every shard succeeded: a job whose needs failed is skipped, and a skip can read
 # as a pass.
 
@@ -90,7 +90,7 @@ jobs:
           python3 scripts/check_direct_checks.py --run
 
       # This shard's share of the test:* batteries, one at a time, each with its own TMPDIR. The lists
-      # are scripts/ci_shards.py, which fails CI when one is missing or in two shards.
+      # are scripts/check_ci_shards.py, which fails CI when one is missing or in two shards.
       - name: This shard's selftest batteries, one at a time
         run: |
           python3 -V
@@ -108,4 +108,4 @@ jobs:
       - name: Every Mac shard succeeded (a skipped or cancelled one is not a pass)
         env:
           NEEDS: ${{ toJSON(needs) }}
-        run: python3 scripts/ci_shards.py fan-in --expect mac-python-shards
+        run: python3 scripts/check_ci_shards.py fan-in --expect mac-python-shards

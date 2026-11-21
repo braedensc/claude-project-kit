@@ -42,7 +42,7 @@ DIRECT = (
     "scripts/check_label_gate.py",
     "scripts/check_template_label_gate.py",
     "scripts/check_ci_covers_tests.py",
-    "scripts/ci_shards.py --verify",
+    "scripts/check_ci_shards.py --verify",
     "scripts/pipeline_session_kinds.py --check",
 )
 

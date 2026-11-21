@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Which job runs which battery: the CI shard lists, and the fan-in that never reads a skip as a pass (KIT-945).
 
-    python3 scripts/ci_shards.py --verify                     # lists, workflows and fan-ins agree
-    python3 scripts/ci_shards.py --list FAMILY N              # the batteries of shard N (1-based), one a line
-    python3 scripts/ci_shards.py fan-in --expect ID,ID,...    # the fan-in step: every needed job succeeded
-    python3 scripts/ci_shards.py --selftest                   # the battery CI runs
+    python3 scripts/check_ci_shards.py --verify                     # lists, workflows and fan-ins agree
+    python3 scripts/check_ci_shards.py --list FAMILY N              # the batteries of shard N (1-based), one a line
+    python3 scripts/check_ci_shards.py fan-in --expect ID,ID,...    # the fan-in step: every needed job succeeded
+    python3 scripts/check_ci_shards.py --selftest                   # the battery CI runs
 
 WHY. On 20 Nov 2026 "Kit checks" took 14m25s of its 15 minutes, the sweeps 15m32s of 20, and the
 Python 3.9 job passed its 30 minutes and was cancelled at the limit on two PRs, so the batteries
@@ -37,7 +37,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
 # The batteries of each shard, balanced on measured times (20 Nov 2026, Ubuntu): the sweeps by
-# 482 s and 481 s, the Mac job by 196 s each (about four times that on the macOS runner).
+# 482 s and 481 s, the Mac job on the first macOS runs (test:runner-setup alone is 9.5 minutes there).
 # Add a new battery to the shortest list. Order inside a list is the order they run.
 SWEEPS = [
     [
@@ -84,51 +84,51 @@ SWEEPS = [
 
 MAC = [
     [
-        "test:bypass", "test:merge", "test:sync-user-skills", "test:gh-fallback",
-        "test:review-basis", "test:root-guard", "test:stage-e-setup", "test:stage-e-app",
-        "test:install", "test:settings", "test:bridge", "test:chat-cap", "test:bridge-push-setup",
-        "test:watcher-copy", "test:watcher-tracker", "test:watcher-judge", "test:tech-lead-tools",
-        "test:validator-app", "test:validator-limits", "test:validator-setup", "test:standup",
-        "test:usage", "test:runner-limits", "test:session-tools", "test:heartbeat-monitor",
-        "test:acceptance-run", "test:direct-checks", "test:alert-pages",
+        "test:dor", "test:approve", "test:graders", "test:plan-executor", "test:plan-poller",
+        "test:review-local", "test:pass-lock", "test:install", "test:ask", "test:chat-lane-setup",
+        "test:bridge-push-setup", "test:bridge-requests", "test:review-poller", "test:look",
+        "test:sweep-setup", "test:watcher", "test:watcher-copy", "test:watcher-tracker",
+        "test:hold", "test:morning", "test:validator-brief", "test:validator-pieces",
+        "test:validator-plans", "test:validator-limits", "test:sprint-plan", "test:queue-pool",
+        "test:runner-probe", "test:runner", "test:runner-limits", "test:session-tools",
+        "test:writer-key", "test:notifier", "test:conflict-waker-setup", "test:watch",
+        "test:branch-rule", "test:stdlib-only", "test:secret-scan", "test:sync-kit",
     ],
     [
-        "test:delivery", "test:safe-outputs", "test:review", "test:pass-lock",
-        "test:stage-a-setup", "test:bridge-transport", "test:voice", "test:finding-poller",
-        "test:sweep-setup", "test:hold", "test:day-planner", "test:validator-settings",
-        "test:validator-evidence", "test:validator-facts", "test:validator-brief",
-        "test:sprint-review", "test:queue-settings", "test:window", "test:queue-read",
-        "test:runner-setup", "test:queue-setup", "test:conflict", "test:watch", "test:union",
-        "test:gate-policy", "test:machine-tickets", "test:sync-kit", "test:temp-leaks",
+        "test:runner-setup",
     ],
     [
-        "test:hooks", "test:emit", "test:graders", "test:block", "test:plan-poller",
-        "test:lifecycle", "test:dashboard", "test:ws-client", "test:bridge-setup",
-        "test:telemetry-local", "test:look", "test:status", "test:validator-pieces",
-        "test:validator-route", "test:sprint", "test:spend-ledger", "test:session-kinds",
-        "test:runner-probe", "test:day-plan", "test:bounce", "test:notifier",
-        "test:acceptance-poller", "test:pr-base", "test:template-label-gate",
-        "test:agent-trigger", "test:runner-pin", "test:ci-covers", "test:scratch-run",
-    ],
-    [
-        "test:dor", "test:jsonschema", "test:schemas", "test:local-dispatch",
-        "test:criteria-snapshot", "test:chat-lane-setup", "test:bridge-modules",
-        "test:bridge-requests", "test:watcher-setup", "test:watcher-page", "test:validator-check",
-        "test:morning", "test:validator-run", "test:validator-plans", "test:sprint-plan",
-        "test:queue-order", "test:usage-runs", "test:queue-start", "test:harness-claude",
-        "test:runner-guard", "test:runner-store", "test:runner", "test:runner-live",
-        "test:update", "test:branch-rule", "test:stdlib-only", "test:repo-setup",
-        "test:secret-scan", "test:routing-tags",
-    ],
-    [
-        "test:workflow-calls", "test:approve", "test:telemetry", "test:plan-executor",
-        "test:review-local", "test:github-app", "test:ask", "test:parts", "test:model-switch",
-        "test:bridge-push", "test:review-poller", "test:catchup", "test:sweep", "test:watcher",
-        "test:validator-ledger", "test:validator-merge", "test:tech-lead-turn",
-        "test:sprint-changes", "test:queue-pool", "test:writer-key", "test:notifier-setup",
-        "test:conflict-waker-setup", "test:session-brief", "test:acceptance-setup",
-        "test:hooks-path", "test:label-gate", "test:agent-env", "test:cleanup-probe",
+        "test:emit", "test:merge", "test:telemetry", "test:block", "test:github-app",
+        "test:model-switch", "test:status", "test:validator-facts", "test:validator-check",
+        "test:validator-route", "test:sprint", "test:usage", "test:spend-ledger",
+        "test:queue-read", "test:runner-live", "test:day-plan", "test:heartbeat-monitor",
+        "test:update", "test:union", "test:acceptance-poller", "test:pr-base", "test:hooks-path",
+        "test:label-gate", "test:gate-policy", "test:repo-setup", "test:ci-covers",
         "test:ci-shards",
+    ],
+    [
+        "test:hooks", "test:jsonschema", "test:local-dispatch", "test:safe-outputs",
+        "test:review", "test:gh-fallback", "test:criteria-snapshot", "test:stage-a-setup",
+        "test:settings", "test:chat-cap", "test:bridge-push", "test:bridge-setup", "test:voice",
+        "test:telemetry-local", "test:sweep", "test:watcher-page", "test:day-planner",
+        "test:validator-settings", "test:validator-evidence", "test:validator-run",
+        "test:standup", "test:sprint-changes", "test:window", "test:queue-order",
+        "test:session-kinds", "test:harness-claude", "test:runner-guard", "test:runner-store",
+        "test:queue-setup", "test:bounce", "test:conflict", "test:template-label-gate",
+        "test:runner-pin", "test:alert-pages", "test:routing-tags", "test:temp-leaks",
+        "test:agent-env", "test:cleanup-probe",
+    ],
+    [
+        "test:bypass", "test:workflow-calls", "test:delivery", "test:schemas",
+        "test:sync-user-skills", "test:lifecycle", "test:dashboard", "test:review-basis",
+        "test:root-guard", "test:stage-e-setup", "test:stage-e-app", "test:parts", "test:bridge",
+        "test:bridge-transport", "test:ws-client", "test:bridge-modules", "test:finding-poller",
+        "test:catchup", "test:watcher-setup", "test:watcher-judge", "test:tech-lead-tools",
+        "test:validator-ledger", "test:validator-app", "test:validator-merge",
+        "test:validator-setup", "test:tech-lead-turn", "test:sprint-review",
+        "test:queue-settings", "test:usage-runs", "test:queue-start", "test:notifier-setup",
+        "test:session-brief", "test:acceptance-run", "test:acceptance-setup",
+        "test:agent-trigger", "test:direct-checks", "test:machine-tickets", "test:scratch-run",
     ],
 ]
 
@@ -191,7 +191,7 @@ def list_problems(batteries, families=None):
                             % (family, name, seen[name]))
         for name in sorted(full - set(seen)):
             problems.append("%s: %s is in no shard, so no job would run it: add it to a list in %s"
-                            % (family, name, "scripts/ci_shards.py"))
+                            % (family, name, "scripts/check_ci_shards.py"))
     return problems
 
 
@@ -206,6 +206,8 @@ def split_jobs(text):
     for line in text.splitlines():
         if line.startswith("jobs:"):
             in_jobs = True
+            continue
+        if line.startswith("#"):          # a column-0 comment between jobs ends nothing
             continue
         if in_jobs and line and not line.startswith(" "):
             in_jobs = False
@@ -276,9 +278,9 @@ def workflow_problems(workflows, fan_ins=None, families=None):
             problems.append("%s: needs is %r, but the shard jobs are %r (write needs as a one-line list)"
                             % (where, needs, shard_ids))
         body = "\n".join(fan)
-        m = re.search(r"ci_shards\.py fan-in --expect (\S+)", body)
+        m = re.search(r"check_ci_shards\.py fan-in --expect (\S+)", body)
         if not m or sorted(m.group(1).split(",")) != sorted(shard_ids):
-            problems.append("%s: its fan-in step must run `ci_shards.py fan-in --expect %s`"
+            problems.append("%s: its fan-in step must run `check_ci_shards.py fan-in --expect %s`"
                             % (where, ",".join(shard_ids)))
         if "toJSON(needs)" not in body:
             problems.append("%s: its fan-in step must pass NEEDS: ${{ toJSON(needs) }}" % where)
@@ -323,7 +325,7 @@ def fan_in(needs, expect):
 
 def cmd_fan_in(argv):
     if "--expect" not in argv or argv.index("--expect") + 1 >= len(argv):
-        print("usage: ci_shards.py fan-in --expect ID,ID,...", file=sys.stderr)
+        print("usage: check_ci_shards.py fan-in --expect ID,ID,...", file=sys.stderr)
         return 2
     expect = [w for w in argv[argv.index("--expect") + 1].split(",") if w]
     raw = os.environ.get("NEEDS", "")
@@ -449,12 +451,12 @@ def selftest():
           "  k-1:\n    name: Shard 1\n    steps:\n      - run: x\n"
           "  k-2:\n    name: Shard 2\n    steps:\n      - run: y\n"
           "  k:\n    name: K\n    needs: [k-1, k-2]\n    if: always()\n    steps:\n"
-          "      - run: python3 scripts/ci_shards.py fan-in --expect k-1,k-2\n"
+          "      - run: python3 scripts/check_ci_shards.py fan-in --expect k-1,k-2\n"
           "        env:\n          NEEDS: ${{ toJSON(needs) }}\n"
           "  s-shards:\n    name: S shard ${{ matrix.shard }}\n    strategy:\n      fail-fast: false\n"
           "      matrix:\n        shard: [1, 2]\n    steps:\n      - run: c --shard f/${{ matrix.shard }}\n"
           "  s:\n    name: S\n    needs: [s-shards]\n    if: always()\n    steps:\n"
-          "      - run: python3 scripts/ci_shards.py fan-in --expect s-shards\n"
+          "      - run: python3 scripts/check_ci_shards.py fan-in --expect s-shards\n"
           "        env:\n          NEEDS: ${{ toJSON(needs) }}\n")
     spec = ({"workflow": "w.yml", "id": "k", "name": "K", "shards": "prefix:k-", "family": None},
             {"workflow": "w.yml", "id": "s", "name": "S", "shards": "matrix:s-shards", "family": "f"})
@@ -464,6 +466,8 @@ def selftest():
         return workflow_problems({"w.yml": text}, specs, fam)
 
     expect("workflow: a well-formed fan-in and matrix pass", wp(wf), [])
+    expect("workflow: a column-0 comment between jobs hides no job",
+           wp(wf.replace("  k:\n", "# a note\n  k:\n", 1)), [])
     expect("workflow: a fan-in without `if: always()` fails",
            len(wp(wf.replace("    if: always()\n", "", 1))), 1)
     expect("workflow: a fan-in whose needs omits a shard fails (and its --expect differs from the jobs)",

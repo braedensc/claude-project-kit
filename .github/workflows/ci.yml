@@ -99,14 +99,12 @@ jobs:
       # KIT-668. The label gate runs the default branch's workflow and code, never the PR's.
       - name: Label gate check (the gate runs from the default branch)
         run: |
-          python3 -m pip install --quiet pyyaml
           python3 scripts/check_label_gate.py --selftest
           python3 scripts/check_label_gate.py
 
       # KIT-788. The stack template's label gate runs the default branch's workflow, never the PR's.
       - name: Template label gate check (the gate runs from the default branch)
         run: |
-          python3 -m pip install --quiet pyyaml
           python3 scripts/check_template_label_gate.py --selftest
           python3 scripts/check_template_label_gate.py
 
@@ -513,7 +511,6 @@ jobs:
       # in a PR. The one exception is ci-newest-image.yml, whose job is to run there.
       - name: Runner pin check (no workflow on a -latest image)
         run: |
-          python3 -m pip install --quiet pyyaml
           python3 scripts/check_runner_pin.py --selftest
           python3 scripts/check_runner_pin.py
 
@@ -774,8 +771,8 @@ jobs:
       # once, and each fan-in job keeps its name, `if: always()` and a needs list of every shard.
       - name: CI shards (every battery in exactly one shard; the fan-in jobs cannot read a skip as a pass)
         run: |
-          python3 scripts/ci_shards.py --selftest
-          python3 scripts/ci_shards.py --verify
+          python3 scripts/check_ci_shards.py --selftest
+          python3 scripts/check_ci_shards.py --verify
 
       # The cyrus-setup/teardown patterns are here for a reason that is not obvious from
       # the filename: if a worktree ROOT contains one, the dispatcher EXECUTES it on
@@ -830,7 +827,6 @@ jobs:
 
       - name: Agent trigger author check (@claude needs a trusted author)
         run: |
-          python3 -m pip install --quiet pyyaml
           python3 scripts/check_agent_trigger_author.py --selftest
           python3 scripts/check_agent_trigger_author.py
 
@@ -839,7 +835,6 @@ jobs:
 
       - name: Validate all tracked JSON/YAML
         run: |
-          python3 -m pip install --quiet pyyaml
           python3 scripts/check_direct_checks.py --json-yaml
 
       # KIT-659. The Python 3.9 job runs the direct checks above (the ones run bare, not as a
@@ -1080,7 +1075,7 @@ jobs:
 
   # KIT-945. THE REQUIRED CONTEXT. Its name is what branch protection requires, so it stays "Kit checks".
   # A job whose `needs` failed is SKIPPED, and a skipped required check can read as a pass: this one runs
-  # `if: always()` and `ci_shards.py fan-in` fails unless EVERY shard's result is "success". `--verify`
+  # `if: always()` and `check_ci_shards.py fan-in` fails unless EVERY shard's result is "success". `--verify`
   # (test:ci-shards) fails when a shard is missing from `needs` or from `--expect`.
   kit-checks:
     name: Kit checks
@@ -1094,11 +1089,11 @@ jobs:
       - name: Every Kit checks shard succeeded (a skipped or cancelled one is not a pass)
         env:
           NEEDS: ${{ toJSON(needs) }}
-        run: python3 scripts/ci_shards.py fan-in --expect kit-checks-1,kit-checks-2,kit-checks-3
+        run: python3 scripts/check_ci_shards.py fan-in --expect kit-checks-1,kit-checks-2,kit-checks-3
 
   # KIT-617 moved the two leak sweeps out of Kit checks into a job of their own. KIT-945 splits them across
   # two shard jobs: each runs its share of the batteries once and then stopped by a SIGTERM, from the lists
-  # in scripts/ci_shards.py. Together they ran 16m09s of a 20-minute limit (20 Nov 2026). The required
+  # in scripts/check_ci_shards.py. Together they ran 16m09s of a 20-minute limit (20 Nov 2026). The required
   # context "Temp-leak sweeps" is the fan-in job below the shards, so the name stays.
   temp-leak-sweeps-shards:
     name: Temp-leak sweeps shard ${{ matrix.shard }}/2
@@ -1138,7 +1133,7 @@ jobs:
       - name: Every sweep shard succeeded (a skipped or cancelled one is not a pass)
         env:
           NEEDS: ${{ toJSON(needs) }}
-        run: python3 scripts/ci_shards.py fan-in --expect temp-leak-sweeps-shards
+        run: python3 scripts/check_ci_shards.py fan-in --expect temp-leak-sweeps-shards
 
   # This template is public and must stay project-neutral. This job fails on
   # absolute home paths and real email addresses in tracked files; the "don't

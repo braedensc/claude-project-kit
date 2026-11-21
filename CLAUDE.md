@@ -537,10 +537,10 @@ its own empty TMPDIR, once to the end and once stopped by a SIGTERM, and fails o
 one leaves behind (KIT-450, KIT-617). **Each long job is parallel shard jobs and one fan-in job
 that keeps the old name (KIT-945):** `kit-checks-1` to `-3` (their steps are the list; each battery
 is in exactly one, which `check_ci_covers_tests.py` enforces), the sweeps in 2 shards and the Python 3.9
-job in 5 (the lists are in `scripts/ci_shards.py`, and `--verify` fails on a battery in none or in two).
+job in 5 (the lists are in `scripts/check_ci_shards.py`, and `--verify` fails on a battery in none or in two).
 A fan-in job runs `if: always()` and fails unless every shard's result is `success`, because a job whose
 `needs` failed is skipped and a skipped required check can read as a pass. A new battery needs a step in
-one `kit-checks-N` job and a name in one list of each family in `scripts/ci_shards.py`. `main` is protected: **four** contexts are required —
+one `kit-checks-N` job and a name in one list of each family in `scripts/check_ci_shards.py`. `main` is protected: **four** contexts are required —
 **Kit checks**, **Provenance scan**, **Hooks change guard** and **Temp-leak sweeps** (since
 12 Nov 2026, KIT-699), each by that exact name, which is the fan-in job where a job is sharded, with admins enforced, so a
 leak blocks the merge. The shard jobs ("Kit checks shard 1/3" and so on) are never required themselves: no new

@@ -257,18 +257,18 @@ old name. Branch protection requires "Kit checks", "Provenance scan", "Hooks cha
 | Family | Shards | Who owns the list | What fails when a battery is missing or doubled |
 | --- | --- | --- | --- |
 | Kit checks | `kit-checks-1` to `-3` in `ci.yml`: their steps are the list | the workflow | `scripts/check_ci_covers_tests.py`: a `test:*` battery run by no shard job, or by two, fails |
-| Temp-leak sweeps | `temp-leak-sweeps-shards`, a matrix of 2 | `scripts/ci_shards.py` (`SWEEPS`) | `ci_shards.py --verify` |
-| Kit checks (Python 3.9, the Mac's) | `mac-python-shards`, a matrix of 5 | `scripts/ci_shards.py` (`MAC`) | `ci_shards.py --verify` |
+| Temp-leak sweeps | `temp-leak-sweeps-shards`, a matrix of 2 | `scripts/check_ci_shards.py` (`SWEEPS`) | `check_ci_shards.py --verify` |
+| Kit checks (Python 3.9, the Mac's) | `mac-python-shards`, a matrix of 5 | `scripts/check_ci_shards.py` (`MAC`) | `check_ci_shards.py --verify` |
 
 **A new battery** needs its `test:*` script, a step in exactly one `kit-checks-N` job (the shortest
-one), and a name in exactly one list of `SWEEPS` and of `MAC` in `scripts/ci_shards.py`. A battery
+one), and a name in exactly one list of `SWEEPS` and of `MAC` in `scripts/check_ci_shards.py`. A battery
 that is in no list is a red check (`npm run test:ci-shards`), not a silent skip. The lists were
 balanced on measured times; rebalance them when a shard's measured time drifts from the others.
 
 **A fan-in job runs `if: always()` and fails unless every shard's result is `success`.** When a
 needed job fails, GitHub skips the jobs that depend on it, and a skipped required check can read as
-a pass. `python3 scripts/ci_shards.py fan-in --expect <ids>` fails on a failed, skipped, cancelled
-or missing shard, and on a shard nobody listed. `ci_shards.py --verify` fails when a workflow's
+a pass. `python3 scripts/check_ci_shards.py fan-in --expect <ids>` fails on a failed, skipped, cancelled
+or missing shard, and on a shard nobody listed. `check_ci_shards.py --verify` fails when a workflow's
 fan-in loses its name, its `if: always()`, a shard in `needs` or in `--expect`, or when a matrix's
 shard list differs from the lists. A new shard job needs a line in all of those, so it cannot be
 forgotten.
@@ -330,7 +330,7 @@ the list differ (`npm run test:direct-checks`). A failure turns the PR red.
 It is **not a required context**, so a failure turns the PR red without blocking the merge. The
 owner can add it with the same command as Temp-leak sweeps above, using the context name
 `Kit checks (Python 3.9, the Mac's)` (the fan-in job). If a shard nears its limit, add a shard or rebalance
-the lists in `scripts/ci_shards.py`; do not trim batteries.
+the lists in `scripts/check_ci_shards.py`; do not trim batteries.
 
 macOS minutes are free on a public repository. A private copy of the kit is billed for them at
 a high rate (a multiple of the Linux rate), so check the plan before copying this workflow there.

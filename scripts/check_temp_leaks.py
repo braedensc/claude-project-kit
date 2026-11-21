@@ -4,7 +4,7 @@
     python3 scripts/check_temp_leaks.py               # run every `test:*` battery, one at a time
     python3 scripts/check_temp_leaks.py --sigterm 1   # …and stop each with SIGTERM 1 s in
     python3 scripts/check_temp_leaks.py --only hooks,stage-e-setup
-    python3 scripts/check_temp_leaks.py --shard sweeps/1   # one CI shard (scripts/ci_shards.py owns the lists)
+    python3 scripts/check_temp_leaks.py --shard sweeps/1   # one CI shard (scripts/check_ci_shards.py owns the lists)
     python3 scripts/check_temp_leaks.py --list        # the batteries it would run
     python3 scripts/check_temp_leaks.py --selftest    # this check's own battery
 
@@ -618,14 +618,14 @@ def main(argv):
             return 2
         batteries = [(n, c) for n, c in batteries if n in wanted]
     if "--shard" in argv:
-        # KIT-945: a CI shard runs a share of the batteries. scripts/ci_shards.py owns the lists and
+        # KIT-945: a CI shard runs a share of the batteries. scripts/check_ci_shards.py owns the lists and
         # fails CI when they miss or double a battery; a name here that package.json lacks is a
         # broken list, so it is could-not-check, never a quiet skip.
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        import ci_shards
+        import check_ci_shards
         try:
-            family, number = ci_shards.parse_spec(argv[argv.index("--shard") + 1])
-            wanted = set(ci_shards.shard_names(family, number))
+            family, number = check_ci_shards.parse_spec(argv[argv.index("--shard") + 1])
+            wanted = set(check_ci_shards.shard_names(family, number))
         except (IndexError, ValueError) as exc:
             print(f"check_temp_leaks: --shard: {exc}")
             return 2
