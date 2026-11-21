@@ -490,6 +490,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
+      - name: PROOF ONLY, reverted next commit (KIT-945) - a shard that fails on purpose
+        run: exit 1
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
