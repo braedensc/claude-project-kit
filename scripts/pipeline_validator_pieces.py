@@ -163,7 +163,7 @@ def last_change(inputs, verdict):
             created = pool.epoch(t.get("createdAt"))
     if hist is None or created is None:
         return None
-    return max([created] + [when for when, _e in hist])
+    return max([created] + [pool.edit_reach(when, e) for when, e in hist])   # KIT-940: an edit's window end
 
 
 def _latest(rows, ticket):
@@ -482,6 +482,15 @@ def selftest():
         code, said = go(host)
         check("...but the same hold on a piece changed since its row is written again",
               kinds(), [("TOD-20", "held", ["risk-path"]), ("TOD-20", "held", ["risk-path"])])
+
+        # KIT-940: a grouped edit that opened before a row and ran past it is a change after the row.
+        grouped = dict((k, None) for k in pool.HISTORY_KEYS)
+        grouped.update(createdAt="2026-11-02T09:00:00Z", updatedAt="2026-11-02T11:00:00Z",
+                       actorId="someone", toTitle="x")
+        check("KIT-940: the piece's last change is the end of a grouped edit's window, not its start",
+              last_change({"histories": {"id-T": [grouped]}, "tickets": [
+                  {"id": "id-T", "createdAt": "2026-11-01T00:00:00Z"}]}, {"id": "id-T"}),
+              pool.epoch("2026-11-02T11:00:00Z"))
 
         # 3b. A piece the agent escalated, unchanged since, waits for you: no second run, and the
         #     next piece gets the pass's one run (Stage E on #618).

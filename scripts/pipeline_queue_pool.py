@@ -325,7 +325,8 @@ def read_history(raw):
     moved the ticket is placed at the move's own time, `movedAt` (KIT-934), never at its
     `createdAt`, which in a grouped entry is an earlier change. A move with none is a time it
     cannot place. An edit in the same entry goes with the move, so never before that entry's
-    `createdAt`."""
+    `createdAt`. KIT-940: an entry that edited the ticket needs a readable `updatedAt`, the end of
+    its window, or it is a time this cannot place (see `edit_reach`)."""
     if not isinstance(raw, list):
         return None
     out = []
@@ -334,14 +335,24 @@ def read_history(raw):
                 e["actorId"] is None or isinstance(e["actorId"], str)):
             return None
         at = epoch(e["movedAt"] if is_move(e) else e["createdAt"])
-        if at is None:
-            return None
+        if at is None or (is_edit(e) and epoch(e.get("updatedAt")) is None):
+            return None             # KIT-940: an edit with no window's end cannot be placed
         out.append((at, e))
     return sorted(out, key=lambda p: p[0])
 
 
 def is_edit(e):
     return any(e.get(f) for f in EDIT_FIELDS)
+
+
+def edit_reach(at, e):
+    """The latest second an entry's edit may have been made (KIT-940). Linear groups one user's
+    nearby changes into one entry whose `createdAt` is the first change and `updatedAt` the last,
+    so a grouped entry opened before an approval can hold an edit made after it. An edit is dated
+    by the end of its entry's window, never its start; an entry that edited nothing keeps `at`.
+    `read_history` has already refused an edit whose `updatedAt` cannot be read."""
+    end = epoch(e.get("updatedAt")) if is_edit(e) else None
+    return at if end is None else max(at, end)
 
 
 def is_owner(cfg, actor):
@@ -365,8 +376,9 @@ def newest_move(hist, state_id, creator, created):
 def changed_since(cfg, hist, baseline):
     """True when anyone but the owner changed the ticket's title, text, labels, parent or
     relations at or after `baseline`, and the owner has not touched it since: an edit of the
-    owner's own, or a move, strictly later."""
-    theirs = [at for at, e in hist if at >= baseline and is_edit(e)
+    owner's own, or a move, strictly later. KIT-940: their edit is dated by the end of its entry's
+    window (`edit_reach`), so a grouped entry that opened before `baseline` but ran past it counts."""
+    theirs = [edit_reach(at, e) for at, e in hist if edit_reach(at, e) >= baseline and is_edit(e)
               and not is_owner(cfg, e["actorId"])]
     last = max(theirs) if theirs else None
     return last is not None and not any(
@@ -642,7 +654,7 @@ def lane_plan(cfg, t, ctx, epic, hist, created, v):
             held = "added-after-approval"
         elif fingerprint(t) != approved[t["id"]]:
             held = "changed"
-    elif created > at or any(e["toParentId"] == epic.get("id") and when >= at
+    elif created > at or any(e["toParentId"] == epic.get("id") and edit_reach(when, e) >= at
                              for when, e in hist):
         held = "added-after-approval"
     if held is None and changed_since(cfg, hist, at):
@@ -669,7 +681,7 @@ def validator_approved(ctx, t, created, hist):
     at = row.get("at") if isinstance(row, dict) and row.get("kind") == "approved" else None
     if isinstance(at, bool) or not isinstance(at, (int, float)):
         return None
-    last = max([created] + [when for when, _e in hist])
+    last = max([created] + [edit_reach(when, e) for when, e in hist])
     return at if at > last else None
 
 
@@ -861,6 +873,8 @@ def _cases(check):
 
     def ev(at, actor, **kw):
         e = dict(dict.fromkeys(HISTORY_KEYS), createdAt=at, actorId=actor, **kw)
+        if any(e.get(f) for f in EDIT_FIELDS):
+            e.setdefault("updatedAt", at)      # KIT-940: an edit alone in its entry ends where it began
         if (e["fromStateId"] or e["toStateId"]) and "movedAt" not in kw:
             e["movedAt"] = at          # a move alone in its entry: the state history dates it then
         return e
@@ -871,7 +885,7 @@ def _cases(check):
     MOVE = to_todo(T1, OWNER)
     # KIT-934: one entry holding the owner's label at T0 and his move at T1, as Linear groups them.
     GROUPED = ev(T0, OWNER, addedLabelIds=["l1"], fromStateId="st-backlog", toStateId="st-todo",
-                 movedAt=T1)
+                 movedAt=T1, updatedAt=T1)
 
     def run(ts, hists, cfg=None, epics=(), busy=(), findings={}, plans={}, ledger=LEDGER,
             validator=None):
@@ -919,6 +933,10 @@ def _cases(check):
        ("todo", "history-unreadable", None), h=[dict(GROUPED, movedAt=None)])
     sc("KIT-934: …nor is a move dated by a time that cannot be read",
        ("todo", "history-unreadable", None), h=[dict(GROUPED, movedAt="16:21")])
+    sc("KIT-940: an edit with no window's end cannot be placed against the approval",
+       ("todo", "history-unreadable", None), h=[MOVE, ev(T2, OTHER, toTitle="x", updatedAt=None)])
+    sc("KIT-940: another user's grouped entry, opened before the approval, running past it",
+       CH, h=[MOVE, ev(T0, OTHER, toTitle="x", updatedAt=T2)])
     # -- anyone else's change since, until the owner touches it again --------------------------
     for field, val in (("fromTitle", "a"), ("toTitle", "b"), ("updatedDescription", True),
                        ("addedLabelIds", ["l1"]), ("removedLabelIds", ["l2"]),
@@ -1187,6 +1205,11 @@ def _cases(check):
     P("…a piece moved under it after the approval",
       [PA, ("plan", "added-after-approval", "start ENG-12")], slack=False,
       hists={"id-12": [ev(T2, OWNER, toParentId="id-10")]})
+    P("KIT-940: …moved under it by a grouped entry opened before the approval and running past it",
+      [PA, ("plan", "added-after-approval", "start ENG-12")], slack=False,
+      hists={"id-12": [ev(T0, OWNER, toParentId="id-10", updatedAt=T3)]})
+    P("KIT-940: …the same entry ending before the approval is not after it", [PA, PA], slack=False,
+      hists={"id-12": [ev(T0, OWNER, toParentId="id-10", updatedAt=T0)]})
     P("an edit by someone else since the approval", [("plan", "changed", "start ENG-11"), PA],
       hists={"id-11": [ev(T2, OTHER, toTitle="x")]})
     P("…and the owner's touch after it", [PA, PA],
@@ -1247,6 +1270,28 @@ def _cases(check):
     v = run([issue()], {"id-1": [GROUPED, ev("2026-11-02T09:30:00Z", OTHER, toTitle="x")]})[0]
     check("KIT-934: …so someone else's edit before the move's own time came before his approval",
           (v["reason"], v["at"]), ("admitted", T1))
+    # -- KIT-940: an edit is dated by the end of its entry's window, never its first change --------
+    # Another user's one entry: a change at T0 (before the approval at T1) and a description edit
+    # that its `updatedAt`, T2, says came after the approval.
+    wide = ev(T0, OTHER, addedLabelIds=["l1"], updatedDescription=True, updatedAt=T2)
+    check("KIT-940: a grouped entry of someone else, opened before the approval, whose window runs"
+          " past it voids the approval",
+          [run([issue()], {"id-1": [MOVE, wide]})[0][k] for k in ("reason", "reply")],
+          ["changed", "start ENG-1"])
+    check("KIT-940: …one whose window ends before the approval does not",
+          run([issue()], {"id-1": [MOVE, dict(wide, updatedAt=T0)]})[0]["reason"], "admitted")
+    check("KIT-940: …an edit with no window's end cannot be placed: unreadable, said in words",
+          [run([issue()], {"id-1": [MOVE, dict(wide, updatedAt=None)]})[0][k]
+           for k in ("reason", "reply")], ["history-unreadable", None])
+    check("KIT-940: …nor can one whose end cannot be read",
+          run([issue()], {"id-1": [MOVE, dict(wide, updatedAt="12:00")]})[0]["reason"],
+          "history-unreadable")
+    check("KIT-940: …the owner's touch inside that window is not after the edit's end",
+          run([issue()], {"id-1": [MOVE, wide, ev("2026-11-02T10:30:00Z", OWNER, toTitle="y")]}
+              )[0]["reason"], "changed")
+    check("KIT-940: …but one after the window's end is",
+          run([issue()], {"id-1": [MOVE, wide, ev(T3, OWNER, toTitle="y")]})[0]["reason"],
+          "admitted")
     late = "2026-11-02T10:00:00.900Z"                 # the entry's updatedAt: its last change, the move
     spans = [{"stateId": "st-backlog", "startedAt": "2026-11-02T08:00:00.123Z"},
              {"stateId": "st-todo", "startedAt": "2026-11-02T10:00:00.849Z"}]
@@ -1449,7 +1494,7 @@ def _cases(check):
         "is_owner", "newest_move", "changed_since", "read_history", "lane_of", "judge", "LANES",
         "NEVER", "EDIT_FIELDS", "ready_problems", "plan_problems", "fingerprint", "names_guarded",
         "small", "first_generation", "apply_cap", "slack_owner", "decide", "paused_at",
-        "plan_wait_open"))
+        "plan_wait_open", "edit_reach"))
 
     def caught(**patched):
         saved = dict((k, globals()[k]) for k in patched)
@@ -1509,6 +1554,12 @@ def _cases(check):
                     raw))),
             ("KIT-934: a move with no time of its own placed at its entry's createdAt", dict(
                 read_history=lambda raw: o["read_history"]([dict(e, movedAt=e.get("movedAt") or e.get(
+                    "createdAt")) if isinstance(e, dict) else e for e in raw]) if isinstance(raw, list)
+                else None)),
+            ("KIT-940: an edit dated by its entry's first change, not its window's end",
+             dict(edit_reach=lambda at, e: at)),
+            ("KIT-940: an edit with no window's end placed at its start", dict(
+                read_history=lambda raw: o["read_history"]([dict(e, updatedAt=e.get("updatedAt") or e.get(
                     "createdAt")) if isinstance(e, dict) else e for e in raw]) if isinstance(raw, list)
                 else None)),
             ("the readiness gate skipped", dict(ready_problems=lambda t, parent=None: [])),
