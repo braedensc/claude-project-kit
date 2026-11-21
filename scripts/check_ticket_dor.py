@@ -789,7 +789,7 @@ def ui_paths_named(sections):
     """Paths the ticket CHANGES or PROVES: Pointers and Acceptance criteria only. Context is left
     out on purpose: it names sibling tickets' files."""
     spans = code_spans(body_of(sections, "Pointers") or [])
-    spans += code_spans(body_of(sections, CRITERIA_HEADING) or [])
+    spans += code_spans(criteria_lines(sections) or [])
     out = []
     for span in spans:
         if looks_like_path(span):
@@ -836,7 +836,7 @@ def check_browser(sections, r, strict, config, skipped):
         if errs:
             block = None
     if block is not None:
-        n_ac = len(checklist_items(body_of(sections, CRITERIA_HEADING) or []))
+        n_ac = len(checklist_items(criteria_lines(sections) or []))
         ids = [c["id"] for c in block["checks"]]
         dup = sorted({i for i in ids if ids.count(i) > 1})
         if dup:
@@ -1686,6 +1686,28 @@ def selftest():
     assert "src/components/Panel.tsx" in ctx["description"]
     browser_case("a UI path named only in Context does not make a UI ticket",
                  browser_rules(ctx, True)[:2], ([], []))
+    # KIT-944: the browser check reads the criteria by the same rule as the rest of the file
+    # (criteria_lines), so a heading that passes only by the prefix rule gets the same verdict.
+    def prefixed(t):
+        t = dict(t)
+        t["description"] = t["description"].replace("## Acceptance criteria\n", "## Acceptance criteria (its DM form)\n", 1)
+        assert "## Acceptance criteria (its DM form)" in t["description"]
+        return t
+
+    for label, make in (("a criteria index within the ticket's criteria", lambda: ui_ticket(fenced(check_block()))),
+                        ("a UI path named only under the criteria",
+                         lambda: ui_ticket("- `npm test`\n", pointer="`session.ts` — the reactive refresh this replaces"))):
+        exact = make()
+        if label.startswith("a UI path"):
+            exact["description"] = exact["description"].replace(
+                "## Acceptance criteria\n", "## Acceptance criteria\n\n- [ ] `src/components/Panel.tsx` shows it\n", 1)
+        browser_case("a prefix-only criteria heading gets the exact heading's browser verdict: " + label,
+                     browser_rules(prefixed(exact), True), browser_rules(exact, True))
+    ui_only = ui_ticket("- `npm test`\n", pointer="`session.ts` — the reactive refresh this replaces")
+    ui_only["description"] = ui_only["description"].replace(
+        "## Acceptance criteria\n", "## Acceptance criteria (its DM form)\n\n- [ ] `src/components/Panel.tsx` shows it\n", 1)
+    browser_case("a UI path under a prefix-only criteria heading still makes a UI ticket",
+                 browser_rules(ui_only, True)[:2], (["browser-check-required"], []))
     browser_case("a `No browser check:` line with a reason satisfies it",
                  browser_rules(ui_ticket("- `npm test`\n- No browser check: a copy change a browser shows no differently\n"), True)[:2],
                  ([], []))
