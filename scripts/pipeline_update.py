@@ -121,7 +121,7 @@ CONF_KEYS = (
     "QUEUE_HEARTBEAT_MAX_AGE_MINUTES", "MORNING_HEARTBEAT_MAX_AGE_MINUTES",
     "SWEEP_HEARTBEAT_MAX_AGE_MINUTES",
     "MEMORY_FREE_FLOOR_PCT", "SWAP_CEILING_GB", "BURN_USAGE_FILE", "BURN_WEEK_PCT", "BURN_FIVE_HOUR_PCT",
-    "WRITER_KEY_STATUS_FILE",
+    "WRITER_KEY_STATUS_FILE", "CHAT_CAP_TRIPS_FILE",
 )
 CONF_DEFAULTS = {
     "DISPATCHER_PORT": "3456",
@@ -152,6 +152,7 @@ CONF_DEFAULTS = {
     "MORNING_HEARTBEAT_FILE": "",
     "SWEEP_HEARTBEAT_FILE": "",
     "WRITER_KEY_STATUS_FILE": "",
+    "CHAT_CAP_TRIPS_FILE": "",
     "QUEUE_HEARTBEAT_MAX_AGE_MINUTES": "60",
     "MORNING_HEARTBEAT_MAX_AGE_MINUTES": "60",
     "SWEEP_HEARTBEAT_MAX_AGE_MINUTES": "180",
@@ -348,7 +349,7 @@ def validate_conf(values):
         errors.append("CONFLICT_WAKER_STATE_DIR must be an absolute path (got %r)" % waker)
     for key in ("NOTIFIER_HEARTBEAT_FILE", "MONITOR_HEARTBEAT_FILE", "WATCHER_PAGE_HEARTBEAT_FILE",
                 "PUSH_HEARTBEAT_FILE", "QUEUE_HEARTBEAT_FILE", "MORNING_HEARTBEAT_FILE",
-                "SWEEP_HEARTBEAT_FILE", "WRITER_KEY_STATUS_FILE"):
+                "SWEEP_HEARTBEAT_FILE", "WRITER_KEY_STATUS_FILE", "CHAT_CAP_TRIPS_FILE"):
         beat = conf.get(key, "")
         if beat and not beat.startswith("/"):
             errors.append("%s must be an absolute path (got %r)" % (key, beat))

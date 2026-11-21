@@ -1085,8 +1085,8 @@ read or lock its record it sends nothing: a notifier page is then owed again nex
 pass summary says why.
 
 It is a runaway stop. Normal use must never reach it, so reaching it is a defect to look at. Each
-time it is reached the check writes `chat-cap-trips.json` in `STATE_DIR` (the last twenty trips)
-and a line on stderr. The default is above what normal chat reaches: the repo holds no traffic
+time it is reached the check writes `chat-cap-trips.json` in `STATE_DIR` (the last twenty trips, each with how many messages it held)
+and a line on stderr. The health watch's `chat-cap` kind raises each trip once (`CHAT_CAP_TRIPS_FILE`). The default is above what normal chat reaches: the repo holds no traffic
 log, so it is worked out from the fastest normal traffic, a conversation with the tech lead
 (one reply a turn, a turn takes tens of seconds), plus a handful of pages.
 

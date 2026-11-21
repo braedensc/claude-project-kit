@@ -83,6 +83,11 @@ WHAT IT CHECKS, one KIND each (a kind is what an alert is about):
               hours, a renewed key within six hours of its end, or a runner silent for three hours,
               two passes running. Fixed words from the runner's own judge: nothing the file says is
               repeated but its times. Empty: not watched. Slack only, through the status file.
+  chat-cap    the chat limit's trips (KIT-941), where CHAT_CAP_TRIPS_FILE names the copy of
+              chat-cap-trips.json (the bridge's state folder): each trip is raised once, naming the chat and
+              how many messages were held. A record that cannot be read or is in another shape, two passes
+              running, is said and never read as no trips; one that does not exist is none (the cap writes it
+              only at a first trip). Empty: not watched. Slack only, through the status file.
 A last kind, `watch-job` — this job itself stopped — cannot be reported by the job. The
 heartbeat monitor watches the status file this job writes and pages when it goes stale.
 
@@ -171,13 +176,13 @@ STATUS_SCHEMA = "pipeline-health-status/1"
 STATE_SCHEMA = "pipeline-health-watch-state/1"
 KINDS = ("hooks", "updates", "release", "dispatcher", "front-door", "disk", "temp",
          "conflict-waker", "waker-sandbox", "watcher-page", "push-connection", "notifier", "monitor",
-         "credentials", "memory", "burn", "queue", "morning", "sweep", "writer-key")
+         "credentials", "memory", "burn", "queue", "morning", "sweep", "writer-key", "chat-cap")
 # Read here for the heartbeat monitor, which cannot (KIT-339): the conflict waker is the
 # owner's LaunchAgent, and its heartbeat sits in the owner's home. It reaches Slack through
 # the status file alone. It opens no GitHub issue: the alert workflow knows a fixed list of
 # kinds, and a deployed copy that does not know this one would fail every send.
 SLACK_ONLY_KINDS = ("conflict-waker", "waker-sandbox", "watcher-page", "push-connection", "memory", "burn",
-                    "queue", "morning", "sweep", "writer-key")
+                    "queue", "morning", "sweep", "writer-key", "chat-cap")
 WAKER_SCHEMA = "pr-conflict-waker-heartbeat/1"
 # The watcher's page job (KIT-519) writes this beat. A page that could not be sent shows in it as
 # `could-not-page` and the routes that failed, and nothing else reads it (KIT-549). The route names
@@ -1045,6 +1050,48 @@ def check_writer_key(env, conf, state):
     return finding(kind, UNKNOWN, "the session writer's key: %s, this pass; one more and it fires" % said)
 
 
+def _trip_words(trip):
+    held = trip.get("held")
+    held = held if isinstance(held, int) and not isinstance(held, bool) and held >= 0 else 0
+    return "chat %s reached its limit of %d messages in %d minutes at %s, and %d message%s held" % (
+        trip["chat"][:40], trip["max"], trip["window_minutes"], trip["at"][:25], held,
+        " was" if held == 1 else "s were")
+
+
+def check_chat_cap(env, conf, state):
+    """The chat cap's trips (KIT-941), where CHAT_CAP_TRIPS_FILE names the copy of chat-cap-trips.json, and said
+    off where it is not. Each trip is raised once: the pass that first sees it fires, naming the chat and how many
+    messages were held, and the next pass is ok unless another trip came. A record that cannot be read, or is in
+    another shape, is a problem and is never read as no trips (debounced like the job heartbeats). A record that does
+    not exist is the one case read as none: the cap writes the file only at its first trip. Slack only."""
+    import pipeline_chat_cap as ccap
+    kind, path = "chat-cap", conf.get("CHAT_CAP_TRIPS_FILE")
+    if not path:
+        return finding(kind, OK, "CHAT_CAP_TRIPS_FILE is not set: the chat limit's trips are not watched here")
+    trips, why = ccap.read_trips(path)
+    if trips is None and why == "absent":
+        _debounced(state, kind, False)
+        return finding(kind, OK, "no trip record at %s: the cap writes it only when the limit is first reached" % path)
+    if trips is None:
+        said = "the chat limit's trip record %s %s" % (path, why)
+        if _debounced(state, kind, True):
+            return finding(kind, FIRING, (
+                "%s, for %d passes running, so a trip would not be seen. If %s is a copy, the copier may have "
+                "stopped refreshing it." % (said[0].upper() + said[1:], DEBOUNCE, path)))
+        return finding(kind, UNKNOWN, "%s this pass; one more and it fires" % said)
+    _debounced(state, kind, False)
+    rec = state.setdefault("kinds", {}).setdefault(kind, {})
+    seen = set(rec.get("seen") or [])
+    new = [t for t in trips if "%s|%s" % (t["at"], t["chat"]) not in seen]
+    rec["seen"] = ["%s|%s" % (t["at"], t["chat"]) for t in trips]
+    if not new:
+        return finding(kind, OK, "no new trips of the chat limit")
+    lines = "; ".join(_trip_words(t) for t in new[:5]) + ("; and %d more" % (len(new) - 5) if len(new) > 5 else "")
+    return finding(kind, FIRING, (
+        "The chat limit was reached: %s. The held messages go out together in one digest. This is a runaway stop: "
+        "look at what is sending (docs/UPDATE-OPERATOR.md, the `chat-cap` row)." % lines))
+
+
 def check_clerk(env, conf, state, kind):
     """The notifier or the heartbeat monitor (KIT-286), where its heartbeat file is named, and
     said off where it is not. Debounced like the waker: on a wake from sleep this hourly pass
@@ -1192,6 +1239,7 @@ def run_pass(env, conf, dry_run=False, tally=None):
     findings += [check_clerk(env, conf, state, kind) for kind in CLERKS]
     findings += [check_job_beat(env, conf, state, kind) for kind in JOB_BEATS]
     findings.append(check_writer_key(env, conf, state))         # KIT-933
+    findings.append(check_chat_cap(env, conf, state))           # KIT-941
     failed, notes, claimed = [], [], set()
     github_on = bool(conf.get("ALERT_REPO"))
     for f in findings:
@@ -3039,6 +3087,64 @@ def selftest():
         check("a relative WRITER_KEY_STATUS_FILE is refused by name",
               bool([e for e in pu.validate_conf(dict(base_c, WRITER_KEY_STATUS_FILE="x.json"))[1]
                     if "WRITER_KEY_STATUS_FILE" in e]), True)
+
+        # -- the chat cap's trips (KIT-941): the record the cap writes when it holds messages; off unless
+        #    named; each trip raised once, in words that name the chat and the held count; a record that
+        #    cannot be read is said (unknown once, fires on the second pass), never read as no trips; Slack only
+        import pipeline_chat_cap as ccap
+        cc_path = os.path.join(home, "chat-cap-trips-copy.json")
+
+        def cc_write(trips, schema=ccap.TRIPS_SCHEMA):
+            with open(cc_path, "w") as fh:
+                json.dump({"schema": schema, "trips": trips}, fh)
+
+        def cc_trip(at, chat, held):
+            return {"at": at, "chat": chat, "max": 20, "window_minutes": 10, "sent_in_window": 20, "held": held}
+        env = make_env(home)
+        ccc = conf(CHAT_CAP_TRIPS_FILE=cc_path)
+        off = check_chat_cap(env, conf(), {})
+        check("chat-cap is said off where CHAT_CAP_TRIPS_FILE is not set",
+              (off["state"], "not watched here" in off["summary"]), (OK, True))
+        none_yet = check_chat_cap(env, ccc, {})
+        check("no record yet is ok, and says the cap writes it only at a first trip",
+              (none_yet["state"], "only when" in none_yet["summary"]), (OK, True))
+        cc_write([])
+        check("an empty record is ok", check_chat_cap(env, ccc, {})["state"], OK)
+        st_c = {}
+        cc_write([cc_trip("2026-11-20T10:00:00Z", "D123", 7)])
+        first = check_chat_cap(env, ccc, st_c)
+        check("a trip fires once, naming the chat and how many messages were held",
+              (first["state"], "D123" in first["summary"], "7 messages were held" in first["summary"]),
+              (FIRING, True, True))
+        again = check_chat_cap(env, ccc, st_c)
+        check("the same trip on the next pass is not raised again",
+              (again["state"], again["summary"][:12]), (OK, "no new trips"))
+        cc_write([cc_trip("2026-11-20T10:00:00Z", "D123", 9), cc_trip("2026-11-20T12:00:00Z", "D456", 1)])
+        third = check_chat_cap(env, ccc, st_c)
+        check("a later trip is raised on its own, and the earlier one is not repeated",
+              (third["state"], "D456" in third["summary"], "1 message was held" in third["summary"],
+               "D123" in third["summary"]), (FIRING, True, True, False))
+        seen_c = []
+        for name, writer in (("unreadable", lambda: open(cc_path, "w").write("{")),
+                             ("another shape", lambda: cc_write([], schema="x/1")),
+                             ("a trip in no shape", lambda: cc_write([{"at": 1}]))):
+            writer()
+            st_x = {}
+            two = [check_chat_cap(env, ccc, st_x) for _ in range(2)]
+            seen_c.append((name, two[0]["state"], two[1]["state"], "no trips" in two[1]["summary"]))
+        check("a record that cannot be read is unknown once and fires on two passes, never read as no trips",
+              seen_c, [(n, UNKNOWN, FIRING, False) for n in ("unreadable", "another shape", "a trip in no shape")])
+        cc_write([cc_trip("2026-11-20T10:00:00Z", "D123", 7)])
+        jc_home = os.path.join(home, "chat-cap-pass")
+        os.makedirs(jc_home)
+        jc_status = os.path.join(home, "chat-cap-health.json")
+        env = make_env(jc_home, gh=gh_ok(T))
+        run_pass(env, conf(HEALTH_STATUS_FILE=jc_status, KIT_CHECKOUT=kit, CHAT_CAP_TRIPS_FILE=cc_path))
+        check("...a trip reaches the status file the monitor reads, and no GitHub issue",
+              (sorted(json.load(open(jc_status))["firing"]), env.runner.writes), (["chat-cap"], []))
+        check("a relative CHAT_CAP_TRIPS_FILE is refused by name",
+              bool([e for e in pu.validate_conf(dict(base_c, CHAT_CAP_TRIPS_FILE="x.json"))[1]
+                    if "CHAT_CAP_TRIPS_FILE" in e]), True)
 
         # -- the yearly credentials (KIT-579): the owner writes each date down; the kind
         #    warns CREDENTIAL_WARN_DAYS ahead and after, names only, and is upkeep -------------
