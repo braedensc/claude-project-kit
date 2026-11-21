@@ -6503,9 +6503,40 @@ def paused_only_for_the_probe(said):
     return paused
 
 
+# KIT-948: A READ THAT TIMED OUT ONCE IS TRIED AGAIN ONCE. On 19 and 20 Nov the role account's
+# calls to GitHub and Linear sometimes got no answer ("[Errno 60] Operation timed out"), and one
+# such read in a dry run stopped the whole one command; a rerun passed. A dry run only reads, so
+# trying it again is safe. Once, after a short wait, said in words; a second timeout still fails
+# the step. Our own limit on a command (exit 124) is never this: that is a hang, not a blip.
+DRY_RUN_RETRY_WAIT_SECONDS = 20
+NETWORK_TIMEOUT = re.compile(r"Errno 60\b|Errno 110\b|timed out", re.I)
+
+
+def timed_out_read(res):
+    """True for a failed dry run whose own words say a network read timed out."""
+    return (res.rc not in (0, COMPONENT_EXIT_DECLINED, 124)
+            and bool(NETWORK_TIMEOUT.search(res.out + res.err)))
+
+
 def step_dry_run(ctx, apply_it):
     """Every component's own dry run, shape-checked. This is what CK-5 reads."""
     r, notes = ctx.runner, []
+
+    def as_role(label, script, timeout):
+        res = r.as_role(ctx.account, script, timeout=timeout)
+        if not timed_out_read(res):
+            return res
+        say("  %s: a read timed out. Trying it once more in %d seconds."
+            % (label, DRY_RUN_RETRY_WAIT_SECONDS))
+        _pause(DRY_RUN_RETRY_WAIT_SECONDS)
+        again = r.as_role(ctx.account, script, timeout=timeout)
+        if timed_out_read(again):
+            say("  %s: it timed out again, so it counts as failed." % label)
+        elif again.rc in (0, COMPONENT_EXIT_DECLINED):
+            say("  %s: passed on the second try." % label)
+            notes.append("%s timed out once and passed when tried again after %d seconds"
+                         % (label, DRY_RUN_RETRY_WAIT_SECONDS))
+        return again
     # RECORDED ONLY ON AN APPLY PASS (Stage E's review of KIT-790). The count below comes from
     # the poller config already on the machine, and only an apply pass has just written it from
     # this conf (the `configs` step runs first). A `verify` after a conf edit counts the old
@@ -6515,17 +6546,17 @@ def step_dry_run(ctx, apply_it):
             "sha256": dry_run_fingerprint(ctx.conf), "parts": dry_run_parts(ctx.conf),
             "settings": list(DRY_RUN_COUNT_SETTINGS)}
     env = 'set -a; . %s/env; set +a; ' % ctx.stage_home
-    poller = r.as_role(ctx.account,
+    poller = as_role("the poller's dry run",
                        env + "/usr/bin/python3 %s/kit/scripts/pipeline_review_poller.py "
                              "--config %s/poller.json scan --dry-run"
-                       % (ctx.stage_home, ctx.stage_home), timeout=600)
-    bounce = r.as_role(ctx.account,
+                       % (ctx.stage_home, ctx.stage_home), 600)
+    bounce = as_role("the bounce driver's dry run",
                        env + "/usr/bin/python3 %s/kit/scripts/pipeline_bounce_local.py %s"
-                       % (ctx.stage_home, " ".join(BOUNCE_DRY_RUN_ARGS)), timeout=600)
-    finding = r.as_role(ctx.account,
+                       % (ctx.stage_home, " ".join(BOUNCE_DRY_RUN_ARGS)), 600)
+    finding = as_role("the finding poller's dry run",
                         env + "/usr/bin/python3 %s/kit/scripts/pipeline_finding_poller.py "
                               "scan --config %s/finding/poller.json --dry-run"
-                        % (ctx.stage_home, ctx.stage_home), timeout=600)
+                        % (ctx.stage_home, ctx.stage_home), 600)
     ctx.catchup_problem = None
     have_catchup = catchup_off(ctx.conf) or r.as_role(
         ctx.account, "test -f %s/kit/scripts/pipeline_catchup_poller.py && test -f "
@@ -6542,10 +6573,10 @@ def step_dry_run(ctx, apply_it):
         notes.append("the catch-up poller's dry run did not run: its script or config is not in "
                      "place until `run` moves the clone and writes it")
     else:
-        catchup = r.as_role(ctx.account,
+        catchup = as_role("the catch-up poller's dry run",
                             env + "/usr/bin/python3 %s/kit/scripts/pipeline_catchup_poller.py "
                                   "run --config %s/catchup/poller.json --dry-run"
-                            % (ctx.stage_home, ctx.stage_home), timeout=900)
+                            % (ctx.stage_home, ctx.stage_home), 900)
     # The status job (KIT-411), by the catch-up poller's rules: off by name, not yet
     # measurable before `run` moves the clone, and never a stop.
     ctx.status_problem = None
@@ -6561,11 +6592,11 @@ def step_dry_run(ctx, apply_it):
         notes.append("the status job's dry run did not run: its script or config is not in "
                      "place until `run` moves the clone and writes it")
     else:
-        status = r.as_role(ctx.account,
+        status = as_role("the status job's dry run",
                            env + "/usr/bin/python3 %s/kit/scripts/pipeline_status_local.py "
                                  "run --config %s/%s --dry-run"
                            % (ctx.stage_home, ctx.stage_home, STATUS_CONFIG),
-                           timeout=STATUS_PASS_SECONDS + 60)
+                           STATUS_PASS_SECONDS + 60)
     blob = (poller.out + poller.err + bounce.out + bounce.err)
     say("")
     say("  -- the poller's dry run --")
@@ -13064,6 +13095,48 @@ def _selftest_body():
                "poller" in str(exc) and "bounce driver" in str(exc),
                "only one of two broken components was reported — the other stays hidden "
                "exactly as the bounce driver did: %s" % exc)
+
+    # KIT-948: A DRY RUN'S READ THAT TIMED OUT ONCE IS TRIED AGAIN ONCE, said in words. A second
+    # timeout still fails the step, and our own limit on a command (exit 124) is never retried.
+    cases += 1
+    timeout_words = "could not reach GitHub: [Errno 60] Operation timed out\n"
+
+    def _flaky_bounce(fails, words=timeout_words, rc=1):
+        ctxT, fakeT = _dry_run_ctx(conf)
+        real_exec, seen = fakeT._exec, {"bounce": 0}
+
+        def flaky(argv, stdin, timeout, cwd=None):
+            if "pipeline_bounce_local.py" in _fmt(argv):
+                seen["bounce"] += 1
+                if seen["bounce"] <= fails:
+                    return Result(rc, "", words)
+            return real_exec(argv, stdin, timeout, cwd=cwd)
+        fakeT._exec = flaky
+        waits, g = [], globals()
+        saved_pause = g["_pause"]
+        g["_pause"] = waits.append
+        try:
+            row, said = _quiet(lambda: _dry_run_row(ctxT))
+        finally:
+            g["_pause"] = saved_pause
+        return row, said, seen["bounce"], waits
+
+    rowT1, saidT1, triesT1, waitsT1 = _flaky_bounce(1)
+    expect("dry-run-retry", isinstance(rowT1, tuple) and rowT1[0] is True and triesT1 == 2
+           and waitsT1 == [DRY_RUN_RETRY_WAIT_SECONDS]
+           and "timed out. Trying it once more" in saidT1 and "passed on the second try" in saidT1
+           and any("timed out once" in str(n) for n in (rowT1[2] or [])),
+           "one timeout then success did not pass and say it retried: %r %r" % (rowT1, saidT1[-300:]))
+    rowT2, saidT2, triesT2, _w2 = _flaky_bounce(2)
+    expect("dry-run-retry", isinstance(rowT2, SetupError) and triesT2 == 2
+           and "timed out again" in saidT2 and "bounce driver" in str(rowT2),
+           "two timeouts did not fail the step after exactly one retry: %r tries=%d" % (rowT2, triesT2))
+    rowT3, _s3, triesT3, waitsT3 = _flaky_bounce(1, words="boom: usage error\n", rc=2)
+    expect("dry-run-retry", isinstance(rowT3, SetupError) and triesT3 == 1 and waitsT3 == [],
+           "a failure that is not a timeout was retried: %r tries=%d" % (rowT3, triesT3))
+    rowT4, _s4, triesT4, waitsT4 = _flaky_bounce(1, words="timed out after 600s: x\n", rc=124)
+    expect("dry-run-retry", isinstance(rowT4, SetupError) and triesT4 == 1 and waitsT4 == [],
+           "our own command time limit (exit 124) was retried as a network blip: %r" % (rowT4,))
 
     # THE CATCH-UP POLLER (KIT-47): exit 3 is a finding for a person (a disabled webhook, a
     # session still silent after its re-prompt), so the install goes on and says so; any
