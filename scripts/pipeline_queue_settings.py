@@ -71,9 +71,9 @@ OLD_RE = re.compile(r"^(?:0|[1-9][0-9]{0,8})(?:\.[0-9]{0,8}[1-9])?\Z")   # an ol
 # settings file it is composed into (the installer's compose(), pinned in the selftest), and its default there.
 ALLOWED = {
     "PLANNED_LOAD": {"name": "the planned load", "words": ("planned load", "daily load"), "whole": False,
-                     "paths": (("order", "planned_load"), ("planner", "planned_load")), "default": "40"},
+                     "paths": (("order", "planned_load"), ("planner", "planned_load")), "default": "400"},
     "DAY_STOP": {"name": "the day stop", "words": ("day stop", "daily stop"), "whole": False,
-                 "paths": (("order", "day_stop"),), "default": "60"},
+                 "paths": (("order", "day_stop"),), "default": "600"},
     "LANES_PER_REPO": {"name": "the lanes per repository", "words": ("lanes",), "whole": True,
                        "paths": (("order", "lanes_per_repo"), ("planner", "lanes_per_repo")), "default": "1"},
 }

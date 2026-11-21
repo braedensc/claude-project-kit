@@ -2079,6 +2079,7 @@ both pieces.
 | `other_pull_requests` | pull request[] (optional) | KIT-487. Each open pull request in a repository `required_checks` names by key that no listed plan's piece links to, read the same way, in repository and number order. At most 200. A file from before KIT-487 has none. |
 | `other_pull_requests_complete` | boolean \| null (optional) | KIT-487. `true`: every such repository's open pull requests were listed. `false`: at least one was not, or there were more than 200, and `sources.github` says why. `null`: `required_checks` is a list, so it names no repository and none was looked for. An empty list means "none open" only when this is `true`. |
 | `queue_room` | object \| null (optional) | KIT-474. The queue's room hold, from the bridge's record (the `room_file` setting; empty turns it off). `null`: the job is told not to look, or the queue has not yet read the machine. See *The queue's room*. |
+| `queue_points` | object \| null (optional) | KIT-923. The day plan's story points (the `day_plan_file` setting; empty turns it off), copied as numbers and a date only: `state` (`read` or `unread`), `date`, `written_at`, `day` and `sprint` (each `planned`, `started` and `left`; `sprint` is null when the plan could not place it) and `reason`. `null`: the job is told not to look, or no plan has been written yet. `unread`: the plan is there and cannot be read or holds no points, and it is never taken as none left. |
 | `kit_clone` | object \| null (optional) | KIT-581. Whether the checkout these jobs run from, the role account's copy of the kit, is behind main. `null`: the job is not told a repository (`kit_repo`). See *The kit copy*. |
 | `findings` | finding[] | The heartbeat monitor's view of `sources`, in the health watch's words. |
 | `firing` | string[] | Empty unless `result` is `failed`: then the sources that failed, which the monitor pages on. |
@@ -2792,7 +2793,8 @@ The writer refuses a folder inside a git working tree.
 | `date` | string | The local date the plan is for, `YYYY-MM-DD`: the usage file's day. |
 | `planned_by` | object | Who planned the day, below. |
 | `window` | object | The working window the plan is for, below. |
-| `budget` | object | The day's load, its hard stop and the spend, below. |
+| `budget` | object | The day's dollar runaway figures and the spend, below. |
+| `points` | object | Optional (KIT-923). The day's story points and the sprint's, below. A file from before it has none. |
 | `lanes` | lane[] | At most 100, by repository and then slot. |
 | `needs_ok` | item[] | What only the owner can clear: the most urgent first, then the most that waits on it. At most 200. |
 | `agent_filed` | start[] | The agent-filed tickets in today's plan, each with the ticket it came from. At most 200. |
@@ -2802,6 +2804,13 @@ The writer refuses a folder inside a git working tree.
 
 Times are UTC to the second, or null where the source gave none. Dollars are the SDK's own estimate
 at API prices (§17): a measure of plan use, never a bill.
+
+### Points (KIT-923)
+
+The day is sized in story points: a piece's effort label gives it points (`S` 1, `M` 2, `L` 3 by default), and the
+day takes up to `points_per_day`. `points.day` and `points.sprint` each hold three whole numbers: `planned` (the room),
+`started` (what the queue has started, counted when it starts a piece) and `left` (never below none). `sprint` is null
+when the usage file cannot place the sprint. A piece with no effort label is held `no-estimate` and not started.
 
 ### Planned by, the window and the budget
 
@@ -2825,7 +2834,7 @@ at API prices (§17): a measure of plan use, never a bill.
 | `title` | string \| null | Cleaned. Null when the ticket has none. |
 | `estimate` | number \| null | The queue's estimate for its effort, or null when it names none. |
 | `state` | enum | `planned`: the queue may start it now. `held`: it cannot. `started` and `done`: the caller said so. |
-| `held` | word \| null | Why, when `state` is `held`, in the queue's words: `malformed`, `no-repo`, `no-estimate`, `blockers-unreadable`, `blocked`, `stopped`, `no-lane`, `running-cap`, `starts-cap`, `agent-filed-cap` or `over-load`. Null otherwise. |
+| `held` | word \| null | Why, when `state` is `held`, in the queue's words: `malformed`, `no-repo`, `no-estimate`, `blockers-unreadable`, `blocked`, `stopped`, `no-lane`, `running-cap`, `starts-cap`, `agent-filed-cap`, `over-load` (the dollar runaway figure) or `over-points` (the day's story points). Null otherwise. |
 
 A held piece sits in its repository's first lane, because the queue gives a piece a slot only when
 it starts it. The queue's decision alone says `planned` and `held`: `started` and `done` come from
@@ -2848,7 +2857,7 @@ what the caller knows of the day's sessions.
 |---|---|---|
 | `id`, `source` | string, string \| null | An agent-filed ticket in today's plan, and the ticket its finding came from. |
 | `id`, `reason` | string \| null, word | A piece the checks dropped, or null for something that was not a ticket id. The reason is `not-in-pool`, `duplicate`, `wrong-repo`, `blocker-order` (a blocker neither done nor earlier in the same lane), `lane-cap`, `overlap` (footprints that share files where the merge gate cannot yet test pull requests together), `bad-footprint` or `over-load`. |
-| `stop`, `ref`, `value`, `limit` | word, string \| null, number \| null, number \| null | A runaway stop: `usage-missing`, `usage-failed`, `usage-stale`, `ledger-unknown`, `plan-near-limit`, `plan-at-limit`, `day-hard-stop`, `piece-cost`, `too-many-running`, `too-many-starts` or `api-key`; what it is about, what the queue saw, and the limit it was held to. |
+| `stop`, `ref`, `value`, `limit` | word, string \| null, number \| null, number \| null | A runaway stop: `usage-missing`, `usage-failed`, `usage-stale`, `ledger-unknown`, `plan-near-limit`, `plan-at-limit`, `day-hard-stop`, `piece-cost`, `too-many-running`, `too-many-starts`, `api-key` or `weekly-share` (new starts paused because the weekly window is at the share the owner set, `ref` `paused`, or because the usage file gave no figure for it, `ref` `unreadable`); what it is about, what the queue saw, and the limit it was held to. |
 | `lanes`, `needs_ok`, `agent_filed`, `stops`, `dropped` | integer | The length of each list. |
 | `pieces` | integer | The pieces in the lanes: `planned`, `started`, `done` and `held` add up to it. |
 | `unplaced` | integer | Held pieces that name no repository, so no lane holds them. |

@@ -38,13 +38,23 @@ pull request waiting for a merge holds its lane. Lanes are `owner/name:<slot>`: 
 a slot number, the same tomorrow as today. Where a repository's merge gate cannot yet test open
 pull requests together (`merge_gate_ready` lists those that can), a second lane needs every
 footprint declared and none shared; without footprints it is one lane. At most `running_cap`
-sessions at once. The day's load, `planned_load`, is today's spend from the usage file plus an
-estimate (per effort, S, M, L) for each session running and each piece started: a piece that
-does not fit is held `over-load`, and is not a stop.
+sessions at once.
+
+THE DAY'S POINTS (KIT-923).  The day is sized in story points: `points` gives each effort label
+(S, M, L) its points, and the day takes up to `points_per_day`. The ledger's `points_started`
+(or what runs now, if that is more) is what the day has taken; a piece that would pass the day
+is held `over-points` (a piece alone may take an empty day, so none is stuck), and that is not a
+stop. A piece with no effort label is not started: it is held `no-estimate`. `usage_pause_share`
+(a percent) pauses new starts when the weekly window has filled to it (`weekly-share`); a week the
+usage file gives no figure for pauses them too, and says it could not read it.
+
+The dollar figures are runaway stops only, set high. `planned_load` is today's spend from the
+usage file plus a dollar estimate (per effort) for each session running and each piece started: a
+piece that does not fit is held `over-load`.
 
 THE RUNAWAY STOPS.  Each holds every start and is named in `stops`: the plan near its limit
 (`plan-near-limit`) or at it (`plan-at-limit`), from the usage file's windows; today's spend at
-or over `day_stop` (60); a piece in play whose spend this week is over `piece_stop` (15); more
+or over `day_stop` (600); a piece in play whose spend this week is over `piece_stop` (150); more
 running than the caps; starts today at or over `starts_cap` (20), or agent-filed starts over
 `agent_filed_per_day`; the usage file missing, failed, more than `max_usage_age_seconds` from now
 (older, or dated ahead) or not about today; today's counts unknown; any run signed in with an API
@@ -52,7 +62,7 @@ key. A window whose reset has passed no longer counts: the plan resumes by itsel
 one can read is a stop, never a zero.
 
 WHAT IT RETURNS.  `start` (in order, each with its lane and slot, its estimate, and who approved
-it), `held` (admitted pieces that cannot start now, each with a reason from HELD), `stops`,
+it, and its points), `held` (admitted pieces that cannot start now, each with a reason from HELD), `stops`,
 `needs_ok` (what only the owner can do, and how much of today's plan waits on it: kind, ref,
 pieces, usd, the exact reply or None, and `urgent` when the top of the queue is Urgent or High
 and waits on it), `order` (the whole queue, in order), `load` and `notes`. Ids, words from
@@ -76,10 +86,10 @@ URGENT = (1, 2)                      # the ones the top of the queue pages for
 WINDOWS = ("five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet",
            "seven_day_overage_included", "overage", "other")
 HELD = ("malformed", "no-repo", "no-estimate", "blockers-unreadable", "blocked", "stopped",
-        "no-lane", "running-cap", "starts-cap", "agent-filed-cap", "over-load")
+        "no-lane", "running-cap", "starts-cap", "agent-filed-cap", "over-load", "over-points")
 STOPS = ("usage-missing", "usage-failed", "usage-stale", "ledger-unknown", "plan-near-limit",
          "plan-at-limit", "day-hard-stop", "piece-cost", "too-many-running", "too-many-starts",
-         "api-key")
+         "api-key", "weekly-share")
 KINDS = ("plan", "agent_filed", "changed", "approval", "merge", "question")
 NOTES = ("usage-partial", "week-unknown")
 SOURCES = ("todo", "backlog", "plan", "agent_filed", "none")
@@ -98,9 +108,15 @@ DEFAULTS = {
     "lanes_by_repo": {},                 # {"owner/name": n}: a repository's own, never above 3
     "merge_gate_ready": [],              # repositories whose gate tests open PRs together
     "running_cap": 5,                    # sessions at once, across every repository
-    "planned_load": 40,                  # the day's estimated work, in dollars at API prices
-    "day_stop": 60,                      # today's spend at or over this holds every start
-    "piece_stop": 15,                    # a piece in play over this holds every start
+    # KIT-923: the day is planned in story points. The dollar figures below are runaway stops only, set
+    # high on purpose: a subscription's dollars at API prices are not how the day is sized.
+    "points": {"S": 1, "M": 2, "L": 3},  # a piece's story points, by its effort label
+    "points_per_day": 10,                # story points the queue takes on in a working day
+    "sprint_points": None,               # story points for the sprint; None: points_per_day x working days
+    "usage_pause_share": None,           # percent of the weekly window at which new starts pause; None: off
+    "planned_load": 400,                 # runaway stop: the day's estimated dollars at API prices
+    "day_stop": 600,                     # runaway stop: today's spend at or over this holds every start
+    "piece_stop": 150,                   # runaway stop: a piece in play over this holds every start
     "starts_cap": 20,                    # starts in a day at or over this hold every start
     "agent_filed_per_day": 5,            # agent-filed starts in a day over this hold every start
     "estimates": {"S": 2.0, "M": 4.0, "L": 8.0},    # a piece's estimate, by effort
@@ -181,6 +197,16 @@ def config(raw):
              "must be a whole number from %d%s" % (low, "" if high is None else " to %d" % high))
     for key in ("planned_load", "day_stop", "piece_stop"):
         need(key, amount(cfg[key]) and cfg[key] > 0, "must be a number above 0")
+    need("points", isinstance(cfg["points"], dict) and set(cfg["points"]) == set(EFFORTS)
+         and all(whole(v) and v >= 1 for v in cfg["points"].values()),
+         "must give S, M and L each a whole number, 1 or more")
+    need("points_per_day", whole(cfg["points_per_day"]) and cfg["points_per_day"] >= 1,
+         "must be a whole number, 1 or more")
+    need("sprint_points", cfg["sprint_points"] is None or (
+        whole(cfg["sprint_points"]) and cfg["sprint_points"] >= 1), "must be a whole number, 1 or more, or null")
+    need("usage_pause_share", cfg["usage_pause_share"] is None or (
+        amount(cfg["usage_pause_share"]) and 0 < cfg["usage_pause_share"] <= 100),
+        "must be a percent above 0 and up to 100, or null")
     need("lanes_by_repo", isinstance(cfg["lanes_by_repo"], dict) and all(
         isinstance(k, str) and REPO_RE.match(k) and whole(v) and 1 <= v <= MAX_LANES
         for k, v in cfg["lanes_by_repo"].items()), "must map repositories to 1 to %d" % MAX_LANES)
@@ -482,7 +508,24 @@ def stop_key(cfg, now, c):
     return [stop("api-key", value=len(runs))] if runs else []
 
 
-STOP_CHECKS = (stop_usage, stop_ledger, stop_plan, stop_spend, stop_piece, stop_running,
+def stop_share(cfg, now, c):
+    """KIT-923: new starts pause when the weekly window has filled to the owner's share. A usage file
+    that cannot say how full the week is holds them too, said as such: never read as under the share."""
+    share = cfg["usage_pause_share"]
+    if share is None or c.usage is None:          # off; or no usage file, which stop_usage says
+        return []
+    window = dig(c.usage, "status", "windows", "seven_day")
+    used = dig(window, "utilization")
+    reset = epoch(dig(window, "resets_at"))
+    if reset is not None and reset <= now:
+        return []                                 # that window has reset: the week starts empty
+    if not amount(used) or used < 0:
+        return [stop("weekly-share", ref="unreadable")]
+    pct = round(used * 100, 1)
+    return [stop("weekly-share", ref="paused", value=pct, limit=share)] if pct >= share else []
+
+
+STOP_CHECKS = (stop_usage, stop_share, stop_ledger, stop_plan, stop_spend, stop_piece, stop_running,
                stop_starts, stop_key)
 
 
@@ -494,9 +537,11 @@ def spent_today(u, today):
 
 
 def read_ledger(ledger, today):
+    """Today's ledger, or None. `points_started` (KIT-923) is optional: a ledger from before it counts none."""
     ok = isinstance(ledger, dict) and ledger.get("date") == today and all(
-        whole(ledger.get(k)) and ledger[k] >= 0 for k in ("starts", "agent_filed_starts"))
-    return ledger if ok else None
+        whole(ledger.get(k)) and ledger[k] >= 0 for k in ("starts", "agent_filed_starts")) and (
+        "points_started" not in ledger or (whole(ledger["points_started"]) and ledger["points_started"] >= 0))
+    return dict(ledger, points_started=ledger.get("points_started", 0)) if ok else None
 
 
 # --------------------------------------------------------------------------- #
@@ -563,6 +608,12 @@ def order(cfg, now, pieces, running, usage, ledger):
     committed = (c.spent or 0) + worst * unread + sum(
         cfg["estimates"].get(o["effort"], worst) for r in occ.values() for o in r
         if o["kind"] == "session")
+    # The day's story points: what the ledger says was started today, or what runs now if that is more
+    # (a piece begun yesterday and still running counts). One that names no effort counts at the largest.
+    worst_pts = max(cfg["points"].values())
+    running_pts = worst_pts * unread + sum(
+        cfg["points"].get(o["effort"], worst_pts) for r in occ.values() for o in r if o["kind"] == "session")
+    points_now = max((c.ledger or {}).get("points_started", 0), running_pts)
     start, held, waits, running_now = [], [], {}, sessions
     for p in [q for q in queue if q["admitted"]]:
         est, why, on = cfg["estimates"].get(p["effort"]), None, []
@@ -594,6 +645,8 @@ def order(cfg, now, pieces, running, usage, ledger):
                 why = "agent-filed-cap"
             elif committed + est > cfg["planned_load"]:
                 why = "over-load"
+            elif points_now and points_now + cfg["points"][p["effort"]] > cfg["points_per_day"]:
+                why = "over-points"      # a piece alone may take a day smaller than it, so none is stuck
         if why:
             held.append({"ticket": p["ticket"], "reason": why, "waits_on": on})
             continue
@@ -601,8 +654,10 @@ def order(cfg, now, pieces, running, usage, ledger):
                                               "effort": p["effort"], "lane": None,
                                               "footprint": p["footprint"]})
         committed, running_now = committed + est, running_now + 1
+        points_now += cfg["points"][p["effort"]]
         start.append({"ticket": p["ticket"], "id": p["id"], "repo": p["repo"],
                       "lane": lane_id(p["repo"], slot), "slot": slot, "estimate": est,
+                      "points": cfg["points"][p["effort"]],
                       "priority": effective_priority(p), "plan": p["plan"], "source": p["source"],
                       "by": p["by"], "at": p["at"]})
     memo, items = {}, {}
@@ -621,7 +676,9 @@ def order(cfg, now, pieces, running, usage, ledger):
                 not i["urgent"], -i["usd"], i["kind"], i["ref"])),
             "order": [p["ticket"] for p in queue],
             "load": {"spent": c.spent, "committed": round(committed, 2),
-                     "planned": cfg["planned_load"]}}
+                     "planned": cfg["planned_load"]},
+            "points": {"planned": cfg["points_per_day"], "started": points_now,
+                       "left": max(0, cfg["points_per_day"] - points_now)}}
 
 
 def main(argv=None):
@@ -729,10 +786,13 @@ def _cases(check):
         return dict({"kind": "session", "repo": repo, "ref": ref, "lane": lane, "effort": "S"},
                     **kw)
 
+    OLD_DOLLARS = {"planned_load": 40, "day_stop": 60, "piece_stop": 15, "points_per_day": 1000}
+
     def go(pieces, running=(), cfg=None, u=None, led=None, now=NOW):
         def read(x, dflt):
             return dflt if x is None else (None if x is NODATA else x)
-        return order(dict(cfg or {}), now, pieces, list(running), read(u, usage(now)),
+        # the dollar cases below were written for the old dollar day: their figures, and no points limit
+        return order(dict(OLD_DOLLARS, **(cfg or {})), now, pieces, list(running), read(u, usage(now)),
                      read(led, ledger(now)))
 
     ST = lambda r: [s["ticket"] for s in r["start"]]                       # noqa: E731
@@ -965,16 +1025,60 @@ def _cases(check):
       cfg={"handoff_states": ["Ready to merge"]})
     S("…the default does not name them", [], OK, ready)
 
+    # -- story points (KIT-923): the day takes up to a number of points, by effort label --------------------
+    def share(used, status="allowed", reset=None):
+        doc = usage()
+        doc["status"]["windows"]["seven_day"].update(
+            utilization=used, status=status, **({"resets_at": reset} if reset else {}))
+        return doc
+    PTS = {"points_per_day": 5}
+    sized = [P(1, effort="M"), P(2, effort="M"), P(3, effort="S"), P(4, effort="L")]     # 2 + 2 + 1 + 3
+    S("points: pieces start up to the day's points, in order, and the next waits", ["ENG-1", "ENG-2", "ENG-3"], ST,
+      sized, cfg=PTS)
+    S("…the piece that would pass the day's points is held, said as such", [("ENG-4", "over-points")], HD,
+      sized, cfg=PTS)
+    S("…the day's points count what the ledger says was started today", ["ENG-3"], ST,
+      [P(3, effort="S"), P(4, effort="M")], cfg=PTS, led=dict(ledger(), points_started=4))
+    S("…and what runs now when that is more (a piece begun yesterday)", [("ENG-3", "over-points")], HD,
+      [P(3, effort="S")], running=[sess("ENG-8", repo="acme/other", effort="L"), sess("ENG-9", repo="acme/o2", effort="L")],
+      cfg=PTS)
+    S("…a piece bigger than the whole day may still take an empty day", ["ENG-4"], ST,
+      [P(4, effort="L")], cfg={"points_per_day": 2})
+    S("…a settings of its own: L is 4 points", [("ENG-4", "over-points")], HD, [P(1, effort="M"), P(4, effort="L")],
+      cfg={"points_per_day": 5, "points": {"S": 1, "M": 2, "L": 4}})
+    S("a piece with no effort label is not started, and is held as having none", [("ENG-5", "no-estimate")], HD,
+      [P(5, effort=None)], cfg=PTS)
+    S("the day's points: planned, started, left", {"planned": 5, "started": 5, "left": 0},
+      lambda r: r["points"], sized[:3], cfg=PTS)
+    S("…and an old ledger with no points counts none", 0, lambda r: r["points"]["started"], [], cfg=PTS, led=ledger())
+    S("…and a ledger whose points are not a count is no ledger", ["ledger-unknown"], SP, ONE,
+      led=dict(ledger(), points_started=-1))
+    # -- the weekly share (KIT-923) --------------------------------------------------------------------
+    SH = {"usage_pause_share": 85}
+    S("a weekly share left unset pauses nothing", [], SP, ONE, u=share(0.99))
+    S("under the share, new starts go on", ["ENG-1"], ST, ONE, cfg=SH, u=share(0.84))
+    S("at the share, new starts pause", ["weekly-share"], SP, ONE, cfg=SH, u=share(0.85))
+    S("…and say how full the week is and the share", [("paused", 85.0, 85)],
+      lambda r: [(x["ref"], x["value"], x["limit"]) for x in r["stops"]], ONE, cfg=SH, u=share(0.85))
+    S("…every piece is held as stopped", [("ENG-1", "stopped")], HD, ONE, cfg=SH, u=share(0.9))
+    S("a week the usage file gives no figure for holds new starts, and says it cannot read it", [("unreadable", None)],
+      lambda r: [(s["ref"], s["value"]) for s in r["stops"]], ONE, cfg=SH, u=share(None))
+    S("…a figure that is text is not a figure", ["weekly-share"], SP, ONE, cfg=SH, u=share("0.1"))
+    S("…and no usage file at all is the usage stop, never under the share", ["usage-missing"], SP, ONE, cfg=SH, u=NODATA)
+    S("a weekly window that has reset is an empty week, whatever it last said", [], SP, ONE, cfg=SH,
+      u=share(0.99, reset=stamp(-60)))
+
     def battery():
         return [thunk() for _n, _w, thunk in SC]
     got = battery()
     for (name, want, _t), g in zip(SC, got):
         check(name, g, want)
     results = list(RAW[:len(SC)])
-    check("the defaults are the brief's: 1 lane, 5 running, a load of 40, stops of 60, 15 and 20",
-          (DEFAULTS["lanes_per_repo"], DEFAULTS["running_cap"], DEFAULTS["planned_load"],
+    check("the defaults: 1 lane, 5 running, 10 points a day (S 1, M 2, L 3), no weekly pause, and dollar runaway stops set high",
+          (DEFAULTS["lanes_per_repo"], DEFAULTS["running_cap"], DEFAULTS["points_per_day"], DEFAULTS["points"],
+           DEFAULTS["usage_pause_share"], DEFAULTS["sprint_points"], DEFAULTS["planned_load"],
            DEFAULTS["day_stop"], DEFAULTS["piece_stop"], DEFAULTS["starts_cap"]),
-          (1, 5, 40, 60, 15, 20))
+          (1, 5, 10, {"S": 1, "M": 2, "L": 3}, None, None, 400, 600, 150, 20))
     check("the usage fixtures are documents the usage file's own schema accepts",
           check_schemas.document_problems(usage(), "pipeline-usage"), [])
     # -- the shape of what comes out --------------------------------------------------------------
@@ -987,7 +1091,7 @@ def _cases(check):
     check("every start is fields only, with the documented keys",
           set(tuple(sorted(s)) for r in results for s in r["start"]),
           set([tuple(sorted(("ticket", "id", "repo", "lane", "slot", "estimate", "priority",
-                             "plan", "source", "by", "at")))]))
+                             "plan", "source", "by", "at", "points")))]))
     check("no title or text reaches a result (the sentinel)", LEAK in json.dumps(results), False)
     # -- pinned to the bridge's own order, and what it never reads -------------------------------
     links = ((2, [9]), (3, []), (5, []), (9, []), (10, [11]), (11, [10]), (1, [3]))
@@ -1053,7 +1157,14 @@ def _cases(check):
                        ("no lanes", {"lanes_per_repo": 0}),
                        ("a repository's lanes above the ceiling", {"lanes_by_repo": {"a/b": 4}}),
                        ("a running cap of 0", {"running_cap": 0}),
-                       ("a load above the hard stop", {"planned_load": 61}),
+                       ("a load above the hard stop", {"planned_load": 601}),
+                       ("points for the wrong efforts", {"points": {"S": 1, "M": 2}}),
+                       ("a fraction of a point", {"points": {"S": 0.5, "M": 2, "L": 3}}),
+                       ("no points a day", {"points_per_day": 0}),
+                       ("a sprint of no points", {"sprint_points": 0}),
+                       ("a pause share of 0", {"usage_pause_share": 0}),
+                       ("a pause share above 100", {"usage_pause_share": 101}),
+                       ("a pause share that is text", {"usage_pause_share": "85"}),
                        ("a stop that is text", {"day_stop": "60"}),
                        ("estimates for the wrong efforts", {"estimates": {"S": 1, "M": 2}}),
                        ("a negative estimate", {"estimates": {"S": -1, "M": 2, "L": 3}}),
@@ -1066,7 +1177,7 @@ def _cases(check):
     # -- pacing to the plan's weekly reset (KIT-512): off by default, only ever lowers a day ------------
     def pc_days(n, seen=None):
         return lambda until: ((seen if seen is not None else []).append(until), n)[1]
-    pc_on = dict(pace_to_reset=True, weekly_budget_usd=100)
+    pc_on = dict(pace_to_reset=True, weekly_budget_usd=100, planned_load=40, day_stop=60)
 
     def pc_week(usd, known=True, today=10.0):
         doc = usage(spent=today)
@@ -1077,7 +1188,7 @@ def _cases(check):
         res, said = pace(config(dict(pc_on, **(over or {})))[0], u if u is not None else pc_week(40),
                          now, pc_days(n))
         return (res["planned_load"], res["day_stop"]), said
-    pc_cfg0 = config({})[0]
+    pc_cfg0 = config({"planned_load": 40, "day_stop": 60})[0]
     pc_asked = []
     check("pacing is off by default, and off changes nothing and counts nothing",
           (pace(pc_cfg0, pc_week(40), NOW, pc_days(4, pc_asked)), DEFAULTS["pace_to_reset"],
@@ -1158,7 +1269,7 @@ def _cases(check):
     # -- mutants: a check that cannot fail checks nothing -----------------------------------------
     o = dict((k, globals()[k]) for k in (
         "effective_priority", "sort_key", "dependency_index", "lane_for", "occupants", "overlaps",
-        "STOP_CHECKS", "causes_of", "lane_id", "order", "URGENT"))
+        "STOP_CHECKS", "causes_of", "lane_id", "order", "URGENT", "stop_share", "read_ledger"))
 
     def caught(**patched):
         saved = dict((k, globals()[k]) for k in patched)
@@ -1223,6 +1334,23 @@ def _cases(check):
             ("running sessions not counted", dict(order=lambda cfg, now, ps, running, *r: o[
                 "order"](cfg, now, ps, [dict(x, kind="pr") if isinstance(x, dict) else x
                                         for x in running], *r))),
+            ("the day's points ignored", dict(order=lambda cfg, *r: o["order"](
+                dict(cfg, points_per_day=10 ** 6), *r))),
+            ("a piece with no effort label counted as a small one", dict(order=feed(
+                lambda p: dict(p, effort=p.get("effort") or "S")))),
+            ("the points the ledger says were started not counted", dict(
+                read_ledger=lambda ledger, today: (lambda r: r and dict(r, points_started=0))(
+                    o["read_ledger"](ledger, today)))),
+            ("every piece counted at one point", dict(order=lambda cfg, *r: o["order"](
+                dict(cfg, points={"S": 1, "M": 1, "L": 1}), *r))),
+            ("a week the usage file gives no figure for read as under the share", dict(
+                STOP_CHECKS=tuple((lambda cfg, now, c: [s for s in o["stop_share"](cfg, now, c)
+                                                        if s["ref"] != "unreadable"])
+                                  if f is o["stop_share"] else f for f in o["STOP_CHECKS"]))),
+            ("a week at the share not paused", dict(
+                STOP_CHECKS=tuple((lambda cfg, now, c: [s for s in o["stop_share"](cfg, now, c)
+                                                        if s["ref"] != "paused"])
+                                  if f is o["stop_share"] else f for f in o["STOP_CHECKS"]))),
             ("urgency ignored", dict(URGENT=())),
             ("what a blocker waits on not followed", dict(
                 causes_of=lambda cfg, p, by, memo, seen=(): set()))):

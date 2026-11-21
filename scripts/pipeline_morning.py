@@ -224,8 +224,6 @@ def load_config(path):
             elif status_job.inside_git_worktree(os.path.dirname(cfg["sprint_plan_file"])):
                 bad.append("morning.sprint_plan_file: must be outside every git working tree, where a "
                            "session can write: it holds the owner's yes")
-        if cfg["order"] is not None and cfg["order"].get("weekly_budget_usd") is None:
-            bad.append("morning.sprint_plan_file: needs order.weekly_budget_usd, since a week cannot be sized without a budget")
     if len(paths) == 3:
         cfg["usage_file"], cfg["day_plan_file"], cfg["inputs_file"] = paths
         if status_job.inside_git_worktree(os.path.dirname(paths[1])):
@@ -525,7 +523,7 @@ def propose_sprint(cfg, pieces, paced, usage, now, dry_run, say):
     """KIT-575. On the first pass of a new sprint, one proposal of the week's work into the sprint plan file.
     None when sprint planning is off or the sprint has its proposal already; True when it was made (or, in a
     dry run, would be); False when it could not be, said in words (the pass then exits 3, since an input
-    could not be read). Nothing is guessed: no budget, no placed week, or no spend figure is no proposal."""
+    could not be read). Nothing is guessed: a week the usage file cannot place is no proposal."""
     if not cfg["sprint_plan_file"]:
         return None
     when = datetime.datetime.fromtimestamp(now, datetime.timezone.utc)
@@ -546,8 +544,9 @@ def propose_sprint(cfg, pieces, paced, usage, now, dry_run, say):
     except sprint_plan.SprintPlanError as exc:
         say("no sprint plan was proposed: %s" % exc)
         return False
-    say("%s a sprint plan for the week starting %s: %d piece(s), $%.2f of estimates" % (
-        "would propose" if dry_run else "proposed", doc["first_day"], len(doc["planned"]), doc["planned_usd"]))
+    say("%s a sprint plan for the week starting %s: %d piece(s), %s of %s point(s)" % (
+        "would propose" if dry_run else "proposed", doc["first_day"], len(doc["planned"]), doc["planned_points"],
+        doc["budget_points"]))
     return True
 
 
@@ -639,7 +638,10 @@ def run(cfg, dry_run=False, clock=None, runner=None, say=print):
             paced["day_stop"], result["planned_by"], result["why"], now,
             titles=titles_of(pieces), estimates=cfg["order"]["estimates"],
             filed_from=filed_from(inputs["findings"]), progress=None,
-            dropped=result["dropped"] or [])
+            dropped=result["dropped"] or [],
+            points=sprint_plan.points_block(paced, decision, sprint.sprint_view(
+                usage, datetime.datetime.fromtimestamp(now, datetime.timezone.utc), cfg["morning"]["sprint_days"]),
+                inputs["ledger"]))
     except ValueError as exc:       # fixed words: what the writer cannot read, never a value
         say("COULD NOT BUILD: %s" % exc)
         return EXIT_ERROR
@@ -1112,7 +1114,7 @@ def _cases(verify, hits, tmp):
            ([{"kind": "approval", "ref": "ENG-5", "title": "Title 5 " + SENT,
               "holds_up": {"pieces": 1, "usd": 2.0}, "reply": "start ENG-5", "urgent": False}],
             [{"id": "ENG-6", "source": "ENG-90"}],
-            {"planned": 40.0, "stop": 60.0, "spent": 6.5, "estimated": 8.0},
+            {"planned": 400.0, "stop": 600.0, "spent": 6.5, "estimated": 8.0},
             {"state": "open", "opens_at": "2026-11-04T21:00:00Z",
              "closes_at": "2026-11-05T03:00:00Z"}))
     target = ag.cfg["day_plan_file"]
@@ -1231,7 +1233,7 @@ def _cases(verify, hits, tmp):
             [x for x in seen["agent"].said if x.startswith("the day's load: ")]),
            (18.0, 27.0, ["the day's load: paced to the weekly reset: 54.0 left of 90 at the "
                          "start of today, over 3 working windows, so today plans 18.0 and stops at 27.0"],
-            40.0, ["the day's load: pacing is on, but the usage file cannot place the plan's "
+            400.0, ["the day's load: pacing is on, but the usage file cannot place the plan's "
                    "week, so the day stays at its configured figures"], []))
     # KIT-575: sprint planning
     sp = seen["sprint"]
@@ -1253,10 +1255,14 @@ def _cases(verify, hits, tmp):
            (out(seen["sprint-unknown"])[0], os.path.exists(seen["sprint-unknown"].cfg["sprint_plan_file"]),
             [x for x in seen["sprint-unknown"].said if x.startswith("no sprint plan was proposed")]),
            (3, False, ["no sprint plan was proposed: the sprint is not known (the usage file can't place the plan's week yet)"]))
-    verify("a week whose spend cannot be read: no proposal, said in words, exit 3, no file",
+    verify("a week with no spend figure is still sized, in points: proposed, exit 0 (KIT-923)",
            (out(seen["sprint-no-spend"])[0], os.path.exists(seen["sprint-no-spend"].cfg["sprint_plan_file"]),
             [x for x in seen["sprint-no-spend"].said if x.startswith("no sprint plan was proposed")]),
-           (3, False, ["no sprint plan was proposed: what the week has spent so far could not be read from the usage file"]))
+           (0, True, []))
+    verify("the day plan carries the day's points and the sprint's (KIT-923)",
+           (seen["sprint"].plan["points"]["day"], sorted(seen["sprint"].plan["points"]["sprint"]),
+            seen["sprint"].plan["points"]["sprint"]["planned"] > 0),
+           ({"planned": 10, "started": 4, "left": 6}, ["left", "planned", "started"], True))
     verify("a damaged sprint plan file is never planned over (the yes may be in it), and the pass says so",
            (out(seen["sprint-damaged"])[0], open(seen["sprint-damaged"].cfg["sprint_plan_file"]).read(),
             [x for x in seen["sprint-damaged"].said if x.startswith("no sprint plan was proposed")]),
@@ -1274,8 +1280,7 @@ def _cases(verify, hits, tmp):
             planned_for_sprint(seen["sprint-planned"].cfg, dict(USAGE, week=dict(SPRINT_WEEK, starts_at="2026-10-28T10:00:00Z"))),
             planned_for_sprint(seen["sprint-off"].cfg, dict(USAGE, week=SPRINT_WEEK))),
            (["ENG-3"], ["ENG-1"], ["ENG-3"], [], []))
-    for label, edit_, needle in (("no weekly budget", lambda c: c["morning"].update(sprint_plan_file="p.json"), "order.weekly_budget_usd"),
-                                 ("a file in a folder", lambda c: c["morning"].update(sprint_plan_file=tmp, **{}) or
+    for label, edit_, needle in (("a file in a folder", lambda c: c["morning"].update(sprint_plan_file=tmp, **{}) or
                                   c["order"].update(weekly_budget_usd=60), "must name a file"),
                                  ("a day that is not one", lambda c: c["morning"].update(sprint_days=["funday"]), "sprint_days"),
                                  ("a repeated day", lambda c: c["morning"].update(sprint_days=["mon", "mon"]), "sprint_days"),
