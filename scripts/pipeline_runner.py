@@ -4156,9 +4156,9 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                (360, 8192, 20480))
         # KIT-946: this runner judges every live run, not only the grower. A run at rest is the
         # stand-in under the runner's own wrapper: 98 MB under the Mac's /usr/bin/python3 3.9, which
-        # writes no bytecode, so each wrapper compiles the runner from source; 79 MB under Homebrew's
-        # 3.13 (measured 20 Nov). The line sits well above that and well below the grower's peak,
-        # 200 MB higher, so it stops growth and never a run at rest.
+        # writes no bytecode, so each wrapper compiles the runner from source; 77 MB under Homebrew's
+        # 3.13 (measured 20 Nov, in the guard's MB). The line sits well above that and well below
+        # the grower's peak, 200 MB higher, so it stops growth and never a run at rest.
         tight_mb = 192
         rest = limits.resident_kb(limits.tree(store.read_run(sdir, rec7["run"])["pid"]) or [])
         expect("a session at rest, the runner's own wrapper with it, is under the line the runaway "
