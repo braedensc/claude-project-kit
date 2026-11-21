@@ -4154,7 +4154,18 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
         expect("no limits set: the defaults, far above any run",
                (cfg["limits"]["wall_minutes"], cfg["limits"]["memory_mb"], cfg["limits"]["disk_mb"]),
                (360, 8192, 20480))
-        tight = R(dict(cfg, limits=dict(cfg["limits"], memory_mb=96, check_seconds=0)), tracker,
+        # KIT-946: this runner judges every live run, not only the grower. A run at rest is the
+        # stand-in under the runner's own wrapper: 98 MB under the Mac's /usr/bin/python3 3.9, which
+        # writes no bytecode, so each wrapper compiles the runner from source; 79 MB under Homebrew's
+        # 3.13 (measured 20 Nov). The line sits well above that and well below the grower's peak,
+        # 200 MB higher, so it stops growth and never a run at rest.
+        tight_mb = 192
+        rest = limits.resident_kb(limits.tree(store.read_run(sdir, rec7["run"])["pid"]) or [])
+        expect("a session at rest, the runner's own wrapper with it, is under the line the runaway "
+               "case sets, under this Python too (KIT-946)",
+               "under" if rest is not None and rest < tight_mb * 1024 else "%s at rest" % (
+                   "unmeasured" if rest is None else "%d MB" % (rest // 1024)), "under")
+        tight = R(dict(cfg, limits=dict(cfg["limits"], memory_mb=tight_mb, check_seconds=0)), tracker,
                        environ=environ, git_env=genv, say=said.append, room=roomy, engine=safe)
         store.ask(sdir, "queue", "start", "code", "app", "ENG-17")
         tight.pass_once()
@@ -4162,8 +4173,10 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
         _wait(lambda: tight.pass_once() and store.read_run(sdir, rec9["run"])["state"] == "stopped", 30)
         rec9 = store.read_run(sdir, rec9["run"])
         expect("a session that grows without bound is stopped at its memory limit, and says why",
-               (rec9["state"], rec9["reason"], "past its limit of 96 MB" in (rec9["why"] or ""),
+               (rec9["state"], rec9["reason"], "past its limit of %d MB" % tight_mb in (rec9["why"] or ""),
                 os.path.exists(rec9["pin"])), ("stopped", "limit:memory", True, False))
+        expect("…and a session at rest beside it is not: the line stops growth, never a run at rest "
+               "(KIT-946)", store.read_run(sdir, rec7["run"])["state"], store.RUNNING)
         pids9 = [c["pid"] for c in _calls(calls) if c.get("pid") and c["cwd"].endswith("/ENG-17")]
         expect("…with its whole tree", (bool(pids9), [p for p in pids9 if _pid_alive(p)]), (True, []))
         kids9 = [c["child_pid"] for c in _calls(calls) if c.get("child_pid") and c["cwd"].endswith("/ENG-17")]
