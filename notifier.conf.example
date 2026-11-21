@@ -257,6 +257,16 @@ DM_USER_IDS=
 # no, the default, says the ticket has the next step instead.
 REPLAN_IN_DM=no
 
+# Where the reply relay sends an answer for a runner-lane project (KIT-920).  The
+# runner's store, and each team key's project key in the runner's settings, as
+# KIT=app,TOD=todo.  Both empty, the default: every answer is posted in the
+# session's tracker thread, as before.  With both set, a team's answer goes to the
+# runner, as a resume of the session that asked, while the runner's own `fix` lane
+# is on for that project.  That lane is the one switch: this sets no lane.  Needs
+# REPLY_RELAY=yes.
+RUNNER_STORE_DIR=
+RUNNER_PROJECTS=
+
 # Screenshots in a page (KIT-568).  yes: a page that has screenshots (the
 # acceptance check's, from LOOK_RECORD_DIR above) carries up to 4 of them in its
 # thread.  The Slack app

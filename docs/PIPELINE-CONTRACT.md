@@ -30,7 +30,7 @@ exists to prevent.
 | [Acceptance follow-up request](#25-acceptance-follow-up-request) | a comment on the plan's epic | the acceptance poller's live pass | the finding poller |
 | [Acceptance check request](#26-acceptance-check-request) | a comment on the plan's epic | the Slack bridge, on the owner's yes | the acceptance poller's live pass |
 | [Acceptance second look](#27-acceptance-second-look) | the acceptance session's answer, in its own thread | the acceptance session, asked by the live pass | the acceptance poller's live pass |
-| [Run record](#28-run-record) | the runner's own store, outside every worktree | requests: five pipeline jobs; records: the runner | the runner; the usage job, when its config names the store |
+| [Run record](#28-run-record) | the runner's own store, outside every worktree | requests: six pipeline jobs; records: the runner | the runner; the usage job, when its config names the store |
 | [Spend ledgers](#30-spend-ledgers) | each caller's own state folder, outside every worktree | the four callers whose model calls no dispatcher log records, by one writer function | the usage job, by one reader function |
 
 > **§8 onwards are appended rather than slotted in beside their topical neighbours.**
@@ -3402,7 +3402,7 @@ One JSON file, written whole by `ask()`, mode 0600.
 | `schema` | `"pipeline-runner-request/1"` | Anything else is refused. |
 | `id` | `rq-` and 32 hex characters | Made by `ask()`, or one its caller chose and recorded before asking (KIT-644). An id already waiting or answered is refused, so one request is never asked twice. |
 | `at` | time, UTC, to the second | Stamped by `ask()`, never by the caller. |
-| `caller` | `queue` \| `review` \| `planner` \| `fix-driver` \| `acceptance` | The job that asks. |
+| `caller` | `queue` \| `review` \| `planner` \| `fix-driver` \| `notifier` \| `acceptance` | The job that asks. |
 | `action` | `start` \| `resume` \| `stop` | |
 | `kind` | `code` \| `fix` \| `conflict` \| `review` \| `plan` \| `acceptance` | The kind of session. |
 | `project` | a key of the runner's `projects` | Which repository. |
@@ -3419,6 +3419,7 @@ One JSON file, written whole by `ask()`, mode 0600.
 | `review`, the review job | `review` | |
 | `planner`, the planner job | `plan` | |
 | `fix-driver`, the fix driver | `fix`, `conflict` | Only as a resume of a `code`, `fix` or `conflict` run. |
+| `notifier`, the notifier's reply relay | `fix` | Only as a resume, carrying the owner's answer to the session that asked (KIT-920). It is judged by the project's `fix` lane. |
 | `acceptance`, the acceptance job | `acceptance` | |
 
 A caller may start, resume and stop only its own kinds. A `fix` or `conflict` is never a start.

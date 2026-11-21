@@ -23,12 +23,15 @@ move into it; until then this is the whole store.
                                    settings (KIT-708): the runner's alone, read by the jobs that
                                    ask it, so each takes the old road for a lane that is off
 
-WHO MAY ASK.  Five jobs, each for its own kinds of session (CALLERS):
+WHO MAY ASK.  Six jobs, each for its own kinds of session (CALLERS):
 
     queue        the queue's starter    code
     review       the review job         review
     planner      the planner job        plan
     fix-driver   the fix driver         fix and conflict, which are resumes of a code run
+    notifier     the notifier's relay   fix, as a resume of the run that asked: the owner's answer
+                                        (KIT-920). The same kind of session as a fix, so the
+                                        project's one `fix` lane switches it
     acceptance   the acceptance job     acceptance
 
 A caller names itself, and its word is not the authority. Under one account any process that can
@@ -102,6 +105,7 @@ CALLERS = {
     "review": ("review",),
     "planner": ("plan",),
     "fix-driver": ("fix", "conflict"),
+    "notifier": ("fix",),        # KIT-920: the owner's answer, as a resume of the run that asked
     "acceptance": ("acceptance",),
 }
 STARTS = ("code", "review", "plan", "acceptance")        # fix and conflict are only resumes
@@ -274,7 +278,7 @@ def request_problems(doc):
     if not (isinstance(doc["at"], str) and TIME_RE.match(doc["at"])):
         bad.append("the request's time is not one")
     if not (isinstance(doc["caller"], str) and doc["caller"] in CALLERS):
-        bad.append("the caller is not one of the five that may ask")
+        bad.append("the caller is not one of the six that may ask")
     if doc["action"] not in ACTIONS:
         bad.append("the action is not start, resume or stop")
     if doc["kind"] not in KINDS:
@@ -944,8 +948,16 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
     expect("the fix driver may resume as a fix", may("fix-driver", "resume", "fix"), True)
     expect("the fix driver may resume as a conflict fix", may("fix-driver", "resume", "conflict"), True)
     expect("an unknown caller may do nothing", may("session", "start", "code"), False)
+    # KIT-920: the notifier's relay asks for one thing, a fix-kind resume carrying the owner's answer.
+    expect("the notifier may resume as a fix", may("notifier", "resume", "fix"), True)
+    expect("the notifier may not start anything, or resume any other kind",
+           [may("notifier", "start", "fix"), may("notifier", "start", "code"),
+            may("notifier", "resume", "conflict"), may("notifier", "resume", "code"),
+            may("notifier", "stop", "code")], [False] * 5)
+    expect("no other caller's kinds grew with it", sorted(CALLERS), sorted(
+        ["queue", "review", "planner", "fix-driver", "notifier", "acceptance"]))
     expect("each caller may stop its own kinds",
-           [may(c, "stop", k) for c in CALLERS for k in CALLERS[c]], [True] * 6)
+           [may(c, "stop", k) for c in CALLERS for k in CALLERS[c]], [True] * 7)
     expect("every usage kind is one the usage job counts", _usage_kinds_known(), True)
 
     rid = ask(store, "queue", "start", "code", "app", "ENG-1", now=1700000000)
@@ -967,7 +979,7 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
             ("another job's kind", lambda: ask(store, "review", "start", "code", "app", "ENG-1"),
              "the review job may not ask to start a code session"),
             ("an unknown caller", lambda: ask(store, "session", "start", "code", "app", "ENG-1"),
-             "the caller is not one of the five that may ask"),
+             "the caller is not one of the six that may ask"),
             ("a bad ticket id", lambda: ask(store, "queue", "start", "code", "app", "eng-1"),
              "the ticket is not a ticket id"),
             ("a bad project key", lambda: ask(store, "queue", "start", "code", "App", "ENG-1"),
@@ -1050,7 +1062,7 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
     expect("a caller that is a list is named, never a crash", may([], "start", "code"), False)
     got = {i[0]: i[2][:1] for i in pending(store)}
     expect("…and the request is named, not a crash of every pass", got["rq-" + "a" * 32],
-           ["the caller is not one of the five that may ask"])
+           ["the caller is not one of the six that may ask"])
     expect("a broken request is named", got["rq-" + "b" * 32],
            ["the request could not be read: it could not be read (JSONDecodeError)"])
     expect("an extra field is named", got["rq-" + "c" * 32],

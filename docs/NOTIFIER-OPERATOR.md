@@ -271,6 +271,20 @@ Good: the `handover` row says `replies: the reply relay is ON`, and the `slack-a
 Not that: `REPLY_RELAY=yes and BRIDGE_PINGS=yes are both on`, or the same with `DM_USER_IDS`. Pick
 one: the Slack bridge replaces the relay.
 
+**Answering a session on a runner lane (KIT-920).** The relay posts your answer in the session's
+tracker thread, which only the old dispatcher reads. For a project on the runner, set
+`RUNNER_STORE_DIR` (the runner's store) and `RUNNER_PROJECTS` (`KIT=app`, a team key and its project in
+the runner's settings) in `notifier.conf`, with `REPLY_RELAY=yes`, and run the installer again. While
+the runner's `fix` lane is on for that project, your answer is asked of the runner as a resume of the
+session that asked, fenced as data. Turn the lane off in the runner's settings and the thread is used
+again: the lane is the one switch, so the two cannot disagree. Every failure is said in words and paged
+in the channel: a session that is gone or ambiguous, a refused request, a runner that has not taken it
+in an hour. A store it cannot read stops the pass with a failure and is tried again.
+
+Good: `RELAYED ... as a resume of runner run run-...`, and a later pass that says nothing.
+Not that: `DROPPED ... has no session for KIT-20`. The runner has no run to answer: answer in the
+ticket, or start the work again.
+
 **A title that looks like a credential (KIT-202).** A ticket title is written by anyone who can
 edit the ticket, so the notifier never sends one that carries a credential shape. It used to
 withhold the whole page, which left the escalation unheard and made every pass exit 3 until
