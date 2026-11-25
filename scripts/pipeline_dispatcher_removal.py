@@ -95,7 +95,8 @@ NONE = "none"
 LAUNCH_DAEMONS = "/Library/LaunchDaemons"
 MARKER_DIR = se.LANE_SYSTEM_DIR
 OLD_MARKER_DIR = se.DEFAULT_PINS_ROOT + "/" + se.LANE_MARKER_DIR      # `~` is the pipeline account's home
-BACKUPS_DIR = os.path.dirname(se.ROLE_KIT_CLONE_PATH) + "/backups"    # the review installer's config copies
+STAGE_HOME = ps.STATE_DEFAULT                                         # the review jobs' own folder
+BACKUPS_DIR = STAGE_HOME + "/backups"                                 # the review installer's config copies
 PF_ANCHOR, PF_RULES_DIR, PF_RULES = cl.PF_ANCHOR, cl.PF_RULES_DIR, cl.PF_RULES_PATH
 PF_LABEL, PF_LOG = cl.PF_DAEMON_LABEL, cl.PF_DAEMON_LOG
 TRACKER_APPS_PAGE = "https://linear.app/settings/api/applications"
@@ -802,8 +803,8 @@ def secret_paths(n):
 def gate_files(io, n, sv):
     """None of the files this removes is one of the runner's or the kit's own, by where it resolves."""
     r = n["runner"]
-    own = [r["RUNNER_DIR"], r["ENV_FILE"], r["ROLE_KIT_CLONE"], r["WRITER_KEY_FILE"], r["WRITER_RENEWAL_FILE"],
-           r["WRITER_CLIENT_FILE"], "~/.stage-e/env"] + ([r["PUSH_TOKEN_FILE"]] if r["PUSH_TOKEN_FILE"] != "off" else [])
+    own = [r["RUNNER_DIR"], r["ENV_FILE"], r["WRITER_KEY_FILE"], r["WRITER_RENEWAL_FILE"], r["WRITER_CLIENT_FILE"],
+           STAGE_HOME] + ([r["PUSH_TOKEN_FILE"]] if r["PUSH_TOKEN_FILE"] != "off" else [])
     theirs = secret_paths(n) + [p for p in (opt(n, "FRONT_DOOR_CONFIG"),) if p]
     copies = opt(n, "STATE_BACKUP_COPIES")
     if copies:

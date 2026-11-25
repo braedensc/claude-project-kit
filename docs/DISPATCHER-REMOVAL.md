@@ -111,9 +111,11 @@ The end of a finished `run` prints these, each with its page:
 
 1. Delete the tunnel, on the page `TUNNEL_PAGE` names. Then take the public name out of its domain's
    records. Let the domain lapse if nothing else uses it.
-2. Turn the tracker application's webhook off, on the application's own page. Keep the application.
-3. Rotate or revoke the keys nothing uses now, each on its own page. It lists the names the old
-   dispatcher's env file held. Keep the application's client id and secret.
+2. Turn the tracker application's webhook off, on its page under
+   https://linear.app/settings/api/applications. Keep the application.
+3. Rotate or revoke the keys nothing uses now. It lists the names the old dispatcher's env file held.
+   A code host token goes at https://github.com/settings/tokens. A key you made for the tunnel's
+   provider goes on that provider's own page. Keep the application's client id and secret.
 
 **Never revoke the tracker application's authorization or its tokens.** That is the session writer's
 key, which the runner now renews. The copies removed here ended when the runner renewed it, and the
