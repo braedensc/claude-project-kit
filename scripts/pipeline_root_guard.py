@@ -56,7 +56,7 @@ INSTALLERS = (
     ("pipeline_validator_setup", ["run"]),
 )
 SEAMED = ("pipeline_install", "pipeline_model_switch", "pipeline_stage_e_app", "pipeline_conflict_waker_setup",
-          "pipeline_validator_app", "pipeline_branch_rule")
+          "pipeline_validator_app", "pipeline_branch_rule", "pipeline_dispatcher_removal")
 
 
 def root_case(main, argv):
