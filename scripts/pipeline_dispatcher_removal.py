@@ -1086,7 +1086,8 @@ def show_plan(io, n, sv):
                     "the runner's next pass takes the renewal token from %s, once." % n["DISPATCHER_CONFIG"],
            "wait": "The runner is already set to renew the key: nothing to switch.",
            "done": "The runner already renews the key itself: nothing to hand over.",
-           "file": "The runner reads the key from its own file: nothing to hand over."}[sv.handover]
+           "file": "The runner reads the key from its own file: nothing to hand over."}.get(
+        sv.handover, "How the key hands over could not be read: `run` stops at this step.")
     io.say("  2. %s" % how)
     io.say("  3. %s Then the runner's own `check` must say the same." % (
         "Wait, up to %d minutes, for the runner to say it renewed the key and the key answered as the session writer."
@@ -1257,8 +1258,13 @@ def step_wait(io, n, sv, box):
             if doc["source"] == "renew" and fresh("renewal") and fresh("check") and doc["state"] == "ok" and \
                     doc["renewal"]["result"] == "renewed" and doc["check"]["result"] == "writer":
                 break
-            if doc["source"] == "renew" and doc["reason"] in HARD_REASONS and (wkey.epoch(doc["at"]) or 0) >= since:
-                raise Stop("the runner says: %s" % wkey.REASONS[doc["reason"]])
+            renewal, asked = (doc.get("renewal") or {}).get("result"), (doc.get("check") or {}).get("result")
+            if doc["source"] == "renew" and fresh("renewal") and renewal in HARD_REASONS:
+                raise Stop("the runner says: %s" % wkey.REASONS[renewal])        # a person must mend it
+            if doc["source"] == "renew" and fresh("renewal") and renewal == "renewed" and fresh("check") and \
+                    asked in HARD_REASONS:
+                raise Stop("the runner renewed the key, and says: %s" % wkey.REASONS[asked])
+            # A renewal that did not complete (the tracker out of reach) is tried again in five minutes: wait.
         if io.now() >= deadline:
             raise Stop("the runner has not said it renewed the key and the key answered as the session writer, "
                        "within %d minutes%s" % (HANDOVER_WAIT // 60, "" if doc is None else " (it says %s: %s)" % (
@@ -1383,6 +1389,10 @@ def restart_words(io, n, box):
 def apply(io, n, sv):
     """Steps 1 to 4, in order. Returns the exit code, having said what was and was not done."""
     box, done, order = {}, [], [p for p in sv.pieces if p["state"] == PRESENT]
+    if sv.handover not in ("switch", "apply", "wait", "done", "file"):
+        io.say("  NOT DONE  stop the old dispatcher: how the session writer's key hands over could not be read. "
+               "Nothing was changed.")
+        return EXIT_UNKNOWN
     steps = [("stop", "stop the old dispatcher", lambda: step_stop(io, n, sv))]
     if sv.handover in ("switch", "apply"):
         steps.append(("switch", "switch the runner to renew the key", lambda: step_switch(io, n, sv, box)))
@@ -1522,6 +1532,7 @@ class _World(object):
                    "block return in quick on ! lo0 inet6 proto tcp from any to any port = 3456"]
         self.package, self.npm_keeps, self.port_open, self.renewal = True, False, False, "renewed"
         self.apply_fails, self.renewed_once, self.renewed_while_held, self.on_ask = False, False, False, None
+        self.flaky_at = None
         self.runner_json = self.home + "/.pipeline-runner/runner.json"
         self.status_json = self.home + "/.pipeline-runner/store/" + wkey.STATUS_FILE
 
@@ -1619,18 +1630,27 @@ class _World(object):
             src = json.load(fh)["session_tools"]["key_source"]
         if src.get("kind") != "renew" or self.renewed_once:
             return
+        outcome = self.renewal
+        if outcome == "flaky":            # the tracker out of reach once: the runner tries again five minutes on
+            if self.flaky_at is None:
+                self.flaky_at = self.clock
+                _write(self.status_json, json.dumps(_status("renew", self.clock, renewal="renewal-failed",
+                                                            check="unreadable", state="failed", reason="unreadable")))
+            if self.clock - self.flaky_at < wkey.RETRY_EVERY:
+                return
+            outcome = "renewed"
         self.renewed_once = True
-        if self.renewal == "silent":
+        if outcome == "silent":
             return
         self.renewed_while_held = self.renewed_while_held or DISP in self.jobs
-        self.log.append(("renewal", self.renewal))
+        self.log.append(("renewal", outcome))
         doc = {"renewed": _status("renew", self.clock, renewal="renewed"),
                "client-refused": _status("renew", self.clock, renewal="client-refused", check=None, state="failed",
                                          reason="client-refused"),
                "other-user": _status("renew", self.clock, renewal="renewed", check="other-user", state="failed",
-                                     reason="other-user")}[self.renewal]
+                                     reason="other-user")}[outcome]
         _write(self.status_json, json.dumps(doc))
-        if self.renewal != "client-refused":
+        if outcome != "client-refused":
             _write(self.home + "/.pipeline-runner/writer-renewal-key", REFRESH[::-1])
 
 
@@ -1961,6 +1981,9 @@ def _cases(expect, tmp):  # noqa: C901  (one battery, read top to bottom)
     rc, text, w, io = run("run", fix=lambda w: setattr(w, "renewal", "silent"))
     expect("the runner says nothing: exit 1 after the wait, nothing removed",
            (rc, _first(w.log, ("remove",)), "within %d minutes" % (HANDOVER_WAIT // 60) in text), (1, None, True))
+    rc, text, w, io = run("run", fix=lambda w: setattr(w, "renewal", "flaky"))
+    expect("a renewal that did not complete is tried again by the runner: the wait goes on, and it ends DONE",
+           (rc, _left(w)), (0, []))
     rc, text, w, io = run("run", fix=lambda w: setattr(w, "apply_fails", True))
     with open(w.kit + "/" + RUNNER) as fh:
         expect("the runner's installer fails: exit 1, nothing removed, runner.conf put back",
