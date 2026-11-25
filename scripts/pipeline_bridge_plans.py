@@ -5253,6 +5253,13 @@ def cases_approve(kit):
 
             # -- KIT-645: our own runner. On a switched project the queue's start is a code
             #    request to the runner, and nothing is delegated; each later pass reads its answer.
+            def _set_code(path, on):             # KIT-961: the runner's own lane switch, flipped
+                with open(path, encoding="utf-8") as fh:
+                    doc = json.load(fh)
+                doc["projects"]["app"]["lanes"]["code"] = on
+                with open(path, "w", encoding="utf-8") as fh:
+                    json.dump(doc, fh)
+
             def runner_at(name, code=True, enabled=True, text=None):
                 folder = os.path.join(tmp, "runner-" + name)
                 os.makedirs(folder)
@@ -5411,6 +5418,38 @@ def cases_approve(kit):
                    out[0]),
                   ([("queue", "resume", "code", "app", "PROD-7")], ["run-" + "c" * 32],
                    [("PROD-7", "resume")], EXIT_OK))
+            # A start the queue's order admitted another way (his move, not this yes) keeps the queue's
+            # own words: the yes names only a start made on it.
+            lane, rstore = runner_at("slack-other")
+            c, s, t, out, ledger = slack_queued("q-slack-other", dict(decided(todo7), verdicts=admitted7),
+                                                {"uuid-7": yes_rec()}, lane)
+            check("runner-961-a-start-not-made-on-the-yes-keeps-the-queues-own-words",
+                  kept(c, "runner_asks").get("PROD-7", {}).get("body"), words7)
+            # A resume the bridge cannot ask is said as its own: the lane off now, or a store that
+            # refuses the request. Each closes the yes, so it is never asked again.
+            for name, setup, why in (
+                    ("off", lambda rs, path: _set_code(path, False), "its project's coding lane is off now"),
+                    ("walls", lambda rs, path: os.chmod(rs, 0o755),
+                     "our own runner's store would not take it (others can read or write the store: it "
+                     "must be mode 0700)")):
+                lane, rstore = runner_at("slack-resume-" + name)
+                setup(rstore, lane["settings_file"])
+                c, s, t, out, ledger = slack_queued("q-slack-resume-" + name, dict(decided(), verdicts=[]),
+                                                    {"uuid-7": yes_rec("resume", "run-" + "c" * 32)}, lane)
+                os.chmod(rstore, 0o700)
+                check("runner-961-a-resume-it-cannot-ask-is-said-as-its-own-and-closes-the-yes-%s" % name,
+                      (said_count(s, "I couldn't ask our own runner to resume PROD-7: %s. Nothing was "
+                                     "started." % why), waiting(rstore),
+                       (kept(c, "slack_starts")["uuid-7"]["answered"] or {}).get("ok")),
+                      (1, [], False))
+            # Answered records are kept as long as a refusal is, then dropped; an open one is never.
+            lane, rstore = runner_at("slack-prune")
+            old_yes = dict(yes_rec(), answered={"ok": True, "run": None, "at": iso(now - 15 * 86400)})
+            new_yes = dict(yes_rec(), ticket="PROD-8", answered={"ok": True, "run": None, "at": iso(now)})
+            c, s, t, out, ledger = slack_queued("q-slack-prune", dict(decided(), verdicts=[]),
+                                                {"uuid-7": old_yes, "uuid-8": new_yes}, lane)
+            check("runner-961-an-answered-yes-is-dropped-after-the-refusals-keep-and-not-before",
+                  sorted(kept(c, "slack_starts")), ["uuid-8"])
             lane, rstore = runner_at("slack-resume-closed")
             c, s, t, out, ledger = slack_queued(
                 "q-slack-resume-closed", {"state": "closed", "why": "before-start", "decision": None},
@@ -5878,7 +5917,30 @@ def cases_approve(kit):
                 return delegate_to
 
             import pipeline_bridge as bridge_module
+
+            def scene_961_answered(name):          # KIT-961: the runner's answer to the owner's yes
+                lane, rstore = runner_at(name)
+                c, s, t, _out, _ledger = slack_queued(name, dict(decided(slack7), verdicts=admitted7),
+                                                      {"uuid-7": yes_rec()}, lane)
+                answer_all(rstore, True)
+                answer["v"] = dict(decided(), verdicts=[])
+                run(c, s, t, at=now + 2000)
+                return (said_count(s, "Our own runner started PROD-7 on your yes."),
+                        (kept(c, "slack_starts")["uuid-7"]["answered"] or {}).get("ok"))
+
+            def scene_961_resumed(name):           # KIT-961: a resume the owner said yes to
+                lane, rstore = runner_at(name)
+                slack_queued(name, dict(decided(), verdicts=[]),
+                             {"uuid-7": yes_rec("resume", "run-" + "c" * 32)}, lane)
+                return waiting(rstore)
             for what, got, good in (
+                    ("KIT-961: the runner's answer to the owner's yes never said, nor his yes closed",
+                     broken("q961-m1", "slack_answered", lambda saved: lambda self, ident, got: None,
+                            scene_961_answered, bridge_module.Pass), (1, True)),
+                    ("KIT-961: a resume the owner said yes to never asked by the queue's pass",
+                     broken("q961-m2", "slack_resumes", lambda saved: lambda self, ledger: 0,
+                            scene_961_resumed, bridge_module.Pass),
+                     [("queue", "resume", "code", "app", "PROD-7")]),
                     ("the ledger row written after the hand-over",
                      broken("q-m1", "start_queued", late_ledger, scene_starts),
                      [("PROD-51", 0), ("PROD-7", 1)]),

@@ -3174,6 +3174,20 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                ((store.answer(sdir, rq58b) or {}).get("ok"), (store.answer(sdir, rq58b) or {}).get("why")),
                (False, "ENG-58 was started once already on this yes in Slack, and one yes starts one run: "
                        "ask again with a new one"))
+        # The rule's mutant, kept in the battery: with it dropped, that same yes is no longer refused
+        # in its words. Nothing can start meanwhile: the run's workspace stands, and any request left
+        # waiting is taken back.
+        real_once = once_per_yes
+        globals()["once_per_yes"] = lambda runs, ticket, approval: ""
+        try:
+            rq58c = store.ask(sdir, "queue", "start", "code", "app", "ENG-58")
+            judged.pass_once()
+            unruled = (store.answer(sdir, rq58c) or {}).get("why")
+            store.withdraw(sdir, rq58c)
+        finally:
+            globals()["once_per_yes"] = real_once
+        expect("KIT-961 mutant: the one-yes-one-run rule dropped is caught",
+               unruled != (store.answer(sdir, rq58b) or {}).get("why"), True)
         expect("KIT-961 …a yes at another second, another member's, or a move is not that yes",
                [once_per_yes([r58], "ENG-58", dict(by="U0OWNER001", at=t2, how=h)) == "" for h in
                 ("move", "slack", "validator")] + [once_per_yes([r58], "ENG-58", a) for a in (

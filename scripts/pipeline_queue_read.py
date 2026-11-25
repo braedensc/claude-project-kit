@@ -36,8 +36,9 @@ backlog.
 WHAT IT RETURNS.  One document, schema SCHEMA: `read_at`, `date` (the machine-local day, as the
 usage job names one), `result`, `sources` (`tracker`, `findings`, `plans`, `ledger`: `state` and
 `reason`), `tickets`, `epics`, `histories`, `busy`, `findings`, `plans`, `ledger`, `extras`,
-`running`, `slack_starts` (KIT-961; null when the bridge's state file is off or unreadable, and
-then it is said in the `plans` source, which reads the same file). What was not read is null or empty and said, never zero. `result` is `ok` (every source
+`running`, `slack_starts` (KIT-961; null when the bridge's state file is off or unreadable). The
+`plans` source reads the same file, and says it: could-not-read for the whole file, partly-read
+when only that record could not be read, so a yes that approves nothing is never silent. What was not read is null or empty and said, never zero. `result` is `ok` (every source
 on was read whole), `partial` (one was not) or `failed` (candidates or running work not read at
 all: lists empty, no record read). Reasons are fixed words and numbers, never a title, a text or an
 error's words. The file is written for every result, atomically, mode 0600, so a stale one is never
@@ -94,6 +95,8 @@ SOURCES = ("tracker", "findings", "plans", "ledger", "validator")
 # modules do not import each other.
 SECTIONS = ("pool", "order", "planner", "window", "reader", "morning", "room", "hold")
 NO_RECORD, UNREADABLE = "no record yet", "the record could not be read"
+# KIT-961: the bridge's state file read, but not its record of the owner's yes in Slack.
+SLACK_UNREAD = "the record of the owner's yes in Slack could not be read"
 NOT_READ = "not read: the tracker was not read"
 HALTED = {"time": "the pass ran out of time (run_timeout_seconds)",
           "requests": "the pass reached its cap of requests (max_requests)",
@@ -667,6 +670,14 @@ def read_slack_starts(path, say):
     return starts
 
 
+def slack_source(reader, sources, starts):
+    """The `plans` source, said partly read when the bridge's state file was read but its record of
+    the owner's yes in Slack was not (KIT-961): could not read is never silent (contract section 13)."""
+    if reader["bridge_state_file"] and starts is None and sources["plans"]["state"] == READ:
+        sources["plans"] = {"state": PARTLY, "reason": SLACK_UNREAD}
+    return sources
+
+
 def open_start_ids(starts):
     """The ticket ids the record names whose start the runner has not answered (KIT-961)."""
     return sorted(k for k, rec in (starts or {}).items()
@@ -786,6 +797,7 @@ def collect(cfg, gql, now, clock, say):
                            "reason": "; ".join(problems) or None}}
     for name, (_value, state, reason) in zip(SOURCES[1:], records):
         sources[name] = {"state": state, "reason": reason}
+    sources = slack_source(reader, sources, slack_starts)
     prio = dict((e["id"], priority_of(e.get("priority"))) for e in epics
                 if isinstance(e.get("id"), str))
     entries = [e for e in (running_entry(cfg, n) for n in running) if e]
@@ -1265,6 +1277,8 @@ def _cases(check, tmp, blocked):
                             + [piece(n, "Done") for n in (13, 14, 15)], {"max_pages": 1, "findings_file": F["seen"]},
                             size=3),
         "DOWN": lambda: read(ISSUES[:2], FILESET, fail=failing(down, nth=1)),
+        # KIT-961: a state file whose epics read, and whose record of the owner's yes does not.
+        "SB": lambda: read(ISSUES[:2], {"bridge_state_file": F["slack_bad"]}),
         # KIT-961: the pool reads no backlog, and the owner said yes to start ENG-20 in it.
         "SS": lambda: types.SimpleNamespace(doc=gather(
             {"pool": dict(PCFG, backlog=False, agent_filed="off"),
@@ -1318,6 +1332,10 @@ def _cases(check, tmp, blocked):
                     "or" in candidate_filter(pool_config(PCFG)[0]),
                     candidate_filter(pool_config(PCFG)[0], open_start_ids(json.load(open(F["slack"]))[
                         "slack_starts"]))))
+    case("KIT-961 …a state file read without its record of the yes is said: plans partly read, the result partial",
+         ({"state": PARTLY, "reason": SLACK_UNREAD}, "partial", None, {"state": READ, "reason": None}),
+         lambda d: (d["SB"].doc["sources"]["plans"], d["SB"].doc["result"], d["SB"].doc["slack_starts"],
+                    d["SS"].doc["sources"]["plans"]))
     case("KIT-961 …off is none, no file yet or no record is empty, a file it cannot read is None",
          ([None, {}, {}, None, None, None], {}),
          lambda d: ([read_slack_starts(x, quiet) for x in ("", F["none"], F["bridge"], F["bad"], F["list"],
@@ -1487,7 +1505,7 @@ def _cases(check, tmp, blocked):
     o = dict((k, globals()[k]) for k in (
         "repo_of blockers_of running_entry read_history read_busy paged read_ledger read_findings read_plans "
         "result_of read_tickets read_epics failed write read_config reader_config resolve_path read_slack_starts "
-        "open_start_ids").split())
+        "open_start_ids slack_source").split())
     cap = lambda cfg, **kw: dict(cfg, reader=dict(cfg["reader"], **kw))
     rel_ = lambda n, **kw: dict(n, inverseRelations=dict(n["inverseRelations"], **kw))
     blank = lambda fn, empty: lambda path, *rest: (lambda r: (empty, READ, None) if r[1] == COULD_NOT else r)(
@@ -1550,6 +1568,8 @@ def _cases(check, tmp, blocked):
            open_start_ids=lambda starts: [])
     mutant("KIT-961: a start the runner answered read again", open_start_ids=lambda starts: sorted(
         k for k, r in (starts or {}).items() if isinstance(r, dict)))
+    mutant("KIT-961: a record of the yes it could not read not said in any source",
+           slack_source=lambda reader, sources, starts: sources)
     mutant("KIT-961: an unreadable record taken for an empty one", read_slack_starts=lambda path, say: (
         o["read_slack_starts"](path, say) if o["read_slack_starts"](path, say) is not None or not path else {}))
     mutant("plan past max_pages kept", read_epics=lambda b, cfg, t, rec, pr: o["read_epics"](

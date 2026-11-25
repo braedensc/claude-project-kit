@@ -200,33 +200,36 @@ class HandoverMixin(object):
     """Pass's `retry` and `start` (KIT-352)."""
 
     def handover_read(self, kind, ident):
-        """(issue, sessions, agent id, refusal) for a retry or start of the ticket now: the
+        """(issue, sessions, agent id, refusal, road) for a retry or start of the ticket now: the
         refusal as handover_refusal gives it, or None when it may go ahead. KIT-961: with our own
         runner wired, the ticket is read first, and on a project that codes on it no agent is
-        asked for: (issue, [], None, runner_refusal's refusal)."""
+        asked for: (issue, [], None, runner_refusal's refusal, road), `road` being (store,
+        project) as it was read this once, and handed on so no later read of it can differ. On the
+        old road `road` is None."""
         issue = None
         if (self.cfg.get("runner_lane") or {}).get("repos"):
             issue = self.tracker.issue(ident)
             if not issue or not issue.get("id"):
-                return None, [], None, ("I can't find %s in Linear." % ident, "", "not found")
-            if self.runner_road(issue):
-                return issue, [], None, self.runner_refusal(kind, issue)
+                return None, [], None, ("I can't find %s in Linear." % ident, "", "not found"), None
+            road = self.runner_road(issue)
+            if road:
+                return issue, [], None, self.runner_refusal(kind, issue, road), road
         name = self.cfg["agent_user_name"].strip()
         if not name:
             return None, [], None, (
                 "I can't hand anything to the agent: no agent account is named here.", "",
-                "no agent named")
+                "no agent named"), None
         agent_id, why = self.tracker.agent_user(name)
         if not agent_id:
             return None, [], None, ("I can't hand anything to the agent: %s." % why, "",
-                                    "no agent")
+                                    "no agent"), None
         issue = issue or self.tracker.issue(ident)
         if not issue or not issue.get("id"):
-            return None, [], agent_id, ("I can't find %s in Linear." % ident, "", "not found")
+            return None, [], agent_id, ("I can't find %s in Linear." % ident, "", "not found"), None
         node = self.tracker.epic(ident) or {}
         sessions = [n or {} for n in self.tracker.sessions_on(issue["id"])]
         return issue, sessions, agent_id, self.handover_refusal(kind, issue, node, sessions,
-                                                                agent_id)
+                                                                agent_id), None
 
     def handover_refusal(self, kind, issue, node, sessions, agent_id):
         """Why the ticket can't be retried or started now, as (text, bind, why), or None. A
@@ -339,15 +342,17 @@ class HandoverMixin(object):
         rec = (self.state.get("slack_starts") or {}).get(issue_id)
         return rec if isinstance(rec, dict) and rec.get("answered") is None else None
 
-    def runner_refusal(self, kind, issue):
+    def runner_refusal(self, kind, issue, road):
         """Why this ticket can't be started or resumed on our own runner now (KIT-961), as (text,
         bind, why), or None. The watcher's hold first, as on the old road; then the owner the queue
         names, the runner's own record of the ticket's runs, what already waits for it, and for a
-        start the old road's checks of the ticket itself."""
+        start the old road's checks of the ticket itself. `road` is (store, project) as
+        handover_read read it."""
         ident = issue["identifier"]
         blocked, why, clear = self.hold_gate()
         if blocked:
-            return ("I won't ask our own runner to start %s: %s." % (ident, why), clear,
+            return ("I won't ask our own runner to %s %s: %s."
+                    % ("start" if kind == "start" else "resume", ident, why), clear,
                     "held by the watcher")
         team = (issue.get("team") or {}).get("key")
         if team not in self.cfg["team_keys"]:
@@ -361,7 +366,7 @@ class HandoverMixin(object):
         if not owners:
             return ("I can't take a yes to start %s on our own runner: %s." % (ident, why), "",
                     "no owner named")
-        runs, why = self.runner_runs(self.runner_road(issue)[0], ident)
+        runs, why = self.runner_runs(road[0], ident)
         if runs is None:
             return ("I can't read our own runner's records of its runs (%s), so I won't ask it "
                     "about %s." % (why, ident), "", "runs unread")
@@ -425,8 +430,7 @@ class HandoverMixin(object):
             self.mark(channel, msg, what)
         if self.refused_over_limit(channel, thread, msg):
             return
-        issue, _sessions, _agent, refusal = self.handover_read(kind, ident)
-        road = self.runner_road(issue) if issue is not None else None
+        issue, _sessions, _agent, refusal, road = self.handover_read(kind, ident)
         if issue is not None and (not road or road[1] != q["runner"]["project"]):
             refusal = ("%s's project doesn't code on our own runner as it did when I asked, so "
                        "nothing was asked of it, and I have closed the question." % ident,
@@ -497,6 +501,10 @@ class HandoverMixin(object):
             if got.get("ok"):
                 text = ("Our own runner started %s on your yes." % ident if start else
                         "Our own runner resumed %s's run on your yes." % ident)
+            elif got.get("mine"):
+                text = ("I couldn't ask our own runner to %s %s: %s. Nothing was started."
+                        % ("start" if start else "resume", ident,
+                           self.clean(str(got.get("why") or "no reason"))[:300]))
             else:
                 text = ("Our own runner refused to %s %s: %s. Nothing was started."
                         % ("start" if start else "resume", ident,
@@ -557,7 +565,8 @@ class HandoverMixin(object):
                 self.queue_failed("%s's resume cannot be asked: %s" % (ident, self.clean(why)))
                 return None
             if lane != "on":
-                self.slack_answered(ident, {"ok": False, "why": "its project's coding lane is off now"})
+                self.slack_answered(ident, {"ok": False, "mine": True,
+                                            "why": "its project's coding lane is off now"})
                 continue
             if self.dry:
                 self.say("  [dry-run] the queue would ask our runner to resume %s" % ident)
@@ -575,9 +584,10 @@ class HandoverMixin(object):
                 rid = runner_store.ask(where, "queue", "resume", "code", rec["project"], ident,
                                        run=rec["run"], text=RUNNER_RESUME_TEXT, now=self.now)
             except (ValueError, OSError) as exc:
-                self.slack_answered(ident, {"ok": False, "why": "our own runner's store would not "
-                                            "take it (%s)" % (self.clean(str(exc)) if isinstance(
-                                                exc, ValueError) else type(exc).__name__)})
+                self.slack_answered(ident, {"ok": False, "mine": True,
+                                            "why": "our own runner's store would not take it (%s)"
+                                            % (self.clean(str(exc)) if isinstance(exc, ValueError)
+                                               else type(exc).__name__)})
                 continue
             self.state.setdefault("runner_asks", {})[ident] = {
                 "request": rid, "store": where, "project": rec["project"], "issue_id": issue_id,
@@ -615,15 +625,21 @@ class HandoverMixin(object):
                          terms=None, set_up=None):
         """`retry <ticket>` or `start <ticket>` (KIT-352): every check, then the question. On a
         project that codes on our own runner (KIT-961), `resume <ticket>` comes here as a retry."""
-        issue, sessions, _agent, refusal = self.handover_read(kind, ident)
+        issue, sessions, _agent, refusal, road = self.handover_read(kind, ident)
         if refusal:
             text, bind, why = refusal
             self.refuse_request(channel, msg, thread, text, why, bind=bind, ticket=ident)
             return
-        road = self.runner_road(issue)
         if road:
-            runs, _why = self.runner_runs(road[0], ident)
+            runs, why = self.runner_runs(road[0], ident)
             run = self.newest_code_run(runs) if kind == "retry" else None
+            if runs is None or (kind == "retry" and run is None):
+                # Read once more for the question: a read that fails now is said, never guessed.
+                self.refuse_request(channel, msg, thread, "I can't read our own runner's records of "
+                                    "its runs (%s), so I won't ask it about %s." % (
+                                        why or "its newest run is not there now", ident),
+                                    "runs unread", ticket=ident)
+                return
             self.ask(channel, msg, thread, kind, issue, requester,
                      runner_parts(kind, issue, run, requester, self.cfg, by_bot=by_bot, dm=dm,
                                   terms=terms),
@@ -654,7 +670,7 @@ class HandoverMixin(object):
             self.mark(channel, msg, what)
         if self.refused_over_limit(channel, thread, msg):
             return
-        issue, sessions, agent_id, refusal = self.handover_read(kind, ident)
+        issue, sessions, agent_id, refusal, _road = self.handover_read(kind, ident)
         if refusal is None and agent_id is None:
             # KIT-961: asked on the old road, and its project codes on our own runner now.
             refusal = ("%s's project codes on our own runner now, so nothing was handed over, and "
@@ -981,20 +997,23 @@ def cases_handover(kit):
         from pipeline_bridge import TEAM
         from pipeline_bridge_config import OPEN
 
-        def lane_conf(name, owners=(ALICE,), code=True):
+        def lane_conf(name, owners=(ALICE,), code=True, hold=None):
             folder = os.path.join(_tmp, "runner-961", name)
             os.makedirs(folder)
             store = os.path.join(folder, "store")
             runner_store.prepare(store)
             qpath, rpath = os.path.join(folder, "queue.json"), os.path.join(folder, "runner.json")
+            queue = {"pool": {"owner_user_ids": ["owner-1"], "team_keys": ["PROD"],
+                              "dispatcher_user_ids": ["agent-1"],
+                              "owner_slack_user_ids": list(owners)},
+                     "reader": {"repo_by_team": {"PROD": "acme/app"},
+                                "inputs_file": os.path.join(folder, "in.json")},
+                     "window": {"days": dict((d, None) for d in (
+                         "mon", "tue", "wed", "thu", "fri", "sat", "sun"))}}
+            if hold:
+                queue["hold"] = {"file": hold}
             with open(qpath, "w", encoding="utf-8") as fh:
-                json.dump({"pool": {"owner_user_ids": ["owner-1"], "team_keys": ["PROD"],
-                                    "dispatcher_user_ids": ["agent-1"],
-                                    "owner_slack_user_ids": list(owners)},
-                           "reader": {"repo_by_team": {"PROD": "acme/app"},
-                                      "inputs_file": os.path.join(folder, "in.json")},
-                           "window": {"days": dict((d, None) for d in (
-                               "mon", "tue", "wed", "thu", "fri", "sat", "sun"))}}, fh)
+                json.dump(queue, fh)
             with open(rpath, "w", encoding="utf-8") as fh:
                 json.dump({"enabled": True, "store_dir": store,
                            "projects": {"app": {"lanes": {"code": code}}}}, fh)
@@ -1119,6 +1138,19 @@ def cases_handover(kit):
         check("ho961-each-runner-check-is-said-once-and-records-nothing",
               outcome(case_runner_refusals),
               [(True, [], None)] * 3 + ["Your yes for PROD-6 already waits for the queue to have room."])
+
+        def case_runner_held():
+            import pipeline_hold as watcher_hold
+            hold = os.path.join(_tmp, "runner-961-hold.json")
+            watcher_hold.write(hold, [("labels", "protected-label", "acme/app#12")], lambda: now)
+            over, store = lane_conf("held", hold=hold)
+            stopped(store)
+            c, s, t = asked("ho961-held", "resume PROD-6", None, **over)
+            return dm_lines(s)[-1].split(". To clear it")[0], slack_record(c)
+        check("ho961-a-watchers-hold-on-a-resume-is-said-as-one-and-records-nothing",
+              outcome(case_runner_held),
+              ("I won't ask our own runner to resume PROD-6: the watcher has held new starts: "
+               "protected-label acme/app#12", None))
 
         def case_runner_switch():
             over, _store = lane_conf("back")
