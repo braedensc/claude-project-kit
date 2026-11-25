@@ -1319,6 +1319,8 @@ def row_findings(ctx):
     """The fix lane has something to fix: Stage E's review of this head has a finding at or above the bounce
     threshold, and bounces are left. Each fact from the bounce driver's own reader."""
     head = ctx.before.get("head")
+    if not head:
+        raise Unknown("the pull request's head is not known, so whether Stage E's review is of it cannot be told")
     st = stage_e_state(ctx, head).get("bounce") or {}
     if st.get("state") != "read":
         raise Unknown("the bounce driver's record %s" % st.get("state"))
