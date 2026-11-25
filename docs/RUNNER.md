@@ -86,8 +86,9 @@ Before it starts anything, it checks the request against the tracker:
 
 - **A code start** is judged by the queue's own reader and judge, called as they are (KIT-645). It
   starts only a ticket the judge admits with a named approver: the owner's move, his creation where
-  the judge counts one, his approval of a plan in Slack, or the validator in his place while its
-  pieces switch is on. One rule, for the queue and the runner.
+  the judge counts one, his approval of a plan in Slack, the validator in his place while its
+  pieces switch is on, or his own yes in Slack to start that one ticket (KIT-961, `slack-start`).
+  One rule, for the queue and the runner. One yes in Slack starts one run at most.
 - **Any other start** needs the owner's own move into an approved state for that kind, in the
   ticket's whole history: the newest move for a plan start, any move for the kinds that follow.
 - **A resume** follows its kind's own rule over the history, with the session writer's moves left
@@ -621,17 +622,30 @@ To switch a project on, the runner's settings need `session_tools`, `queue_confi
 driver's own `RUNNER_LANE_REPOS` names that project too (KIT-765), and the runner's `fix` and
 `conflict` lanes send its fixes and conflict fixes there (KIT-708).
 
-**Not on this lane yet.**
+**The owner's start in the chat (KIT-961).** On a switched project, `start`, `retry` and `resume`
+in the tech lead chat ask a question of their own. Only a yes from a member in the queue's
+`owner_slack_user_ids` acts, after every check of the sender a yes gets. Anyone else's yes is
+refused in words. The design is `docs/adr/2026-11-24-the-owners-yes-in-slack-starts-a-piece-on-our-own-runner.md`.
 
-- **The tech lead's own start.** On a switched project, the tech lead refuses `start` and `retry`
-  in Slack, in words, and the queue lets go of a piece the plan's limit stopped. The runner starts
-  a ticket only on its approver's move. The runner's own way to start, retry and resume a piece
-  must land before any real project's coding lane is switched on, or the owner loses `start` there.
+1. **The yes is recorded, not sent.** The bridge writes it to its own record, `slack_starts`, with
+   the message's workspace, channel and ts. Nothing is written to Linear.
+2. **A start goes the queue's way.** The queue's reader reads the record. The pool admits the ticket
+   on it, `via` `slack-start`. The queue then starts it as it starts a move into Todo: inside the
+   working window, a free lane and the day's points, with the runaway stops and the ledger row.
+3. **A resume goes the same way.** `retry` and `resume` ask for the ticket's newest stopped code run.
+   The queue's own pass asks the runner to resume it, inside the window, with a ledger row.
+4. **The runner judges it** with the same judge, and refuses a second start on one yes.
+5. **The answer is said where you said yes**, and so is a hold the queue puts on the ticket.
 
-Good: the owner moves ENG-12 into Todo on a switched project. The queue asks the runner, ENG-12
-moves to In Progress as the session writer, and the session's comments come through its own tools.
-Not: the owner types `start ENG-12` in Slack on a switched project. The tech lead says to move it
-into Todo instead, and nothing is handed to the old dispatcher.
+What stays as it was: the queue still lets go of a piece the plan's limit stopped; type
+`resume <ticket>` for it. A review of a run started this way is refused, as one of a plan you
+approved in Slack is.
+
+Good: you type `start ENG-12` in the tech lead chat on a switched project and reply `yes`. The
+reply says it starts once the queue has room. The next queue pass asks the runner, and you hear
+*Our own runner started ENG-12 on your yes.*
+Not: *Only the owner's yes starts work on our own runner.* The yes came from a member the queue's
+settings do not name. Check `owner_slack_user_ids` in the queue's settings.
 
 ## The planning lane
 

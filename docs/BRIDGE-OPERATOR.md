@@ -824,6 +824,11 @@ that one setting switches it, and back. Then, on that repository:
   session. Each pass reads its answer. A start gets the comment naming who approved it.
 - A refusal, or no answer in 30 minutes, ends the pass loud once, in the runner's words. A
   refused ticket is asked again only once you approve it again.
+- `start`, `retry` and `resume` in your DM ask our own runner, not the agent (KIT-961). Only
+  your yes counts: you must be in the queue's `owner_slack_user_ids`. Your yes is recorded with
+  its message, and the queue starts the ticket inside its window and today's limits, as a move
+  into Todo would. `retry` and `resume` ask it to resume the ticket's newest stopped run. You hear
+  the runner's answer where you said yes, and why if the queue holds the ticket.
 - `start` and `retry` are refused there in words: move the ticket into Todo yourself. A piece the
   plan's limit stopped is let go, and the log says so.
 - Runner settings it cannot read, or the lane on while the runner is off, start nothing on that

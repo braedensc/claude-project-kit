@@ -360,7 +360,8 @@ def decide(raw_config, gql, now, clock=time.time, say=None, room=None):
     # KIT-543: the validator's approvals of held pieces, read only while its pieces switch is on.
     verdicts = pool.decide(cfg["pool"], now, inputs["tickets"], inputs["epics"],
                            inputs["histories"], inputs["busy"], inputs["findings"],
-                           inputs["plans"], inputs["ledger"], inputs.get("validator"))
+                           inputs["plans"], inputs["ledger"], inputs.get("validator"),
+                           slack_starts=inputs.get("slack_starts"))     # KIT-961: the owner's yes
     usage = read_usage(cfg["usage_file"])
     paced, why_paced = order.pace(cfg["order"], usage, now, lambda until: window.windows_left(
         cfg["window"], now, until))
@@ -722,6 +723,13 @@ def _cases(check, tmp, home):
 
     FINE = {"pressure": 1, "free_disk_gb": 100.0, "swap_gb": 0.0}
     asked = []
+    # KIT-961: the owner's yes in Slack to start ENG-2, after the other member's move, and the
+    # settings that name his Slack id.
+    SLACK_RAW = dict(RAW, pool=dict(RAW["pool"], owner_slack_user_ids=["U0OWNER001"]))
+    SLACK_YES = {"id-2": {"ticket": "ENG-2", "kind": "start", "approved_by": "U0OWNER001",
+                          "approved_at": "2026-11-04T09:30:00Z", "team": "T0TEAM001",
+                          "channel": "D0CHAN001", "answered": None,
+                          "ts": "%d.000100" % pool.epoch("2026-11-04T09:30:00Z")}}
 
     def run(doc=None, now=NOW, raw=None, room=None):
         calls[:] = []
@@ -956,6 +964,15 @@ def _cases(check, tmp, home):
              [("closed", "before-start", 0), ("closed", "day-off", 0)]),
             ("open: the owner's move starts, another's is held, extras admit nothing",
              run(), ("decided", None, 1, ["ENG-1"], [])),
+            # KIT-961: the owner's yes in Slack to start ENG-2, which another moved. The pool admits
+            # it, and the order starts it as any start: inside the window, a lane and the day's load.
+            ("KIT-961: the owner's yes in Slack starts a ticket another moved, by the order like any start",
+             run(inputs(slack_starts=SLACK_YES), raw=SLACK_RAW), ("decided", None, 1, ["ENG-1", "ENG-2"], [])),
+            ("KIT-961 ...and a closed window starts it no sooner, nor reads anything",
+             run(inputs(slack_starts=SLACK_YES), now=pool.epoch("2026-11-04T08:00:00Z"), raw=SLACK_RAW)[:4],
+             ("closed", "before-start", 0, [])),
+            ("KIT-961 ...and without the owner's Slack id in the settings, his yes is no approval",
+             run(inputs(slack_starts=SLACK_YES)), ("decided", None, 1, ["ENG-1"], [])),
             ("a failed read starts nothing and says why",
              run(inputs("failed", sources={"tracker": {"state": "could-not-read",
                                                        "reason": "the tracker did not answer"}})),

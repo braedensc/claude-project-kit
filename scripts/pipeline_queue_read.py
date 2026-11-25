@@ -27,12 +27,17 @@ user by its session); the plans, and only plans (a candidate's parent the idea g
 reads every epic as a plan, so a sub-issue of an ordinary parent stays an ordinary ticket; a plan
 past `max_pages` is left out, and its pieces among the candidates held); each issue's whole
 history and whether a dispatcher's agent session commented on it (whole or null, never a part),
-each move in it dated by the issue's state history (`movedAt`, KIT-934); the three records.
+each move in it dated by the issue's state history (`movedAt`, KIT-934); the three records. And,
+KIT-961, the bridge's record of the owner's yes in Slack to start one ticket (`slack_starts` in
+the bridge's state file, read before the candidates): each ticket it names is read as a candidate
+too, whatever its state, so a yes to start one in the backlog is judged while the pool reads no
+backlog.
 
 WHAT IT RETURNS.  One document, schema SCHEMA: `read_at`, `date` (the machine-local day, as the
 usage job names one), `result`, `sources` (`tracker`, `findings`, `plans`, `ledger`: `state` and
 `reason`), `tickets`, `epics`, `histories`, `busy`, `findings`, `plans`, `ledger`, `extras`,
-`running`. What was not read is null or empty and said, never zero. `result` is `ok` (every source
+`running`, `slack_starts` (KIT-961; null when the bridge's state file is off or unreadable, and
+then it is said in the `plans` source, which reads the same file). What was not read is null or empty and said, never zero. `result` is `ok` (every source
 on was read whole), `partial` (one was not) or `failed` (candidates or running work not read at
 all: lists empty, no record read). Reasons are fixed words and numbers, never a title, a text or an
 error's words. The file is written for every result, atomically, mode 0600, so a stale one is never
@@ -70,7 +75,7 @@ try:
     import check_ticket_dor as dor
     from pipeline_finding_poller import PollerError, load_seen
     from pipeline_queue_order import config as order_config
-    from pipeline_queue_pool import (GATE_EPIC_LABEL, HISTORY_KEYS, TEAM_RE, config as pool_config,
+    from pipeline_queue_pool import (GATE_EPIC_LABEL, HISTORY_KEYS, ID_RE, TEAM_RE, config as pool_config,
                                      dig, epoch as pool_epoch, has_children, iso, label_names,
                                      local_date, move_times, pointer_lines, undated_moves)
     from pipeline_status_local import (ENV_NAME_RE, PR_URL_RE, REPO_RE, SourceError, credential,
@@ -223,12 +228,18 @@ def complexity(query):
     return selection(tokens.index("{") + 1)[0]
 
 
-def candidate_filter(pcfg):
-    """Issues of the work teams in a ready state, and in a backlog state when the pool reads one."""
+def candidate_filter(pcfg, also=()):
+    """Issues of the work teams in a ready state, and in a backlog state when the pool reads one.
+    `also` (KIT-961): the ids of tickets the owner said yes to start in Slack, read in any state, on
+    the work teams only. Without them the filter is as it always was."""
     states = list(pcfg["ready_states"])
     if pcfg["backlog"] or pcfg["agent_filed"] != "off":
         states += [s for s in pcfg["backlog_states"] if s not in states]
-    return {"team": {"key": {"in": list(pcfg["team_keys"])}}, "state": {"name": {"in": states}}}
+    team = {"key": {"in": list(pcfg["team_keys"])}}
+    base = {"team": team, "state": {"name": {"in": states}}}
+    if not also:
+        return base
+    return {"or": [base, {"team": team, "id": {"in": sorted(also)}}]}
 
 
 def running_filter(pcfg, ocfg):
@@ -476,10 +487,10 @@ def unique(nodes):
     return out
 
 
-def read_tickets(budget, cfg, problems):
+def read_tickets(budget, cfg, problems, also=()):
     """The candidates, the first `max_tickets` of them. TrackerDown when none could be read."""
     reader = cfg["reader"]
-    nodes, status, _ = paged(budget, Q_CANDIDATES, {"filter": candidate_filter(cfg["pool"])},
+    nodes, status, _ = paged(budget, Q_CANDIDATES, {"filter": candidate_filter(cfg["pool"], also)},
                              ("issues",), reader["max_pages"])
     if status == "error" and not nodes:
         raise TrackerDown(HALTED["down"] if budget.halt == "down" else "the tickets could not be read")
@@ -636,6 +647,33 @@ def read_plans(path, say):
     return epics, READ, None
 
 
+def read_slack_starts(path, say):
+    """The `slack_starts` of the bridge's state (KIT-961): the owner's yes in Slack to start one
+    ticket, keyed by the ticket's id; not there yet, or no such record, is empty. None when the
+    file is off, or cannot be read: then no yes approves anything."""
+    if not path:
+        return None
+    try:
+        doc = read_json(path)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError, RecursionError) as exc:
+        say("slack starts: %s could not be read (%s)" % (path, type(exc).__name__))
+        return None
+    starts = doc.get("slack_starts", {}) if isinstance(doc, dict) else None
+    if not isinstance(starts, dict):
+        say("slack starts: %s holds no record of them" % path)
+        return None
+    return starts
+
+
+def open_start_ids(starts):
+    """The ticket ids the record names whose start the runner has not answered (KIT-961)."""
+    return sorted(k for k, rec in (starts or {}).items()
+                  if isinstance(k, str) and ID_RE.match(k) and isinstance(rec, dict)
+                  and rec.get("kind") == "start" and rec.get("answered") is None)
+
+
 def read_ledger(path, today, say):
     """(ledger, state, reason): today's counts of starts. The queue's starter writes a row before
     every start, so no file means no start: zero, not unknown. A day gone by starts again at
@@ -697,12 +735,12 @@ def result_of(sources):
 
 
 def document(now, sources, tickets=(), epics=(), histories=None, busy=(), records=(None,) * 4,
-             extras=None, running=()):
+             extras=None, running=(), slack_starts=None):
     return {"schema": SCHEMA, "read_at": iso(now), "date": local_date(now),
             "result": result_of(sources), "sources": sources, "tickets": list(tickets),
             "epics": list(epics), "histories": histories or {}, "busy": list(busy),
             "findings": records[0], "plans": records[1], "ledger": records[2],
-            "validator": records[3],
+            "validator": records[3], "slack_starts": slack_starts,
             "extras": extras or {}, "running": list(running)}
 
 
@@ -720,8 +758,10 @@ def collect(cfg, gql, now, clock, say):
     """One pass over a config that has been checked: the document, whatever the tracker said."""
     reader, today = cfg["reader"], local_date(now)
     budget, problems = Budget(gql, reader, clock, say), []
+    # KIT-961: read first, so each ticket the owner said yes to start in Slack is a candidate too.
+    slack_starts = read_slack_starts(reader["bridge_state_file"], say)
     try:
-        tickets = read_tickets(budget, cfg, problems)
+        tickets = read_tickets(budget, cfg, problems, open_start_ids(slack_starts))
         running = read_running(budget, cfg)
     except TrackerDown as exc:
         return failed(cfg, now, str(exc))
@@ -751,7 +791,7 @@ def collect(cfg, gql, now, clock, say):
     entries = [e for e in (running_entry(cfg, n) for n in running) if e]
     return document(now, sources, tickets, epics, histories, busy, [r[0] for r in records],
                     extras_of(cfg, tickets + pieces, prio),
-                    sorted(entries, key=lambda e: (e["kind"], str(e["ref"]))))
+                    sorted(entries, key=lambda e: (e["kind"], str(e["ref"]))), slack_starts)
 
 
 def gather(raw_config, gql, now, clock=time.time, say=None):
@@ -1010,8 +1050,9 @@ def _cases(check, tmp, blocked):
 
     def matches(f, i):
         st = f.get("state", {})
-        assert set(f) <= {"team", "state", "or"} and set(st) <= {"name", "type"}, f
+        assert set(f) <= {"team", "state", "or", "id"} and set(st) <= {"name", "type"}, f
         return (("team" not in f or i["team"]["key"] in f["team"]["key"]["in"])
+                and ("id" not in f or i["id"] in f["id"]["in"])
                 and ("name" not in st or i["state"]["name"] in st["name"]["in"])
                 and ("type" not in st or i["state"]["type"] == st["type"]["eq"])
                 and ("or" not in f or any(matches(g, i) for g in f["or"])))
@@ -1133,7 +1174,13 @@ def _cases(check, tmp, blocked):
          "pts": dict(LEDGER, points_started=4, sprint={"week": "2026-11-10T18:00:00Z", "points": 7}),
          "pts_old": dict(LEDGER, date="1999-01-01", points_started=4, sprint={"week": "2026-11-10T18:00:00Z", "points": 7}),
          "pts_bad": dict(LEDGER, points_started=-1), "sprint_bad": dict(LEDGER, sprint={"week": "w", "points": 1.5}),
-         "sprint_key": dict(LEDGER, sprint={"week": "w", "points": 1, "x": 1})},
+         "sprint_key": dict(LEDGER, sprint={"week": "w", "points": 1, "x": 1}),
+         # KIT-961: the owner's yes in Slack to start ENG-20, waiting; ENG-21's the runner answered.
+         "slack": {"epics": {}, "slack_starts": {
+             "id-20": {"ticket": "ENG-20", "kind": "start", "answered": None},
+             "id-21": {"ticket": "ENG-21", "kind": "start", "answered": {"ok": True}},
+             "id-22": {"ticket": "ENG-22", "kind": "resume", "answered": None}}},
+         "slack_bad": {"epics": {}, "slack_starts": []}},
         **dict(("junk%d" % i, v) for i, v in enumerate(JUNK))).items())
     F["none"] = os.path.join(FILES, "none.json")
     FILESET = {"findings_file": F["seen"], "bridge_state_file": F["bridge"], "ledger_file": F["ledger"]}
@@ -1218,6 +1265,12 @@ def _cases(check, tmp, blocked):
                             + [piece(n, "Done") for n in (13, 14, 15)], {"max_pages": 1, "findings_file": F["seen"]},
                             size=3),
         "DOWN": lambda: read(ISSUES[:2], FILESET, fail=failing(down, nth=1)),
+        # KIT-961: the pool reads no backlog, and the owner said yes to start ENG-20 in it.
+        "SS": lambda: types.SimpleNamespace(doc=gather(
+            {"pool": dict(PCFG, backlog=False, agent_filed="off"),
+             "reader": dict(READER, bridge_state_file=F["slack"])},
+            Linear([issue(n, "Backlog") for n in (20, 21, 22, 23)] + ISSUES[:1], HIST, COMM), NOW,
+            lambda: 0.0)),
         "NORUN": lambda: read(ISSUES[:2], fail=failing(boom, "QueueRunning")),
         "RB": lambda: read(ISSUES[:2], {"findings_file": F["bad"]}),
         "ATOMIC": atomic, "OK": lambda: cli(), "DRY": lambda: cli(["--dry-run"]),
@@ -1251,8 +1304,24 @@ def _cases(check, tmp, blocked):
                     len(QS), sorted(set(d["W"].calls))))
     case("document: keys, schema, time, local day; ok when all is read",
          (sorted("schema read_at date result sources tickets epics histories busy findings plans "
-                 "ledger validator extras running".split()), SCHEMA, "2026-11-05T22:30:00Z", TODAY, "ok"),
+                 "ledger validator extras running slack_starts".split()), SCHEMA, "2026-11-05T22:30:00Z",
+          TODAY, "ok"),
          lambda d: (sorted(W(d)), W(d)["schema"], W(d)["read_at"], W(d)["date"], d["OK"].doc["result"]))
+    case("KIT-961: a ticket the owner said yes to start is read in any state; the record handed on",
+         (["ENG-1", "ENG-20"], ["id-20", "id-21", "id-22"], True),
+         lambda d: (sorted(t["identifier"] for t in d["SS"].doc["tickets"]),
+                    sorted(d["SS"].doc["slack_starts"]), d["SS"].doc["histories"].get("id-20") is not None))
+    case("KIT-961 …with no open yes the filter is the one it always was, with one only its id more",
+         (True, False, {"or": [candidate_filter(pool_config(PCFG)[0]), {
+             "team": {"key": {"in": ["ENG", "OPS"]}}, "id": {"in": ["id-20"]}}]}),
+         lambda d: (candidate_filter(pool_config(PCFG)[0]) == candidate_filter(pool_config(PCFG)[0], ()),
+                    "or" in candidate_filter(pool_config(PCFG)[0]),
+                    candidate_filter(pool_config(PCFG)[0], open_start_ids(json.load(open(F["slack"]))[
+                        "slack_starts"]))))
+    case("KIT-961 …off is none, no file yet or no record is empty, a file it cannot read is None",
+         ([None, {}, {}, None, None, None], {}),
+         lambda d: ([read_slack_starts(x, quiet) for x in ("", F["none"], F["bridge"], F["bad"], F["list"],
+                                                         F["slack_bad"])], W(d)["slack_starts"]))
     case("paging; plans from tickets and the record; a history for each",
          ([5, 3, 3], ["ENG-%d" % n for n in (1, 2, 3, 4, 5, 6, 10, 11, 12, 13)],
           [["ENG-11", "ENG-12", "ENG-13"], ["ENG-41"]], [False] * 2, 12, [DATED]),
@@ -1417,7 +1486,8 @@ def _cases(check, tmp, blocked):
     check("no socket was opened, and the guard is live", (before, len(blocked.attempts)), ([], 1))
     o = dict((k, globals()[k]) for k in (
         "repo_of blockers_of running_entry read_history read_busy paged read_ledger read_findings read_plans "
-        "result_of read_tickets read_epics failed write read_config reader_config resolve_path").split())
+        "result_of read_tickets read_epics failed write read_config reader_config resolve_path read_slack_starts "
+        "open_start_ids").split())
     cap = lambda cfg, **kw: dict(cfg, reader=dict(cfg["reader"], **kw))
     rel_ = lambda n, **kw: dict(n, inverseRelations=dict(n["inverseRelations"], **kw))
     blank = lambda fn, empty: lambda path, *rest: (lambda r: (empty, READ, None) if r[1] == COULD_NOT else r)(
@@ -1474,8 +1544,14 @@ def _cases(check, tmp, blocked):
         dict(s, findings={"state": READ}, plans={"state": READ}, ledger={"state": READ})))
     mutant("request cap ignored", out_of_requests=lambda budget: False)
     mutant("clock ignored", out_of_time=lambda budget: False)
-    mutant("ticket cap ignored", read_tickets=lambda b, cfg, pr: o["read_tickets"](
-        b, cap(cfg, max_tickets=10 ** 6), pr))
+    mutant("ticket cap ignored", read_tickets=lambda b, cfg, pr, *rest: o["read_tickets"](
+        b, cap(cfg, max_tickets=10 ** 6), pr, *rest))
+    mutant("KIT-961: a ticket the owner said yes to start not read outside the candidates",
+           open_start_ids=lambda starts: [])
+    mutant("KIT-961: a start the runner answered read again", open_start_ids=lambda starts: sorted(
+        k for k, r in (starts or {}).items() if isinstance(r, dict)))
+    mutant("KIT-961: an unreadable record taken for an empty one", read_slack_starts=lambda path, say: (
+        o["read_slack_starts"](path, say) if o["read_slack_starts"](path, say) is not None or not path else {}))
     mutant("plan past max_pages kept", read_epics=lambda b, cfg, t, rec, pr: o["read_epics"](
         b, cap(cfg, max_pages=10 ** 6), t, rec, pr))
     mutant("a ticket with pieces not a plan", has_children=lambda t: False)

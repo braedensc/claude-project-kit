@@ -26,6 +26,16 @@ state alone, and never the dispatcher's user. Four sources:
                small (effort S), names no guarded path in its Pointers, came from a source the
                finding record does not itself list as agent-filed, and the day's count of such
                starts is under the cap. The stricter setting `agent_filed: off` turns it off.
+THE OWNER'S YES IN SLACK TO START ONE TICKET (KIT-961). On a project that codes on our own runner,
+the tech lead's `start <ticket>` asks, and the owner's yes is written to the bridge's record
+(`state["slack_starts"]`, given here as `slack_starts`). It is no lane of its own. It settles a ticket a
+lane above holds for want of his `start` (the verdict's reply says `start ENG-12`), and it names
+him where a lane's limits admitted a finding with nobody: `via` "slack-start", `by` his Slack id,
+`at` the second of his message. It counts only from a member of `owner_slack_user_ids`, only for
+the ticket the record names by id and key, only with the message it came in (its workspace, its
+channel and its ts, whose second is the approval's time), and only after the ticket's last change
+by anyone but the owner. A record for a resume approves no start, and neither does one the runner
+has answered: one message starts one run at most.
 The readiness gate (scripts/check_ticket_dor.py, strict) gates everything. A ticket anyone but
 the owner changed after it was filed or approved (title, text, label, parent or relation) is
 held until the owner touches it again: an edit or a move of the owner's own, later.
@@ -61,6 +71,9 @@ WHAT IT IS GIVEN (all of it data; nothing is fetched).
              because it was added or changed after the approval, is admitted `via` "validator"
              when its latest decision is `approved` and newer than the piece's last change. None
              is today's rule exactly: the owner's start decides.
+  slack_starts  the bridge's record of the owner's yes in Slack to start one ticket (KIT-961),
+             `{ticket id: {"ticket", "kind", "approved_by", "approved_at", "team", "channel", "ts",
+             "answered"}}`, or None: then no such yes approves anything, as before.
   A record that is None cannot be read, and what depends on it is held and said.
 
 WHAT IT RETURNS.  A list of verdicts, fields only: `id`, `ticket`, `team`, `plan` (the epic's
@@ -85,8 +98,10 @@ LIVE-TEST ITEMS (coded defensively; verify on the first real run and amend here)
   - The history's edit fields (`updatedDescription`, `fromTitle`, `toTitle`, `addedLabelIds`,
     `removedLabelIds`, `fromParentId`, `toParentId`, `relationChanges`) are read as the
     @linear/sdk typings name them. A live answer without them holds every ticket, never opens it.
-  - A `start` reply must leave an owner-attributed entry in the history (a move, or an edit):
-    that is what ends a hold. An owner's move into any state, or an edit by the owner, counts.
+  - On the old road, a `start` reply must leave an owner-attributed entry in the history (a move,
+    or an edit): that is what ends a hold. An owner's move into any state, or an edit by the owner,
+    counts. On a project that codes on our own runner, the bridge's record of his yes ends it
+    instead (`slack_starts`, KIT-961), and nothing is written to the tracker.
 """
 import argparse
 import datetime
@@ -110,7 +125,10 @@ except ImportError as exc:  # a packaging accident, never a state to run in
 
 EXIT_USAGE = 2
 SOURCES = ("todo", "backlog", "plan", "agent_filed", "none")
-VIAS = ("move", "creation", "slack", "limits", "validator")
+# KIT-961: the owner's own yes in Slack to start one ticket. The runner's store spells it the same
+# (pipeline_runner_store.SLACK_START), pinned equal by the selftest.
+SLACK_START = "slack-start"
+VIAS = ("move", "creation", "slack", "limits", "validator", SLACK_START)
 # The validator's name wherever an approval of its own is recorded: a piece's start it approved
 # (KIT-543), and a plan it approved in the owner's place, in the bridge's record (KIT-544). Lower
 # case, so no Slack member's id is ever spelled so.
@@ -147,6 +165,10 @@ ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}\Z")
 TICKET_RE = re.compile(r"^[A-Z][A-Z0-9]{0,15}-[0-9]{1,9}\Z")
 TEAM_RE = re.compile(r"^[A-Z][A-Z0-9]{0,15}\Z")
 SLACK_RE = re.compile(r"^[UW][A-Z0-9]{8,}\Z")
+# KIT-961: the message a yes came in, as Slack names it: its workspace, its channel and its ts.
+SLACK_TEAM_RE = re.compile(r"^[TE][A-Z0-9]{2,20}\Z")
+SLACK_CHANNEL_RE = re.compile(r"^[CDG][A-Z0-9]{2,20}\Z")
+SLACK_TS_RE = re.compile(r"^([0-9]{9,11})\.[0-9]{1,9}\Z")
 TIME_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?Z\Z")
 
 DEFAULTS = {
@@ -710,7 +732,58 @@ def facts(t, epic):
             "plan": pick(dig(epic, "identifier"), TICKET_RE)}
 
 
+def slack_start(cfg, rec, t, hist):
+    """(by, seconds) when `rec`, the bridge's record of a yes in Slack to start one ticket (KIT-961),
+    is the owner's for this very ticket and was given after its last change by anyone but him; else
+    None. The ts is the message's own, and its second is the approval's time, so a record names one
+    message and one time, never a time of its own choosing."""
+    ts = rec.get("ts")
+    m = SLACK_TS_RE.match(ts) if isinstance(ts, str) else None
+    at, by = epoch(rec.get("approved_at")), rec.get("approved_by")
+    if not (m and at is not None and int(m.group(1)) == at
+            and rec.get("ticket") == dig(t, "identifier")
+            and isinstance(rec.get("team"), str) and SLACK_TEAM_RE.match(rec["team"])
+            and isinstance(rec.get("channel"), str) and SLACK_CHANNEL_RE.match(rec["channel"])
+            and slack_owner(cfg, by)):
+        return None
+    if changed_since(cfg, hist, at):
+        return None
+    return by, at
+
+
+def open_start(ctx, ticket_id):
+    """The bridge's record of a yes to start this ticket that no runner answer has closed, or None."""
+    rec = (ctx.slack_starts or {}).get(ticket_id) if isinstance(ticket_id, str) else None
+    if isinstance(rec, dict) and rec.get("kind") == "start" and rec.get("answered") is None:
+        return rec
+    return None
+
+
 def judge(cfg, t, ctx, epic):
+    """One candidate's verdict, by its lane (judge_lanes); then the owner's own yes in Slack to
+    start it (KIT-961) settles a hold his `start` tap would settle, or names him where the limits
+    admitted it with nobody. It never opens a ticket any rule holds without a tap: a ticket that
+    is never started, not ready, waits inside a plan or could not be read stays held."""
+    v = judge_lanes(cfg, t, ctx, epic)
+    rec = open_start(ctx, v["id"])
+    if rec is None or not v["ticket"] or not (
+            v["reply"] == START % v["ticket"] or (v["admitted"] and v["via"] == "limits")):
+        return v
+    hist = read_history(ctx.histories.get(v["id"]))
+    if hist is None:                        # the yes cannot be dated against a change: it waits
+        return dict(v, admitted=False, reason="history-unreadable", by=None, at=None, via=None,
+                    reply=None)
+    plan = epic if cfg["plans"] else None
+    if plan is not None and plan_wait_open((ctx.plans or {}).get(plan.get("id")), t, plan):
+        return v
+    got = slack_start(cfg, rec, t, hist)
+    if got is None:
+        return v
+    return dict(v, admitted=True, reason="admitted", by=got[0], at=iso(got[1]), via=SLACK_START,
+                reply=None)
+
+
+def judge_lanes(cfg, t, ctx, epic):
     """One candidate's verdict: the first rule that holds it, or admitted. With plans switched
     off a plan's pieces are ordinary tickets, and judged as such."""
     epic = epic if cfg["plans"] else None
@@ -742,10 +815,12 @@ def judge(cfg, t, ctx, epic):
 
 
 def apply_cap(cfg, ctx, verdicts):
-    """The day's cap on agent-filed starts: of the tickets this pass would admit, the lowest
-    numbers up to what is left of it. A ticket past it waits for the owner's tap."""
+    """The day's cap on agent-filed starts: of the tickets this pass would admit by the limits
+    alone, the lowest numbers up to what is left of it. A ticket past it waits for the owner's tap;
+    one the owner said yes to in Slack (KIT-961) is his approval, not the limits'."""
     left = cfg["agent_filed_per_day"] - (ctx.agent_starts or 0)
-    for v in sorted((v for v in verdicts if v["admitted"] and v["source"] == "agent_filed"),
+    for v in sorted((v for v in verdicts if v["admitted"] and v["source"] == "agent_filed"
+                     and v["via"] == "limits"),
                     key=lambda v: ticket_number(v["ticket"])):
         if left > 0:
             left -= 1
@@ -754,7 +829,8 @@ def apply_cap(cfg, ctx, verdicts):
                      reply=START % v["ticket"])
 
 
-def decide(cfg, now, tickets, epics, histories, busy, findings, plans, ledger, validator=None):
+def decide(cfg, now, tickets, epics, histories, busy, findings, plans, ledger, validator=None,
+           slack_starts=None):
     """One verdict per candidate, flat tickets first, then each epic's pieces in order. A
     candidate this module cannot read is held as `malformed`, never guessed and never dropped."""
     cfg, bad = config(cfg)
@@ -777,6 +853,7 @@ def decide(cfg, now, tickets, epics, histories, busy, findings, plans, ledger, v
         if isinstance(findings, dict) else None, plans=plans if isinstance(plans, dict) else None,
         histories=histories if isinstance(histories, dict) else {},
         validator=validator if isinstance(validator, dict) else None,
+        slack_starts=slack_starts if isinstance(slack_starts, dict) else None,
         epic_ids=set(e["id"] for e in epics) | set(plans if isinstance(plans, dict) else ()),
         agent_starts=starts if isinstance(starts, int) and not isinstance(starts, bool)
         and starts >= 0 else None,
@@ -888,10 +965,12 @@ def _cases(check):
                  movedAt=T1, updatedAt=T1)
 
     def run(ts, hists, cfg=None, epics=(), busy=(), findings={}, plans={}, ledger=LEDGER,
-            validator=None):
+            validator=None, slack_starts=None):
         def read(x):
             return None if x is UNREAD else x
         extra = {} if validator is None else {"validator": validator}
+        if slack_starts is not None:
+            extra["slack_starts"] = slack_starts
         return decide(dict(CFG, **(cfg or {})), NOW, ts, list(epics), hists, busy,
                       read(findings), read(plans), read(ledger), **extra)
 
@@ -1017,6 +1096,51 @@ def _cases(check):
         return GOOD.replace(text, pointer)
     FA = "agent_filed"
     sc("a small finding within the limits, the backlog off", (FA, "admitted", None), **ag())
+
+    # -- KIT-961: the owner's own yes in Slack to start one ticket, the bridge's record ----------
+    def yes(n=1, by=SLACK, at=T2, **over):
+        rec = {"ticket": "ENG-%d" % n, "kind": "start", "approved_by": by, "approved_at": at,
+               "team": "T0TEAM001", "channel": "D0CHAN001", "ts": "%d.000100" % epoch(at),
+               "answered": None}
+        rec.update(over)
+        return {"id-%d" % n: rec}
+    MOVED_BY_OTHER = [to_todo(T1, OTHER)]
+    sc("KIT-961: moved by someone else, then the owner's yes in Slack starts it",
+       ("todo", "admitted", None), h=MOVED_BY_OTHER, slack_starts=yes())
+    sc("KIT-961 …a yes from a Slack member who is not the owner starts nothing",
+       ("todo", "not-owner", START1), h=MOVED_BY_OTHER, slack_starts=yes(by="U0OTHER001"))
+    sc("KIT-961 …a record naming another ticket's key starts nothing",
+       ("todo", "not-owner", START1), h=MOVED_BY_OTHER, slack_starts=yes(ticket="ENG-2"))
+    for what, over in (("no message ts", {"ts": None}), ("a ts of another second", {
+            "ts": "1700000000.000100"}), ("no workspace", {"team": None}), ("no channel", {
+            "channel": "x"}), ("a time that is not one", {"approved_at": "soon"})):
+        sc("KIT-961 …a record with %s names no message, and starts nothing" % what,
+           ("todo", "not-owner", START1), h=MOVED_BY_OTHER, slack_starts=yes(**over))
+    sc("KIT-961 …a record the runner has answered starts nothing again: one message, one start",
+       ("todo", "not-owner", START1), h=MOVED_BY_OTHER, slack_starts=yes(answered={"ok": True}))
+    sc("KIT-961 …a record for a resume starts nothing", ("todo", "not-owner", START1),
+       h=MOVED_BY_OTHER, slack_starts=yes(kind="resume"))
+    sc("KIT-961 …someone else's change after the yes holds it", ("todo", "not-owner", START1),
+       h=MOVED_BY_OTHER + [ev(T3, OTHER, fromTitle="a", toTitle="b")], slack_starts=yes())
+    sc("KIT-961 …a change before the yes does not: the yes saw it",
+       ("todo", "admitted", None), h=[to_todo(T0, OTHER), ev(T1, OTHER, fromTitle="a", toTitle="b")],
+       slack_starts=yes())
+    sc("KIT-961 …a ticket held without a tap stays held: not ready", ("todo", "not-ready", None),
+       issue(description="Too short."), h=MOVED_BY_OTHER, slack_starts=yes())
+    sc("KIT-961 …a ticket held without a tap stays held: marked blocked",
+       ("todo", "marked-blocked", None),
+       issue(labels=("effort:S", "provenance:human", "agent:blocked")), h=MOVED_BY_OTHER,
+       slack_starts=yes())
+    sc("KIT-961 …a backlog ticket while the backlog is off starts on his yes",
+       ("backlog", "admitted", None), issue(state="Backlog"), [], cfg={"backlog": False},
+       slack_starts=yes())
+    sc("KIT-961 …and its history unread holds the yes until it can be read",
+       ("backlog", "history-unreadable", None), issue(state="Backlog"), UNREAD,
+       cfg={"backlog": False}, slack_starts=yes())
+    sc("KIT-961 …a finding the limits admitted carries his yes as its approval",
+       (FA, "admitted", None), **ag(slack_starts=yes()))
+    sc("KIT-961 …a finding past its own rules starts on his yes",
+       (FA, "admitted", None), **ag(findings={}, slack_starts=yes()))
     sc("…never by itself when agent_filed is off", (FA, "agent-off", START1),
        **ag(cfg={"backlog": True, "agent_filed": "off"}))
     sc("…a label is not the finding record", (FA, "not-in-record", START1), **ag(findings={}))
@@ -1243,6 +1367,28 @@ def _cases(check):
         return got, verdicts
 
     WANT = [w for _n, w, _t, _h, _k in SC] + [w for _n, _v, w in PLAN]
+    # KIT-961: who the owner's yes names, when, and how; the runner's store spells it the same.
+    import pipeline_runner_store as runner_store
+
+    def named(**kw):
+        v = run([issue()], {"id-1": MOVED_BY_OTHER}, **kw)[0]
+        return (v["admitted"], v["by"], v["at"], v["via"])
+    check("KIT-961: the owner's yes names him by his Slack id, at his message's second",
+          named(slack_starts=yes()), (True, SLACK, T2, "slack-start"))
+    check("KIT-961 …a finding the limits admitted names him too, and is not the limits' any more",
+          [(v["via"], v["by"]) for v in run([ag()["t"]], {"id-1": []}, findings=FIND,
+                                            cfg={"backlog": False}, slack_starts=yes())],
+          [("slack-start", SLACK)])
+    check("KIT-961 …and the day's cap on findings the limits start does not hold his yes",
+          [(v["ticket"], v["reason"], v["via"]) for v in run(
+              [issue(n, state="Backlog", labels=AGENT) for n in (2, 1)], {"id-1": [], "id-2": []},
+              findings=dict(("c%d" % n, {"filed": "ENG-%d" % n, "source": "ENG-90"}) for n in (1, 2)),
+              cfg={"backlog": False, "agent_filed_per_day": 1},
+              ledger=dict(LEDGER, agent_filed_starts=1), slack_starts=yes(1))],
+          [("ENG-2", "daily-cap", None), ("ENG-1", "admitted", "slack-start")])
+    check("KIT-961 …no record is today's rule, word for word", named(), (False, None, None, None))
+    check("KIT-961 …the runner's store spells the approval the same, and counts it as named",
+          (runner_store.SLACK_START, SLACK_START in runner_store.APPROVALS), (SLACK_START, True))
     WANT += [[("ENG-2", "daily-cap", "start ENG-2"), ("ENG-1", "admitted", None)],
              [("ENG-2", "daily-cap", "start ENG-2"), ("ENG-1", "daily-cap", "start ENG-1")],
              [("ENG-2", "admitted", None), ("ENG-1", "admitted", None)],
@@ -1494,7 +1640,7 @@ def _cases(check):
         "is_owner", "newest_move", "changed_since", "read_history", "lane_of", "judge", "LANES",
         "NEVER", "EDIT_FIELDS", "ready_problems", "plan_problems", "fingerprint", "names_guarded",
         "small", "first_generation", "apply_cap", "slack_owner", "decide", "paused_at",
-        "plan_wait_open", "edit_reach"))
+        "plan_wait_open", "edit_reach", "slack_start", "open_start", "judge_lanes"))
 
     def caught(**patched):
         saved = dict((k, globals()[k]) for k in patched)
@@ -1596,8 +1742,28 @@ def _cases(check):
             ("plans switched off ignored", dict(judge=lambda cfg, *a: o["judge"](
                 dict(cfg, plans=True), *a))),
             ("an unreadable record taken for an empty one", dict(decide=lambda c, n, t, e, h, b, f,
-                                                                  p, led: o["decide"](
-                c, n, t, e, h, b, {} if f is None else f, {} if p is None else p, led))),
+                                                                  p, led, **kw: o["decide"](
+                c, n, t, e, h, b, {} if f is None else f, {} if p is None else p, led, **kw))),
+            # KIT-961: each rule of the owner's yes in Slack, broken one at a time.
+            ("KIT-961: any Slack member's yes taken for the owner's", dict(
+                slack_start=lambda cfg, rec, t, h: o["slack_start"](
+                    dict(cfg, owner_slack_user_ids=[rec.get("approved_by")]), rec, t, h))),
+            ("KIT-961: a yes not bound to its ticket's key", dict(
+                slack_start=lambda cfg, rec, t, h: o["slack_start"](
+                    cfg, dict(rec, ticket=t.get("identifier")), t, h))),
+            ("KIT-961: a yes not bound to its message", dict(
+                slack_start=lambda cfg, rec, t, h: o["slack_start"](cfg, dict(
+                    rec, ts="%d.1" % (epoch(rec.get("approved_at")) or 0), team="T0X0",
+                    channel="D0X0"), t, h))),
+            ("KIT-961: a change after the yes not heeded", dict(
+                slack_start=lambda cfg, rec, t, h: o["slack_start"](cfg, rec, t, []))),
+            ("KIT-961: a record the runner answered taken again", dict(
+                open_start=lambda ctx, tid: (ctx.slack_starts or {}).get(tid))),
+            ("KIT-961: a hold without a tap opened by a yes", dict(
+                judge=lambda cfg, t, ctx, epic: (lambda v: dict(
+                    v, admitted=True, reason="admitted", via="slack-start", reply=None)
+                    if o["open_start"](ctx, v["id"]) and v["reason"] in ("not-ready", "marked-blocked")
+                    else o["judge"](cfg, t, ctx, epic))(o["judge_lanes"](cfg, t, ctx, epic)))),
             ("a label taken for the finding record", dict(LANES=lane(
                 "agent_filed", lambda f, cfg, t, ctx, *r: f(cfg, t, types.SimpleNamespace(
                     **dict(vars(ctx), rec_of=lambda x: {"source": "ENG-90"})), *r)))),
