@@ -50,11 +50,13 @@ def unignored(gitignore_text, filled):
     with tempfile.TemporaryDirectory(prefix="settings-ignored-") as tmp:
         if _git(["init", "-q"], tmp).returncode != 0:
             return None
+        # Judge only the copied .gitignore: a person's global ignore file must not hide a missing line.
+        no_global = ["-c", "core.excludesFile=" + os.devnull]
         with open(os.path.join(tmp, ".gitignore"), "w") as fh:
             fh.write(gitignore_text)
         out = []
         for name in filled:
-            r = _git(["check-ignore", "-q", "--no-index", name], tmp)
+            r = _git(no_global + ["check-ignore", "-q", "--no-index", name], tmp)
             if r.returncode == 1:
                 out.append(name)
             elif r.returncode != 0:
