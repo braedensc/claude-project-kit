@@ -9,7 +9,8 @@ lane live").
 
     Options: --conf runner.conf · --queue-conf queue.conf · --probe <the probe's --out folder>
              --minutes N (the lane's own time limit) · --after-minutes N · --stage-e-state <folder>
-             --acceptance-config <file>
+             --acceptance-config <file> · --acceptance-conf <the acceptance installer's conf> · --plan-state <folder>
+             --then review (with --lane fix: the fix lane goes off and the review lane on in one write, KIT-968)
 
 WHAT IT IS.  A person's tool, run in their own terminal, never by a session. It proves one lane of our
 own runner (code, fix, review, plan or acceptance) on one test project, from off to on and back to off,
@@ -26,7 +27,9 @@ arguments, so a new user proves a lane on a project of their own before a real o
        passing, at a commit at or after main's last change to the session kinds; the project's
        delivery.json on main passing the kit's validator; now inside the queue's working window; the lane
        off now, and the settings with it on taken by the runner's own loader; for the coding lane, no other
-       approved ticket waiting; and the ticket ready for its chain. Anything it cannot read is UNKNOWN,
+       approved ticket waiting; and the ticket ready for its chain. Each lane's own proof adds rows that say it can
+       start: a review the poller would take (review), a finding at the bounce threshold with bounces left
+       (fix), and the acceptance job's config, browser, profile, look tool, repository and start rule. Anything it cannot read is UNKNOWN,
        never OK. `check` stops here and changes nothing.
     2. SHOW exactly what `run` switches on, and ask for one typed yes.
     3. SWITCH that one lane on for that one project: `projects.<project>.lanes.<lane>` in the runner's
@@ -81,6 +84,9 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 from pipeline_agent_env import AGENT_ENV_MARKERS  # noqa: E402  (the one list, imported, never copied)
+import pipeline_acceptance_run as acc_run  # noqa: E402  (the acceptance job's own limits; its loaders run as the role account)
+import pipeline_acceptance_setup as acc_setup  # noqa: E402  (its installer's own `verify` rows, and its row words)
+import pipeline_bounce_local as bounce  # noqa: E402  (the bounce driver's own delivery reader and freshness rule)
 import pipeline_harness_claude as harness  # noqa: E402  (git's helper for the push token, as a session gets it)
 import pipeline_notifier_setup as ns  # noqa: E402  (the role-file read and write, and a person's login)
 import pipeline_queue_setup as qs  # noqa: E402  (queue.conf's reader, and `~/` made the role's home)
@@ -125,8 +131,8 @@ SPEC = {
                "chain": ("asked", "started", "ended", "reviewed"), "after_chain": (),
                "owner": "Nothing to do now: the review job asks for a review of %s's pull request on its next "
                         "pass. It must not be reviewed at its head already, or a re-review must be asked for."},
-    "plan": {"kind": "plan", "caller": "planner", "action": "start", "minutes": 60, "after": 0,
-             "chain": ("asked", "started", "ended"), "after_chain": (),
+    "plan": {"kind": "plan", "caller": "planner", "action": "start", "minutes": 60, "after": 20,
+             "chain": ("asked", "started", "ended"), "after_chain": ("executor",),
              "owner": "Move the idea %s to Plan it yourself, in the tracker, now."},
     "acceptance": {"kind": "acceptance", "caller": "acceptance", "action": "start", "minutes": 90, "after": 0,
                    "chain": ("asked", "started", "ended", "verdict"), "after_chain": (),
@@ -400,6 +406,134 @@ if a.get("ledger"):
     except poller.LedgerError as exc:
         files[a["ledger"]] = {"state": "could not be read: %s" % exc}
 out["files"] = files
+rs = a.get("stage_e")
+if rs:
+    # Stage E's own readers, as the role account: the review poller's seen-set and re-review requests, and the
+    # bounce driver's ledger and outcome record. Only fields come back.
+    sd, st = rs["state_dir"], {}
+    try:
+        import pipeline_review_poller as rp
+        seen = rp.load_seen(rp.seen_path(sd))
+        due, problems = rp.due_rereviews(sd, rs["repo"], [{"number": rs["pr"], "headRefOid": rs["head"]}])
+        st["review"] = {"state": "read", "seen": rp.pr_key(rs["repo"], rs["pr"]) in seen, "due": rs["pr"] in due,
+                        "problems": [str(x)[:200] for x in problems[:3]]}
+    except Exception as exc:
+        st["review"] = {"state": "could not be read: %s: %s" % (type(exc).__name__, str(exc)[:160])}
+    try:
+        import pipeline_bounce_local as bl
+        view = bl.ledger_view(bl.ledger_path(sd), rs["repo"], rs["pr"])
+        oc = bl.read_outcome(sd, rs["repo"], rs["pr"])
+        ls = view.get("last_spent")
+        keep = ("usable", "meets_threshold", "max_severity", "head_sha", "at", "threshold", "outcome_schema")
+        st["bounce"] = {"state": "read", "prior": view["prior"], "last_spent": {"at": ls.get("at")} if ls else None,
+                        "outcome": None if oc is None else dict((k, oc.get(k)) for k in keep)}
+    except Exception as exc:
+        st["bounce"] = {"state": "could not be read: %s: %s" % (type(exc).__name__, str(exc)[:160])}
+    out["stage_e"] = st
+ps = a.get("plan_seen")
+if ps:
+    # The plan poller's own seen-set: the record of the run for one request, as the executor left it.
+    try:
+        import pipeline_plan_poller as pp
+        doc = pp.load_seen(ps["state_dir"])
+        recs = [r for r in (doc.get("triggers") or {}).values() if isinstance(r, dict) and r.get("request") == ps["request"]]
+        keep = ("status", "verdict", "lane", "exit", "filed_any", "unknown_any", "attempts", "idea", "request")
+        res = recs[0].get("result") if recs else None
+        out["plan_seen"] = {"state": "read", "first": bool(doc.get("_first")), "found": bool(recs),
+                            "record": dict((k, recs[0].get(k)) for k in keep) if recs else None,
+                            "result": dict((k, res.get(k)) for k in ("class", "kind", "filed", "epic", "questions"))
+                            if isinstance(res, dict) else None}
+    except Exception as exc:
+        out["plan_seen"] = {"state": "could not be read: %s: %s" % (type(exc).__name__, str(exc)[:160])}
+print(json.dumps(out, sort_keys=True))
+'''
+
+# The acceptance job's own loaders and start rule, as the role account (KIT-968). GitHub's answers come in as
+# data fetched under the owner's own login; the tracker is read with the runner's own key file, which never
+# leaves this process. Only fields come back.
+ACCEPT_PY = r'''
+import io, json, os, sys
+a = json.loads(sys.argv[1])
+sys.path[:0] = a["scripts"]
+import pipeline_runner as r        # first: the folder the runner runs from, before anything else reaches for it
+import pipeline_acceptance_run as acc
+import pipeline_acceptance_poller as poller
+out = {"schema": "runner-live-accept/1"}
+try:
+    cfg = acc.load_config(a["config"])
+    out["config"] = {"state": "read", "entry": a["repo"].lower() in cfg["entries"],
+                     "road": (cfg["runner_lane"].get("repos") or {}).get(a["repo"].lower())}
+except acc.RunError as exc:
+    out["config"] = {"state": "bad", "why": str(exc)[:400]}
+    print(json.dumps(out, sort_keys=True))
+    raise SystemExit(0)
+try:
+    acc.load_look_base(cfg)
+    out["look"] = {"state": "read"}
+except acc.RunError as exc:
+    out["look"] = {"state": "bad", "why": str(exc)[:300]}
+except Exception as exc:
+    out["look"] = {"state": "could not be read: %s" % type(exc).__name__}
+need, problems = {"prs": [], "checks": []}, []
+try:
+    mine = [(u, t) for u, t in acc.approved_plans(cfg["bridge_state"]) if t == a["plan"]]
+    out["approved"] = bool(mine)
+except acc.RunError as exc:
+    mine = []
+    out["approved"] = None
+    out["start"] = {"state": "could not be read: %s" % str(exc)[:200]}
+if mine:
+    rc, bad = r.load_file(a["settings"])
+    if bad:
+        out["start"] = {"state": "could not be read: the runner's own settings do not load"}
+    else:
+        tr = r.LinearTracker(rc["linear_key_file"])
+
+        class Lin(object):
+            def epic(self, issue_id):
+                try:
+                    return tr.gql(acc.Q_EPIC, {"id": issue_id}).get("issue")
+                except r.TrackerError as exc:
+                    raise acc.RunError("the tracker could not be read (%s: %s)" % (type(exc).__name__, str(exc)[:100]))
+
+        class Gh(object):
+            def delivery(self, repo):
+                return a["delivery"]
+
+            def pr(self, repo, number):
+                doc = (a.get("docs") or {}).get("pr-%d" % number)
+                if doc is None:
+                    need["prs"].append({"repo": repo, "number": number})
+                    raise acc.RunError("pull request #%d not fetched yet" % number)
+                return doc
+
+            def check_runs(self, repo, sha):
+                doc = (a.get("docs") or {}).get("checks-" + sha)
+                if doc is None:
+                    need["checks"].append({"repo": repo, "head": sha})
+                    raise acc.RunError("the checks of %s not fetched yet" % sha)
+                return doc
+        orig = acc.approved_plans
+        acc.approved_plans = lambda path: mine
+        try:
+            plans, info = acc.gather_facts(cfg, Lin(), Gh(), problems, io.StringIO(), ())
+        finally:
+            acc.approved_plans = orig
+        plan = ([p for p in plans if p["plan"] == a["plan"]] or [None])[0]
+        if plan is None:
+            out["start"] = {"state": "read", "verdict": "no-facts", "detail": "; ".join(problems[:2])[:300]}
+        else:
+            verdict, detail, head = poller.decide_plan(plan)
+            try:
+                rows = poller.load_ledger(cfg["ledger"])
+                done = (a["plan"], head) in rows
+                lstate = "read"
+            except poller.LedgerError as exc:
+                done, lstate = None, "could not be read: %s" % str(exc)[:200]
+            out["start"] = {"state": "read", "verdict": verdict, "detail": detail[:300], "head": head,
+                            "piece": (info.get(a["plan"]) or {}).get("piece"), "acceptance": plan["acceptance"],
+                            "already": done, "ledger": lstate, "problems": [x[:200] for x in problems[:3]]}
+out["need"] = need
 print(json.dumps(out, sort_keys=True))
 '''
 
@@ -921,6 +1055,7 @@ def row_delivery(ctx):
             ctx.slug, base))
     try:
         ctx.before["delivery"] = json.loads(text)
+        ctx.before["delivery_text"] = text
     except ValueError:
         raise Missing("%s's delivery.json on %s is not JSON" % (ctx.slug, base))
     with tempfile.TemporaryDirectory(prefix="runner-live-") as tmp:
@@ -1072,12 +1207,15 @@ def row_lane_off(ctx):
     return "off in the settings, and the runner takes none of it"
 
 
-def composed(ctx, on):
-    """The installed settings with only this lane changed, and the runner's own loader's problems with them."""
+def composed(ctx, on, also=None):
+    """The installed settings with only this lane changed (and, for a hand-over, the one lane `also` names, in
+    the same document), and the runner's own loader's problems with them."""
     doc = json.loads(json.dumps(ctx.settings))
     proj = doc["projects"][ctx.project]
     flags = store.lane_flags(proj.get("lanes")) or dict.fromkeys(store.KINDS, False)
     flags[ctx.kind] = bool(on)
+    for kind, value in (also or {}).items():
+        flags[kind] = bool(value)
     proj["lanes"] = flags
     _cfg, bad = runner_job.load_config(qs.with_home(doc, ctx.home))
     return doc, bad
@@ -1134,6 +1272,255 @@ def row_ticket(ctx):
     return "%s, read by the runner's own reader" % ctx.ticket
 
 
+def stage_e_state(ctx, head):
+    """Stage E's own readers for the pull request, as the role account (the review poller's seen-set and
+    re-review requests, the bounce driver's ledger and outcome record): {"review": ..., "bounce": ...}."""
+    snap = snapshot(ctx, stage_e={"state_dir": under_home(ctx, ctx.args.stage_e_state), "repo": ctx.slug,
+                                  "pr": ctx.pr["number"], "head": head})
+    got = snap.get("stage_e")
+    if not isinstance(got, dict):
+        raise Unknown("Stage E's readers gave no answer")
+    return got
+
+
+def review_possible(ctx, head):
+    """(possible, words): whether the review poller would review this pull request on its next pass: Stage E
+    has no record of it, or a re-review request waits and the head has moved off the one it was written at.
+    Unknown (raised) when it cannot be read."""
+    st = stage_e_state(ctx, head).get("review") or {}
+    if st.get("state") != "read":
+        raise Unknown("the review poller's record %s" % st.get("state"))
+    if st.get("problems"):
+        raise Unknown("a re-review request for #%s cannot be acted on: %s" % (ctx.pr["number"], st["problems"][0]))
+    if not st["seen"]:
+        return True, "Stage E has no record of #%s, so its next pass reviews it" % ctx.pr["number"]
+    if st["due"]:
+        return True, "a re-review request waits for #%s and its head has moved off the one it was asked at" % (
+            ctx.pr["number"])
+    return False, ("Stage E reviewed #%s already, and no re-review request waits for a head that has moved: "
+                   "nothing for the review lane to take" % ctx.pr["number"])
+
+
+def row_review(ctx):
+    """The review lane has something to review: its proof would not wait out its time limit for nothing."""
+    if ctx.lane == "fix":                      # --then review: the fix's own push makes the request
+        st = stage_e_state(ctx, ctx.before.get("head")).get("review") or {}
+        if st.get("state") != "read":
+            raise Unknown("the review poller's record %s" % st.get("state"))
+        return ("the review poller's record of #%s reads; the fix's push makes the re-review request the review "
+                "lane then takes" % ctx.pr["number"])
+    possible, words = review_possible(ctx, ctx.before.get("head"))
+    if not possible:
+        raise Missing(words + ". Push a new head, or leave a re-review request, then check again")
+    return words
+
+
+def row_findings(ctx):
+    """The fix lane has something to fix: Stage E's review of this head has a finding at or above the bounce
+    threshold, and bounces are left. Each fact from the bounce driver's own reader."""
+    head = ctx.before.get("head")
+    st = stage_e_state(ctx, head).get("bounce") or {}
+    if st.get("state") != "read":
+        raise Unknown("the bounce driver's record %s" % st.get("state"))
+    outcome = st.get("outcome")
+    if outcome is None:
+        raise Missing("Stage E has left no review of #%s: there is nothing to fix" % ctx.pr["number"])
+    fresh, why = bounce.outcome_is_fresh(outcome, head or "", st.get("last_spent"))
+    if not fresh:
+        raise Missing("Stage E's review is no trigger for a fix: %s" % why)
+    if not outcome.get("usable"):
+        raise Missing("Stage E's review of #%s declined, and a decline is not a finding" % ctx.pr["number"])
+    if not outcome.get("meets_threshold"):
+        raise Missing("Stage E's review of #%s found nothing at or above the bounce threshold (highest %s)" % (
+            ctx.pr["number"], outcome.get("max_severity") or "none"))
+    text = ctx.before.get("delivery_text")
+    if text is None:
+        raise Unknown("waits on the delivery row: the bounce budget is read from delivery.json")
+    max_bounces, threshold, _l, _s, state = bounce.parse_delivery(text)
+    if state != "ok":
+        raise Missing("the bounce budget cannot be read: %s" % state.split(":", 1)[-1])
+    if st["prior"] >= max_bounces:
+        raise Missing("no bounces are left for #%s: %d of %d spent" % (ctx.pr["number"], st["prior"], max_bounces))
+    return "Stage E's review of #%s at %s has a finding at %s, over the %s threshold; %d of %d bounces spent" % (
+        ctx.pr["number"], short(head), outcome.get("max_severity"), threshold or outcome.get("threshold") or "review's",
+        st["prior"], max_bounces)
+
+
+def row_then(ctx):
+    """`--then review`: the review lane is off now, and the runner's own loader takes the settings with the fix
+    lane off and the review lane on, as the one write that hands over."""
+    flags = store.lane_flags((ctx.settings["projects"].get(ctx.project) or {}).get("lanes"))
+    if flags is None:
+        raise Missing("project %s's lanes in %s are not true or false for each kind" % (ctx.project, ctx.settings_path))
+    if flags["review"]:
+        raise Missing("the review lane is already on for %s: this run proves it from off. Switch it off first: %s" % (
+            ctx.project, off_command(ctx, "review")))
+    _doc, bad = composed(ctx, False, also={"review": True})
+    if bad:
+        raise Missing("with the fix lane off and the review lane on, the runner's own loader refuses the settings: %s"
+                      % "; ".join(bad[:3]))
+    return "the review lane is off, and the runner's loader takes the settings with it on and the fix lane off"
+
+
+ACC_ROW_RE = re.compile(r"^  ([a-z][a-z-]*)\s+(ALREADY-DONE|DONE|WOULD-CHANGE|BLOCKED-ON-HUMAN|FAILED|UNKNOWN)\b\s*(.*)$")
+
+
+def acceptance_verify(ctx):
+    """The acceptance installer's own `verify`, read only: {step: (outcome, detail)}. Unknown when it cannot say."""
+    if "acc_verify" in ctx.before:
+        return ctx.before["acc_verify"]
+    argv = [sys.executable, os.path.join(HERE, "pipeline_acceptance_setup.py"), "verify"]
+    if ctx.args.acceptance_conf != acc_setup.DEFAULT_CONF:
+        argv += ["--conf", ctx.args.acceptance_conf]
+    res = ctx.io.run(argv, timeout=300)
+    rows = {}
+    for line in (res.out or "").splitlines():
+        m = ACC_ROW_RE.match(line)
+        if m:
+            rows[m.group(1)] = (m.group(2), m.group(3).strip())
+    if not rows:
+        raise Unknown("the acceptance installer's verify gave no rows (exit %d)" % res.rc)
+    ctx.before["acc_verify"] = rows
+    return rows
+
+
+def acc_steps(ctx, names):
+    """The installer's rows for these steps must each be ALREADY-DONE: else Missing; UNKNOWN is Unknown."""
+    rows = acceptance_verify(ctx)
+    for n in names:
+        got = rows.get(n)
+        if got is None:
+            raise Unknown("the acceptance installer's verify has no %s row" % n)
+        if got[0] == acc_setup.UNKNOWN:
+            raise Unknown("the acceptance installer's %s row is UNKNOWN: %s" % (n, got[1]))
+        if got[0] != acc_setup.ALREADY_DONE:
+            raise Missing("the acceptance installer's %s row says %s: %s. Run its `run`, then check again" % (
+                n, got[0], got[1]))
+
+
+def acceptance_job(ctx, docs=None):
+    """The acceptance job's own loaders and start rule, as the role account, with GitHub's answers fetched here
+    under the owner's own login. One answer per call; the one that asks for more is called again."""
+    if ctx.slug is None:
+        raise Unknown("waits on the project clone row")
+    plan = (ctx.before.get("ticket") or {}).get("parent")
+    args = {"scripts": runner_code(ctx), "config": under_home(ctx, ctx.args.acceptance_config),
+            "settings": ctx.settings_path, "repo": ctx.slug, "plan": plan or "",
+            "delivery": ctx.before.get("delivery_text"), "docs": docs or {}}
+    doc = role_python(ctx, ACCEPT_PY, args)
+    if doc.get("schema") != "runner-live-accept/1":
+        raise Unknown("the acceptance job's reader answered with something else")
+    return doc
+
+
+def acceptance_read(ctx):
+    """The job's loaders and start rule, with the pull requests and check runs it asks for fetched under the
+    owner's login. Cached for the rows. Raises Unknown."""
+    if "acc" in ctx.before:
+        return ctx.before["acc"]
+    docs, doc = {}, None
+    for _ in range(4):
+        doc = acceptance_job(ctx, docs)
+        need = doc.get("need") or {}
+        if not need.get("prs") and not need.get("checks"):
+            break
+        for want in need.get("prs") or []:
+            got = gh_json(ctx, ["api", "repos/%s/pulls/%d" % (want["repo"], want["number"])])
+            if got is None:
+                raise Unknown("GitHub could not be read with gh for #%d" % want["number"])
+            docs["pr-%d" % want["number"]] = got
+        for want in need.get("checks") or []:
+            got = gh_json(ctx, ["api", "repos/%s/commits/%s/check-runs?per_page=%d" % (
+                want["repo"], want["head"], acc_run.MAX_CHECK_RUNS)])
+            if got is None:
+                raise Unknown("GitHub could not be read with gh for the check runs of %s" % short(want["head"]))
+            docs["checks-" + want["head"]] = got
+    else:
+        raise Unknown("the acceptance job's reader kept asking for more")
+    ctx.before["acc"] = doc
+    return doc
+
+
+def row_acc_config(ctx):
+    """The acceptance job's config, and the look tool's base config, load by the job's own loaders."""
+    acc_steps(ctx, ("config",))
+    cfg = acceptance_read(ctx).get("config") or {}
+    if cfg.get("state") == "bad":
+        raise Missing("the acceptance job's own loader refuses its config %s: %s" % (ctx.args.acceptance_config,
+                                                                                   cfg.get("why")))
+    if cfg.get("state") != "read":
+        raise Unknown("the acceptance job's config %s" % cfg.get("state"))
+    return "the installer's config row holds, and the job's own loader takes %s" % ctx.args.acceptance_config
+
+
+def row_acc_browser(ctx):
+    """The browser (Playwright and Chromium, root's) and the sandbox profile, by the installer's own rows."""
+    acc_steps(ctx, ("browser", "profile"))
+    return "the installer's browser and profile rows hold: Playwright and Chromium root-owned, the profile current"
+
+
+def row_acc_look(ctx):
+    """The look tool: its MCP config, and its base config, which the job's own reader takes."""
+    acc_steps(ctx, ("mcp-config",))
+    look = acceptance_read(ctx).get("look") or {}
+    if look.get("state") == "bad":
+        raise Missing("the look tool's base config is refused: %s" % look.get("why"))
+    if look.get("state") != "read":
+        raise Unknown("the look tool's base config %s" % look.get("state"))
+    return "the installer's mcp-config row holds, and the job reads the look tool's base config"
+
+
+def row_acc_on(ctx):
+    """Acceptance is on for the repository: delivery.json carries an `acceptance` block, and the job's config
+    names the repository and its runner project."""
+    text = ctx.before.get("delivery_text")
+    if text is None:
+        raise Unknown("waits on the delivery row")
+    try:
+        doc = json.loads(text)
+    except ValueError:
+        raise Unknown("delivery.json is not JSON")
+    if not isinstance(doc, dict) or not isinstance(doc.get("acceptance"), dict):
+        raise Missing("%s's delivery.json has no `acceptance` block: acceptance is off for it" % ctx.slug)
+    cfg = acceptance_read(ctx).get("config") or {}
+    if cfg.get("state") != "read":
+        raise Unknown("the job's config could not be read, so its entries are not known")
+    if not cfg.get("entry"):
+        raise Missing("the acceptance job's config names no entry for %s" % ctx.slug)
+    if cfg.get("road") != ctx.project:
+        raise Missing("the job's config sends %s's checks to project %s, not %s: its runner_lane repos must name %s" % (
+            ctx.slug, cfg.get("road") or "none", ctx.project, ctx.project))
+    return "%s's delivery.json has an acceptance block; the job's config has its entry, on the runner lane of %s" % (
+        ctx.slug, ctx.project)
+
+
+def row_acc_start(ctx):
+    """The job's own start rule, for the named piece's plan: approved by the owner, every other piece Done, the
+    piece's pull request open, green and reviewed, and not checked at that head already."""
+    doc = acceptance_read(ctx)
+    plan = (ctx.before.get("ticket") or {}).get("parent")
+    if not plan:
+        raise Missing("%s has no parent: acceptance checks the last piece of an approved plan" % ctx.ticket)
+    if doc.get("approved") is False:
+        raise Missing("the bridge has recorded no owner-approved plan %s, the parent of %s" % (plan, ctx.ticket))
+    st = doc.get("start") or {}
+    if st.get("state") != "read":
+        raise Unknown("the job's start rule for %s %s" % (plan, st.get("state") or "was not judged"))
+    if st.get("verdict") == "no-facts":
+        raise Unknown("the job could not read the facts of plan %s: %s" % (plan, st.get("detail") or "no reason"))
+    if st.get("verdict") != acc_run.poller.START:
+        raise Missing("the job's start rule holds back %s: %s (%s)" % (plan, st.get("verdict"), st.get("detail")))
+    if st.get("piece") != ctx.ticket:
+        raise Missing("the plan's one open piece is %s, not %s" % (st.get("piece"), ctx.ticket))
+    if st.get("already") is None:
+        raise Unknown("the acceptance ledger %s" % st.get("ledger"))
+    if st["already"]:
+        raise Missing("the job has checked %s at %s already: a head is checked once. Push a new head" % (
+            plan, short(st.get("head"))))
+    return "plan %s: %s; not checked at that head yet" % (plan, st.get("detail"))
+
+
+
 def coded(runs):
     """The ticket's newest code run of this runner's that it started on an approval, and has ended."""
     done = [r for r in runs if r["kind"] == "code" and r["how"] in store.APPROVALS and r["state"] not in store.LIVE]
@@ -1160,7 +1547,29 @@ ROWS = (("runner", "row_runner"), ("engine", "row_engine"), ("kit", "row_kit"),
         ("project clone", "row_project_clone"), ("queue store", "row_queue_store"), ("keys", "row_keys"),
         ("push", "row_push"), ("writer key", "row_writer_key"), ("probe", "row_probe"),
         ("delivery", "row_delivery"), ("brief", "row_brief"), ("window", "row_window"),
-        ("lane off", "row_lane_off"), ("switch", "row_switch"), ("todo", "row_todo"), ("ticket", "row_ticket"))
+        ("lane off", "row_lane_off"), ("switch", "row_switch"), ("todo", "row_todo"), ("ticket", "row_ticket"),
+        ("fix findings", "row_findings"), ("review start", "row_review"), ("then", "row_then"),
+        ("acc config", "row_acc_config"), ("acc browser", "row_acc_browser"), ("acc look", "row_acc_look"),
+        ("acc on", "row_acc_on"), ("acc start", "row_acc_start"))
+# KIT-968: a row only some lanes need is not listed for the others (`then` only with --then).
+ROW_LANES = {"fix findings": ("fix",), "review start": ("fix", "review"), "then": ("fix",),
+             "acc config": ("acceptance",), "acc browser": ("acceptance",), "acc look": ("acceptance",),
+             "acc on": ("acceptance",), "acc start": ("acceptance",)}
+
+
+def listed_rows(ctx):
+    """The rows this run reads: the shared ones, and each lane's own."""
+    out = []
+    then = getattr(ctx.args, "then", None)
+    for name, fn in ROWS:
+        if ctx.lane not in ROW_LANES.get(name, LANES):
+            continue
+        if name == "then" and not then:
+            continue
+        if name == "review start" and ctx.lane == "fix" and not then:
+            continue
+        out.append((name, fn))
+    return out
 
 
 def ready(rows):
@@ -1171,7 +1580,7 @@ def ready(rows):
 def check(ctx):
     """Every row, read in order; a row that cannot be read is UNKNOWN, never OK. True when all are OK."""
     ctx.rows = []
-    for name, fn in ROWS:
+    for name, fn in listed_rows(ctx):
         try:
             state, words = OK, globals()[fn](ctx)
         except NotNeededRow as exc:
@@ -1258,9 +1667,9 @@ def review_comments(view, since=None):
     return sorted(out, key=lambda c: c["at"] or 0)
 
 
-def off_command(ctx):
+def off_command(ctx, lane=None):
     return "python3 scripts/pipeline_runner_live.py off --lane %s --project %s%s" % (
-        ctx.lane, ctx.project, "" if ctx.args.conf == setup.DEFAULT_CONF else " --conf %s" % ctx.args.conf)
+        lane or ctx.lane, ctx.project, "" if ctx.args.conf == setup.DEFAULT_CONF else " --conf %s" % ctx.args.conf)
 
 
 # --------------------------------------------------------------------------- #
@@ -1271,8 +1680,9 @@ def keep_sudo(ctx):
     return ctx.io.run(["sudo", "-n", "-v"], timeout=30).ok
 
 
-def set_lane(ctx, on):
-    """Write the lane on or off, as the role account, and read it back. Raises Missing / Unknown."""
+def set_lane(ctx, on, also=None):
+    """Write the lane on or off, as the role account, and read it back. Raises Missing / Unknown. `also` is a
+    hand-over's other lane, written in the same document, so there is no moment with both on or a gap between."""
     text, _mode = read_role_file(ctx, ctx.settings_path)
     if text is None:
         raise Missing("the runner's settings %s are gone" % ctx.settings_path)
@@ -1281,8 +1691,8 @@ def set_lane(ctx, on):
         ctx.settings["projects"][ctx.project]
     except (ValueError, KeyError, TypeError):
         raise Missing("the runner's settings %s no longer hold project %s" % (ctx.settings_path, ctx.project))
-    doc, bad = composed(ctx, on)
-    if bad and on:
+    doc, bad = composed(ctx, on, also)
+    if bad and (on or any((also or {}).values())):
         raise Missing("the runner's own loader refuses the settings with the lane on: %s" % bad[0])
     body = json.dumps(doc, indent=2, sort_keys=True) + "\n"
     res = as_role(ctx, ns.CONFIG_WRITE_SH.replace("@F@", shlex.quote(ctx.settings_path)), stdin=body)
@@ -1533,6 +1943,29 @@ def watch_plan(ctx, snap):
     return True
 
 
+def plan_record(ctx):
+    """The plan poller's record of this run's request, as its own reader (load_seen) holds it, read as the role
+    account: {"state", "found", "record", "result"}. Raises Unknown when it cannot be read."""
+    snap = snapshot(ctx, plan_seen={"state_dir": under_home(ctx, ctx.args.plan_state), "request": ctx.request["id"]})
+    got = snap.get("plan_seen")
+    if not isinstance(got, dict) or got.get("state") != "read":
+        raise Unknown("the plan poller's record %s" % ((got or {}).get("state") or "gave no answer"))
+    return got
+
+
+def after_plan(ctx):
+    """With the lane off: the plan poller collects the run's final message and runs the executor over it. The
+    step is seen once the poller's own record of this request carries the executor's answer."""
+    got = plan_record(ctx)
+    rec = got.get("record") or {}
+    if not got["found"] or rec.get("exit") is None:
+        return
+    res = got.get("result") or {}
+    mark(ctx, "executor", "the plan poller's record: executor exit %s, verdict %s, result %s%s" % (
+        rec.get("exit"), rec.get("verdict"), res.get("class") or "not read",
+        ", epic %s" % res["epic"] if res.get("epic") else ""))
+
+
 def acceptance_files(ctx):
     """The acceptance job's settings, as installed: its run state, its ledger and the look tool's records."""
     path = under_home(ctx, ctx.args.acceptance_config)
@@ -1583,7 +2016,7 @@ def watch_acceptance(ctx, snap):
 
 # Each lane's steps and checks, by name: looked up when used, so the selftest's mutants reach them.
 WATCH = dict((lane, "watch_" + lane) for lane in LANES)
-AFTER = {"code": "after_code"}
+AFTER = {"code": "after_code", "plan": "after_plan"}
 
 
 def waiting_for(ctx, names):
@@ -1856,8 +2289,28 @@ def agree_plan(ctx):
         ctx.notes.append("the idea's labels changed during the run: before %s; after %s" % (
             ", ".join(before) or "none", ", ".join(after_) or "none"))
     out = ctx.before.get("output") or {}
-    agreed(ctx, "the plan document", BY_HAND, "the run left a %d-character final message for the planner; compare "
-           "the tree it filed with the old lane's tree for the same idea, by hand" % (out.get("chars") or 0))
+    try:
+        got = plan_record(ctx)
+    except Unknown as exc:
+        got = None
+        agreed(ctx, "the executor read the plan", None, str(exc))
+    if got is not None:
+        rec, res = got.get("record") or {}, got.get("result") or {}
+        read = bool(got["found"]) and rec.get("exit") is not None and rec.get("lane") == "runner" \
+            and res.get("class") == "filed" and res.get("filed") is True and bool(res.get("epic"))
+        agreed(ctx, "the executor read the plan", read,
+               "the plan poller's record of request %s: %s" % (ctx.request["id"], (
+                   "the executor ran (exit %s, verdict %s) and filed epic %s" % (rec.get("exit"), rec.get("verdict"),
+                                                                              res.get("epic")) if read else
+                   "no record of it" if not got["found"] else
+                   "the executor never answered" if rec.get("exit") is None else
+                   "the executor's result was %s, not a filed plan (verdict %s)" % (res.get("class") or "unread",
+                                                                                   rec.get("verdict")))))
+    agreed(ctx, "the plan document", BY_HAND, "the run left a %d-character final message for the planner%s; compare "
+           "the tree it filed with the old lane's tree for the same idea, by hand" % (
+               out.get("chars") or 0, " and the executor filed epic %s" % (
+                   ((got or {}).get("result") or {}).get("epic")) if got and (got.get("result") or {}).get("epic")
+               else ""))
 
 
 def agree_acceptance(ctx):
@@ -1989,11 +2442,19 @@ def parse(argv):
     p.add_argument("--after-minutes", type=int)
     p.add_argument("--stage-e-state", default="~/.stage-e/state")
     p.add_argument("--acceptance-config", default="~/.stage-e/acceptance/acceptance.json")
+    p.add_argument("--acceptance-conf", default=acc_setup.DEFAULT_CONF,
+                   help="the acceptance installer's conf, whose `verify` the acceptance rows read")
+    p.add_argument("--plan-state", default="~/.stage-a/state",
+                   help="the plan poller's state folder, where the executor's record of a plan is read")
+    p.add_argument("--then", choices=("review",),
+                   help="with --lane fix: hand the fix lane's switch to the review lane in the same run")
     args = p.parse_args(argv)
     if not store.PROJECT_RE.match(args.project):
         p.error("--project must be a project key of the runner's settings")
     if args.command != "off" and not (args.ticket and store.TICKET_RE.match(args.ticket)):
         p.error("--ticket must be a ticket id, such as ENG-12")
+    if args.then and (args.lane != "fix" or args.command == "off"):
+        p.error("--then review goes with `check` or `run` of --lane fix only")
     for name in ("minutes", "after_minutes"):
         v = getattr(args, name)
         if v is not None and not 1 <= v <= 24 * 60:
@@ -2057,35 +2518,67 @@ def _raise_stop(signum, _frame):
     raise Interrupted("stopped by signal %d" % signum)
 
 
-def command_run(ctx):
-    s = ctx.spec
+LOADED = ("conf", "role", "home", "settings_path", "engine", "cfg", "proj", "store_dir", "slug", "role_scripts",
+          "https", "engine_why", "code_run", "pr", "ticket")
+
+
+def then_ctx(ctx):
+    """The context of the lane a hand-over goes to (`--then review`): the same loaded settings, its own steps."""
+    args = argparse.Namespace(**vars(ctx.args))
+    args.lane, args.then, args.minutes, args.after_minutes = ctx.args.then, None, None, None
+    kid = Ctx(ctx.io, args)
+    for name in LOADED:
+        setattr(kid, name, getattr(ctx, name))
+    kid.settings = ctx.settings
+    kid.before = {"job_commit": ctx.before.get("job_commit"), "head": ctx.before.get("head")}
+    kid.minutes, kid.after_minutes = kid.spec["minutes"], kid.spec["after"]
+    return kid
+
+
+def hand_off(ctx, kid):
+    """The fix lane goes off and the review lane goes on in ONE write of the settings: there is never a moment
+    with both on, and no gap between them for the old review job to take the new head in. The fix lane's
+    switch off is confirmed first. A review that could not start is refused before anything is written."""
+    view = pr_view(ctx, ctx.pr["number"]) or {}
+    head = view.get("headRefOid") or ctx.pr.get("headRefOid")
+    kid.pr, kid.before["head"] = dict(ctx.pr, headRefOid=head), head
+    possible, words = review_possible(kid, head)
+    if not possible:
+        raise Missing("the fix's push left no review for the review lane to take: %s" % words)
     ctx.say("")
-    ctx.say("What `run` does, and nothing else:")
-    ctx.say("  1. Switch lanes.%s ON for project %s, in %s, as %s. No other lane, project or key changes." % (
-        ctx.kind, ctx.project, ctx.settings_path, ctx.role))
-    ctx.say("  2. Then you: %s" % (s["owner"] % ctx.ticket))
-    ctx.say("  3. Wait up to %d minutes for: %s." % (ctx.minutes, ", ".join(s["chain"])))
-    ctx.say("  4. Switch lanes.%s OFF again, by the same setting, %s; watch %d minutes that nothing of it starts."
-            % (ctx.kind, "and wait up to %d minutes for: %s" % (ctx.after_minutes, ", ".join(s["after_chain"]))
-               if s["after_chain"] else "at once", QUIET_SECONDS // 60))
-    ctx.say("  5. Check that the run record, the tracker, the pull request and the ledger agree, and print the "
-            "result.")
-    ctx.say("A failure or Ctrl-C at any point switches the lane off first.")
-    if not typed_yes(ctx, "Type yes to switch the %s lane on for %s: " % (ctx.kind, ctx.project)):
-        ctx.say("Not yes, so nothing was changed.")
-        return EXIT_NOT_YES
-    olds = {}
-    for sig in (signal.SIGTERM, signal.SIGHUP):
-        try:
-            olds[sig] = signal.signal(sig, _raise_stop)
-        except (ValueError, OSError):
-            pass
-    failed = None
+    ctx.say("Handing over: %s" % words)
+    if not keep_sudo(ctx):
+        raise Unknown("your sudo session ended while it waited, so the lanes could not be switched")
+    kid.on_at = ctx.off_at = ctx.io.now()
+    set_lane(ctx, False, also={kid.kind: True})
+    ctx.say("Switched: lanes.%s OFF and lanes.%s ON for %s in %s, in one write, at %s UTC." % (
+        ctx.kind, kid.kind, ctx.project, ctx.settings_path, hms(ctx.off_at)))
+    ctx.off_seen = confirm(ctx, False)
+    if ctx.off_seen is None:
+        raise Missing("the runner did not say it dropped the %s lane within %d seconds" % (ctx.kind, CONFIRM_SECONDS))
+    ctx.say("The runner no longer takes the %s lane (seen %s)." % (ctx.kind, hms(ctx.off_seen)))
+    kid.settings = ctx.settings
+    kid.on_seen = confirm(kid, True)
+    if kid.on_seen is None:
+        raise Missing("the runner did not say it takes the %s lane within %d seconds" % (kid.kind, CONFIRM_SECONDS))
+    ctx.say("The runner takes the %s lane (seen %s)." % (kid.kind, hms(kid.on_seen)))
+    return True
+
+
+def lane_phase(ctx, kid=None, already_on=False):
+    """Switch the lane on (unless a hand-over did), wait for its chain, and end with the lane off: by the
+    hand-over to `kid` when there is one and the chain finished, else by its own switch off. (failed, off_ok,
+    handed)."""
+    s = ctx.spec
+    failed, handed = None, False
     try:
-        switch_on(ctx)
+        if not already_on:
+            switch_on(ctx)
         ctx.say("")
         ctx.say("NOW: %s" % (s["owner"] % ctx.ticket))
         failed = watch(ctx)
+        if not failed and kid is not None:
+            handed = hand_off(ctx, kid)
     except (Missing, Unknown) as exc:
         failed = str(exc)
     except (KeyboardInterrupt, Interrupted) as exc:
@@ -2093,14 +2586,18 @@ def command_run(ctx):
     except Exception as exc:                                      # noqa: BLE001  (a surprise still ends off)
         failed = "unexpected %s: %s" % (type(exc).__name__, short(str(exc), 200))
     finally:
-        off_ok = switch_off(ctx)
-        for sig, old in olds.items():
-            signal.signal(sig, old)
-    quiet_ok = False
+        off_ok = ctx.off_seen is not None if handed else switch_off(ctx)
+    return failed, off_ok, handed
+
+
+def finish_lane(ctx, failed, off_ok):
+    """With the lane off: the steps after it, the checks, and the lane's result block. (passed, stopped)."""
+    quiet_ok, stopped = False, False
     if off_ok:
         try:
             quiet_ok = after(ctx, failed)
         except (KeyboardInterrupt, Interrupted):
+            stopped = True
             ctx.problem("you stopped the watch after the switch off, so it is not complete")
             quiet_ok = quiet_check(ctx)
     if not failed and ctx.run is not None:
@@ -2110,7 +2607,62 @@ def command_run(ctx):
     ctx.say("---- result: post this on the lane's live-proof ticket ----")
     ctx.say(text)
     ctx.say("---- end of result ----")
-    return EXIT_STILL_ON if not off_ok else EXIT_OK if passed else EXIT_FAILED
+    return passed, stopped
+
+
+def command_run(ctx):
+    s = ctx.spec
+    kid = then_ctx(ctx) if ctx.args.then else None
+    ctx.say("")
+    ctx.say("What `run` does, and nothing else:")
+    ctx.say("  1. Switch lanes.%s ON for project %s, in %s, as %s. No other lane, project or key changes." % (
+        ctx.kind, ctx.project, ctx.settings_path, ctx.role))
+    ctx.say("  2. Then you: %s" % (s["owner"] % ctx.ticket))
+    ctx.say("  3. Wait up to %d minutes for: %s." % (ctx.minutes, ", ".join(s["chain"])))
+    if kid is None:
+        ctx.say("  4. Switch lanes.%s OFF again, by the same setting, %s; watch %d minutes that nothing of it starts."
+                % (ctx.kind, "and wait up to %d minutes for: %s" % (ctx.after_minutes, ", ".join(s["after_chain"]))
+                   if s["after_chain"] else "at once", QUIET_SECONDS // 60))
+    else:
+        ctx.say("  4. Switch lanes.%s OFF and lanes.%s ON in ONE write of the settings (never both on, no gap for the "
+                "old review job); watch %d minutes that nothing of the fix lane starts." % (
+                    ctx.kind, kid.kind, QUIET_SECONDS // 60))
+        ctx.say("  5. Wait up to %d minutes for the review lane's chain: %s. Then switch lanes.%s OFF, and watch that "
+                "nothing of it starts." % (kid.minutes, ", ".join(kid.spec["chain"]), kid.kind))
+    ctx.say("  %d. Check that the run record, the tracker, the pull request and the ledger agree, and print the "
+            "result%s." % (5 if kid is None else 6, "" if kid is None else " of each lane"))
+    ctx.say("A failure or Ctrl-C at any point switches every lane it switched on off first.")
+    if not typed_yes(ctx, "Type yes to switch the %s lane on for %s: " % (ctx.kind, ctx.project)):
+        ctx.say("Not yes, so nothing was changed.")
+        return EXIT_NOT_YES
+    olds = {}
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        try:
+            olds[sig] = signal.signal(sig, _raise_stop)
+        except (ValueError, OSError):
+            pass
+    all_off, all_passed = True, True
+    try:
+        failed, off_ok, handed = lane_phase(ctx, kid)
+        passed, stopped = finish_lane(ctx, failed, off_ok)
+        all_off, all_passed = off_ok, passed
+        if kid is not None and handed and not stopped:
+            try:
+                failed2, off2, _h = lane_phase(kid, None, already_on=True)
+                passed2, _s2 = finish_lane(kid, failed2, off2)
+                all_off, all_passed = all_off and off2, all_passed and passed2
+            except (KeyboardInterrupt, Interrupted):
+                all_passed = False
+        elif kid is not None:
+            all_passed = False          # the hand-over did not happen, or the watch was stopped: no review proof
+    finally:
+        if kid is not None and kid.on_at is not None and kid.off_at is None:
+            # The review lane was switched on and its own phase never switched it off (a stop in between): off.
+            all_off = switch_off(kid) and all_off
+            ctx.problem("the review lane was switched off by the guard, not by its own run")
+        for sig, old in olds.items():
+            signal.signal(sig, old)
+    return EXIT_STILL_ON if not all_off else EXIT_OK if all_passed else EXIT_FAILED
 
 
 # --------------------------------------------------------------------------- #
@@ -2183,6 +2735,8 @@ class LinearTracker(object):
                 raise TrackerError("the state history was refused")
             return {"issue": {"stateHistory": {"nodes": self._one(variables["id"]).get("states") or [],
                                                "pageInfo": {"hasNextPage": False}}}}
+        if "AcceptanceEpic" in query:
+            return {"issue": (d.get("epics") or {}).get(variables["id"])}
         return {"issue": {"comments": {"nodes": d["comments"].get(variables["id"], [])}}}
 
 
@@ -2239,6 +2793,14 @@ FLAGS = {
     # KIT-934: the owner's move shares one history entry with his label 18m 27s before it (as on 20 Nov), and
     # the reader dated it by that entry's first change, as before KIT-934, and the run recorded that time.
     "grouped": False, "reader_early": False, "states_down": False,
+    # KIT-968: what each lane's own proof needs first, as Stage E, the plan poller and the acceptance job hold it.
+    "review_state": "due",        # due | unseen | reviewed | same-head | bad-seen: the review poller's record
+    "outcome": "findings",        # findings | none | clean | stale | declined | bad: Stage E's review record
+    "spent": 0, "max_bounces": 3, "then": False,
+    "plan_record": "filed",       # filed | none | no-plan | unreadable: the plan poller's record of the run
+    "acc_verify": None, "acc_cfg": "ok", "acc_pieces": "last", "acc_checks": "green", "acc_review": "reviewed",
+    "acc_started": False, "acc_approved": True, "acc_acceptance": True, "acc_road": "app", "acc_verify_down": False,
+    "acc_look": "ok",
 }
 
 
@@ -2267,6 +2829,8 @@ class World(object):
         self.stub, self.tracker_file = os.path.join(root, "stub"), os.path.join(root, "tracker.json")
         self.conf, self.qconf = os.path.join(root, "owner", "runner.conf"), os.path.join(root, "owner", "queue.conf")
         self.now, self.sudo_live, self.validations, self.writes = T0, False, 0, 0
+        self.written = []              # the lanes of each settings document the tool wrote, in order
+        self.review_run = self.review_ask = self.review_on_seen = None
         self.on_seen = self.off_seen = self.asked = self.strayed = self.run_id = self.code_run = None
         self.move_at, self.events, self.prs = None, set(), {}
         self.tracker = {"tickets": {}, "comments": {}}
@@ -2332,18 +2896,128 @@ class World(object):
                                "headRefName": self.code_run["branch"], "headRefOid": H0,
                                "author": {"login": "pusher"}, "comments": [],
                                "commits": [{"oid": H0, "committedDate": store.iso(T0 - 6100)}]}
-            if lane == "review" and not self.f["no_old_review"]:
+            if lane == "fix" or (lane == "review" and not self.f["no_old_review"]):
                 self.comment(T0 - 3600)
+            self.stage_e_files()
         if lane == "acceptance":
             self.tracker["tickets"][self.ticket]["node"]["parent"] = {"identifier": "ENG-49"}
             self.history(self.ticket, OWNER, "st-backlog", "st-acc", T0 - 600)
-            _put(os.path.join(self.acc, "acceptance.json"), json.dumps(
-                {"state_dir": "~/.stage-e/acceptance", "look_record_dir": "~/.stage-e/acceptance/looks"}))
+            self.acceptance_files()
         if self.f["no_role"]:
             os.chmod(self.settings, 0)
         if self.f["settings_list"]:
             _put(self.settings, "[]\n")
         self.save()
+
+    def stage_e_files(self):
+        """Stage E's records for the pull request, written by its own writers: the review poller's seen-set, the
+        bounce driver's re-review request, ledger rows and the review's outcome record."""
+        import pipeline_bounce_local as bl
+        import pipeline_review_poller as rp
+        sd, f = os.path.join(self.se, "state"), self.f
+        key = rp.pr_key(SLUG, PR_NO)
+        if f["review_state"] == "bad-seen":
+            _put(rp.seen_path(sd), "{not json")
+        elif f["review_state"] != "unseen":
+            rp._atomic_write_json(rp.seen_path(sd), {"schema": rp.SEEN_SCHEMA, "seen": {key: {"status": "collected"}}})
+        if f["review_state"] == "due":
+            bl.write_rereview_request(sd, SLUG, PR_NO, 1, "9" * 40)
+        elif f["review_state"] == "same-head":
+            bl.write_rereview_request(sd, SLUG, PR_NO, 1, H0)
+        if self.lane != "fix":
+            return
+        if f["outcome"] != "none":
+            found = f["outcome"] in ("findings", "stale", "declined")
+            doc = {"schema": rp.FINDINGS_SCHEMA, "outcome_schema": rp.OUTCOME_SCHEMA, "repo": SLUG, "pr": PR_NO,
+                   "head_branch": self.code_run["branch"], "ticket_id": self.ticket, "review_ticket": None,
+                   "head_sha": "9" * 40 if f["outcome"] == "stale" else H0, "threshold": "high",
+                   "usable": f["outcome"] != "declined", "max_severity": "high" if found else "low",
+                   "meets_threshold": found and f["outcome"] != "declined", "summary": "", "findings": [],
+                   "reason": "", "reviewer_outcome": "success", "at": store.iso(T0 - 3000)}
+            path = rp.outcome_path(sd, SLUG, PR_NO)
+            if f["outcome"] == "bad":
+                _put(path, "{not json")
+            else:
+                rp._atomic_write_json(path, doc)
+        ledger = os.path.join(sd, "bounce-ledger.jsonl")
+        if f["spent"]:
+            os.makedirs(sd, exist_ok=True)
+            with open(ledger, "a") as fh:
+                if f["spent"] == "bad":
+                    fh.write("{not json\n")
+                else:
+                    for n in range(1, f["spent"] + 1):
+                        fh.write(json.dumps({"schema": "pipeline-bounce-ledger/1", "outcome": "spent", "bounce_no": n,
+                                             "head_sha": H0, "repo": SLUG, "pr": PR_NO, "at": store.iso(T0 - 5000)}) + "\n")
+
+    def acceptance_files(self):
+        """The acceptance job's config, its look tool's base config, the bridge's approved plan, the epic and its
+        pieces in the tracker, and Stage E's review of the last piece's pull request."""
+        import pipeline_acceptance_run as arun
+        f = self.f
+        if f["acc_cfg"] != "absent":
+            cfg = {"state_dir": "~/.stage-e/acceptance", "look_base_config": "~/.stage-e/acceptance/look-base.json",
+                   "look_config_dir": "~/.stage-e/acceptance/look-configs",
+                   "look_record_dir": "~/.stage-e/acceptance/looks", "review_state_dir": "~/.stage-e/state",
+                   "team_key": "ENG", "agent_user_id": "agent-1",
+                   "entries": {SLUG: {"workspace_dir": os.path.join(self.root, "ws")}},
+                   "required_checks": {SLUG: ["Kit checks"]},
+                   "runner_lane": {"store_dir": "~/.pipeline-runner/store", "repos": {SLUG: f["acc_road"]}}}
+            if f["acc_cfg"] == "bad":
+                cfg["team_key"] = "not a key"
+            _put(os.path.join(self.acc, "acceptance.json"), json.dumps(cfg))
+        _put(os.path.join(self.acc, "look-base.json"), json.dumps(
+            {"node": "/x"} if f["acc_look"] == "ok" else {"worktree": "/x"}))
+        if f["acc_approved"]:
+            _put(os.path.join(self.acc, "bridge-state.json"), json.dumps({
+                "schema": arun.BRIDGE_STATE_SCHEMA, "epics": {"epic-uuid-49": {"ticket": "ENG-49",
+                                                                               "approved": {"c": "f"}}}}))
+        link = {"nodes": [{"url": "https://github.com/%s/pull/%d" % (SLUG, PR_NO), "sourceType": "github",
+                           "metadata": {"status": "open"}}], "pageInfo": {"hasNextPage": False}}
+        none = {"nodes": [], "pageInfo": {"hasNextPage": False}}
+        pieces = [{"id": "k-%d" % n, "identifier": "ENG-4%d" % n, "description": "", "state": {"type": "completed"},
+                   "attachments": none} for n in (7, 8)]
+        if f["acc_pieces"] == "pending":
+            pieces.append({"id": "k-9", "identifier": "ENG-52", "description": "", "state": {"type": "started"},
+                           "attachments": none})
+        pieces.append({"id": "k-50", "identifier": self.ticket, "description": "", "state": {"type": "started"},
+                       "attachments": link})
+        self.tracker["epics"] = {"epic-uuid-49": {
+            "id": "epic-uuid-49", "identifier": "ENG-49", "description": "", "state": {"type": "started"},
+            "comments": {"nodes": []}, "children": {"nodes": pieces, "pageInfo": {"hasNextPage": False}}}}
+        _put(os.path.join(self.se, "state", "outcomes", "acme__app__pr-%d.json" % PR_NO), json.dumps({
+            "outcome_schema": "pipeline-review-outcome/1", "head_sha": H0 if f["acc_review"] == "reviewed" else H1,
+            "usable": True, "meets_threshold": False, "coverage": "full"}))
+        if f["acc_started"]:
+            import pipeline_acceptance_poller as poller
+            _put(os.path.join(self.acc, "acceptance-ledger.json"), json.dumps({
+                "schema": poller.LEDGER_SCHEMA, "rows": [{"plan": "ENG-49", "head": H0, "status": "started",
+                                                          "at": store.iso(T0 - 900), "verdict": None}]}))
+
+    def plan_record(self, rec):
+        """The plan poller's record of the run, as its own writer saves it."""
+        import pipeline_plan_poller as pp
+        path = pp.seen_path(os.path.join(self.home, ".stage-a", "state"))
+        if self.f["plan_record"] == "unreadable":
+            _put(path, "{not json")
+            return
+        nothing = self.f["plan_record"] == "no-plan"
+        result = {"class": "no-plan", "kind": "", "filed": False, "epic": None, "questions": 0} if nothing else {
+            "class": "filed", "kind": "filed", "filed": True, "epic": "ENG-61", "questions": 0}
+        pp._atomic_write_json(path, {"schema": pp.SEEN_SCHEMA, "ideas": {}, "direct": {}, "runs_by_day": {}, "triggers": {
+            "move-1": {"lane": "runner", "request": rec["request"], "idea": self.ticket, "status": "closed",
+                       "verdict": "filed-or-reported", "exit": 0, "attempts": 1, "result": result}}})
+
+    def acc_verify(self):
+        """The acceptance installer's `verify`, as its own printed rows."""
+        if self.f["acc_verify_down"]:
+            return Res(1, "boom\n")
+        rows = dict((n, ("ALREADY-DONE", "fine")) for n in ("preflight", "profile", "browser", "config", "mcp-config",
+                                                         "entry", "job"))
+        rows.update(self.f["acc_verify"] or {})
+        lines = ["Acceptance installer -- VERIFY, read-only", "", "-- steps --"]
+        lines += ["  %-10s %-17s %s" % (n, o, d) for n, (o, d) in rows.items()]
+        return Res(0, "\n".join(lines) + "\n")
 
     # -- the tracker and GitHub, as data ----------------------------------- #
     def node(self, t, state):
@@ -2368,9 +3042,9 @@ class World(object):
         with open(self.tracker_file, "w") as fh:
             json.dump(self.tracker, fh)
 
-    def comment(self, at, coverage="full"):
+    def comment(self, at, coverage="full", head=H0):
         body = "## Stage E review %s\n%s\n\nA finding." % (review_local.REVIEW_MARKER,
-                                                            review_local.coverage_line(coverage, H0))
+                                                            review_local.coverage_line(coverage, head))
         self.prs[PR_NO]["comments"].append({"author": {"login": "stage-e"}, "body": body, "createdAt": store.iso(at)})
 
     def stamp(self, folder, rid):
@@ -2404,9 +3078,19 @@ class World(object):
         if f["gh_down"]:
             return Res(1, "", "gh: could not reach GitHub")
         if path == base + "delivery.json?ref=main" and f["delivery"] != "absent":
-            text = json.dumps({"version": 1, "linear": {"teamKey": "ENG"}}) if f["delivery"] != "example" else \
+            doc = {"version": 1, "linear": {"teamKey": "ENG"},
+                   "budgets": {"maxBounces": f["max_bounces"], "reviewSeverityThreshold": "high"}}
+            if self.lane == "acceptance" and f["acc_acceptance"]:
+                doc["acceptance"] = {"url": "http://localhost:3000"}
+            text = json.dumps(doc) if f["delivery"] != "example" else \
                 open(os.path.join(KIT, "delivery.example.json")).read()
             return Res(0, json.dumps({"content": base64.b64encode(text.encode()).decode(), "encoding": "base64"}))
+        if path == "repos/%s/pulls/%d" % (SLUG, PR_NO):
+            return Res(0, json.dumps({"state": "open", "head": {"sha": H0}}))
+        if path.startswith("repos/%s/commits/%s/check-runs" % (SLUG, H0)):
+            red = f["acc_checks"] == "red"
+            return Res(0, json.dumps({"total_count": 1, "check_runs": [{
+                "name": "Kit checks", "status": "completed", "conclusion": "failure" if red else "success"}]}))
         if path == base + BRIEF + "?ref=main":
             names = session_tools.TOOL_NAMES if f["brief_tools"] else session_tools.TOOL_NAMES[:3]
             text = "# The session brief\n\nYour tools: %s.\n" % ", ".join("`%s`" % t for t in names)
@@ -2512,6 +3196,13 @@ class World(object):
                 self.on_seen = t
             if not on and self.on_seen is not None and self.off_seen is None:
                 self.off_seen = t
+        # `--then review`: the review lane is the second lane of one run, and the stand-in takes its request too.
+        review_on = bool(doc.get("enabled")) and bool(flags.get("review")) and f["then"] and self.lane == "fix"
+        if review_on and not frozen and self.review_on_seen is None:
+            self.review_on_seen = t
+        if review_on and self.review_ask is None and self.review_on_seen is not None and t >= self.review_on_seen + 30:
+            self.review_ask = self.stamp("requests", store.ask(self.store, "review", "start", "review", "app",
+                                                               self.ticket, text="facts", now=t, tier="standard"))
         if self.on_seen is not None and self.asked is None and on and t >= self.on_seen + 30:
             self.asked = self.stamp("requests", self.ask(self.ticket))
         if f["stray"] and self.off_seen is not None and self.strayed is None and t >= self.off_seen + 20:
@@ -2520,7 +3211,8 @@ class World(object):
         for rid, req, problems in store.pending(self.store):
             if problems:
                 continue
-            if not (on or (f["ignore_off"] and rid == self.strayed)):
+            lane_on = review_on if self.lane == "fix" and req["kind"] == "review" else on
+            if not (lane_on or (f["ignore_off"] and rid == self.strayed)):
                 store.settle(self.store, rid, req, False, None, "the %s lane is off for project app" % req["kind"], t)
             elif f["refuse"]:
                 store.settle(self.store, rid, req, False, None, f["refuse"], t)
@@ -2597,7 +3289,9 @@ class World(object):
                 doc = json.load(fh)
             doc.update(dispatch_id=rec["run"], branch=rec["branch"])
             _put(pin, json.dumps(doc))
-        if self.run_id is None and ticket == self.ticket and req["id"] != self.strayed:
+        if kind == "review" and self.lane == "fix":
+            self.review_run = rec["run"]
+        elif self.run_id is None and ticket == self.ticket and req["id"] != self.strayed:
             self.run_id = rec["run"]
         return rec
 
@@ -2625,8 +3319,20 @@ class World(object):
                     os.unlink(rec["pin"])
                 if self.lane == "plan":
                     store.write_output(self.store, rec["run"], False, "success", "Here is the plan.", t)
+        if self.review_run:
+            r2 = store.read_run(self.store, self.review_run)
+            began2 = epoch(r2["started_at"]) if r2 else None
+            if r2 and r2["state"] == store.RUNNING and t >= began2 + 120:
+                store.write_run(self.store, dict(r2, state="ended", reason="ended", exit=0, ended_at=store.iso(t),
+                                                 seconds=t - began2, cost_usd=1.25, turns=30, pid=None))
+            if r2 and r2["state"] == "ended" and "published2" not in self.events and t >= epoch(r2["ended_at"]) + 40:
+                self.events.add("published2")
+                self.comment(t, head=self.prs[PR_NO]["headRefOid"])
         if rec and rec["state"] == "ended":
             ended = epoch(rec["ended_at"])
+            if self.lane == "plan" and "plan-record" not in self.events and t >= ended + 90 and f["plan_record"] != "none":
+                self.events.add("plan-record")
+                self.plan_record(rec)
             if self.lane == "code" and not f["no_review"] and "review" not in self.events and t >= ended + 90:
                 self.events.add("review")
                 self.comment(t)
@@ -2690,6 +3396,10 @@ class FakeIO(IO):
                 return w.shell(tag.group(1), script)
             if "cat >" in script:
                 w.writes += 1
+                try:
+                    w.written.append(dict(json.loads(stdin)["projects"]["app"]["lanes"]))
+                except (ValueError, KeyError, TypeError):
+                    pass
             p = subprocess.run(["/bin/sh", "-c", script], input=stdin, capture_output=True, universal_newlines=True,
                                env={"HOME": w.home, "PATH": "/usr/bin:/bin"}, timeout=timeout)
             self.outs.append(p.stdout + p.stderr)              # everything the role account's commands said
@@ -2702,6 +3412,8 @@ class FakeIO(IO):
             return w.gh(argv[1:])
         if len(argv) > 1 and argv[1].endswith("pipeline_runner_setup.py"):
             return w.installer()
+        if len(argv) > 1 and argv[1].endswith("pipeline_acceptance_setup.py"):
+            return w.acc_verify()
         if len(argv) > 1 and argv[1].endswith("check_delivery_config.py"):
             return w.validator(argv)
         return Res(127, "", "not stood in for")
@@ -3126,6 +3838,174 @@ def _cases(check_, tmp):  # noqa: C901  (one battery, read top to bottom)
          ("the verdict marks not read", [(me, "agree_acceptance", lambda ctx: None)]))
     case("the acceptance lane: a verdict mark that says otherwise DISAGREEs",
          lambda: "| the verdict comment | DISAGREE |" in lane_run("acceptance", mark_word="held")[2], True)
+
+    # 7b. KIT-968: each lane's own proof says, before the lane is on, that it can start.
+    def row_states(lane, names, **flags):
+        w = world(lane, **flags)
+        _rc, io = go(w, "check")
+        got = rows(io)
+        return dict((n, got.get(n)) for n in names)
+    modes = ("due", "unseen", "reviewed", "same-head", "bad-seen")
+    case("the review lane's check is Ready only when a review can start: an unreviewed pull request, or a "
+         "re-review request with a moved head; reviewed already, a request at the same head and an unreadable "
+         "record are not",
+         lambda: dict((m, row_states("review", ("review start",), review_state=m)["review start"]) for m in modes),
+         {"due": OK, "unseen": OK, "reviewed": MISSING, "same-head": MISSING, "bad-seen": UNKNOWN},
+         ("the row always Ready", [(me, "row_review", lambda ctx: "ok")]),
+         ("a reviewed pull request taken as unreviewed", [(me, "review_possible", lambda ctx, head: (True, "x"))]),
+         ("an unreadable record taken as none", [(me, "stage_e_state", lambda ctx, head: {"review": {
+             "state": "read", "seen": False, "due": False, "problems": []}})]))
+    outs = ("findings", "none", "clean", "stale", "declined", "bad")
+    case("the fix lane's check is Ready only with a fresh usable review at the bounce threshold, and bounces left",
+         lambda: dict([(m, row_states("fix", ("fix findings",), outcome=m)["fix findings"]) for m in outs] + [
+             ("spent-all", row_states("fix", ("fix findings",), spent=3)["fix findings"]),
+             ("spent-two", row_states("fix", ("fix findings",), spent=2)["fix findings"]),
+             ("ledger-bad", row_states("fix", ("fix findings",), spent="bad")["fix findings"])]),
+         {"findings": OK, "none": MISSING, "clean": MISSING, "stale": MISSING, "declined": MISSING, "bad": UNKNOWN,
+          "spent-all": MISSING, "spent-two": OK, "ledger-bad": UNKNOWN},
+         ("the row always Ready", [(me, "row_findings", lambda ctx: "ok")]),
+         ("a stale review taken as fresh", [(bounce, "outcome_is_fresh", lambda o, h, ls: (True, ""))]),
+         ("the budget never counted", [(bounce, "parse_delivery", lambda raw: (99, "high", "", "", "ok"))]))
+
+    case("the fix lane's own review facts are not listed for the lanes that do not need them",
+         lambda: [sorted(set(rows(go(world(l), "check")[1])) & {"fix findings", "review start", "then"})
+                  for l in ("code", "plan", "review", "fix")], [[], [], ["review start"], ["fix findings"]],
+         ("every row listed for every lane", [(me, "listed_rows", lambda ctx: list(ROWS))]))
+
+    # the plan lane: the result says whether the executor read the plan, from the plan poller's own record.
+    def plan_modes():
+        out = {}
+        for m in ("filed", "none", "no-plan", "unreadable"):
+            rc, lane, text = lane_run("plan", plan_record=m)
+            out[m] = (rc, lane, "**Result: PASSED" in text, "| the executor read the plan | AGREE |" in text,
+                      "| the executor read the plan | DISAGREE |" in text, "executor did not happen" in text)
+        return out
+    case("the plan lane: PASSED only when the plan poller's record shows the executor read and filed the plan; "
+         "no record is FAILED, a no-plan answer DISAGREEs, an unreadable record is NOT CHECKED",
+         plan_modes,
+         {"filed": (EXIT_OK, False, True, True, False, False),
+          "none": (EXIT_FAILED, False, False, False, True, True),
+          "no-plan": (EXIT_FAILED, False, False, False, True, False),
+          "unreadable": (EXIT_FAILED, False, False, False, False, False)},
+         ("the executor taken as read at once", [(me, "after_plan", lambda ctx: mark(ctx, "executor", "x"))]),
+         ("any record taken as a filed plan", [(me, "plan_record", lambda ctx: {
+             "state": "read", "first": False, "found": True,
+             "record": {"lane": "runner", "exit": 0, "verdict": "filed-or-reported"},
+             "result": {"class": "filed", "filed": True, "epic": "ENG-61"}})]))
+
+    # the acceptance lane: a row for each thing its job needs.
+    acc_names = ("acc config", "acc browser", "acc look", "acc on", "acc start")
+
+    def acc_rows(**flags):
+        return dict((k, v) for k, v in row_states("acceptance", acc_names, **flags).items() if v != OK)
+    case("the acceptance lane's check names each thing its job needs, and is Ready with all of them",
+         lambda: {"ready": acc_rows(),
+                  "config": acc_rows(acc_cfg="bad")["acc config"],
+                  "browser": acc_rows(acc_verify={"browser": ("WOULD-CHANGE", "would install")}),
+                  "profile unknown": acc_rows(acc_verify={"profile": ("UNKNOWN", "not measured")}),
+                  "look": acc_rows(acc_look="bad")["acc look"],
+                  "mcp": acc_rows(acc_verify={"mcp-config": ("BLOCKED-ON-HUMAN", "x")})["acc look"],
+                  "verify down": acc_rows(acc_verify_down=True)},
+         {"ready": {}, "config": MISSING, "browser": {"acc browser": MISSING},
+          "profile unknown": {"acc browser": UNKNOWN}, "look": MISSING, "mcp": MISSING,
+          "verify down": {"acc config": UNKNOWN, "acc browser": UNKNOWN, "acc look": UNKNOWN}},
+         ("the installer's rows not read", [(me, "acc_steps", lambda ctx, names: None)]),
+         ("the job's own loader not asked", [(me, "row_acc_config", lambda ctx: (acc_steps(ctx, ("config",)), "ok")[1])]),
+         ("the look tool's base config not read", [(me, "row_acc_look", lambda ctx: (acc_steps(ctx, ("mcp-config",)),
+                                                                                    "ok")[1])]))
+    case("the acceptance lane: acceptance off for the repository, or its checks sent to another project, is MISSING",
+         lambda: {"off": acc_rows(acc_acceptance=False).get("acc on"), "road": acc_rows(acc_road="other").get("acc on")},
+         {"off": MISSING, "road": MISSING},
+         ("the row always Ready", [(me, "row_acc_on", lambda ctx: "ok")]))
+    case("the acceptance lane: the job's own start rule, for the named piece's plan, holds each reason back",
+         lambda: {"pieces": acc_rows(acc_pieces="pending").get("acc start"),
+                  "red": acc_rows(acc_checks="red").get("acc start"),
+                  "unreviewed": acc_rows(acc_review="pending").get("acc start"),
+                  "again": acc_rows(acc_started=True).get("acc start"),
+                  "unapproved": acc_rows(acc_approved=False).get("acc start"),
+                  "off": acc_rows(acc_acceptance=False).get("acc start")},
+         {"pieces": MISSING, "red": MISSING, "unreviewed": MISSING, "again": MISSING, "unapproved": MISSING,
+          "off": MISSING},
+         ("the row always Ready", [(me, "row_acc_start", lambda ctx: "ok")]),
+         ("a checked head started again", [(me, "row_acc_start", lambda ctx, real=row_acc_start: (
+             ctx.before.get("acc") or acceptance_read(ctx)).get("start", {}).update(already=False) or real(ctx))]))
+    case("the acceptance rows never leave a key or a title in the output",
+         lambda: [t in "\n".join(go(world("acceptance"), "check")[1].said) for t in ("not-a-key", "add the thing")],
+         [False, False])
+
+    # --then review: one run, two lanes in sequence, never together.
+    def lanes_on(doc):
+        return tuple(k for k in ("fix", "review") if doc.get(k))
+
+    def lanes_now(w):
+        with open(w.settings) as fh:
+            return lanes_on(json.load(fh)["projects"]["app"]["lanes"])
+
+    def then_run(**flags):
+        w = world("fix", then=True, **flags)
+        rc, io = go(w, extra=("--then", "review"))
+        return w, rc, "\n".join(io.said)
+
+    def then_happy():
+        w, rc, text = then_run()
+        return (rc, [lanes_on(d) for d in w.written], lanes_now(w), text.count("**Result: PASSED"),
+                "### Live run: the fix lane" in text and "### Live run: the review lane" in text)
+
+    def hand_off_review_first(ctx, kid):
+        view = pr_view(ctx, ctx.pr["number"]) or {}
+        kid.pr, kid.before["head"] = dict(ctx.pr, headRefOid=view.get("headRefOid")), view.get("headRefOid")
+        kid.on_at = ctx.off_at = ctx.io.now()
+        set_lane(kid, True)
+        set_lane(ctx, False)
+        ctx.off_seen = confirm(ctx, False)
+        kid.settings = ctx.settings
+        kid.on_seen = confirm(kid, True)
+        return True
+
+    def hand_off_with_a_gap(ctx, kid):
+        view = pr_view(ctx, ctx.pr["number"]) or {}
+        kid.pr, kid.before["head"] = dict(ctx.pr, headRefOid=view.get("headRefOid")), view.get("headRefOid")
+        kid.on_at = ctx.off_at = ctx.io.now()
+        set_lane(ctx, False)
+        ctx.off_seen = confirm(ctx, False)
+        set_lane(kid, True)
+        kid.on_seen = confirm(kid, True)
+        return True
+    case("--then review: the fix lane goes off as the review lane goes on, in one write: never both on, no gap, "
+         "every lane off at the end, a result block for each",
+         then_happy, (EXIT_OK, [("fix",), ("review",), ()], (), 2, True),
+         ("the review lane switched on first", [(me, "hand_off", hand_off_review_first)]),
+         ("a gap between the two switches", [(me, "hand_off", hand_off_with_a_gap)]),
+         ("no hand-over at all", [(me, "hand_off", lambda ctx, kid: False)]))
+    case("--then review: a fix run that pushed nothing fails, the review lane is never switched on, every lane off",
+         lambda: (lambda r: (r[1], [lanes_on(d) for d in r[0].written], lanes_now(r[0]),
+                             "nothing was pushed" in r[2]))(then_run(no_push=True)),
+         (EXIT_FAILED, [("fix",), ()], (), True),
+         ("the hand-over made after a failed chain", [(me, "watch", lambda ctx: None)]))
+    case("--then review: Ctrl-C while the fix lane's quiet watch runs: the review lane is switched off, nothing left on",
+         lambda: (lambda r: (r[1], lanes_now(r[0]), "stopped" in r[2]))(then_run(interrupt_at=190)),
+         (EXIT_FAILED, (), True),
+         ("the review lane left on", [(me, "switch_off", lambda ctx, real=switch_off: True if ctx.kind == "review"
+                                       else real(ctx))]))
+    case("--then review: Ctrl-C while the review lane waits: it is switched off, said",
+         lambda: (lambda r: (r[1], lanes_now(r[0]), "stopped by you" in r[2]))(then_run(interrupt_at=350)),
+         (EXIT_FAILED, (), True),
+         ("the review lane left on", [(me, "switch_off", lambda ctx, real=switch_off: True if ctx.kind == "review"
+                                       else real(ctx))]))
+    case("--then review: a re-review that no push left for the review lane stops the hand-over before anything is written",
+         lambda: (lambda r: (r[1], [lanes_on(d) for d in r[0].written], "left no review for the review lane" in r[2]))(
+             then_run(review_state="reviewed")),
+         (EXIT_FAILED, [("fix",), ()], True),
+         ("an unreviewable head handed over", [(me, "review_possible", lambda ctx, head: (True, "x"))]))
+    def then_row(**flags):
+        return rows(go(world("fix", **flags), "check", extra=("--then", "review"))[1]).get("then")
+    case("--then review: check adds a row that says the review lane is off and the hand-over's settings load",
+         lambda: (then_row(), then_row(lanes={"review": True})), (OK, MISSING),
+         ("the row always Ready", [(me, "row_then", lambda ctx: "ok")]))
+    case("--then goes with the fix lane only", lambda: [
+        main(["check", "--lane", "code", "--project", "app", "--ticket", "ENG-1", "--then", "review"], FakeIO(world())),
+        main(["off", "--lane", "fix", "--project", "app", "--then", "review"], FakeIO(world()))],
+         [EXIT_USAGE, EXIT_USAGE])
 
     # 8. off: one command that only switches the lane off, and confirms it.
     def off():

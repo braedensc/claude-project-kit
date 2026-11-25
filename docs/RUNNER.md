@@ -868,7 +868,8 @@ review, the idea to plan, or the piece to check.
    at a commit with main's session kinds; `delivery.json` on main passing the kit's validator; the
    project's `docs/SESSION-BRIEF.md` naming the ticket tools; now inside the working window; the lane
    off; the settings with it on taken by the runner's own loader; no other approved ticket waiting; and
-   the ticket ready.
+   the ticket ready. A lane's own proof adds rows that say, before you wait, that the proof can start
+   (below). Each reads from its owner's own reader, and an unreadable one is UNKNOWN.
 2. **Show and ask.** It says what it will switch, then waits for you to type `yes`.
 3. **Switch on.** It sets `lanes.<lane>` for that one project, as the role account, and waits until the
    runner says so in its store.
@@ -880,6 +881,41 @@ review, the idea to plan, or the piece to check.
    the lane's proof asks. The approval's time is checked against the ticket's state history itself, so
    an approval dated by an earlier change in the same history entry disagrees (KIT-934). Then one result
    block to post on the proof's ticket, with what did not work.
+
+### What each lane's own rows check
+
+A proof that cannot start used to read Ready, and you waited out the whole time limit. These rows
+close that. Each is MISSING with what to do, UNKNOWN when it cannot be read, and is only listed for
+its own lane.
+
+| Lane | Row | It says Ready only when |
+| --- | --- | --- |
+| review | `review start` | The review poller would take the pull request on its next pass: Stage E has no record of it, or a re-review request waits and the head has moved off the head it was written at. Read by the poller's own `load_seen` and `due_rereviews`. |
+| fix | `fix findings` | Stage E's review of the pull request's current head has a finding at or above the bounce threshold, is not a decline, and bounces are left. Read by the bounce driver's own ledger, outcome record, freshness rule and `delivery.json` reader. |
+| plan | (after the run) | The plan poller's own record of the run's request shows the executor ran over the plan the run left, and filed it. The lane stays watched for 20 minutes after the switch off, since the poller collects on its own pass. A plan the executor never read is FAILED, not PASSED. The tree is still compared by hand. |
+| acceptance | `acc config`, `acc browser`, `acc look` | The acceptance installer's own `verify` rows `config`, `browser`, `profile` and `mcp-config` are ALREADY-DONE, and the job's own loader takes its config and the look tool's base config. |
+| acceptance | `acc on` | `delivery.json` has an `acceptance` block, and the job's config has an entry for the repository on this project's runner lane. |
+| acceptance | `acc start` | The job's own start rule (`decide_plan`, run over facts the job's own `gather_facts` reads) says start for the piece's plan: approved by you in the bridge, every other piece Done, this piece's pull request open, its required checks green, Stage E's review at that head with nothing at the threshold, and not checked at that head already. |
+
+The acceptance rows run the installer's `verify` (read only, it uses your sudo session), and read the
+tracker with the runner's own key inside the role account. Point `--acceptance-conf` at its conf if it is
+not `acceptance.conf` here. `--plan-state` names the plan poller's state folder (`~/.stage-a/state`).
+
+### A fix proof that hands to a review proof
+
+```bash
+python3 scripts/pipeline_runner_live.py check --lane fix --then review --project <key> --ticket <ID>
+python3 scripts/pipeline_runner_live.py run   --lane fix --then review --project <key> --ticket <ID>
+```
+
+A fix push makes a re-review request, and the old review job could take the new head in the gap before
+you type `run --lane review`. With `--then review` it is one run. When the fix chain is done, the fix
+lane goes off and the review lane goes on in ONE write of the settings. There is never a moment with
+both on, and no gap for the old job. It checks first that a review can start for the new head, and
+the runner says it dropped the fix lane before the review lane's chain is watched. Each lane prints
+its own result block. Every lane is off at the end, after a failure, and after Ctrl-C. `check` adds a
+`then` row: the review lane is off, and the runner's own loader takes the settings with the hand-over.
+`off --lane review` switches the second lane off if the tool is ever cut off.
 
 No key reaches the script, its output or a command line. Each key file is looked at with `stat`. The
 dry run hands the push token to git as a session's git gets it, and the writer key is asked who it is by
