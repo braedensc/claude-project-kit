@@ -183,7 +183,7 @@ CHAT_CAP_TRIPS_FILE=
 
 # The runner's incidents (KIT-957): a COPY of incidents.json from the runner's store, made by the watcher's copier
 # (watcher.conf's RUNNER_INCIDENTS). You do not write this line: the one command sets it to the copy. The
-# `runner-incidents` kind raises each new incident once, in the runner's own plain words, to Slack only. A copy that
+# incidents kind of this watch raises each new incident once, in the runner's own plain words, to Slack only. A copy that
 # could not be made or read is said after two passes, never read as no incidents. Empty: not watched.
 RUNNER_INCIDENTS_FILE=
 
