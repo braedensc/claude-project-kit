@@ -480,6 +480,13 @@ def new_request_id():
     return "rq-" + uuid.uuid4().hex
 
 
+class RefusedBeforeWrite(ValueError):
+    """`ask` refused the request before it wrote anything (KIT-962): its shape, or the store's walls.
+    The request is known not to exist, so a caller may record it as dropped. A plain ValueError
+    from `ask` (an id asked already) or a StoreError from the write itself is not this: the
+    request may exist."""
+
+
 def ask(store, caller, action, kind, project, ticket, run=None, text=None, now=None,
         request_id=None, tier=None):
     """Write one request, and return its id. ValueError, in words, when it is not one this caller
@@ -495,11 +502,11 @@ def ask(store, caller, action, kind, project, ticket, run=None, text=None, now=N
         doc["tier"] = tier
     bad = request_problems(doc)
     if bad:
-        raise ValueError(bad[0])
+        raise RefusedBeforeWrite(bad[0])
     folder = os.path.join(store, "requests")
     bad = walls(store) or walls(folder)
     if bad:
-        raise ValueError(bad[0])
+        raise RefusedBeforeWrite(bad[0])
     if any(os.path.lexists(os.path.join(store, f, rid + ".json")) for f in ("requests", "taken")):
         raise ValueError("a request with this id was asked already")
     write_json(os.path.join(folder, rid + ".json"), doc, ensure_ascii=False)
@@ -1005,6 +1012,26 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
              "the store is inside a git working tree, where a session can write")):
         expect("ask refuses %s" % name, refused(fn), want)
     expect("no refused ask wrote a request", len(pending(store)), 1)
+
+    # KIT-962: which refusals are known to have written nothing.
+    def kind_of(fn):
+        try:
+            fn()
+        except RefusedBeforeWrite:
+            return "before-write"
+        except ValueError:
+            return "plain"
+        return "none"
+    expect("a shape refusal and a wall refusal are refused before writing",
+           (kind_of(lambda: ask(store, "queue", "stop", "code", "app", "ENG-1")),
+            kind_of(lambda: ask(os.path.join(git_tree, "s"), "queue", "start", "code", "app",
+                                "ENG-1"))), ("before-write", "before-write"))
+    _seen = new_request_id()
+    ask(store, "acceptance", "start", "acceptance", "app", "ENG-2", text="facts", request_id=_seen)
+    expect("an id asked already is NOT refused before writing: that request exists",
+           kind_of(lambda: ask(store, "acceptance", "start", "acceptance", "app", "ENG-2",
+                               request_id=_seen)), "plain")
+    withdraw(store, _seen)
 
     # KIT-708: a request its caller names first, and one it takes back while it waits.
     named = new_request_id()
