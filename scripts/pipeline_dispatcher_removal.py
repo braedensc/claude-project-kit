@@ -1521,13 +1521,13 @@ class _World(object):
     runner's installer are data. The pipeline account's programs run for real, with its home in the folder."""
 
     def __init__(self, root):
-        self.root, self.home, self.disp, self.kit = root, root + "/home", root + "/opt/disp", root + "/kit"
+        self.root, self.home, self.disp, self.kit = root, root + "/acct", root + "/opt/disp", root + "/kit"
         self.clock, self.uid, self.answer, self.no_sudo, self.no_role = 1795000000.0, 501, "yes", False, False
         self.env = {"PATH": "/usr/bin:/bin", ps.DIR_ENV: root + "/settings"}
         self.jobs = dict((k, "running") for k in (DISP, BACKUP_JOB, FRONT, TUNNEL, CANARY, RUNNER_JOB))
         self.jobs[PF_LABEL] = "not running"
         self.stuck, self.disabled, self.log = set(), set(), []
-        self.cwds = ["/", root + "/home/.pipeline-runner/work/x"]
+        self.cwds = ["/", self.home + "/.pipeline-runner/work/x"]
         self.pf = ["block return in quick on ! lo0 inet proto tcp from any to any port = 3456",
                    "block return in quick on ! lo0 inet6 proto tcp from any to any port = 3456"]
         self.package, self.npm_keeps, self.port_open, self.renewal = True, False, False, "renewed"
@@ -1813,7 +1813,7 @@ def _cases(expect, tmp):  # noqa: C901  (one battery, read top to bottom)
 
     everything = sorted([BACKUP_JOB, CANARY, DISP, FRONT, PF_LABEL, TUNNEL]) + sorted([
         "/etc/claude-pipeline/dispatched-lane/" + ACCT, "/etc/tunnel/token",
-        "/home/.claude/pipeline/pins/dispatched-lane/" + ACCT, "/home/.stage-e/backups/config.json.20261101T000000Z",
+        "/acct/.claude/pipeline/pins/dispatched-lane/" + ACCT, "/acct/.stage-e/backups/config.json.20261101T000000Z",
         "/log/pf.log", "/opt/disp/" + ENV_NAME, "/opt/disp/Caddyfile", "/opt/disp/config.json",
         "/opt/disp/" + pu.TOKEN_STORE, "/opt/disp/state/state.json.bak-20261101T000000Z", "/pf/pf.rules"]) + [
         "pf rules", "package"]
