@@ -210,7 +210,10 @@ A RERUN CARRIES ON (KIT-930)
   result carries its time, the kit's commit, and a sha256 of each settings file: each one the
   parts list names, and every other `.conf` file beside them.
   A result is reused only when it is under 30 minutes old (REUSE_SECONDS), was measured on the
-  same commit, and every settings file still has the same bytes. A result that waited on you is
+  same commit, and every settings file still has the same bytes. Those three are all it compares.
+  Anything else a step looks at, such as a loaded job, a clone or an app's installations on the
+  code host, is not compared, so a change to one of them within those 30 minutes shows only when
+  that result is next measured. `--fresh` measures everything now. A result that waited on you is
   never kept, so the part is measured again, and its own installer checks the sign-off it waited
   on against the settings it was made under. A reused result keeps its first time when it is kept
   again, so it can never outlive its age.
