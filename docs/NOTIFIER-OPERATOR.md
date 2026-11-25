@@ -284,7 +284,9 @@ in an hour. The session that asked is the run named on line 2 of its own questio
 run twice still gets the answer in the right session; a question whose record names no run, a run no longer
 in the store and a run resumed since are said and paged, and the page says what to do instead: put the answer
 in the ticket and start the work again. A request the runner's store refused before writing anything is
-dropped in its words; one that may have been written stays pending, named unconfirmed. A store it cannot read stops the pass with a failure and is tried again.
+dropped in its words; one that may have been written stays pending, named unconfirmed. Once, at the
+upgrade: a question recorded before this change has no run on line 2, so an open runner-lane question
+is said and paged as naming no run; answer those in the ticket. A store it cannot read stops the pass with a failure and is tried again.
 
 Good: `RELAYED ... as a resume of runner run run-...`, and a later pass that says nothing.
 Not that: `DROPPED ... the run that asked (run-...) is no longer in the runner's store`. The runner has no
