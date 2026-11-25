@@ -1633,10 +1633,10 @@ def run_cases(check):
     CAPCOPY, INCCOPY = INST + "/copy/chat-cap-trips.json", INST + "/copy/runner-incidents.json"
     put_update()
     put_watcher(CHAT_CAP_TRIPS="/srv/b/chat-cap-trips.json", RUNNER_INCIDENTS="/srv/r/incidents.json")
+    before957 = get(update_conf)
     got957 = level_settings(update_conf, watcher_conf)
     check("kit957-the-two-records-the-watcher-names-get-the-line-for-their-copy",
           shown(got957), [("CHAT_CAP_TRIPS_FILE", "", CAPCOPY), ("RUNNER_INCIDENTS_FILE", "", INCCOPY)])
-    before957 = get(update_conf)
     check("kit957-a-read-changes-nothing", get(update_conf), before957)
     check("kit957-the-write-reads-back-through-the-health-checks-own-loader",
           (write_settings(pi.FakeIo(), update_conf, got957),

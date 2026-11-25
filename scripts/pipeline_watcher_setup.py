@@ -784,8 +784,12 @@ def step_first_pass(ctx, apply_it):
         bad = [r.get("reason") for r in rows if not isinstance(r, dict) or r.get("state") not in ("copied", "absent")]
         usage_only = not any(c[k] for k in BEATS)
         why = "; ".join(str(b) for b in bad) or "no copy was reported"
+        waiting = [os.path.basename(str(r.get("dest"))) for r in rows if isinstance(r, dict) and r.get("state") == "absent"]
+        made = len(rows) - len(waiting)
         if rows and not bad:
-            says = "made the usage copy" if usage_only else "made its %d copies" % len(rows)
+            says = "made the usage copy" if usage_only else "made its %d cop%s" % (made, "y" if made == 1 else "ies")
+            if waiting:
+                says += " (%s not written yet by its writer, so no copy of it)" % ", ".join(waiting)
         elif usage_only:
             says = "REFUSED the usage file (%s): spend and runs stay blind until that is fixed" % why
         else:
@@ -1682,6 +1686,8 @@ def selftest():
                [r_["state"] for r_ in json.loads(hn.read(inst + "/copy/copier-status.json"))["copies"]
                 if r_["dest"].endswith(("chat-cap-trips.json", "runner-incidents.json"))]),
               (EX_OK, EX_OK, False, [False, False], ["absent", "absent"]))
+        check("...and the first pass counts only the copies it made, and names the two not written yet",
+              ("made its 4 copies" in outn, "chat-cap-trips.json, runner-incidents.json not written yet" in outn), (True, True))
         hs = machine()
         put_beats()
         hs.source_uid = os.getuid() + 1
