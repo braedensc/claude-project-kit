@@ -8637,8 +8637,10 @@ def _runner_relay_selftest(ok, tmp, good):
                       [record(RUN_A), record(RUN_B, ticket="KIT-99")],
                       "no longer in the runner's store", asked=RUN_B)
     ok("KIT-962 instead: a final drop on a runner lane tells the owner what to do instead",
-       RUNNER_INSTEAD in runner_asking_run(make_store("instead", runs=[]), "app", "KIT-20",
-                                            RUN_A)[1])
+       "put it in the ticket and start the work again" in runner_asking_run(
+           make_store("instead", runs=[]), "app", "KIT-20", RUN_A)[1]
+       and "put it in the ticket and start the work again" in runner_asking_run(
+           make_store("instead2", runs=[record(RUN_A)]), "app", "KIT-20", None)[1])
     for who, other in ((RUN_A, RUN_B), (RUN_B, RUN_A)):
         store_t = make_store("two-chains-" + who[4], runs=[
             record(RUN_A), record(RUN_B, at="2026-11-17T11:00:00Z")])
