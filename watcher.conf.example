@@ -53,6 +53,13 @@ SWEEP_HEARTBEAT=
 # renewed, is near its end, or the runner went quiet.  Empty = not watched.
 WRITER_KEY_STATUS=
 
+# Optional (KIT-957): the bridge's chat-cap-trips.json (in its state folder; written only at the first trip) and the
+# runner's incidents.json (in its store; written at the first incident), as the SOURCES.  The same copier copies each; a
+# source that is not there yet is "absent", told apart from a copy it refused.  The one command points the health
+# check's CHAT_CAP_TRIPS_FILE and RUNNER_INCIDENTS_FILE at the copies.  Empty = not watched.
+CHAT_CAP_TRIPS=
+RUNNER_INCIDENTS=
+
 # Optional: the validator's ledger (docs/WATCHER.md, approval-rate).  With it, every merge into a watched
 # repository is checked against the validator's approvals.  This account must be able to read the file.
 # OWNER_LOGINS: your own GitHub logins, comma-separated: your own merges need no approval.  Leave yours out,

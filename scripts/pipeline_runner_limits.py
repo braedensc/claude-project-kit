@@ -485,6 +485,29 @@ def _read_incidents(path):
     return doc
 
 
+def read_record(path):
+    """(record, None) from an incident record at `path` (the file itself or a copy of it), else (None, a short plain
+    reason). The reason is "absent" for a file that does not exist: the runner writes it at its first incident, so
+    absent can mean none yet. Every other reason is a record that could not be read, in a shape this reader does not
+    know, or holding an entry in no known shape. The health watch's reader (KIT-957); _read_incidents above is the
+    writer's own and replaces a broken file."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except FileNotFoundError:
+        return None, "absent"
+    except (OSError, ValueError) as exc:
+        return None, "cannot be read (%s)" % type(exc).__name__
+    if (not isinstance(doc, dict) or doc.get("schema") != INCIDENTS_SCHEMA
+            or not isinstance(doc.get("open"), dict) or not isinstance(doc.get("told"), list)):
+        return None, "is not in the shape %s" % INCIDENTS_SCHEMA
+    for t in doc["told"]:
+        if (not isinstance(t, dict) or not isinstance(t.get("at"), str) or not isinstance(t.get("key"), str)
+                or not isinstance(t.get("words"), str)):
+            return None, "has an incident in no known shape"
+    return doc, None
+
+
 def _write_incidents(path, doc):
     tmp = "%s.%d.tmp" % (path, os.getpid())
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)

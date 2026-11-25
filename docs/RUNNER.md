@@ -164,8 +164,11 @@ project's budget for the ticket's effort (KIT-645). A pin the runner cannot read
 Good: a session's tree passes 8 GB. It is stopped, its record says `limit:memory`, and one line is told.
 Not: the same session is told about again on every pass.
 
-The health watch does not page from the incidents file yet. It learns the runner when the first lane
-moves.
+The health watch's `runner-incidents` kind reads a copy of that file, made by the watcher's copier
+(`RUNNER_INCIDENTS` in watcher.conf; the one command sets `RUNNER_INCIDENTS_FILE`). It reaches Slack once
+for each new incident, in the words above. The first pass raises only the incidents still open. A copy that
+could not be made is said, and is never read as no incidents; the runner writes the file at its first
+incident, and the copier tells "not written yet" apart from "could not copy".
 
 ## Each kind of session
 

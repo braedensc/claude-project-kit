@@ -20,6 +20,9 @@ WHAT IT DOES.  Reads its rules (a file of root's, in the install folder). For ea
     copy is replaced whole, never edited in place.
 It then writes a status file beside the copies: for each copy, copied or refused, why, size, the file's SHA-256.
 The watcher checks the status is fresh and that the copy it reads has that hash.
+A copy may be marked `absent_ok` (KIT-957), for a record its writer creates only at a first event. A source that is
+not there is then `absent` in the status, not `refused`, and the old copy is removed; a link, a stranger's file or an
+oversize file is refused as before. Readers treat a missing copy as none only where the status says `absent`.
 
 WHAT IT NEVER DOES.  Take a path from anywhere but its rules (there is no argument, no environment variable and no
 stdin that names a source). Follow a link in the source's last name. Read a source it was not told. Run a shell,
@@ -58,7 +61,8 @@ PATH_RE = re.compile(r"^/[A-Za-z0-9_./-]{1,%d}\Z" % PATH_LIMIT)
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,60}\Z")
 ACCOUNT_RE = re.compile(r"^_?[a-z][a-z0-9_-]{1,30}\Z")
 RULE_KEYS = {"schema", "status_file", "copies"}
-COPY_KEYS = {"source", "owner", "dest", "max_bytes"}
+COPY_KEYS = {"source", "owner", "dest", "max_bytes", "absent_ok"}
+ABSENT_REASON = "the source is missing"      # read_source's words for a source that is not there (KIT-957)
 EXAMPLE = {"schema": RULES_SCHEMA, "status_file": "/usr/local/claw-watcher/copy/copier-status.json",
            "copies": [{"source": "/srv/pipeline/usage/usage.json", "owner": "_workers-account",
                        "dest": "/usr/local/claw-watcher/copy/usage.json", "max_bytes": DEFAULT_MAX_BYTES}]}
@@ -128,7 +132,7 @@ def validate_rules(raw):
     for n, c in enumerate(copies, 1):
         where = "copy %d" % n
         if not isinstance(c, dict) or set(c) - COPY_KEYS or not {"source", "owner", "dest"} <= set(c):
-            errors.append("%s must hold exactly source, owner, dest and optionally max_bytes" % where)
+            errors.append("%s must hold exactly source, owner, dest and optionally max_bytes and absent_ok" % where)
             continue
         ok = True
         if not _clean_path(c["source"]):
@@ -154,9 +158,14 @@ def validate_rules(raw):
         if isinstance(cap, bool) or not isinstance(cap, int) or not 1 <= cap <= HARD_MAX_BYTES:
             errors.append("%s: max_bytes must be a whole number from 1 to %d" % (where, HARD_MAX_BYTES))
             ok = False
+        absent_ok = c.get("absent_ok", False)
+        if not isinstance(absent_ok, bool):
+            errors.append("%s: absent_ok must be true or false" % where)
+            ok = False
         if ok:
             dests.add(dest)
-            out.append({"source": c["source"], "owner": c["owner"], "dest": dest, "max_bytes": cap})
+            out.append({"source": c["source"], "owner": c["owner"], "dest": dest, "max_bytes": cap,
+                        "absent_ok": absent_ok})
     if errors:
         return None, errors
     return {"status_file": status, "copy_dir": copy_dir, "copies": out}, []
@@ -194,7 +203,7 @@ def read_source(source, owner, max_bytes):
         try:
             fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dfd)
         except FileNotFoundError:
-            return None, "the source is missing"
+            return None, ABSENT_REASON
         except OSError as exc:
             if exc.errno == errno.ELOOP:
                 return None, "the source is a link"
@@ -302,17 +311,23 @@ def run_rules(rules_path, out=None):
                 row.update(bytes=len(data), sha256=hashlib.sha256(data).hexdigest(), copied_at=_iso())
             except OSError as exc:
                 why = "the copy could not be written (%s)" % (exc.strerror or "error")
-        if why is not None:
+        if why == ABSENT_REASON and c["absent_ok"]:
+            # KIT-957: a record its writer creates only at a first event is not there yet. That is a finding of its
+            # own, never a refusal and never a copy: the old copy goes, and a reader is told "absent", not "none".
+            row.update(state="absent", reason="the source does not exist yet: its writer has not written it"
+                       + ("" if remove_old(c["dest"]) else "; the old copy could not be removed"))
+        elif why is not None:
             row.update(state="refused", reason=why + ("" if remove_old(c["dest"]) else "; the old copy could not be removed"))
         rows.append(row)
-    refused = [r for r in rows if r["state"] != "copied"]
+    refused = [r for r in rows if r["state"] == "refused"]
+    absent = [r for r in rows if r["state"] == "absent"]
     doc = {"schema": STATUS_SCHEMA, "written_at": _iso(), "result": "refused" if refused else "copied", "copies": rows}
     try:
         write_whole(rules["status_file"], (json.dumps(doc, indent=2, sort_keys=True) + "\n").encode("utf-8"))
     except OSError as exc:
         out.write("copier: the status file could not be written (%s)\n" % (exc.strerror or "error"))
         return EX_STATUS
-    out.write("copier: %d of %d copied%s\n" % (len(rows) - len(refused), len(rows), "".join(
+    out.write("copier: %d of %d copied%s\n" % (len(rows) - len(refused) - len(absent), len(rows), "".join(
         "; REFUSED %s: %s" % (os.path.basename(r["dest"]), r["reason"]) for r in refused)))
     return EX_REFUSED if refused else EX_OK
 
@@ -457,6 +472,33 @@ def selftest():
         put_src(b"x" * 64)
         rc, _t, doc = go()
         check("a file exactly at the cap is copied", (rc, doc["copies"][0]["bytes"]), (EX_OK, 64))
+        put_src()
+
+        # KIT-957: a record its writer creates only at a first event may be named absent_ok. Not there yet is then its
+        # own state ("absent": exit 0, the old copy gone), told apart from a refusal; every other fault still refuses.
+        opt = dict(good, copies=[dict(good["copies"][0], absent_ok=True)])
+        put_rules(opt)
+        go()
+        os.unlink(src)
+        rc, text, doc = go()
+        check("an optional source that is not there yet is absent, not refused: exit 0, and its old copy is gone",
+              (rc, doc["result"], doc["copies"][0]["state"], os.path.exists(dest), "REFUSED" in text),
+              (EX_OK, "copied", "absent", False, False))
+        os.symlink(secret, src)
+        rc, text, doc = go()
+        check("an optional source that is a link is still refused",
+              (rc, doc["copies"][0]["state"], "is a link" in doc["copies"][0]["reason"]), (EX_REFUSED, "refused", True))
+        os.unlink(src)
+        put_src(b"x" * 65)
+        rc, _t, doc = go()
+        check("an optional source over its cap is still refused", (rc, doc["copies"][0]["state"]), (EX_REFUSED, "refused"))
+        put_src()
+        rc, _t, doc = go()
+        check("an optional source that has appeared is copied", (rc, doc["copies"][0]["state"]), (EX_OK, "copied"))
+        put_rules(dict(good, copies=[dict(good["copies"][0], absent_ok="yes")]))
+        rc, text, _d = go()
+        check("absent_ok must be true or false", (rc, "absent_ok must be true or false" in text), (EX_RULES, True))
+        put_rules(good)
         put_src()
 
         # nothing outside its rules is ever read

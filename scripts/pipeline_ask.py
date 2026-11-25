@@ -22,7 +22,8 @@ WHAT IT ASKS, AND WHEN
   line of update.conf at the copier's copy of it, and lists that line on the consent page like the rest.
   A job watcher.conf leaves out is written as off, and only if the line holds its own copy path. The
   runner's word on the session writer's key (KIT-933: WRITER_KEY_STATUS, WRITER_KEY_STATUS_FILE) is set
-  the same way.
+  the same way, and so are the chat cap's trips and the runner's incidents (KIT-957: CHAT_CAP_TRIPS,
+  RUNNER_INCIDENTS; CHAT_CAP_TRIPS_FILE, RUNNER_INCIDENTS_FILE).
   A settings file that is not there asks nothing and is said in one plain line, before the first
   question: `Not asked: no bridge.conf in the kit folder, so the tech lead's name was not asked.`
   (and the same for update.conf and the key end dates). It says where it looked. A file that is
@@ -1626,6 +1627,27 @@ def run_cases(check):
     check("kit782-no-watcher-conf-gives-no-change", level_settings(update_conf, watcher_conf), [])
     put_watcher(**dict(ON, KIT_COMMIT="not-a-commit"))
     check("kit782-a-watcher-conf-with-a-problem-gives-no-change", level_settings(update_conf, watcher_conf), [])
+    # KIT-957: the chat cap's trips and the runner's incidents are two more entries of the same map: the line for
+    # each copy, shown first, written after the yes, nothing on a rerun, and a path a person typed kept while the
+    # watcher does not name the record.
+    CAPCOPY, INCCOPY = INST + "/copy/chat-cap-trips.json", INST + "/copy/runner-incidents.json"
+    put_update()
+    put_watcher(CHAT_CAP_TRIPS="/srv/b/chat-cap-trips.json", RUNNER_INCIDENTS="/srv/r/incidents.json")
+    got957 = level_settings(update_conf, watcher_conf)
+    check("kit957-the-two-records-the-watcher-names-get-the-line-for-their-copy",
+          shown(got957), [("CHAT_CAP_TRIPS_FILE", "", CAPCOPY), ("RUNNER_INCIDENTS_FILE", "", INCCOPY)])
+    before957 = get(update_conf)
+    check("kit957-a-read-changes-nothing", get(update_conf), before957)
+    check("kit957-the-write-reads-back-through-the-health-checks-own-loader",
+          (write_settings(pi.FakeIo(), update_conf, got957),
+           [pu.load_conf(update_conf).get(k) for k in ("CHAT_CAP_TRIPS_FILE", "RUNNER_INCIDENTS_FILE")]),
+          (None, [CAPCOPY, INCCOPY]))
+    check("kit957-a-rerun-changes-nothing", level_settings(update_conf, watcher_conf), [])
+    put_update()
+    put(update_conf, UPDATE_HEAD + "CHAT_CAP_TRIPS_FILE=/home/me/their-own.json\n# end of file\n")
+    put_watcher()
+    check("kit957-a-path-a-person-typed-is-kept-while-the-watcher-does-not-name-the-record",
+          level_settings(update_conf, watcher_conf), [])
     put_watcher(**ON)
     reset(expiries=FAR, body="APP_NAME=Rex\n")
     reset_state = get(update_conf)
