@@ -780,6 +780,12 @@ def gate_sessions(io, n, sv, entries):
         return sv.gate("sessions", OK if sv.facts["dispatcher"] is False else UNKNOWN,
                        "the old dispatcher's job is gone" if sv.facts["dispatcher"] is False else
                        "the old dispatcher's work folders are not known, so its sessions cannot be looked for")
+    blind = [e["id"] or e["repositoryPath"] or "?" for e in entries["entries"] if e["active"] and not
+             e["workspaceBaseDir"]]
+    if blind:                 # it works in a folder of its own choosing: none of its sessions can be looked for
+        sv.facts["workspaces"] = sv.facts["sessions"] = None
+        return sv.gate("sessions", UNKNOWN, "the old dispatcher's entry %s names no work folder (workspaceBaseDir), "
+                       "so its sessions cannot be looked for" % ", ".join(sorted(blind)))
     cwds = role_cwds(io, n["ROLE_ACCOUNT"])
     if cwds is None:
         sv.facts["sessions"] = None
@@ -1163,11 +1169,13 @@ def kinds_gone(io, acct, paths, root=False):
 
 def sessions_busy(io, n, sv):
     """A fresh look: the old dispatcher's processes in its work folders. None when it could not be listed."""
+    if sv.facts.get("workspaces") is None:
+        return None           # its work folders are not known, so its sessions cannot be looked for
     cwds = role_cwds(io, n["ROLE_ACCOUNT"])
     if cwds is None:
         return None
     home = sv.facts.get("home") or ""
-    real = [d.replace("~", home, 1) if d.startswith("~/") and home else d for d in sv.facts.get("workspaces") or []]
+    real = [d.replace("~", home, 1) if d.startswith("~/") and home else d for d in sv.facts["workspaces"]]
     return sorted(set(c for c in cwds for d in real if under(c, d)))
 
 
@@ -1193,6 +1201,14 @@ def step_stop(io, n, sv):
         raise Stop("the old dispatcher is stopped, but its port %s is %s: something else may listen there"
                    % (n["DISPATCHER_PORT"], "open" if port == "open" else "not readable"))
     return "stopped and disabled; its port %s is closed" % n["DISPATCHER_PORT"]
+
+
+def runner_status(io, n):
+    """The runner's own status of the writer's key, read now as the account, or None. Never a key."""
+    got = role_py(io, n["ROLE_ACCOUNT"], JSON_PY, [n["runner"]["RUNNER_DIR"].rstrip("/") + "/store/" + wkey.STATUS_FILE,
+                                                   "doc"])
+    doc = got.get("doc") if got and got.get("state") == "read" else None
+    return doc if doc is not None and not wkey.status_problems(doc) else None
 
 
 def settings_kind(io, n):
@@ -1227,7 +1243,7 @@ def step_switch(io, n, sv, box):
             raise Stop("the runner's own loader refused %s with WRITER_KEY_SOURCE=renew (%s), so it was put back as "
                        "it was" % (path, (errors or ["it did not read back"])[0]))
         box["conf_changed"] = (path, text, mode)
-    box["switched_at"] = io.now()
+    box["switched_at"], box["applied"] = io.now(), True
     rc, doc = io.installer(["apply", "--conf", path, "--watch-conf", n["paths"][UPDATE]], answers=ANSWERS)
     rows = dict((r.get("step"), r) for r in ((doc or {}).get("rows") or []) if isinstance(r, dict))
     applied = (rows.get("settings") or {}).get("outcome") in (se.DONE, se.ALREADY_DONE)
@@ -1248,13 +1264,10 @@ def step_switch(io, n, sv, box):
 def step_wait(io, n, sv, box):
     """The runner's own word: it renewed the key, and the key answered as the session writer."""
     since = box.get("switched_at", 0) - SLACK if sv.handover in ("switch", "apply") else 0
-    path = n["runner"]["RUNNER_DIR"].rstrip("/") + "/store/" + wkey.STATUS_FILE
     deadline = io.now() + HANDOVER_WAIT
     while sv.handover in ("switch", "apply", "wait"):
-        got = role_py(io, n["ROLE_ACCOUNT"], JSON_PY, [path, "doc"])
-        doc = got.get("doc") if got and got.get("state") == "read" else None
-        if doc is not None and not wkey.status_problems(doc):
-            box["status"] = doc
+        doc = runner_status(io, n)
+        if doc is not None:
             fresh = lambda part: (wkey.epoch((doc.get(part) or {}).get("at")) or 0) >= since    # noqa: E731
             if doc["source"] == "renew" and fresh("renewal") and fresh("check") and doc["state"] == "ok" and \
                     doc["renewal"]["result"] == "renewed" and doc["check"]["result"] == "writer":
@@ -1365,7 +1378,7 @@ REMOVERS = {"job": remove_job, "pf": remove_pf, "package": remove_package, "root
 
 def restart_words(io, n, box):
     label, path = n["DISPATCHER_SERVICE"], n["paths"][RUNNER]
-    doc = box.get("status") or {}
+    doc = runner_status(io, n) or {}        # read now: a runner on renew renews on its own pass, wait or no wait
     renewed = (doc.get("source") == "renew" and (doc.get("renewal") or {}).get("result") == "renewed"
                and (wkey.epoch((doc.get("renewal") or {}).get("at")) or 0) >= box.get("switched_at", 0) - SLACK)
     io.say("NOTHING WAS REMOVED. The old dispatcher's files, its job file and every host piece are as they were.")
@@ -1380,9 +1393,15 @@ def restart_words(io, n, box):
         says = ps.conf_values(io.read_text(path)).get("WRITER_KEY_SOURCE")
     except (OSError, ValueError):
         says = None
-    if box.get("conf_changed") or says != "other-program":
+    installed = settings_kind(io, n)        # read now: the installer may have written renew, whatever it said
+    if says != "other-program":
         io.say("    set WRITER_KEY_SOURCE=other-program in %s, then:" % path)
+    if box.get("applied") or installed != "other-program":
         io.say("    echo '%s' | python3 scripts/pipeline_runner_setup.py apply --conf %s" % (ANSWERS, path))
+        io.say("    python3 scripts/pipeline_runner_setup.py check --conf %s" % path)
+        io.say("      and start the old dispatcher only once its writer-key row says the key is read from another "
+               "program's settings%s: with the runner on renew, the two would renew the one key." % (
+                   "" if installed else " (the runner's installed source could not be read just now)"))
     io.say("    sudo launchctl enable system/%s" % label)
     io.say("    sudo launchctl bootstrap system %s" % plist_path(label))
 
@@ -1610,7 +1629,7 @@ class _World(object):
         self.log.append(("installer", args[0]))
         if args[0] == "apply":
             assert answers == ANSWERS, answers
-            if self.apply_fails:
+            if self.apply_fails is True:
                 return 1, {"rows": [{"step": "settings", "outcome": "FAILED", "detail": "a stand-in's refusal"}]}
             conf, errors = rs.load_conf(args[args.index("--conf") + 1], None)
             assert not errors, errors
@@ -1618,6 +1637,8 @@ class _World(object):
                 doc = json.load(fh)
             doc["session_tools"]["key_source"] = rs.writer_source(conf)
             _write(self.runner_json, json.dumps(doc))
+            if self.apply_fails == "after-writing":         # it wrote the settings, then failed: say so as it does
+                return 1, {"rows": [{"step": "settings", "outcome": "FAILED", "detail": "a stand-in's read-back"}]}
             return 4, {"rows": [{"step": "settings", "outcome": "DONE", "detail": "written"},
                                 {"step": "writer-key", "outcome": "UNKNOWN", "detail": "waits"}]}
         with open(self.status_json) as fh:
@@ -1874,7 +1895,8 @@ def _cases(expect, tmp):  # noqa: C901  (one battery, read top to bottom)
     def serves_more(w):
         with open(w.disp + "/config.json") as fh:
             doc = json.load(fh)
-        doc["repositories"].append({"id": "old", "githubUrl": "https://github.com/acme/old.git", "isActive": True})
+        doc["repositories"].append({"id": "old", "githubUrl": "https://github.com/acme/old.git", "isActive": True,
+                                    "workspaceBaseDir": w.disp + "/worktrees"})
         doc["repositories"].append({"id": "off", "githubUrl": "https://github.com/acme/gone.git", "isActive": False})
         _write(w.disp + "/config.json", json.dumps(doc))
     rc, text, w, io = run(fix=serves_more)
@@ -1895,6 +1917,14 @@ def _cases(expect, tmp):  # noqa: C901  (one battery, read top to bottom)
     expect("the pipeline's account cannot be reached: UNKNOWN, exit 4", (rc, "ANSWER: UNKNOWN" in text), (4, True))
     rc, text, w, io = run(fix=lambda w: w.cwds.append(w.disp + "/worktrees/app-12"))
     expect("a session of the old dispatcher still works: NOT READY", (rc, "still work in" in text), (1, True))
+    def no_work_folder(w):
+        with open(w.disp + "/config.json") as fh:
+            doc = json.load(fh)
+        del doc["repositories"][1]["workspaceBaseDir"]
+        _write(w.disp + "/config.json", json.dumps(doc))
+    rc, text, w, io = run("run", fix=no_work_folder)
+    expect("an entry that names no work folder: UNKNOWN, its sessions cannot be looked for, nothing changed",
+           (rc, "entry web names no work folder" in text, changes(w)), (4, True, []))
     rc, text, w, io = run(fix=lambda w: setattr(w, "cwds", None))
     expect("its processes cannot be listed: UNKNOWN", (rc, "could not be listed" in text), (4, True))
     rc, text, w, io = run(fix=lambda w: os.unlink(w.home + "/.pipeline-runner/writer-client"))
@@ -1989,6 +2019,19 @@ def _cases(expect, tmp):  # noqa: C901  (one battery, read top to bottom)
     with open(w.kit + "/" + RUNNER) as fh:
         expect("the runner's installer fails: exit 1, nothing removed, runner.conf put back",
                (rc, _first(w.log, ("remove",)), "WRITER_KEY_SOURCE=other-program" in fh.read()), (1, None, True))
+    def writes_then_fails(renewal):
+        def fix(w):
+            w.apply_fails, w.renewal = "after-writing", renewal
+        return fix
+    rc, text, w, io = run("run", fix=writes_then_fails("renewed"))
+    expect("the installer writes renew, then fails, and the runner renews on its own: nothing removed, and it says "
+           "never to start the old one", (rc, _first(w.log, ("remove",)), "Do NOT start the old dispatcher" in text),
+           (1, None, True))
+    rc, text, w, io = run("run", fix=writes_then_fails("silent"))
+    order = [text.find(s) for s in ("pipeline_runner_setup.py apply --conf", "pipeline_runner_setup.py check --conf",
+                                    "sudo launchctl enable system/" + DISP)]
+    expect("the installer writes renew, then fails, and the runner is quiet: the advice puts the installed source back "
+           "and checks it before the old dispatcher starts", (rc, -1 not in order and order == sorted(order)), (1, True))
     rc, text, w, io = run("run", fix=lambda w: w.stuck.add(DISP))
     expect("launchd keeps the old dispatcher: exit 1, nothing switched or removed",
            (rc, _first(w.log, ("put",)), _first(w.log, ("remove",))), (1, None, None))
