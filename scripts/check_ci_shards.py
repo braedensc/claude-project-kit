@@ -57,7 +57,7 @@ SWEEPS = [
         "test:conflict-waker-setup", "test:union", "test:acceptance-run",
         "test:template-label-gate", "test:label-gate", "test:gate-policy", "test:branch-rule",
         "test:repo-setup", "test:ci-covers", "test:alert-pages", "test:routing-tags",
-        "test:sync-kit", "test:scratch-run", "test:agent-env",
+        "test:sync-kit", "test:scratch-run", "test:agent-env", "test:settings-ignored",
     ],
     [
         "test:hooks", "test:bypass", "test:workflow-calls", "test:dor", "test:jsonschema",
@@ -104,7 +104,7 @@ MAC = [
         "test:queue-read", "test:runner-live", "test:day-plan", "test:heartbeat-monitor",
         "test:update", "test:union", "test:acceptance-poller", "test:pr-base", "test:hooks-path",
         "test:label-gate", "test:gate-policy", "test:repo-setup", "test:ci-covers",
-        "test:ci-shards",
+        "test:ci-shards", "test:settings-ignored",
     ],
     [
         "test:hooks", "test:jsonschema", "test:local-dispatch", "test:safe-outputs",
