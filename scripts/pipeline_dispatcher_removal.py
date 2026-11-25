@@ -1527,6 +1527,7 @@ class _World(object):
 
     def run(self, argv):
         assert argv[:2] == ["sudo", "-n"], "a sudo call without -n: %r" % (argv,)
+        self.tick()             # the runner's pass runs beside this script: its first after an apply comes at once
         if argv[2] == "-u":
             assert argv[3] == ACCT and argv[4] == "-H" and argv[5:7] == ["/bin/sh", "-c"], argv
             if self.no_role:
