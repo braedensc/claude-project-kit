@@ -278,12 +278,19 @@ the runner's settings) in `notifier.conf`, with `REPLY_RELAY=yes`, and run the i
 the runner's `fix` lane is on for that project, your answer is asked of the runner as a resume of the
 session that asked, fenced as data. Turn the lane off in the runner's settings and the thread is used
 again: the lane is the one switch, so the two cannot disagree. Every failure is said in words and paged
-in the channel: a session that is gone or ambiguous, a refused request, a runner that has not taken it
-in an hour. A store it cannot read stops the pass with a failure and is tried again.
+in the channel: a session that is gone, a refused request, a runner that has not taken it
+in an hour. The session that asked is the run named on line 2 of its own question
+(`pipeline-asked-by`, written by the session's tracker tools and by nothing the session can type), so a ticket
+run twice still gets the answer in the right session; a question whose record names no run, a run no longer
+in the store and a run resumed since are said and paged, and the page says what to do instead: put the answer
+in the ticket and start the work again. A request the runner's store refused before writing anything is
+dropped in its words; one that may have been written stays pending, named unconfirmed. Once, at the
+upgrade: a question recorded before this change has no run on line 2, so an open runner-lane question
+is said and paged as naming no run; answer those in the ticket. A store it cannot read stops the pass with a failure and is tried again.
 
 Good: `RELAYED ... as a resume of runner run run-...`, and a later pass that says nothing.
-Not that: `DROPPED ... has no session for KIT-20`. The runner has no run to answer: answer in the
-ticket, or start the work again.
+Not that: `DROPPED ... the run that asked (run-...) is no longer in the runner's store`. The runner has no
+run to answer: answer in the ticket, and start the work again.
 
 **A title that looks like a credential (KIT-202).** A ticket title is written by anyone who can
 edit the ticket, so the notifier never sends one that carries a credential shape. It used to

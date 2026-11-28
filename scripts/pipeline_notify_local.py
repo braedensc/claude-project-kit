@@ -1963,6 +1963,23 @@ def find_mark(body):
     return match.group(1)
 
 
+ASKED_BY_RE = re.compile(r"^<!-- pipeline-asked-by: (run-[0-9a-f]{32}) -->\Z")
+
+
+def asked_run_of(body):
+    """The run a question names as its asker (KIT-962), or None. Only line 2 of a body whose line 1
+    is an escalation mark, matched whole: the session tools write it, and refuse any text of the
+    session's own that holds `<!--`. Raw, never decoded, like find_mark. It is a claim, not
+    proof: the relay still finds that run in the runner's records for this project and ticket."""
+    if not body or find_mark(body) is None:
+        return None
+    lines = body.split("\n", 2)
+    if len(lines) < 2:
+        return None
+    match = ASKED_BY_RE.match(lines[1])
+    return match.group(1) if match else None
+
+
 def resolve_marks(bodies):
     """Given several bodies, the single mark that wins by precedence, or None."""
     found = {m for m in (find_mark(b) for b in bodies) if m}
@@ -2721,6 +2738,8 @@ def select_events(tickets, sent_keys, cfg, labelled_keys=None):
                 # session whose question the owner is answering.
                 "comment_id": cid,
                 "thread_id": comment.get("parent_id"),
+                # KIT-962: the run the question's own record names, for a runner-lane answer.
+                "asked_run": asked_run_of(body),
                 "settle": bool(owed),
                 "ticket_id": tid,
                 "ticket_uuid": ticket.get("uuid"),
@@ -3067,6 +3086,7 @@ def record_relayable(relay_state, channel, ts, event, now):
         # None when the mark was not written inside a thread: then there is no session to
         # answer, and a reply is DECLINED by name rather than sent to some other session.
         "thread_id": event.get("thread_id"),
+        "asked_run": event.get("asked_run"),
         "mark": event.get("mark"),
         "recorded_at": now,
     }
@@ -3372,35 +3392,44 @@ def runner_relay_route(cfg, ticket_id):
     return (lane["store_dir"], project), ""
 
 
-def runner_asking_run(store_dir, project, ticket_id):
-    """(run record, "", False) of the session that asked, or (None, why, retry). It is the tip of
-    the chain of this ticket's runs in the runner's own records, matched on project and ticket
-    and never on anything a session wrote: a resume keeps the session and a fresh start after a
-    lost one replaces it, so the tip is the session a question came from. `retry` is True when a
-    later pass may find it (records not all readable, the run still going): nothing is recorded.
-    False is final: no such run, more than one chain so the asking session cannot be told, or a
-    session the runner lost and did not start afresh."""
+RUNNER_INSTEAD = ("The runner reads no ticket thread, so to answer, put it in the ticket and "
+                  "start the work again")
+
+
+def runner_asking_run(store_dir, project, ticket_id, asked_run=None):
+    """(run record, "", False) of the session that asked, or (None, why, retry). `asked_run` is the
+    run the question's own record names (KIT-962: the session tools wrote it, outside anything the
+    session's text can spell), and the answer goes to that run only, after the runner's own records
+    agree it is a run of this project and ticket that no later run has resumed. It is never found
+    from the ticket: a ticket run twice has two chains, and only the record says which asked.
+    `retry` is True when a later pass may find it (records not all readable, the run still going):
+    nothing is recorded. False is final, and its words say what to do instead: the record names no
+    run, the run is not in the store, it was resumed since, or the runner lost it and did not
+    start it afresh."""
     rs = _runner_store()
     got = rs.read_runs(store_dir)
     if got["state"] != "read":
         return None, ("the runner's run records could not be read whole (%s), so the session "
                       "that asked could not be found" % got["why"]), True
+    if not asked_run:
+        return None, ("the question's record names no run, so which session of %s asked cannot "
+                      "be told. %s" % (ticket_id, RUNNER_INSTEAD)), False
     mine = [r for r in got["runs"] if r["project"] == project and r["ticket"] == ticket_id
             and r["kind"] in rs.RESUMES[RUNNER_KIND]]
-    if not mine:
-        return None, ("the runner has no session for %s, so there is none to answer: it is gone "
-                      "or never ran there" % ticket_id), False
-    followed = set(r["resumes"] for r in mine if r["resumes"])
-    tips = [r for r in mine if r["run"] not in followed]
-    if len(tips) != 1:
-        return None, ("the runner holds %d separate sessions for %s, so which one asked cannot "
-                      "be told" % (len(tips), ticket_id)), False
-    tip = tips[0]
+    tip = next((r for r in mine if r["run"] == asked_run), None)
+    if tip is None:
+        return None, ("the run that asked (%s) is no longer in the runner's store, so there is "
+                      "no session for %s to answer. %s" % (asked_run, ticket_id, RUNNER_INSTEAD)
+                      ), False
+    later = [r["run"] for r in mine if r["resumes"] == asked_run]
+    if later:
+        return None, ("the run that asked (%s) was resumed since, by %s, so its question is out "
+                      "of date. %s" % (asked_run, later[0], RUNNER_INSTEAD)), False
     if tip["state"] in rs.LIVE or tip["auto_resume"] == "pending":
         return None, "the runner's session for %s is still going" % ticket_id, True
     if tip["reason"] == "session-gone":
         return None, ("the session that asked (runner run %s) is gone and the runner did not "
-                      "start it afresh" % tip["run"]), False
+                      "start it afresh. %s" % (tip["run"], RUNNER_INSTEAD)), False
     return tip, "", False
 
 
@@ -3440,11 +3469,12 @@ def relay_via_runner(cfg, chat, relay_state, route, item, dry_run, now, out, res
     state could not be saved). Every end is said in words: a retryable one is a failure, nothing
     recorded, so the next pass asks again; a final one is recorded and paged; a request the runner
     refuses is read back by settle_runner_asks and paged there."""
-    key, pkey, ticket, reply_ts, text = item
+    key, pkey, ticket, reply_ts, text = item[:5]
+    asked_run = item[5] if len(item) > 5 else None
     store_dir, project = route
     failures, problems, stamp = result["failures"], result["problems"], _iso_at(now)
     try:
-        run, why, retry = runner_asking_run(store_dir, project, ticket)
+        run, why, retry = runner_asking_run(store_dir, project, ticket, asked_run)
     except Exception as exc:                                      # noqa: BLE001
         run, why, retry = (None, "the runner's records could not be read (%s)"
                            % type(exc).__name__, True)
@@ -3488,6 +3518,27 @@ def relay_via_runner(cfg, chat, relay_state, route, item, dry_run, now, out, res
     try:
         rs.ask(store_dir, RUNNER_CALLER, "resume", RUNNER_KIND, project, ticket, run=run["run"],
                text=runner_answer_text(reply_ts, text), request_id=request_id)
+    except getattr(rs, "RefusedBeforeWrite", ()) as exc:
+        # KIT-962: refused before anything was written, so the request is known not to exist:
+        # dropped, in the store's own words, and the hour's count gives it back.
+        why = "the runner refused the request before writing it: %s" % redact(str(exc)[:300],
+                                                                              secrets)
+        relay_state["relays"].pop()
+        relay_state["replies"][key] = {"status": RELAY_DROPPED, "parent": pkey,
+                                       "ticket_id": ticket, "reason": why, "at": stamp}
+        result["declined"] += 1
+        result["dropped"] += 1
+        problems.append("DROPPED reply %s under the %s ping: %s" % (key, ticket, why))
+        failed = page_relay_problem(chat, cfg, ticket, why)
+        if failed:
+            failures.append("the page for relay %s could not be sent: %s"
+                            % (key, redact(failed, secrets)))
+        try:
+            save_relay(cfg, relay_state)
+        except NotifierError as exc2:
+            failures.append(str(exc2))
+            return True
+        return False
     except Exception as exc:                                      # noqa: BLE001
         said = ("the request to the runner for %s did not confirm (%s), so it is left pending "
                 "and NOT asked again, since it may have been written"
@@ -4259,7 +4310,8 @@ def relay_replies(cfg, tracker, chat, relay_state, dry_run, now, out=sys.stdout,
         if route is not None:
             before = result["relayed"]
             if relay_via_runner(cfg, chat, relay_state, route, (key, pkey, ticket, msg.get("ts"),
-                                                                 text), dry_run, now, out, result,
+                                                                 text, parent.get("asked_run")),
+                                dry_run, now, out, result,
                                 secrets):
                 return result
             relays_in_window += result["relayed"] - before
@@ -8429,12 +8481,13 @@ def _runner_relay_selftest(ok, tmp, good):
         return msg
 
     def one_pass(cfg, store=None, now=NOW, tracker=None, chat=None, text=None, ticket="KIT-20",
-                 seed_it=True):
+                 seed_it=True, asked=RUN_A):
         if seed_it:
             st = load_relay(cfg)
             record_relayable(st, "C0123456789", P,
                              {"mark": ESC_BLOCKED, "ticket_id": ticket, "thread_id": "root-20",
-                              "comment_id": "mark-" + ticket, "key": "comment:mark-" + ticket},
+                              "comment_id": "mark-" + ticket, "key": "comment:mark-" + ticket,
+                              "asked_run": asked},
                              "seeded")
             save_relay(cfg, st)
         tracker = tracker or _FakeTracker([], threads={ticket: ["root-20"]})
@@ -8569,12 +8622,34 @@ def _runner_relay_selftest(ok, tmp, good):
            any("did not reach its session" in p and needle in p and "<@U0OWNER001>" in p
                for p in chat.posts), chat.posts)
 
-    dropped_and_paged("no run", [], "has no session for KIT-20")
+    dropped_and_paged("no run", [], "no longer in the runner's store")
     dropped_and_paged("a run of another ticket", [record(RUN_A, ticket="KIT-99")],
-                      "has no session for KIT-20")
+                      "no longer in the runner's store")
     dropped_and_paged("session gone", [record(RUN_A, reason="session-gone")], "is gone")
-    dropped_and_paged("two sessions", [record(RUN_A), record(RUN_B, at="2026-11-17T11:00:00Z")],
-                      "2 separate sessions")
+    # KIT-962: the question's own record names the run, so a ticket run twice is not ambiguous.
+    dropped_and_paged("a record naming no run", [record(RUN_A)], "names no run", asked=None)
+    dropped_and_paged("a resumed run's older question",
+                      [record(RUN_A), record(RUN_B, resumes=RUN_A, at="2026-11-17T11:00:00Z")],
+                      "was resumed since")
+    dropped_and_paged("the run named is gone from the store", [record(RUN_B)],
+                      "no longer in the runner's store")
+    dropped_and_paged("a forged run of another ticket named in the record",
+                      [record(RUN_A), record(RUN_B, ticket="KIT-99")],
+                      "no longer in the runner's store", asked=RUN_B)
+    ok("KIT-962 instead: a final drop on a runner lane tells the owner what to do instead",
+       "put it in the ticket and start the work again" in runner_asking_run(
+           make_store("instead", runs=[]), "app", "KIT-20", RUN_A)[1]
+       and "put it in the ticket and start the work again" in runner_asking_run(
+           make_store("instead2", runs=[record(RUN_A)]), "app", "KIT-20", None)[1])
+    for who, other in ((RUN_A, RUN_B), (RUN_B, RUN_A)):
+        store_t = make_store("two-chains-" + who[4], runs=[
+            record(RUN_A), record(RUN_B, at="2026-11-17T11:00:00Z")])
+        res, tr, chat, out = one_pass(cfg_for(store_t), asked=who)
+        got_t = rs.pending(store_t)
+        ok("KIT-962 two chains: the answer goes to the run the question names (%s...), not the "
+           "other, and nothing is dropped" % who[:7],
+           len(got_t) == 1 and got_t[0][1].get("run") == who and res["exit"] == EXIT_OK,
+           (res["summary"], got_t))
 
     store_l = make_store("live", runs=[record(RUN_A, state="running")])
     cfg_l = cfg_for(store_l)
@@ -8665,6 +8740,67 @@ def _runner_relay_selftest(ok, tmp, good):
     res, tr, chat, out = one_pass(cfg_w, now=NOW + 5, seed_it=False)
     ok("KIT-920 ...and the next pass names it unconfirmed and asks nothing",
        "UNCONFIRMED" in res["summary"] and rs.pending(store_w) == [], res["summary"])
+
+    # KIT-962: the run a question names is read from line 2 of its own record, and only there.
+    L1 = "<!-- pipeline-escalation: agent:blocked -->"
+    L2 = "<!-- pipeline-asked-by: %s -->"
+    ok("KIT-962 record: line 2 of an escalation names the run",
+       asked_run_of("%s\n%s\n**Question:** q" % (L1, L2 % RUN_A)) == RUN_A)
+    ok("KIT-962 record: no line 2 names no run",
+       asked_run_of("%s\n**Question:** q" % L1) is None)
+    ok("KIT-962 forged: a run mark in the session's own text (any later line) is ignored",
+       asked_run_of("%s\n**Question:** q\n%s" % (L1, L2 % RUN_B)) is None
+       and asked_run_of("%s\n**Question:** %s" % (L1, L2 % RUN_B)) is None)
+    ok("KIT-962 forged: an escaped or padded or wrongly shaped mark is ignored",
+       asked_run_of("%s\n%s" % (L1, (L2 % RUN_B).replace("<", "&lt;"))) is None
+       and asked_run_of("%s\n %s" % (L1, L2 % RUN_B)) is None
+       and asked_run_of("%s\n%s" % (L1, L2 % "run-x")) is None
+       and asked_run_of("%s\n%s extra" % (L1, L2 % RUN_B)) is None)
+    ok("KIT-962 forged: a run mark under no escalation mark is ignored",
+       asked_run_of("hello\n%s" % (L2 % RUN_B)) is None
+       and asked_run_of("%s\n%s" % ("<!-- stage-e-review -->", L2 % RUN_B)) is None)
+    # A forged line 2 that does name a real run of ANOTHER ticket still reaches nothing: the
+    # runner's own records must agree it is this project's and this ticket's.
+    store_f = make_store("forged-line2", runs=[record(RUN_A, ticket="KIT-99")])
+    got_f = runner_asking_run(store_f, "app", "KIT-20",
+                              asked_run_of("%s\n%s" % (L1, L2 % RUN_A)))
+    ok("KIT-962 forged: a run the record names but the runner holds for another ticket is "
+       "refused", got_f[0] is None and got_f[2] is False, got_f)
+
+    # KIT-962: a request the store refused BEFORE writing is known not to exist: dropped, in the
+    # store's own words, paged, and not counted against the hour. A write that may have happened
+    # (the case above) stays pending.
+    store_v = make_store("refused-before")
+    cfg_v = cfg_for(store_v)
+    req_v = os.path.join(store_v, "requests")
+    os.chmod(req_v, 0o755)                    # the store's own wall: others may read the folder
+    try:
+        res, tr, chat, out = one_pass(cfg_v)
+    finally:
+        os.chmod(req_v, 0o700)
+    rec_v = list(load_relay(cfg_v)["replies"].values())
+    ok("KIT-962 refused before writing (the store's own wall): dropped in the store's words, "
+       "paged, nothing pending, nothing written, the hour's count given back",
+       res["exit"] == EXIT_DECLINED and [r.get("status") for r in rec_v] == [RELAY_DROPPED]
+       and "mode 0700" in (rec_v[0].get("reason") or "") and rs.pending(store_v) == []
+       and any("mode 0700" in p for p in chat.posts) and load_relay(cfg_v)["relays"] == [],
+       (res["summary"], rec_v))
+    res, tr, chat, out = one_pass(cfg_v, now=NOW + 5, seed_it=False)
+    ok("KIT-962 ...and a later pass names nothing unconfirmed about it",
+       "UNCONFIRMED" not in res["summary"] and res["exit"] == EXIT_OK, res["summary"])
+    store_y = make_store("asked-already")
+    cfg_y = cfg_for(store_y)
+
+    def seen_ask(*a, **k):
+        raise ValueError("a request with this id was asked already")
+    rs.ask = seen_ask
+    try:
+        res, tr, chat, out = one_pass(cfg_y)
+    finally:
+        rs.ask = real_ask
+    ok("KIT-962 an id asked already may be written: it stays pending, as today",
+       [r.get("status") for r in load_relay(cfg_y)["replies"].values()] == [RELAY_PENDING],
+       res["summary"])
 
     # ── the one write into the runner's store, pinned in this file's own source ────────
     source = open(__file__, encoding="utf-8").read()
@@ -8833,7 +8969,7 @@ def _dm_selftest(ok, tmp, good):
     LEDGER_SCHEMA = "pipeline-notifier-dm-posts/1"
     LEDGER_FIELDS = {"channel", "ts", "ticket_id", "mark", "event_key", "recorded_at"}
     PING_FIELDS = {"channel", "ts", "ticket_id", "event_key", "comment_id", "thread_id", "mark",
-                   "recorded_at"}
+                   "recorded_at", "asked_run"}
 
     def case(name, fn):
         try:
