@@ -374,6 +374,11 @@ def rule_settings(parts, root):
     found = []
     for part in parts:
         example = part["settings"]["example"]
+        off_key = part["settings"].get("off_when_empty")
+        if off_key and off_key not in part["settings"]["keys"]:
+            # KIT-965: the key that leaves a part off is one of its named keys, so it is in the example.
+            found.append("settings: %s is off when %s is empty, which is not one of its keys"
+                         % (part["id"], off_key))
         keys = list(part["settings"]["keys"])
         keys += [s["key"] for s in part["secrets"]]
         keys += [j["from_key"] for j in part["jobs"] if j["from_key"]]
@@ -881,6 +886,13 @@ def selftest():
           lambda d: a(d)["secrets"][0].update(default_name="OTHER_TOKEN"), "settings:")
     fails("settings: a job key the example lacks fails",
           lambda d: a(d)["jobs"][0].update(from_key="NO_LABEL"), "settings:")
+    # KIT-965: the key that leaves a part off is one of its own keys, and a key name.
+    expect("settings: an off key that is one of the part's keys passes",
+           run(lambda d: a(d)["settings"].update(off_when_empty="JOB_LABEL")), [])
+    fails("settings: an off key that is not one of the part's keys fails",
+          lambda d: a(d)["settings"].update(off_when_empty="TOKEN_ENV"), "settings:")
+    fails("schema: an off key that is not a key name fails",
+          lambda d: a(d)["settings"].update(off_when_empty="not a key"), "schema:")
     # credentials
     fails("schema: a secret with no ends fails", lambda d: a(d)["secrets"][0].pop("ends"), "schema:")
     fails("schema: a secret ending some other way fails",

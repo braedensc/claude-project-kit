@@ -117,8 +117,9 @@ there is no override.
    not look never counts as a pass.
 
 8. **The idea gate.** `python3 scripts/pipeline_install.py` pulls the kit, then runs Stage E's
-   check and the idea gate's installer. Run it again after each stop. Guide:
-   `docs/STAGE-A-OPERATOR.md`, section 5.
+   check and the idea gate's installer. A stop lists every card it found. Sign them all, then run
+   it again: it carries on from the step that stopped. Guide: `docs/STAGE-A-OPERATOR.md`,
+   section 5.
    *Works:* `python3 scripts/pipeline_stage_a_setup.py verify` exits 0, and a throwaway idea
    moved to **Plan it** becomes a plan.
    *Fails:* the planner says the routing is unknown. Nothing new starts until it is known.

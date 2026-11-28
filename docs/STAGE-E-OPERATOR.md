@@ -2889,6 +2889,11 @@ and its `github-app` row checks the key, the app, each installation and the test
 Good: `github-app  ALREADY-DONE  Stage E posts as acme-stage-e[bot]`. Not that: `github-app
 ALREADY-DONE  OFF by conf (GITHUB_APP_ID is empty)`: Stage E still posts as your login.
 
+While `GITHUB_APP_ID` is empty, the one command's line for this part reads `off on this Mac
+(GITHUB_APP_ID is empty in stage-e.conf)`. It does not run the app's check, and that line never
+makes the command exit 4. Once the id is set, the check runs, and a failure there is "could not be
+measured" again (KIT-965).
+
 **If the app's token cannot be had,** the poller posts nothing that pass, rather than post as
 your login, and tries again on the next. Its heartbeat says `"posting_as": "app-unavailable"`,
 and `"posting_unavailable_for"` names each repository it could not post on. With no app at all

@@ -1023,7 +1023,8 @@
           "GITHUB_APP_ID",
           "GITHUB_APP_LOGIN",
           "GITHUB_APP_KEY_FILE"
-        ]
+        ],
+        "off_when_empty": "GITHUB_APP_ID"
       },
       "secrets": [],
       "jobs": [],

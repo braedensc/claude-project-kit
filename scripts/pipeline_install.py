@@ -5,7 +5,8 @@
 
 Run it in a terminal, as yourself, from the kit checkout you install from. It does
 everything a machine can do and stops only for what a person must do. Run it again after
-any stop: it picks up where it left off.
+any stop: it picks up where it left off, and reuses what the last run measured, for up to
+30 minutes (A RERUN CARRIES ON, below).
 
 THE FIRST SCREEN, THE CONSENT AND THE RECORD (KIT-717; docs/adr/2026-11-11-one-consent-then-no-stops.md)
   After the three refusals it offers Automatic ("things just work") or Manual ("show me each
@@ -42,6 +43,8 @@ WHAT IT DOES, IN ORDER
   1. The kit checkout. It must be on its default branch with no uncommitted changes to
      tracked files. It fast-forwards it to origin, and when that moved the code it starts
      itself again, so the rest runs on what you merged.
+  1b. What earlier runs measured (KIT-930; A RERUN CARRIES ON, below). It reads the record of
+     results the last run kept, and says how many it may reuse and why the rest are not.
   2. The skills. Claude Code loads skills from your home folder for any project without
      its own, and nothing updates that copy (`scripts/sync_user_skills.py`). When they
      differ from the kit's, it asks before replacing them.
@@ -148,13 +151,36 @@ and Ctrl-C included; the refusals read nothing, so they print nothing)
   of: up to date · updated · waiting on you · off on this Mac · could not be measured · not
   reached (the run stopped before that part). The steps above report their own result for
   the parts they act on. Every other part with a check is looked at once, read-only, with no
-  input and no terminal to prompt on: its settings file absent is "off on this Mac" and its
-  check does not run; exit 0 is up to date, 10 waiting on you, anything else (another code,
+  input and no terminal to prompt on: its settings file absent, or its own off key empty
+  (KIT-965), is "off on this Mac" and its check does not run; exit 0 is up to date, 10 waiting
+  on you, anything else (another code,
   a killed or timed-out child, a check that wanted to ask) could not be measured. A part
   with no check and no step is named on one closing line and changes no exit code.
   Then a short list: the cards (`CK-...`) a waiting part's own output names, split into
   "Only you can do these" and "Sign-offs still asked for", or "Nothing is waiting on you."
+  Each card's row is followed by how to read that card, when its script prints one card by its
+  id (`read it: python3 scripts/<script> card CK-5`): the card holds the exact line that signs it.
   The lines are built as data first, one record per part (id, name, outcome, detail).
+
+  EVERY CARD IN ONE RUN (KIT-930). Stage E's cards are read from its own record
+  (`~/.stage-e-setup/state.json`), for every step its check and its installer measured in this
+  run. Its check keeps going past a card, so the later steps' cards are there too, where they
+  could be measured without changing anything. A card no part lists, such as CK-8, is named with
+  Stage E's own title. Its check is not run again at the end to find them; only when the record
+  cannot be read is it run once more, as before. A run that got past the consent and the checkout,
+  and then stopped part way, still looks at every part it did not reach, read-only, the way the
+  lines look at a part with no step: no terminal, stdin closed, a time limit. That part's line
+  keeps "not reached", because its own step did not run, and its detail says what the look found.
+  The cards it names go on the short list, so you can sign every one of them in one sitting. A
+  check that needs the Mac password cannot be looked at this way, and its detail says so. A run
+  that stopped at the consent or the checkout, or by Ctrl-C, looks at nothing.
+
+  OFF BY ITS OWN KEY (KIT-965). A part whose settings file is here can still be off, by your
+  choice, when the parts list names a key that leaves it off when empty (`off_when_empty`). Stage
+  E's own app is the one: with GITHUB_APP_ID empty in stage-e.conf, its line is "off on this Mac
+  (GITHUB_APP_ID is empty in stage-e.conf)" and its check does not run, so it never makes the run
+  exit 4. Only that one key is read. A file that cannot be read is never "off": its check runs,
+  and a failure there is still "could not be measured".
   In Automatic, a part whose installer ran with work to do, and that has steps only a person
   can do, keeps its real outcome and gains the note "its installer still asks its own
   questions; Automatic cannot answer them yet". The note changes no outcome, no exit code
@@ -167,13 +193,47 @@ and Ctrl-C included; the refusals read nothing, so they print nothing)
   wins when the file is there. Checks that need the Mac password read "could not be measured",
   because they run without a terminal and cannot ask for it.
 
+A RERUN CARRIES ON (KIT-930)
+  At the end of a run that got past the consent and was not interrupted, it keeps what it
+  measured, so the next run does not measure it again. The record sits beside the consent
+  record, /Library/Application Support/claude-pipeline/results-record.json, and is trusted the
+  same way. Root writes it, through sudo, from a private temp file, and it is read back. A later
+  run uses it only if the file and every folder above it are root's alone. Saving it holds the Mac
+  password once, if this run did not already. A record that cannot be trusted or read, or is in
+  another shape, is said, and everything is measured again.
+  What it keeps:
+    - each step that ended up to date or updated (never the consent or the checkout);
+    - each part's read-only check that passed;
+    - Stage E's stop, when its installer stopped on a card: its cards, and a sha256 of the
+      sign-offs in Stage E's record and the conflict waker's.
+  Nothing else. It never keeps a check's words, a step's words or a setting's value. Every kept
+  result carries its time, the kit's commit, and a sha256 of each settings file: each one the
+  parts list names, and every other `.conf` file beside them.
+  A result is reused only when it is under 30 minutes old (REUSE_SECONDS), was measured on the
+  same commit, and every settings file still has the same bytes. Those three are all it compares.
+  Anything else a step looks at, such as a loaded job, a clone or an app's installations on the
+  code host, is not compared, so a change to one of them within those 30 minutes shows only when
+  that result is next measured. `--fresh` measures everything now. A result that waited on you is
+  never kept, so the part is measured again, and its own installer checks the sign-off it waited
+  on against the settings it was made under. A reused result keeps its first time when it is kept
+  again, so it can never outlive its age.
+  A reused step is not run. Its heading says it is up to date from the last run, with the age,
+  and its line says "reused, not measured again", with where and when it was measured. The end
+  lists every reused result and its age. `--fresh` reuses nothing, and still keeps the record.
+  Stage E, right after a sign-off: when its installer stopped on a card in the last run, and a
+  sign-off has been recorded since in either record, it carries on from there. Its installer
+  runs, and measures that sign-off and each of its own steps, as it always does. Its check is not
+  run first. When no sign-off was recorded, or the records cannot be read, its check runs first,
+  as before.
+
 TO ONLY LOOK: --check (KIT-736)
   `pipeline_install.py --check` looks at every part and changes nothing. It needs no terminal,
   so a run with no person at one can use it. The refusals come first and print only themselves:
   inside a Claude session it exits 3, as root it exits 2. After that it asks nothing: no first
   screen, no consent page, no password, and the consent record is neither read nor written.
   It writes no settings file, makes no folder, installs no job and runs no `git fetch`, `pull`
-  or `checkout`. The only commands it runs are each part's own read-only check, run the way the
+  or `checkout`. It neither reads nor keeps the record of earlier results (KIT-930), so every
+  part is measured fresh. The one settings value it reads is a part's own off key (KIT-965). The only commands it runs are each part's own read-only check, run the way the
   end lines run them (no terminal, stdin closed, a time limit), and two read-only git calls:
   `git rev-parse HEAD` and `git ls-remote --symref origin HEAD`. (Python itself may write its
   bytecode cache next to the scripts; PYTHONDONTWRITEBYTECODE=1 stops that too.)
@@ -184,8 +244,8 @@ TO ONLY LOOK: --check (KIT-736)
       tell behind from ahead, so it never says behind. An origin that cannot be reached or
       read is "could not be measured", and the line says which. The branch the checkout is on
       is not asked, so a detached commit is measured like any other.
-    - Every other part: its settings file absent is "off on this Mac"; otherwise its own check
-      runs once and is read the one way for every part. One exception, because the lines at
+    - Every other part: its settings file absent, or its own off key empty, is "off on this
+      Mac"; otherwise its own check runs once and is read the one way for every part. One exception, because the lines at
       the end read it so too: the skills check exits 1 for "differ from the kit's", which is
       "waiting on you". The review jobs share one check, and a look cannot tell a card from
       work, so each of their parts reads "waiting on you" when it exits 10. A part with no
@@ -196,7 +256,7 @@ TO ONLY LOOK: --check (KIT-736)
   could not be measured, or the list of parts could not be read (4 comes before 10).
 
 Usage:
-    pipeline_install.py [--conf stage-a.conf] [--stage-e-conf stage-e.conf]
+    pipeline_install.py [--conf stage-a.conf] [--stage-e-conf stage-e.conf] [--fresh]
                         [--no-pull] [--skip-stage-e] [--notifier-conf notifier.conf] [--queue-conf queue.conf]
                         [--validator-conf validator.conf]
                         [--runner-conf runner.conf]
@@ -217,6 +277,7 @@ Exit: 0 every part is up to date, updated or off · 4 a part could not be measur
       lines); a stop that would exit 0 exits 4.
 """
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -507,6 +568,13 @@ class Io(object):
         except (OSError, ValueError):
             return None
 
+    def conf_key(self, path, key):
+        """What one key says in a settings file (KIT-965): its value, "" when the file does not
+        set it, or None when the file cannot be read. A look (--check) may read this; the rest of
+        the file is not kept."""
+        conf = Io.read_conf(self, path)
+        return None if conf is None else conf.get(key, "")
+
     # The one administrator session of this run, kept so its keep-alive outlives the call.
     _sudo = None
 
@@ -529,6 +597,60 @@ class Io(object):
         """Install `text` at `path` as root:wheel 0644, in a root-owned folder made with sudo
         when it is missing. None when done, else why not. The text is written to a private
         temp file first; sudo only copies it."""
+        return self._install_root_file(path, text)
+
+    def read_results(self, path):
+        """(state, data, why) for the record of what earlier runs measured (KIT-930): see
+        load_results. It is trusted as the consent record is, or not at all."""
+        return load_results(path)
+
+    def write_results(self, path, text):
+        """Save what this run measured (KIT-930) the way the consent record is saved: root's, 0644,
+        read back byte for byte. The Mac password is held for it first, once for the run. None when
+        saved, else why not."""
+        if not self.sudo_once("it saves what this run measured in a folder only the administrator "
+                              "can write, so a Claude session cannot edit what the next run reuses."):
+            return "it needs your Mac password, which was not given"
+        return self._install_root_file(path, text)
+
+    def fingerprint(self, paths):
+        """{settings file: sha256 of its bytes, or "absent", or None when it could not be read}:
+        see fingerprint_files (KIT-930). It reads, and never says, what a file holds."""
+        return fingerprint_files(paths)
+
+    def stage_e_cards(self, since):
+        """[(step, card)] for each step Stage E's own record says waited on a card, measured at or
+        after `since` (KIT-930); None when the record cannot be read. A row on a card keeps the
+        card's id as its detail. In the order of Stage E's own steps."""
+        path = os.path.expanduser("~/.stage-e-setup/state.json")
+        try:
+            with open(path, encoding="utf-8") as fh:
+                steps = json.load(fh).get("steps") or {}
+            import pipeline_stage_e_setup as se
+            order = [s[0] for s in se.STEPS]
+            found = [(sid, str(row.get("detail") or "")) for sid, row in steps.items()
+                     if isinstance(row, dict) and row.get("outcome") == "BLOCKED-ON-HUMAN"
+                     and str(row.get("at") or "") >= since]
+        except (OSError, ValueError, AttributeError, ImportError):
+            return None
+        return sorted(((s, c) for s, c in found if CARD_ID.match(c)),
+                      key=lambda sc: (order.index(sc[0]) if sc[0] in order else len(order), sc[0]))
+
+    def signoff_ledgers(self):
+        """{ledger: fingerprint of the sign-offs it holds} for the two records Stage E's step reads
+        sign-offs from: its own, and the conflict waker's (KIT-930). See signoffs_fingerprint."""
+        try:
+            import pipeline_conflict_waker_setup as waker
+            waker_home = waker.DEFAULT_STATE_HOME
+        except ImportError:
+            waker_home = None
+        return {"stage-e": signoffs_fingerprint(os.path.join(
+                    os.path.expanduser("~/.stage-e-setup"), "state.json")),
+                "conflict-waker": None if waker_home is None else signoffs_fingerprint(
+                    os.path.join(os.path.expanduser(waker_home), "state.json"))}
+
+    def _install_root_file(self, path, text):
+        """write_record's body, shared with write_results: one way to put a root-owned file down."""
         import shutil
         import tempfile
         private = tempfile.mkdtemp(prefix="consent-record-")     # made 0700: only this user
@@ -684,11 +806,29 @@ class Report(object):
         # Answers of checks already run, by argv: build_records reuses one rather than run it
         # twice. Empty in a real run, whose checks run after its steps. --check fills it.
         self.seen = {}
+        # KIT-930, a rerun carries on. `stamp` gives (when, settings fingerprint) and is set by a
+        # real run; each note is stamped with it, so a result keeps the moment and the settings it
+        # was measured under. `cache` holds what earlier runs measured that may be reused now.
+        self.stamp = None
+        self.noted = {}
+        self.cache = None
+        self.consented = False      # past the consent: only such a run looks further, or saves
+        self.commit = None          # the kit's commit this run measured under
+        self.reused = []            # (what, age in seconds, source), said at the end
+        self.reused_steps = {}      # step key -> the saved entry it reused, kept as it was
+        self.passed = {}            # check argv -> (when, fingerprint) of a pass measured this run
+        self.reused_checks = {}     # check argv -> the saved entry a line reused
+        self.stage_e_cards = None   # [(step, card)] from Stage E's own record, or None: not read
+        self.stage_e_since = None   # where that record is read from when the run resumed
+        self.resume = None          # Stage E's installer stopped on a card: kept for the next run
+        self.results_path = None    # where what this run measured is kept (--results-record)
 
     def note(self, key, outcome, detail="", card_only=False):
         self.steps[key] = (outcome, detail)
         if card_only:
             self.card_only.add(key)
+        if self.stamp is not None:
+            self.noted[key] = self.stamp()
 
     def note_code(self, key, code, what):
         """An installer ended with `code` and the step stops or carries on without success:
@@ -708,6 +848,9 @@ def step_checkout(io, argv, no_pull, rep, pulled_from=None, mode=None):
     io.say("Kit checkout: %s" % KIT)
     if no_pull:
         io.say("Not pulled (--no-pull).")
+        # KIT-930: the commit every result of this run is bound to.
+        code, head = git(io, "rev-parse", "HEAD")
+        rep.commit = head if code == 0 and head and not re.search(r"\s", head) else None
         if pulled_from:
             # The run this command started itself after a pull that moved the code.
             _code, now = git(io, "rev-parse", "--short", "HEAD")
@@ -737,7 +880,8 @@ def step_checkout(io, argv, no_pull, rep, pulled_from=None, mode=None):
     if code != 0:
         rep.note("checkout", OUT_UNMEASURED, "git could not fast-forward")
         return stop(io, "git could not fast-forward %s:\n    %s" % (want, out[:300]), 1)
-    _code, after = git(io, "rev-parse", "HEAD")
+    code, after = git(io, "rev-parse", "HEAD")
+    rep.commit = after if code == 0 and after and not re.search(r"\s", after) else None
     _code, line = git(io, "log", "--oneline", "-1")
     io.say("Now at: %s" % line)
     rep.note("checkout", OUT_UPDATED if before != after else OUT_OK,
@@ -784,7 +928,14 @@ def step_skills(io, rep):
     return None
 
 
+def iso_at(epoch):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
+
+
 def step_stage_e(io, conf, skip, rep):
+    """Stage E's check, then its installer when there is work. `rep.stage_e_since` is where its
+    own record is read from at the end, for the cards it names (KIT-930): its check keeps going
+    past a card, so that read names every card it could measure without changing anything."""
     heading(io, "3. Stage E, the review jobs")
     if skip:
         io.say("Skipped (--skip-stage-e).")
@@ -796,32 +947,45 @@ def step_stage_e(io, conf, skip, rep):
                "to date." % os.path.relpath(conf, KIT))
         io.say("The idea gate asks for the dispatcher's details itself.")
         return None
+    # A RERUN RIGHT AFTER A SIGN-OFF (KIT-930): the installer stopped on a card in an earlier run,
+    # and a sign-off was recorded since. Its check would only say again that there is work, so the
+    # installer runs, and measures the sign-off itself. Its record is read from that check's start,
+    # but never from further back than a result may be reused.
     started = io.now()
-    code, _out = io.run([sys.executable, STAGE_E, "verify", "--conf", conf])
-    if io.interrupted:
-        rep.note("stage_e", OUT_UNMEASURED, "interrupted during its check")
-        return stop(io, INTERRUPTED % "Stage E's check", code or EX_BLOCKED)
-    if code == 0:
-        io.say("")
-        io.say("Stage E is up to date. Nothing to do.")
-        rep.note("stage_e", OUT_OK)
-        return None
-    if code != 10:
-        rep.note_code("stage_e", code, "its check")
-        # NOT "WORK OUTSTANDING": a step that FAILED (1), one that could not be measured
-        # (4), a settings problem (2), a refusal (3) or no password (5). None of those is a
-        # card a person signs, and none is something to carry on past.
-        return stop(io, STAGE_E_MEANS.get(code, "Stage E's check stopped with exit %d. The "
-                                                "lines above say why." % code)
-                    + STAGE_E_SKIP_HINT, code)
-    # WHAT IS OUTSTANDING DECIDES WHAT HAPPENS. The check records every step it measured,
-    # and only rows THIS check wrote are read: an older pass's record says nothing about
-    # now. A step `run` would change is work for the installer; a card is work for a
-    # person, and running the installer again cannot clear it.
-    steps = io.stage_e_steps(started)
+    resumed = resume_stage_e(io, rep)
+    if resumed:
+        floor = iso_at((parse_iso(started) or 0) - REUSE_SECONDS)
+        rep.stage_e_since = max(resumed["since"], floor)
+        steps = None
+    else:
+        rep.stage_e_since = started
+        code, _out = io.run([sys.executable, STAGE_E, "verify", "--conf", conf])
+        if io.interrupted:
+            rep.note("stage_e", OUT_UNMEASURED, "interrupted during its check")
+            return stop(io, INTERRUPTED % "Stage E's check", code or EX_BLOCKED)
+        if code == 0:
+            io.say("")
+            io.say("Stage E is up to date. Nothing to do.")
+            rep.note("stage_e", OUT_OK)
+            return None
+        if code != 10:
+            rep.note_code("stage_e", code, "its check")
+            # NOT "WORK OUTSTANDING": a step that FAILED (1), one that could not be measured
+            # (4), a settings problem (2), a refusal (3) or no password (5). None of those is a
+            # card a person signs, and none is something to carry on past.
+            return stop(io, STAGE_E_MEANS.get(code, "Stage E's check stopped with exit %d. The "
+                                                    "lines above say why." % code)
+                        + STAGE_E_SKIP_HINT, code)
+        # WHAT IS OUTSTANDING DECIDES WHAT HAPPENS. The check records every step it measured,
+        # and only rows THIS check wrote are read: an older pass's record says nothing about
+        # now. A step `run` would change is work for the installer; a card is work for a
+        # person, and running the installer again cannot clear it.
+        steps = io.stage_e_steps(started)
     if steps is None or any(o == "WOULD-CHANGE" for o in steps.values()):
         io.say("")
-        io.say("Stage E is not up to date: the check above names what is outstanding.")
+        io.say("Stage E's installer carries on from where it stopped: the lines above say why."
+               if resumed else "Stage E is not up to date: the check above names what is "
+                               "outstanding.")
         io.say("Updating it can restart the dispatcher, which cuts off any session it is "
                "running.")
         io.say("If it moves the clone, it also stops the notifier and the tech lead, where "
@@ -866,6 +1030,10 @@ def step_stage_e(io, conf, skip, rep):
         # out, and says NOT DONE for any it could not (KIT-661). The next pass's check tells
         # the two apart: if all that is left then is a card, it carries on.
         rep.note_code("stage_e", code, "its installer")
+        if code == EX_BLOCKED:
+            # KIT-930: kept for a rerun right after a sign-off. The run ends here, so what the
+            # sign-offs are at its end is what they were at this stop (save_results reads them).
+            rep.resume = {"since": rep.stage_e_since}
         return stop(io, STAGE_E_MEANS.get(code, "Stage E's installer stopped part way "
                                                 "(exit %d). The lines above say where." % code)
                     + " It loads the review jobs it unloaded again on its way out. Any it says "
@@ -1722,9 +1890,11 @@ def _read_small(path):
     return raw.decode("utf-8")
 
 
-def load_record(path, lstat=os.lstat, realpath=os.path.realpath, read=_read_small):
+def load_record(path, lstat=os.lstat, realpath=os.path.realpath, read=_read_small,
+                valid=None, what="a consent record"):
     """(state, record, why). State is 'none' (no file), 'ok' (a record only root could have
-    written) or 'unreadable' (anything else: never a match, so the consent is asked)."""
+    written) or 'unreadable' (anything else: never a match, so the consent is asked). `valid`
+    and `what` let the record of earlier results (KIT-930) be judged the same way."""
     try:
         why = untrusted_why(path, lstat, realpath)
     except FileNotFoundError:
@@ -1737,8 +1907,8 @@ def load_record(path, lstat=os.lstat, realpath=os.path.realpath, read=_read_smal
         data = json.loads(read(path))
     except (OSError, ValueError) as exc:
         return "unreadable", None, "it could not be read (%s)" % exc
-    if not _valid_record(data):
-        return "unreadable", None, "it is not a consent record this command wrote"
+    if not (valid or _valid_record)(data):
+        return "unreadable", None, "it is not %s this command wrote" % what
     return "ok", data, ""
 
 
@@ -1826,6 +1996,326 @@ def step_write_settings(io, writes):
                         "that, then run this again; it asks again for what is still missing."
                     % failed, 1)
     return None
+
+
+# --------------------------------------------------------------------------- #
+# A rerun carries on: what a run measured, kept for the next one (KIT-930)
+# --------------------------------------------------------------------------- #
+# Beside the consent record, with the same trust: root writes it through sudo from a private temp
+# file and it is read back; a later run trusts it only if it and every folder above it are root's
+# alone. A result in it is reused only while it is younger than REUSE_SECONDS, was measured on this
+# kit commit, and every settings file still has the bytes it had then. A result that waited on a
+# person is never kept, so a sign-off is always measured again, by its own installer.
+DEFAULT_RESULTS = "/Library/Application Support/claude-pipeline/results-record.json"
+RESULTS_VERSION = 1
+REUSE_SECONDS = 30 * 60
+# The steps whose result may stand for them on a rerun. Never the consent, nor the checkout: the
+# checkout is how a run finds out whether the code moved.
+REUSABLE_STEPS = ("skills", "stage_e", "sweep", "notifier", "bridge", "queue", "watch", "runner",
+                  "validator", "stage_a")
+STEP_TITLES = {"skills": "2. The skills in your home folder", "stage_e": "3. Stage E, the review jobs",
+               "sweep": "3b. The sweep, what finished runs leave behind",
+               "watch": "3g. The hourly health check", "stage_a": "4. The idea gate"}
+CARD_ID = re.compile(r"^[A-Z]{2}-[A-Z0-9]{1,12}$")
+# The card scripts that print one card by its id (`card <ID>`): each card holds the exact line that
+# signs it. The selftest pins this list against each script's own source.
+CARD_READERS = ("pipeline_stage_e_setup.py", "pipeline_conflict_waker_setup.py",
+                "pipeline_stage_a_setup.py", "pipeline_notifier_setup.py", "pipeline_bridge_setup.py",
+                "pipeline_validator_setup.py", "pipeline_chat_lane_setup.py")
+
+
+def step_title(key):
+    """The heading a step prints, by its key."""
+    for spec in JOB_STEPS + (RUNNER_STEP, VALIDATOR_STEP):
+        if spec["key"] == key:
+            return "%s. %s" % (spec["number"], spec["title"])
+    return STEP_TITLES.get(key, key)
+
+
+def settings_files(parts, files):
+    """Every settings file this run reads or a part names, where this Mac keeps it: what a result
+    is bound to, beside the commit."""
+    found = set(v for v in files.values() if v)
+    for part in parts:
+        path = settings_path(part, files)
+        if path:
+            found.add(path)
+        for cmd in (part.get("check"), part.get("apply")):
+            found.update(conf_path(a, files) for a in (cmd or {}).get("args") or []
+                         if a.endswith(".conf"))
+    return sorted(os.path.abspath(p) for p in found)
+
+
+def fingerprint_files(paths, listdir=os.listdir):
+    """{path: sha256 of its bytes | "absent" | None} for each path, and for every other `.conf` file
+    in the folders they are in, since a setting may name another settings file by its path (the
+    conflict waker's is named that way). None is a file, or a folder, that could not be read: it
+    is never equal to anything, so nothing measured under it is reused."""
+    want = set(os.path.abspath(p) for p in paths if p)
+    out = {}
+    for folder in sorted(set(os.path.dirname(p) for p in want)):
+        try:
+            want.update(os.path.join(folder, n) for n in listdir(folder) if n.endswith(".conf"))
+        except FileNotFoundError:
+            continue
+        except OSError:
+            out[os.path.join(folder, "*.conf")] = None
+    for path in sorted(want):
+        try:
+            with open(path, "rb") as fh:
+                out[path] = hashlib.sha256(fh.read()).hexdigest()
+        except FileNotFoundError:
+            out[path] = "absent"
+        except OSError:
+            out[path] = None
+    return out
+
+
+def signoffs_fingerprint(path):
+    """A sha256 of the sign-offs an installer's record holds, "absent" when there is no record, or
+    None when it cannot be read. Only a change matters: one sign-off made or removed changes it."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return "absent"
+    except (OSError, ValueError):
+        return None
+    signed = data.get("attestations", {}) if isinstance(data, dict) else None
+    if not isinstance(signed, dict):
+        return None
+    return hashlib.sha256(json.dumps(signed, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def parse_iso(text):
+    """Seconds since the epoch for a UTC stamp in the form io.now() writes, or None."""
+    import calendar
+    try:
+        return calendar.timegm(time.strptime(str(text), "%Y-%m-%dT%H:%M:%SZ"))
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
+def age_words(seconds):
+    minutes = int(seconds // 60)
+    return "under a minute" if minutes < 1 else "%d minute%s" % (minutes, "" if minutes == 1 else "s")
+
+
+def _strings_map(value):
+    return isinstance(value, dict) and all(isinstance(k, str) and (v is None or isinstance(v, str))
+                                           for k, v in value.items())
+
+
+# The fields each kind of kept result has, and no others. None of them is free text: a step's key
+# and outcome come from fixed lists, a check is a part's own command from the parts list, the
+# settings are file paths with a sha256 each, and Stage E's stop holds step ids, card ids and the
+# sign-offs' sha256s. So the record holds no secret by its shape, and no check's words ever.
+RESULT_FIELDS = {"step": {"kind", "key", "outcome", "at", "commit", "settings"},
+                 "check": {"kind", "argv", "code", "at", "commit", "settings"},
+                 "resume": {"kind", "key", "since", "ledgers", "cards", "at", "commit", "settings"}}
+
+
+def _valid_results(data):
+    """True for a record of results this command wrote: every entry in the shape it writes."""
+    try:
+        if data["version"] != RESULTS_VERSION or not isinstance(data["saved_at"], str) \
+                or not isinstance(data["results"], list) or set(data) != {"version", "saved_at",
+                                                                          "results"}:
+            return False
+        for r in data["results"]:
+            if not (set(r) == RESULT_FIELDS.get(r.get("kind")) and isinstance(r["at"], str)
+                    and isinstance(r["commit"], str) and _strings_map(r["settings"])):
+                return False
+            if r["kind"] == "step":
+                ok = r["key"] in REUSABLE_STEPS and r["outcome"] in (OUT_OK, OUT_UPDATED)
+            elif r["kind"] == "check":
+                ok = (isinstance(r["argv"], list) and bool(r["argv"])
+                      and all(isinstance(a, str) for a in r["argv"])
+                      and type(r["code"]) is int and r["code"] == 0)
+            else:
+                ok = (r["key"] == "stage_e" and isinstance(r["since"], str)
+                      and _strings_map(r["ledgers"]) and isinstance(r["cards"], list)
+                      and all(isinstance(c, list) and len(c) == 2
+                              and all(isinstance(x, str) for x in c) and CARD_ID.match(c[1])
+                              for c in r["cards"]))
+            if not ok:
+                return False
+        return True
+    except (KeyError, TypeError, AttributeError):
+        return False
+
+
+def load_results(path, lstat=os.lstat, realpath=os.path.realpath, read=_read_small):
+    """(state, data, why) for the record of earlier results: judged as the consent record is."""
+    return load_record(path, lstat, realpath, read, valid=_valid_results, what="a record of results")
+
+
+def reuse_why_not(entry, now, commit, prints):
+    """None when a saved result may be reused now; else why not, in words. It must be younger than
+    REUSE_SECONDS (a time it cannot read, or one after now, is never young), measured on this
+    commit, and under the same bytes in every settings file: one that is not there now, or could
+    not be read then or now, is a change."""
+    at = parse_iso(entry.get("at"))
+    if now is None or at is None:
+        return "its time could not be read"
+    if at > now:
+        return "it is dated after now"
+    if now - at > REUSE_SECONDS:
+        return "older than %d minutes" % (REUSE_SECONDS // 60)
+    if not commit or entry.get("commit") != commit:
+        return "measured on other code"
+    was = entry.get("settings") or {}
+    if any(was.get(p) is None or prints.get(p) is None or was.get(p) != prints.get(p)
+           for p in set(was) | set(prints)):
+        return "a settings file changed since"
+    return None
+
+
+def step_results(io, rep, path, fresh, wanted):
+    """What earlier runs measured, read after the consent and the checkout (KIT-930). Each saved
+    result that may be reused goes in rep.cache; the rest are counted, by why not. It never stops
+    the run, and an unreadable record is said, never read as "nothing to reuse"."""
+    heading(io, "1b. What earlier runs measured")
+    rep.cache = {"steps": {}, "checks": {}, "resume": None}
+    if fresh:
+        io.say("Not used (--fresh): every part is measured again.")
+        return None
+    state, data, why = io.read_results(path)
+    if state == "none":
+        io.say("Nothing is saved from an earlier run, so every part is measured.")
+        return None
+    if state != "ok":
+        io.say("The record of earlier results cannot be used (%s), so every part is measured "
+               "again." % why)
+        return None
+    now, prints = parse_iso(io.now()), io.fingerprint(wanted)
+    kept, why_not = 0, {}
+    for entry in data["results"]:
+        why = reuse_why_not(entry, now, rep.commit, prints)
+        if why:
+            why_not[why] = why_not.get(why, 0) + 1
+            continue
+        kept += 1
+        if entry["kind"] == "step":
+            rep.cache["steps"][entry["key"]] = entry
+        elif entry["kind"] == "check":
+            rep.cache["checks"][tuple(entry["argv"])] = entry
+        else:
+            rep.cache["resume"] = entry
+    io.say("The run at %s saved %d result(s); %d may be reused here. A result is reused only while "
+           "it is under %d minutes old, measured on this code and under these settings; a part "
+           "that waited on you is always measured again." % (
+               data["saved_at"], len(data["results"]), kept, REUSE_SECONDS // 60))
+    for why, n in sorted(why_not.items()):
+        io.say("  Not reused, %d: %s." % (n, why))
+    return None
+
+
+def note_reused(io, rep, what, entry, label):
+    """The words a reused result carries on its line; `label` names it on the closing list."""
+    age = max(0, (parse_iso(io.now()) or 0) - (parse_iso(entry["at"]) or 0))
+    rep.reused.append((label, age, entry["at"]))
+    return "reused, not measured again: %s %s ago, in this command's run at %s" % (
+        what, age_words(age), entry["at"])
+
+
+def reuse_step(io, rep, key):
+    """True when this step's saved result stands for it now (KIT-930): it ended up to date, on this
+    code, under these settings, less than REUSE_SECONDS ago. The step is not run; its heading
+    and its line say so, with the result's age and source."""
+    entry = ((rep.cache or {}).get("steps") or {}).get(key)
+    if not entry:
+        return False
+    heading(io, step_title(key))
+    detail = note_reused(io, rep, "up to date when this step last ran", entry,
+                         "step %s: up to date" % step_title(key))
+    io.say("Up to date when this step last ran, %s ago (%s); nothing it is bound to has changed, "
+           "so it is not run again." % (age_words(rep.reused[-1][1]), entry["at"]))
+    rep.note(key, OUT_OK, detail)
+    rep.reused_steps[key] = entry
+    return True
+
+
+def resume_stage_e(io, rep):
+    """The saved stop of Stage E's installer, when this run may carry on from it: the stop may be
+    reused, and a sign-off has been recorded since in a record Stage E's steps read. Its check is
+    then not run again, and its installer runs, which measures that sign-off itself. None
+    otherwise, said in one line when there was a stop to carry on from."""
+    entry = (rep.cache or {}).get("resume")
+    if not entry:
+        return None
+    age = max(0, (parse_iso(io.now()) or 0) - (parse_iso(entry["at"]) or 0))
+    cards = ", ".join(c for _s, c in entry["cards"]) or "a card"
+    io.say("Its installer stopped %s ago (%s), on %s." % (age_words(age), entry["at"], cards))
+    now = io.signoff_ledgers() or {}
+    if not now or any(v is None for v in now.values()) or any(
+            v is None for v in entry["ledgers"].values()):
+        io.say("The records its sign-offs are kept in could not all be read, so its check runs "
+               "again.")
+        return None
+    if now == entry["ledgers"]:
+        io.say("No sign-off has been recorded since, so its check runs again.")
+        return None
+    io.say("A sign-off has been recorded since, so it carries on from there: its installer runs "
+           "now and measures that sign-off, and its check is not run first.")
+    note_reused(io, rep, "Stage E's check found work outstanding", entry,
+                "Stage E's check: work outstanding, and its installer stopped on a card")
+    return entry
+
+
+def results_doc(rep, when, ledgers=None):
+    """The record this run leaves for the next one: each step that ended up to date, each check
+    that passed, and Stage E's stop on a card, with its cards and `ledgers`, the sign-offs as
+    they stood. A reused result is kept as it was saved, with its own time, so it is never reused
+    past its age."""
+    results = []
+    for key in sorted(rep.steps):
+        outcome = rep.steps[key][0]
+        if key in rep.reused_steps:
+            results.append(rep.reused_steps[key])
+        elif key in REUSABLE_STEPS and outcome in (OUT_OK, OUT_UPDATED) and key in rep.noted:
+            at, prints = rep.noted[key]           # its detail is words, and is never kept
+            results.append({"kind": "step", "key": key, "outcome": outcome, "at": at,
+                            "commit": rep.commit, "settings": prints})
+    for argv in sorted(rep.passed):
+        at, prints = rep.passed[argv]
+        results.append({"kind": "check", "argv": list(argv), "code": 0, "at": at,
+                        "commit": rep.commit, "settings": prints})
+    results.extend(rep.reused_checks[a] for a in sorted(rep.reused_checks) if a not in rep.passed)
+    if rep.resume and rep.resume.get("since") and "stage_e" in rep.noted:
+        at, prints = rep.noted["stage_e"]         # stamped when the stop was noted
+        results.append({"kind": "resume", "key": "stage_e", "since": rep.resume["since"],
+                        "cards": [list(sc) for sc in rep.stage_e_cards or []],
+                        "ledgers": ledgers if isinstance(ledgers, dict) else {},
+                        "at": at, "commit": rep.commit, "settings": prints})
+    return {"version": RESULTS_VERSION, "saved_at": when, "results": results}
+
+
+def save_results(io, rep, path):
+    """Keep what this run measured for the next one, after a run that got past the consent and was
+    not interrupted. A failure is said, and changes no exit code: the next run measures again."""
+    if not rep.consented or io.interrupted:
+        return
+    io.say("")
+    if not rep.commit:
+        io.say("What this run measured is not kept: the kit checkout's commit was not read in this "
+               "run, so the next run measures everything again.")
+        return
+    doc = results_doc(rep, io.now(), io.signoff_ledgers() if rep.resume else None)
+    if not _valid_results(doc):
+        # Never written in another shape than a later run would trust: that would be a defect here.
+        io.say("What this run measured is not kept: it is not in the shape a record of results "
+               "has, so the next run measures everything again.")
+        return
+    text = json.dumps(doc, indent=2, sort_keys=True) + "\n"
+    try:
+        failed = io.write_results(path, text)
+    except KeyboardInterrupt:
+        failed = "interrupted"
+    io.say("What this run measured is kept for the next run: %d result(s), each reusable until it "
+           "is %d minutes old." % (len(doc["results"]), REUSE_SECONDS // 60) if not failed else
+           "What this run measured is not kept (%s), so the next run measures everything again."
+           % failed)
 
 
 # --------------------------------------------------------------------------- #
@@ -1978,16 +2468,72 @@ def outcome_of_check(code, out):
     return OUT_UNMEASURED, "its check stopped with exit %d" % code
 
 
+def off_by_key(io, part, path):
+    """Why a part is off on this Mac by its own settings (KIT-965), or None. The parts list names
+    the key that leaves it off when empty (`settings.off_when_empty`), and its settings file has
+    that key empty or not at all. A file that cannot be read is never "off": its check runs."""
+    key = (part.get("settings") or {}).get("off_when_empty")
+    if not key or not path:
+        return None
+    value = io.conf_key(path, key)
+    if value is None or value.strip():
+        return None
+    return "%s is empty in %s" % (key, os.path.basename(path))
+
+
+def look_once(io, rep, argv, seen):
+    """(exit code, output, the saved entry it reused or None) of a part's read-only check, run once
+    per run. A pass an earlier run saved, which may be reused (KIT-930), stands for it; a pass
+    measured now is kept with its time and settings, for the next run."""
+    key = tuple(argv)
+    if key not in seen:
+        entry = ((rep.cache or {}).get("checks") or {}).get(key)
+        if entry is not None:
+            rep.reused_checks[key] = entry
+            seen[key] = (0, "")
+        else:
+            seen[key] = io.measure(argv)
+            if seen[key][0] == 0 and rep.stamp is not None:
+                rep.passed[key] = rep.stamp()
+    return seen[key][0], seen[key][1], rep.reused_checks.get(key)
+
+
+def look_unreached(io, rep, part, files, rec, texts):
+    """A part whose step this run never reached, looked at once, read-only (KIT-930), so the cards
+    it names are on the short list. Its line keeps "not reached": its own step, which may have
+    work to do, did not run, and not every step stops at a missing settings file (the idea gate's
+    writes its own). The detail says what the look found. A settings file that is absent, or a
+    key that leaves the part off, is said there, and its check is not run."""
+    path = settings_path(part, files)
+    off = missing(path) if path and not io.exists(path) else off_by_key(io, part, path)
+    if off:
+        rec["detail"] = "the run stopped before its step; %s" % off
+        return
+    code, out, entry = look_once(io, rep, check_argv(part, files), rep.seen)
+    words = outcome_of_check(code, out)[1] or "it found nothing outstanding"
+    rec["detail"] = "the run stopped before its step; looked at read-only: %s" % (
+        note_reused(io, rep, "its check passed", entry, "%s: its check passed" % part["name"])
+        if entry else words)
+    texts[part["id"]] = out or ""
+
+
 def build_records(io, parts, rep, files, reached):
     """([record], [names with no check of their own], {part id: its check's output}).
     A record is {id, name, outcome, detail}. `reached` is False when a step stopped the
-    run: the checks of the other parts are then not run, and say so."""
+    run. A run that got past the consent and the checkout, and was not interrupted, still looks
+    at the parts it did not reach, read-only (KIT-930); one that did not leaves them unlooked at,
+    and says so."""
     try:
         import pipeline_parts
         ordered = pipeline_parts.order(parts)
     except (ImportError, ValueError):
         ordered = list(parts)
     records, nocheck, texts, seen, group = [], [], {}, rep.seen, {}
+    look = (reached or (rep.consented and rep.commit is not None)) and not io.interrupted
+    if (rep.stage_e_since and rep.steps.get("stage_e", ("",))[0] == OUT_WAITING
+            and not io.interrupted):
+        # KIT-930: every card Stage E's own record names for the steps measured in this run.
+        rep.stage_e_cards = io.stage_e_cards(rep.stage_e_since)
     for part in ordered:
         rec = {"id": part["id"], "name": part["name"], "outcome": OUT_NOT_REACHED,
                "detail": "the run stopped before this part"}
@@ -1995,6 +2541,8 @@ def build_records(io, parts, rep, files, reached):
         if key:
             if key in rep.steps:
                 rec["outcome"], rec["detail"] = rep.steps[key]
+            elif look and part.get("check"):
+                look_unreached(io, rep, part, files, rec, texts)
             if (io.auto and key in rep.asked and part.get("person_steps")
                     and rec["outcome"] != OUT_NOT_REACHED):
                 # A NOTE, never an outcome: the part keeps what its own result said, so a
@@ -2002,24 +2550,32 @@ def build_records(io, parts, rep, files, reached):
                 rec["detail"] = "%s; %s" % (rec["detail"], ASKED_DETAIL) if rec["detail"] \
                     else ASKED_DETAIL
             if rec["outcome"] == OUT_WAITING and part.get("check") and not io.interrupted:
-                # The step ran its installer uncaptured, so its card ids are read from the
-                # part's own check, once more, read-only.
-                argv = check_argv(part, files)
-                if tuple(argv) not in seen:
-                    seen[tuple(argv)] = io.measure(argv)
-                texts[part["id"]] = seen[tuple(argv)][1] or ""
+                if key == "stage_e" and rep.stage_e_cards is not None:
+                    # KIT-930: Stage E's own record names every card its check and installer met
+                    # in this run, so its check is not run a third time to read them.
+                    texts[part["id"]] = " ".join(card for _s, card in rep.stage_e_cards)
+                else:
+                    # The step ran its installer uncaptured, so its card ids are read from the
+                    # part's own check, once more, read-only.
+                    argv = check_argv(part, files)
+                    if tuple(argv) not in seen:
+                        seen[tuple(argv)] = io.measure(argv)
+                    texts[part["id"]] = seen[tuple(argv)][1] or ""
                 group.setdefault(key, []).append((rec, part))
         elif part.get("check"):
             path = settings_path(part, files)
+            off = None if path and not io.exists(path) else off_by_key(io, part, path)
             if path and not io.exists(path):
                 rec["outcome"] = OUT_OFF
                 rec["detail"] = missing(path)
-            elif reached and not io.interrupted:
-                argv = check_argv(part, files)
-                if tuple(argv) not in seen:
-                    seen[tuple(argv)] = io.measure(argv)
-                code, out = seen[tuple(argv)]
+            elif off:
+                rec["outcome"], rec["detail"] = OUT_OFF, off
+            elif look:
+                code, out, entry = look_once(io, rep, check_argv(part, files), seen)
                 rec["outcome"], rec["detail"] = outcome_of_check(code, out)
+                if entry:
+                    rec["detail"] = note_reused(io, rep, "its check passed", entry,
+                                                "%s: its check passed" % part["name"])
                 texts[part["id"]] = out or ""
         elif part["id"] == "host" and not io.interrupted:
             rec["outcome"], rec["detail"] = host_outcome(io)
@@ -2069,12 +2625,33 @@ def cards_named(text, card):
     return bool(re.search(r"(?<![A-Za-z0-9-])%s(?![A-Za-z0-9-])" % re.escape(card), text))
 
 
-def short_list(parts, records, texts):
-    """The cards a waiting part's own output names, and the parts that wait without one."""
+def read_card_line(script, card):
+    """How to read one card, which holds the exact line that signs it (KIT-930), when its script
+    prints a card by its id; else nothing, and the card is in that script's own lines."""
+    if os.path.basename(script or "") in CARD_READERS:
+        return ["             read it: python3 %s card %s" % (script, card)]
+    return []
+
+
+def stage_e_card(card):
+    """(title, is a sign-off) of one of Stage E's own cards, or None when it has no such card."""
+    try:
+        import pipeline_stage_e_setup as se
+        got = se.CARDS.get(card)
+    except ImportError:
+        return None
+    return (got["title"], bool(got.get("attest"))) if got else None
+
+
+def short_list(parts, records, texts, stage_e_cards=None):
+    """The cards a waiting part's own output names, and the parts that wait without one. A part
+    the run did not reach, looked at read-only, has its cards here too (KIT-930), and so has a
+    card Stage E's own record names that no part lists (its own title is the words)."""
     by_id = dict((p["id"], p) for p in parts)
     mine, signs, lone, done = [], [], [], set()
     for rec in records:
-        if rec["outcome"] != OUT_WAITING:
+        looked = rec["outcome"] == OUT_NOT_REACHED and rec["id"] in texts
+        if rec["outcome"] != OUT_WAITING and not looked:
             continue
         part = by_id[rec["id"]]
         text = texts.get(rec["id"])
@@ -2084,17 +2661,35 @@ def short_list(parts, records, texts):
             if card and cards_named(text or "", card) and card not in done:
                 done.add(card)
                 found = True
-                row = "  %-8s %s (%s)" % (card, step["words"], part["name"])
-                (mine if step["kind"] == "only-a-person" else signs).append(row)
+                row = ["  %-8s %s (%s)" % (card, step["words"], part["name"])] + read_card_line(
+                    step.get("card_in"), card)
+                (mine if step["kind"] == "only-a-person" else signs).extend(row)
             elif card and card in done:
                 found = True
-        if not found:
+        if not found and not looked:
             lone.append(part["name"])
+    listed = set(st.get("card") for p in parts for st in p.get("person_steps") or [])
+    for sid, card in stage_e_cards or []:
+        known = stage_e_card(card)
+        if card in done or card in listed or known is None:
+            continue
+        done.add(card)
+        (signs if known[1] else mine).extend(
+            ["  %-8s %s (Stage E's step %s)" % (card, known[0], sid)]
+            + read_card_line("scripts/pipeline_stage_e_setup.py", card))
     return mine, signs, lone
 
 
 def finish(io, parts, rep, files, reached, stop_code, stopped, unreadable=None):
-    """Print the lines and the short list; return the exit code."""
+    """Print the lines and the short list; keep what this run measured for the next one
+    (KIT-930); return the exit code."""
+    code = _finish(io, parts, rep, files, reached, stop_code, stopped, unreadable)
+    if not unreadable:
+        save_results(io, rep, rep.results_path or DEFAULT_RESULTS)
+    return code
+
+
+def _finish(io, parts, rep, files, reached, stop_code, stopped, unreadable=None):
     heading(io, "Where every part stands")
     if unreadable:
         io.say("The list of parts could not be read (%s), so no part was looked at." % unreadable)
@@ -2107,13 +2702,27 @@ def finish(io, parts, rep, files, reached, stop_code, stopped, unreadable=None):
                                  " (%s)" % rec["detail"] if rec["detail"] else ""))
     if nocheck:
         io.say("No check of their own: %s." % "; ".join(nocheck))
+    if rep.reused:
+        # KIT-930: which earlier results stood for a measurement, and how old each one was.
+        io.say("")
+        io.say("Reused from earlier runs, not measured again (each under %d minutes old, on this "
+               "code and under these settings):" % (REUSE_SECONDS // 60))
+        for what, age, at in rep.reused:
+            io.say("  - %s: %s old (%s)" % (what, age_words(age), at))
+        io.say("To measure everything again: run it with --fresh.")
+    if not reached and rep.consented and rep.commit is not None and not io.interrupted:
+        io.say("")
+        io.say("The parts after the stop were looked at read-only, so every card that waits is "
+               "listed below. Sign them, then run this again: it carries on from the step that "
+               "stopped.")
     code = end_code(stop_code, records, stopped)
     counts = dict((o, sum(1 for r in records if r["outcome"] == o)) for o in OUTCOMES)
     if counts[OUT_UNMEASURED] or counts[OUT_NOT_REACHED]:
         io.say("")
         io.say("%d part(s) could not be measured and %d were not reached, so this run is not "
                "a pass (exit %d)." % (counts[OUT_UNMEASURED], counts[OUT_NOT_REACHED], code))
-    mine, signs, lone = short_list(parts, records, texts)
+    waiting_e = rep.steps.get("stage_e", ("", ""))[0] == OUT_WAITING
+    mine, signs, lone = short_list(parts, records, texts, rep.stage_e_cards if waiting_e else None)
     io.say("")
     hosts = [r for r in records if r["id"] == "host" and r["outcome"] == OUT_WAITING]
     if hosts:
@@ -2302,6 +2911,9 @@ def main(argv=None, io=None):
     parser.add_argument("--skip-stage-e", action="store_true",
                         help="do not check or update the review jobs")
     parser.add_argument("--check", action="store_true", help="only look: change nothing, ask nothing, no terminal needed")
+    parser.add_argument("--fresh", action="store_true",
+                        help="measure everything again: reuse no result an earlier run kept")
+    parser.add_argument("--results-record", default=DEFAULT_RESULTS, help=argparse.SUPPRESS)
     parser.add_argument("--pulled-from", default=None, help=argparse.SUPPRESS, type=commit_id)
     parser.add_argument("--chosen-mode", default=None, choices=sorted(MODE_WORDS),
                         help=argparse.SUPPRESS)
@@ -2362,8 +2974,12 @@ def main(argv=None, io=None):
             key = step_of(part)
             if key and part.get("check") and key not in rep.checks:
                 rep.checks[key] = check_argv(part, files)
+        # KIT-930: each result is stamped with its time and the settings it was measured under.
+        wanted = settings_files(parts, files)
     except (OSError, ValueError, ImportError, KeyError, TypeError) as exc:
-        parts, unreadable = [], "%s: %s" % (type(exc).__name__, exc)
+        parts, unreadable, wanted = [], "%s: %s" % (type(exc).__name__, exc), []
+    rep.stamp = lambda: (io.now(), io.fingerprint(wanted))
+    rep.results_path = os.path.abspath(args.results_record)
 
     # THE FIRST SCREEN. Only now, past the three refusals, is anything read: first the consent
     # record (its mode is the default), then the person is asked which way this run goes.
@@ -2399,21 +3015,33 @@ def main(argv=None, io=None):
                             "you are ready.", EX_BLOCKED)
             return finish(io, parts, rep, files, False, code, True, unreadable)
 
-    steps = (lambda: step_consent_and_mode(io, record_path, mode, state, rec, why, parts, files,
-                                           args.skip_stage_e, unreadable, writes),
-             lambda: step_checkout(io, argv, args.no_pull, rep, args.pulled_from, mode),
-             lambda: step_skills(io, rep),
-             lambda: step_stage_e(io, files["stage-e.conf"], args.skip_stage_e, rep),
-             lambda: step_sweep(io, files["sweep.conf"], rep)) \
-        + tuple((lambda spec=spec: step_job(io, spec, files, rep)) for spec in JOB_STEPS) \
-        + (lambda: step_watch(io, files["update.conf"], rep),) \
-        + (lambda: step_job(io, RUNNER_STEP, files, rep),) \
-        + (lambda: step_job(io, VALIDATOR_STEP, files, rep),) \
-        + (lambda: step_stage_a(io, files["stage-a.conf"], files["stage-e.conf"], rep),)
+    def consent():
+        code = step_consent_and_mode(io, record_path, mode, state, rec, why, parts, files,
+                                     args.skip_stage_e, unreadable, writes)
+        rep.consented = code is None
+        return code
+
+    # Each step with the key its result is kept by (KIT-930): a step whose kept result may be
+    # reused is not run again. None is a step that always runs: the consent, the checkout, and the
+    # reading of what earlier runs kept. --skip-stage-e runs Stage E's step, which says it skipped.
+    steps = ((None, consent),
+             (None, lambda: step_checkout(io, argv, args.no_pull, rep, args.pulled_from, mode)),
+             (None, lambda: step_results(io, rep, rep.results_path, args.fresh, wanted)),
+             ("skills", lambda: step_skills(io, rep)),
+             (None if args.skip_stage_e else "stage_e",
+              lambda: step_stage_e(io, files["stage-e.conf"], args.skip_stage_e, rep)),
+             ("sweep", lambda: step_sweep(io, files["sweep.conf"], rep))) \
+        + tuple((spec["key"], (lambda spec=spec: step_job(io, spec, files, rep)))
+                for spec in JOB_STEPS) \
+        + (("watch", lambda: step_watch(io, files["update.conf"], rep)),) \
+        + (("runner", lambda: step_job(io, RUNNER_STEP, files, rep)),) \
+        + (("validator", lambda: step_job(io, VALIDATOR_STEP, files, rep)),) \
+        + (("stage_a", lambda: step_stage_a(io, files["stage-a.conf"], files["stage-e.conf"],
+                                            rep)),)
     code, reached, stopped = None, True, False
     try:
-        for n, step in enumerate(steps):
-            code = step()
+        for n, (key, step) in enumerate(steps):
+            code = None if key and reuse_step(io, rep, key) else step()
             if code is not None:
                 reached = n == len(steps) - 1
                 stopped = not reached
@@ -2533,6 +3161,45 @@ class FakeIo(Io):
     def wait(self, seconds):
         self.waits = tuple(self.waits) + (seconds,)
 
+    # KIT-930, a rerun carries on. The record of earlier results reads as `results` (state, data,
+    # why), and what a run keeps goes to `results_written`, apart from the consent record's seams,
+    # so every case written before it keeps its meaning. Every settings file reads as `prints`
+    # all through a run; Stage E's own record names `cards` (None: it cannot be read, so the lines
+    # read its check once more, as before); the sign-off records read as `ledgers`, a list being
+    # answered in turn. `clock` is what now() says.
+    clock = "2026-10-03T00:00:00Z"
+    results = ("none", None, "no record yet")
+    results_reads = ()
+    results_written = ()
+    results_failure = None
+    prints = {"/kit/stage-e.conf": "a1"}
+    cards = None
+    cards_since = ()
+    ledgers = {"stage-e": "absent", "conflict-waker": "absent"}
+
+    def read_results(self, path):
+        self.results_reads = tuple(self.results_reads) + (path,)
+        return self.results
+
+    def write_results(self, path, text):
+        if self.results_failure:
+            return self.results_failure
+        self.results_written = tuple(self.results_written) + ((path, text),)
+        return None
+
+    def fingerprint(self, paths):
+        return dict(self.prints)
+
+    def stage_e_cards(self, since):
+        self.cards_since = tuple(self.cards_since) + (since,)
+        return None if self.cards is None else [tuple(c) for c in self.cards]
+
+    def signoff_ledgers(self):
+        got = self.ledgers
+        if isinstance(got, list):
+            return dict(got.pop(0) if len(got) > 1 else got[0])
+        return dict(got)
+
     def run(self, argv, capture=False):
         k = self.key(argv)
         if argv[0] != "git":
@@ -2593,7 +3260,7 @@ class FakeIo(Io):
         return got.pop(0) if isinstance(got, list) else got
 
     def now(self):
-        return "2026-10-03T00:00:00Z"
+        return self.clock
 
     def prompt(self, question):
         self.asked.append(question)
@@ -2610,6 +3277,14 @@ class FakeIo(Io):
     def read_conf(self, path):
         self.conf_reads.append(path)
         return self.conf.get(path)
+
+    key_reads = ()
+
+    def conf_key(self, path, key):
+        """KIT-965's one-key read: a file this case did not script cannot be read (None)."""
+        self.key_reads = tuple(self.key_reads) + ((path, key),)
+        conf = self.conf.get(path)
+        return None if conf is None else conf.get(key, "")
 
     def missing_values(self, update_conf, bridge_conf):
         self.asked_files.append((update_conf, bridge_conf))
@@ -2699,7 +3374,10 @@ def selftest_look(check, base, se_conf, tmp):
             raise AssertionError("--check called %s%r" % (name, a[:2]))
         return refused
     for name in ("ask", "prompt", "line", "sudo_once", "make_sudo", "read_record",
-                 "write_record", "read_conf", "stage_e_steps", "restart", "run"):
+                 "write_record", "read_conf", "stage_e_steps", "restart", "run",
+                 # KIT-930: a look never reads or keeps the record of earlier results.
+                 "read_results", "write_results", "fingerprint", "stage_e_cards",
+                 "signoff_ledgers"):
         setattr(Untouchable, name, refuses(name))
 
     class Pressed(Untouchable):
@@ -2914,11 +3592,16 @@ def selftest_look(check, base, se_conf, tmp):
                          present=[kit("notifier.conf")])
     at = lambda s: io.lines.index(s) if s in io.lines else len(io.lines)       # noqa: E731
     only, signs = at("Only you can do these:"), at("Sign-offs still asked for:")
-    first = lambda lines: [(ln.split() or [""])[0] for ln in lines]            # noqa: E731
+    # A card's row is followed by how to read it (KIT-930); the rows themselves start with the id.
+    first = lambda lines: [(ln.split() or [""])[0] for ln in lines             # noqa: E731
+                           if not ln.lstrip().startswith("read it:")]
     check("kit736-short-list-splits-by-kind-and-matches-whole-card-ids",
-          (first(io.lines[only + 1:signs]), first(io.lines[signs + 1:signs + 2]), code,
+          (first(io.lines[only + 1:signs]), first(io.lines[signs + 1:signs + 3]), code,
            io.measured.count(paging)),
           (["CK-N1"], ["CK-N3"], EX_BLOCKED, 1))
+    check("kit930-each-card-row-says-how-to-read-it-in-a-look-too",
+          io.lines[signs + 2:signs + 3],
+          ["             read it: python3 scripts/pipeline_notifier_setup.py card CK-N3"])
     code, io, err = look(codes={"pipeline_stage_e_setup.py verify": 10},
                          out={"pipeline_stage_e_setup.py verify": "CK-11 waits"})
     check("kit736-a-waiting-step-part-takes-its-cards-from-its-check-run-once",
@@ -3040,6 +3723,388 @@ def selftest_look(check, base, se_conf, tmp):
     check("kit736-the-flag-is-in-the-help-and-the-docstring",
           ("--check" in helped, "pipeline_install.py --check" in (__doc__ or ""),
            "TO ONLY LOOK" in (__doc__ or "")), (True, True, True))
+
+    # 12. KIT-965 IN A LOOK: Stage E's own app, off by its empty key, reads "off on this Mac" here
+    #     too, and its check does not run; set, the check runs, and an exit 1 is still a 4.
+    code, io, err = look(conf={se_conf: {"GITHUB_APP_ID": ""}})
+    check("kit965-a-look-says-the-app-is-off-by-its-key",
+          (err, rec(io)["review-identity"], "pipeline_stage_e_app.py verify" in io.measured, code),
+          (None, (OUT_OFF, "GITHUB_APP_ID is empty in stage-e.conf"), False, EX_OK))
+    code, io, err = look(conf={se_conf: {"GITHUB_APP_ID": "123"}},
+                         codes={"pipeline_stage_e_app.py verify": 1})
+    check("kit965-a-look-with-the-app-set-still-measures-and-a-failure-is-4",
+          (err, rec(io)["review-identity"][0], code), (None, OUT_UNMEASURED, EX_UNMEASURED))
+    # KIT-930: a look neither reads nor keeps the record of earlier results (the Untouchable
+    # refuses each of its seams), so it measures every part, fresh.
+    code, io, err = look()
+    check("kit930-a-look-never-reads-or-keeps-earlier-results",
+          (err, io.results_reads, io.results_written), (None, (), ()))
+
+
+def selftest_rerun(check, base, se_conf, tmp, healthy):
+    """KIT-930 and KIT-965, and no other case: one run lists every card, the parts it did not
+    reach included; a rerun right after a sign-off carries on, reusing only results that may be
+    reused, and says which, and how old; every result stays bound to its time, its code and its
+    settings; and Stage E's own app, off by its empty key, reads "off on this Mac"."""
+    import collections
+
+    def run(codes=None, answers=(), argv=(), setup=None, **kw):
+        io = FakeIo(codes=dict(healthy, **(codes or {})), answers=answers, **kw)
+        for name, value in (setup or {}).items():
+            setattr(io, name, value)
+        return main(base + list(argv), io=io), io
+
+    def line(io, part_id):
+        return dict((r["id"], (r["outcome"], r["detail"])) for r in (io.records or []))[part_id]
+
+    def kept(io):
+        return json.loads(io.results_written[-1][1]) if io.results_written else {"results": []}
+
+    def entries(doc, kind):
+        return [r for r in doc["results"] if r["kind"] == kind]
+
+    def said(io, words):
+        return any(words in ln for ln in io.lines)
+
+    t0, t4, t31 = "2026-10-03T00:00:00Z", "2026-10-03T00:04:00Z", "2026-10-03T00:31:00Z"
+    stopped_on_card = {"pipeline_stage_e_setup.py verify": 10, "pipeline_stage_e_setup.py run": 10}
+    stop_steps = [{"code": "WOULD-CHANGE"}, {"code": "DONE", "dry-run": "BLOCKED-ON-HUMAN"}]
+    signs0 = {"stage-e": "s0", "conflict-waker": "w0"}
+
+    # 1. ONE RUN LISTS EVERY CARD. Stage E's come from its own record, the later steps' included,
+    #    and its check is not run a third time to read them; a card no part lists has Stage E's
+    #    own title; each card row says how to read the card, which holds the line that signs it.
+    code1, io1 = run(stopped_on_card, answers=[True], steps=list(stop_steps),
+                     setup={"cards": [("dry-run", "CK-5"), ("conflict-waker", "CK-8")],
+                            "ledgers": dict(signs0)})
+    check("kit930-a-stop-on-a-card-keeps-its-code", code1, EX_BLOCKED)
+    check("kit930-stage-e-cards-come-from-its-own-record-read-from-this-runs-check",
+          (io1.cards_since, "pipeline_stage_e_setup.py verify" in io1.measured), ((t0,), False))
+
+    def after(io, header, n):
+        """The n lines after a header of the short list; none when it is not there."""
+        at = io.lines.index(header) + 1 if header in io.lines else len(io.lines)
+        return io.lines[at:at + n]
+    check("kit930-every-stage-e-card-is-listed-with-how-to-read-it",
+          ([(ln.split() or [""])[0] for ln in after(io1, "Sign-offs still asked for:", 1)],
+           after(io1, "Sign-offs still asked for:", 2)[1:], after(io1, "Only you can do these:", 2)),
+          (["CK-5"], ["             read it: python3 scripts/pipeline_stage_e_setup.py card CK-5"],
+           ["  CK-8     Read your conflict waker's dry run before it is turned on (Stage E's step "
+            "conflict-waker)",
+            "             read it: python3 scripts/pipeline_stage_e_setup.py card CK-8"]))
+    # The parts the run did not reach are looked at, read-only: a waiting one's cards are listed,
+    # and its line keeps "not reached".
+    paging = os.path.join(KIT, "notifier.conf")
+    code, io = run({"pipeline_stage_e_setup.py verify": 10}, answers=[False],
+                   setup={"present": {paging},
+                          "measure_codes": {"pipeline_notifier_setup.py check": 10},
+                          "measure_out": {"pipeline_notifier_setup.py check": "CK-N4 waits for you"}})
+    check("kit930-a-part-not-reached-is-looked-at-and-its-cards-listed",
+          (code, line(io, "paging")[0], "looked at read-only" in line(io, "paging")[1],
+           "pipeline_notifier_setup.py check" in io.measured,
+           any(ln.startswith("  CK-N4") for ln in io.lines),
+           said(io, "The parts after the stop were looked at read-only")),
+          (EX_BLOCKED, OUT_NOT_REACHED, True, True, True, True))
+    check("kit930-a-part-not-reached-with-no-settings-file-is-said-and-not-measured",
+          (line(io, "work-queue"), "pipeline_queue_setup.py run" in io.measured),
+          ((OUT_NOT_REACHED, "the run stopped before its step; no queue.conf in the kit folder"),
+           False))
+    # Before the consent, or at a checkout that stopped, nothing is looked at, kept or read.
+    code, io = run(typed=["1", "no"])
+    check("kit930-no-consent-looks-at-nothing-and-keeps-nothing",
+          (code, io.measured, io.results_reads, io.results_written,
+           said(io, "What this run measured")), (EX_BLOCKED, [], (), (), False))
+    code, io = run(git_state={"status": (0, " M scripts/x.py")})
+    check("kit930-a-checkout-that-stopped-looks-at-nothing-and-keeps-nothing",
+          (code, io.measured, io.results_written, said(io, "the kit checkout's commit was not read")),
+          (EX_USAGE, [], (), True))
+
+    # 2. WHAT IS KEPT: Stage E's stop with its cards and its sign-offs as they stood; each step that
+    #    ended up to date; each check that passed. Never a result that waited on a person, never
+    #    a check's words.
+    doc = kept(io1)
+    resume = entries(doc, "resume")
+    check("kit930-the-stop-on-a-card-is-kept-with-its-cards-and-sign-offs",
+          [(r["since"], r["cards"], r["ledgers"], r["at"]) for r in resume],
+          [(t0, [["dry-run", "CK-5"], ["conflict-waker", "CK-8"]], signs0, t0)])
+    check("kit930-a-step-up-to-date-is-kept-and-a-waiting-one-is-not",
+          (sorted(r["key"] for r in entries(doc, "step")), [r["outcome"] for r in entries(doc, "step")]),
+          (["skills"], [OUT_OK]))
+    check("kit930-a-check-that-passed-is-kept-by-its-command-and-holds-no-words",
+          ([os.path.basename(r["argv"][1]) + " " + r["argv"][2] for r in entries(doc, "check")],
+           all(set(r) == {"kind", "argv", "code", "at", "commit", "settings"}
+               for r in entries(doc, "check"))),
+          (["pipeline_stage_e_app.py verify"], True))
+    check("kit930-every-result-is-bound-to-its-commit-and-settings",
+          all(r["commit"] == "aaa" and r["settings"] == FakeIo.prints for r in doc["results"]), True)
+    check("kit930-the-record-is-kept-where-the-consent-record-is",
+          ([path for path, _text in io1.results_written],
+           os.path.dirname(DEFAULT_RESULTS) == os.path.dirname(DEFAULT_RECORD)),
+          ([DEFAULT_RESULTS], True))
+    code, io = run(setup={"present": {paging},
+                          "measure_codes": {"pipeline_notifier_setup.py check": 10}},
+                   codes={"pipeline_notifier_setup.py run --dry-run": 10})
+    check("kit930-a-check-that-waited-is-never-kept",
+          [r["argv"][2] for r in entries(kept(io), "check")
+           if os.path.basename(r["argv"][1]) == "pipeline_notifier_setup.py"], [])
+
+    # 3. A RERUN RIGHT AFTER A SIGN-OFF carries on: Stage E's installer runs at once, its check is
+    #    not run first, and what was up to date is reused, each said with its age and source.
+    code2, io2 = run({"pipeline_stage_e_setup.py run": 0}, answers=[True],
+                     setup={"results": ("ok", doc, ""), "clock": t4,
+                            "ledgers": {"stage-e": "s1", "conflict-waker": "w0"}})
+    check("kit930-after-a-sign-off-stage-e-carries-on-from-its-installer",
+          ("pipeline_stage_e_setup.py verify" in io2.ran, "pipeline_stage_e_setup.py run" in io2.ran,
+           said(io2, "A sign-off has been recorded since, so it carries on from there"), code2),
+          (False, True, True, EX_OK))
+    check("kit930-a-step-up-to-date-is-not-run-again-and-says-its-age-and-source",
+          ("sync_user_skills.py" in io2.ran, line(io2, "skills")),
+          (False, (OUT_OK, "reused, not measured again: up to date when this step last ran 4 "
+                           "minutes ago, in this command's run at %s" % t0)))
+    check("kit930-a-check-that-passed-is-not-run-again-and-says-so",
+          ("pipeline_stage_e_app.py verify" in io2.measured,
+           line(io2, "review-identity")[1].startswith("reused, not measured again: its check passed 4 minutes ago")),
+          (False, True))
+    check("kit930-the-end-lists-every-result-it-reused-with-its-age",
+          (said(io2, "Reused from earlier runs, not measured again"),
+           said(io2, "  - step 2. The skills in your home folder: up to date: 4 minutes old (%s)" % t0),
+           said(io2, "  - Stage E's check: work outstanding, and its installer stopped on a card: 4 "
+                     "minutes old"),
+           said(io2, "  - Reviews post under their own login, not yours: its check passed: 4 minutes old"),
+           said(io2, "--fresh")),
+          (True, True, True, True, True))
+    check("kit930-the-start-says-what-may-be-reused",
+          said(io2, "The run at %s saved %d result(s); %d may be reused here." % (
+              t0, len(doc["results"]), len(doc["results"]))), True)
+    # With no sign-off since, Stage E's check runs as before.
+    code, io = run(setup={"results": ("ok", doc, ""), "clock": t4, "ledgers": dict(signs0)})
+    check("kit930-with-no-sign-off-since-stage-e-is-checked-again",
+          ("pipeline_stage_e_setup.py verify" in io.ran,
+           said(io, "No sign-off has been recorded since, so its check runs again."), code),
+          (True, True, EX_OK))
+    code, io = run(setup={"results": ("ok", doc, ""), "clock": t4,
+                          "ledgers": {"stage-e": None, "conflict-waker": "w0"}})
+    check("kit930-sign-offs-that-cannot-be-read-mean-a-check-again",
+          ("pipeline_stage_e_setup.py verify" in io.ran, said(io, "could not all be read")), (True, True))
+
+    # 4. BOUND. Older than the set age, other code, another settings file, or --fresh: measured
+    #    again, and said. A record that cannot be read is said too (contract section 13).
+    for name, setup, kw, why in (
+            ("older-than-the-set-age", {"clock": t31}, {}, "Not reused, %d: older than 30 minutes."),
+            ("a-settings-file-changed", {"clock": t4, "prints": {"/kit/stage-e.conf": "b2"}}, {},
+             "Not reused, %d: a settings file changed since."),
+            ("a-settings-file-gone", {"clock": t4, "prints": {"/kit/stage-e.conf": "a1",
+                                                              "/kit/new.conf": "c3"}}, {},
+             "Not reused, %d: a settings file changed since."),
+            ("a-settings-file-unreadable", {"clock": t4, "prints": {"/kit/stage-e.conf": None}}, {},
+             "Not reused, %d: a settings file changed since."),
+            ("other-code", {"clock": t4}, {"git_state": {"rev-parse HEAD": [(0, "bbb"), (0, "bbb")]}},
+             "Not reused, %d: measured on other code."),
+            ("dated-after-now", {"clock": "2026-10-02T23:00:00Z"}, {},
+             "Not reused, %d: it is dated after now.")):
+        code, io = run({"pipeline_stage_e_setup.py run": 0}, answers=[True],
+                       setup=dict({"results": ("ok", doc, ""),
+                                   "ledgers": {"stage-e": "s1", "conflict-waker": "w0"}}, **setup),
+                       **kw)
+        check("kit930-%s-is-measured-again-and-said" % name,
+              ("sync_user_skills.py" in io.ran, "pipeline_stage_e_setup.py verify" in io.ran,
+               "pipeline_stage_e_app.py verify" in io.measured,
+               io.lines.count("  " + why % len(doc["results"])), rep_reused(io)),
+              (True, True, True, 1, False))
+    code, io = run(setup={"results": ("unreadable", None, "/x is not owned by root")})
+    check("kit930-an-untrusted-record-is-said-and-everything-is-measured",
+          (said(io, "The record of earlier results cannot be used (/x is not owned by root), so every "
+                    "part is measured again."), "sync_user_skills.py" in io.ran), (True, True))
+    code, io = run(argv=["--fresh"], setup={"results": ("ok", doc, ""), "clock": t4,
+                                            "ledgers": {"stage-e": "s1", "conflict-waker": "w0"}})
+    check("kit930-fresh-reuses-nothing-and-still-keeps-the-record",
+          (said(io, "Not used (--fresh): every part is measured again."), io.results_reads,
+           "sync_user_skills.py" in io.ran, "pipeline_stage_e_setup.py verify" in io.ran,
+           len(io.results_written)), (True, (), True, True, 1))
+    code, io = run(setup={"results": ("none", None, "no record yet")})
+    check("kit930-no-record-is-said", said(io, "Nothing is saved from an earlier run"), True)
+    # A reused result is kept again with its own time, so it is never reused past its age.
+    doc2 = kept(io2)
+    check("kit930-a-reused-result-is-kept-with-its-own-time",
+          sorted((r["kind"], r["at"]) for r in doc2["results"] if r["kind"] != "resume"),
+          sorted([("step", t0), ("step", t4), ("step", t4), ("check", t0)]))
+    code, io = run(setup={"results": ("ok", doc2, ""), "clock": t31})
+    check("kit930-so-a-result-reused-once-is-not-reused-past-its-age",
+          ("sync_user_skills.py" in io.ran, line(io, "skills")[1]), (True, ""))
+    check("kit930-a-rerun-after-a-stage-e-update-reuses-it",
+          ("pipeline_stage_e_setup.py verify" in run(setup={"results": ("ok", doc2, ""),
+                                                             "clock": t4})[1].ran), False)
+
+    # 5. THE RECORD: trusted as the consent record is, in the shape this command writes, kept only
+    #    after the consent, never with a secret, and with the Mac password.
+    St = collections.namedtuple("St", "st_uid st_mode")
+    folders = ["/", "/Library", "/Library/Application Support",
+               "/Library/Application Support/claude-pipeline"]
+    # A record of each kind, made here, so these cases do not hang on what an earlier run kept.
+    bound = {"at": t0, "commit": "aaa", "settings": {"/kit/stage-e.conf": "a1"}}
+    sample = {"version": RESULTS_VERSION, "saved_at": t0, "results": [
+        dict(bound, kind="step", key="skills", outcome=OUT_OK),
+        dict(bound, kind="check", argv=["/py", "/kit/scripts/pipeline_stage_e_app.py", "verify"],
+             code=0),
+        dict(bound, kind="resume", key="stage_e", since=t0, ledgers={"stage-e": "s0"},
+             cards=[["dry-run", "CK-5"]])]}
+    step_e, check_e, resume_e = sample["results"]
+    good = json.dumps(sample)
+
+    def judged(text=good, owner=0):
+        nodes = dict((f, St(0, stat.S_IFDIR | 0o755)) for f in folders)
+        nodes[DEFAULT_RESULTS] = St(owner, stat.S_IFREG | 0o644)
+
+        def lstat(path):
+            if path not in nodes:
+                raise FileNotFoundError(path)
+            return nodes[path]
+        return load_results(DEFAULT_RESULTS, lstat, lambda p: p, lambda _p: text)
+
+    check("kit930-record-root-owned-is-trusted", judged()[0:2], ("ok", sample))
+    check("kit930-record-owned-by-the-user-is-not", judged(owner=501)[0], "unreadable")
+    only_one = lambda entry: json.dumps(dict(sample, results=[entry]))  # noqa: E731
+    for name, text in (("another-version", json.dumps(dict(sample, version=2))),
+                       ("results-not-a-list", json.dumps(dict(sample, results={}))),
+                       ("a-field-beside-the-results", json.dumps(dict(sample, note="words"))),
+                       ("an-unknown-kind", only_one(dict(step_e, kind="other"))),
+                       ("a-step-that-waited", only_one(dict(step_e, outcome=OUT_WAITING))),
+                       ("the-checkout-as-a-step", only_one(dict(step_e, key="checkout"))),
+                       ("a-check-that-did-not-pass", only_one(dict(check_e, code=10))),
+                       ("a-check-whose-code-is-a-boolean", only_one(dict(check_e, code=False))),
+                       ("a-check-with-no-command", only_one(dict(check_e, argv=[]))),
+                       ("a-stop-on-something-not-a-card", only_one(
+                           dict(resume_e, cards=[["dry-run", "words"]]))),
+                       ("settings-not-a-map", only_one(dict(step_e, settings=["x"]))),
+                       ("a-field-it-never-writes", only_one(dict(step_e, detail="words"))),
+                       ("no-commit", only_one(dict((k, v) for k, v in step_e.items()
+                                                   if k != "commit")))):
+        check("kit930-record-in-another-shape-is-not-used:%s" % name,
+              judged(text), ("unreadable", None, "it is not a record of results this command wrote"))
+    mine = os.path.join(tmp, "results-mine.json")
+    with open(mine, "w") as fh:
+        fh.write(good)
+    if os.getuid() != 0:
+        check("kit930-a-real-record-this-process-made-is-never-trusted",
+              Io().read_results(mine)[0], "unreadable")
+    check("kit930-the-record-flag-is-hidden-and-fresh-is-shown",
+          [(flag in subprocess.run([sys.executable, os.path.abspath(__file__), "--help"],
+                                   capture_output=True, text=True).stdout)
+           for flag in ("results-record", "--fresh")], [False, True])
+    # No free text is ever kept: a step's words, a check's output, a conf's values. Only its shape.
+    rep = Report()
+    rep.consented, rep.commit = True, "a" * 40
+    token = "gh" + "p_" + "A" * 36
+    rep.steps["skills"] = (OUT_OK, "words " + token)
+    long_path = "/private/var/folders/z4/yjpy80vx4q306chhgrfmlqjc0000gn/T/keyring/stage-e.conf"
+    rep.noted["skills"] = (t0, {long_path: hashlib.sha256(b"x").hexdigest()})
+    rep.passed[("/usr/bin/env", "scripts/pipeline_stage_e_app.py", "verify", "--conf", long_path)] = (
+        t0, {long_path: hashlib.sha256(b"x").hexdigest()})
+    io = FakeIo()
+    save_results(io, rep, "/x/results.json")
+    got = json.loads(io.results_written[0][1]) if io.results_written else {"results": []}
+    check("kit930-the-record-holds-no-free-text-only-its-shape",
+          (len(io.results_written), token in (io.results_written or [("", "")])[0][1],
+           sorted(sorted(r) for r in got["results"]), _valid_results(got)),
+          (1, False, [sorted(RESULT_FIELDS["check"]), sorted(RESULT_FIELDS["step"])], True))
+    bad = Report()
+    bad.consented, bad.commit, bad.resume = True, "aaa", {"since": t0}
+    bad.noted["stage_e"], bad.stage_e_cards = (t0, {}), [("dry-run", "not a card")]
+    io = FakeIo()
+    save_results(io, bad, "/x/results.json")
+    check("kit930-a-record-in-a-shape-a-later-run-would-not-trust-is-never-written",
+          (io.results_written, said(io, "not in the shape a record of results has")), ((), True))
+    io = FakeIo()
+    io.results_failure = "disk full"
+    rep.steps["skills"] = (OUT_OK, "")
+    save_results(io, rep, "/x/results.json")
+    check("kit930-a-record-that-cannot-be-kept-is-said",
+          said(io, "What this run measured is not kept (disk full), so the next run measures "
+                   "everything again."), True)
+
+    class NoSudo(Io):
+        def sudo_once(self, why):
+            return False
+    check("kit930-keeping-the-record-needs-the-mac-password",
+          NoSudo().write_results(os.path.join(tmp, "never.json"), "{}"),
+          "it needs your Mac password, which was not given")
+
+    # 6. WHAT A RESULT IS BOUND TO, read for real: each settings file's bytes, and every other
+    #    `.conf` beside it; the sign-offs an installer's record holds.
+    folder = os.path.join(tmp, "prints")
+    os.makedirs(folder)
+    for name, body in (("a.conf", "A=1\n"), ("b.conf", "B=2\n"), ("c.txt", "C\n")):
+        with open(os.path.join(folder, name), "w") as fh:
+            fh.write(body)
+    got = fingerprint_files([os.path.join(folder, "a.conf"), os.path.join(folder, "gone.conf")])
+    check("kit930-fingerprint-hashes-each-file-and-its-sibling-confs",
+          (sorted(os.path.basename(p) for p in got), got[os.path.join(folder, "a.conf")],
+           got[os.path.join(folder, "gone.conf")]),
+          (["a.conf", "b.conf", "gone.conf"], hashlib.sha256(b"A=1\n").hexdigest(), "absent"))
+    check("kit930-fingerprint-of-a-folder-it-cannot-list-is-never-equal",
+          fingerprint_files([os.path.join(folder, "a.conf")],
+                            listdir=lambda _f: (_ for _ in ()).throw(PermissionError(_f)))[
+              os.path.join(folder, "*.conf")], None)
+    ledger = os.path.join(tmp, "ledger.json")
+    states = []
+    for body in (None, "{", json.dumps({"steps": {}}), json.dumps({"attestations": {}}),
+                 json.dumps({"attestations": {"A-DRY-RUN": {"initials": "ab"}}}),
+                 json.dumps({"attestations": []})):
+        if body is not None:
+            with open(ledger, "w") as fh:
+                fh.write(body)
+        states.append(signoffs_fingerprint(ledger))
+    check("kit930-sign-offs-fingerprint",
+          (states[0], states[1], states[2] == states[3], states[3] != states[4], states[5]),
+          ("absent", None, True, True, None))
+
+    # 7. PINS: the card readers are the scripts that print one card by its id; each step's title
+    #    is the heading it prints.
+    card_scripts = set(os.path.basename(st["card_in"]) for p in Io().parts()
+                       for st in p.get("person_steps") or [] if st.get("card_in"))
+    printing = set(s for s in card_scripts
+                   if 'args.command == "card"' in open(os.path.join(HERE, s)).read())
+    check("kit930-card-readers-are-the-scripts-that-print-a-card", sorted(printing),
+          sorted(s for s in CARD_READERS if s in card_scripts))
+    src = open(os.path.abspath(__file__)).read()
+    check("kit930-each-step-title-is-the-heading-its-step-prints",
+          [k for k, title in STEP_TITLES.items() if 'heading(io, "%s")' % title not in src], [])
+
+    # 8. KIT-965: Stage E's own app, off by its empty key, is "off on this Mac" with the reason,
+    #    its check does not run, and it does not make the run exit 4. A real failure still does.
+    app = "pipeline_stage_e_app.py verify"
+    for name, conf in (("empty", {"GITHUB_APP_ID": ""}), ("not-set", {"ROLE_ACCOUNT": "_x"}),
+                       ("only-spaces", {"GITHUB_APP_ID": "  "})):
+        code, io = run(conf={se_conf: conf}, setup={"measure_codes": {app: 1}})
+        check("kit965-the-app-off-by-its-key-is-off:%s" % name,
+              (line(io, "review-identity"), app in io.measured, code),
+              ((OUT_OFF, "GITHUB_APP_ID is empty in stage-e.conf"), False, EX_OK))
+    code, io = run(conf={se_conf: {"GITHUB_APP_ID": "123"}}, setup={"measure_codes": {app: 1}})
+    check("kit965-the-app-set-whose-check-fails-is-unmeasured-and-exits-4",
+          (line(io, "review-identity"), code),
+          ((OUT_UNMEASURED, "its check stopped with exit 1"), EX_UNMEASURED))
+    code, io = run(setup={"measure_codes": {app: 1}})
+    check("kit965-a-conf-it-cannot-read-is-never-off-and-a-failure-is-still-4",
+          (line(io, "review-identity")[0], code, (se_conf, "GITHUB_APP_ID") in io.key_reads),
+          (OUT_UNMEASURED, EX_UNMEASURED, True))
+    conf_file = os.path.join(tmp, "app.conf")
+    answers = []
+    for body in ("GITHUB_APP_ID=\n", "GITHUB_APP_ID=42 # the app\n", "OTHER=1\n", None):
+        if body is None:
+            os.unlink(conf_file)
+        else:
+            with open(conf_file, "w") as fh:
+                fh.write(body)
+        answers.append(Io().conf_key(conf_file, "GITHUB_APP_ID"))
+    check("kit965-the-one-key-read", answers, ["", "42", "", None])
+    check("kit965-the-parts-list-names-the-key",
+          [(p["id"], p["settings"].get("off_when_empty")) for p in Io().parts()
+           if p["settings"].get("off_when_empty")], [("review-identity", "GITHUB_APP_ID")])
+
+
+def rep_reused(io):
+    """True when any line says a result was reused (KIT-930)."""
+    return any("reused, not measured again" in ln for ln in io.lines)
 
 
 def selftest():
@@ -4252,7 +5317,7 @@ def selftest():
     only = io.lines.index("Only you can do these:")
     signs = io.lines.index("Sign-offs still asked for:")
     check("lines-short-list-splits-by-kind-and-matches-whole-card-ids",
-          ([ln.split()[0] for ln in io.lines[only + 1:signs]],
+          ([ln.split()[0] for ln in io.lines[only + 1:signs] if "read it:" not in ln],
            [ln.split()[0] for ln in io.lines[signs + 1:signs + 2]],
            any("CK-N2" in ln or "CK-N4" in ln for ln in io.lines)),
           (["CK-N1"], ["CK-N3"], False))
@@ -4884,6 +5949,10 @@ def selftest():
           [pt["id"] for pt in real_parts if (step_of(pt) or pt.get("jobs"))
            and not pt.get("consent")], [])
     check("kit717-no-hard-coded-python-path", ("/usr/bin/" + "python3") in src, False)
+
+    # 12. KIT-930 AND KIT-965: every card in one run; a rerun carries on, bound to its time, code and
+    #     settings; an app off by its own key. Every one of their cases is in selftest_rerun().
+    selftest_rerun(check, base, se_conf, tmp, healthy)
 
     import shutil
     shutil.rmtree(tmp, ignore_errors=True)

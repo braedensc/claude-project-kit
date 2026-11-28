@@ -53,7 +53,8 @@
           "properties": {
             "file": {"type": ["string", "null"], "maxLength": 80, "description": "The settings file it reads, by name."},
             "example": {"oneOf": [{"$ref": "#/$defs/path"}, {"type": "null"}], "description": "The committed example of that file."},
-            "keys": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/keyName"}, "description": "The keys that matter most, each present in the example."}
+            "keys": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/keyName"}, "description": "The keys that matter most, each present in the example."},
+            "off_when_empty": {"$ref": "#/$defs/keyName", "description": "Optional. One of `keys`: when it is empty in the settings file, the part is off on this Mac by the owner's choice, and its check is not run (KIT-965)."}
           }
         },
         "secrets": {
