@@ -174,10 +174,18 @@ SWEEP_HEARTBEAT_MAX_AGE_MINUTES=180
 # three hours. Two passes running, Slack only. Empty: not watched, and every pass says so. docs/RUNNER.md, "The writer's key".
 WRITER_KEY_STATUS_FILE=
 
-# The chat limit's trips (KIT-941): a COPY of chat-cap-trips.json from the bridge's state folder, readable by this account.
-# The `chat-cap` kind raises each trip once, naming the chat and how many messages were held, to Slack only. An unreadable
-# copy is said after two passes, never read as no trips. Empty: not watched, and every pass says so.
+# The chat limit's trips (KIT-941): a COPY of chat-cap-trips.json from the bridge's state folder, made by the watcher's
+# copier (watcher.conf's CHAT_CAP_TRIPS). You do not write this line: the one command sets it to the copy (KIT-957).
+# The `chat-cap` kind raises each trip once, naming the chat and how many messages were held, to Slack only. A copy that
+# could not be made, or cannot be read, is said after two passes, never read as no trips; a record the cap has not
+# written yet (it writes it at its first trip) is none. Empty: not watched, and every pass says so.
 CHAT_CAP_TRIPS_FILE=
+
+# The runner's incidents (KIT-957): a COPY of incidents.json from the runner's store, made by the watcher's copier
+# (watcher.conf's RUNNER_INCIDENTS). You do not write this line: the one command sets it to the copy. The
+# incidents kind of this watch raises each new incident once, in the runner's own plain words, to Slack only. A copy that
+# could not be made or read is said after two passes, never read as no incidents. Empty: not watched.
+RUNNER_INCIDENTS_FILE=
 
 # The yearly credentials' end dates (KIT-579): name:YYYY-MM-DD, comma separated. Names and
 # dates ONLY, never a token. The `credentials` kind opens a GitHub issue once a date is within

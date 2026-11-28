@@ -300,6 +300,16 @@ watch reads them; the one command sets the matching lines in `update.conf` (docs
 `WRITER_KEY_STATUS` in `watcher.conf` names it, as `writer-key-status.json`. It is refused for the same reasons, and its old copy
 removed. The health watch's `writer-key` kind reads the copy, and the one command sets `WRITER_KEY_STATUS_FILE` to it.
 
+**The chat cap's trips and the runner's incidents (KIT-957).** The same copier copies `chat-cap-trips.json` (the bridge's state
+folder) and `incidents.json` (the runner's store) when `CHAT_CAP_TRIPS` and `RUNNER_INCIDENTS` in `watcher.conf` name them, as
+`chat-cap-trips.json` and `runner-incidents.json` in `INSTALL_DIR/copy/`. Neither folder is ever loosened: root reads the file, the same
+refusals apply (a link, a file of another account, a second name, too large; the incident file's cap is 512 KB) and a refused copy's old
+file is removed. Both records are written only at a first event, so the copier's rule for them is `absent_ok`: a source that is not there
+yet is `absent` in the copier's status, not `refused`, and the run is not a failure. The health watch reads that status beside the copy: a
+copy that is not there counts as none only where the status, fresh within six hours, says `absent` for that very copy. A refusal, no status,
+an old status or a copy the status says was made but is gone is said, never read as none. The one command sets `CHAT_CAP_TRIPS_FILE` and
+`RUNNER_INCIDENTS_FILE` (docs/UPDATE-OPERATOR.md).
+
 Two more limits: the copier has a plain-file check but does not read the content (the watcher judges that), and clearing
 `USAGE_FILE` later does not remove the copier's job. Remove it by hand.
 

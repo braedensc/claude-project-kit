@@ -94,14 +94,23 @@ CONF_DEFAULTS = {
     # KIT-933: the runner's word on the session writer's key (writer-key.json in the runner's store), copied the same
     # way, so the health watch's writer-key kind can read it. Empty: not watched.
     "WRITER_KEY_STATUS": "",
+    # KIT-957: the bridge's chat-cap-trips.json (in its state folder) and the runner's incidents.json (in its store),
+    # copied the same way, so the health watch's chat-cap and runner-incidents kinds can read them. Empty: not watched.
+    "CHAT_CAP_TRIPS": "", "RUNNER_INCIDENTS": "",
 }
 # The three heartbeat sources, and the runner's word on the writer's key (KIT-933): conf key -> (the copy's name in
 # root's copy folder, the health check's update.conf key). The one command writes that update.conf key with the copy's path.
 BEATS = {"QUEUE_HEARTBEAT": ("queue-heartbeat.json", "QUEUE_HEARTBEAT_FILE"),
          "MORNING_HEARTBEAT": ("morning-heartbeat.json", "MORNING_HEARTBEAT_FILE"),
          "SWEEP_HEARTBEAT": ("sweep-heartbeat.json", "SWEEP_HEARTBEAT_FILE"),
-         "WRITER_KEY_STATUS": ("writer-key-status.json", "WRITER_KEY_STATUS_FILE")}
+         "WRITER_KEY_STATUS": ("writer-key-status.json", "WRITER_KEY_STATUS_FILE"),
+         "CHAT_CAP_TRIPS": ("chat-cap-trips.json", "CHAT_CAP_TRIPS_FILE"),
+         "RUNNER_INCIDENTS": ("runner-incidents.json", "RUNNER_INCIDENTS_FILE")}
 BEAT_MAX_BYTES = 65536          # a heartbeat is a few lines; a bigger file is refused
+# KIT-957: the records their writers create only at a first event. Not there yet is the copier's "absent" (a finding
+# of its own, read by the health watch as none yet), never a refusal. The incident record keeps its last 200 told.
+OPTIONAL_SOURCES = ("CHAT_CAP_TRIPS", "RUNNER_INCIDENTS")
+BEAT_CAPS = {"RUNNER_INCIDENTS": 512 * 1024}
 
 
 def copies_wanted(c):
@@ -312,8 +321,11 @@ def compose_copier_rules(c):
                        "max_bytes": copier.DEFAULT_MAX_BYTES})
     for key in sorted(BEATS):          # KIT-782: the same refusals as the usage file's: a link, a stranger's file, oversize
         if c[key]:
-            copies.append({"source": c[key], "owner": c["ROLE_ACCOUNT"], "dest": beat_copy_path(c, key),
-                           "max_bytes": BEAT_MAX_BYTES})
+            entry = {"source": c[key], "owner": c["ROLE_ACCOUNT"], "dest": beat_copy_path(c, key),
+                     "max_bytes": BEAT_CAPS.get(key, BEAT_MAX_BYTES)}
+            if key in OPTIONAL_SOURCES:
+                entry["absent_ok"] = True
+            copies.append(entry)
     doc = {"schema": copier.RULES_SCHEMA, "status_file": p["copy_status"], "copies": copies}
     _rules, errors = copier.validate_rules(doc)
     if errors:
@@ -769,11 +781,15 @@ def step_first_pass(ctx, apply_it):
         h.kickstart(copier_label(c))
         cdoc = _wait_for(ctx, p["copy_status"], began, "copier status file", p["copier_log"])
         rows = cdoc.get("copies") if isinstance(cdoc.get("copies"), list) else []
-        bad = [r.get("reason") for r in rows if not isinstance(r, dict) or r.get("state") != "copied"]
+        bad = [r.get("reason") for r in rows if not isinstance(r, dict) or r.get("state") not in ("copied", "absent")]
         usage_only = not any(c[k] for k in BEATS)
         why = "; ".join(str(b) for b in bad) or "no copy was reported"
+        waiting = [os.path.basename(str(r.get("dest"))) for r in rows if isinstance(r, dict) and r.get("state") == "absent"]
+        made = len(rows) - len(waiting)
         if rows and not bad:
-            says = "made the usage copy" if usage_only else "made its %d copies" % len(rows)
+            says = "made the usage copy" if usage_only else "made its %d cop%s" % (made, "y" if made == 1 else "ies")
+            if waiting:
+                says += " (%s not written yet by its writer, so no copy of it)" % ", ".join(waiting)
         elif usage_only:
             says = "REFUSED the usage file (%s): spend and runs stay blind until that is fixed" % why
         else:
@@ -936,6 +952,13 @@ SWEEP_HEARTBEAT=
 # health check's WRITER_KEY_STATUS_FILE at the copy, so the health watch says when the key could not be read or
 # renewed, is near its end, or the runner went quiet.  Empty = not watched.
 WRITER_KEY_STATUS=
+
+# Optional (KIT-957): the bridge's chat-cap-trips.json (in its state folder; written only at the first trip) and the
+# runner's incidents.json (in its store; written at the first incident), as the SOURCES.  The same copier copies each; a
+# source that is not there yet is "absent", told apart from a copy it refused.  The one command points the health
+# check's CHAT_CAP_TRIPS_FILE and RUNNER_INCIDENTS_FILE at the copies.  Empty = not watched.
+CHAT_CAP_TRIPS=
+RUNNER_INCIDENTS=
 
 # Optional: the validator's ledger (docs/WATCHER.md, approval-rate).  With it, every merge into a watched
 # repository is checked against the validator's approvals.  This account must be able to read the file.
@@ -1602,7 +1625,9 @@ def selftest():
         beat_src = dict((k, os.path.join(beat_dir, n)) for k, n in (("QUEUE_HEARTBEAT", "q.json"),
                                                                     ("MORNING_HEARTBEAT", "m.json"),
                                                                     ("SWEEP_HEARTBEAT", "s.json"),
-                                                                    ("WRITER_KEY_STATUS", "w.json")))
+                                                                    ("WRITER_KEY_STATUS", "w.json"),
+                                                                    ("CHAT_CAP_TRIPS", "c.json"),
+                                                                    ("RUNNER_INCIDENTS", "i.json")))
 
         def put_beats(links=()):
             shutil.rmtree(beat_dir, ignore_errors=True)
@@ -1626,14 +1651,20 @@ def selftest():
         rc, outb, askedb = go(hb)
         crb = json.loads(hb.read(inst + "/" + COPIER_RULES_NAME))
         check("heartbeats alone give a copier whose rules name each source, the role account and its copy, small",
-              [(c_["source"], c_["owner"], c_["dest"], c_["max_bytes"]) for c_ in crb["copies"]],
-              [(beat_src[k], "_clawdispatch", "%s/copy/%s" % (inst, BEATS[k][0]), BEAT_MAX_BYTES)
-               for k in ("MORNING_HEARTBEAT", "QUEUE_HEARTBEAT", "SWEEP_HEARTBEAT", "WRITER_KEY_STATUS")])
-        check("...a full run ends fine and says the copier made four copies (KIT-933: the writer key's status too)",
-              (rc, hb.copier_rc, "made its 4 copies" in outb), (EX_OK, EX_OK, True))
+              [(c_["source"], c_["owner"], c_["dest"], c_["max_bytes"], c_.get("absent_ok", False))
+               for c_ in crb["copies"]],
+              [(beat_src[k], "_clawdispatch", "%s/copy/%s" % (inst, BEATS[k][0]),
+                BEAT_CAPS.get(k, BEAT_MAX_BYTES), k in OPTIONAL_SOURCES)
+               for k in ("CHAT_CAP_TRIPS", "MORNING_HEARTBEAT", "QUEUE_HEARTBEAT", "RUNNER_INCIDENTS",
+                         "SWEEP_HEARTBEAT", "WRITER_KEY_STATUS")])
+        check("...the two records their writers create only at a first event are named absent_ok, and no other is (KIT-957)",
+              sorted(c_["source"] for c_ in crb["copies"] if c_.get("absent_ok")),
+              sorted([beat_src["CHAT_CAP_TRIPS"], beat_src["RUNNER_INCIDENTS"]]))
+        check("...a full run ends fine and says the copier made six copies (KIT-957: the chat cap's trips and the incidents too)",
+              (rc, hb.copier_rc, "made its 6 copies" in outb), (EX_OK, EX_OK, True))
         check("...each copy is the source, whole",
               [open(hb._real("%s/copy/%s" % (inst, BEATS[k][0])), "rb").read() == open(beat_src[k], "rb").read()
-               for k in sorted(BEATS)], [True, True, True, True])
+               for k in sorted(BEATS)], [True] * 6)
         check("...and the watcher's rules name no usage file",
               "usage_file" in json.loads(hb.read(inst + "/" + RULES_NAME)), False)
         hl = machine()
@@ -1644,6 +1675,19 @@ def selftest():
                os.path.exists(hl._real("%s/copy/%s" % (inst, BEATS["SWEEP_HEARTBEAT"][0]))),
                os.path.exists(hl._real("%s/copy/%s" % (inst, BEATS["QUEUE_HEARTBEAT"][0])))),
               (EX_OK, 4, True, False, True))
+        hn = machine()
+        put_beats()
+        os.unlink(beat_src["CHAT_CAP_TRIPS"])
+        os.unlink(beat_src["RUNNER_INCIDENTS"])
+        rc, outn, _a = go(hn)
+        check("the two records not written yet are absent, not refused: the run is fine, and no copy of them exists (KIT-957)",
+              (rc, hn.copier_rc, "REFUSED" in outn,
+               [os.path.exists(hn._real("%s/copy/%s" % (inst, BEATS[k][0]))) for k in ("CHAT_CAP_TRIPS", "RUNNER_INCIDENTS")],
+               [r_["state"] for r_ in json.loads(hn.read(inst + "/copy/copier-status.json"))["copies"]
+                if r_["dest"].endswith(("chat-cap-trips.json", "runner-incidents.json"))]),
+              (EX_OK, EX_OK, False, [False, False], ["absent", "absent"]))
+        check("...and the first pass counts only the copies it made, and names the two not written yet",
+              ("made its 4 copies" in outn, "chat-cap-trips.json, runner-incidents.json not written yet" in outn), (True, True))
         hs = machine()
         put_beats()
         hs.source_uid = os.getuid() + 1

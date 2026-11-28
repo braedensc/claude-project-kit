@@ -86,8 +86,14 @@ WHAT IT CHECKS, one KIND each (a kind is what an alert is about):
   chat-cap    the chat limit's trips (KIT-941), where CHAT_CAP_TRIPS_FILE names the copy of
               chat-cap-trips.json (the bridge's state folder): each trip is raised once, naming the chat and
               how many messages were held. A record that cannot be read or is in another shape, two passes
-              running, is said and never read as no trips; one that does not exist is none (the cap writes it
-              only at a first trip). Empty: not watched. Slack only, through the status file.
+              running, is said and never read as no trips. One that does not exist is none only where the
+              copier says the cap has not written it yet (KIT-957); a copy that could not be made is said.
+              Empty: not watched. Slack only, through the status file.
+  runner-incidents  the runner's incidents (KIT-957), where RUNNER_INCIDENTS_FILE names the copy of
+              incidents.json (the runner's store): each new incident is raised once, in the runner's own
+              plain words (the first pass raises only those still open). A copy that could not be made,
+              read, or is in another shape, two passes running, is said and never read as no incidents;
+              one the runner has not written yet is none. Empty: not watched. Slack only.
 A last kind, `watch-job` — this job itself stopped — cannot be reported by the job. The
 heartbeat monitor watches the status file this job writes and pages when it goes stale.
 
@@ -155,6 +161,7 @@ component. It reports; `pipeline_update.py` and a person update.
 """
 import argparse
 import calendar
+import hashlib
 import json
 import os
 import plistlib
@@ -176,13 +183,13 @@ STATUS_SCHEMA = "pipeline-health-status/1"
 STATE_SCHEMA = "pipeline-health-watch-state/1"
 KINDS = ("hooks", "updates", "release", "dispatcher", "front-door", "disk", "temp",
          "conflict-waker", "waker-sandbox", "watcher-page", "push-connection", "notifier", "monitor",
-         "credentials", "memory", "burn", "queue", "morning", "sweep", "writer-key", "chat-cap")
+         "credentials", "memory", "burn", "queue", "morning", "sweep", "writer-key", "chat-cap", "runner-incidents")
 # Read here for the heartbeat monitor, which cannot (KIT-339): the conflict waker is the
 # owner's LaunchAgent, and its heartbeat sits in the owner's home. It reaches Slack through
 # the status file alone. It opens no GitHub issue: the alert workflow knows a fixed list of
 # kinds, and a deployed copy that does not know this one would fail every send.
 SLACK_ONLY_KINDS = ("conflict-waker", "waker-sandbox", "watcher-page", "push-connection", "memory", "burn",
-                    "queue", "morning", "sweep", "writer-key", "chat-cap")
+                    "queue", "morning", "sweep", "writer-key", "chat-cap", "runner-incidents")
 WAKER_SCHEMA = "pr-conflict-waker-heartbeat/1"
 # The watcher's page job (KIT-519) writes this beat. A page that could not be sent shows in it as
 # `could-not-page` and the routes that failed, and nothing else reads it (KIT-549). The route names
@@ -1058,6 +1065,71 @@ def _trip_words(trip):
         " was" if held == 1 else "s were")
 
 
+COPY_STATUS_SCHEMA = "pipeline-watcher-copy-status/1"     # the watcher's copier (KIT-573), which sits beside each copy
+COPY_STATUS_MAX_AGE = 6 * 3600     # a copier that has said nothing for this long cannot vouch for "not there yet"
+
+
+def _copy_row(env, path):
+    """(the copier's row for this copy, None), or (None, a plain reason). The copier writes `copier-status.json`
+    beside its copies. The status must be there, in its shape, fresh, and list this very copy once (KIT-957)."""
+    status = os.path.join(os.path.dirname(path), "copier-status.json")
+    try:
+        with open(status, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except FileNotFoundError:
+        return None, "the copier has left no status beside it, so a copy that was never made cannot be told from one not needed yet"
+    except (OSError, ValueError) as exc:
+        return None, "the copier's status beside it cannot be read (%s)" % type(exc).__name__
+    if not isinstance(doc, dict) or doc.get("schema") != COPY_STATUS_SCHEMA or not isinstance(doc.get("copies"), list):
+        return None, "the copier's status beside it is not in the shape %s" % COPY_STATUS_SCHEMA
+    written = _parse_iso(doc.get("written_at"))
+    if written is None or _now(env) - written > COPY_STATUS_MAX_AGE:
+        return None, "the copier's status beside it is older than %d hours, so it may have stopped" % (COPY_STATUS_MAX_AGE // 3600)
+    rows = [r for r in doc["copies"] if isinstance(r, dict) and r.get("dest") == path]
+    if len(rows) != 1:
+        return None, "the copier does not list this copy"
+    return rows[0], None
+
+
+def _absent_verdict(env, path):
+    """A copy named in update.conf is not there. Whether that is the one harmless case (None), or a problem
+    (a plain reason, KIT-957). A source its writer has not created yet is `absent` in the copier's status, apart
+    from `refused`. No readable, fresh status that says `absent` for this very copy is therefore a copy that could
+    not be made, never none: a refused source, a stopped copier, and a line pointing where no copier writes all
+    look the same from here, and each is said."""
+    row, why = _copy_row(env, path)
+    if row is None:
+        return why
+    if row.get("state") == "absent":
+        return None
+    if row.get("state") == "refused":
+        return "the copier refused it (%s)" % re.sub(r"[^\x20-\x7e]", " ", str(row.get("reason") or "no reason given"))[:160]
+    return "the copier says it made the copy, but it is not there"
+
+
+def _present_problem(env, path):
+    """A copy that is there, but not vouched for: a plain reason, or None (KIT-957). The copier's status beside it must
+    be fresh, list this copy as `copied`, and carry the hash of the bytes that are there, so a stopped copier, a failed
+    last attempt whose old copy survived, or a copy edited after the copier made it never reads as no news. The
+    copier and this pass share no clock: a mismatch is read once more before it is said."""
+    why = None
+    for _ in range(2):
+        try:
+            with open(path, "rb") as fh:
+                data = fh.read()
+        except OSError as exc:
+            return "cannot be read (%s)" % type(exc).__name__
+        row, why = _copy_row(env, path)
+        if row is None:
+            return "is there, but %s" % why
+        if row.get("state") != "copied":
+            return "is there, but the copier says it is %s" % re.sub(r"[^a-z]", "", str(row.get("state")))[:20]
+        if row.get("sha256") == hashlib.sha256(data).hexdigest():
+            return None
+        why = "is not the copy the copier made (its hash differs)"
+    return why
+
+
 def check_chat_cap(env, conf, state):
     """The chat cap's trips (KIT-941), where CHAT_CAP_TRIPS_FILE names the copy of chat-cap-trips.json, and said
     off where it is not. Each trip is raised once: the pass that first sees it fires, naming the chat and how many
@@ -1070,8 +1142,16 @@ def check_chat_cap(env, conf, state):
         return finding(kind, OK, "CHAT_CAP_TRIPS_FILE is not set: the chat limit's trips are not watched here")
     trips, why = ccap.read_trips(path)
     if trips is None and why == "absent":
-        _debounced(state, kind, False)
-        return finding(kind, OK, "no trip record at %s: the cap writes it only when the limit is first reached" % path)
+        missing = _absent_verdict(env, path)       # KIT-957: not written yet, or a copy that could not be made?
+        if missing is None:
+            _debounced(state, kind, False)
+            return finding(kind, OK, "no trip record at %s: the cap writes it only when the limit is first reached, "
+                                     "and the copier says it has not" % path)
+        why = "is not there, and %s" % missing
+    if trips is not None:
+        unvouched = _present_problem(env, path)       # KIT-957: a copy the copier no longer vouches for
+        if unvouched:
+            trips, why = None, unvouched
     if trips is None:
         said = "the chat limit's trip record %s %s" % (path, why)
         if _debounced(state, kind, True):
@@ -1090,6 +1170,60 @@ def check_chat_cap(env, conf, state):
     return finding(kind, FIRING, (
         "The chat limit was reached: %s. The held messages go out together in one digest. This is a runaway stop: "
         "look at what is sending (docs/UPDATE-OPERATOR.md, the `chat-cap` row)." % lines))
+
+
+def _incident_words(words):
+    return re.sub(r"[^\x20-\x7e]", " ", words)[:240].strip()
+
+
+def check_runner_incidents(env, conf, state):
+    """The runner's incidents (KIT-957), where RUNNER_INCIDENTS_FILE names the copy of incidents.json, and said off
+    where it is not. Read by the runner's own reader. Each new incident is raised once, in the runner's own plain
+    words; the first pass raises only the ones still open, so a long cleared history is not paged as new. A record
+    that cannot be read, or is in another shape, or a copy that could not be made, is a problem and is never read as
+    no incidents (debounced like the chat cap's). One the runner has not written yet is the one case read as none,
+    and only where the copier says so. Slack only."""
+    import pipeline_runner_limits as rlim
+    kind, path = "runner-incidents", conf.get("RUNNER_INCIDENTS_FILE")
+    if not path:
+        return finding(kind, OK, "RUNNER_INCIDENTS_FILE is not set: the runner's incidents are not watched here")
+    doc, why = rlim.read_record(path)
+    if doc is None and why == "absent":
+        missing = _absent_verdict(env, path)
+        if missing is None:
+            _debounced(state, kind, False)
+            return finding(kind, OK, "no incident record at %s: the runner writes it at its first incident, and the "
+                                     "copier says it has not" % path)
+        why = "is not there, and %s" % missing
+    if doc is not None:
+        unvouched = _present_problem(env, path)       # KIT-957: a copy the copier no longer vouches for
+        if unvouched:
+            doc, why = None, unvouched
+    if doc is None:
+        said = "the runner's incident record %s %s" % (path, why)
+        if _debounced(state, kind, True):
+            return finding(kind, FIRING, (
+                "%s, for %d passes running, so an incident would not be seen. If %s is a copy, the copier may have "
+                "stopped refreshing it." % (said[0].upper() + said[1:], DEBOUNCE, path)))
+        return finding(kind, UNKNOWN, "%s this pass; one more and it fires" % said)
+    _debounced(state, kind, False)
+    rec = state.setdefault("kinds", {}).setdefault(kind, {})
+    first = "seen" not in rec
+    seen = set(rec.get("seen") or [])
+    ident = lambda t: "%s|%s" % (t["at"], t["key"])
+    if first:
+        new = [t for t in doc["told"] if t["key"] in doc["open"] and isinstance(doc["open"][t["key"]], dict)
+               and doc["open"][t["key"]].get("at") == t["at"]]
+    else:
+        new = [t for t in doc["told"] if ident(t) not in seen]
+    rec["seen"] = [ident(t) for t in doc["told"]]
+    if not new:
+        return finding(kind, OK, "no new incidents of the runner")
+    lines = "; ".join(_incident_words(t["words"]) for t in new[:5]) + (
+        "; and %d more" % (len(new) - 5) if len(new) > 5 else "")
+    return finding(kind, FIRING, (
+        "The runner told of %d new incident%s: %s. What a person does: docs/RUNNER.md, the incidents file, and the "
+        "`runner-incidents` row of docs/UPDATE-OPERATOR.md." % (len(new), "" if len(new) == 1 else "s", lines)))
 
 
 def check_clerk(env, conf, state, kind):
@@ -1240,6 +1374,7 @@ def run_pass(env, conf, dry_run=False, tally=None):
     findings += [check_job_beat(env, conf, state, kind) for kind in JOB_BEATS]
     findings.append(check_writer_key(env, conf, state))         # KIT-933
     findings.append(check_chat_cap(env, conf, state))           # KIT-941
+    findings.append(check_runner_incidents(env, conf, state))   # KIT-957
     failed, notes, claimed = [], [], set()
     github_on = bool(conf.get("ALERT_REPO"))
     for f in findings:
@@ -3097,6 +3232,7 @@ def selftest():
         def cc_write(trips, schema=ccap.TRIPS_SCHEMA):
             with open(cc_path, "w") as fh:
                 json.dump({"schema": schema, "trips": trips}, fh)
+            cp_write("copied", dest=cc_path, sha=hashlib.sha256(open(cc_path, "rb").read()).hexdigest())
 
         def cc_trip(at, chat, held):
             return {"at": at, "chat": chat, "max": 20, "window_minutes": 10, "sent_in_window": 20, "held": held}
@@ -3105,9 +3241,50 @@ def selftest():
         off = check_chat_cap(env, conf(), {})
         check("chat-cap is said off where CHAT_CAP_TRIPS_FILE is not set",
               (off["state"], "not watched here" in off["summary"]), (OK, True))
+        # KIT-957: a copy that is not there is none only where the copier's status, beside it, says its source is
+        # absent. No status, an old one, a refusal, a copy it says it made, or another copy's row is never none.
+        cp_status = os.path.join(home, "copier-status.json")
+
+        def cp_write(state, reason=None, age=0, dest=cc_path, schema="pipeline-watcher-copy-status/1", rows=None,
+                     sha=None):
+            row = {"dest": dest, "state": state, "reason": reason, "bytes": None, "sha256": sha, "copied_at": None}
+            with open(cp_status, "w") as fh:
+                json.dump({"schema": schema, "written_at": _iso(T - age), "result": "copied",
+                           "copies": [row] if rows is None else rows}, fh)
+
+        def gone(p):
+            if os.path.exists(p):
+                os.unlink(p)
+        gone(cc_path)
+        gone(cp_status)
+        no_status = check_chat_cap(env, ccc, {})
+        check("a copy that is not there and no copier status beside it is never read as none",
+              (no_status["state"], "no trips" in no_status["summary"], "left no status" in no_status["summary"]),
+              (UNKNOWN, False, True))
+        cp_write("absent", "the source does not exist yet")
         none_yet = check_chat_cap(env, ccc, {})
-        check("no record yet is ok, and says the cap writes it only at a first trip",
-              (none_yet["state"], "only when" in none_yet["summary"]), (OK, True))
+        check("no record yet is ok where the copier says the cap has not written it, and says so",
+              (none_yet["state"], "only when" in none_yet["summary"], "copier says it has not" in none_yet["summary"]),
+              (OK, True, True))
+        bad_cases = []
+        for name, writer, words in (
+                ("a refusal", lambda: cp_write("refused", "the source is a link"), "refused it (the source is a link)"),
+                ("a copy said made but missing", lambda: cp_write("copied"), "says it made the copy"),
+                ("an old status", lambda: cp_write("absent", age=7 * 3600), "may have stopped"),
+                ("another copy's row", lambda: cp_write("absent", dest=cc_path + ".other"), "does not list this copy"),
+                ("another shape", lambda: cp_write("absent", schema="x/1"), "not in the shape"),
+                ("an unreadable status", lambda: open(cp_status, "w").write("{"), "cannot be read")):
+            writer()
+            st_x = {}
+            two = [check_chat_cap(env, ccc, st_x) for _ in range(2)]
+            bad_cases.append((name, two[0]["state"], two[1]["state"], words in two[1]["summary"],
+                              "no trips" in two[1]["summary"]))
+        check("a copy that could not be made is unknown once, fires on the second pass, in the copier's words, "
+              "and is never read as no trips (refused, stale, other shapes)",
+              bad_cases, [(n, UNKNOWN, FIRING, True, False) for n in (
+                  "a refusal", "a copy said made but missing", "an old status", "another copy's row", "another shape",
+                  "an unreadable status")])
+        cp_write("absent")
         cc_write([])
         check("an empty record is ok", check_chat_cap(env, ccc, {})["state"], OK)
         st_c = {}
@@ -3134,6 +3311,24 @@ def selftest():
             seen_c.append((name, two[0]["state"], two[1]["state"], "no trips" in two[1]["summary"]))
         check("a record that cannot be read is unknown once and fires on two passes, never read as no trips",
               seen_c, [(n, UNKNOWN, FIRING, False) for n in ("unreadable", "another shape", "a trip in no shape")])
+        # a copy that is there but that the copier no longer vouches for is never read as no news (stopped copier, a
+        # failed last attempt whose old copy survived, a copy edited after it was made)
+        cc_write([])
+        good_sha = hashlib.sha256(open(cc_path, "rb").read()).hexdigest()
+        unv = []
+        for name, writer, words in (
+                ("a hash that differs", lambda: cp_write("copied", sha="0" * 64), "hash differs"),
+                ("an old status", lambda: cp_write("copied", sha=good_sha, age=7 * 3600), "may have stopped"),
+                ("a refusal after the copy was made", lambda: cp_write("refused", "x", sha=good_sha), "says it is refused"),
+                ("no status at all", lambda: gone(cp_status), "left no status")):
+            writer()
+            st_x = {}
+            two = [check_chat_cap(env, ccc, st_x) for _ in range(2)]
+            unv.append((name, two[0]["state"], two[1]["state"], words in two[1]["summary"], "no new trips" in two[1]["summary"]))
+        check("a copy that is there but not vouched for by the copier is unknown once and fires on the second pass, "
+              "never read as no trips", unv,
+              [(n, UNKNOWN, FIRING, True, False) for n in (
+                  "a hash that differs", "an old status", "a refusal after the copy was made", "no status at all")])
         cc_write([cc_trip("2026-11-20T10:00:00Z", "D123", 7)])
         jc_home = os.path.join(home, "chat-cap-pass")
         os.makedirs(jc_home)
@@ -3145,6 +3340,98 @@ def selftest():
         check("a relative CHAT_CAP_TRIPS_FILE is refused by name",
               bool([e for e in pu.validate_conf(dict(base_c, CHAT_CAP_TRIPS_FILE="x.json"))[1]
                     if "CHAT_CAP_TRIPS_FILE" in e]), True)
+
+        # -- the runner's incidents (KIT-957): the record the runner writes at its first incident; off unless named;
+        #    each new incident raised once in the runner's words (the first pass only the open ones); a copy that could
+        #    not be made, read, or is in another shape is said (unknown once, fires on the second), never none; Slack only
+        import pipeline_runner_limits as rlim
+        ri_path = os.path.join(home, "runner-incidents-copy.json")
+
+        def ri_write(told, open_=None, schema=rlim.INCIDENTS_SCHEMA):
+            with open(ri_path, "w") as fh:
+                json.dump({"schema": schema, "open": open_ or {}, "told": told}, fh)
+            cp_write("copied", dest=ri_path, sha=hashlib.sha256(open(ri_path, "rb").read()).hexdigest())
+
+        def ri_told(at, key, words):
+            return {"at": at, "key": key, "words": words}
+
+        def ri_status(state, reason=None):
+            cp_write(state, reason, dest=ri_path)
+        env = make_env(home)
+        ric = conf(RUNNER_INCIDENTS_FILE=ri_path)
+        off = check_runner_incidents(env, conf(), {})
+        check("runner-incidents is said off where RUNNER_INCIDENTS_FILE is not set",
+              (off["state"], "not watched here" in off["summary"]), (OK, True))
+        gone(ri_path)
+        gone(cp_status)
+        lone = check_runner_incidents(env, ric, {})
+        check("a copy that is not there and no copier status is never read as no incidents",
+              (lone["state"], "left no status" in lone["summary"]), (UNKNOWN, True))
+        ri_status("absent")
+        yet = check_runner_incidents(env, ric, {})
+        check("no record yet is ok where the copier says the runner has not written it",
+              (yet["state"], "copier says it has not" in yet["summary"]), (OK, True))
+        ri_status("refused", "the source is larger than its 524288-byte cap")
+        st_r = {}
+        two = [check_runner_incidents(env, ric, st_r) for _ in range(2)]
+        check("a copy the copier refused is unknown once, then fires in the copier's words, never as no incidents",
+              (two[0]["state"], two[1]["state"], "larger than its 524288-byte cap" in two[1]["summary"],
+               "no new incidents" in two[1]["summary"]), (UNKNOWN, FIRING, True, False))
+        old = ri_told("2026-11-20T08:00:00Z", "floor", "an old floor incident, long cleared")
+        now_open = ri_told("2026-11-20T10:00:00Z", "writer-key", "the writer's key stopped answering")
+        ri_write([old, now_open], {"writer-key": {"at": "2026-11-20T10:00:00Z", "words": now_open["words"]}})
+        st_i = {}
+        first = check_runner_incidents(env, ric, st_i)
+        check("the first pass raises the incident still open, in the runner's own words, and not the old cleared one",
+              (first["state"], "the writer's key stopped answering" in first["summary"],
+               "old floor incident" in first["summary"]), (FIRING, True, False))
+        again = check_runner_incidents(env, ric, st_i)
+        check("the same incident on the next pass is not raised again",
+              (again["state"], again["summary"][:16]), (OK, "no new incidents"))
+        ri_write([old, now_open, ri_told("2026-11-20T12:00:00Z", "limit:memory", "run r9 was stopped at its memory limit")],
+                 {"writer-key": {"at": "2026-11-20T10:00:00Z", "words": "x"}})
+        later = check_runner_incidents(env, ric, st_i)
+        check("a later incident is raised on its own, and the earlier ones are not repeated",
+              (later["state"], "memory limit" in later["summary"], "writer's key" in later["summary"]),
+              (FIRING, True, False))
+        ri_write([ri_told("2026-11-20T13:00:00Z", "x", "line one\x1b[31m red\nline two")])
+        clean = check_runner_incidents(env, ric, {"kinds": {"runner-incidents": {"seen": []}}})
+        check("the runner's words are repeated without control characters",
+              (clean["state"], "\x1b" in clean["summary"], "\n" in clean["summary"]), (FIRING, False, False))
+        seen_r = []
+        for name, writer in (("unreadable", lambda: open(ri_path, "w").write("{")),
+                             ("another shape", lambda: ri_write([], schema="x/1")),
+                             ("an incident in no shape", lambda: ri_write([{"at": 1}]))):
+            writer()
+            st_x = {}
+            pair = [check_runner_incidents(env, ric, st_x) for _ in range(2)]
+            seen_r.append((name, pair[0]["state"], pair[1]["state"], "no new incidents" in pair[1]["summary"]))
+        check("a record that cannot be read is unknown once and fires on two passes, never read as no incidents",
+              seen_r, [(n, UNKNOWN, FIRING, False) for n in ("unreadable", "another shape", "an incident in no shape")])
+        ri_write([])
+        ri_sha = hashlib.sha256(open(ri_path, "rb").read()).hexdigest()
+        unv_r = []
+        for name, writer, words in (("a hash that differs", lambda: cp_write("copied", dest=ri_path, sha="0" * 64), "hash differs"),
+                                    ("an old status", lambda: cp_write("copied", dest=ri_path, sha=ri_sha, age=7 * 3600),
+                                     "may have stopped")):
+            writer()
+            st_x = {}
+            pair = [check_runner_incidents(env, ric, st_x) for _ in range(2)]
+            unv_r.append((name, pair[0]["state"], pair[1]["state"], words in pair[1]["summary"]))
+        check("an incident copy the copier no longer vouches for is unknown once and fires on the second pass",
+              unv_r, [(n, UNKNOWN, FIRING, True) for n in ("a hash that differs", "an old status")])
+        ri_write([ri_told("2026-11-20T10:00:00Z", "writer-key", "the writer's key stopped answering")],
+                 {"writer-key": {"at": "2026-11-20T10:00:00Z", "words": "x"}})
+        jr_home = os.path.join(home, "runner-incidents-pass")
+        os.makedirs(jr_home)
+        jr_status = os.path.join(home, "runner-incidents-health.json")
+        env = make_env(jr_home, gh=gh_ok(T))
+        run_pass(env, conf(HEALTH_STATUS_FILE=jr_status, KIT_CHECKOUT=kit, RUNNER_INCIDENTS_FILE=ri_path))
+        check("...an incident reaches the status file the monitor reads, and no GitHub issue",
+              (sorted(json.load(open(jr_status))["firing"]), env.runner.writes), (["runner-incidents"], []))
+        check("a relative RUNNER_INCIDENTS_FILE is refused by name",
+              bool([e for e in pu.validate_conf(dict(base_c, RUNNER_INCIDENTS_FILE="x.json"))[1]
+                    if "RUNNER_INCIDENTS_FILE" in e]), True)
 
         # -- the yearly credentials (KIT-579): the owner writes each date down; the kind
         #    warns CREDENTIAL_WARN_DAYS ahead and after, names only, and is upkeep -------------
