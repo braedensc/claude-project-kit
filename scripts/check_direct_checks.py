@@ -32,6 +32,7 @@ DIRECT = (
     "scripts/check_runner_pin.py",
     "scripts/check_agent_trigger_author.py",
     "scripts/check_stdlib_only.py",
+    "scripts/check_settings_ignored.py",
     "scripts/check_workflow_calls.py",
     "scripts/check_placeholders.py",
     "scripts/check_session_brief.py",

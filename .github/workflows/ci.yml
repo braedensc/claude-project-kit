@@ -529,6 +529,13 @@ jobs:
       - name: Standard-library-only check (no outside import beyond the allow list)
         run: python3 scripts/check_stdlib_only.py
 
+      # KIT-981. Every committed *.conf.example has its filled-in name in .gitignore.
+      - name: Settings files ignored (selftest)
+        run: python3 scripts/check_settings_ignored.py --selftest
+
+      - name: Settings files ignored (this repository)
+        run: python3 scripts/check_settings_ignored.py
+
       - name: Placeholder integrity (used == documented)
         run: python3 scripts/check_placeholders.py
 

@@ -475,6 +475,7 @@ npm run test:ci-covers      # every package.json test:* script has a CI step out
 npm run test:ci-shards      # the sweeps' and the Python 3.9 job's shard lists hold every battery once; each fan-in job keeps
                              #   its name, `if: always()` and every shard, and fails on a skipped one (KIT-945)
 npm run lint:ci-covers      # …and the same check over this repo
+npm run test:settings-ignored  # every committed *.conf.example has its filled-in name in .gitignore, checked in a private repo; a dropped line fails (KIT-981)
 npm run test:stdlib-only    # the kit's Python imports only the standard library, bar a named list (KIT-652)
 npm run lint:stdlib-only    # …and the same check over this repo's tracked .py files
 npm run test:repo-setup     # the repo-setup check: missing label, missing variable, all present, unreadable (KIT-692)

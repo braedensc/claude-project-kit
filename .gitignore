@@ -89,3 +89,19 @@ sweep.conf
 # The validator installer's filled-in settings: same reasoning as stage-e.conf. validator.conf.example is the
 # committed one.
 validator.conf
+
+# The runner installer's filled-in settings: same reasoning as stage-e.conf. runner.conf.example is the
+# committed one.
+runner.conf
+
+# The queue installer's filled-in settings: same reasoning as stage-e.conf. queue.conf.example is the
+# committed one.
+queue.conf
+
+# The watcher installer's filled-in settings: same reasoning as stage-e.conf. watcher.conf.example is the
+# committed one.
+watcher.conf
+
+# The acceptance installer's filled-in settings: same reasoning as stage-e.conf. acceptance.conf.example is the
+# committed one.
+acceptance.conf

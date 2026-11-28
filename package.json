@@ -138,6 +138,7 @@
     "test:gate-policy": "python3 scripts/pipeline_gate_policy.py --selftest",
     "test:branch-rule": "python3 scripts/pipeline_branch_rule.py --selftest",
     "test:runner-pin": "python3 scripts/check_runner_pin.py --selftest && python3 scripts/check_runner_pin.py",
+    "test:settings-ignored": "python3 scripts/check_settings_ignored.py --selftest",
     "test:stdlib-only": "python3 scripts/check_stdlib_only.py --selftest",
     "lint:stdlib-only": "python3 scripts/check_stdlib_only.py",
     "test:repo-setup": "python3 scripts/check_repo_setup.py --selftest",
