@@ -521,6 +521,13 @@ jobs:
       - name: Branch rule selftest (main also requires a pull request; one yes; read back)
         run: python3 scripts/pipeline_branch_rule.py --selftest
 
+      # KIT-646. The owner's script that takes the old dispatcher off a Mac. Offline, against a
+      # stand-in Mac in a folder: refused under a model or as root, every lane on the runner before
+      # anything changes, the session writer's key handed over (stop, switch, renewed, checked) before
+      # the first removal, one yes, and each piece read back as gone.
+      - name: Dispatcher removal selftest (old dispatcher off the Mac; key handed over first)
+        run: python3 scripts/pipeline_dispatcher_removal.py --selftest
+
       # KIT-652. The kit's Python imports only the standard library, bar a short named list,
       # because its jobs and hooks run on a Python with nothing added to it.
       - name: Standard-library-only selftest

@@ -488,6 +488,9 @@ npm run test:gate-policy     # the owner's Actions policy that lets the gate run
 npm run test:branch-rule     # the owner's script that makes main's rule require a pull request (KIT-911):
                              #   ON/OFF/UNKNOWN, never ON on a failed read; lists commits that skipped
                              #   a pull request; one yes; checks and admins read back unchanged
+npm run test:dispatcher-removal  # the owner's script that takes the old dispatcher off a Mac (KIT-646):
+                             #   every lane on the runner first; the writer's key handed over before
+                             #   anything goes; one yes; each piece read back; UNKNOWN is never READY
 npm run test:template-label-gate  # the stack template's label gate runs the default branch's workflow on
                              #   pull_request_target, never the PR's: one closed reason per rule (KIT-788)
 npm run test:alert-pages     # alert templates page a person (ALERT_PAGE_TO, else a user

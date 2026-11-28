@@ -1,0 +1,58 @@
+# dispatcher-removal.conf.example: what the removal script needs that no other part file names.
+#
+# ---------------------------------------------------------------------------
+# HOW TO USE THIS FILE
+#
+#   cp dispatcher-removal.conf.example dispatcher-removal.conf
+#   $EDITOR dispatcher-removal.conf
+#   python3 scripts/pipeline_dispatcher_removal.py check    # read only, any time
+#   python3 scripts/pipeline_dispatcher_removal.py run      # you, in a terminal
+#
+# Guide: docs/DISPATCHER-REMOVAL.md. Keep this file beside the other part files
+# (stage-e.conf, update.conf, runner.conf): the script reads them too.
+#
+# FORMAT.  `KEY=value`, one per line; `#` starts a comment only at the start of
+# a line.  Parsed, never sourced.  No value here is a credential: a file that
+# holds one is named by its path, never copied here.
+#
+# WHAT THE OTHER FILES GIVE.  The pipeline's account, the dispatcher's launchd
+# label, its settings file and its port come from stage-e.conf; its env file,
+# its package and the line that puts its Node on PATH come from update.conf;
+# the front door's label and settings file come from chat-lane.conf.  Every
+# file that names a value must name the same one.
+#
+# EVERY KEY BELOW IS REQUIRED: its value, or `none` when this Mac has no such
+# piece.  `none` is said in `check`, never guessed.  The values below are
+# refused as typed, so an unedited copy cannot run.
+# ---------------------------------------------------------------------------
+
+# The launchd label of the job that copies the old dispatcher's state aside
+# each night.  RULE: reverse-DNS, at least two dot-separated parts.
+STATE_BACKUP_SERVICE=com.example.dispatcher-backup
+
+# Where that job's copies are: their folder, then the start of each copy's
+# name.  Only files in that folder whose names start so are removed, and the
+# folder must be inside the old dispatcher's own folder (the one its settings
+# file is in).
+STATE_BACKUP_COPIES=/opt/example-dispatcher/state/state.json.bak-
+
+# The launchd label of the tunnel's job, which gives the front door its
+# public name.  RULE: reverse-DNS.
+TUNNEL_SERVICE=com.example.tunnel
+
+# The tunnel's token file, root's alone (mode 600).  It is removed only if the
+# tunnel's own job file names it.
+TUNNEL_TOKEN_FILE=/etc/example-tunnel/token
+
+# The page where you delete the tunnel.  Printed at the end, never opened.
+TUNNEL_PAGE=https://dash.example.com/tunnels
+
+# Any other launchd jobs that exist only for the old dispatcher, such as a
+# credential check that reads its env file, comma-separated, or `none`.
+OTHER_SERVICES=none
+
+# Optional.  The front door's launchd label and settings file, when
+# chat-lane.conf does not name them; `none` when this Mac has no front door.
+# Left empty, chat-lane.conf's FRONT_DOOR_SERVICE and FRONT_DOOR_CONFIG are used.
+FRONT_DOOR_SERVICE=
+FRONT_DOOR_CONFIG=
