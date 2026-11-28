@@ -46,9 +46,12 @@ ticket from the tracker and judges it:
     scripts/pipeline_queue_read.py's gather() over the queue's settings (`queue_config`), then
     scripts/pipeline_queue_pool.py's decide(). One rule, for the queue and the runner alike. It
     starts only a ticket the judge admits with a named approver: the owner's move, his creation
-    where the judge counts one, his approval of a plan in Slack (the bridge's record), or the
-    validator in his place while its switch is on. An agent-filed finding the limits admitted has
-    no approver, and is refused. A judge that could not read what it needs holds the request.
+    where the judge counts one, his approval of a plan in Slack (the bridge's record), the
+    validator in his place while its switch is on, or his own yes in Slack to start that one ticket
+    (KIT-961, the bridge's record of the message, via "slack-start"). An agent-filed finding the
+    limits admitted has no approver, and is refused. A judge that could not read what it needs holds
+    the request. One yes in Slack starts one run at most: a code start whose "slack-start" approval,
+    by the same member at the same second, already started a run of the ticket is refused.
   - Any other start needs the owner's own move into one of the kind's approved states
     (`approval_states`) in the ticket's whole history: the newest move for a plan start, any move
     for a kind that follows an approved ticket. A ticket the owner made in that state, with no move
@@ -670,7 +673,8 @@ def queue_judge(cfg, gql, ticket, now, say=None):
         return None, "the queue's judge could not read the board: %s" % (
             doc["sources"]["tracker"]["reason"] or "the tracker was not read"), True
     verdicts = pool.decide(qcfg["pool"], now, doc["tickets"], doc["epics"], doc["histories"],
-                           doc["busy"], doc["findings"], doc["plans"], doc["ledger"], doc.get("validator"))
+                           doc["busy"], doc["findings"], doc["plans"], doc["ledger"], doc.get("validator"),
+                           slack_starts=doc.get("slack_starts"))
     v = next((x for x in verdicts if x.get("ticket") == ticket), None)
     if v is None:
         return None, ("the queue's judge has no verdict on %s: it is not among the queue's candidates"
@@ -684,6 +688,21 @@ def queue_judge(cfg, gql, ticket, now, say=None):
                       "start on this lane needs one: its approver's move starts it" % ticket), False
     return {"by": by, "at": at if isinstance(at, str) and store.TIME_RE.match(at) else None,
             "how": v["via"]}, "", False
+
+
+def once_per_yes(runs, ticket, approval):
+    """Why a code start may not go on this approval, or "": one yes of the owner's in Slack starts one
+    run at most (KIT-961). A start on a "slack-start" approval is refused when a run of this ticket was
+    already started on it, by the same member at the same second, whatever became of that run. Every
+    other approval is as it was."""
+    if approval.get("how") != store.SLACK_START:
+        return ""
+    if any(r["ticket"] == ticket and r["resumes"] is None and r["how"] == store.SLACK_START
+           and (r["approved_by"], r["approved_at"]) == (approval.get("by"), approval.get("at"))
+           for r in runs):
+        return ("%s was started once already on this yes in Slack, and one yes starts one run: "
+                "ask again with a new one" % ticket)
+    return ""
 
 
 def run_approval(cfg, runs, project, ticket, kind):
@@ -1984,6 +2003,9 @@ class Runner(object):
             ok, why, waits = self.judge(ticket)
             if ok is None:
                 return ("held" if waits else "refused"), None, why
+            used = once_per_yes(runs, ticket, ok)
+            if used:
+                return "refused", None, used
         elif "from_run" in rule:                # KIT-644: a review follows its ticket's code run
             ok, why = run_approval(cfg, runs, project_key, ticket, rule["from_run"])
             if ok is None:
@@ -3001,6 +3023,7 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                 def match(f, i):
                     st = f.get("state", {})
                     return (("team" not in f or i["team"]["key"] in f["team"]["key"]["in"])
+                            and ("id" not in f or i["id"] in f["id"]["in"])
                             and ("name" not in st or i["state"]["name"] in st["name"]["in"])
                             and ("type" not in st or i["state"]["type"] == st["type"]["eq"])
                             and ("or" not in f or any(match(g, i) for g in f["or"])))
@@ -3025,8 +3048,9 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
             bnode(51), bnode(52, "Backlog", ("effort:S", "provenance:agent", "track:platform")),
             bnode(53), bnode(54), bnode(50, labels=("provenance:agent",),
                                         children={"nodes": [{"id": "uuid-eng-55"}]}),
-            piece, bnode(56), bnode(57)]
+            piece, bnode(56), bnode(57), bnode(58), bnode(59)]
         tracker.board = Board(board_issues, {
+            "uuid-eng-58": [hmove("someone")], "uuid-eng-59": [hmove("someone")],
             "uuid-eng-51": [hmove("owner-1")], "uuid-eng-53": [hmove("someone")],
             "uuid-eng-54": [hmove("owner-1")], "uuid-eng-56": [hmove("owner-1")],
             # KIT-934: the owner's label at t0 and his move at t1, in one entry, as Linear groups them.
@@ -3038,9 +3062,16 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
             json.dump({"schema": finding_poller.SEEN_SCHEMA,
                        "seen": {"c1": {"filed": "ENG-52", "source": "ENG-90"}}}, fh)
         with open(bridge_file, "w") as fh:
+            # KIT-961: the owner's yes in Slack to start ENG-58, and another member's to start ENG-59.
+            t2 = "2026-11-01T11:00:00Z"
+            yes = lambda n, by: {"ticket": "ENG-%d" % n, "kind": "start", "approved_by": by,  # noqa: E731
+                                 "approved_at": t2, "team": "T0TEAM001", "channel": "D0CHAN001",
+                                 "ts": "%d.000100" % pool.epoch(t2), "answered": None}
             json.dump({"epics": {"uuid-eng-50": {
                 "ticket": "ENG-50", "approved_by": "U0OWNER001", "approved_at": t1,
-                "approved": {"uuid-eng-55": pool.fingerprint(piece)}}}}, fh)
+                "approved": {"uuid-eng-55": pool.fingerprint(piece)}}},
+                "slack_starts": {"uuid-eng-58": yes(58, "U0OWNER001"), "uuid-eng-59": yes(59, "U0OTHER001")}},
+                fh)
         with open(queue_conf, "w") as fh:
             json.dump({"pool": {"owner_user_ids": ["owner-1"], "dispatcher_user_ids": ["bot-1"],
                                 "owner_slack_user_ids": ["U0OWNER001"], "team_keys": ["ENG"],
@@ -3050,7 +3081,8 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                                   "inputs_file": os.path.join(qdir, "inputs.json")}}, fh)
         for n, title in ((51, "Judged by the queue"), (52, "An agent-filed finding"), (53, "Moved by another"),
                          (54, "Its history is refused"), (55, "A piece approved in Slack"),
-                         (56, "Its move is refused at first"), (57, "Its move shares an entry with a label")):
+                         (56, "Its move is refused at first"), (57, "Its move shares an entry with a label"),
+                         (58, "Started on the owner's yes in Slack"), (59, "Another member said yes")):
             ticket("ENG-%d" % n, title, [move("owner-1", "st-ready")])
         nodes["ENG-55"].update(state={"id": "st-backlog"}, parent={"identifier": "ENG-50"},
                                labels={"nodes": [{"id": "lab-s", "name": "effort:S"},
@@ -3072,6 +3104,10 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                                         True))
         expect("…a piece of a plan the owner approved in Slack is his approval, by the bridge's record",
                judged.judge("ENG-55"), ({"by": "U0OWNER001", "at": t1, "how": "slack"}, "", False))
+        expect("KIT-961: …a ticket someone else moved, with the owner's yes in Slack to start it, is his approval",
+               judged.judge("ENG-58"), ({"by": "U0OWNER001", "at": t2, "how": "slack-start"}, "", False))
+        expect("KIT-961 …another member's yes is no approval: the judge's own hold, refused in its words",
+               judged.judge("ENG-59"), (None, "the queue's judge does not admit ENG-59 (not-owner)", False))
         expect("KIT-934: …a move sharing one entry with his label at t0 is his approval at t1, the move's own time",
                judged.judge("ENG-57"), ({"by": "owner-1", "at": t1, "how": "move"}, "", False))
         expect("…a ticket the queue does not read at all has no verdict, and is refused",
@@ -3122,8 +3158,42 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
                (a55.get("ok"), (store.read_run(sdir, run55) or {}).get("how") if run55 else None),
                (True, "slack"))
         run56 = (store.answer(sdir, rq56) or {}).get("run")
+        rq58 = store.ask(sdir, "queue", "start", "code", "app", "ENG-58")
+        judged.pass_once()
+        a58 = store.answer(sdir, rq58) or {}
+        r58 = store.read_run(sdir, a58["run"]) if a58.get("run") else {}
+        expect("KIT-961: a start on the owner's yes in Slack goes, its record naming him and his message's second",
+               (a58.get("ok"), r58.get("approved_by"), r58.get("approved_at"), r58.get("how")),
+               (True, "U0OWNER001", t2, "slack-start"))
         _wait(lambda: judged.pass_once() and all(
-            store.read_run(sdir, r)["state"] not in store.LIVE for r in (r51.get("run"), run55, run56) if r), 15)
+            store.read_run(sdir, r)["state"] not in store.LIVE for r in (r51.get("run"), run55, run56,
+                                                                       a58.get("run")) if r), 15)
+        rq58b = store.ask(sdir, "queue", "start", "code", "app", "ENG-58")
+        judged.pass_once()
+        expect("KIT-961 …and the same yes asked again starts nothing: one message, one run, said in words",
+               ((store.answer(sdir, rq58b) or {}).get("ok"), (store.answer(sdir, rq58b) or {}).get("why")),
+               (False, "ENG-58 was started once already on this yes in Slack, and one yes starts one run: "
+                       "ask again with a new one"))
+        # The rule's mutant, kept in the battery: with it dropped, that same yes is no longer refused
+        # in its words. Nothing can start meanwhile: the run's workspace stands, and any request left
+        # waiting is taken back.
+        real_once = once_per_yes
+        globals()["once_per_yes"] = lambda runs, ticket, approval: ""
+        try:
+            rq58c = store.ask(sdir, "queue", "start", "code", "app", "ENG-58")
+            judged.pass_once()
+            unruled = (store.answer(sdir, rq58c) or {}).get("why")
+            store.withdraw(sdir, rq58c)
+        finally:
+            globals()["once_per_yes"] = real_once
+        expect("KIT-961 mutant: the one-yes-one-run rule dropped is caught",
+               unruled != (store.answer(sdir, rq58b) or {}).get("why"), True)
+        expect("KIT-961 …a yes at another second, another member's, or a move is not that yes",
+               [once_per_yes([r58], "ENG-58", dict(by="U0OWNER001", at=t2, how=h)) == "" for h in
+                ("move", "slack", "validator")] + [once_per_yes([r58], "ENG-58", a) for a in (
+                    dict(by="U0OWNER001", at=t1, how="slack-start"), dict(by="U0OTHER001", at=t2, how="slack-start"))]
+               + [once_per_yes([r58], "ENG-57", dict(by="U0OWNER001", at=t2, how="slack-start"))],
+               [True, True, True, "", "", ""])
         rqfix = store.ask(sdir, "fix-driver", "resume", "fix", "app", "ENG-55", run=run55, text="Fix it STANDIN:quick")
         judged.pass_once()
         afix = store.answer(sdir, rqfix) or {}

@@ -147,11 +147,13 @@ LIMIT_REASONS = ("limit:time", "limit:memory", "limit:disk")
 STARTED_FOR = ("request", "interrupted", "session-gone")
 RUNNERS_OWN = ("interrupted", "session-gone")
 AUTO_RESUME = ("pending", "started", "refused")
-# How a run was let start: the owner's move or creation, a plan he approved in Slack or the
-# validator in his place (each as the queue's own judge names it, KIT-645), a resume of a run of
+# How a run was let start: the owner's move or creation, a plan he approved in Slack, the
+# validator in his place, or his own yes in Slack to start that one ticket (KIT-961, the bridge's
+# record of the message), each as the queue's own judge names it (KIT-645); a resume of a run of
 # the same session, a fresh session in the workspace of a run whose session was gone, or the
 # approval its ticket's code run recorded (KIT-644: a review follows the coding it judges).
-APPROVALS = ("move", "creation", "slack", "validator")
+SLACK_START = "slack-start"
+APPROVALS = ("move", "creation", "slack", "validator", SLACK_START)
 HOW = APPROVALS + ("resumed-run", "fresh-session", "code-run")
 FOLLOWS = ("resumed-run", "fresh-session")              # a run that carries on another run
 
@@ -1228,7 +1230,7 @@ def _selftest():  # noqa: C901  (one battery, read top to bottom)
     os.chmod(os.path.join(store, "runs"), 0o700)
 
     # ---- KIT-645: how a start was approved, as the queue's judge names it ----- #
-    for how in ("slack", "validator"):
+    for how in ("slack", "validator", SLACK_START):
         expect("a start the queue's judge let through by %s is a record" % how,
                run_problems(dict(rec, how=how)), [])
     expect("…and a start that names no approval is not one",

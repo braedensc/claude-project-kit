@@ -28,9 +28,20 @@ WHAT IS HERE
               the agent taken off and put back, since Linear starts a session only for a
               real change), the sessions read back for a retry (none new: nothing was
               retried, and it says so), then the comment naming who said yes.
-  Our runner  a ticket whose project codes on our own runner (KIT-645) is neither retried nor
-              started here: the runner starts one only on its approver's move, and the
-              question says so. A runner whose settings cannot be read refuses it too.
+  Our runner  a ticket whose project codes on our own runner (KIT-645) is never handed to the
+              agent. There `start`, `retry` and `resume` (KIT-961) ask a question of their own,
+              and only a yes from a member the queue's settings name as the owner
+              (`owner_slack_user_ids`, judged by the pool's own slack_owner, after every check
+              of the sender a yes gets) acts. The yes is recorded, with its message (its
+              workspace, its channel and its ts), in the bridge's own record `slack_starts`,
+              and nothing is written to Linear. A start then goes the way a move into the ready
+              state goes: the queue's reader reads the record, the pool admits the ticket on it,
+              and the queue's order starts it inside its window, its lanes and the day's load,
+              as a code request the runner judges with that same pool. A resume is asked of
+              the runner by the queue's own pass, inside its window, for the ticket's newest
+              stopped run. The runner's answer, and a hold the queue puts on the ticket, are
+              said where the yes was given; the record is closed by the answer, so one yes
+              starts one run at most. A runner whose settings cannot be read refuses it.
 """
 import os
 import sys
@@ -40,14 +51,19 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
+import json  # noqa: E402
 import check_ticket_dor as dor  # noqa: E402
 import pipeline_machine_tickets as machine  # noqa: E402
 import pipeline_notify_local as notify  # noqa: E402
+import pipeline_queue_pool as pool  # noqa: E402  (KIT-961: the owner's one check, slack_owner)
+import pipeline_queue_start as starter  # noqa: E402  (KIT-961: the queue's settings, and its ledger)
+import pipeline_runner_store as runner_store  # noqa: E402  (KIT-961: the runner's runs and requests)
 from pipeline_bridge_config import (ASK_AGAIN_BIND, DONE, EXIT_USAGE,  # noqa: E402
-                                    REFUSED, SLACK_USER_RE, credit_terms, iso, label_names,
-                                    ts_float)
+                                    REFUSED, SLACK_USER_RE, credit_terms, epoch, iso,
+                                    label_names, ts_float)
 from pipeline_bridge_transport import BridgeError  # noqa: E402
-from pipeline_bridge_plans import HANDOVER_RETRY_SECONDS, SESSION_RUNNING  # noqa: E402
+from pipeline_bridge_plans import (HANDOVER_RETRY_SECONDS, RUNNER_REFUSED_KEEP,  # noqa: E402
+                                   SESSION_RUNNING)
 from pipeline_bridge_requests import (ACT_OFF_THEN_BIND, HANDOVER_KINDS,  # noqa: E402
                                       QUESTION_BIND, ticket_fingerprint)
 
@@ -60,6 +76,19 @@ START_INSTEAD_BIND = "To hand it to the agent, type `start %s`."
 RETRY_INSTEAD_BIND = "If it never started, type `retry %s`."
 APPROVE_INSTEAD_BIND = "To start its pieces, type `approve %s`."
 HEADS = {"retry": "*Hand this over again?* ", "start": "*Start this?* "}
+# KIT-961, on a project that codes on our own runner: what a yes does there, what to type instead,
+# the heads of its questions, and the fixed words a resume asks the run with (never a ticket's).
+RUNNER_START_THEN_BIND = ("I'll ask our own runner to start it once the queue has room for it: "
+                          "inside its working window, its lanes and today's limits")
+RUNNER_RESUME_THEN_BIND = ("I'll ask our own runner to resume its stopped run once the queue has "
+                           "room, inside its working window")
+RUNNER_START_INSTEAD_BIND = "To start it, type `start %s`."
+RUNNER_RESUME_INSTEAD_BIND = "To resume its stopped run, type `resume %s`."
+RUNNER_HEADS = {"retry": "*Resume this on our own runner?* ",
+                "start": "*Start this on our own runner?* "}
+RUNNER_RESUME_TEXT = "The owner said yes in Slack to resume this run. Carry on from where it stopped."
+RUN_ENDS = {"ended": "ended", "stopped": "was stopped", "interrupted": "was interrupted",
+            "failed": "never got going"}
 # A ticket `start` takes: one in a backlog or to-do state, which nobody began. One still in
 # triage was never accepted, and done or canceled is never handed over.
 START_STATES = ("backlog", "unstarted")
@@ -104,10 +133,9 @@ def _in_words(items):
     return items[0] if len(items) == 1 else "%s and %s" % (", ".join(items[:-1]), items[-1])
 
 
-def handover_parts(kind, issue, since, requester, cfg, by_bot=False, dm=False, terms=None):
-    """(head, body, bind, facts) for a retry or start question (KIT-352), as question_parts
-    makes a plan question's. `since` is when a retried ticket's newest hand-over was made,
-    or None."""
+def ticket_words(issue, requester, by_bot):
+    """(title, creator, state, team, who asked, the body's first sentence) as a handover question
+    says them, on either road."""
     title = notify.safe_title(issue.get("title") or "")
     creator = notify.safe_title(((issue.get("creator") or {}).get("displayName")
                                  or (issue.get("creator") or {}).get("name") or "someone"))
@@ -117,11 +145,19 @@ def handover_parts(kind, issue, since, requester, cfg, by_bot=False, dm=False, t
         who = "a bot"            # the tech lead's own lines name it in their terms (KIT-492)
     else:
         who = ("<@%s>" % requester) if SLACK_USER_RE.match(requester or "") else "a bot"
+    return title, creator, state, team, who, ("%s “%s”: in %s on %s, filed by %s."
+                                              % (issue.get("identifier"), title, state, team,
+                                                 creator))
+
+
+def handover_parts(kind, issue, since, requester, cfg, by_bot=False, dm=False, terms=None):
+    """(head, body, bind, facts) for a retry or start question (KIT-352), as question_parts
+    makes a plan question's. `since` is when a retried ticket's newest hand-over was made,
+    or None."""
+    title, creator, state, team, who, body = ticket_words(issue, requester, by_bot)
     then = RETRY_THEN_BIND if kind == "retry" else START_THEN_BIND
     if not cfg["act"]:
         then = ACT_OFF_THEN_BIND
-    body = ("%s “%s”: in %s on %s, filed by %s."
-            % (issue.get("identifier"), title, state, team, creator))
     if kind == "retry":
         body += (" It was handed to the agent at %s and hasn't started." % iso(since)
                  if since is not None else " Its dev stopped before it finished.")
@@ -136,28 +172,64 @@ def handover_parts(kind, issue, since, requester, cfg, by_bot=False, dm=False, t
     return HEADS[kind], body, bind, facts
 
 
+def runner_parts(kind, issue, run, requester, cfg, by_bot=False, dm=False, terms=None):
+    """(head, body, bind, facts) for a start or a resume on our own runner (KIT-961). `run` is the
+    ticket's newest code run for a resume, as the runner's own record holds it; None for a start."""
+    title, creator, state, team, who, body = ticket_words(issue, requester, by_bot)
+    if kind == "retry":
+        body += " Its newest run on our own runner %s at %s." % (
+            RUN_ENDS.get(run.get("state"), "ended"), run.get("ended_at") or "a time it did not record")
+        then = RUNNER_RESUME_THEN_BIND
+    else:
+        body += (" It passes the readiness gate; the rules that need the project's own settings "
+                 "were skipped.")
+        then = RUNNER_START_THEN_BIND
+    body += " Its project codes on our own runner, so only the owner's yes counts here."
+    if not cfg["act"]:
+        then = ACT_OFF_THEN_BIND
+    yes, credit = credit_terms(terms, who)
+    bind = QUESTION_BIND % (yes, "here" if dm else "in this thread", cfg["question_ttl_hours"],
+                            then, credit)
+    facts = {"ticket": issue.get("identifier"), "title": title, "state": state, "team": team,
+             "filed_by": creator, "on": "our own runner",
+             "needs": "the owner's answer to the fixed line after this message"}
+    return RUNNER_HEADS[kind], body, bind, facts
+
+
 class HandoverMixin(object):
     """Pass's `retry` and `start` (KIT-352)."""
 
     def handover_read(self, kind, ident):
-        """(issue, sessions, agent id, refusal) for a retry or start of the ticket now: the
-        refusal as handover_refusal gives it, or None when it may go ahead."""
+        """(issue, sessions, agent id, refusal, road) for a retry or start of the ticket now: the
+        refusal as handover_refusal gives it, or None when it may go ahead. KIT-961: with our own
+        runner wired, the ticket is read first, and on a project that codes on it no agent is
+        asked for: (issue, [], None, runner_refusal's refusal, road), `road` being (store,
+        project) as it was read this once, and handed on so no later read of it can differ. On the
+        old road `road` is None."""
+        issue = None
+        if (self.cfg.get("runner_lane") or {}).get("repos"):
+            issue = self.tracker.issue(ident)
+            if not issue or not issue.get("id"):
+                return None, [], None, ("I can't find %s in Linear." % ident, "", "not found"), None
+            road = self.runner_road(issue)
+            if road:
+                return issue, [], None, self.runner_refusal(kind, issue, road), road
         name = self.cfg["agent_user_name"].strip()
         if not name:
             return None, [], None, (
                 "I can't hand anything to the agent: no agent account is named here.", "",
-                "no agent named")
+                "no agent named"), None
         agent_id, why = self.tracker.agent_user(name)
         if not agent_id:
             return None, [], None, ("I can't hand anything to the agent: %s." % why, "",
-                                    "no agent")
-        issue = self.tracker.issue(ident)
+                                    "no agent"), None
+        issue = issue or self.tracker.issue(ident)
         if not issue or not issue.get("id"):
-            return None, [], agent_id, ("I can't find %s in Linear." % ident, "", "not found")
+            return None, [], agent_id, ("I can't find %s in Linear." % ident, "", "not found"), None
         node = self.tracker.epic(ident) or {}
         sessions = [n or {} for n in self.tracker.sessions_on(issue["id"])]
         return issue, sessions, agent_id, self.handover_refusal(kind, issue, node, sessions,
-                                                                agent_id)
+                                                                agent_id), None
 
     def handover_refusal(self, kind, issue, node, sessions, agent_id):
         """Why the ticket can't be retried or started now, as (text, bind, why), or None. A
@@ -230,6 +302,312 @@ class HandoverMixin(object):
                     RETRY_AFTER_BIND % (ident, iso(safe)), "Linear may still deliver it")
         return None
 
+    # -- our own runner (KIT-961) --------------------------------------------------------
+    def runner_road(self, issue):
+        """(store, project) when this ticket's project codes on our own runner now, else None:
+        the runner's own switch for the project (runner_route_of), read afresh each time."""
+        route, where = self.runner_route_of(issue)
+        return where if route == "runner" else None
+
+    def runner_owners(self):
+        """(the owner's Slack ids, why): the queue's own `owner_slack_user_ids`, the one list the
+        queue's judge and our own runner read too. ([], why) when it names none, or the queue's
+        settings cannot be read: then no yes here starts work on our own runner."""
+        try:
+            with open(self.cfg["queue_config"], encoding="utf-8") as fh:
+                qcfg, bad = starter.load(json.load(fh))
+        except (OSError, ValueError, RecursionError) as exc:
+            return [], "the queue's settings could not be read (%s)" % type(exc).__name__
+        if bad:
+            return [], "the queue's settings are not usable"
+        owners = list(qcfg["pool"]["owner_slack_user_ids"])
+        return owners, "" if owners else "the queue's settings name no Slack member as the owner"
+
+    def runner_runs(self, where, ident):
+        """(this ticket's runs on our own runner, why): every record the runner keeps of them, or
+        (None, why) when the records cannot all be read, so a live run is never missed."""
+        got = runner_store.read_runs(where)
+        if got["state"] != "read":
+            return None, self.clean(got["why"] or "they could not be read")
+        return [r for r in got["runs"] if r["ticket"] == ident], ""
+
+    def newest_code_run(self, runs):
+        """The ticket's newest code run on our own runner, or None."""
+        coded = [r for r in runs or () if r["kind"] == "code"]
+        return max(coded, key=lambda r: (r["started_at"] or "", r["run"])) if coded else None
+
+    def open_slack_start(self, issue_id):
+        """The bridge's record of a yes given in Slack for this ticket that our own runner has not
+        answered yet, or None (KIT-961)."""
+        rec = (self.state.get("slack_starts") or {}).get(issue_id)
+        return rec if isinstance(rec, dict) and rec.get("answered") is None else None
+
+    def runner_refusal(self, kind, issue, road):
+        """Why this ticket can't be started or resumed on our own runner now (KIT-961), as (text,
+        bind, why), or None. The watcher's hold first, as on the old road; then the owner the queue
+        names, the runner's own record of the ticket's runs, what already waits for it, and for a
+        start the old road's checks of the ticket itself. `road` is (store, project) as
+        handover_read read it."""
+        ident = issue["identifier"]
+        blocked, why, clear = self.hold_gate()
+        if blocked:
+            return ("I won't ask our own runner to %s %s: %s."
+                    % ("start" if kind == "start" else "resume", ident, why), clear,
+                    "held by the watcher")
+        team = (issue.get("team") or {}).get("key")
+        if team not in self.cfg["team_keys"]:
+            return ("%s is on %s, and I start work only on %s."
+                    % (ident, team or "no team", ", ".join(self.cfg["team_keys"])), "", "team")
+        state = issue.get("state") or {}
+        if state.get("type") in ENDED_STATES:
+            return ("%s is %s, so there's nothing to start."
+                    % (ident, notify.safe_title(state.get("name") or "closed")), "", "closed")
+        owners, why = self.runner_owners()
+        if not owners:
+            return ("I can't take a yes to start %s on our own runner: %s." % (ident, why), "",
+                    "no owner named")
+        runs, why = self.runner_runs(road[0], ident)
+        if runs is None:
+            return ("I can't read our own runner's records of its runs (%s), so I won't ask it "
+                    "about %s." % (why, ident), "", "runs unread")
+        if any(r["state"] in runner_store.LIVE for r in runs):
+            return ("A run is at work on %s on our own runner now, so I won't ask for another."
+                    % ident, "", "running")
+        if ident in (self.state.get("runner_asks") or {}):
+            return ("%s already waits for our own runner's answer." % ident, "", "asked")
+        if self.open_slack_start(issue["id"]):
+            return ("Your yes for %s already waits for the queue to have room." % ident, "",
+                    "approved already")
+        newest = self.newest_code_run(runs)
+        if kind != "start":
+            if newest is None:
+                return ("%s has no stopped run on our own runner to resume." % ident,
+                        RUNNER_START_INSTEAD_BIND % ident, "no run")
+            return None
+        if newest is not None:
+            return ("%s ran on our own runner before." % ident, RUNNER_RESUME_INSTEAD_BIND % ident,
+                    "ran before")
+        if state.get("type") not in START_STATES:
+            return ("%s is in %s, so I won't start it."
+                    % (ident, notify.safe_title(state.get("name") or "?")), "", "state")
+        node = self.tracker.epic(ident) or {}
+        if (node.get("delegate") or {}).get("id"):
+            return ("%s is handed to someone already, so I won't ask our own runner to start it."
+                    % ident, "", "held")
+        if (node.get("children") or {}).get("nodes"):
+            return ("%s is a plan." % ident, APPROVE_INSTEAD_BIND % ident, "a plan")
+        if machine.is_planning_ticket(issue.get("description"), label_names(issue)):
+            return ("%s is a planning run, which the planner starts itself." % ident, "",
+                    "planning run")
+        failed, _skipped = gate_failures(issue)
+        if failed:
+            return ("%s isn't ready to start: it fails the readiness gate on %s."
+                    % (ident, _in_words(failed)), "", "not ready")
+        return None
+
+    def act_on_runner(self, channel, thread, q, msg):
+        """The yes to a start or a resume on our own runner (KIT-961). Only a member the queue's
+        settings name as the owner may give it: anyone else's answer is refused in words, and the
+        question stays open for him. Everything is read again, as the question judged it and bound
+        to what it showed. Then the yes is recorded with its message, for the queue to carry, and
+        said. Nothing is written to Linear here: the queue starts it, and our own runner judges it."""
+        kind, ident = q["kind"], q["ticket"]
+        owners, _why = self.runner_owners()
+        if not pool.slack_owner({"owner_slack_user_ids": owners}, msg.get("user")):
+            self.post_refusal(channel, thread, "Only the owner's yes starts work on our own runner, "
+                              "so I can't take that as an answer to the question about %s."
+                              % ident, "not the owner", "answer-refused", ident)
+            self.mark(channel, msg, "refused: not the owner")
+            self.counts["refused"] += 1
+            self.say("  refused an answer on %s: not the owner" % ident)
+            return
+
+        def finish(status, text, what, kind_="runner-refused", bind=""):
+            # Posted first: the status changes only after the reply saying so lands.
+            self.post(channel, thread, text, kind=kind_, bind=bind, join=" ",
+                      facts={"ticket": ident})
+            q.update(status=status, answered_by=msg["user"], answered_ts=msg.get("ts"))
+            self.mark(channel, msg, what)
+        if self.refused_over_limit(channel, thread, msg):
+            return
+        issue, _sessions, _agent, refusal, road = self.handover_read(kind, ident)
+        if issue is not None and (not road or road[1] != q["runner"]["project"]):
+            refusal = ("%s's project doesn't code on our own runner as it did when I asked, so "
+                       "nothing was asked of it, and I have closed the question." % ident,
+                       ASK_AGAIN_BIND % (kind, ident), "changed since asked")
+        elif issue is not None and refusal is None:
+            runs, _why = self.runner_runs(road[0], ident)
+            if ticket_fingerprint(issue) != q.get("fingerprint"):
+                refusal = ("%s changed since I asked (its title, text, team, labels or state), so "
+                           "nothing was asked of our own runner, and I have closed the question."
+                           % ident, ASK_AGAIN_BIND % (kind, ident), "changed since asked")
+            elif kind == "retry" and (self.newest_code_run(runs) or {}).get("run") != q[
+                    "runner"]["run"]:
+                refusal = ("%s's runs on our own runner changed since I asked, so nothing was "
+                           "asked of it, and I have closed the question." % ident,
+                           ASK_AGAIN_BIND % (kind, ident), "changed since asked")
+        if refusal:
+            text, bind, why = refusal
+            finish(REFUSED, "%s Nothing was asked of our own runner." % text if why != "changed "
+                   "since asked" else text, "refused: %s" % why, bind=bind)
+            return
+        if self.dry:
+            self.say("  [dry-run] would record the yes to %s %s on our own runner"
+                     % ("start" if kind == "start" else "resume", ident))
+            return
+        ts = msg.get("ts")
+        # Recorded before it is said: a reply that fails leaves the yes standing, and the next
+        # pass says it waits already, never that nothing was done.
+        self.state.setdefault("slack_starts", {})[issue["id"]] = {
+            "ticket": ident, "kind": "start" if kind == "start" else "resume",
+            "run": q["runner"]["run"], "project": road[1], "approved_by": msg["user"],
+            "approved_at": iso(ts_float(ts)), "name": self.name_of(msg["user"]),
+            "team": self.me["team_id"], "channel": channel, "thread": thread, "ts": ts,
+            "answered": None, "said": None}
+        self.save()
+        if kind == "start":
+            text = ("Approved by <@%s>. %s starts on our own runner once the queue has room for it: "
+                    "inside its working window, its lanes and today's limits, as a move into %s "
+                    "would. You'll hear here when it starts, or why it can't."
+                    % (msg["user"], ident, self.cfg["ready_state"]))
+        else:
+            text = ("Approved by <@%s>. Our own runner resumes %s's stopped run once the queue has "
+                    "room, inside its working window. You'll hear here when it does, or why it "
+                    "can't." % (msg["user"], ident))
+        finish(DONE, text, "done: approved %s on our own runner" % ident, kind_="runner-approved")
+        self.say("  approved: %s %s on our own runner for %s"
+                 % ("start" if kind == "start" else "resume", ident, msg["user"]))
+
+    # -- the yes, carried by the queue (KIT-961) ------------------------------------------
+    def slack_said(self, entry):
+        """(the comment, the approval's time) for a start the queue's order made on the owner's
+        yes in Slack (KIT-961): its entry names him at his message's second. None for any other."""
+        rec = self.open_slack_start(entry.get("id"))
+        if not rec or rec.get("kind") != "start" or (entry.get("by"), entry.get("at")) != (
+                rec.get("approved_by"), rec.get("approved_at")):
+            return None
+        return ("Started by our own runner for **%s** (Slack user %s), who said yes to its start "
+                "in Slack at %s. The queue started it in lane %s."
+                % (rec.get("name") or rec["approved_by"], rec["approved_by"], rec["approved_at"],
+                   entry.get("lane") or "?"), rec["approved_at"])
+
+    def slack_answered(self, ident, got):
+        """Our own runner's answer to a start or a resume the owner said yes to in Slack, said where
+        he said it, and the record closed, so one yes never asks twice (KIT-961)."""
+        for _issue_id, rec in sorted((self.state.get("slack_starts") or {}).items()):
+            if rec.get("ticket") != ident or rec.get("answered") is not None:
+                continue
+            start = rec.get("kind") == "start"
+            if got.get("ok"):
+                text = ("Our own runner started %s on your yes." % ident if start else
+                        "Our own runner resumed %s's run on your yes." % ident)
+            elif got.get("mine"):
+                text = ("I couldn't ask our own runner to %s %s: %s. Nothing was started."
+                        % ("start" if start else "resume", ident,
+                           self.clean(str(got.get("why") or "no reason"))[:300]))
+            else:
+                text = ("Our own runner refused to %s %s: %s. Nothing was started."
+                        % ("start" if start else "resume", ident,
+                           self.clean(str(got.get("why") or "it gave no reason"))[:300]))
+            self.post(rec["channel"], rec.get("thread"), text, kind="runner-answer",
+                      facts={"ticket": ident})
+            rec["answered"] = {"ok": bool(got.get("ok")), "run": got.get("run"),
+                               "at": iso(self.now)}
+        self.save()
+
+    def slack_holds(self, verdicts):
+        """A start the owner said yes to that the queue's judge holds is said where he said yes, once
+        for each reason: never left to wait in silence (KIT-961). One the judge admitted waits for a
+        lane and the day's room like any start, and is not said. A decision that carries no
+        verdicts judged nothing, and says nothing."""
+        if verdicts is None:
+            return
+        judged = dict((v.get("ticket"), v) for v in verdicts if isinstance(v, dict))
+        asked = self.state.get("runner_asks") or {}
+        for _issue_id, rec in sorted((self.state.get("slack_starts") or {}).items()):
+            # One already asked of our own runner waits for its answer: it may be at work now, and
+            # out of the queue's states, which is no hold.
+            if rec.get("kind") != "start" or rec.get("answered") is not None or rec.get(
+                    "ticket") in asked:
+                continue
+            v = judged.get(rec.get("ticket"))
+            why = None if v and v.get("admitted") else ((v or {}).get("reason") or "not read")
+            if why is None or rec.get("said") == why:
+                continue
+            if why == "not read":
+                text = "%s can't start on our own runner yet: the queue did not read it." % rec["ticket"]
+            else:
+                text = ("%s can't start on our own runner yet: the queue holds it (%s)."
+                        % (rec["ticket"], why))
+            self.post(rec["channel"], rec.get("thread"), text + " Your yes stands until our own "
+                      "runner answers it.", kind="runner-held", facts={"ticket": rec["ticket"]})
+            rec["said"] = why
+        self.save()
+
+    def slack_resumes(self, ledger):
+        """Each resume the owner said yes to in Slack, asked of our own runner by the queue's own
+        pass (KIT-961): inside the working window, with room, no hold and no runaway stop, as the
+        queue's resumes are, its ledger row first. How many were asked, or None when this pass's
+        starts end here, said."""
+        asked = 0
+        for issue_id, rec in sorted((self.state.get("slack_starts") or {}).items()):
+            if rec.get("kind") != "resume" or rec.get("answered") is not None:
+                continue
+            ident = rec["ticket"]
+            if ident in (self.state.get("runner_asks") or {}):
+                continue
+            if self.actions_left() <= 0:
+                self.say("  action limit: resuming %s waits for the next hour" % ident)
+                break
+            lane, where, why = runner_store.caller_lane(
+                (self.cfg.get("runner_lane") or {}).get("settings_file"), rec["project"], "code")
+            if lane == "held":
+                self.queue_failed("%s's resume cannot be asked: %s" % (ident, self.clean(why)))
+                return None
+            if lane != "on":
+                self.slack_answered(ident, {"ok": False, "mine": True,
+                                            "why": "its project's coding lane is off now"})
+                continue
+            if self.dry:
+                self.say("  [dry-run] the queue would ask our runner to resume %s" % ident)
+                continue
+            try:
+                starter.record_start(ledger, self.now, ident, "resume")
+            except starter.QueueBusy as exc:       # KIT-681: another pass writes the ledger
+                self.say("  QUEUE: %s; nothing resumes this pass" % exc)
+                return None
+            except (OSError, ValueError) as exc:
+                self.queue_failed("its ledger refused a resume (%s)" % (
+                    exc if isinstance(exc, ValueError) else type(exc).__name__))
+                return None
+            try:
+                rid = runner_store.ask(where, "queue", "resume", "code", rec["project"], ident,
+                                       run=rec["run"], text=RUNNER_RESUME_TEXT, now=self.now)
+            except (ValueError, OSError) as exc:
+                self.slack_answered(ident, {"ok": False, "mine": True,
+                                            "why": "our own runner's store would not take it (%s)"
+                                            % (self.clean(str(exc)) if isinstance(exc, ValueError)
+                                               else type(exc).__name__)})
+                continue
+            self.state.setdefault("runner_asks", {})[ident] = {
+                "request": rid, "store": where, "project": rec["project"], "issue_id": issue_id,
+                "body": ("Resumed by our own runner for **%s** (Slack user %s), who said yes in "
+                         "Slack at %s." % (rec.get("name") or rec["approved_by"],
+                                           rec["approved_by"], rec["approved_at"])),
+                "approved_at": rec["approved_at"], "at": self.now}
+            self.state["acted_at"].append(self.now)
+            self.save()
+            asked += 1
+            self.say("  acted: the queue asked our runner to resume %s (the owner's yes)" % ident)
+        return asked
+
+    def slack_prune(self):
+        """Answered records of a yes in Slack are kept as long as a refusal is, then dropped."""
+        starts = self.state.get("slack_starts") or {}
+        for issue_id in [k for k, rec in starts.items() if rec.get("answered") and self.now - (
+                epoch(rec["answered"].get("at")) or 0) > RUNNER_REFUSED_KEEP]:
+            del starts[issue_id]
+
     def handed_since(self, sessions):
         """When the newest hand-over of a ticket the agent never started was made: its newest
         session's own time, as the tracker writes it, or None when it can't be told."""
@@ -245,11 +623,28 @@ class HandoverMixin(object):
 
     def request_handover(self, channel, msg, thread, kind, ident, requester, by_bot, dm,
                          terms=None, set_up=None):
-        """`retry <ticket>` or `start <ticket>` (KIT-352): every check, then the question."""
-        issue, sessions, _agent, refusal = self.handover_read(kind, ident)
+        """`retry <ticket>` or `start <ticket>` (KIT-352): every check, then the question. On a
+        project that codes on our own runner (KIT-961), `resume <ticket>` comes here as a retry."""
+        issue, sessions, _agent, refusal, road = self.handover_read(kind, ident)
         if refusal:
             text, bind, why = refusal
             self.refuse_request(channel, msg, thread, text, why, bind=bind, ticket=ident)
+            return
+        if road:
+            runs, why = self.runner_runs(road[0], ident)
+            run = self.newest_code_run(runs) if kind == "retry" else None
+            if runs is None or (kind == "retry" and run is None):
+                # Read once more for the question: a read that fails now is said, never guessed.
+                self.refuse_request(channel, msg, thread, "I can't read our own runner's records of "
+                                    "its runs (%s), so I won't ask it about %s." % (
+                                        why or "its newest run is not there now", ident),
+                                    "runs unread", ticket=ident)
+                return
+            self.ask(channel, msg, thread, kind, issue, requester,
+                     runner_parts(kind, issue, run, requester, self.cfg, by_bot=by_bot, dm=dm,
+                                  terms=terms),
+                     extra={"runner": {"project": road[1], "run": run["run"] if run else None}},
+                     terms=terms, set_up=set_up)
             return
         since = self.handed_since(sessions) if kind == "retry" and not self.newest_ended(
             sessions) else None
@@ -263,6 +658,9 @@ class HandoverMixin(object):
         said yes. A retry takes the agent off and puts it back, then reads its sessions back:
         if Linear made no new one, nothing was retried, and it says so."""
         kind, ident = q["kind"], q["ticket"]
+        if q.get("runner"):
+            self.act_on_runner(channel, thread, q, msg)     # KIT-961: our own runner's road
+            return
 
         def finish(status, text, what, kind_="handover-refused", bind=""):
             # Posted first: the status changes only after the reply saying so lands.
@@ -272,7 +670,12 @@ class HandoverMixin(object):
             self.mark(channel, msg, what)
         if self.refused_over_limit(channel, thread, msg):
             return
-        issue, sessions, agent_id, refusal = self.handover_read(kind, ident)
+        issue, sessions, agent_id, refusal, _road = self.handover_read(kind, ident)
+        if refusal is None and agent_id is None:
+            # KIT-961: asked on the old road, and its project codes on our own runner now.
+            refusal = ("%s's project codes on our own runner now, so nothing was handed over, and "
+                       "I have closed the question." % ident, ASK_AGAIN_BIND % (kind, ident),
+                       "changed since asked")
         if issue is not None and ticket_fingerprint(issue) != q.get("fingerprint"):
             refusal = ("%s changed since I asked (its title, text, team, labels or state), so "
                        "nothing was handed over, and I have closed the question." % ident,
@@ -531,10 +934,11 @@ def cases_handover(kit):
         unread = dict(queue_config=qconf, runner_lane={
             "settings_file": os.path.join(rfolder, "gone.json"), "repos": {"acme/app": "app"}})
         rows = (
+            # KIT-961: a switched project's start is the runner's road, and with no owner named in
+            # the queue's settings no yes there can start anything: said, never asked.
             ("ho-runner-start", "start PROD-6", readied, switched,
-             "PROD-6's project codes on our own runner now. It starts a ticket only when its "
-             "approver moves it into Todo, so I won't hand it to the agent. Move it there "
-             "yourself, and the queue asks the runner."),
+             "I can't take a yes to start PROD-6 on our own runner: the queue's settings name no "
+             "Slack member as the owner."),
             ("ho-runner-unread", "retry PROD-6", lambda t_: held(t_, sessions=lost), unread,
              "I can't tell whether PROD-6's project codes on our own runner (the runner's settings "
              "could not be read: it could not be opened (FileNotFoundError)), so I won't hand it "
@@ -586,6 +990,188 @@ def cases_handover(kit):
         check("ho-each-check-refuses-once-with-no-hand-over-and-an-ended-dev-retries-at-once",
               outcome(case_each_check), [(want, []) for _n, _t, _s, _o, want in rows]
               + [(True, [])])
+
+        # 4c. KIT-961: on a project that codes on our own runner, `start`, `retry` and `resume`
+        #     ask, and only the owner's yes records the approval, with its message, for the
+        #     queue. Nothing is handed over and nothing is written to Linear.
+        from pipeline_bridge import TEAM
+        from pipeline_bridge_config import OPEN
+
+        def lane_conf(name, owners=(ALICE,), code=True, hold=None):
+            folder = os.path.join(_tmp, "runner-961", name)
+            os.makedirs(folder)
+            store = os.path.join(folder, "store")
+            runner_store.prepare(store)
+            qpath, rpath = os.path.join(folder, "queue.json"), os.path.join(folder, "runner.json")
+            queue = {"pool": {"owner_user_ids": ["owner-1"], "team_keys": ["PROD"],
+                              "dispatcher_user_ids": ["agent-1"],
+                              "owner_slack_user_ids": list(owners)},
+                     "reader": {"repo_by_team": {"PROD": "acme/app"},
+                                "inputs_file": os.path.join(folder, "in.json")},
+                     "window": {"days": dict((d, None) for d in (
+                         "mon", "tue", "wed", "thu", "fri", "sat", "sun"))}}
+            if hold:
+                queue["hold"] = {"file": hold}
+            with open(qpath, "w", encoding="utf-8") as fh:
+                json.dump(queue, fh)
+            with open(rpath, "w", encoding="utf-8") as fh:
+                json.dump({"enabled": True, "store_dir": store,
+                           "projects": {"app": {"lanes": {"code": code}}}}, fh)
+            return dict(queue_config=qpath, runner_lane={"settings_file": rpath,
+                                                         "repos": {"acme/app": "app"}}), store
+
+        def stopped(store, state="ended"):
+            """PROD-6's code run on our own runner, as the runner records one."""
+            rec = dict((k, None) for k in runner_store.RUN_KEYS)
+            rec.update(schema=runner_store.RUN_SCHEMA, run="run-" + "c" * 32, request="rq-" + "d" * 32,
+                       caller="queue", kind="code", project="app", ticket="PROD-6",
+                       started_for="request", approved_by="owner-1", approved_at=iso(now - hour),
+                       how="move", session_id="0b0e5e2c-1111-4222-8333-944445555666",
+                       workspace=os.path.join(store, "w"), branch="feat/prod-6-x", state=state,
+                       started_at=iso(now - hour))
+            if state not in runner_store.LIVE:
+                rec.update(ended_at=iso(now - 60), reason="ended", seconds=3540.0, exit=0,
+                           why="the program ended with exit 0")
+            runner_store.write_run(store, rec)
+            return rec
+
+        def slack_record(c):
+            return (json.load(open(state_path(c))).get("slack_starts") or {}).get("uuid-6")
+
+        def case_runner_start():
+            over, _store = lane_conf("start")
+            c, s, t = asked("ho961-start", "start PROD-6", readied, **over)
+            question = dm_lines(s)[-1]
+            said = answered(c, s, t, now + 120)
+            rec = slack_record(c) or {}
+            return (question.startswith("*Start this on our own runner?* PROD-6"),
+                    "so only the owner's yes counts here" in question,
+                    "and I'll ask our own runner to start it once the queue has room for it: inside "
+                    "its working window, its lanes and today's limits." in question, said,
+                    tuple(rec.get(k) for k in ("ticket", "kind", "approved_by", "team", "channel",
+                                               "answered")),
+                    rec.get("approved_at") == iso(ts_float(rec.get("ts"))), t.delegations,
+                    t.comments, statuses(c))
+        check("ho961-start-on-our-runner-asks-and-the-owners-yes-records-it-with-its-message",
+              outcome(case_runner_start),
+              (True, True, True,
+               "Approved by <@%s>. PROD-6 starts on our own runner once the queue has room for it: "
+               "inside its working window, its lanes and today's limits, as a move into Todo "
+               "would. You'll hear here when it starts, or why it can't." % ALICE,
+               ("PROD-6", "start", ALICE, TEAM, DM, None), True, [], [], [("PROD-6", "start", DONE)]))
+
+        def case_runner_not_owner():
+            over, _store = lane_conf("not-owner", owners=("U0NOTALICE1",))
+            c, s, t = asked("ho961-not-owner", "start PROD-6", readied, **over)
+            said = answered(c, s, t, now + 120)
+            return said, slack_record(c), t.delegations, statuses(c)
+        check("ho961-a-yes-from-anyone-but-the-owner-the-queue-names-is-refused-in-words",
+              outcome(case_runner_not_owner),
+              ("Only the owner's yes starts work on our own runner, so I can't take that as an "
+               "answer to the question about PROD-6.", None, [], [("PROD-6", "start", OPEN)]))
+
+        def case_runner_edited():
+            over, _store = lane_conf("edited")
+            c, s, t = asked("ho961-edited", "start PROD-6", readied, **over)
+            s.add(ALICE, "yes", channel=DM, edited={"user": ALICE, "ts": "1"})
+            run(c, s, t, at=now + 120)
+            return ("it was edited after it was sent" in dm_lines(s)[-1], slack_record(c),
+                    statuses(c))
+        check("ho961-an-edited-yes-records-nothing", outcome(case_runner_edited),
+              (True, None, [("PROD-6", "start", OPEN)]))
+
+        def case_runner_replayed():
+            over, _store = lane_conf("replayed")
+            c, s, t = asked("ho961-replayed", "start PROD-6", readied, **over)
+            answered(c, s, t, now + 120)
+            before = (len(dm_lines(s)), slack_record(c))
+            run(c, s, t, at=now + 180)
+            run(c, s, t, at=now + 240)
+            return before == (len(dm_lines(s)), slack_record(c)), before[1] is not None
+        check("ho961-the-same-yes-read-again-records-and-says-nothing-more",
+              outcome(case_runner_replayed), (True, True))
+
+        def case_runner_resume(verb):
+            over, store = lane_conf("resume-" + verb)
+            ran = stopped(store)
+            c, s, t = asked("ho961-" + verb, "%s PROD-6" % verb, None, **over)
+            question = dm_lines(s)[-1]
+            said = answered(c, s, t, now + 120)
+            rec = slack_record(c) or {}
+            return (question.startswith("*Resume this on our own runner?* PROD-6"),
+                    "Its newest run on our own runner ended at %s." % ran["ended_at"] in question,
+                    "and I'll ask our own runner to resume its stopped run once the queue has room, "
+                    "inside its working window." in question, said,
+                    (rec.get("kind"), rec.get("run")), t.delegations)
+        for verb in ("retry", "resume"):
+            check("ho961-%s-on-our-runner-asks-to-resume-its-newest-stopped-run" % verb,
+                  outcome(lambda: case_runner_resume(verb)),
+                  (True, True, True,
+                   "Approved by <@%s>. Our own runner resumes PROD-6's stopped run once the queue has "
+                   "room, inside its working window. You'll hear here when it does, or why it "
+                   "can't." % ALICE, ("resume", "run-" + "c" * 32), []))
+
+        def case_runner_refusals():
+            got = []
+            for name, text, setup, runs, want in (
+                    ("ran-before", "start PROD-6", readied, stopped,
+                     "PROD-6 ran on our own runner before. To resume its stopped run, type "
+                     "`resume PROD-6`."),
+                    ("no-run", "retry PROD-6", None, None,
+                     "PROD-6 has no stopped run on our own runner to resume. To start it, type "
+                     "`start PROD-6`."),
+                    ("live", "retry PROD-6", None, lambda st: stopped(st, state="running"),
+                     "A run is at work on PROD-6 on our own runner now, so I won't ask for "
+                     "another.")):
+                over, store = lane_conf("r-" + name)
+                if runs:
+                    runs(store)
+                c, s, t = asked("ho961-" + name, text, setup, **over)
+                got.append((dm_lines(s)[-1] == want, t.delegations, slack_record(c)))
+            over, _store = lane_conf("r-waits")
+            c, s, t = asked("ho961-waits", "start PROD-6", readied, **over)
+            answered(c, s, t, now + 120)
+            s.add(ALICE, "start PROD-6", channel=DM)
+            run(c, s, t, at=now + 180)
+            got.append(dm_lines(s)[-1])
+            return got
+        check("ho961-each-runner-check-is-said-once-and-records-nothing",
+              outcome(case_runner_refusals),
+              [(True, [], None)] * 3 + ["Your yes for PROD-6 already waits for the queue to have room."])
+
+        def case_runner_held():
+            import pipeline_hold as watcher_hold
+            hold = os.path.join(_tmp, "runner-961-hold.json")
+            watcher_hold.write(hold, [("labels", "protected-label", "acme/app#12")], lambda: now)
+            over, store = lane_conf("held", hold=hold)
+            stopped(store)
+            c, s, t = asked("ho961-held", "resume PROD-6", None, **over)
+            return dm_lines(s)[-1].split(". To clear it")[0], slack_record(c)
+        check("ho961-a-watchers-hold-on-a-resume-is-said-as-one-and-records-nothing",
+              outcome(case_runner_held),
+              ("I won't ask our own runner to resume PROD-6: the watcher has held new starts: "
+               "protected-label acme/app#12", None))
+
+        def case_runner_switch():
+            over, _store = lane_conf("back")
+            c, s, t = asked("ho961-back", "start PROD-6", readied, **over)
+            # The runner's own switch moves the project back to the old road before the yes.
+            rpath = over["runner_lane"]["settings_file"]
+            with open(rpath, encoding="utf-8") as fh:
+                doc = json.load(fh)
+            doc["projects"]["app"]["lanes"]["code"] = False
+            with open(rpath, "w", encoding="utf-8") as fh:
+                json.dump(doc, fh)
+            said = answered(c, s, t, now + 120)
+            old, _store2 = lane_conf("old", code=False)
+            _c2, s2, t2 = asked("ho961-old", "start PROD-6", readied, **old)
+            return (said, slack_record(c), t.delegations,
+                    dm_lines(s2)[-1].startswith("*Start this?* PROD-6"))
+        check("ho961-the-runners-own-lane-switch-moves-a-project-back-and-a-yes-asked-before-acts-on-nothing",
+              outcome(case_runner_switch),
+              ("PROD-6's project doesn't code on our own runner as it did when I asked, so nothing "
+               "was asked of it, and I have closed the question. Ask again with `start PROD-6`.",
+               None, [], True))
 
         # 5. START, at the yes: a ticket changed since the question hands nothing over.
         def case_changed():

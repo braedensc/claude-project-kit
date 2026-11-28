@@ -3461,7 +3461,9 @@ the tracker and judges it.
   `scripts/pipeline_queue_read.py`'s `gather()` over the queue's settings, then
   `scripts/pipeline_queue_pool.py`'s `decide()`. One rule, for the queue and the runner. It starts
   only a ticket the judge admits with a named approver: the owner's move, his creation where the
-  judge counts one, his approval of a plan in Slack (the bridge's record), or the validator in his
+  judge counts one, his approval of a plan in Slack (the bridge's record), his own yes in Slack to
+  start that one ticket (KIT-961, the bridge's `slack_starts` record, `how` `slack-start`: one yes
+  starts one run at most), or the validator in his
   place while its pieces switch is on (§23, §24). An agent-filed finding the judge's limits admit
   names nobody, and is refused. A judge that could not read what it needs leaves the request
   waiting.
@@ -3562,7 +3564,7 @@ removed, and the start is refused. A code run's workspace is never removed this 
 | `kind`, `project`, `ticket` | as in the request | |
 | `resumes` | run id, or null | The run this one resumed, or carries on afresh. |
 | `started_for` | `request` \| `interrupted` \| `session-gone` | `session-gone`: the fresh start after a resume found its session gone. |
-| `approved_by`, `approved_at`, `how` | an approver's id; time or null; `move` \| `creation` \| `slack` \| `validator` \| `resumed-run` \| `fresh-session` \| `code-run` | Who approved, as the check found it: a tracker user, the owner's Slack member for `slack`, or `validator`. |
+| `approved_by`, `approved_at`, `how` | an approver's id; time or null; `move` \| `creation` \| `slack` \| `validator` \| `slack-start` \| `resumed-run` \| `fresh-session` \| `code-run` | Who approved, as the check found it: a tracker user, the owner's Slack member for `slack` and `slack-start`, or `validator`. For `slack-start`, `approved_at` is his message's second (KIT-961). |
 | `session_id` | UUID | Given to the program at the start, kept by a resume. A fresh start gets a new one. |
 | `gone_session` | UUID, or null | The session a fresh start could not resume. Set on a fresh start, and only there. |
 | `workspace`, `branch` | absolute path; branch name | `<work_dir>/<kind>/<TICKET>`, on one fixed pattern. |

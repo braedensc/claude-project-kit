@@ -1559,7 +1559,7 @@ def module_pins(text, tracker=False):
 # named *_BIND; words the bridge never says (the voice guide's swaps: pieces, the dev,
 # Linear); and the lanes a bind never names, by their default names.
 REFUSAL_HELPERS = ("replan_refusal", "replan_work_refusal", "replan_changed",
-                   "answer_refusal", "handover_refusal")
+                   "answer_refusal", "handover_refusal", "runner_refusal")
 NAMED_BINDS = ("DM_HELP", "NOTIFIER_CHECK")
 BANNED_WORDS_RE = re.compile(r"\b(child|children|epics?|delegat\w*|bounce\w*|sessions?|"
                              r"dispatcher|tracker|fingerprints?|ledger|provenance|"
@@ -1576,7 +1576,8 @@ THEN_SLOTS = {"DIRECT_BIND": (2, ("DIRECT_PLAN_THEN_BIND", "DIRECT_PLAN_EACH_THE
                                    "ACT_OFF_THEN_BIND")),
               "QUESTION_BIND": (4, ("PLAN_THEN_BIND", "REPLAN_THEN_BIND", "ACT_OFF_THEN_BIND",
                                     "CANCEL_REPLAN_THEN_BIND", "RETRY_THEN_BIND",
-                                    "START_THEN_BIND")),
+                                    "START_THEN_BIND", "RUNNER_START_THEN_BIND",
+                                    "RUNNER_RESUME_THEN_BIND")),
               "APPROVE_BIND": (4, ("APPROVE_THEN_BIND", "APPROVE_OFF_THEN_BIND")),
               "ANSWER_BIND": (4, ("ANSWER_THEN_BIND", "ANSWER_OFF_THEN_BIND")),
               "PLAN_MOVE_BIND": (4, ("PAUSE_THEN_BIND", "RESUME_THEN_BIND", "CANCEL_THEN_BIND",
@@ -2242,6 +2243,14 @@ def _selftest(identity=(True,) * 5, reached=()):
         "START_INSTEAD_BIND": "To hand it to the agent, type `start %s`.",
         "RETRY_INSTEAD_BIND": "If it never started, type `retry %s`.",
         "APPROVE_INSTEAD_BIND": "To start its pieces, type `approve %s`.",
+        # KIT-961: `start`, `retry` and `resume` on a project that codes on our own runner.
+        "RUNNER_START_THEN_BIND": ("I'll ask our own runner to start it once the queue has room "
+                                   "for it: inside its working window, its lanes and today's "
+                                   "limits"),
+        "RUNNER_RESUME_THEN_BIND": ("I'll ask our own runner to resume its stopped run once the "
+                                    "queue has room, inside its working window"),
+        "RUNNER_START_INSTEAD_BIND": "To start it, type `start %s`.",
+        "RUNNER_RESUME_INSTEAD_BIND": "To resume its stopped run, type `resume %s`.",
         "QUESTION_BIND":("Reply %s %s within %d hours, and %s. Reply `no` to drop it. "
                           "Merging stays yours. %s"),
         "REPLAN_ACT_OFF_BIND": ("Switch acting on and reply `yes %s` to finish it, or reply "
